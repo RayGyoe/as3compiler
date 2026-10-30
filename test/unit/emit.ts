@@ -1593,15 +1593,15 @@ function checkEmitListenerIdentity(): string[] {
     /if \(a->fn == listener->fn && a->env == listener->env\)/.test(rem));
   // AT_TARGET: bubble list only -- no capture lookup may appear in the body.
   check('as_disp_target reads only the non-capture list',
-    target.includes('as_listeners_get(d->listeners, evt->type, false)') &&
-    !target.includes('as_listeners_get(d->listeners, evt->type, true)'));
+    target.includes('as_listeners_get(d->listeners, evt->_type, false)') &&
+    !target.includes('as_listeners_get(d->listeners, evt->_type, true)'));
   check('as_disp_target still sets the AT_TARGET phase and currentTarget',
-    target.includes('evt->eventPhase = 2;') && target.includes('evt->currentTarget = (Object*)target;'));
+    target.includes('evt->_eventPhase = 2;') && target.includes('evt->_currentTarget = (Object*)target;'));
   // The ancestor capture phase must stay (that is where capture listeners live);
   // as_disp_phase takes the flag as a parameter, so the walk itself supplies `true`.
   check('the capture phase still walks the ancestors',
     c.includes('for (int i = anc_count - 1; i >= 0; i--) { if (event->propStopped) break; if (as_disp_phase(event, ancestors[i], true)) ran = true; }') &&
-    phase.includes('as_listeners_get(d->listeners, evt->type, capture)'));
+    phase.includes('as_listeners_get(d->listeners, evt->_type, capture)'));
 
   console.log(`     [listener] ${ok} check(s) passed`);
   return bad;
@@ -3814,7 +3814,7 @@ function checkEmitNativeMenu(): string[] {
   check('a click dispatches select on the item AND its menu',
     c.includes('EventDispatcher_dispatchEvent((EventDispatcher*)it, (Event*)Event_new((char*)"select", false, false));')
     && c.includes('if (it->_menu != NULL) as_menu_select_on((void*)it->_menu, it);')
-    && /static void as_menu_select_on\(void\* disp, NativeMenuItem\* item\) \{[\s\S]{0,300}?e->target = \(Object\*\)item;/.test(c));
+    && /static void as_menu_select_on\(void\* disp, NativeMenuItem\* item\) \{[\s\S]{0,300}?e->_target = \(Object\*\)item;/.test(c));
 
   // ---- capability flags answer for the backend ------------------------------
   const pre = RUNTIME_PREAMBLE;
@@ -3991,8 +3991,8 @@ function checkEmitScreenMouseEvent(): string[] {
     && /Event_vt = \{[^}]*Object_propertyIsEnumerable, Event_clone,/.test(c));
   // clone(): ctor-level state only (measured: localX/delta reset, screenX survives).
   check('clone copies the screen coordinates and the two extra flags',
-    c.includes('ScreenMouseEvent_new(e->type, e->bubbles, e->cancelable, e->_screen_x, e->_screen_y, e->ctrlKey, e->altKey, e->shiftKey, e->buttonDown, e->commandKey, e->controlKey)')
-    && c.includes('c->target = e->target;'));
+    c.includes('ScreenMouseEvent_new(e->_type, e->_bubbles, e->_cancelable, e->_screen_x, e->_screen_y, e->ctrlKey, e->altKey, e->shiftKey, e->buttonDown, e->commandKey, e->controlKey)')
+    && c.includes('c->_target = e->_target;'));
   // toString(): AIR's own shape -- no eventPhase, unlike Event_toString.
   check('toString has AIR\'s ScreenMouseEvent shape', c.includes('"[ScreenMouseEvent type='));
   check('...and carries no eventPhase',

@@ -1093,20 +1093,31 @@ export class SymbolTable {
     // are modeled as fields; three extra internal flags (cancelled/propStopped/
     // immStopped) drive preventDefault/stopPropagation/stopImmediatePropagation.
     // target/currentTarget are Object* (any dispatcher or display object).
-    const evf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Event', isStatic: false, isConst: false });
+    // The six AS3 read-only properties are stored PRIVATELY and exposed through
+    // real getters (stage 325). As plain public fields, `e["type"] = 1` and even
+    // `e.type = 1` were accepted, while adl 51.4.1 throws ReferenceError #1074
+    // ("Illegal write to read-only property type on <receiver class>") for a
+    // dynamic write and rejects the static form at compile time -- measured in
+    // temp/smeprobe/adl4.txt. A field cannot throw on write, so the stored names
+    // carry an underscore and the getter is the only way in; the internal writers
+    // (Event_ctor, the dispatcher, clone) touch the underscore names directly.
+    // The three propagate flags stay ordinary private fields (they are not AS3
+    // properties at all).
+    const evp = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'Event', isStatic: false, isConst: false });
+    const evg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Event', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const evm = (ret: CType, params: Param[] = []): MethodInfo => ({ returnType: ret, params, owner: 'Event', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     const evc = (value: string): FieldInfo => ({ type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner: 'Event', isStatic: true, isConst: true });
     this.classMap.set('Event', {
       fields: new Map([
-        ['type', evf({ kind: 'string' })],
-        ['bubbles', evf({ kind: 'bool' })],
-        ['cancelable', evf({ kind: 'bool' })],
-        ['target', evf({ kind: 'object', className: 'Object' })],
-        ['currentTarget', evf({ kind: 'object', className: 'Object' })],
-        ['eventPhase', evf({ kind: 'int' })],
-        ['cancelled', evf({ kind: 'bool' })],
-        ['propStopped', evf({ kind: 'bool' })],
-        ['immStopped', evf({ kind: 'bool' })],
+        ['_type', evp({ kind: 'string' })],
+        ['_bubbles', evp({ kind: 'bool' })],
+        ['_cancelable', evp({ kind: 'bool' })],
+        ['_target', evp({ kind: 'object', className: 'Object' })],
+        ['_currentTarget', evp({ kind: 'object', className: 'Object' })],
+        ['_eventPhase', evp({ kind: 'int' })],
+        ['cancelled', evp({ kind: 'bool' })],
+        ['propStopped', evp({ kind: 'bool' })],
+        ['immStopped', evp({ kind: 'bool' })],
       ]),
       methods: new Map([
         ['toString', evm({ kind: 'string' })],
@@ -1214,7 +1225,14 @@ export class SymbolTable {
         ['TOUCH_MOVE', evc('touchMove')],
       ]),
       staticMethods: new Map(),
-      getters: new Map(),
+      getters: new Map([
+        ['type', evg({ kind: 'string' })],
+        ['bubbles', evg({ kind: 'bool' })],
+        ['cancelable', evg({ kind: 'bool' })],
+        ['target', evg({ kind: 'object', className: 'Object' })],
+        ['currentTarget', evg({ kind: 'object', className: 'Object' })],
+        ['eventPhase', evg({ kind: 'int' })],
+      ]),
       setters: new Map(),
       constructor: { params: [
         { name: 'type', type: 'String', defaultValue: null, isRest: false },

@@ -66,7 +66,7 @@ function checkContextMenuModel(): string[] {
     (c.match(/as_menu_popup_stage\([^;]*, 0\);/g) || []).length === 2);
   check('emit: menu-level SELECT keeps the ITEM as target',
     c.includes('static void as_menu_select_on(void* disp, NativeMenuItem* item)') &&
-    /as_menu_select_on[\s\S]{0,300}?e->target = \(Object\*\)item;/.test(c));
+    /as_menu_select_on[\s\S]{0,300}?e->_target = \(Object\*\)item;/.test(c));
   check('emit: the popup is polled once per frame',
     c.includes('as_menu_popup_pump();'));
 

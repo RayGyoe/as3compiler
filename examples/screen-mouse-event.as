@@ -88,4 +88,32 @@ sameStr(s2, "[ScreenMouseEvent type=\"x\" bubbles=false cancelable=false screenX
 check(d is Event, "is Event");
 sameStr(d.toString().substr(1, 17), "ScreenMouseEvent ", "qualified name in toString");
 
+// ---- stage 325: Event's read-only properties are real accessors ----
+// adl 51.4.1 throws ReferenceError #1074 on a DYNAMIC write to each of them and
+// names the RECEIVER's class (ScreenMouseEvent here, not the declaring Event);
+// a method name answers #1037 and a name that does not exist #1056. Reads are
+// unaffected -- they reach the same getter the dot form uses.
+function errId(fn:Function):int {
+  try { fn(); } catch (err:Error) { return err.errorID; }
+  return 0;
+}
+var asObj:Object = e;
+check(errId(function():void { asObj["type"] = 1; }) == 1074, "dynamic write to type -> #1074");
+check(errId(function():void { asObj["bubbles"] = true; }) == 1074, "dynamic write to bubbles -> #1074");
+check(errId(function():void { asObj["cancelable"] = true; }) == 1074, "dynamic write to cancelable -> #1074");
+check(errId(function():void { asObj["target"] = null; }) == 1074, "dynamic write to target -> #1074");
+check(errId(function():void { asObj["currentTarget"] = null; }) == 1074, "dynamic write to currentTarget -> #1074");
+check(errId(function():void { asObj["eventPhase"] = 1; }) == 1074, "dynamic write to eventPhase -> #1074");
+check(errId(function():void { asObj["clone"] = 1; }) == 1037, "dynamic write to a method -> #1037");
+check(errId(function():void { asObj["nope"] = 1; }) == 1056, "dynamic write to an unknown name -> #1056");
+// The reads still work, and the values are the ones the constructor stored.
+sameStr(asObj["type"] as String, "t", "dynamic read of type");
+check((asObj["bubbles"] as Boolean) == true, "dynamic read of bubbles");
+// A write does not leak into the stored value.
+sameStr(e.type, "t", "a rejected write leaves type alone");
+// (The three internal propagate flags -- cancelled/propStopped/immStopped -- are
+// NOT AS3 properties at all. AIR answers them with #1056 for both read and write;
+// ours still exposes them through the reflection table. Registered in TODO.md so
+// the leak is not mistaken for a contract.)
+
 trace("screen-mouse-event OK");

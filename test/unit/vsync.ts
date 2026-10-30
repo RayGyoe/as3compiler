@@ -44,8 +44,10 @@ function checkVsync(): string[] {
   // struct must be laid out on top of Event (so an Event-typed slot accepts it).
   check('struct declares available (bool) then refreshRate (double)',
     /struct VsyncStateChangeAvailabilityEvent \{[\s\S]*?\bbool available;[\s\S]*?\bdouble refreshRate;[\s\S]*?\};/.test(c));
-  check('it inherits the Event layout (type/bubbles/... fields present)',
-    /struct VsyncStateChangeAvailabilityEvent \{[\s\S]*?\bchar\* type;[\s\S]*?\bbool bubbles;[\s\S]*?\bbool available;/.test(c));
+  // Event's storage is private since stage 325 (the six read-only properties are
+  // accessors now), so the inherited slots are the underscore names.
+  check('it inherits the Event layout (type/bubbles/... slots present)',
+    /struct VsyncStateChangeAvailabilityEvent \{[\s\S]*?\bchar\* _type;[\s\S]*?\bbool _bubbles;[\s\S]*?\bbool available;/.test(c));
   check('vtable chain points at Event (superClass = Event)',
     /static VsyncStateChangeAvailabilityEvent_vtable VsyncStateChangeAvailabilityEvent_vt = \{ "VsyncStateChangeAvailabilityEvent", &Event_vt,/.test(c));
 

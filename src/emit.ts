@@ -10272,7 +10272,7 @@ as_value NativeMenu_dispatchContextMenuSelect(void* _this, Object* mouseEvent) {
 static void as_menu_select_on(void* disp, NativeMenuItem* item) {
   if (disp == NULL) return;
   Event* e = Event_new((char*)"select", false, false);
-  e->target = (Object*)item;
+  e->_target = (Object*)item;
   as_disp_depth++;
   as_disp_target(e, disp);
   as_disp_depth--;
@@ -11553,9 +11553,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static bool as_disp_phase(Event* evt, void* current, bool capture) {');
     this.indent++;
     this.line('EventDispatcher* d = (EventDispatcher*)current;');
-    this.line('evt->currentTarget = (Object*)current;');
+    this.line('evt->_currentTarget = (Object*)current;');
     this.line('if (d->listeners == NULL) return false;');
-    this.line('as_value v = as_listeners_get(d->listeners, evt->type, capture);');
+    this.line('as_value v = as_listeners_get(d->listeners, evt->_type, capture);');
     this.line('if (v.tag == 6) return as_disp_arr((as_array*)v.ptr, evt);');
     this.line('return false;');
     this.indent--;
@@ -11571,8 +11571,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // fired the target's capture listener too, which AIR never does.
     this.line('static bool as_disp_target(Event* evt, void* target) {');
     this.indent++;
-    this.line('evt->eventPhase = 2;');
-    this.line('evt->currentTarget = (Object*)target;');
+    this.line('evt->_eventPhase = 2;');
+    this.line('evt->_currentTarget = (Object*)target;');
     this.line('EventDispatcher* d = (EventDispatcher*)target;');
     this.line('if (d->listeners == NULL) return false;');
     // AT_TARGET consults the NON-capture list only. AIR's capture phase walks root
@@ -11583,7 +11583,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // well double-fired such listeners -- which for the drag idiom (a container that
     // registers its own MOUSE_DOWN with capture) means the handler runs twice and the
     // second run sees state the first one already consumed.
-    this.line('as_value vb = as_listeners_get(d->listeners, evt->type, false);');
+    this.line('as_value vb = as_listeners_get(d->listeners, evt->_type, false);');
     this.line('if (vb.tag == 6) return as_disp_arr((as_array*)vb.ptr, evt);');
     this.line('return false;');
     this.indent--;
@@ -11593,20 +11593,31 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // target/currentTarget/phase plus the three propagation flags.
     this.line('void Event_ctor(Event* o, char* type, bool bubbles, bool cancelable) {');
     this.indent++;
-    this.line('o->type = type;');
+    this.line('o->_type = type;');
     this.line('gc_write_barrier((void*)type);');
-    this.line('o->bubbles = bubbles;');
-    this.line('o->cancelable = cancelable;');
-    this.line('o->target = NULL;');
-    this.line('o->currentTarget = NULL;');
+    this.line('o->_bubbles = bubbles;');
+    this.line('o->_cancelable = cancelable;');
+    this.line('o->_target = NULL;');
+    this.line('o->_currentTarget = NULL;');
     // AIR constructs an event already AT_TARGET (`new Event("x", true, true).toString()`
     // reports eventPhase=2 on adl 51.4.1; measured in temp/evtdefprobe).
-    this.line('o->eventPhase = 2;');
+    this.line('o->_eventPhase = 2;');
     this.line('o->cancelled = false;');
     this.line('o->propStopped = false;');
     this.line('o->immStopped = false;');
     this.indent--;
     this.line('}');
+    // The read halves of Event's six read-only properties (stage 325). There is no
+    // setter on purpose: as_dyn_set then answers a dynamic write with AIR's
+    // ReferenceError #1074, and codegen rejects the statically typed write with
+    // "read-only property". The stored names carry an underscore, so the internal
+    // writers (ctor, dispatcher, clone) are the only ones that can reach them.
+    this.line('char* Event_get_type(void* _this) { return ((Event*)_this)->_type; }');
+    this.line('bool Event_get_bubbles(void* _this) { return ((Event*)_this)->_bubbles; }');
+    this.line('bool Event_get_cancelable(void* _this) { return ((Event*)_this)->_cancelable; }');
+    this.line('Object* Event_get_target(void* _this) { return ((Event*)_this)->_target; }');
+    this.line('Object* Event_get_currentTarget(void* _this) { return ((Event*)_this)->_currentTarget; }');
+    this.line('int Event_get_eventPhase(void* _this) { return ((Event*)_this)->_eventPhase; }');
     this.line('Event* Event_new(char* type, bool bubbles, bool cancelable) {');
     this.indent++;
     this.line('Event* o = (Event*)gc_alloc(GCT_CLASS, sizeof(Event));');
@@ -11646,19 +11657,19 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('Event* e = (Event*)_this;');
     this.line('char* r = as_str_alloc(128);');
     this.line('snprintf(r, 128, "[Event type=\\"%s\\" bubbles=%s cancelable=%s eventPhase=%d]",');
-    this.line('  e->type ? e->type : "", e->bubbles ? "true" : "false", e->cancelable ? "true" : "false", e->eventPhase);');
+    this.line('  e->_type ? e->_type : "", e->_bubbles ? "true" : "false", e->_cancelable ? "true" : "false", e->_eventPhase);');
     this.line('return r;');
     this.indent--;
     this.line('}');
     this.line('Event* Event_clone(void* _this) {');
     this.indent++;
     this.line('Event* e = (Event*)_this;');
-    this.line('Event* c = Event_new(e->type, e->bubbles, e->cancelable);');
-    this.line('c->target = e->target;');
+    this.line('Event* c = Event_new(e->_type, e->_bubbles, e->_cancelable);');
+    this.line('c->_target = e->_target;');
     this.line('return c;');
     this.indent--;
     this.line('}');
-    this.line('void Event_preventDefault(void* _this) { Event* e = (Event*)_this; if (e->cancelable) e->cancelled = true; }');
+    this.line('void Event_preventDefault(void* _this) { Event* e = (Event*)_this; if (e->_cancelable) e->cancelled = true; }');
     this.line('bool Event_isDefaultPrevented(void* _this) { return ((Event*)_this)->cancelled; }');
     this.line('void Event_stopPropagation(void* _this) { ((Event*)_this)->propStopped = true; }');
     this.line('void Event_stopImmediatePropagation(void* _this) { Event* e = (Event*)_this; e->propStopped = true; e->immStopped = true; }');
@@ -11772,8 +11783,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // (see AS_DISP_SNAP_SLOTS above), so the depth must be exact.
     this.line('as_disp_depth++;');
     this.line('void* own = disp->_evtarget != NULL ? disp->_evtarget : _this;');
-    this.line('Object* savedTarget = event->target;');
-    this.line('event->target = (Object*)own;');
+    this.line('Object* savedTarget = event->_target;');
+    this.line('event->_target = (Object*)own;');
     // Build the ancestor chain in a fixed stack buffer instead of an arena array:
     // dispatchEvent runs every frame for ENTER_FRAME, and a per-call as_array_new()
     // + as_array_push() leaked an arena slot (never reclaimed) on every dispatch.
@@ -11781,12 +11792,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('int anc_count = 0;');
     this.line('for (void* p = as_disp_parent(own); p != NULL && anc_count < 64; p = as_disp_parent(p)) ancestors[anc_count++] = p;');
     this.line('bool ran = false;');
-    this.line('event->eventPhase = 1; // CAPTURING (outermost -> target parent)');
+    this.line('event->_eventPhase = 1; // CAPTURING (outermost -> target parent)');
     this.line('for (int i = anc_count - 1; i >= 0; i--) { if (event->propStopped) break; if (as_disp_phase(event, ancestors[i], true)) ran = true; }');
     this.line('if (!event->propStopped && as_disp_target(event, own)) ran = true;');
-    this.line('event->eventPhase = 3; // BUBBLING (target parent -> outermost)');
-    this.line('if (event->bubbles) { for (int i = 0; i < anc_count; i++) { if (event->propStopped) break; if (as_disp_phase(event, ancestors[i], false)) ran = true; } }');
-    this.line('if (!ran || savedTarget != NULL) event->target = savedTarget;');
+    this.line('event->_eventPhase = 3; // BUBBLING (target parent -> outermost)');
+    this.line('if (event->_bubbles) { for (int i = 0; i < anc_count; i++) { if (event->propStopped) break; if (as_disp_phase(event, ancestors[i], false)) ran = true; } }');
+    this.line('if (!ran || savedTarget != NULL) event->_target = savedTarget;');
     this.line('as_disp_depth--;');
     this.line('return !event->cancelled;');
     this.indent--;
@@ -13674,8 +13685,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('ScreenMouseEvent* ScreenMouseEvent_clone(void* _this) {');
     this.indent++;
     this.line('ScreenMouseEvent* e = (ScreenMouseEvent*)_this;');
-    this.line('ScreenMouseEvent* c = ScreenMouseEvent_new(e->type, e->bubbles, e->cancelable, e->_screen_x, e->_screen_y, e->ctrlKey, e->altKey, e->shiftKey, e->buttonDown, e->commandKey, e->controlKey);');
-    this.line('c->target = e->target;');
+    this.line('ScreenMouseEvent* c = ScreenMouseEvent_new(e->_type, e->_bubbles, e->_cancelable, e->_screen_x, e->_screen_y, e->ctrlKey, e->altKey, e->shiftKey, e->buttonDown, e->commandKey, e->controlKey);');
+    this.line('c->_target = e->_target;');
     this.line('return c;');
     this.indent--;
     this.line('}');
@@ -13684,11 +13695,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('char* ScreenMouseEvent_toString(void* _this) {');
     this.indent++;
     this.line('ScreenMouseEvent* e = (ScreenMouseEvent*)_this;');
-    this.line('char* s = as_str_concat((char*)"[ScreenMouseEvent type=\\"", e->type != NULL ? e->type : (char*)"null");');
+    this.line('char* s = as_str_concat((char*)"[ScreenMouseEvent type=\\"", e->_type != NULL ? e->_type : (char*)"null");');
     this.line('s = as_str_concat(s, (char*)"\\" bubbles=");');
-    this.line('s = as_str_concat(s, e->bubbles ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, e->_bubbles ? (char*)"true" : (char*)"false");');
     this.line('s = as_str_concat(s, (char*)" cancelable=");');
-    this.line('s = as_str_concat(s, e->cancelable ? (char*)"true" : (char*)"false");');
+    this.line('s = as_str_concat(s, e->_cancelable ? (char*)"true" : (char*)"false");');
     this.line('s = as_str_concat(s, (char*)" screenX=");');
     this.line('s = as_str_concat(s, as_str_from_double(e->_screen_x));');
     this.line('s = as_str_concat(s, (char*)" screenY=");');
@@ -18333,7 +18344,7 @@ StorageVolumeChangeEvent* StorageVolumeChangeEvent_new(char* type, bool bubbles,
 }
 Event* StorageVolumeChangeEvent_clone(void* _this) {
   StorageVolumeChangeEvent* o = (StorageVolumeChangeEvent*)_this;
-  return (Event*)StorageVolumeChangeEvent_new(o->type, o->bubbles, o->cancelable, o->_rootDirectory, o->_volume);
+  return (Event*)StorageVolumeChangeEvent_new(o->_type, o->_bubbles, o->_cancelable, o->_rootDirectory, o->_volume);
 }
 File* StorageVolumeChangeEvent_get_rootDirectory(void* _this) { return ((StorageVolumeChangeEvent*)_this)->_rootDirectory; }
 StorageVolume* StorageVolumeChangeEvent_get_storageVolume(void* _this) { return ((StorageVolumeChangeEvent*)_this)->_volume; }`);
@@ -25910,7 +25921,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (evt == NULL) { evt = Event_new((char*)"enterFrame", false, false); gc_root_register((void**)&evt); }');
     this.line('for (int i = 0; i < as_ef_count; i++) {');
     this.indent++;
-    this.line('evt->target = NULL; evt->propStopped = false; evt->immStopped = false;');
+    this.line('evt->_target = NULL; evt->propStopped = false; evt->immStopped = false;');
     this.line('EventDispatcher_dispatchEvent(as_ef_objs[i], evt);');
     this.indent--;
     this.line('}');
@@ -36010,7 +36021,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     // getter accessor: obj.prop -> dispatch through the runtime object's vtable
     // (virtual): a base-typed reference (`Texture`) must reach an overriding
     // subclass getter (`ConcreteTexture.get root()`), not the base getter.
-    const g = cinfo?.getters.get(expr.property);
+    // ... and it must come from the NEAREST declaration along the super chain, not
+    // from this class only: an inherited read-only property (`MouseEvent.target`,
+    // declared on Event) is served by an ancestor's accessor. `findGetter` is that
+    // chain walk -- using `cinfo.getters` alone made every inherited accessor an
+    // "undefined field" once Event's read-only members became real getters.
+    const g = this.symbols.findGetter(obj.type.className, expr.property)?.g;
     if (g) {
       if (!this.symbols.isAccessible(g.visibility, g.owner, this.currentClass)) {
         throw new CodegenError(`getter '${expr.property}' is not accessible here`);

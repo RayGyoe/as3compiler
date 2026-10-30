@@ -17914,6 +17914,43 @@ Proxy、`Object`、Array 子类 backing、`_dyn` 槽表这些兜底分支原样�
 **链只走一遍**（靠「字段读到方法读之间没有回边」判定，防止把三个循环拆回去）、Proxy/Object/`_dyn`
 兜底仍在链后、示例钉存在）。
 
+| **`Event` 的三个内部传播标志可被动态读写**（`cancelled` / `propStopped` / `immStopped` —— 它们不是 AS3 属性，`adl` 读写都报 `#1056`） | 未开始（2026-10-30 阶段三百二十五 收口只读访问器时**顺带留下**：这三个标志是 C 侧的派发状态，必须留在结构体里，且当前在反射表里以公有字段注册 ⇒ `e["cancelled"] = true` 生效。修法是把反射表的字段带可见性、或把这三个挪出 `props` 改由私有访问器持有；收益仅是「挡住一个 AIR 会拒绝的写」，风险面却覆盖整条派发链，故先记录不修） |
+### 阶段三百二十五：`Event` 的只读属性改成真访问器（v0.4.285 → v0.4.286）
+
+**范围**：遗留表「`Event` 的只读访问器在我们这里是可写字段」。
+
+**实测口径**（`adl 51.4.1`，`temp/smeprobe/adl4.txt`）：`(e as Object)["type"] = 1` 抛
+`ReferenceError #1074 "Illegal write to read-only property type on ScreenMouseEvent."` —— 报文写
+**接收者**的类，不是声明者；`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛；方法名抛
+`#1037`；真正不存在的名字才是 `#1056`。静态写由 `mxmlc` 在编译期拒绝。
+
+**实现**：六个属性从公有字段改为私有存储 + 只读访问器。
+
+1. `src/symbols.ts`：`Event` 的 `type`/`bubbles`/`cancelable`/`target`/`currentTarget`/`eventPhase`
+   改名为 `_type`/`_bubbles`/… 并降为 `private`，同时在 `getters` 里注册六个 `isGetter` 的
+   `MethodInfo`。**没有 setter** —— `as_dyn_set` 因此自然走已有的「只读 trait」分支给出 `#1074`，
+   静态写则由 codegen 报只读错误，两条路都不需要新代码。
+2. `src/emit.ts`：`Event_get_type` … `Event_get_eventPhase` 六个函数体（原型由访问器槽自动生成，
+   返回类型必须与槽一致 —— `eventPhase` 是 `int` 不是 `double`）；`Event_ctor`、派发器
+   （`as_disp_target`/`as_disp_phase`）、`clone`、`formatToString` 及各事件子类的
+   `clone`/`toString`/`menu` 派发共 29 处内部写读改走 `_` 前缀名。
+3. **连带修一处解析缺口**：属性读的访问器查找此前是 `cinfo.getters.get(prop)`（**只查本类**），
+   于是任何**继承来的**访问器都读不到 —— `Event` 的属性一改成访问器，`MouseEvent.target` 立刻
+   变成 `undefined field 'target' on class 'MouseEvent'`。改为 `findGetter`（沿 super 链取最近
+   声明），与字段/方法两条路的口径一致。
+
+**为什么不是「加个 const 位」**：`const` 与「只读访问器」在 `describeType` 里是两种 trait
+（`<constant>` vs `<accessor access="readonly">`），阶段一百八十六 已把描述树对齐，用 const 位
+收口等于把一个已对齐的面改坏。
+
+**如实留下的残差**（新登记一行）：`cancelled`/`propStopped`/`immStopped` 是派发器的内部状态，
+不是 AS3 属性；它们在反射表里仍是公有字段，所以 `e["cancelled"] = true` 在我们这里生效、`adl`
+报 `#1056`。修它要把反射表的字段带可见性或整条挪走，收益（挡一个 AIR 会拒绝的写）不抵风险。
+
+**验收**：`examples/screen-mouse-event.as` 新增 10 条运行期断言（六个属性各自 `#1074`、方法名
+`#1037`、未知名 `#1056`、读值不变、被拒的写不落盘）；`unit: emit/*` 里 5 处旧钉改指 `_` 前缀
+（派发器、`ScreenMouseEvent.clone`、菜单 select）；全量示例 / 单元组见提交说明。
+
 ### 遗留待开发
 > **2026-10-30 追加（阶段三百二十一：叶子类普通方法去虚化）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表仍 **115 项**。本阶段只改变有封闭编译面证明的 C 调用形态，不改 AS3 可见语义；访问器、`final`、private 与方法值 thunk 属设计文档中既定的后续独立阶段，不作为本轮新遗留重复登记。
 > **2026-10-30 追加（阶段三百二十：Stage3D 六个上传入口的边界契约）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表（`遗留项|状态|说明|建议`）行数 **114 → 115**（`未开始` 按列二含该词重数 **92 → 93**；上一轮 note 标 90，与实测差 2，本轮按实测记账，与阶段三百一十四/三百一十五 记过的同类偏差同因）。**本阶段修净的全都不占表**：`uploadFromByteArray` 的静默截断、负目标的越界写、短数组错报 `#2004`、`Texture.uploadFromByteArray` 的 `miplevel > 0` 报明、`uploadFromVector` 按 `startVertex` 起读、`uploadFromBitmapData` 越界 level 静默 `return` —— 六处都是「`adl` 跑得对我们跑不出/跑错」，属 §1.5 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记 1 行**＝`CubeTexture.uploadFromByteArray`（仍是响亮 stub；`adl` 支持逐面从 ByteArray 上传，本轮未测它的字节布局与 `side` 语义，故只登记不改）。**顺带修掉一处文档错位**：阶段三百一十九 的章节此前被错插在阶段六十四 的正文里（还留下一行带反引号的 `### 遗留待开发`），本次搬回本节序列尾部。口径与实测表见 `docs/zh-cn/display3d.md` §9.15。
@@ -18195,7 +18232,7 @@ Proxy、`Object`、Array 子类 backing、`_dyn` 槽表这些兜底分支原样�
 | **空 `File`（`new File()`）的成员访问全线不抛 `#2037`**（`nativePath`/`url`/`size`/`exists`/`isDirectory`/`name`/`extension`/`parent`/`spaceAvailable`） | **已完成**（2026-10-30 阶段三百二十三：`nativePath` 改为访问器，`as_file_has_path` 一个守卫覆盖全部路径成员；`clone()`/`data`/`preventBackup`/`toString()` 按实测不抛） | 我方 `File` 把 `nativePath` 当**普通字段**（`NULL` 原样返回、`url` 拼出 `"file://"`、`size`/`spaceAvailable` 回 `0`、`exists`/`isDirectory` 回 `false`、`parent` 回 `NULL`）。**已对齐的两个**：`getDirectoryListing()`（空 `File` → `#2037`，顺带补齐 `#3003` 缺失 / `#3007` 非目录 / 不可读目录回空表三条实测口径）与 `getDirectoryListingAsync()`（空 `File` 与「上一次还在飞」共用 `#2037`）。**仍缺的八个**是上述 getter：族级修复要先把 `nativePath` 从字段改成访问器（牵动 AMF 成员表、结构体布局、codegen 的字段访问），不是单点补丁 | 先把 `nativePath` 变访问器（`File_get_nativePath` 抛 `#2037`），再给其余八个成员各加同一守卫；每个成员配一条 `examples/` 断言 + 一条 `unit:` 源级钉。**注意**：`nativePath` 是 AMF 成员名，改成访问器时要同步 `File_amf_members` 与反射表 |
 | **基类 `EventDispatcher.parent` 字段在动态读里压过派生类 getter**（`f["parent"]` 恒回 `null`，含 `File` 这种**有** `parent` getter 的类） | **已完成**（2026-10-30 阶段三百二十四：`as_dyn_get` 改为**逐层链上三表**——每一层先字段、再 getter、再方法，最近声明者胜；此前是「整条链的字段 → 整条链的 getter」，故基类内部链接字段压过派生类 getter。`examples/file-ops.as` 三条等价断言 + `unit: reflection/DynGetTraitPriority` 5 钉） | `adl 51.4.1`：`new File("…/a.txt")["parent"]` → `[object File]`、`typeof` 为 `"object"`、`"parent" in f` 为 `true`；我们同一个对象 `f.parent`（静态）正确而 **`f["parent"]` 回 `null`**（`typeof` 也是 `"object"` ⇒ 不是 `undefined`）。根因在 `as_dyn_get`（`src/runtime.ts:5335`）：它把**整条 super 链的 props（字段）表走完**，才轮到 getters 表 ⇒ 基类**字段**永远优先于派生类 **getter**；而 `EventDispatcher_props[]` 把 C 侧内部链接 `parent`（`offsetof(EventDispatcher, parent)`，`vis=0` 即「公开成员」）列了出来。`adl` 的 `EventDispatcher` **没有任何 accessor/variable**（`describeType` 实测为空表），所以这个字段本就不该是反射可见成员 | 两条路选一：① `EventDispatcher` 的 `parent` 链接**不进** `_props`（置 `vis=1`，与 `_arr`/`_runs` 那些 C-runtime-only 槽同口径），派生类的 getter 自然胜出；② 让 `as_dyn_get` 按**类层次**逐级解析（每级先看 props+getters 再看基类），与 AS3「派生遮蔽基类」一致。证据：`temp/listingprobe/{Shadow,DynParent}.as` + `adlshadow.txt`（`adl` 侧）| 先按 ① 改（一行 `vis`，改动面最小），再用 `for-in`/`JSON` 双端对照补验「该字段是否还从别的反射口漏出」；② 是更彻底的口径修复，但会动动态读的解析顺序，需全量回归 |
 | **`File` 的其余三个 async 成员仍是 inline 完成**（`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync`） | **已完成**（2026-10-30 阶段三百二十三：`AS_JOB_FS_OP` 作业 + `File__opFinish` 完成 thunk，三个成员改为作业线程执行、帧边界派发，`cancel()` 与「在飞再调 ⇒ `#2037`」同 `getDirectoryListingAsync`） | `adl` 在自己的 IO 线程上完成再派发（实测「调用后立刻查 `exists` 仍为 `true`」），我们则**在同一次调用内**做完并派发 ⇒ 大盘（如递归删除几万个条目的目录）会照样把 AS3 线程卡住，且 `File.cancel()` 对它们没有可取消的作业（调用返回时作业已退休）。三者的 `#2037`/`#3003` 等**错误口径**已与 `adl` 一致（阶段二百四十三 已量），缺的只是**投递时机**与可取消性 | 与 `AS_JOB_DIR` 同法：各加一个作业类型（`AS_JOB_TRASH`/`AS_JOB_DELETE_FILE`/`AS_JOB_DELETE_DIR`）+ 完成 thunk（在 AS3 线程上派发 `COMPLETE`/`IOErrorEvent`），`File.cancel()` 已经按「按目标对象找在飞作业」实现，接上即可。注意 `moveToTrash` 在 Windows 走 `SHFileOperationW`，作业体里要保留同一条回退链 |
-| **`Event` 的只读访问器在我们这里是可写字段**（`type` / `bubbles` / `cancelable` / `target` / `currentTarget` …） | 未开始（2026-10-23 阶段二百五十八 实测登记） | 阶段二百五十八 量动态写只读 trait 时顺手量出来的：`adl 51.4.1` 上 `(new ScreenMouseEvent("x") as Object)["type"] = 1` 抛 **`#1074`**（`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛，且报文写的是**接收者的类**而不是声明者），`toString`/`clone` 这类方法名抛 **`#1037`**，只有真正不存在的名字才是 `#1056`；我方 `as_dyn_set` 本轮已按此补齐 `#1074`/`#1037` 两条，但 `type`/`bubbles`/`target` 在 `Event` 里是**普通字段**（`FieldInfo`），于是动态写会**照收**、静态写也编得过 ⇒ 与 `adl` 不一致。成因是 `Event` 从阶段三十五 就是「字段 + 直接访问」，改成访问器要动 `Event_ctor`/AMF 成员表/`X_props` 布局与全部派发点 | 先把 `type`/`target`/`bubbles`/`cancelable`/`currentTarget`/`eventPhase` 从字段改成 `X_get_*` 访问器（只读者不给 setter，写路径自然走 `#1074` 与编译错），同步 AMF 成员表与反射表；`Event_ctor` 与内置派发改用内部写入口。风险面较大（`Event` 是全部事件的基类），需先跑一遍全量回归确定零行为漂移再改 |
+| **`Event` 的只读访问器在我们这里是可写字段**（`type` / `bubbles` / `cancelable` / `target` / `currentTarget` …） | **已完成**（2026-10-30 阶段三百二十五：六个属性从公有字段改为私有 `_type`/`_bubbles`/`_cancelable`/`_target`/`_currentTarget`/`_eventPhase` + `Event_get_*` 只读访问器，同步 vtable getter 槽与反射表；动态写 ⇒ `ReferenceError #1074`（报接收者类），静态写 ⇒ 编译错。连带修：属性读的 getter 查找此前只查**本类**，改为 `findGetter` 沿链上取最近声明（否则 `MouseEvent.target` 直接成 `undefined field`） | 阶段二百五十八 量动态写只读 trait 时顺手量出来的：`adl 51.4.1` 上 `(new ScreenMouseEvent("x") as Object)["type"] = 1` 抛 **`#1074`**（`type`/`bubbles`/`cancelable`/`target`/`clickCount` 全抛，且报文写的是**接收者的类**而不是声明者），`toString`/`clone` 这类方法名抛 **`#1037`**，只有真正不存在的名字才是 `#1056`；我方 `as_dyn_set` 本轮已按此补齐 `#1074`/`#1037` 两条，但 `type`/`bubbles`/`target` 在 `Event` 里是**普通字段**（`FieldInfo`），于是动态写会**照收**、静态写也编得过 ⇒ 与 `adl` 不一致。成因是 `Event` 从阶段三十五 就是「字段 + 直接访问」，改成访问器要动 `Event_ctor`/AMF 成员表/`X_props` 布局与全部派发点 | 先把 `type`/`target`/`bubbles`/`cancelable`/`currentTarget`/`eventPhase` 从字段改成 `X_get_*` 访问器（只读者不给 setter，写路径自然走 `#1074` 与编译错），同步 AMF 成员表与反射表；`Event_ctor` 与内置派发改用内部写入口。风险面较大（`Event` 是全部事件的基类），需先跑一遍全量回归确定零行为漂移再改 |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
