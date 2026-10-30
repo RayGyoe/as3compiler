@@ -409,12 +409,12 @@ function checkClassStaticMember(): string[] {
   // with no constructor at all) keeps NULL.
   const c2 = generateC(parse('var c:Class = null;\nvar n:Object = c.nativeApplication;\n')).c;
   check('a built-in class object wires its static-member table',
-    /static as_class NativeApplication_cls = \{ &NativeApplication_vt, \(void\*\(\*\)\(void\)\)NativeApplication_new, NULL, "flash\.desktop::NativeApplication", 0, NativeApplication_statics \};/.test(c2));
+    /static as_class NativeApplication_cls = \{ &NativeApplication_vt, \(void\*\(\*\)\(void\)\)NativeApplication_new, NULL, "flash\.desktop::NativeApplication", 0, NativeApplication_statics, NULL, NULL \};/.test(c2));
   check('a no-arg built-in constructor is registered directly',
-    /static as_class Sprite_cls = \{ &Sprite_vt, \(void\*\(\*\)\(void\)\)Sprite_new, NULL, "flash\.display::Sprite", 0, NULL \};/.test(
+    /static as_class Sprite_cls = \{ &Sprite_vt, \(void\*\(\*\)\(void\)\)Sprite_new, NULL, "flash\.display::Sprite", 0, NULL, NULL, NULL \};/.test(
       generateC(parse('var s:Sprite = new Sprite();\n')).c));
   check('an all-defaulted built-in constructor gets a _new_default wrapper',
-    /static as_class Point_cls = \{ &Point_vt, \(void\*\(\*\)\(void\)\)Point_new_default, NULL, "flash\.geom::Point", 0, NULL \};/.test(c2)
+    /static as_class Point_cls = \{ &Point_vt, \(void\*\(\*\)\(void\)\)Point_new_default, NULL, "flash\.geom::Point", 0, NULL, NULL, NULL \};/.test(c2)
     && c2.includes('Point* Point_new_default(void) { return Point_new('));
   check('a constant holder with no constructor keeps a NULL factory',
     /static as_class SoundMixer_cls = \{ &SoundMixer_vt, NULL, NULL, "flash\.media::SoundMixer", 0, /.test(c2));
@@ -797,3 +797,90 @@ function checkDynCallArityDefaults(): string[] {
   return bad;
 }
 registerGroup('unit: reflection/DynCallArityDefaults', checkDynCallArityDefaults);
+
+// ---- class values in value position (stage 333 / v0.4.294) ----
+// The whole surface is judged against adl 51.4.1 (temp/gprobe: A series for the
+// wrapper classes, B for interfaces, C for Vector.<T>, N for Function/Class,
+// gprobe6 for the numeric class-value range rule, gprobe7 for `extends`).
+function checkClassValues(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [clsval] ${label}`); return; }
+    bad.push(label);
+    console.log(`FAIL  [clsval] ${label}`);
+  };
+  const c = generateC(parse([
+    'var c:Class = null;',
+    'var v:Vector.<int> = new Vector.<int>();',
+    'var s:Sprite = new Sprite();',
+    'var b:Boolean = (s is IEventDispatcher);',
+    'var d:Boolean = (5 is int);',
+    'var e:Object = c;',
+    'var f:Object = Vector.<int>;',
+    '',
+  ].join('\n'))).c;
+
+  // as_class_str: the short name is the tail after the last '::' -- a '.' only
+  // counts when there is no '::' at all, so `__AS3__.vec::Vector.<int>` keeps
+  // "Vector.<int>" (adl prints "[class Vector.<int>]").
+  check('as_class_str prefers the last "::" cut over "."',
+    c.includes('if (*p == 0x2e) dcut = p + 1;')
+    && c.includes('else if (*p == 0x3a) cc = (p[1] == 0x3a) ? p + 2 : p + 1;')
+    && c.includes('const char* last = (cc != NULL) ? cc : ((dcut != NULL) ? dcut : fqn);'));
+
+  // as_class_is_val: int/uint class values are VALUE-RANGE tests. A boxed Number
+  // carries no int/uint tag, so the old tag test said true for 5.5 (adl: false).
+  check('int/uint class values test the value range, not the box tag',
+    c.includes('if (strcmp(pf, "int") == 0) return as_num_is_int32(v.num);')
+    && c.includes('if (strcmp(pf, "uint") == 0) return as_num_is_uint32(v.num);'));
+
+  // A Vector.<T> value carries its reflective name and matches by it.
+  check('a Vector.<T> class value is emitted with its reflective name',
+    c.includes('static as_class as_veccls_') && c.includes('"__AS3__.vec::Vector.<int>"'));
+  check('the Vector slot matches by name',
+    c.includes('if (cl->vecfqn != NULL) return as_vec_is_name(v, cl->vecfqn);'));
+
+  // `new (Function)()` is an empty function; `new (Class)()` is #1115; a body
+  // argument is AIR's own #1066 refusal.
+  check('a Function class value constructs an empty function',
+    c.includes('if (strcmp(n, "Function") == 0) {')
+    && c.includes('return as_v_fn((void*)as_fn_make(as_empty_fn_impl, NULL, 0));')
+    && c.includes('static as_value as_empty_fn_impl(void* env, as_value* args, int argc) {'));
+  check('new (Class)() reports AIR\'s #1115',
+    c.includes('as_throw(TypeError_new((char*)"Error #1115: Class$ is not a constructor.", 1115));'));
+  check('a dynamic function body reports AIR\'s #1066',
+    c.includes("Error #1066: The form function('function body') is not supported."));
+
+  // `extends` a built-in class must inherit that class's interfaces: AIR's
+  // EventDispatcher DOES implement IEventDispatcher, so `new Sprite() is
+  // IEventDispatcher` is true (adl 51.4.1). The interface list is per-class and
+  // as_iface_lookup is shallow, so the entry has to be on the built-in itself.
+  const symSrc = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  check('the built-in EventDispatcher declares IEventDispatcher',
+    /superClass: 'Object',\n\s+isFinal: false,\n\s+\/\/ AIR's flash\.events\.EventDispatcher IMPLEMENTS/.test(symSrc));
+  check('Sprite carries the inherited interface vtable',
+    /static void\* Sprite_ifaces\[\] = \{ [^}]*Sprite_IEventDispatcher_vt[^}]*\};/.test(c)
+    && c.includes('static IEventDispatcher_vtable Sprite_IEventDispatcher_vt = { "IEventDispatcher"'));
+  check('an interface Class value matches through the interface list',
+    c.includes('if (cl->iface != NULL) {') && c.includes('return as_iface_lookup(v.ptr, cl->iface) != NULL;'));
+
+  // `Function` / `Class` are Class values too (they used to be parse errors in
+  // value position) and both are registered under their bare names.
+  check('Function and Class are usable as class values',
+    c.includes('"Function"') && c.includes('"Class"'));
+
+  // The example pins the measured AIR goldens end to end.
+  const ex = readFileSync(join(dir, 'builtin-class.as'), 'utf8');
+  check('the example pins the wrapper/interface/Vector string forms',
+    ex.includes('check(String(cStr) == "[class String]"')
+    && ex.includes('check(String(cV) == "[class Vector.<int>]"')
+    && ex.includes('check(String(cIE) == "[class IEventDispatcher]"'));
+  check('...and the inherited-interface is/as results',
+    ex.includes('check((new Sprite() is cIE), "a Sprite is <IEventDispatcher class>")')
+    && ex.includes('check((new Sprite() as cIE) != null, "as <IEventDispatcher class>")'));
+
+  if (ok > 0) console.log(`[clsval] ${ok} class-value checks passed`);
+  return bad;
+}
+registerGroup('unit: reflection/ClassValues', checkClassValues);

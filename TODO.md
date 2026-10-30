@@ -18205,7 +18205,59 @@ empty: size=12 color=0 underline=false url=null
 活键 `7`）。全量 `node test.ts` ⇒ 565 passed / 0 failed；talkmed-meeting 用
 `bin-aot/build-aot.sh` 复编通过（`bin-aot/TalkMED Meeting.c` 两处退回 `as_fn_call_dyn(as_dyn_get(…))`）。
 
+### 阶段三百三十三：值位置上的类名（包装类 / 接口 / `Vector.<T>` / `Function`·`Class`）与 `extends` 内建类（v0.4.293 → v0.4.294）
+
+**范围**（包 G 的第一批）：把「类名出现在**值位置**」这件事补齐到 AIR 的完整面，并顺带修掉
+`extends` 内建类上的一个真 bug。覆盖面全部以 `adl 51.4.1` 双端实测（证据台 `temp/gprobe/`，
+A 系列=包装类、B 系列=接口、C 系列=`Vector.<T>`、N 系列=`Function`/`Class`、`Main6`=数值类值域、
+`Main7`=`extends`）：
+
+1. **包装类作 Class 值**：`String`/`Number`/`int`/`uint`/`Boolean` 此前在值位置一律
+   `CodegenError`；现在它们是真正的 Class 值（`is Class` 成立、`String(c)` 是 `[class String]`、
+   `x is c` 按包装类判定、`getDefinitionByName("String") === String`、
+   `new (c)("hi")` 走与 `String("hi")` 相同的转换）。
+2. **接口作 Class 值**：`IEventDispatcher` 之类此前不能取值。现在发一个带 `iface` 槽的
+   `as_class`，`is`/`as` 走对象的接口表；`getQualifiedClassName` 是反射全名
+   （`flash.events::IEventDispatcher`）。
+3. **`Vector.<T>` 作 Class 值**：`ast.ts` 新增 `VectorClass` 节点（`parser` 看 `>` 后是否紧跟
+   `(` 区分「类型强制」与「类值」），`as_class` 增 `vecfqn` 槽，反射名是
+   `__AS3__.vec::Vector.<int>`，不同元素类型是不同的类值（`V.<int> === V.<uint>` 为 false）。
+4. **`Function` / `Class` 作值**：此前 `Function` 是纯关键字，`trace(Function)` 直接语法错。
+   现在两者都是 Class 值；`new (Function)()` 是空函数值、`new (Class)()` 是 `#1115`、
+   `new (Function)("a","body")` 是 AIR 自己也不做的 `#1066`。
+5. **`is`/`as` 的数值类值是**值域**判定**（`as_class_is_val`）：`5.5 is <int class>` 在 AIR 是
+   **false**，我们此前按「box tag 是 Number」一律返回 true。现与静态形式 `x is int` 同口径
+   （`as_num_is_int32` / `as_num_is_uint32`）。
+
+**顺带修掉的真 bug（AIR 是 true、我们此前是 false）**：内建 `EventDispatcher` 的 `implements`
+是空数组，而 AIR 的 `flash.events.EventDispatcher implements IEventDispatcher`。接口表是
+**按类**发的（`X_ifaces[]` 只装本类（含 `extends` 链）声明的 `implements`），
+`as_iface_lookup` **不**沿 super 链走，于是 `new Sprite() is IEventDispatcher`、
+`new EventDispatcher() is IEventDispatcher`、`(new Sprite() as IEventDispatcher) != null`
+四种形态（静态 / `Object` / `*` / Class 值）全返回 false。修法是给内建 EventDispatcher 补上
+`implements: ['IEventDispatcher']`——`symbols.ts` 的 `info.implements = [...new Set([...super,
+...own])]` 会把接口沿继承链传给每个显示类，且每个类发自己的接口 vtable（方法按**运行时类**
+解析），所以子类重写仍然获胜。
+
+**为什么 `as_iface_lookup` 不去走 super 链**：那样虽然也能查到，但查到的是**父类**的接口 vtable，
+子类重写接口方法后经 `as` 升级的调用会打到父类实现上——静默的错误派发。真正的语义是「一个类的
+接口表包含它全部父类型声明的接口」，所以在**发接口表**这一步把继承闭包算全，查表保持浅层。
+
+**AIR 侧的限制（我们更宽松，登记而不对齐）**：`temp/gprobe7` 实测 `class X extends Array` 的
+动态写抛 `#1056`、`class X extends Dictionary` 同样、`class X extends Date` 带参 `super(y,m,d)`
+抛 `#1107 The ABC data is corrupt`——这三处是 **AIR 自己跑不通**，不是我们缺能力，故按
+AGENTS §1.5 记为增强面（下方增强表），示例里不对它们作运行期断言。
+
+**验收**：`examples/builtin-class.as` 第 10~14 节（包装类 / `Vector.<T>` / 接口 / `Function`·`Class`
+/ `extends` 内建类，约 60 条断言，期望值逐条来自上述 adl 输出）；`unit: reflection/ClassValues`
+新增 13 钉（`as_class_str` 的 `::` 优先切分、数值类值域判定、`vecfqn` 槽与反射名、
+`Function`/`Class` 构造器三态、内建 `EventDispatcher` 的 `implements`、`Sprite_ifaces` 含继承来的
+接口 vtable）。`test/unit/reflection.ts` 的 4 条 `as_class` 初始形钉补齐两个新槽。
+全量 `node test.ts` ⇒ 565 passed / 0 failed。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百三十三：值位置上的类名）**：**新登记 2 行 / 改写 1 行 / 移出 0 行**。**改写的 1 行**是「包装类（`String`/`Number`/`int`/`uint`/`Boolean`）作 Class 值一律 `CodegenError`」⇒ 转**已完成**（连同接口、`Vector.<T>`、`Function`/`Class` 一起）。**新登记的第 1 行**是同一面上量出来、但不在本轮范围的**潜在面**：`Function`/`Class` 这两个**类值本身**现在是合法值，但把一个 `Class` 类型的变量当**函数调用**（`var c:Class = Class; c()`）仍走「不是函数」的路径报 `#1006`，而 AIR 在 `Class` 上是 `#1112 Argument count mismatch on class coercion`（`temp/gprobe N6`）—— `new (c)()` 已按 AIR 对齐，纯调用形态没动。**新登记的第 2 行**是 `getQualifiedClassName(5)`（AIR 是 `int`、我们仍是 `Number`），本轮**顺带量到但没有一起改**：`5 is <int class>` 的值域口径已对齐（`as_class_is_val`），而**反射名**走的是另一条路（box tag → 类型名），改它要动 `as_v_typeof` 的同族映射，属独立立项。
+>
 > **2026-10-30 追加（阶段三百三十二：属性接收者的括号读）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**。本条是阶段三百二十六 引入的**回归**（不是既存遗留），同阶段修净，按表头「已完成项一经落地即从本表移出」不入表。**如实留一笔潜在面**：`classRefName` 的裸名分支对**任何**未识别标识符都返回类名（历史行为，服务于 `String`/`Number`/`Math` 这类无 `ClassInfo` 的静态类），本轮只在 `varInScope` 侧把「实例访问器也是值」补齐；若将来再出现新的「裸名非值」形态（例如同名**方法**取函数值后下标），仍需在 `varInScope` 这一处统一收口，而不是在 `emitIndex` 逐分支打补丁。
 >
 > **2026-10-30 追加（阶段三百三十一：`TextFormat` 成员表 + 13 参构造器）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「`TextFormat` 未设字段语义与成员表不全」转**部分完成**（成员表与 13 参顺序已完成，『未设则保持』的合并仍未做）。
@@ -18518,6 +18570,8 @@ empty: size=12 color=0 underline=false url=null
 
 ### 增强待做
 
+> **2026-10-30 追加（阶段三百三十三：`extends Array`/`Dictionary`/`Date` 在 AIR 侧的限制）**：**新登记 1 行**。`temp/gprobe7` 双端实测（同一份 `.as` 同时喂 `mxmlc`+`adl` 与我们的 AOT）：`class X extends Array` 里任何动态写抛 `ReferenceError #1056: Cannot create property 0 on MyArr`、`class X extends Dictionary` 同样（`Cannot create property k on MyDict`）、`class X extends Date` 带参 `super(y, m, d)` 抛 `#1107 The ABC data is corrupt, attempt to read out of bounds` —— 即 **AIR 自己的子类化是坏的**，这属于「`adl` 本来就报错」⇒ 按 §1.5 是**增强**，不是欠账。我们这边三种子类都照常工作（已量：`arr` 长度/下标、`dict` 键读写、`date.getFullYear()` 全部正确），按增强规矩默认产物**不比 AIR 更宽松**这一条不适用（我们只是不主动复制 AIR 的 bug），故**记为已具备、不引入开关**，示例 `examples/builtin-class.as` 第 14 节刻意不对这三类作运行期断言（只在注释里点名），避免把「AIR 跑不通」写成「我们的契约」。
+>
 > **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
 > **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224）**：下表 **18 项**，已完成 **7 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **7 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
 

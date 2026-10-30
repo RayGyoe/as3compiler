@@ -372,6 +372,12 @@ class RefCollector {
         typeNames(e.elem, this.types);
         for (const a of e.args) this.expr(a);
         return;
+      // `Vector.<T>` used as a Class VALUE references the same element type as the
+      // literal/coercion forms (the element may be a project class, which the
+      // reachability closure must then include).
+      case 'VectorClass':
+        typeNames(e.elem, this.types);
+        return;
       case 'Index':
         this.expr(e.object);
         this.expr(e.index);

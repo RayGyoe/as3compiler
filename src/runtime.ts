@@ -2984,6 +2984,19 @@ typedef struct {
     // NULL-terminated table of the class's static members (NULL when the program
     // never looks a static member up through a Class value).
     const as_class_static* statics;
+    // Non-NULL when this Class value denotes an INTERFACE rather than a class: the
+    // interface's C FQN, which is the key as_iface_lookup searches the object's
+    // interface list for. An interface has no instance vtable and no constructor,
+    // so vtable/factory stay NULL and 'x is <ifaceClassValue>' takes the name
+    // route instead of the super-chain walk (measured on adl 51.4.1, temp/gprobe
+    // B3-B10: new Sprite() is cIE true, {} is cIE false, 5 as cIE null).
+    const char* iface;
+    // Non-NULL when this Class value denotes one Vector.<T> SPECIALIZATION:
+    // its reflect name (__AS3__.vec::Vector.<int>). A vector has no vtable (its
+    // first word is the element buffer / mark pointer), so 'x is <vecClassValue>'
+    // compares reflect names through as_vec_is_name -- the same strict, exact
+    // element-type test the static form uses (measured: temp/gprobe C3-C10).
+    const char* vecfqn;
 } as_class;
 
 // x as Class for a BOXED operand: keep the value when it really is a class

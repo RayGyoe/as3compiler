@@ -1328,6 +1328,15 @@ class Parser {
         this.next();
         return { kind: 'Var', name: t.value };
       }
+      // `Function` is also the core class's NAME, legal in value position:
+      // `trace(Function)` prints `[class Function]` and `Function is Class` is
+      // true (measured on adl 51.4.1, temp/gprobe). It is a keyword only because
+      // `function` is; as an operand it names the class. `Class` needs no branch
+      // here (it is lexed as an ordinary identifier).
+      if (t.value === 'Function') {
+        this.next();
+        return { kind: 'Var', name: t.value };
+      }
       if (!isKeyword(t.value) || t.value === 'get' || t.value === 'set') {
         this.next();
         return { kind: 'Var', name: t.value };
@@ -1470,15 +1479,18 @@ class Parser {
     return { kind: 'New', className, args };
   }
 
-  // `Vector.<T>(...)` without `new` — AS3's Vector COERCION, not the
-  // `new Vector.<T>(length)` constructor (see the VectorCoerce AST node; the adl
-  // measurements separating the two live in temp/vecconv/).
+  // `Vector.<T>` without `new` is EITHER the coercion call
+  // `Vector.<T>(arrayLike)` or, when no '(' follows, the Class VALUE for that
+  // specialization (`var c:Class = Vector.<int>`, `Vector.<int> is Class`).
+  // Measured on adl 51.4.1 (temp/gprobe): the two forms are distinguished by the
+  // next token alone, and the value form is legal in every expression position.
   private parseVectorCall(): Expr {
     this.next(); // Vector
     this.next(); // '.'
     this.next(); // '<'
     const elem = this.parseType();
     this.expect('>');
+    if (!this.at('(')) return { kind: 'VectorClass', elem };
     const args = this.parseArgList();
     return { kind: 'VectorCoerce', elem, args };
   }

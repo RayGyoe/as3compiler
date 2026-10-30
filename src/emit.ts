@@ -297,15 +297,19 @@ export class Emitter {
   // named with AIR's UNQUALIFIED name -- `getQualifiedClassName(int)` prints
   // "int", `String(Array)` prints "[class Array]", and `getDefinitionByName(
   // "Array")` finds it (measured on adl 51.4.1). The value is the boxed
-  // representation's vtable where the runtime has one; `int`, `uint` and `Array`
-  // have no as_object-shaped runtime type at all (an Array is a tag-6 as_array
-  // whose first field is its data pointer, so it must NOT be walked as a vtable),
-  // so theirs stays NULL: identity, name and switch dispatch all still work, and
+  // representation's vtable where the runtime has one; `int`, `uint`, `Array` and
+  // `Class` have no as_object-shaped runtime type at all (an Array is a tag-6
+  // as_array whose first field is its data pointer, so it must NOT be walked as a
+  // vtable; a Class value is the as_class object itself), so theirs stays NULL:
+  // identity, name and switch dispatch all still work, and
   // only an `is`/`as` test through a Class VARIABLE holding one cannot match. The
   // static forms (`x is Array`, `x is int`) are compiled directly and stay exact.
   private static readonly CORE_CLASS_VT: Record<string, string> = {
     'Object': '&as_object_vt', 'String': '&as_string_vt', 'Number': '&as_number_vt',
     'Boolean': '&as_boolean_vt', 'Function': '&as_function_vt', 'int': 'NULL', 'uint': 'NULL', 'Array': 'NULL',
+    // `Class` is the metaclass: `trace(Class)` prints `[class Class]` and
+    // `Class is Class` is true in AIR (measured on adl 51.4.1, temp/gprobe A8).
+    'Class': 'NULL',
   };
   private out: string[] = [];
   private indent = 0;
@@ -389,6 +393,10 @@ export class Emitter {
   private anonIndex = new Map<object, string>();
   private anonSeq = 0;
   private vectorSpecs = new Map<string, CType>();
+  // Vector.<T> specs that appear in VALUE position (`var c:Class = Vector.<int>`),
+  // keyed by vectorCName. They need a class object and a registry entry on top of
+  // the per-spec helpers every used specialization already gets.
+  private vectorClassSpecs = new Set<string>();
   // closure analysis state (pass 1 pre-scan)
   private funcVars: Map<string, CType>[] = [];
   private anonCaptures = new Map<object, { name: string; type: CType }[]>();
@@ -2250,6 +2258,20 @@ export class Emitter {
     this.line('static bool as_class_is_val(as_value v, as_class* c) {');
     this.indent++;
     this.line('as_class* cl = as_req_class(c);');
+    // An INTERFACE Class value matches by name through the object's interface list
+    // (the same lookup the static `x is IFace` form uses). AIR: `new Sprite() is
+    // cIE` is true, `new EventDispatcher() is cIE` is true, `{} is cIE` is false
+    // and `5 as cIE` is null (measured on adl 51.4.1, temp/gprobe B4/B5/B6/B9).
+    this.line('if (cl->iface != NULL) {');
+    this.indent++;
+    this.line('if (v.tag != 4 || v.ptr == NULL) return false;');
+    this.line('return as_iface_lookup(v.ptr, cl->iface) != NULL;');
+    this.indent--;
+    this.line('}');
+    // A Vector.<T> Class value matches by reflect name, exactly: AIR is strict
+    // about element types (`new Vector.<String>() is <Vector.<int> value>` false),
+    // and `[] is cV` is false because an Array is not a Vector (temp/gprobe C4-C6).
+    this.line('if (cl->vecfqn != NULL) return as_vec_is_name(v, cl->vecfqn);');
     this.line('if (v.tag == 4 || v.tag == 6) {');
     this.indent++;
     this.line('if (v.ptr == NULL) return false;');
@@ -2271,13 +2293,23 @@ export class Emitter {
     this.line('}');
     this.line('if (v.tag == 0 || v.tag == 5) return false;  // null / undefined');
     // A boxed primitive is an instance of its OWN wrapper class, and only of that
-    // one: 5 is <Number class> and 5 is <int class> are both true (an int is
-    // carried as a Number), "x" is <String class> is true while 5 is <String
-    // class> is false, true is <Boolean class> is true (measured on adl 51.4.1).
+    // one: 5 is <Number class> and 5 is <int class> are both true, "x" is <String
+    // class> is true while 5 is <String class> is false, true is <Boolean class>
+    // is true (measured on adl 51.4.1). int/uint are NOT tag tests but the same
+    // VALUE-RANGE rule the static form uses (temp/gprobe6 on adl 51.4.1: `5.5 is
+    // <int class>` false, `-1 is <uint class>` false, `3000000000 is <uint class>`
+    // true) -- a boxed Number carries no int/uint tag, so a tag test answered true
+    // for every number.
     this.line('const char* pf = cl->fqn;');
     this.line('if (pf != NULL) {');
     this.indent++;
-    this.line('if (v.tag == 1 && (strcmp(pf, "Number") == 0 || strcmp(pf, "int") == 0 || strcmp(pf, "uint") == 0)) return true;');
+    this.line('if (v.tag == 1) {');
+    this.indent++;
+    this.line('if (strcmp(pf, "Number") == 0) return true;');
+    this.line('if (strcmp(pf, "int") == 0) return as_num_is_int32(v.num);');
+    this.line('if (strcmp(pf, "uint") == 0) return as_num_is_uint32(v.num);');
+    this.indent--;
+    this.line('}');
     this.line('if (v.tag == 2 && strcmp(pf, "Boolean") == 0) return true;');
     this.line('if (v.tag == 3 && strcmp(pf, "String") == 0) return true;');
     this.line('if (v.tag == 7 && strcmp(pf, "Function") == 0) return true;');
@@ -2291,13 +2323,24 @@ export class Emitter {
     // `[class <short name>]`, AIR's Class-value toString (measured on adl 51.4.1,
     // temp/pkg1/oracle/adl-pkg1.txt C1/C4/C6/E2: `trace(BitmapData)` prints
     // "[class BitmapData]"). The short name is the tail of the registry FQN after
-    // its last ':'/'::' (or '.'); the pre-existing constant "[class]" dropped the
-    // name for EVERY class value, user classes included.
+    // its last '::' -- or, for a name with no namespace separator, after its last
+    // '.'; the pre-existing constant "[class]" dropped the name for EVERY class
+    // value, user classes included. The '.' inside a Vector's element list must
+    // not count: `__AS3__.vec::Vector.<int>` prints "[class Vector.<int>]" in AIR
+    // (measured on adl 51.4.1, temp/gprobe C1/C2), so the '::' cut wins whenever
+    // one exists.
     this.line('static char* as_class_str(as_class* c) {');
     this.indent++;
     this.line('const char* fqn = (c != NULL && c->fqn != NULL) ? c->fqn : "Class";');
-    this.line('const char* last = fqn;');
-    this.line('for (const char* p = fqn; *p != 0; p++) { if (*p == \':\' || *p == \'.\') last = p + 1; }');
+    this.line('const char* dcut = NULL;');
+    this.line('const char* cc = NULL;');
+    this.line('for (const char* p = fqn; *p != 0; p++) {');
+    this.indent++;
+    this.line('if (*p == 0x2e) dcut = p + 1;');
+    this.line('else if (*p == 0x3a) cc = (p[1] == 0x3a) ? p + 2 : p + 1;');
+    this.indent--;
+    this.line('}');
+    this.line('const char* last = (cc != NULL) ? cc : ((dcut != NULL) ? dcut : fqn);');
     this.line('const char* parts[3];');
     this.line('parts[0] = "[class ";');
     this.line('parts[1] = last;');
@@ -3001,6 +3044,13 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('static as_value as_dyn_new(as_class* c) { return as_dyn_new_args(c, 0, NULL); }');
+    // The body of `new Function()` / `Function()`: AIR answers an empty function.
+    this.line('static as_value as_empty_fn_impl(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)env; (void)args; (void)argc;');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
     // `new (ClassValue)(args)` on a CORE class. AIR's core classes are all
     // conversions of the first argument -- new int(5) is 5, new String() is "",
     // new Array() is [], new Number() is 0, new Boolean() is false and new
@@ -3015,18 +3065,41 @@ export class Emitter {
     this.line('as_class* c = (as_class*)env;');
     this.line('const char* n = (c != NULL && c->fqn != NULL) ? c->fqn : "";');
     this.line('as_value a = (args != NULL && argc > 0) ? args[0] : as_v_null();');
-    this.line('if (strcmp(n, "int") == 0) return as_v_num((double)as_to_int32(as_v_to_number(a)));');
     this.line('if (strcmp(n, "uint") == 0) return as_v_num((double)as_to_uint32(as_v_to_number(a)));');
     this.line('if (strcmp(n, "Number") == 0) return as_v_num(as_v_to_number(a));');
     this.line('if (strcmp(n, "Boolean") == 0) return as_v_bool(as_v_truthy(a));');
     this.line('if (strcmp(n, "String") == 0) return as_v_str(argc > 0 ? as_v_str_val(a) : (char*)"");');
     this.line('if (strcmp(n, "Object") == 0) return as_obj_conv(a);');
+    this.line('if (strcmp(n, "int") == 0) return as_v_num((double)as_to_int32(as_v_to_number(a)));');
     this.line('if (strcmp(n, "Array") == 0) {');
     this.indent++;
     this.line('if (argc == 1 && a.tag == 1) return as_v_arr((void*)as_array_new_sized((int)a.num));');
     this.line('as_array* arr = as_array_new();');
     this.line('for (int i = 0; i < argc; i++) as_array_set(arr, i, args[i]);');
     this.line('return as_v_arr((void*)arr);');
+    this.indent--;
+    this.line('}');
+    // `Function` and `Class` as CONSTRUCTORS (both are Class values, both are
+    // therefore legal on the left of `new`). Measured on adl 51.4.1 (temp/gprobe
+    // N1/N4/N2): `new Function()` and the bare call `Function()` both answer an
+    // EMPTY function value (typeof function, String gives "function Function() {}"),
+    // `new Function("a", "return 7")` is EvalError #1066 (dynamic function bodies
+    // are not supported by AIR itself), and `new Class()` is TypeError #1115.
+    this.line('if (strcmp(n, "Function") == 0) {');
+    this.indent++;
+    this.line('if (argc > 0) {');
+    this.indent++;
+    this.line('as_throw(EvalError_new((char*)"Error #1066: The form function(\'function body\') is not supported.", 1066));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_fn((void*)as_fn_make(as_empty_fn_impl, NULL, 0));');
+    this.indent--;
+    this.line('}');
+    this.line('if (strcmp(n, "Class") == 0) {');
+    this.indent++;
+    this.line('as_throw(TypeError_new((char*)"Error #1115: Class$ is not a constructor.", 1115));');
+    this.line('return as_v_null();');
     this.indent--;
     this.line('}');
     this.line('return as_v_null();');
@@ -3223,7 +3296,7 @@ export class Emitter {
       entries.push(`{ "${this.escapeCString(info.fqn)}", &${name}_cls }`);
       // A named class object so a bare class name used as a Class value
       // (e.g. `new Starling(Game, ...)`) can be referenced directly.
-      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, ${factory}, ${ctorfn}, "${this.escapeCString(info.fqn)}", ${req}, ${staticTables.get(name) ?? 'NULL'} };`);
+      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, ${factory}, ${ctorfn}, "${this.escapeCString(info.fqn)}", ${req}, ${staticTables.get(name) ?? 'NULL'}, NULL, NULL };`);
     }
     // Built-in classes: give each a class OBJECT too, so a built-in class name can
     // appear as a Class value (`trace(BitmapData)`, `var c:Class = Sprite`,
@@ -3258,7 +3331,7 @@ export class Emitter {
       // temp/adlprobe/adl.txt section 1; the app's Application.NativeApplication goes
       // through flash.desktop.NativeApplication's static getter this way). Leaving it
       // NULL used to read undefined, silently skipping the caller's branch.
-      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, ${factory}, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, ${staticTables.get(name) ?? 'NULL'} };`);
+      clsDecls.push(`static as_class ${name}_cls = { &${name}_vt, ${factory}, ${ctorFn}, "${this.escapeCString(info.reflectFqn)}", 0, ${staticTables.get(name) ?? 'NULL'}, NULL, NULL };`);
     }
     // The core language classes (Object/String/Number/Boolean/int/uint/Array) have
     // no ClassInfo, so the two loops above never see them; they still need a class
@@ -3273,7 +3346,39 @@ export class Emitter {
       const info = this.symbols.classes.get(n);
       if (info !== undefined && (info.fqn !== undefined || info.reflectFqn !== undefined)) continue;
       entries.push(`{ "${n}", &as_corecls_${n} }`);
-      clsDecls.push(`static as_class as_corecls_${n} = { ${Emitter.CORE_CLASS_VT[n]}, NULL, as_core_cls_ctor, "${n}", 0, NULL };`);
+      clsDecls.push(`static as_class as_corecls_${n} = { ${Emitter.CORE_CLASS_VT[n]}, NULL, as_core_cls_ctor, "${n}", 0, NULL, NULL, NULL };`);
+    }
+    // INTERFACES as Class values. AIR resolves an interface name in value position
+    // like any other type name (`var c:Class = IEventDispatcher`,
+    // `getDefinitionByName("flash.events.IEventDispatcher") === IEventDispatcher`,
+    // `getQualifiedClassName(IEventDispatcher)` = "flash.events::IEventDispatcher",
+    // `String(IEventDispatcher)` = "[class IEventDispatcher]" -- the SHORT name, so
+    // the existing as_class_str tail-trim works unchanged; measured on adl 51.4.1,
+    // temp/gprobe B1-B10). The object carries the interface's C FQN in the `iface`
+    // slot so the runtime subtype test can go through as_iface_lookup instead of a
+    // super-chain walk (interfaces are never in a class's super chain).
+    for (const [iname, iface] of this.symbols.interfaces) {
+      const fqn = iface.reflectFqn ?? iname;
+      entries.push(`{ "${this.escapeCString(fqn)}", &${iname}_cls }`);
+      clsDecls.push(`static as_class ${iname}_cls = { NULL, NULL, NULL, "${this.escapeCString(fqn)}", 0, NULL, "${this.escapeCString(iname)}", NULL };`);
+    }
+    // Vector.<T> SPECIALIZATIONS as Class values (`var c:Class = Vector.<int>`,
+    // `new (c)()`). A vector has no vtable, so the class object carries the
+    // specialization's reflect name and a factory that builds the empty vector of
+    // that spec; `x is <that class value>` compares reflect names exactly, which is
+    // the same strict test the static `is Vector.<T>` uses. adl 51.4.1
+    // (temp/gprobe C1-C10): `Vector.<int> === Vector.<int>` true,
+    // `!== Vector.<uint>` false, `[] is` false, `new (c)()` an empty vector.
+    for (const key of this.vectorClassSpecs) {
+      const elem = this.vectorSpecs.get(key);
+      if (elem === undefined) continue;
+      const vname = this.vectorReflectName(elem);
+      const factory = `as_veccls_${key}_new`;
+      // The factory slot is a raw `void* (*)(void)` (as_dyn_new_args wraps the
+      // result itself), so the per-spec helper returns the bare vector pointer.
+      clsDecls.push(`static void* ${factory}(void) { return (void*)as_vector_${key}_new(); }`);
+      entries.push(`{ "${this.escapeCString(vname)}", &as_veccls_${key} }`);
+      clsDecls.push(`static as_class as_veccls_${key} = { NULL, ${factory}, NULL, "${this.escapeCString(vname)}", 0, NULL, NULL, "${this.escapeCString(vname)}" };`);
     }
     // SWC symbols: an exported character's AS3 name is its SymbolClass linkage
     // name, which may hold characters our lexer cannot put in an identifier (CJK)
@@ -7539,6 +7644,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       case 'ArrayLit': for (const el of e.elements) this.walkExpr(el); break;
       case 'VectorLit': this.noteType(`Vector.<${e.elem}>`); for (const el of e.elements) this.walkExpr(el); break;
       case 'VectorCoerce': this.noteType(`Vector.<${e.elem}>`); for (const a of e.args) this.walkExpr(a); break;
+      // A `Vector.<T>` Class value needs the same specialization helpers any other
+      // use of that spec needs (typedef + as_vector_* + reflect-name arm), so it is
+      // noted exactly like the literal/coercion forms -- plus its own class object.
+      case 'VectorClass': this.noteType(`Vector.<${e.elem}>`); this.vectorClassSpecs.add(this.vectorClassKey(e.elem)); break;
       // A COMPUTED key on a Class-typed receiver (`SomeClass[key]`) resolves against
       // the class's WHOLE static table at run time -- there is no name to collect --
       // so every class with a statics table is emitted in FULL for it. That is what
@@ -33289,6 +33398,8 @@ void FileStream_writeObject(void* _this, as_value v) {
         return this.emitVectorLit(expr);
       case 'VectorCoerce':
         return this.emitVectorCoerce(expr);
+      case 'VectorClass':
+        return this.emitVectorClass(expr);
 
       case 'Index':
         return this.emitIndex(expr);
@@ -33552,6 +33663,20 @@ void FileStream_writeObject(void* _this, as_value v) {
         return { code: `&${clsName}_cls`, type: { kind: 'class' } };
       }
     }
+    // A bare INTERFACE name used as a Class value (`var c:Class = IEventDispatcher`,
+    // `getDefinitionByName("flash.events.IEventDispatcher") === IEventDispatcher`).
+    // The short name goes through the same import-aware resolution a type
+    // annotation uses, so the interface's C FQN (which is the key in the
+    // interface map) is what we look up; emitClassRegistry emits one as_class per
+    // interface. Measured on adl 51.4.1 (temp/gprobe B1/B2/B3/B10): the value
+    // compares true against itself, `is Class` is true and its qname is the
+    // package-qualified one.
+    {
+      const it = this.rt(name);
+      if (it.kind === 'interface' && this.symbols.interfaces.has(it.name)) {
+        return { code: `&${it.name}_cls`, type: { kind: 'class' } };
+      }
+    }
     // A bare `length` (or another Array member) inside a `class X extends Array`
     // is an implicit `this.<member>`: AIR's Array trait is inherited, so
     // `i < length` inside Sequence.toDER reads the backing array's length.
@@ -33677,6 +33802,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'ArrayLit': return e.elements.some((el) => this.usesArgumentsExpr(el));
       case 'VectorLit': return e.elements.some((el) => this.usesArgumentsExpr(el));
       case 'VectorCoerce': return e.args.some((a) => this.usesArgumentsExpr(a));
+      case 'VectorClass': return false;
       case 'Index': return this.usesArgumentsExpr(e.object) || this.usesArgumentsExpr(e.index);
       case 'ObjectLit': return e.fields.some((f) => this.usesArgumentsExpr(f.value));
       case 'NullCoalesce': return this.usesArgumentsExpr(e.left) || this.usesArgumentsExpr(e.right);
@@ -38760,6 +38886,27 @@ void FileStream_writeObject(void* _this, as_value v) {
   // DIFFERENT operation from the `new Vector.<T>(length)` constructor. See the
   // VectorCoerce AST node for the adl measurements; `emitNew` keeps the
   // constructor semantics (`new Vector.<T>(3)` -> a length-3 vector of 0s).
+  // `Vector.<T>` in VALUE position: the Class object for one specialization. The
+  // spec's helpers and (via walkExpr -> noteType) its whole as_vector_* family are
+  // emitted by the ordinary specialization machinery; all this adds is the class
+  // object plus its registry entry, both keyed by vectorCName. AIR names the class
+  // `__AS3__.vec::Vector.<int>` for getQualifiedClassName but prints the short
+  // `[class Vector.<int>]` for String(), which is exactly what as_class_str's
+  // tail-trim already does (measured on adl 51.4.1, temp/gprobe C1/C2).
+  private emitVectorClass(expr: Extract<Expr, { kind: 'VectorClass' }>): { code: string; type: CType } {
+    return { code: `&as_veccls_${this.vectorClassKey(expr.elem)}`, type: { kind: 'class' } };
+  }
+
+  // Resolve a `Vector.<T>` element annotation to its spec key and record that the
+  // spec needs a class object (emitClassRegistry reads vectorClassSpecs).
+  private vectorClassKey(elem: ASType): string {
+    const vt = this.rt(`Vector.<${elem}>`);
+    if (vt.kind !== 'vector') throw new CodegenError('invalid Vector element type in a Class value');
+    const key = this.vectorCName(vt.elem);
+    this.vectorClassSpecs.add(key);
+    return key;
+  }
+
   private emitVectorCoerce(expr: Extract<Expr, { kind: 'VectorCoerce' }>): { code: string; type: CType } {
     const vt = this.rt(`Vector.<${expr.elem}>`);
     if (vt.kind !== 'vector') throw new CodegenError('invalid Vector element type in conversion');

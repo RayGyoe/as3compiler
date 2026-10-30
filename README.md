@@ -543,7 +543,7 @@ The full 19-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/audio/` — a UI audio player: `Sound.load` of an **encoded file** + `SoundChannel` + `soundComplete` (needs Skia/SDL2/miniaudio, see `docs/en/audio.md` §13.5)
 - `examples/strcoerce.as` — implicit object → string coercion
 - `examples/flash-net-layered.build.example.json` — a minimal example of per-target manifest layering (not a `.as`; for build-layer assertions)
-- `examples/builtin-class.as` — the built-in class registry & Class values + `in`/`delete`/indexing
+- `examples/builtin-class.as` — the built-in class registry & Class values + `in`/`delete`/indexing; **names in value position** (`String`/`Number`/`int`/`uint`/`Boolean` wrappers, interfaces, `Vector.<T>`, `Function`/`Class`) each being a real Class value with its own reflective name, and `extends` of a built-in class (inherited interfaces take part in `is`/`as`, inherited fields stay live through subclass methods)
 - `examples/wasm-native/` — `--target wasm` (WASI) products, including the `--export` and `[WasmExport]` export surfaces
 - `examples/vsyncevent.as` — `VsyncStateChangeAvailabilityEvent` (the AIR surface + the `refreshRate` enhancement surface) and `Stage.vsyncEnabled`
 - `examples/screen-mouse-event.as` — `flash.events.ScreenMouseEvent` (the measured 11-argument constructor, read-only `screenX`/`screenY`, `clone` carrying constructor-level state only, and the `#1074`/`#1037` dynamic-write errors)

@@ -1289,7 +1289,15 @@ export class SymbolTable {
       constructor: { params: [{ name: 'target', type: 'Object', defaultValue: { kind: 'Null' }, isRest: false }] },
       superClass: 'Object',
       isFinal: false,
-      implements: [],
+      // AIR's flash.events.EventDispatcher IMPLEMENTS flash.events.IEventDispatcher,
+      // so every dispatcher -- and every display object, since Sprite extends
+      // EventDispatcher -- is an IEventDispatcher. Measured on adl 51.4.1
+      // (temp/gprobe): `new Sprite() is IEventDispatcher` is true for the static,
+      // Object-typed and `*` forms, and `new EventDispatcher()` likewise; without
+      // this entry the interface list was empty and every such test answered false
+      // (the `_ifaces` array only carries a class's own (transitively inherited)
+      // `implements` list, and as_iface_lookup does not walk the super chain).
+      implements: ['IEventDispatcher'],
     });
     // flash.events.IEventDispatcher (AIR): the interface EventDispatcher
     // implements, and the declared parent of user interfaces

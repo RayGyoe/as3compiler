@@ -156,6 +156,15 @@ export type Expr =
   // previously desugared this form onto the `New` node, which silently gave the
   // constructor semantics and rejected every array argument.
   | { kind: 'VectorCoerce'; elem: ASType; args: Expr[] }
+  // `Vector.<T>` in VALUE position — the Class value for one monomorphized
+  // specialization. AIR: `trace(Vector.<int>)` prints `[class Vector.<int>]`,
+  // `Vector.<int> is Class` is true, `new (Vector.<int>)()` is an empty vector of
+  // that spec, `Vector.<int> === Vector.<int>` is true but `!== Vector.<uint>`,
+  // and `getDefinitionByName("__AS3__.vec.Vector.<int>")` returns it (measured on
+  // adl 51.4.1, temp/gprobe). The parser can only tell the two apart by the token
+  // that follows `>`: a '(' keeps the VectorCoerce conversion, anything else is
+  // this Class value.
+  | { kind: 'VectorClass'; elem: ASType }
   | { kind: 'Index'; object: Expr; index: Expr }
   | { kind: 'ObjectLit'; fields: { name: string; value: Expr }[] }
   | { kind: 'FunctionExpr'; name: string | null; params: Param[]; returnType: ASType; body: Block }

@@ -652,7 +652,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/audio/` — 带 UI 的音频播放器：`Sound.load` 的**编码文件加载** + `SoundChannel` + `soundComplete`（需 Skia/SDL2/miniaudio，见 `docs/zh-cn/audio.md` §13.5）
 - `examples/strcoerce.as` — 对象 → 字符串的隐式强转
 - `examples/flash-net-layered.build.example.json` — 构建清单按目标分层的最小示例（非 `.as`，供构建层断言）
-- `examples/builtin-class.as` — 内建类注册表 & Class 值 + `in`/`delete`/下标
+- `examples/builtin-class.as` — 内建类注册表 & Class 值 + `in`/`delete`/下标；**值位置上的类名**（`String`/`Number`/`int`/`uint`/`Boolean` 包装类、接口、`Vector.<T>`、`Function`/`Class`）各自是真正的 Class 值并带自己的反射名，以及 `extends` 内建类（继承来的接口参与 `is`/`as`，继承字段经子类方法仍可读写）
 - `examples/wasm-native/` — `--target wasm`（WASI）产物，含 `--export` 与 `[WasmExport]` 导出面
 - `examples/vsyncevent.as` — `VsyncStateChangeAvailabilityEvent`（AIR 面 + `refreshRate` 增强面）与 `Stage.vsyncEnabled`
 - `examples/screen-mouse-event.as` — `flash.events.ScreenMouseEvent`（实测 11 参构造、只读 `screenX`/`screenY`、`clone` 只带构造级状态，以及动态写的 `#1074`/`#1037` 错误面）

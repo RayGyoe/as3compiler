@@ -9,11 +9,17 @@
 //   · adl-vd.txt   : Vector 的 in/delete 边界（length/越界/负数/字符串键）
 //   · adl-idi.txt  : IDataInput/IDataOutput 的 is/as、ByteArray.writeDouble 字节序
 //
-// 本阶段刻意**不**断言的两处（登记在 TODO.md 遗留表，非本示例的覆盖范围）：
-//   `getQualifiedClassName(5)`（AIR 是 `int`，我们仍是 `Number`）、
-//   `String`/`Number` 等包装类作 Class 值（我们是响亮的 CodegenError）。
+// 仍未断言的一处（登记在 TODO.md 遗留表，非本示例的覆盖范围）：
+//   `getQualifiedClassName(5)`（AIR 是 `int`，我们仍是 `Number`）。
+//
+// 阶段三百三十三（v0.4.294）起，第 10~14 节把「值位置上的类名」补齐：包装类
+// （String/Number/int/uint/Boolean）、接口、`Vector.<T>`、`Function`/`Class` 都是
+// 真正的 Class 值，`Vector.<T>` 也带自己的反射名；`extends` 内建类继承来的接口
+// 同样参与 `is`/`as`（此前 Sprite 自己的 implements 为空，`new Sprite() is
+// IEventDispatcher` 在我们这里是 false，adl 是 true —— 真 bug，已修）。
 import flash.utils.getQualifiedClassName;
 import flash.display.BitmapData;
+import flash.geom.Point;
 import flash.utils.getDefinitionByName;
 import flash.utils.ByteArray;
 import flash.utils.IDataInput;
@@ -163,3 +169,138 @@ class TLSish extends Socket implements IDataInput, IDataOutput {
 }
 
 check(true, "a class restating IDataInput/IDataOutput over Socket compiles");
+// ---- 10. 包装类作 Class 值（阶段三百三十三） ------------------------------
+// adl 51.4.1（temp/gprobe A 系列）：String/Number/int/uint/Boolean 与普通内建类
+// 一样是 Class 值，`is Class`、`is <该 Class 值>`、getDefinitionByName 往返都对。
+var cStr:Class = String;
+var cNum:Class = Number;
+var cInt:Class = int;
+var cUint:Class = uint;
+var cBool:Class = Boolean;
+check(cStr is Class && cNum is Class && cInt is Class, "wrapper classes are Class values");
+check(cUint is Class && cBool is Class, "uint/Boolean classes are Class values");
+check(String(cStr) == "[class String]", "wrapper class string form");
+check(getQualifiedClassName(cStr) == "String", "wrapper class name");
+check(("x" is cStr), "a String is <String class>");
+check(!(5 is cStr), "a Number is not <String class>");
+check((5 is cNum), "a Number is <Number class>");
+check((5 is cInt), "a Number 5 is <int class>");
+check(!(5.5 is cInt), "5.5 is not <int class>");
+check((true is cBool) && !(0 is cBool), "Boolean class coercion test");
+check(getDefinitionByName("String") == cStr, "getDefinitionByName finds String");
+check(getDefinitionByName("flash.utils.ByteArray") == ByteArray, "getDefinitionByName finds ByteArray");
+// `new (cStr)("hi")` 走的是与 `String("hi")` 相同的转换（adl: [hi]）。
+var sNew:Object = new cStr("hi");
+check(sNew == "hi", "new <String class>(x) coerces like String(x)");
+check(getQualifiedClassName(new cStr()) == "String", "new <String class>() is an empty String");
+
+// ---- 11. Vector.<T> 作 Class 值 -------------------------------------------
+// adl（temp/gprobe C 系列）：字符串是 `[class Vector.<int>]`，限定名带
+// `__AS3__.vec::` 前缀，`new (cV)()` 是空的 Vector，不同元素类型互不相等。
+var cV:Class = Vector.<int>;
+check(String(cV) == "[class Vector.<int>]", "Vector.<int> class string");
+check(getQualifiedClassName(cV) == "__AS3__.vec::Vector.<int>", "Vector.<int> qualified name");
+check(String(Vector.<String>) == "[class Vector.<String>]", "Vector.<String> class string");
+check(cV is Class, "Vector.<int> is Class");
+check((new Vector.<int>() is cV), "a Vector.<int> is <Vector.<int> class>");
+check(!(new Vector.<String>() is cV), "a Vector.<String> is not <Vector.<int> class>");
+check(!([] is cV), "a plain Array is not <Vector.<int> class>");
+check(getDefinitionByName("__AS3__.vec.Vector.<int>") == cV, "getDefinitionByName finds Vector.<int>");
+check(Vector.<int> == Vector.<int>, "Vector.<int> class value identity");
+check(!(Vector.<int> == Vector.<uint>), "different element types are different classes");
+var vNew:* = new cV();
+check(getQualifiedClassName(vNew) == "__AS3__.vec::Vector.<int>", "new <Vector.<int> class>() is a Vector");
+check(vNew.length == 0, "new <Vector.<int> class>() is empty");
+
+// ---- 12. 接口作 Class 值 ---------------------------------------------------
+// adl（temp/gprobe B 系列）：接口本身是 Class 值，`is`/`as` 走实现关系，
+// 继承来的实现同样算数（Sprite 自己没有写 implements IEventDispatcher）。
+var cIE:Class = IEventDispatcher;
+check(String(cIE) == "[class IEventDispatcher]", "interface class string");
+check(getQualifiedClassName(cIE) == "flash.events::IEventDispatcher", "interface qualified name");
+check(cIE is Class, "an interface is a Class value");
+check(getDefinitionByName("flash.events.IEventDispatcher") == cIE, "getDefinitionByName finds the interface");
+check((new Sprite() is cIE), "a Sprite is <IEventDispatcher class>");
+check((new EventDispatcher() is cIE), "an EventDispatcher is <IEventDispatcher class>");
+check(!(({} as Object) is cIE), "a plain object is not <IEventDispatcher class>");
+check((new Sprite() as cIE) != null, "as <IEventDispatcher class>");
+check((5 as cIE) == null, "a Number as <IEventDispatcher class> is null");
+check(IEventDispatcher == cIE, "interface class value identity");
+// 静态形式（右操作数是写死的接口名）与 Class 变量形式口径一致。
+check((new Sprite() is IEventDispatcher), "static is IEventDispatcher on a built-in subclass");
+check((new EventDispatcher() is IEventDispatcher), "static is IEventDispatcher on EventDispatcher");
+var anyIE:* = new Sprite();
+check((anyIE is IEventDispatcher), "dynamic is IEventDispatcher");
+
+// ---- 13. Function / Class 作值 --------------------------------------------
+// adl（temp/gprobe N1-N6）：两者都是 Class 值；`new (Function)()` 是空函数值，
+// `new (Function)("a","return 7")` 是 AIR 自己也不支持的 #1066，
+// `new (Class)()` 是 #1115。
+check(Function is Class, "Function is Class");
+check(Class is Class, "Class is Class");
+check(String(Function) == "[class Function]", "Function class string");
+check(String(Class) == "[class Class]", "Class class string");
+check(getQualifiedClassName(Function) == "Function", "Function qualified name");
+check(getDefinitionByName("Function") == Function, "getDefinitionByName finds Function");
+check(getDefinitionByName("Class") == Class, "getDefinitionByName finds Class");
+var cFn:Class = Function;
+var emptyFn:* = new cFn();
+check((emptyFn is Function), "new (Function)() is a Function");
+check((emptyFn is cFn), "new (Function)() is <Function class>");
+check(String(emptyFn) == "function Function() {}", "new (Function)() string form");
+check((typeof emptyFn) == "function", "new (Function)() typeof");
+var cCls:Class = Class;
+var caught1115:Boolean = false;
+try {
+	new cCls();
+} catch (e:Error) {
+	caught1115 = true;
+	check(e.errorID == 1115, "new (Class)() reports #1115 (got #" + e.errorID + ")");
+}
+check(caught1115, "new (Class)() throws");
+var caught1066:Boolean = false;
+try {
+	new cFn("a", "return 7");
+} catch (e:Error) {
+	caught1066 = true;
+	check(e.errorID == 1066, "new Function(body) reports #1066 (got #" + e.errorID + ")");
+}
+check(caught1066, "new Function('function body') throws");
+
+// ---- 14. extends 内建类 ----------------------------------------------------
+// mxmlc/adl 51.4.1 实测（temp/gprobe7）：Point / ByteArray / Error / Event /
+// Sprite 一系的子类行为与普通类一致 —— 继承字段、super(args)、is、限定名。
+// 数组/字典/日期三类的子类在 adl 里**自己**就跑不通（见 TODO.md 增强表：
+// `extends Array`/`extends Dictionary` 动态写 #1056、`extends Date` 带参构造
+// #1107，都是 AIR 侧限制），故这里不作运行期断言。
+class MyPoint extends Point {
+	public var tag:String = "mine";
+	public function MyPoint(px:Number = 0, py:Number = 0) {
+		super(px, py);
+	}
+	public function len2():Number {
+		return x * x + y * y;
+	}
+}
+class MyBytes extends ByteArray {
+	public function MyBytes() {
+		super();
+	}
+}
+
+var mp:MyPoint = new MyPoint(3, 4);
+// adl: point-len=25 point-tag=mine point-is="true true" point-qc=MyPoint
+check(mp.len2() == 25, "a subclass method reads inherited fields");
+check(mp.tag == "mine", "a subclass declares its own fields");
+check((mp is Point) && (mp is Object), "a subclass is its built-in base");
+check(getQualifiedClassName(mp) == "MyPoint", "a subclass reports its own name");
+check(getDefinitionByName("MyPoint") == MyPoint, "getDefinitionByName finds a user class");
+mp.x = 6;
+check(mp.len2() == 52, "an inherited setter keeps working after a subclass write");
+var mbc:MyBytes = new MyBytes();
+mbc.writeByte(7);
+mbc.position = 0;
+// adl: bytes="7 true MyBytes"
+check(mbc.readByte() == 7, "a ByteArray subclass is a real byte stream");
+check(mbc is ByteArray, "a ByteArray subclass is a ByteArray");
+check(getQualifiedClassName(mbc) == "MyBytes", "a ByteArray subclass reports its own name");
