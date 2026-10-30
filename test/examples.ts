@@ -407,6 +407,12 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // htmltext-metrics.as（阶段三百三十六 · D-T23/D-T24）断言 getLineText、htmlText 块级行高、
   // 规则 leading 与「尾部空行不计 textHeight」，行高相关部分只在 Skia 后端成立（示例自行跳过）。
   'htmltext-metrics.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // text-underline.as（阶段三百四十二 · G28）断言 TextFormat.underline / HTML `<u>` 真的
+  // 被**画出来**：1 设备像素、落在 2+ascent+descent/2（12px `_typewriter` 即 y=15）、覆盖该
+  // 范围的整个前进宽度（含行尾空格）、每个视觉行一条、leading 不移动它、局部范围与
+  // underline=false 的断口、取 run 自己的颜色、混排行按**行盒**落。判据全部来自 adl 51.4.1
+  // 逐像素实测（temp/g28/）。纯 C 构建没有文本/光栅后端，示例自行 skip。
+  'text-underline.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
   // tf-scale-metrics.as 断言的是**字体度量 + 字形光栅**（缩放字段的 textWidth/textHeight 口径，
   // 以及「字形按 scaleY 整体缩放、scaleX 不拉宽」的 ink 宽），两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十九的缩放口径回归）。

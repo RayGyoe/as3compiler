@@ -848,13 +848,15 @@ follow, because **markdown is an upper layer, not the core**:
 ```c
 // src/runtime.ts:8831 — rich-text runs already carry per-run styling
 typedef struct { unsigned start; unsigned end; const char* family; double size;
-                 int bold; int italic; unsigned color; double leading; } sk_text_run;
+                 int bold; int italic; unsigned color; double leading;
+                 int underline; } sk_text_run;   // underline: stage 342, see flash-text.md 15
 ```
 
 `sk_textlayout_new_runs` hands those runs to `ParagraphBuilder`, so markdown's bold / italic /
 inline code (family+size) / headings / colour **all land inside the existing 13 functions**; what is
-missing is only `underline`, `strikethrough`, `background` and `link` on the run (a plain C struct
-we own — add fields) plus a markdown → run parser.
+missing is only `strikethrough`, `background` and `link` on the run (a plain C struct we own — add
+fields) plus a markdown → run parser. (`underline` was added in stage 342, but it is drawn by the paint
+pass as a 1 px row rather than through Skia's decoration — see `flash-text.md` 15.)
 
 In other words: the limit is **our own wrapper not growing upward**, not SkParagraph's capability.
 Behind it sit HarfBuzz and ICU; its shaping is not weaker than any candidate Rust stack.

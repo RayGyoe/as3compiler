@@ -13664,6 +13664,137 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return le;');
     this.indent--;
     this.line('}');
+    // The format whose BOX a line uses. AIR sizes a line box from the TALLEST
+    // format on it, not from the character at its start: measured on adl 51.4.1
+    // (temp/g28/Main5.as), "x<font size=24>yy</font>" reports 20/6 h=26 with the
+    // small run first AND with the big run first, a line after a <br> keeps its own
+    // 12/3 h=15, and a 12/18/24 line again reports the 24 px box. getLineMetrics and
+    // the underline row both go through here so they cannot disagree -- before this
+    // existed, getLineMetrics answered from the line's FIRST character, which made a
+    // mixed-size line claim the small box.
+    this.line('static TextFormat* as_tf_line_fmt(TextField* tf, const int* starts, int n, int idx) {');
+    this.indent++;
+    this.line('const char* t = as_tf_text(tf);');
+    this.line('int len = (t != NULL) ? (int)strlen(t) : 0;');
+    this.line('int le = as_tf_line_end(t, starts, n, idx, len);');
+    this.line('if (le <= starts[idx]) return as_tf_base_fmt(tf);');
+    this.line('TextFormat* best = as_tf_fmt_at(tf, starts[idx]);');
+    this.line('if (best == NULL) best = as_tf_base_fmt(tf);');
+    this.line('double bw = (best != NULL) ? as_v_num_val(best->size) : 12.0;');
+    this.line('int nrun = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
+    this.line('for (int i = 0; i < nrun; i++) {');
+    this.indent++;
+    this.line('int r0 = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int r1 = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('if (r1 <= starts[idx] || r0 >= le) continue;');
+    this.line('TextFormat* rf = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]);');
+    this.line('if (rf == NULL) continue;');
+    this.line('double sz = as_v_num_val(rf->size);');
+    this.line('if (sz > bw) { bw = sz; best = rf; }');
+    this.indent--;
+    this.line('}');
+    this.line('return best;');
+    this.indent--;
+    this.line('}');
+    // ---------------------------------------------------------------------
+    // TextFormat.underline (G28). AIR paints ONE device-pixel row per (visual
+    // line, underlined range); the model is measured, not guessed -- see
+    // temp/g28/ (adl 51.4.1, 22 face/size pairs, pure-space strings so the row
+    // is the only ink):
+    //   * the row's y is floor(originY + lineTop + ascent + descent/2), where
+    //     ascent/descent are the SAME leading-free halves getLineMetrics reports
+    //     (a TextFormat.leading shifts the box, not the row: lead4 still lands on
+    //     15 at 12 px), and a mixed-size line uses the LINE's halves, not the
+    //     underlined run's (a 12 px underlined run on a 24 px line paints at the
+    //     24 px line's descent);
+    //   * the thickness is 1 px at every size (48 px is still one row -- the face's
+    //     own underline metrics would give 3-4 px, which is why this does not go
+    //     through Skia's decoration);
+    //   * the row spans the range's ADVANCE on each line, trailing blanks
+    //     included, in the run's own color.
+    // Which characters are underlined is resolved per run: a run whose TextFormat
+    // has an explicit underline wins, otherwise the field's base format decides
+    // (AIR inherits the default format's underline into a run that never set it --
+    // temp/g28/Main2.as mix_bg, where a 24 px plain run is still underlined).
+    this.line('static int as_tf_ul_of(TextField* tf, TextFormat* rf) {');
+    this.indent++;
+    this.line('if (rf != NULL && rf->underline.tag != 0) return as_v_bool_val(rf->underline) ? 1 : 0;');
+    this.line('TextFormat* bf = as_tf_base_fmt(tf);');
+    this.line('return (bf != NULL && as_v_bool_val(bf->underline)) ? 1 : 0;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_tf_paint_underline(TextField* tf, void* canvas, double ox, double oy) {');
+    this.indent++;
+    this.line('TextFormat* bf = as_tf_base_fmt(tf);');
+    this.line('if (bf == NULL) return;');
+    this.line('const char* t = as_tf_text(tf);');
+    this.line('int len = (t != NULL) ? (int)strlen(t) : 0;');
+    this.line('if (len <= 0) return;');
+    this.line('void* para = as_tf_paragraph(tf);');
+    this.line('if (para == NULL) return;');
+    this.line('int nrun = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
+    this.line('int baseUl = as_v_bool_val(bf->underline) ? 1 : 0;');
+    // Fast out: an untouched field (no run table, base format not underlined) is
+    // the overwhelmingly common case and must not pay for a line walk per frame.
+    this.line('int any = baseUl;');
+    this.line('for (int i = 0; i < nrun && !any; i++) { TextFormat* rf0 = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]); if (rf0 != NULL && rf0->underline.tag != 0 && as_v_bool_val(rf0->underline)) any = 1; }');
+    this.line('if (!any) return;');
+    // Ranges: maximal byte spans that are underlined, in text order. Gaps between
+    // runs take the base format (that is what as_tf_fmt_at answers for them, and
+    // what the paragraph lays out there), runs take their own color when they set
+    // one.
+    this.line('#define AS_TF_MAX_UL 32');
+    this.line('int ulr[AS_TF_MAX_UL * 2]; unsigned ulc[AS_TF_MAX_UL]; int uln = 0;');
+    this.line('unsigned baseCol = (unsigned)as_v_num_val(bf->color);');
+    this.line('int prev = 0;');
+    this.line('for (int i = 0; i < nrun && uln < AS_TF_MAX_UL; i++) {');
+    this.indent++;
+    this.line('int b = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int e = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('if (b < prev) b = prev;');
+    this.line('if (b > len) b = len;');
+    this.line('if (e > len) e = len;');
+    this.line('TextFormat* rf = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]);');
+    this.line('if (b > prev && baseUl) { ulr[uln * 2] = as_tf_utf16_index(tf, prev); ulr[uln * 2 + 1] = as_tf_utf16_index(tf, b); ulc[uln] = baseCol; uln++; }');
+    this.line('if (e > b && as_tf_ul_of(tf, rf)) {');
+    this.indent++;
+    this.line('unsigned c = (rf != NULL && rf->color.tag != 0) ? (unsigned)as_v_num_val(rf->color) : baseCol;');
+    this.line('ulr[uln * 2] = as_tf_utf16_index(tf, b); ulr[uln * 2 + 1] = as_tf_utf16_index(tf, e); ulc[uln] = c; uln++;');
+    this.indent--;
+    this.line('}');
+    this.line('if (e > prev) prev = e;');
+    this.indent--;
+    this.line('}');
+    this.line('if (prev < len && baseUl && uln < AS_TF_MAX_UL) { ulr[uln * 2] = as_tf_utf16_index(tf, prev); ulr[uln * 2 + 1] = as_tf_utf16_index(tf, len); ulc[uln] = baseCol; uln++; }');
+    this.line('if (uln <= 0) return;');
+    // One row per line, from the SAME per-line box getLineMetrics answers (the
+    // line's own format, leading excluded from the ascent/descent split).
+    this.line('int starts[AS_TF_MAX_LINES]; double tops[AS_TF_MAX_LINES]; double rowy[AS_TF_MAX_LINES]; double t0 = 0.0;');
+    this.line('int n = as_tf_line_table(tf, starts, NULL, tops, AS_TF_MAX_LINES);');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('TextFormat* lf = as_tf_line_fmt(tf, starts, n, i);');
+    this.line('if (lf == NULL) lf = bf;');
+    this.line('double lead = (lf != NULL) ? as_v_num_val(lf->leading) : 0.0;');
+    this.line('double size = (lf != NULL) ? as_v_num_val(lf->size) : 12.0;');
+    this.line('char* fam = (lf != NULL) ? lf->font : NULL;');
+    this.line('int bo = (lf != NULL && as_v_bool_val(lf->bold)) ? 1 : 0;');
+    this.line('int it = (lf != NULL && as_v_bool_val(lf->italic)) ? 1 : 0;');
+    this.line('double a = 0.0, d = 0.0, left = 0.0, w = 0.0;');
+    this.line('as_skia_textlayout_line_box(para, i, lead, fam, size, bo, it, &a, &d, &left, &w);');
+    // Skia's own box sits half a leading above where our AIR model puts it
+    // (tops[0] comes back -0.5 at 12 px, -1.0 at 24 px, +2.7 for a leading-4 line),
+    // and AIR measures the row from ITS box top, i.e. from the field's inset. So
+    // the line offsets are taken RELATIVE to the first line: line 0 then lands on
+    // floor(oy + ascent + descent/2) = 15 at 12 px, exactly the measured row, while
+    // multi-line spacing keeps Skia's (identical to AIR's when the formats agree).
+    this.line('if (tops[0] != 0.0) t0 = tops[0];');
+    this.line('rowy[i] = floor(oy + (tops[i] - t0) + a + d * 0.5);');
+    this.indent--;
+    this.line('}');
+    this.line('as_skia_textlayout_paint_underline(para, canvas, ox, rowy, n, ulr, ulc, uln);');
+    this.indent--;
+    this.line('}');
     // Scroll so line `line` is visible. dir > 0 pins it to the TOP of the view, dir <
     // 0 to the BOTTOM (measured: PageDown leaves the caret on the first line of the
     // new page, PageUp on the last), dir == 0 only scrolls when it would otherwise
@@ -23727,6 +23858,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('runs[i].italic = as_v_bool_val(rf->italic) ? 1 : 0;');
     this.line('runs[i].color = (unsigned)as_v_num_val(rf->color);');
     this.line('runs[i].leading = as_v_num_val(rf->leading);');
+    // G28: underline is NOT a layout input (AIR's textWidth/textHeight/getLineMetrics
+    // are identical with and without it, temp/g28/air-out-1.txt), so this only feeds
+    // the paint pass; the paragraph cache key therefore stays as it is.
+    this.line('runs[i].underline = as_v_bool_val(rf->underline) ? 1 : 0;');
     this.indent--;
     this.line('}');
     // The field's own default style: AIR lays out everything the runs do NOT
@@ -23735,7 +23870,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // adl -- see sk_set_air_run_height in vendor/skia_text_glue.cc).
     this.line('sk_text_run dr;');
     this.line('dr.start = 0; dr.end = 0; dr.family = fmt->font; dr.size = size;');
-    this.line('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading;');
+    this.line('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading; dr.underline = as_v_bool_val(fmt->underline) ? 1 : 0;');
     this.line('double pw = w; int pa = layoutAlign;');
     this.line('if (w <= 0.0 && layoutAlign != 0) {');
     this.indent++;
@@ -24073,7 +24208,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int llen = (int)strlen(lt);');
     this.line('int le0 = as_tf_line_end(lt, starts, n, index, llen);');
     this.line('int lempty = (le0 <= starts[index]) ? 1 : 0;');
-    this.line('TextFormat* lf = lempty ? as_tf_base_fmt(tf) : as_tf_fmt_at(tf, starts[index]);');
+    this.line('TextFormat* lf = as_tf_line_fmt(tf, starts, n, index);');
     this.line('if (lf == NULL) lf = as_tf_base_fmt(tf);');
     this.line('double lead = (lf != NULL) ? as_v_num_val(lf->leading) : 0.0;');
     this.line('double size = (lf != NULL) ? as_v_num_val(lf->size) : 12.0;');
@@ -24343,7 +24478,6 @@ void FileStream_writeObject(void* _this, as_value v) {
     // lays it out through sk_textlayout_new_runs exactly like setTextFormat runs.
     this.line('static void as_tf_html_emit_run(TextField* tf, int begin, int end, char* face, double size, unsigned color, bool bold, bool italic, bool underline, double lead) {');
     this.indent++;
-    this.line('(void)underline; // underline not yet modeled by the TextStyle subset');
     this.line('if (begin >= end) return;');
     this.line('if (tf->_runs == NULL) tf->_runs = as_array_new();');
     // `lead` is this run's own leading: the field's default plus whatever the
@@ -24351,7 +24485,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // H1: a `leading:6px` rule makes its lines 18 px tall -- ascent 9 + descent 3 +
     // leading 6 -- instead of 12). The glue turns it into AIR's per-run line box, and
     // sk_textlayout_line_box strips it back out of the ascent/descent split.
-    this.line('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, 0, lead);');
+    // G28: `underline` (from <u> / text-decoration:underline) is carried on the run's
+    // TextFormat; the paint pass reads it (as_tf_paint_underline).
+    this.line('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, underline ? 1 : 0, lead);');
     this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
     this.line('as_array_push(tf->_runs, as_v_num((double)end));');
     this.line('as_array_push(tf->_runs, as_v_obj((void*)f));');
@@ -24521,7 +24657,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('char* face = (as_tf_base_fmt(tf) != NULL) ? as_tf_base_fmt(tf)->font : NULL;');
     this.line('double size = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->size) : 12.0;');
     this.line('unsigned color = (as_tf_base_fmt(tf) != NULL) ? (unsigned)as_v_num_val(as_tf_base_fmt(tf)->color) : 0x000000u;');
-    this.line('bool bold = false, italic = false, underline = false;');
+    // Un-tagged text inherits the DEFAULT format's emphasis flags, exactly like it
+    // inherits font/size/color (measured on adl 51.4.1, temp/g28/Main6.as: with
+    // defaultTextFormat.bold/italic/underline = true, htmlText "ab" reads back as
+    // <B>ab</B> / <I>ab</I> / <U>ab</U>). Leaving these false silently dropped the
+    // underline -- and the weight and slant -- of every plain span in an htmlText
+    // field whose default format set them.
+    this.line('bool bold = (as_tf_base_fmt(tf) != NULL && as_v_bool_val(as_tf_base_fmt(tf)->bold));');
+    this.line('bool italic = (as_tf_base_fmt(tf) != NULL && as_v_bool_val(as_tf_base_fmt(tf)->italic));');
+    this.line('bool underline = (as_tf_base_fmt(tf) != NULL && as_v_bool_val(as_tf_base_fmt(tf)->underline));');
     this.line('double lead = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->leading) : 0.0;');
     this.line('int runStart = 0;');
     this.line('int i = 0;');
@@ -28482,6 +28626,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('as_skia_textlayout_paint(para, canvas, 2.0 + alignDx - scrollX, 2.0 - scrollY);');
+    // G28: TextFormat.underline / HTML <u>. Painted AFTER the glyphs (AIR draws the
+    // row as part of the run, so a descender crosses over it, not under it) and
+    // before the selection re-colour, which must be able to blacken it like any
+    // other glyph pixel.
+    this.line('as_tf_paint_underline(tf, canvas, 2.0 + alignDx - scrollX, 2.0 - scrollY);');
     // The black glyphs of the selected range: the SAME layout is painted again
     // inside a layer whose paint forces every pixel to black while keeping its
     // coverage, clipped to the selection rectangles. Re-using one layout (instead

@@ -608,10 +608,19 @@ function checkLineMetrics(): string[] {
   // stylesheet rule's `leading` lives on the run, adl reports asc 9 / desc 3 /
   // lead 6 for such a line), not from defaultTextFormat -- and it is still not
   // clamped, unlike textHeight's no-Skia approximation.
+  // 阶段三百四十二 (G28): the format in effect on the line is the TALLEST one on it,
+  // not the one at its first character -- adl reports 20/6 h=26 for
+  // "x<font size=24>yy</font>" in either run order (temp/g28/Main5.as), while the
+  // line after a <br> keeps its own 12/3 h=15. as_tf_line_fmt owns that rule and
+  // serves getLineMetrics and the underline row alike.
   check('the leading comes from the line\'s own format and is NOT clamped',
     lmBodyScoped.includes('double lead = (lf != NULL) ? as_v_num_val(lf->leading) : 0.0;') &&
-    lmBodyScoped.includes('TextFormat* lf = lempty ? as_tf_base_fmt(tf) : as_tf_fmt_at(tf, starts[index]);') &&
+    lmBodyScoped.includes('TextFormat* lf = as_tf_line_fmt(tf, starts, n, index);') &&
     !/lead\s*<\s*0/.test(lmBodyScoped));
+  check('the line format is the tallest run on that line (as_tf_line_fmt)',
+    emitted.includes('static TextFormat* as_tf_line_fmt(TextField* tf, const int* starts, int n, int idx) {')
+    && emitted.includes('if (sz > bw) { bw = sz; best = rf; }')
+    && emitted.includes('if (r1 <= starts[idx] || r0 >= le) continue;'));
   check('an empty line is measured with the DEFAULT format box (idx -1)',
     lmBodyScoped.includes('int lempty = (le0 <= starts[index]) ? 1 : 0;') &&
     lmBodyScoped.includes('as_skia_textlayout_line_box(para, lempty ? -1 : index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);'));
@@ -1422,6 +1431,114 @@ registerGroup('unit: display/DisplayGeometry', checkDisplayGeometry);
 registerGroup('unit: display/TransformMatrix', checkTransformMatrix);
 registerGroup('unit: display/Scale9Grid', checkScale9Grid);
 registerGroup('unit: display/LineMetrics', checkLineMetrics);
+// ---- TextFormat.underline / htmlText <u> actually paints (阶段三百四十二 · G28) ----
+//
+// AIR paints ONE device-pixel row per (visual line, underlined range) at
+// floor(2 + ascent + descent/2), spanning the range's ADVANCE on each line, in the
+// run's own colour, and the row is NOT a layout input (textWidth / textHeight /
+// getLineMetrics are bit-identical with and without it). All of that was measured
+// on adl 51.4.1 over 22 face/size pairs plus htmlText / mixed / leading / wrap cases
+// (temp/g28/, air-out-1.txt + g28e/f/g/h-out.txt). Before this stage the flag was
+// parsed into the run table and then thrown away with `(void)underline`.
+function checkUnderline(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [underline] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [underline] ${label}`); }
+  };
+
+  const glue = readGlue();
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+  const gen = generateC(parse('import flash.text.TextField;\nvar tf:TextField = new TextField();\n'
+    + 'tf.text = "ab";\ntrace(tf.textWidth);\n')).c;
+
+  // ---- the flag has to REACH both run builders -------------------------
+  check('the per-run builder copies TextFormat.underline onto the run',
+    emitted.includes('runs[i].underline = as_v_bool_val(rf->underline) ? 1 : 0;'));
+  check('the default style carries it too (that is what fills run gaps)',
+    emitted.includes('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading; dr.underline = as_v_bool_val(fmt->underline) ? 1 : 0;'));
+  check('sk_text_run declares the field in the C struct',
+    gen.includes('typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; int underline; } sk_text_run;'));
+  // The C and C++ sides of the bridge are two copies of one struct; a field added to
+  // only one of them silently reads garbage. Compare the field NAME sequences.
+  const rtStruct = (runtime.match(/typedef struct \{ unsigned start;[\s\S]*?\} sk_text_run;/) || [''])[0];
+  const ccStruct = (glue.match(/struct sk_text_run \{[\s\S]*?\n\};/) || [''])[0];
+  const fieldsOf = (src: string, dropComments: boolean): string[] => {
+    const body = src.slice(src.indexOf('{') + 1, src.lastIndexOf('}'));
+    const stripped = dropComments ? body.replace(/\/\/[^\n]*/g, '') : body;
+    return stripped.split(';').map((f) => f.trim()).filter((f) => f.length > 0)
+      .map((f) => f.replace(/^[a-zA-Z_]+/, '').trim());
+  };
+  const rtFields = fieldsOf(rtStruct, false);
+  const ccFields = fieldsOf(ccStruct, true);
+  check('runtime.ts and the glue declare sk_text_run with the same fields, in the same order',
+    rtFields.length === 9 && rtFields.join(',') === ccFields.join(','));
+  check('...and underline is one of them on both sides',
+    rtFields[8] === 'underline' && ccFields[8] === 'underline');
+
+  // ---- the seam exists in every build shape ----------------------------
+  // Three definitions (Skia linked / text engine absent / pure C) plus the extern.
+  check('the paint seam is declared and stubbed for every build shape',
+    (runtime.match(/static inline void as_skia_textlayout_paint_underline\(/g) || []).length === 3
+    && runtime.includes('extern void sk_textlayout_paint_underline(void* para, void* canvas, double ox, const double* rowY, int lineCount, const int* u16, const unsigned* colors, int rangeCount);'));
+
+  // ---- the row geometry is AIR's, not the font's -----------------------
+  check('the row is floored from the line box: floor(oy + lineTop + ascent + descent/2)',
+    emitted.includes('rowy[i] = floor(oy + (tops[i] - t0) + a + d * 0.5);'));
+  check('...with line offsets taken RELATIVE to the first line (Skia sits half a leading high)',
+    emitted.includes('if (tops[0] != 0.0) t0 = tops[0];'));
+  check('the row uses the same line format getLineMetrics reports (tallest run on the line)',
+    emitted.includes('TextFormat* lf = as_tf_line_fmt(tf, starts, n, i);'));
+  check('the glue draws exactly one pixel tall, in the run colour, over the range advance',
+    glue.includes('void sk_textlayout_paint_underline(void* para, void* canvas, double ox,') &&
+    glue.includes('getRectsForRange((unsigned)s, (unsigned)e, RectHeightStyle::kMax,') &&
+    glue.includes('RectWidthStyle::kTight') &&
+    glue.includes('1.0f),') &&
+    glue.includes('paint.setColor(0xFF000000u | (colors[r] & 0x00FFFFFFu));'));
+
+  // ---- which characters are underlined ---------------------------------
+  check('an explicit underline=false on a run beats an underlined base format',
+    emitted.includes('if (rf != NULL && rf->underline.tag != 0) return as_v_bool_val(rf->underline) ? 1 : 0;'));
+  check('runs and the gaps between them are resolved in text order, gaps taking the base format',
+    emitted.includes('if (b > prev && baseUl) { ulr[uln * 2] = as_tf_utf16_index(tf, prev); ulr[uln * 2 + 1] = as_tf_utf16_index(tf, b); ulc[uln] = baseCol; uln++; }')
+    && emitted.includes('if (prev < len && baseUl && uln < AS_TF_MAX_UL) { ulr[uln * 2] = as_tf_utf16_index(tf, prev); ulr[uln * 2 + 1] = as_tf_utf16_index(tf, len); ulc[uln] = baseCol; uln++; }'));
+  check('the byte-offset ranges are converted to Skia UTF-16 code units',
+    emitted.includes('static int as_tf_utf16_index(TextField* tf, int byteIndex) {')
+    && emitted.includes('ulr[uln * 2] = as_tf_utf16_index(tf, b); ulr[uln * 2 + 1] = as_tf_utf16_index(tf, e);'));
+
+  // ---- htmlText --------------------------------------------------------
+  check('htmlText <u> reaches the run instead of being dropped on the floor',
+    !emitted.includes('(void)underline;')
+    && emitted.includes('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, underline ? 1 : 0, lead);'));
+  // adl: with defaultTextFormat.bold/italic/underline = true, htmlText "ab" reads back
+  // as <B>ab</B> / <I>ab</I> / <U>ab</U> (temp/g28/Main6.as) -- un-tagged text inherits
+  // ALL of the default format's emphasis flags, like it inherits font/size/color.
+  check('un-tagged htmlText text inherits the default format\'s bold/italic/underline',
+    emitted.includes('bool bold = (as_tf_base_fmt(tf) != NULL && as_v_bool_val(as_tf_base_fmt(tf)->bold));')
+    && emitted.includes('bool italic = (as_tf_base_fmt(tf) != NULL && as_v_bool_val(as_tf_base_fmt(tf)->italic));')
+    && emitted.includes('bool underline = (as_tf_base_fmt(tf) != NULL && as_v_bool_val(as_tf_base_fmt(tf)->underline));'));
+
+  // ---- where it is painted ---------------------------------------------
+  // After the glyphs (a descender crosses over the row, not under it) and before the
+  // selection re-colour, which must be able to blacken it like any other glyph pixel.
+  const paintBody = gen.slice(gen.indexOf('as_skia_textlayout_paint(para, canvas, 2.0 + alignDx - scrollX, 2.0 - scrollY);'));
+  const iPaint = paintBody.indexOf('as_skia_textlayout_paint(para, canvas,');
+  const iUnder = paintBody.indexOf('as_tf_paint_underline(tf, canvas, 2.0 + alignDx - scrollX, 2.0 - scrollY);');
+  const iSel = paintBody.indexOf('as_skia_paint_black()');
+  check('the row is painted after the glyphs and before the selection overlay',
+    iPaint >= 0 && iUnder > iPaint && iSel > iUnder);
+  check('an untouched field pays nothing: the pass returns before any line walk',
+    emitted.includes("int any = baseUl;")
+    && emitted.includes('if (!any) return;'));
+
+  if (ok > 0) console.log(`[underline] ${ok} underline checks passed`);
+  return bad;
+}
+registerGroup('unit: display/Underline', checkUnderline);
+
 registerGroup('unit: display/AutoSizeMetrics', checkAutoSizeMetrics);
 registerGroup('unit: display/TfScaleMetrics', checkTfScaleMetrics);
 // ---- htmlText 的块级行高、规则 leading 与 getLineText（阶段三百三十六）----------
@@ -1461,7 +1578,7 @@ function checkHtmlTextMetrics(): string[] {
 
   check('the html run carries its own leading',
     emitted.includes('static void as_tf_html_emit_run(TextField* tf, int begin, int end, char* face, double size, unsigned color, bool bold, bool italic, bool underline, double lead) {')
-    && emitted.includes('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, 0, lead);'));
+    && emitted.includes('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, underline ? 1 : 0, lead);'));
   check('the style stack saves and restores it',
     emitted.includes('double st_lead[AS_TF_STACK];')
     && emitted.includes('st_lead[depth] = lead;')

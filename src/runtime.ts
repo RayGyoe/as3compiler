@@ -9512,7 +9512,7 @@ static as_value as_json_parse(char* s) {
 // DisplayObject.render() will drive these through as_skia_* semantic wrappers.
 // sk_text_run is defined unconditionally (a plain C struct, no Skia symbols)
 // because the TextField runtime references it even in pure-C builds.
-typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; } sk_text_run;
+typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; int underline; } sk_text_run;
 // Graphics draw groups (swc.md §9 E). AIR paints each beginFill/endFill group
 // independently, so a single "one path + one fill + one stroke" pair cannot
 // represent two overlapping fills or two strokes of different colour: the last
@@ -9843,6 +9843,10 @@ extern int sk_textlayout_caret_rect(void* para, int index, double* x, double* y,
 // sk_set_air_run_height in the glue: AIR fills run gaps AND styles the line box
 // from it).
 extern void* sk_textlayout_new_runs(const char* text, const sk_text_run* def, const sk_text_run* runs, int run_count, double width, int align, int collapseNewlines);
+// G28: TextFormat.underline. rowY is the 1 px row per visual line, already floored by
+// the caller; u16 is 2 ints per range (UTF-16 indices into the paragraph text) and
+// colors one 0xRRGGBB per range.
+extern void sk_textlayout_paint_underline(void* para, void* canvas, double ox, const double* rowY, int lineCount, const int* u16, const unsigned* colors, int rangeCount);
 extern void sk_paint_set_image_filter_blur(void* paint, double sigmaX, double sigmaY);
 extern void sk_paint_set_image_filter_drop_shadow(void* paint, double dx, double dy, double sigmaX, double sigmaY, unsigned rgb, double alpha, double strength, int drawSource);
 extern void sk_paint_set_image_filter_glow(void* paint, double sigmaX, double sigmaY, unsigned rgb, double alpha, double strength);
@@ -10047,6 +10051,7 @@ static inline int as_skia_textlayout_line_count(void* p) { return sk_textlayout_
 static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { return sk_textlayout_line_metrics(p, s, e, t, b, cap); }
 static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { return sk_textlayout_line_box(p, i, ld, fam, sz, b, it, a, d, l, w); }
 static inline void as_skia_textlayout_paint(void* p, void* c, double x, double y) { sk_textlayout_paint(p, c, x, y); }
+static inline void as_skia_textlayout_paint_underline(void* p, void* c, double ox, const double* ry, int nl, const int* u16, const unsigned* col, int nr) { sk_textlayout_paint_underline(p, c, ox, ry, nl, u16, col, nr); }
 static inline void as_skia_textlayout_delete(void* p) { sk_textlayout_delete(p); }
 static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { return sk_textlayout_glyph_position_at(p, x, y); }
 static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, int skip, double* l, double* t, double* r, double* b, int max) { return sk_textlayout_rects_for_range(p, s, e, skip, l, t, r, b, max); }
@@ -10077,6 +10082,7 @@ static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
 static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { (void)p; (void)s; (void)e; (void)t; (void)b; (void)cap; return 0; }
 static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { (void)p; (void)i; (void)ld; (void)fam; (void)sz; (void)b; (void)it; (void)a; (void)d; (void)l; (void)w; return 0; }
 static inline void as_skia_textlayout_paint(void* p, void* c, double x, double y) { (void)p; (void)c; (void)x; (void)y; as_text_engine_absent(); }
+static inline void as_skia_textlayout_paint_underline(void* p, void* c, double ox, const double* ry, int nl, const int* u16, const unsigned* col, int nr) { (void)p; (void)c; (void)ox; (void)ry; (void)nl; (void)u16; (void)col; (void)nr; as_text_engine_absent(); }
 static inline void as_skia_textlayout_delete(void* p) { (void)p; }
 static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { (void)p; (void)x; (void)y; return -1; }
 static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, int skip, double* l, double* t, double* r, double* b, int max) { (void)p; (void)s; (void)e; (void)skip; (void)l; (void)t; (void)r; (void)b; (void)max; return 0; }
@@ -10796,6 +10802,7 @@ static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
 static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { (void)p; (void)s; (void)e; (void)t; (void)b; (void)cap; return 0; }
 static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { (void)p; (void)i; (void)ld; (void)fam; (void)sz; (void)b; (void)it; (void)a; (void)d; (void)l; (void)w; return 0; }
 static inline void as_skia_textlayout_paint(void* p, void* c, double x, double y) { (void)p; (void)c; (void)x; (void)y; }
+static inline void as_skia_textlayout_paint_underline(void* p, void* c, double ox, const double* ry, int nl, const int* u16, const unsigned* col, int nr) { (void)p; (void)c; (void)ox; (void)ry; (void)nl; (void)u16; (void)col; (void)nr; }
 static inline void as_skia_textlayout_delete(void* p) { (void)p; }
 static inline int as_skia_textlayout_glyph_position_at(void* p, double x, double y) { (void)p; (void)x; (void)y; return -1; }
 static inline int as_skia_textlayout_rects_for_range(void* p, int s, int e, int skip, double* l, double* t, double* r, double* b, int max) { (void)p; (void)s; (void)e; (void)skip; (void)l; (void)t; (void)r; (void)b; (void)max; return 0; }

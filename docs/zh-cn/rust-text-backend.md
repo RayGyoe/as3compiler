@@ -725,12 +725,15 @@ skia_enable_skshaper = true
 ```c
 // src/runtime.ts:8831 —— 富文本 run 已经支持逐段样式
 typedef struct { unsigned start; unsigned end; const char* family; double size;
-                 int bold; int italic; unsigned color; double leading; } sk_text_run;
+                 int bold; int italic; unsigned color; double leading;
+                 int underline; } sk_text_run;   // underline: 阶段三百四十二加，见 flash-text.md §15
 ```
 
 `sk_textlayout_new_runs` 把这些 run 交给 `ParagraphBuilder`，所以 markdown 的粗体/斜体/行内代码
 （换 `family`/`size`）/标题/颜色**全部落在现有 13 个函数的能力内**；缺的只是 run 上的
-`underline`、`strikethrough`、`background`、`link` 几个字段（我们自己控制的 C 结构体，加字段即可）
+`strikethrough`、`background`、`link` 几个字段（我们自己控制的 C 结构体，加字段即可；`underline`
+在阶段三百四十二已经加进去了，但它是**绘制阶段自绘 1 px 线**而不是 Skia 的 decoration，见
+`flash-text.md` §15）
 与一个 markdown → run 的解析器。
 
 也就是说：受限的是**我们自己的封装没往上长**，不是 SkParagraph 的能力。它背后是 HarfBuzz + ICU，

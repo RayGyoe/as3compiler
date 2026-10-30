@@ -680,7 +680,8 @@ byte).
 ### 13.2 Line heights: each line's own format box, the default box for the empty line
 
 `getLineMetrics(i)` now takes `ascent`/`descent` from the `TextFormat` in effect on **that line**
-(`as_tf_fmt_at(tf, line start)`) and `leading` from there too -- it used to read `defaultTextFormat`
+(`as_tf_fmt_at(tf, line start)`; since stage 342 through `as_tf_line_fmt(tf, starts, n, i)` -- the
+TALLEST run on the line, see §15.4) and `leading` from there too -- it used to read `defaultTextFormat`
 unconditionally, which reported `h=18 asc=13.5 desc=4.5 lead=0` for a rule-`leading` line where AIR says
 `h=18 asc=9 desc=3 lead=6`.
 
@@ -726,3 +727,90 @@ assertion is now "`textHeight` is a whole number of line boxes".
   by using `multiline = true` in `examples/textwidth-trailing.as` and saying so. Fixing it moves the
   default meaning of `collapse` and would touch every single-line text example plus the index domains of
   `getLineMetrics`/`selection`, so it is registered separately.
+
+## 15. Painting `TextFormat.underline` / HTML `<u>` (stage 342 / v0.4.303)
+
+`underline` used to be "settable, readable, carried by clone/reset" while **no layout or paint path ever
+read it** -- the first line of `as_tf_html_emit_run` was `(void)underline;`. Text went to the right place
+in the right colour and size, just without the line; and because an underline is **not a layout input**,
+every geometry assertion stayed green, which is why the gap stayed hidden (asaotui `compiler-gaps.md` G28).
+
+### 15.1 AIR's contract (`adl 51.4.1`, pixel-measured in `temp/g28/`)
+
+The probes use **all-space** strings (the row is then the only ink): 22 face/size pairs plus htmlText,
+mixed sizes, leading and wrapping.
+
+- **One device pixel**, at every size (8/12/24/48/96 all paint a single solid row). AIR does not use the
+  typeface's underline metrics (those give `size/14`, i.e. 3.4 px at 48), so we do **not** go through
+  SkParagraph's `TextDecoration`: the paint pass draws the row itself.
+- Row y is `floor(2 + ascent + descent/2)` with the same ascent/descent `getLineMetrics` reports
+  (leading excluded). 12px `_typewriter` (Monaco, 12/3) lands on **y=15**, 24px on 25.
+  `TextFormat.leading` only grows the line box and does **not** move the row (`lead4` stays at 15).
+- Horizontally the row covers the range's whole **advance**, trailing blanks included (8 spaces =
+  57.6 px => x=2..59, the right edge being a partially covered pixel), in the run's own `color`.
+- **One row per visual line** -- one for every hard break and every wrapped line.
+- If any part of a line is underlined the row follows the **line box**, which is the TALLEST run on the
+  line (15.4), not the underlined run's own size (`temp/g28/Main2.as` `mix_sm`: a 12px underlined run on
+  a 24px line still paints at 26).
+- **Zero layout effect**: `textWidth`, `textHeight` and every `getLineMetrics` value are bit-identical
+  with and without the flag (`air-out-1.txt`, the `LAYOUT ul/noul` and `LM ul/noul` lines).
+- `htmlText`'s `<u>` and `setTextFormat(fmt, b, e)` take the same path; a run with `underline = false`
+  **breaks** the row (AIR reads back `"<U>ab</U>cd<U>ef</U>"`, i.e. two segments).
+
+### 15.2 Plumbing
+
+`sk_text_run` gained `int underline` -- `src/runtime.ts` and `vendor/skia_text_glue.cc` hold two copies of
+that struct and **must stay in the same field order** (a unit check compares the field-name sequences).
+Both the per-run builder and the default style in `as_tf_paragraph` fill it. It deliberately does **not**
+enter the paragraph cache key, because it is not a layout input.
+
+### 15.3 Painting
+
+`as_tf_paint_underline(tf, canvas, ox, oy)` (generated C) runs **after** `as_skia_textlayout_paint` and
+**before** the selection re-colour layer (glyphs sit on top, and a selection must blacken the row too):
+
+1. fast out: base format not underlined and no run setting the flag => return (an ordinary field pays
+   nothing per frame);
+2. resolve "which bytes are underlined" into ranges: a run whose `underline` was **explicitly set**
+   (`tag != 0`) wins, so an explicit `false` beats an underlined base format; runs that never set it, and
+   the gaps between runs, take the base format; ranges stay in text order;
+3. per line compute y from the line box via `as_tf_line_fmt` (15.4), with line offsets taken **relative to
+   the first line** (Skia's own `fBaseline - fAscent` sits half a leading above AIR's box: -0.5 at 12px,
+   -1.0 at 24px, +2.7 for a leading-4 line);
+4. the glue's `sk_textlayout_paint_underline` asks `getRectsForRange(kMax, kTight)` for each range's
+   advance box **on each visual line** (trailing blanks included), matches boxes to lines by their
+   vertical middle, and draws a `1.0f`-tall rect.
+
+Byte offsets to Skia's UTF-16 code units always go through the existing `as_tf_utf16_index` (a password
+field is one ASCII star per byte, so that is the identity there).
+
+### 15.4 Fixed along the way: the line box is the line's TALLEST run
+
+`getLineMetrics` used to take the box from "the run containing the line's first character". `adl` says
+otherwise (`temp/g28/Main5.as`): `"x<font size=24>yy</font>"` reports `20/6 h=26` in either run order, the
+line after a `<br>` keeps its own `12/3 h=15`, and a 12/18/24 line reports the 24px box -- i.e. **the line
+box is the tallest run on the line**. The new `as_tf_line_fmt(tf, starts, n, idx)` (empty lines still fall
+back to the base format) serves both `getLineMetrics` and the underline row, so the two can never disagree
+again.
+
+### 15.5 `htmlText` inherits the emphasis flags
+
+`as_tf_html_set` initialised `bold/italic/underline` to a hard-coded `false` while
+`font/size/color/leading` inherit from the base format -- so with `defaultTextFormat.underline = true`,
+text in an `htmlText` field that no tag covered **lost its underline** (AIR reads it back as
+`<U>ab c</U>`; `temp/g28/Main6.as` shows the same for `bold`/`italic`). All three now inherit like the
+rest.
+
+### 15.6 Nails
+
+- `examples/text-underline.as` (Skia manifest `examples/autosize-metrics.build.json`), 12 assertions:
+  layout untouched; y=15 and exactly 1 px tall; edges cover the advance; a negative case (no flag => no
+  row); one row per line in a 3-line field; one per wrapped line; leading does not move it; a partial
+  range underlines only its first 4 characters; an `underline = false` run breaks the row; the run's own
+  colour; `htmlText`'s `<u>`; a mixed-size line follows the line box. Skips itself without a text backend.
+- `test/unit/display.ts` gained `unit: display/Underline` (17 checks): the flag on the run and on the
+  default style, both `sk_text_run` definitions in the same order, a seam for each of the three build
+  shapes, the row formula, the line format, the glue's 1 px and `kMax/kTight`, explicit `false` beating
+  the base, ranges in text order with gaps falling back, the UTF-16 conversion, `htmlText` no longer
+  dropping the bool and inheriting the flags, the paint order (glyphs -> row -> selection), and the
+  fast-out.

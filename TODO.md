@@ -18465,6 +18465,45 @@ Main.as / Main2.as / Main4.as / Main5.as / Main6.as / Main7.as / Main8.as / Main
 接收者 / 两个顺序 `with` 各留各的对象 / 块外兄弟闭包不受影响）；单元钉 `unit: emit/WithClosureCapture`
 （15 钉，含「合成名不可与 AS3 标识符重名」「捕获类型与 make 站点一侧一致」两条防漂移）。
 
+### 阶段三百四十二：`TextFormat.underline` / HTML `<u>` 真的被画出来（v0.4.302 → v0.4.303）
+
+**范围**：asaotui `compiler-gaps.md` 的 **G28**（「只被解析、不被绘制」）。证据台 `temp/g28/`
+（`src/Main.as`、`Main2.as`–`Main6.as` 五份 `adl 51.4.1` 探针 + `ours.as`/`ours5.as`/`ours6.as`
+AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
+
+1. **AIR 的口径量清**（22 组字号×字面 + htmlText + 混排 + leading + 换行，纯空格串让那条线是唯一墨迹）：
+   线是**一条 1 设备像素**（8/12/24/48/96 全一样，**不用字体 underline metrics**，那会按 `size/14`
+   给出 3.4 px @48）；落点 `floor(2 + ascent + descent/2)`（12px `_typewriter` ⇒ **15**，24px ⇒ 25），
+   `leading` 只抬行盒不移动它；横向覆盖该范围的**整个前进宽度**（含行尾空格），颜色取 run 自己的；
+   每个**视觉行**一条；**对布局零影响**（`textWidth`/`textHeight`/`getLineMetrics` 逐位相同）；
+   `underline=false` 的 run 把线**断开**（`adl` 读回 `"<U>ab</U>cd<U>ef</U>"`）。
+2. **通路**：`sk_text_run` 加 `int underline`（`src/runtime.ts` 与 `vendor/skia_text_glue.cc` 两份
+   **同序**，单元钉按字段名序列比对）；`as_tf_paragraph` 的 per-run 与 default style 都填它（**不进**
+   段落缓存键，它不是排版输入）；`as_tf_html_emit_run` 不再 `(void)underline;`。
+3. **绘制**：新增生成侧 `as_tf_paint_underline(tf, canvas, ox, oy)`，在 `as_skia_textlayout_paint`
+   **之后**、选区反色层**之前**调用；先快出（基准格式与 run 表都没有下划线 ⇒ 直接返回），再把
+   「哪些字节被下划线」解析成区间（run 上 `underline` **显式设置过**（`tag != 0`）就以它为准，没设过的
+   run 与其间的空隙取基准格式），每行按行盒算 y（行偏移以第一行为基准：Skia 自己的
+   `fBaseline - fAscent` 比 AIR 的盒高半个 leading），最后 glue 的 `sk_textlayout_paint_underline` 用
+   `getRectsForRange(kMax, kTight)` 拿每个区间在每行上的前进框、按竖直中线匹配到行、画 `1.0f` 高矩形。
+   字节偏移 → UTF-16 码元走既有 `as_tf_utf16_index`（密码字段一字节一星，恒等）。
+4. **顺带修正·行盒取该行最高的 run**：`getLineMetrics` 此前按「行首字符的 run」取盒；`adl` 实测
+   （`temp/g28/Main5.as`）`"x<font size=\"24\">yy</font>"` 与反序都报 `20/6 h=26`、`<br>` 之后的行
+   仍报自己的 `12/3 h=15`、12/18/24 混排报 24px 的盒 ⇒ 新增 `as_tf_line_fmt(tf, starts, n, idx)`
+   同时供 `getLineMetrics` 与下划线行使用（空行仍回落基准格式），两处不可能再打架。
+5. **顺带修正·`htmlText` 继承强调位**：`as_tf_html_set` 里 `bold/italic/underline` 初值硬编码 `false`
+   而 `font/size/color/leading` 继承基准格式 ⇒ `defaultTextFormat.underline = true` 的字段写 htmlText
+   后，未被标签覆盖的文字**丢了下划线**（`adl` 读回 `<U>ab c</U>`；`bold`/`italic` 同结论，
+   `temp/g28/Main6.as`）。三者改为与其余字段一样继承。
+
+**验收**：`examples/text-underline.as`（Skia 清单 `examples/autosize-metrics.build.json`，12 条断言：
+布局不变 / y=15 且只 1 px 高 / 左右边界覆盖前进宽度 / 负例不画 / 三行各一条 / 换行各一条 / leading
+不移 / 局部范围只画前 4 字符 / `underline=false` 断口 / 取 run 颜色 / `htmlText <u>` / 混排行按行盒落；
+无文本后端时自跳过）；单元钉 `unit: display/Underline`（17 钉，含「两份 `sk_text_run` 同序同字段」
+「三种构建形态各有 seam」「绘制顺序 字形 → 下划线 → 选区」三条防漂移），并把 `unit: display/LineMetrics`
+的「行格式」钉改为 `as_tf_line_fmt`（附 `adl` 证据）；`HtmlTextMetrics` 的 run 构造钉同步到
+`underline ? 1 : 0`。
+
 ### 遗留待开发
 > **2026-10-30 追加（遗留表清仓（二）—— 逐行复核：移出 17 行 / 改写 2 行 / 新登记 1 行）**：按表内实际行数重数，主表 **112 → 96 项**（`未开始` **78 → 73** / `部分完成` **20 → 22** / `已完成` **13 → 0** / `调研完成·实现暂缓` 1）。**（a）移出 13 行状态已是「已完成」的行** —— 表头自述「已完成项一经落地即从本表移出」，这 13 行违反了它：`Array.sort` 位标志、定长小数 17 位上限、极值 `String()`、排序边角、鼠标通知 `#1009`、反射内建类名、`File` 路径契约、隐式强制转换检查、点链首段遮蔽、空 `File` `#2037`、`EventDispatcher.parent` 动态读、`File` 三个 async 成员、`Event` 只读访问器。结论与证据都已在各自阶段节里，表里不再留占位。**（b）移出 4 行「状态还是未开始、代码早已落地」**：① `TextField` 输入字符取前一字 run（阶段三百三十六 第 1 条）；② `Proxy` 枚举/点号接管只对静态类型（阶段三百三十八 修了枚举，本轮实测 `var a:* = new MyProxy()` 的点号读、方法调用、`in` 都已进拦截器）；③ `Proxy.getDescendants` 经 `..` 不可达（阶段三百三十九，实测 `p..foo` 与 `*` 槽位都进拦截器）；④ `with` 作用域不进闭包体（阶段三百四十一）。**第 ④ 条要特别记一笔**：包 H 那条 note 把它写成「修净、不占表」，而它**本来就在表里**（2026-10-03 阶段九十四·二 登记，原话是「`emit` 会临时清空 `withScopes`」，与本轮代码相反）——「修净不占表」只适用于**本阶段新量到、同阶段修掉**的项，清掉一张既有登记必须回表下架。**（c）改写 2 行**：`with` 接收者的静态类型（收窄到「函数/类/正则仍响亮拒绝 + `String`/`Vector` 体内三条写路径非左值」）、`TextFormat` 字段子集（阶段三百三十一 已补齐 7 个字段与 13 参 ctor，残留改为「`indent`/`blockIndent`/`bullet`/`display`/`tabStops` 只存不用」）。**（d）新登记 1 行**：`in` 对原始值（`"toString" in 5` 我们 `false`、`adl` `true`）。**（e）顺带修掉两处记账错**：① 包 H 那两行「新登记」确实写了，但**落在文件末尾**（`---` 与 `## 备注` 之间）——`### 遗留待开发` 的主表里一行都没有；本轮把这两行**搬进主表**（保留原有实测细节）并删掉文件末尾的野表。这正是 [`## 备注`](#备注) 里「新阶段节追加到 `### 遗留待开发` 之前（= 末尾），不要插到某个『看起来该在这儿』的锚点」那条提醒的反面教材：按字符串锚点定位会插到文件尾。② 阶段三百四十 节内把 `adl` 对 `"toString" in 5` 的读数写成 `false`，与 `~/Documents/proxyanyi-out.txt` 的 I6=`true` 相反（`src/emit.ts` 的注释本来就是对的）。**口径**：自本轮起「已完成」行不再停在表里等下一次清仓。
 > **2026-10-30 追加（阶段三百三十八～三百四十一：包 H 的 `Proxy` / `..` / `with` / `in` 四刀）**：**新登记 1 行 / 改写 2 行 / 移出 3 行**（初版记「新登记 2 行 / 改写 1 行 / 移出 0 行」，2026-10-30 清仓逐行复核时更正，见下一条 note）。**改写的 1 行**是「Function 值的 `this` 绑定」（H-5）：本轮把证据台扩到 `temp/proxyany/thisbp/`（U1–U9 九例）与 `thisb.as` 镜像，量清「`this` 在函数值里是**呼叫点决定**」的完整矩阵——`o.cb()` → `o`、`f()` 裸调 → **全局对象**、`.call(a)`/`.apply(a)` → `a`（**普通函数认 `thisArg`**，而我们连这个也忽略）、`with (d) { cb() }` → `d`；而**不加 `this.` 前缀的名字**仍按创建点的词法作用域解析（`T3` 得 `TB`，与 AIR 同）。我们的闭包把 `this` 词法捕获进 `env->this` ⇒ **九例全错**（U1/U3/U4/U5/U6/U8 拿到创建者实例而不是接收者，U2/U7/U9 该给全局对象）。要忠实需要「呼叫点 `this` + 全局对象」两件运行时表示层改动（`as_fn` 的 ABI 没有 self 槽），本轮**只登记不实现**，状态仍 `未开始`，但证据面从三行扩到九行。**新登记 1 行**：`in` 对**原始值**的成员集未建模（`"toString" in 5` 我们答 `false`、`adl` 答 `true`，同族还有 `Boolean`/`Function` 接收者）。**改写的另 1 行**：`with` 接收者的静态类型 —— 该项**在表里本来就有登记**（2026-10-03 阶段九十四·二），故只收窄不改写成新行：剩函数/类/正则三种响亮拒绝 + `String`/`Vector` 体内赋值/自增/`delete` 三条静态路径非左值（`CodegenError`）。**本包修净、从表里移出 3 行**：`Proxy` 在 `*`/`Object` 槽位的 `for-in` 空序列（H-1）、`..` 运算符缺失（H-2，含 `Proxy` 接收者）、`with` 体的闭包丢作用域（H-4）—— 最后一条**本来就是登记项**，初版误记「修净不占表」（该口径只适用于本阶段新量到、同阶段修掉的项）；盒子字符串 `in` 的**段错误**（H-3）此前未单独登记，修净后无需入表。

@@ -595,6 +595,11 @@ struct sk_text_run {
   int italic;
   unsigned color;
   double leading;
+  // G28: TextFormat.underline. Not an input to layout (AIR's textWidth /
+  // textHeight / getLineMetrics are bit-identical with and without it --
+  // temp/g28/air-out-1.txt LAYOUT/LM lines) -- the paint pass reads it to
+  // decide which ranges get the 1 px row, see sk_textlayout_paint_underline.
+  int underline;
 };
 
 // Rich text: lay out a paragraph from an array of style runs, each carrying its
@@ -906,6 +911,71 @@ int sk_textlayout_line_box(void* para, int idx, double leading, const char* fami
 
 void sk_textlayout_paint(void* para, void* canvas, double x, double y) {
   ((skia::textlayout::Paragraph*)para)->paint((SkCanvas*)canvas, (SkScalar)x, (SkScalar)y);
+}
+
+// ---------------------------------------------------------------------------
+// TextFormat.underline (G28): one 1 px row per (visual line, underlined range).
+//
+// AIR does NOT use the typeface's underline metrics, and this is the whole reason
+// the row is drawn here instead of through TextStyle::setDecoration: measured on
+// adl 51.4.1 over 22 (face, size) pairs (temp/g28/air-out-3.txt, all strings pure
+// spaces so the line is the only ink),
+//   * the thickness is ONE DEVICE PIXEL at every size -- 12, 24, 48 and 96 px all
+//     paint exactly one solid row, while SkParagraph/Flutter uses
+//     `fontSize / 14` (or the face's underlineThickness) and would paint 3.4 px at
+//     48; and
+//   * the row sits at `floor(origin + lineTop + ascent + descent/2)`, i.e. the
+//     middle of the line's DESCENT band, where ascent/descent are the same
+//     leading-free halves getLineMetrics reports -- it is NOT the face's
+//     underlinePosition (that ratio is 0.083/0.125/0.104 em at 12/24/48 px, i.e.
+//     not a constant, while descent/2 matches every measured size and face).
+// The caller therefore computes the row (it already owns the AIR line-box model,
+// see sk_textlayout_line_box) and this function only answers the other half:
+// `getRectsForRange` gives, per underlined range, the ADVANCE box on each visual
+// line -- trailing spaces included, which is how AIR underlines the blanks of a
+// run (air-out-1.txt: 8 spaces underlines 27 px wide at a 26 px advance).
+void sk_textlayout_paint_underline(void* para, void* canvas, double ox,
+                                   const double* rowY, int lineCount,
+                                   const int* u16, const unsigned* colors, int rangeCount) {
+  if (para == NULL || canvas == NULL || rowY == NULL || u16 == NULL || colors == NULL) return;
+  if (rangeCount <= 0 || lineCount <= 0) return;
+  using namespace skia::textlayout;
+  auto p = (Paragraph*)para;
+  auto c = (SkCanvas*)canvas;
+  std::vector<LineMetrics> lm;
+  p->getLineMetrics(lm);
+  int nlines = (int)lm.size();
+  if (nlines > lineCount) nlines = lineCount;
+  for (int r = 0; r < rangeCount; r++) {
+    int s = u16[r * 2], e = u16[r * 2 + 1];
+    if (s >= e) continue;
+    auto boxes = p->getRectsForRange((unsigned)s, (unsigned)e, RectHeightStyle::kMax,
+                                     RectWidthStyle::kTight);
+    if (boxes.empty()) continue;
+    SkPaint paint;
+    paint.setColor(0xFF000000u | (colors[r] & 0x00FFFFFFu));
+    paint.setStyle(SkPaint::kFill_Style);
+    paint.setAntiAlias(true);
+    for (auto& b : boxes) {
+      if (b.rect.fRight <= b.rect.fLeft) continue;
+      // kMax heights make each box span exactly one LINE box, so the box's middle
+      // picks the line whose row was handed in. Lists from Skia are in visual
+      // order; matching on geometry (not on an index) keeps multi-line ranges and
+      // ranges that start mid-line correct.
+      const double mid = ((double)b.rect.fTop + (double)b.rect.fBottom) / 2.0;
+      int li = -1;
+      for (int i = 0; i < nlines; i++) {
+        const double top = (double)lm[i].fBaseline - (double)lm[i].fAscent;
+        const double bot = (double)lm[i].fBaseline + (double)lm[i].fDescent;
+        if (mid >= top && mid <= bot) { li = i; break; }
+      }
+      if (li < 0) continue;
+      c->drawRect(SkRect::MakeXYWH((SkScalar)(ox + (double)b.rect.fLeft), (SkScalar)rowY[li],
+                                   (SkScalar)((double)b.rect.fRight - (double)b.rect.fLeft),
+                                   1.0f),
+                  paint);
+    }
+  }
 }
 
 void sk_textlayout_delete(void* para) {

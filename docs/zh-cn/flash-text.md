@@ -612,8 +612,9 @@ C-3 的对照探针需要 `replaceSelectedText`，而我们**根本没有**这�
 
 ### 13.2 行高：每行自己的格式盒 + 尾部空行用**默认**格式
 
-`getLineMetrics(i)` 的 `ascent/descent` 现在按**该行**生效的 `TextFormat`（`as_tf_fmt_at(tf, 行首)`）
-取，`leading` 也从那里取——此前一律读 `defaultTextFormat`，于是带规则 `leading` 的行报
+`getLineMetrics(i)` 的 `ascent/descent` 现在按**该行**生效的 `TextFormat` 取（阶段三百四十二起
+统一走 `as_tf_line_fmt(tf, starts, n, i)`，见 §15.4 —— 取该行**最高**的 run，此前是「行首字符的 run」），
+`leading` 也从那里取——此前一律读 `defaultTextFormat`，于是带规则 `leading` 的行报
 `h=18 asc=13.5 desc=4.5 lead=0`（AIR 是 `h=18 asc=9 desc=3 lead=6`）。
 
 **尾部空行**（`htmlText` 块末尾自然产生的那一行）在 AIR 里报的是**默认格式的盒**（`12/9/3/0`），
@@ -653,3 +654,75 @@ C-3 的对照探针需要 `replaceSelectedText`，而我们**根本没有**这�
   回归，是既有口径差；本轮只是把它从「隐藏」变成「在 `examples/textwidth-trailing.as` 里显式
   用 `multiline = true` 规避并注明」。修它要动 `collapse` 的默认语义，会波及全部单行文本示例与
   `getLineMetrics`/`selection` 的索引域，故独立立项。
+
+## 15. `TextFormat.underline` / HTML `<u>` 的绘制（阶段三百四十二 / v0.4.303）
+
+此前 `underline` 是「设得上、读得回、clone/reset 都带走」，但**布局与绘制路径没有一处读它** ——
+`as_tf_html_emit_run` 的第一句就是 `(void)underline;`。文字位置/颜色/字号全对，只是没有那条线；
+因为下划线**不参与排版**，所有几何断言都是绿的，这个缺口才一直隐身（asaotui `compiler-gaps.md` G28）。
+
+### 15.1 AIR 的口径（`adl 51.4.1` 逐像素实测，`temp/g28/`）
+
+探针用**纯空格**字符串（唯一的墨迹就是那条线），22 组字号×字面 + htmlText + 混排 + leading + 换行：
+
+- **一条 1 设备像素**的横线，**任何字号都是 1 px**（8/12/24/48/96 全是单行实心）。AIR 不用字体的
+  underline metrics（那会按 `size/14` 给出 3.4 px @48），所以我们**不走** SkParagraph 的
+  `TextDecoration`，而是在绘制阶段自己画。
+- 落点 `floor(2 + ascent + descent/2)`，`ascent/descent` 就是 `getLineMetrics` 报的那两个（不含
+  leading）。12px `_typewriter`（Monaco，12/3）⇒ **y=15**；24px ⇒ 25。`TextFormat.leading` 只把
+  行盒撑高，**不移动**这条线（`lead4` 仍在 15）。
+- 横向覆盖该范围的**全部前进宽度**，行尾空格也算（8 个空格 57.6 px ⇒ x=2..59，右端是半覆盖像素），
+  颜色取该 run 自己的 `color`。
+- **每个视觉行一条**：换行与自动换行各一行各一条。
+- 一行里只要有下划线，线就按**行盒**落 —— 行盒取该行**最高**的 run（见 §15.4），不是被下划线那个
+  run 的字号（`temp/g28/Main2.as` 的 `mix_sm`：12px 下划线 run 在 24px 行上，线仍在 26）。
+- **对布局零影响**：`textWidth` / `textHeight` / 每一行 `getLineMetrics` 加不加下划线逐位相同
+  （`air-out-1.txt` 的 `LAYOUT ul/noul` 与 `LM ul/noul`）。
+- `htmlText` 的 `<u>` 与 `setTextFormat(fmt, b, e)` 同一条路；`underline=false` 的 run 会把线**断开**
+  （AIR 读回 `"<U>ab</U>cd<U>ef</U>"`，线上两个线段）。
+
+### 15.2 数据通路
+
+`sk_text_run` 增一字段 `int underline`（`src/runtime.ts` 与 `vendor/skia_text_glue.cc` **两份必须同序**，
+单元组按字段名序列逐项比对）。`as_tf_paragraph` 的 per-run 与 default style 都填它 ——
+注意它**不进**段落缓存键，因为它不是排版输入。
+
+### 15.3 绘制
+
+`as_tf_paint_underline(tf, canvas, ox, oy)`（生成 C 侧）在 `as_skia_textlayout_paint` **之后**、
+选区反色层**之前**调用（字形在上，选中时线也要被涂黑）：
+
+1. 快出：基准格式没下划线且 run 表里没人显式开 ⇒ 直接返回（未设下划线的字段每帧零成本）；
+2. 把「哪些字节被下划线」解析成若干区间：run 上 `underline` **显式设置过**就以它为准（`tag != 0`，
+   所以 `false` 能压过带下划线的基准格式），没设过的 run 与其间的空隙取基准格式；区间按文本序；
+3. 每行的 y 用 `as_tf_line_fmt` 的行盒算（§15.4），行偏移以**第一行**为基准（Skia 自己的
+   `fBaseline - fAscent` 比 AIR 的盒高半个 leading：12px 是 -0.5、24px 是 -1.0、leading 4 的行是 +2.7）；
+4. glue 的 `sk_textlayout_paint_underline` 用 `getRectsForRange(kMax, kTight)` 拿到每个区间在
+   **每个视觉行**上的前进框（含行尾空格），按框的竖直中线匹配到行，再画 `1.0f` 高的矩形。
+
+字节偏移 → Skia 的 UTF-16 码元一律走既有的 `as_tf_utf16_index`（密码字段是「一字节一星」，恒等）。
+
+### 15.4 顺带修正：行盒取该行**最高**的 run
+
+`getLineMetrics` 此前按「行首字符所在的 run」取盒。`adl` 实测（`temp/g28/Main5.as`）：
+`"x<font size=\"24\">yy</font>"` 与反序写法都报 `20/6 h=26`，`<br>` 之后的行仍报自己的 `12/3 h=15`，
+12/18/24 混排报 24px 的盒 ⇒ **行盒 = 该行最高的 run**。新增 `as_tf_line_fmt(tf, starts, n, idx)`
+（空行仍回落到基准格式）同时供 `getLineMetrics` 与下划线行使用，两处不可能再打架。
+
+### 15.5 `htmlText` 的强调位继承
+
+`as_tf_html_set` 里 `bold/italic/underline` 的初值此前硬编码 `false`，而 `font/size/color/leading`
+是继承基准格式的 —— 于是 `defaultTextFormat.underline = true` 的字段写 `htmlText` 后，未被标签覆盖的
+文字**丢了下划线**（`adl` 的 `htmlText` 读回 `<U>ab c</U>`，`temp/g28/Main6.as` 对 `bold`/`italic`
+是同一结论）。三者改为与其余字段一样从基准格式继承。
+
+### 15.6 钉
+
+- `examples/text-underline.as`（Skia 清单 `examples/autosize-metrics.build.json`）：12 项断言 ——
+  布局不受影响、y=15 且只有 1 px 高、左右边界覆盖前进宽度、负例（无下划线不画）、三行各一条、
+  自动换行各一条、leading 不移动、局部范围只画前 4 字符、`underline=false` 断口、取 run 颜色、
+  `htmlText` 的 `<u>`、混排行按行盒落。无文本后端时自跳过。
+- `test/unit/display.ts` 新增 `unit: display/Underline`（17 项）：run/default-style 都带该字段、
+  两个 `sk_text_run` 定义**同序同字段**、三种构建形态各有 seam、行公式、行格式、glue 的 1 px 与
+  `kMax/kTight`、显式 `false` 压过基准、区间按文本序与缺口回落、UTF-16 换算、`htmlText` 不再
+  `(void)underline` 且继承强调位、绘制顺序（字形 → 下划线 → 选区）、未设时快出。
