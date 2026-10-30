@@ -18077,7 +18077,43 @@ getter 同样、遮蔽首段不折叠成静态槽、module 作用域遮蔽让调
 `unit: runtime/Dtoa` 由 9 钉扩到 10 钉（新增「定长区间按量级放宽」一钉、精度区间钉改为 `hi` 初值）。
 全量 `node test.ts` ⇒ 561 passed / 0 failed。
 
+### 阶段三百二十九：隐式强制转换对齐 mxmlc 的拒绝面（v0.4.289 → v0.4.290）
+
+**范围**：遗留表「编译期缺少隐式强制转换检查」。
+
+**实测口径**（`mxmlc 51.4.1`，`temp/coerce/`：12 目标 × 10 源矩阵 `gen.py`、`return` 位 `Q.as`、
+E4X `X.as`）。AIR 的放行面只有三个角：**`*` 源**、**`Object` 目标**、**`Boolean` 目标**；
+数值族（`Number/int/uint`）内部可互转，但**与 String 完全不相通**；其余一切要求真实子类关系。
+
+| 目标 | mxmlc 拒绝的源 |
+|---|---|
+| `String` | Object、interface、Array、Number、Boolean、Function、Class、Date（**XML/XMLList 例外，放行**） |
+| `Number` / `int` / `uint` | Object、interface、Array、String、Boolean、Function、Class、Date |
+| `Boolean` | **无** |
+| `Array` | Object、interface、Number、String、Boolean、Function、Class、Date |
+| `Function` | Object、interface、Array、Number、String、Boolean、Class、Date |
+| `Class` | 除 `Class` 与 `*` 全部 |
+| `Object` / `*` | **无** |
+
+**实现**：新增 `checkImplicitCoercion(src, target)`，在**声明型强制点**调用（变量初始化、赋值到
+已声明槽、`return`、字段/静态初值），共 17 处 `convertImplicit` 调用点。
+**刻意不放进 `convert()`**：`convert()` 同时是内部统一路径（三元两支合一、动态调用管线的类型对齐），
+放进去会把 `cond ? "no throw" : err.errorID` 这种合法表达式判成错误 —— 首版正是这样红了
+`examples/dyn-call-defaults.as`，改为按站点调用后即恢复。接口目标**不查**：我们的内建接口表比
+playerglobal 窄，误判方向是拒绝合法 AIR 代码，比漏报更糟。
+
+**顺带纠正两处我们自己的样例**（不是库缺陷，是样例本身写了 mxmlc 会拒绝的 AS3）：
+`examples/stage34.as` 的 `var removed:Sprite = s.removeChildAt(0)`（`removeChildAt` 返回
+`DisplayObject`）改为 `DisplayObject`；`examples/xml-dynamic-str.as` 的
+`var s0:String = emptyList` 改为 `String(emptyList)`。
+
+**验收**：`test/unit/diagnostics.ts` 新增 5 负例（Object→Array、Object→String、String→Number、
+Number→Function、`return` 位 DisplayObject→Sprite）+ 4 正例（Object/Boolean/`*` 目标、`*` 源、
+数值族互转、XML→String）；全量 `node test.ts` ⇒ 561 passed / 0 failed。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百二十九：隐式强制转换对齐 mxmlc 拒绝面）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「编译期缺少隐式强制转换检查」转**已完成**（12×10 矩阵实测，只在声明型强制点检查；接口目标刻意不查）。
+>
 > **2026-10-30 追加（阶段三百二十八：`String(Number)` 必须读得回 + `is int/uint` 是值域 + 整数字面量按值定型）**：**新登记 0 行 / 改写 2 行 / 移出 0 行** ⇒ 主表项数不变。**改写 2 行**均转**已完成**：「定长小数分支的 17 位上限把 round-trip 弄断」、「极值的 `String()` 表示与 AIR 不同」（后者口径**定案**为「能读回的最短十进制」，写进双语义速查表；AIR 在三个极值上**自己读不回**，不照抄）。**本阶段顺带修净、不占表的两条**：整数字面量按值定型（`3000000000` 曾是**负** int、`123456789012345680000` 曾打成clang 拒绝的 C 整数常量 ⇒ 合法 AS3 编译不过）、`is int`/`is uint` 改为 AIR 的**值域**测试。
 >
 > **2026-10-30 追加（阶段三百二十七：`#1063` qname 的类半取自接收者运行期类）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 主表项数不变。**改写 1 行**＝「Function 值 `#1063` 的 qname 对接口接收者/匿名闭包/顶层函数不逐字」⇒ 接口 / 父类 / 内建继承那一半**已收口**（`adl 51.4.1` 18 例，见该阶段节），剩余两处改为「不可复现（匿名闭包的每文件方法序号）/ 不可构造（`mxmlc` 拒绝包级函数值）」的事实陈述，状态 `未开始` → **`部分完成`**。**本阶段修净、不占表的一条**：嵌套**具名**函数此前被打成 `Function/anonymous`（`adl` 打 `Function/inner`），属「`adl` 跑得对我们跑不出」但同阶段落地。
@@ -18337,7 +18373,7 @@ getter 同样、遮蔽首段不折叠成静态槽、module 作用域遮蔽让调
 | `TextField.textWidth` 的字形累进口径与 AIR 有残差 | 未开始（2026-10-09 阶段一百二十八 三端探针实测，`temp/bakeprobe/`） | 同字体同字号（`_typewriter` 12）同一串：`adl 51.4.1` 给 `14.5`，我们给 `14.40234375`（= 14 + 103/256，看着像 26.6 定点累加；`adl` 的 14.5 更接近其内部 twip/半像素口径）。与本表「`TextField.textWidth` 不含行尾空格（AIR 含）」是**同一族**（字形累进与度量舍入），但根因不同：那条是**取哪些字形**，这条是**每个字形的进位数**。像素影响仅限用 `textWidth` 做布局/换行的代码（本阶段探针的包围盒因字段宽度显式给出而不受影响）。 | 先扩大实测样本（多字号 × 多串 × 单字形）定 AIR 的进位舍入口径（是否 `ceil`/half-px/twip 取整），再决定是否复刻；与「设备字体度量表」那条同批评估更省。**成本低（测量）~中（复刻）**。 |
 | **`flash.data` 加密数据库未支持**（`open(path, mode, …, encryptionKey)`、`reencrypt()`、带密钥的 `attach`） | 未开始（2026-10-12 阶段一百三十九 落地 A–D 时按 §1.5 硬判据登记为**欠账**；同轮四个示例的三端验收见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md) §10.4） | **`adl 51.4.1` 实测**：带密钥建库后宿主机 `sqlite3` 打不开（首 16 字节 = 密文而非 `SQLite format 3\0`、报 `file is not a database`）；明文库与带密钥库的字节 16–23 **唯一差别是 byte 20 `0x00`→`0x20`** ⇒ AIR 加密 = **AES-CCM + 16 字节裸密钥 + 每页保留 32 B**（密钥来自 `writeUTFBytes(16 字符口令)`），与 SQLCipher（PBKDF2 + AES-256-CBC + HMAC + 明文 salt、保留 48 B）**密钥派生/算法/页布局三轴全不兼容**；我们现状：非空密钥一律 **`SQLError #3138` 响亮拒绝**（绝**不**静默写明文库） | 若要做：按 avmplus 的加密页编解码逐字节移植（每页 nonce/MAC 布局需逆向实证），或整体换 SQLCipher （**语义不等价**，等于换引擎）。**明确不做**的替代方案：静默忽略密钥 / 静默写明文 —— 那会把「安全属性丢失」变成无声的数据流失，违反 §1.5。**成本高、优先级低**（目标应用零 `import flash.data`、包装层不传密钥；本轮示例与 ADR 已把该缺口写死为「响亮报错」） |
 | **`File` 的路径字符串契约与 AIR 不符**（`new File(x)` 对**非绝对**的 `x` 应抛 `ArgumentError #2004`；`file://` 形式应解析成原生路径；**两个虚拟 scheme `app:`/`app-storage:` 未建模**） | **已完成**（2026-10-30 阶段三百二十三：构造器拒绝相对路径/空串/非 file scheme ⇒ `#2004`，显式 `null` ⇒ `#2037`，无参形式才建空 `File`；`file://` 与两个虚拟 scheme 早已落地） | **`adl 51.4.1` 实测（第一组：`nativePath` 的校验）**：`new File("abc")` / `"temp/x.txt"` / `"./x.txt"` / `"file://relative/x.txt"` 一律 `ArgumentError #2004 One of the parameters is invalid.`（抛在 `flash.filesystem::File/set nativePath()`，栈由 `-debug=true` 取到）；`"file:///tmp/x.txt"` 与 `"/tmp/x.txt"` **都成功**且 `nativePath == "/tmp/x.txt"`、`url == "file:///tmp/x.txt"`（**归一化**）。**我们侧**：六个输入**全部成功**，`nativePath` 原样回、`url` 恒为 `file://` + 原串（`file:///tmp/x.txt` ⇒ `file://file:///tmp/x.txt`）。**第二组（2026-10-19 复核：`applicationDirectory` 早已实现，故原「运行时缺失」一行已移出本表）**：`as_app_dir()` 由**进程自身可执行文件路径**推目录（`src/emit.ts` 的 `File_new(as_app_dir())` 静态分支），`adl` 与 AOT 的 `appDir.nativePath` **逐字节相同**，`exists`/`isDirectory`/`name` 亦一致。**第三组（同批量出的 `url` 口径差）**：`adl` 的 `applicationDirectory.url == "app:/"`、`applicationStorageDirectory.url == "app-storage:/"`（**虚拟 scheme，不是 `file://`**），而 `desktopDirectory`/`documentsDirectory`/`userDirectory` 是 `file:///C:/Users/…`（**三斜杠 + 正斜杠**），`swf.url == "app:/Adl.swf"`、`swf.parent.url == "app:/"`；我方 `url` 是简化模型 `"file://" + nativePath`，故 `applicationDirectory.url` 给成 `file://C:\…\`（**方案错且少两个斜杠**）。另：`resolvePath` 的分隔符我方给 `/`、`adl` 给 `\` | 修法：在 `File` 的 setter/normalize 一处同时办三件——① 非绝对 ⇒ `#2004`；② 解析 `file://`（百分号解码）并归一化 `url`；③ `url` 按目录分两套（`applicationDirectory`/`applicationStorageDirectory` 回虚拟 scheme `app:`/`app-storage:`，其余回 `file:///` 归一化形式），`resolvePath` 分隔符随平台。**但**须同步改掉**依赖相对路径**的示例（`examples/stage64.as:16,41` 与四个 `examples/sqlite-*.as`，AIR 上的写法是 `File.applicationDirectory`/绝对路径，oracle harness 已如此改写）。**成本中、优先级低**（不影响 `flash.data` 主线：示例与 oracle 两侧都已按各自口径跑通） |
-| **编译期「隐式强制转换」检查缺失**（`mxmlc` 拒绝、我们照单收下）：`var st:String = <`Object` 静态类型值>;` 报「从静态类型为 Object 的值到可能不相关的类型 String 之间的隐式强制转换」；`var top:Function = String;` 报「从类型 String 的值到不相关类型 Function 之间的隐式强制转换」——两种我们都编译通过 | 未开始（2026-10-13 阶段一百四十四 跑 `adl` oracle 时**顺带撞出**：为了让 `adl` 收下同一份探针，不得不把 `var st:String = o;` 改写为 `var st:String = String(o);`、并删掉 `var top:Function = String;` 一行，证据 `temp/apv/adl/` 的两次 COMPILE FAIL 输出）。**方向是「比 AIR 宽松」**，因此**只影响本该被拒绝的程序**、不影响任何 `mxmlc` 能编译的程序 ⇒ **不属保真缺口**，与上一条「`File` 的路径字符串契约」同类（那条也是**更宽松**），如实登记、**优先级低**。修法：在赋值/传参/`return` 的静态类型收敛点补「不相关类型」检查（与现有的 `checkTypeAnnotation` 同层），失败响亮报 `行:列` |
+| **编译期「隐式强制转换」检查缺失**（`mxmlc` 拒绝、我们照单收下） | **已完成**（2026-10-30 阶段三百二十九：`checkImplicitCoercion` 覆盖 17 个声明型强制点） | 12 目标 × 10 源矩阵实测（`temp/coerce/`）：放行面只有 `*` 源 / `Object` 目标 / `Boolean` 目标；数值族内部互转但不与 String 相通；其余要求真实子类关系；E4X 的 XML→String 例外放行。**不放进 `convert()`**（内部三元合一会误伤 `cond ? "s" : 5`），接口目标**刻意不查**（内建接口表比 playerglobal 窄，误判会拒绝合法 AIR）。修后顺带定性我们两个样例为非法 AS3 并改写（`stage34.as` / `xml-dynamic-str.as`） | — |
 | **`Error` 家族实例的 `.message` 不做任何转换**（AIR 存**原值**） | 未开始（2026-10-14 阶段一百五十二 实测登记；「关闭应用即崩溃」修复的副产物） | `adl 51.4.1` 实测（`temp/errnull/`，Q1–Q11）：`Error(null).message === null`、`Error(undefined).message === undefined`、`Error(5).message === 5`（`typeof` 为 `"number"`）、`Error("").message === ""` **全为 true** —— AIR 把实参原样存进实例上**未类型化**的槽，只在**使用**时才字符串化（`5 + ""` → `"5"`、`{}` → `"[object Object]"`）。本构建的 `Error` 类把 `message` 定为 **`char*` String 槽**（构造期 `as_str_from_*` 转换，且 `NULL` → 字面 `"null"`）⇒ `Error(5).message` 我们 `"5"`（String ⇒ `=== 5` 为 false）、`Error(undefined).message` 我们 `"null"`（AIR `undefined`）；`new Error(x)` 形式**同样**（双端证据 `temp/errcall/` 的 E4/N4 两行）。**可观测面**＝严格相等、`typeof e.message`、以及把 `.message` 当动态值的分派 | 立项：把 `message`（连带核对 `name`/`errorID` 的槽形状）改成 **`as_value` 原值槽**，构造期**不**转换。代价：全仓 `e.message` 读点（catch 日志/UI 文案，真应用 talkmed 约百处）从静态 `String` 变成动态装箱（性能 + 新的 `#1009` 面），须与「`catch (e:*)` 的值保真」同批、并做全量回归。**当前有意不改** —— 保持 String 槽正是为了让 `e.message` 永不为 `NULL`（AIR 对 `null` 消息抛 `#1009`，我们若让槽可为 NULL 会把「类型错误」降级成 `strlen(NULL)` 的**内存错误**） |
 | **首页 tab 首标签偶尔掉第一个汉字**（`adl` 稳定 `打开网页`，我方**偶尔** `开网页`：首个汉字「打」整字消失、其余三字位置不变） | 未开始（2026-10-15 阶段一百六十五 巡检副产物，**间歇 1/6 次观测**；已排除与 C 名改写相关——同二进制重跑即正常、两版 C 规范化后逐字节相同 `temp/tkmeet-mac/ab.safe.diff`；复跑harness `temp/tkmeet-mac/labelprobe.py` 4/4 绿；待定方向：数据面（多字节串首部丢字节/BOM 误跳）vs 渲染面（字形图集缓存/GC 时序）；**修法**：加「数据到手即打印长度与首字符」探针 + 复现窗口） |
 | **时间轴回退只认「同一 (父, 深度, 角色)」复用**（这是我们**已实现的** AIR 口径；登记的是**残留 D43b**：向前 `Move` 记录**带新字符**时 `adl` 保留原对象身份，我们换新对象——因为烘培出的类把一个角色的图**画进类里**，换角色必然换实例） | 未开始 / **D43b**（2026-10-16 阶段一百七十二 登记，**回退方向已修**） | `adl 51.4.1` 实测：`temp/btnprobe/Rewind2.as` 中「`_over(5) → _up(1)`」深度 2/3 的 `label1`/`label2` **对象编号不变**、深度 1 因角色 524→518 而换新实例（`instance8 → instance28`）；我方 `Rewind3.as` 回退方向已一致。**未修的那条**：`Move` + 新字符在 `adl` 里是**同一个对象换图**（编号 `#0` 不变）、我方造新对象（`#4`）。它不会丢 App 写入的文字（只有角色真变了才触发），故仅登记。差异清单 **D43 / R30** |

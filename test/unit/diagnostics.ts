@@ -380,7 +380,37 @@ function checkCodegenDiagnostics(): string[] {
   check('an unknown System member is reported as a missing MEMBER',
     s2?.message === "Codegen error at 1:1: System has no member 'notAMemberXYZ'");
 
-  const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2, s1, s2];
+  // 阶段三百二十九: mxmlc 的「隐式强制转换」拒绝面。实测（mxmlc 51.4.1，
+  // temp/coerce/ 的 12x10 矩阵 + Q.as）：只有 `*` 源、`Object` 目标、`Boolean`
+  // 目标是放行的三角，数值族内部可互转但与 String 不相通，其余一律要求真实子类
+  // 关系。我们此前全部接受并在运行期自行转换 —— 等于编译了参考编译器会拒绝的
+  // 程序，而且选了一条 AIR 根本不会走的转换路径。
+  const c1 = gen('var o:Object;\nvar arr:Array = o;');
+  check('Object into an Array slot is an implicit-coercion error',
+    c1?.message === 'Codegen error at 2:1: implicit coercion of a value of type Object to a possibly unrelated type Array');
+  const c2 = gen('var o:Object;\nvar s:String = o;');
+  check('Object into a String slot is an implicit-coercion error',
+    c2?.message === 'Codegen error at 2:1: implicit coercion of a value of type Object to a possibly unrelated type String');
+  const c3 = gen('var s:String = "5";\nvar n:Number = s;');
+  check('String into a Number slot is an implicit-coercion error',
+    c3?.message === 'Codegen error at 2:1: implicit coercion of a value of type String to a possibly unrelated type Number');
+  const c4 = gen('var n:Number = 5;\nvar f:Function = n;');
+  check('Number into a Function slot is an implicit-coercion error',
+    c4?.message === 'Codegen error at 2:1: implicit coercion of a value of type Number to a possibly unrelated type Function');
+  const c5 = gen('function g(d:DisplayObject):Sprite { return d; }');
+  check('a return-position downcast is an implicit-coercion error',
+    c5?.message === 'Codegen error at 1:38: implicit coercion of a value of type DisplayObject to a possibly unrelated type Sprite');
+  // …and the permissive corners stay open, so the check cannot reject valid AIR.
+  const okObj = thrown(() => generateC(parse('var o:Object;\nvar x:Object = o;\nvar b:Boolean = o;\nvar v:* = o;')));
+  check('Object/Boolean/* targets accept an Object source', okObj === null);
+  const okStar = thrown(() => generateC(parse('var v:*;\nvar arr:Array = v;\nvar s:String = v;\nvar n:Number = v;')));
+  check('a * source coerces into any target', okStar === null);
+  const okNum = thrown(() => generateC(parse('var i:int = 1;\nvar u:uint = i;\nvar n:Number = u;\nvar i2:int = n;')));
+  check('the numeric family interconverts', okNum === null);
+  const okXml = thrown(() => generateC(parse('var x:XML = <a/>;\nvar s:String = x;')));
+  check('XML implicitly stringifies (measured: mxmlc allows it)', okXml === null);
+
+  const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2, s1, s2, c1, c2, c3, c4, c5];
   check('every CodegenError carries a numeric line and col',
     all.every((e) => e !== null && typeof e.line === 'number' && typeof e.col === 'number')
     && all.every((e) => /^Codegen error at \d+:\d+: /.test(e!.message)));

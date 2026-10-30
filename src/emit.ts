@@ -4306,7 +4306,7 @@ export class Emitter {
         this.currentClass = cname;
         if (f.isConst && this.isConstExpr(f.init)) {
           const init = this.platformStaticConst(cname, fname)
-            ?? (f.init ? this.convert(this.emitExpr(f.init), f.type) : this.defaultInit(f.type));
+            ?? (f.init ? this.convertImplicit(this.emitExpr(f.init), f.type) : this.defaultInit(f.type));
           this.line(`static ${this.constTypeName(f.type)} ${cname}_${fname} = ${init};`);
         } else {
           // Mutable static slot with a default; the initializer (when present)
@@ -30073,7 +30073,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue; // inherited fields are set by super()
         if (f.init) {
-          this.line(`o->${this.cIdent(fname)} = ${this.convert(this.emitExpr(f.init), f.type)};`);
+          this.line(`o->${this.cIdent(fname)} = ${this.convertImplicit(this.emitExpr(f.init), f.type)};`);
         }
       }
       if (ctor) {
@@ -30323,7 +30323,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (v.isConst && this.isConstExpr(v.init)) {
         this.moduleConsts.add(v.name);
         const e = this.emitExpr(v.init!);
-        this.line(`static ${this.constTypeName(ctype)} ${cn} = ${this.convert(e, ctype)};`);
+        this.line(`static ${this.constTypeName(ctype)} ${cn} = ${this.convertImplicit(e, ctype)};`);
       } else {
         // Mutable file-scope slot; a var's (or runtime-init const's) initializer
         // runs in main() (emitTopLevel) in source order.
@@ -30401,7 +30401,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         const si = this.staticFieldInits.find((x) => x.cname === cname && x.fname === fname);
         if (!si) return false;
         this.currentClass = cname;
-        const init = this.convert(this.emitExpr(si.f.init!), si.f.type);
+        const init = this.convertImplicit(this.emitExpr(si.f.init!), si.f.type);
         this.line(`${si.cname}_${si.fname} = ${init};`);
         this.currentClass = null;
         return true;
@@ -30670,7 +30670,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.sequenceValueExpr(stmt.init, true, true);
         const e = this.emitExpr(stmt.init);
         const ctype = this.moduleScope.get(stmt.name)!;
-        this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
+        this.line(`${this.moduleCName(stmt.name)} = ${this.convertImplicit(e, ctype)};`);
       }
       return;
     }
@@ -30682,7 +30682,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.sequenceValueExpr(stmt.init!, true, true);
         const e = this.emitExpr(stmt.init!);
         const ctype = this.moduleScope.get(stmt.name)!;
-        this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
+        this.line(`${this.moduleCName(stmt.name)} = ${this.convertImplicit(e, ctype)};`);
       }
       return;
     }
@@ -30701,7 +30701,7 @@ void FileStream_writeObject(void* _this, as_value v) {
             this.sequenceValueExpr(d.init!, true, true);
             const e = this.emitExpr(d.init!);
             const ctype = this.moduleScope.get(d.name)!;
-            this.line(`${this.moduleCName(d.name)} = ${this.convert(e, ctype)};`);
+            this.line(`${this.moduleCName(d.name)} = ${this.convertImplicit(e, ctype)};`);
           }
         }
       }
@@ -30741,7 +30741,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           if (!this.isConstExpr(stmt.init)) {
             const ctype = this.moduleScope.get(stmt.name)!;
             const e = this.emitExpr(stmt.init!);
-            this.line(`${this.moduleCName(stmt.name)} = ${this.convert(e, ctype)};`);
+            this.line(`${this.moduleCName(stmt.name)} = ${this.convertImplicit(e, ctype)};`);
           }
           break;
         }
@@ -30754,13 +30754,13 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (this.hoistedLocals.has(stmt.name)) {
           const ht = this.functionScope!.get(stmt.name) ?? this.ann(stmt.type);
           const e = this.emitExpr(stmt.init!);
-          this.line(`${this.emitVar(stmt.name).code} = ${this.convert(e, ht)};`);
+          this.line(`${this.emitVar(stmt.name).code} = ${this.convertImplicit(e, ht)};`);
           break;
         }
         const ctype = stmt.type !== null ? this.ann(stmt.type) : this.emitExpr(stmt.init!).type;
         this.declareVar(stmt.name, ctype);
         const e = this.emitExpr(stmt.init!);
-        this.line(`${this.constTypeName(ctype)} ${this.cIdent(stmt.name)} = ${this.convert(e, ctype)};`);
+        this.line(`${this.constTypeName(ctype)} ${this.cIdent(stmt.name)} = ${this.convertImplicit(e, ctype)};`);
         break;
       }
       case 'ConstDecls': {
@@ -30770,7 +30770,7 @@ void FileStream_writeObject(void* _this, as_value v) {
             if (d.init && !this.isConstExpr(d.init)) {
               const ctype = this.moduleScope.get(d.name)!;
               const e = this.emitExpr(d.init);
-              this.line(`${this.moduleCName(d.name)} = ${this.convert(e, ctype)};`);
+              this.line(`${this.moduleCName(d.name)} = ${this.convertImplicit(e, ctype)};`);
             }
             continue;
           }
@@ -30778,13 +30778,13 @@ void FileStream_writeObject(void* _this, as_value v) {
           if (this.hoistedLocals.has(d.name)) {
             const ht = this.functionScope!.get(d.name) ?? this.ann(d.type);
             const e = this.emitExpr(d.init!);
-            this.line(`${this.emitVar(d.name).code} = ${this.convert(e, ht)};`);
+            this.line(`${this.emitVar(d.name).code} = ${this.convertImplicit(e, ht)};`);
             continue;
           }
           const ctype = d.type !== null ? this.ann(d.type) : this.emitExpr(d.init!).type;
           this.declareVar(d.name, ctype);
           const e = this.emitExpr(d.init!);
-          this.line(`${this.constTypeName(ctype)} ${this.cIdent(d.name)} = ${this.convert(e, ctype)};`);
+          this.line(`${this.constTypeName(ctype)} ${this.cIdent(d.name)} = ${this.convertImplicit(e, ctype)};`);
         }
         break;
       }
@@ -31206,7 +31206,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (stmt.value) {
           this.sequenceValueExpr(stmt.value, true, true);
           const e = this.emitExpr(stmt.value);
-          const code = this.currentReturnType ? this.convert(e, this.currentReturnType) : e.code;
+          const code = this.currentReturnType ? this.convertImplicit(e, this.currentReturnType) : e.code;
           if (this.tryFrames.length === 0) {
             this.line(`return ${code};`);
           } else {
@@ -34482,7 +34482,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       const f = this.symbols.fieldSlot(info.superClass, target.property);
       if (f) {
         let code = expr.op === '='
-          ? this.convert(this.emitExpr(expr.value), f.type)
+          ? this.convertImplicit(this.emitExpr(expr.value), f.type)
           : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), f.type);
         // `super.name = null` is the same DisplayObject slot and takes the same
         // TypeError #2007 guard as `this.name = null`.
@@ -34589,7 +34589,7 @@ void FileStream_writeObject(void* _this, as_value v) {
             // Compound assignment folds the old value in (`C.f += v` =>
             // `C.f = C.f OP v`), matching AS3 semantics.
             const code = expr.op === '='
-              ? this.convert(this.emitExpr(expr.value), sf.type)
+              ? this.convertImplicit(this.emitExpr(expr.value), sf.type)
               : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), sf.type);
             return { code: this.sfWrite(sf.owner, target.property, code), type: sf.type };
           }
@@ -34872,7 +34872,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     const v = this.emitExpr(expr.value);
 
     if (expr.op === '=') {
-      let code = this.convert(v, t.type);
+      let code = this.convertImplicit(v, t.type);
       // AIR throws TypeError #2007 for a null/undefined DisplayObject.name, and
       // the field keeps its previous value because as_req_name throws before the
       // store. Measured on adl 51.4.1 (temp/qfix/gcadl/result16.txt): the static
@@ -39102,6 +39102,109 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'vector': return `Vector.<${this.describeType(t.elem)}>`;
       default: return t.kind;
     }
+  }
+
+  // mxmlc REJECTS an "implicit coercion" when the two static types are unrelated,
+  // and the rule is narrow (measured with mxmlc 51.4.1, temp/coerce/: a 12x10
+  // matrix of `var v:Target = source;`, plus Q.as for the `return` position):
+  //
+  //   * a `*` source coerces into ANY target, and `Object`/`Boolean` targets take
+  //     everything -- those three are the only permissive corners;
+  //   * the numeric family converts inside itself, but NOT to/from String
+  //     ("from a value of type String to an unrelated type Number");
+  //   * everything else needs a REAL subtype relation: Object->Array,
+  //     Object->Number, Object->String, Array->Function and Date->Sprite2 are all
+  //     errors ("possibly unrelated"), while subclass->superclass is not.
+  //
+  // We used to accept every one of those and coerce at run time. That silently
+  // compiled programs the reference compiler refuses, and the coercion chose a
+  // conversion AIR never performs. The check has to stay OUT of explicit casts and
+  // `as` (X(v) is a cast, not a coercion), which do not go through convert().
+  private checkImplicitCoercion(src: CType, target: CType): void {
+    if (src.kind === 'any' || src.kind === 'null' || src.kind === 'void') return;
+    if (target.kind === 'any' || target.kind === 'bool') return;
+    const scalar = (k: string): boolean =>
+      k === 'string' || k === 'number' || k === 'int' || k === 'uint' || k === 'int64' || k === 'uint64';
+    if (target.kind === 'string') {
+      // Only a String source (and the permissive corners above) reaches a String
+      // slot; Object->String is an error, and a Number DOES have to be spelled
+      // String(v) -- AIR refuses `var s:String = 5` outright. E4X is the one
+      // exception: XML and XMLList implicitly stringify (measured with mxmlc
+      // 51.4.1, temp/coerce/X.as: `var s:String = l` and `= x` compile, while
+      // `var l2:XMLList = x` is "from a value of type XML to an unrelated type
+      // XMLList"). Our XMLList is an internal C type, so it must be named here.
+      if (src.kind !== 'string' && src.kind !== 'xml' && src.kind !== 'xmllist') {
+        throw this.implicitCoercionError(src, target);
+      }
+      return;
+    }
+    if (target.kind === 'number' || target.kind === 'int' || target.kind === 'uint') {
+      // The numeric family interconverts, except String: AS3 has no implicit
+      // String->Number (`var n:Number = "5"` is the classic mxmlc error).
+      if (!(src.kind === 'number' || src.kind === 'int' || src.kind === 'uint'
+            || src.kind === 'int64' || src.kind === 'uint64')) throw this.implicitCoercionError(src, target);
+      return;
+    }
+    if (target.kind === 'array') {
+      if (src.kind === 'array') return;
+      // `class X extends Array` IS an Array; a plain object/vector is not.
+      if (src.kind === 'object' && this.symbols.getClass(src.className)?.arrayBacked) return;
+      throw this.implicitCoercionError(src, target);
+    }
+    if (target.kind === 'function') {
+      if (src.kind !== 'function') throw this.implicitCoercionError(src, target);
+      return;
+    }
+    if (target.kind === 'class') {
+      if (src.kind !== 'class') throw this.implicitCoercionError(src, target);
+      return;
+    }
+    // A class-typed slot takes the same class or a subclass (and only that).
+    // Interfaces are deliberately NOT checked: our built-in interface tables are
+    // narrower than playerglobal's, so a 'not implemented' verdict here could
+    // reject valid AIR code -- the failure mode this whole check must avoid.
+    if (target.kind === 'object' && src.kind === 'object') {
+      if (src.className === target.className) return;
+      if (this.symbols.isSubclassOf(src.className, target.className)) return;
+      // Object is the root: every class is one, so Object targets are fine.
+      if (target.className === 'Object') return;
+      // `class X extends Array` into an Array-typed slot is legal even though the
+      // C struct has no Array in its vtable chain.
+      if (this.symbols.getClass(target.className)?.arrayBacked
+          && this.symbols.getClass(src.className)?.arrayBacked) return;
+      throw this.implicitCoercionError(src, target);
+    }
+  }
+
+  private implicitCoercionError(src: CType, target: CType): CodegenError {
+    const where = this.currentClass ? ` in ${this.currentClass}${this.currentMethod ? '.' + this.currentMethod : ''}` : '';
+    // Name the types the way AS3 spells them (describeType is lowercase for the
+    // built-in C kinds, and "implicit coercion … type array" reads like a typo).
+    const as3 = (t: CType): string => {
+      switch (t.kind) {
+        case 'string': return 'String';
+        case 'number': return 'Number';
+        case 'array': return 'Array';
+        case 'function': return 'Function';
+        case 'xmllist': return 'XMLList';
+        case 'xml': return 'XML';
+        case 'record': case 'dict': return 'Object';
+        case 'vector': return `Vector.<${(t as { elem: CType }).elem.kind}>`;
+        default: return this.describeType(t);
+      }
+    };
+    return new CodegenError(
+      `implicit coercion of a value of type ${as3(src)} to a possibly unrelated type ${as3(target)}${where}`);
+  }
+
+  // The declared-type coercion points (a variable's initializer, an assignment to
+  // a declared slot, a `return`, a field/static initializer) run mxmlc's implicit
+  // coercion check first. It does NOT live inside convert(): convert() is also the
+  // internal unification path (ternary branches, dynamic dispatch plumbing), and
+  // rejecting there made a `cond ? "s" : 5` expression a hard error.
+  private convertImplicit(e: { code: string; type: CType }, target: CType): string {
+    this.checkImplicitCoercion(e.type, target);
+    return this.convert(e, target);
   }
 
   private convert(e: { code: string; type: CType }, target: CType): string {

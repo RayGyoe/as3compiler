@@ -39,7 +39,7 @@ check(bag.k == "你好", "a dynamic property holding an XML");
 // includes TEXT nodes (adl 51.4.1: <a>t<b/></a> has two children for `.*`), so
 // x.* on <a>你好</a> is a one-item list holding the text node, not an empty list.
 var emptyList:XMLList = x.nope;
-var s0:String = emptyList;
+var s0:String = String(emptyList);
 check(s0 == "", "an empty XMLList stringifies to the empty string, got '" + s0 + "'");
 check(x.*.length() == 1 && String(x.*) == "你好", "the wildcard axis includes the text child");
 var attr:XMLList = <b n="v"/>.@n;

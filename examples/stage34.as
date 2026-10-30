@@ -32,7 +32,7 @@ trace("after reorder:", s.getChildAt(0) == b);  // true
 // removeChild / removeChildAt reset parent.
 s.removeChild(a);
 trace("removed:", !s.contains(a) && a.parent == null); // true
-var removed:Sprite = s.removeChildAt(0);
+var removed:DisplayObject = s.removeChildAt(0);
 trace("removedAt:", removed == b && b.parent == null); // true
 
 // nested containers: root walks to the topmost ancestor.
