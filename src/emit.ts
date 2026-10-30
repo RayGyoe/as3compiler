@@ -970,12 +970,18 @@ export class Emitter {
         // CType.className is the C identifier ("pkg_Thing"); the AS3 fqn lives on the
         // class info ("pkg::Thing"). Built-in classes carry reflectFqn (measured on
         // adl 51.4.1, temp/pkgA/fqn-result.txt) so a Vector element spells
-        // "__AS3__.vec::Vector.<flash.display::Sprite>"; an interface still falls
-        // back to its short name (interfaces have no fqn yet -- TODO.md backlog).
+        // "__AS3__.vec::Vector.<flash.display::Sprite>". Interfaces carry their own
+        // reflectFqn in the next branch (adl: Vector.<flash.events::IEventDispatcher>).
         const ci = this.symbols.getClass(elem.className);
         return ci?.fqn ?? ci?.reflectFqn ?? elem.className;
       }
-      case 'interface': return elem.name;
+      case 'interface': {
+        // An interface element is spelled with its qualified name, exactly like a
+        // class element: adl 51.4.1 (temp/qcn/Main12) gives
+        // "__AS3__.vec::Vector.<flash.events::IEventDispatcher>" -- the short name
+        // only looks right for interfaces that sit at the top level.
+        return this.symbols.interfaces.get(elem.name)?.reflectFqn ?? elem.name;
+      }
       case 'array': return 'Array';
       case 'function': return 'Function';
       case 'xml': return 'XML';
@@ -4601,8 +4607,8 @@ export class Emitter {
 // Deliberate gaps, documented in docs/zh-cn/xml.md:
 //   * <factory> lists no STATIC members (we carry no static reflection table);
 //   * <metadata> is never emitted;
-//   * an int literal and a Number box both report "Number" (box tag 1 cannot tell
-//     them apart; AIR reports "int" for describeType(1));
+//   * numbers answer by value (a boxed int and a Number are one tag in AIR too),
+//     so describeType(1).@name is "int" while 1.5 and 2^28 are "Number";
 //   * a built-in trait our reflection tables do not model at all cannot appear,
 //     and a modelled built-in accessor pair whose getter is listed without a
 //     setter in our tables reports "readwrite";
@@ -4827,7 +4833,13 @@ static as_xml_node* as_describe_type(as_value v) {
         int dyn = 1;
         int fin = 0;
         int is_vec = 0;
-        if (v.tag == 1 || v.tag == 8 || v.tag == 9) { nm = "Number"; dyn = 0; fin = 1; }
+        // A number answers by VALUE, exactly like getQualifiedClassName: AIR has no
+        // way to tell a boxed int from a Number, so describeType(1) is "int" while
+        // describeType(1.5) and describeType(2^28) are "Number" (measured on adl
+        // 51.4.1, temp/qcn/Main13). The 64-bit enhancement's tags have no AIR
+        // counterpart, so they keep the plain "Number" spelling.
+        if (v.tag == 1) { nm = as_get_qualified_class_name(v); dyn = 0; fin = 1; }
+        else if (v.tag == 8 || v.tag == 9) { nm = "Number"; dyn = 0; fin = 1; }
         else if (v.tag == 2) { nm = "Boolean"; dyn = 0; fin = 1; }
         else if (v.tag == 3) { nm = "String"; dyn = 0; fin = 1; }
         else if (v.tag == 6) nm = "Array";
@@ -37221,7 +37233,14 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'abs': return { code: `fabs(${a[0]})`, type: { kind: 'number' } };
       case 'floor': return { code: `floor(${a[0]})`, type: { kind: 'number' } };
       case 'ceil': return { code: `ceil(${a[0]})`, type: { kind: 'number' } };
-      case 'round': return { code: `round(${a[0]})`, type: { kind: 'number' } };
+      // Math.round is ES3's round: floor(x + 0.5), NOT C's round() (which rounds
+      // halves away from zero). The difference is observable. Measured on adl
+      // 51.4.1 (temp/qcn/Main8): round(-0.5) is +0 (1/r = +Infinity, we gave -1),
+      // round(-2.5) is -2 (we gave -3), and round(0.49999999999999994) is 1 --
+      // because 0.49999999999999994 + 0.5 rounds up to 1.0 in double, which only
+      // the floor(x+0.5) form reproduces. NaN/+-Infinity fall out unchanged
+      // (NaN+0.5 and +-Inf+0.5 are NaN/+-Inf).
+      case 'round': return { code: `floor((${a[0]}) + 0.5)`, type: { kind: 'number' } };
       case 'sqrt': return { code: `sqrt(${a[0]})`, type: { kind: 'number' } };
       case 'pow': return { code: `pow(${a[0]}, ${a[1]})`, type: { kind: 'number' } };
       case 'min': return { code: `fmin(${a[0]}, ${a[1]})`, type: { kind: 'number' } };

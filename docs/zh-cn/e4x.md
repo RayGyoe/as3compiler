@@ -220,7 +220,7 @@ Starling 连纹理图集和位图字体都加载不了**，是渲染管线的硬
 | `<constructor>` | 仅当构造器**有参数**时出现（签名走 `as_dt_ctors[]` 侧表 —— 只有带参构造器、自身又无方法的类，方法表里没有它的位置） |
 | 接口名 | 走 `as_dt_iface_names[]` 侧表（接口 vtable 只有 5 字段前缀，没有 `fqn` 槽位） |
 | `Object` 自身成员 | **从不列**（子类与普通对象都一样）⇒ `describeType({})` 就是一个裸的 `<type name="Object" isDynamic="true" isFinal="false" isStatic="false"/>` |
-| 基元 / 容器 | `int`/`Number`/`String`/`Boolean` → `isDynamic=false`、`isFinal=true`（`String` 另有只读 `length`）；`Array` → dyn=true/fin=false + 可读写 `length`(uint)；`Vector.<int>` → dyn=true/**fin=true**；`flash.utils::Dictionary` → dyn=true；`Date` 无包名 |
+| 基元 / 容器 | `int`/`Number`/`String`/`Boolean` → `isDynamic=false`、`isFinal=true`（`String` 另有只读 `length`）；**数值的 `@name` 按值域**（与 `getQualifiedClassName` 同口径，阶段三百三十四：`describeType(1)` 是 `int`、`1.5` 与 `2^28` 是 `Number`，`temp/qcn/Main13` 实测）；`Array` → dyn=true/fin=false + 可读写 `length`(uint)；`Vector.<int>` → dyn=true/**fin=true**；`flash.utils::Dictionary` → dyn=true；`Date` 无包名 |
 | `describeType(null)` | **空串**；`describeType(undefined)` 抛 `#1010` |
 | 成员顺序 | AIR 是**不可复现的哈希序**，我们按声明序 —— 这是**刻意**的差异（`adl` 自己的顺序每次运行都可能不同） |
 

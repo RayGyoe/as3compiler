@@ -884,3 +884,79 @@ function checkClassValues(): string[] {
   return bad;
 }
 registerGroup('unit: reflection/ClassValues', checkClassValues);
+
+// ---- numeric caliber of reflection names (stage 334) ----
+// adl 51.4.1 measured (temp/qcn/, Main.as..Main12.as): getQualifiedClassName
+// answers NUMBERS BY VALUE, inside a 29-bit window, because AIR has no way to
+// tell a boxed int from a Number that holds an integral value. 268435455 -> int,
+// 268435456 -> Number, 2147483647 -> Number, uint(5) -> int, and negative zero is
+// the one exception in the window. Dictionary also reports its AS3 name, and a
+// Vector's interface element is spelled with its package.
+function checkNumericNameCaliber(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [numname] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [numname] ${label}`); }
+  };
+  const preamble = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const qcn = preamble.slice(preamble.indexOf('static char* as_get_qualified_class_name(as_value v) {'));
+  const qcnBody = qcn.slice(0, qcn.indexOf('\n}\n'));
+
+  check('a number answers by value, not by the slot tag (case 1 no longer returns "Number" outright)',
+    /case 1: \{[\s\S]*?double d = v\.num;/.test(qcnBody));
+  check('the window is [-2^28, 2^28-1], not int32 (268435456 is a Number in AIR)',
+    qcnBody.includes('d >= -268435456.0 && d <= 268435455.0'));
+  check('negative zero is excluded from the window',
+    qcnBody.includes('!(d == 0.0 && signbit(d))'));
+  check('Dictionary reports its AS3 name',
+    qcnBody.includes('if (kind == GCT_DICT) return "flash.utils::Dictionary";'));
+
+  const qscn = preamble.slice(preamble.indexOf('static char* as_get_qualified_superclass_name(as_value v) {'));
+  const qscnBody = qscn.slice(0, qscn.indexOf('\n}\n'));
+  check('but a Dictionary still extends Object',
+    qscnBody.includes('if (kind == GCT_DICT) return (char*)"Object";'));
+
+  // Math.round is ES3's floor(x+0.5), not C's round() (adl: round(-0.5) is +0,
+  // round(-2.5) is -2, round(0.49999999999999994) is 1).
+  const rc = generateC(parse('var x:Number = 1.5;\nvar r:Number = Math.round(x);\n')).c;
+  check('Math.round emits floor(x + 0.5)',
+    rc.includes('floor((') && rc.includes(') + 0.5)') && !rc.includes('round('));
+
+  // A Vector's interface element carries the package, like a class element.
+  const vc = generateC(parse([
+    'import flash.events.IEventDispatcher;',
+    'var v:Vector.<IEventDispatcher> = new Vector.<IEventDispatcher>();',
+    '',
+  ].join('\n'))).c;
+  check('an interface Vector element is spelled with its package',
+    vc.includes('__AS3__.vec::Vector.<flash.events::IEventDispatcher>'));
+  const sc = generateC(parse([
+    'var v:Vector.<String> = new Vector.<String>();',
+    '',
+  ].join('\n'))).c;
+  check('...while a top-level class element stays short',
+    sc.includes('__AS3__.vec::Vector.<String>'));
+
+  const ex = readFileSync(join(dir, 'reflection-name.as'), 'utf8');
+  check('the example pins the window edges',
+    ex.includes('getQualifiedClassName(268435455) == "int"')
+    && ex.includes('getQualifiedClassName(268435456) == "Number"')
+    && ex.includes('getQualifiedClassName(2147483647) == "Number"')
+    && ex.includes('getQualifiedClassName(-268435456) == "int"'));
+  check('the example pins the static-type-independence and dictionary cases',
+    ex.includes('getQualifiedClassName(nv) == "int"')
+    && ex.includes('getQualifiedClassName(dict) == "flash.utils::Dictionary"'));
+  check('the example pins negative zero and the interface Vector element',
+    ex.includes('getQualifiedClassName(negZero) == "Number"')
+    && ex.includes('__AS3__.vec::Vector.<flash.events::IEventDispatcher>'));
+  const exr = readFileSync(join(dir, 'math-round.as'), 'utf8');
+  check('the round example pins the three cases C round() got wrong',
+    exr.includes('round(-0.5) is +0, not -1')
+    && exr.includes('round(-2.5) is -2, not -3')
+    && exr.includes('round(0.49999999999999994) is 1'));
+
+  if (ok > 0) console.log(`[numname] ${ok} numeric-name checks passed`);
+  return bad;
+}
+registerGroup('unit: reflection/NumericNameCaliber', checkNumericNameCaliber);

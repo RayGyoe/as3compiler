@@ -5310,9 +5310,21 @@ static char* as_ptr_typeof(void* p) {
 // name ("包::类", e.g. "starling.display::DisplayObject"). Primitives map to the
 // canonical name strings; object instances and Class references both carry the
 // class vtable as their first field (as_object_header / as_class), so both read
-// the vtable's 'fqn' slot. NOTE: int/uint are boxed as number (tag 1) by boxExpr,
-// so getQualifiedClassName(5) yields "Number" rather than "int" — a documented
-// precision limit (Starling never reflects primitives, so it is moot there).
+// the vtable's 'fqn' slot.
+//
+// Numbers answer by VALUE, not by the slot's static type: AIR has no way to tell a
+// boxed int from a Number that happens to hold an integral value, so both say
+// "int" — and only inside a 29-bit window. Measured on adl 51.4.1 (temp/qcn/):
+// a double from Math.sqrt(25), Number("5"), an int->Number widening and Date.time
+// of 0 all answer "int"; 268435455 answers "int" while 268435456, -268435457,
+// 2147483647 and 4294967295 answer "Number". The window is exactly
+// [-2^28, 2^28-1] (AVM2 tags int atoms with three low bits in a 32-bit word, so
+// its int probe saturates there) — matching an int32 test instead would disagree
+// with AIR for every int-typed variable above 2^28. uint never appears:
+// getQualifiedClassName(uint(5)) is "int" even though "5 is uint" is true, and
+// uint values outside the window answer "Number". "x is int" keeps its own, wider
+// int32 value-domain caliber (as_v_is_int32); the two predicates are not the same
+// question and AIR does not pretend otherwise.
 // Heap kind of a boxed pointer (a GCT_* tag), or -1 when the pointer is not a
 // GC object body at all (a static vtable / class descriptor / literal). Box-value
 // reflection must ask this before reading a vtable slot: an Array and a Vector
@@ -5342,7 +5354,14 @@ static const char* (*as_vec_super_fqn_hook)(void* ptr) = NULL;
 static char* as_get_qualified_class_name(as_value v) {
     switch (v.tag) {
         case 0: return "null";
-        case 1: return "Number";   // int/uint box into number (see note above)
+        case 1: {
+            // Value-domain 29-bit window — see the note above. Negative zero is the
+            // one exception in the window: AIR answers "Number" for -0.0 but "int"
+            // for +0.0 (measured: 0.0 / -0.0 / z*1 / Math.min(0,-0) vs z+0).
+            double d = v.num;
+            if (d >= -268435456.0 && d <= 268435455.0 && d == floor(d) && !(d == 0.0 && signbit(d))) return "int";
+            return "Number";
+        }
         case 2: return "Boolean";
         case 3: return "String";
         case 5: return "void";     // undefined
@@ -5367,7 +5386,11 @@ static char* as_get_qualified_class_name(as_value v) {
                 return "Array";
             }
             if (kind == GCT_ARRAY) return "Array";
-            if (kind == GCT_DICT) return "Object";   // Dictionary is a C kind, not a modeled class
+            // Dictionary is a C kind, not a modeled class, but AIR still reports the
+            // AS3 name (adl 51.4.1: getQualifiedClassName(new Dictionary()) is
+            // "flash.utils::Dictionary"; getQualifiedSuperclassName is "Object",
+            // which the generic vtable-less path below already answers).
+            if (kind == GCT_DICT) return "flash.utils::Dictionary";
             void* vt = ((as_object_header*)v.ptr)->vtable;
             return (char*)(vt ? ((as_vtable_header*)vt)->fqn : "Object");
         }

@@ -2146,8 +2146,10 @@ HUD `457 created 1720 reused FPS 80`，且 `sprite.rotation += 0.1` 复合成赋
   往返闭环（`MainMenu` 存 `getQualifiedClassName(sceneClass)` → `Game` 用 `getDefinitionByName(name)` 取回）依赖这一致性。
 - `as_class` 与 `as_object_header` 第一字段都是 `vtable`，故 `as_class*` box 成 tag 4 后 `getQualifiedClassName` 读 `((as_object_header*)ptr)->vtable`
   即得类 vtable、返回类名——Class 值与实例值走同一路径，无需额外分支。
-- **int/uint 精度限制**：`boxExpr` 把 int/uint 均 box 成 number（tag 1），故 `getQualifiedClassName(5)` 返回 `"Number"` 而非 `"int"`
-  （AS3 中 5 是 int 字面量应返回 `"int"`）。Starling 全部调用只传对象/Class 值，不传原始类型，故无影响；README「当前限制」已记录。
+- **int/uint 精度限制**（**2026-10-30 阶段三百三十四 已修复，此处保留历史记录**）：`boxExpr` 把 int/uint 均 box 成 number（tag 1），
+  当年 `getQualifiedClassName(5)` 返回 `"Number"` 而非 `"int"`。现在 tag 1 分支按**值域**回答
+  （整数在 `[-2^28, 2^28-1]` 内给 `"int"`、其余 `"Number"`、`-0.0` 给 `"Number"`），与 `adl 51.4.1` 逐项一致；
+  见阶段三百三十四 与 `examples/reflection-name.as`。
 - 注册表只收用户类（内建类 `packageName` 为空、`fqn` 未填），故 `getDefinitionByName("flash.display.Sprite")` 会抛 ReferenceError
   ——与「内建 flash 类不进注册表」一致；本项目无 AIR 运行时，`NativeApplication` 等 AIR 专属类天然缺失即正确语义。
 
@@ -18255,7 +18257,59 @@ AGENTS §1.5 记为增强面（下方增强表），示例里不对它们作运�
 接口 vtable）。`test/unit/reflection.ts` 的 4 条 `as_class` 初始形钉补齐两个新槽。
 全量 `node test.ts` ⇒ 565 passed / 0 failed。
 
+### 阶段三百三十四：反射名的数值口径、`Dictionary` 反射名、`Vector.<接口>` 元素名与 `Math.round`（v0.4.294 → v0.4.295）
+
+**范围**（包 G 收尾的反射口径面）：`TODO.md` 遗留表里「反射 API 的内建类名口径不忠实」这一行
+剩下的三处（② int/uint 装箱、③ `Dictionary`、以及 `Vector.<T>` 内建/接口元素名），加上实测途中
+暴露的一个**真数值 bug**（`Math.round`）。全部以 `adl 51.4.1` 双端实测（证据台 `temp/qcn/`，
+Main.as / Main2.as / Main4.as / Main5.as / Main6.as / Main7.as / Main8.as / Main11.as / Main12.as
+走 `mxmlc`+`adl`，逐行输出在 `~/Documents/qcn-out*.txt`；我们的对照程序在 `temp/qcn/ours/`）：
+
+1. **`getQualifiedClassName` 对数值是值域判定**，不是静态类型：AIR 的 `*` 槽里 int 与 Number
+   是同一个 double，于是按**值**回答 —— 整数值落在 **[-2^28, 2^28-1]** 给 `"int"`，其余给 `"Number"`。
+   实测锚点：`5 → int`、`5.5 → Number`、`268435455 → int`、`268435456 → Number`、
+   `-268435456 → int`、`-268435457 → Number`、`2147483647 → Number`、`3000000000 → Number`；
+   `var n:Number = 5` 与 `Math.sqrt(25)`（运行期算出的 double 5.0）也给 **int**，
+   证明判定与静态类型无关。窗口是 **2^28** 而不是 int32——AVM2 的 int 原子用 3 个低位做 tag
+   （32 位字），int 探针在 2^28 处饱和；照 int32 写会在「大于 2^28 的 int 变量」上系统性错。
+2. **`uint` 永不出现**：`uint(5) → int`、`uint.MAX_VALUE → Number`、`4294967295 → Number`，
+   尽管 `5 is uint` 为 true（`is` 是另一条口径，仍是 int32 值域，见阶段三百二十八）。
+3. **负零是窗口内唯一例外**：`-0.0 → Number`，而 `+0.0 → int`；`-0 + 0 → int`、
+   `-0 * 1 → Number`（`retainMath` 的每条都量过，Main7 的 Z1~Z11）。
+4. **`Dictionary` 报 AS3 名**：`getQualifiedClassName(new Dictionary()) == "flash.utils::Dictionary"`，
+   父类仍是 `"Object"`（`GCT_DICT` 在自己的分支里回答，不进 vtable 读）。
+5. **`Vector.<接口>` 的元素名带包限定名**：`__AS3__.vec::Vector.<flash.events::IEventDispatcher>`
+   （与类元素同口径；`Vector.<int>`/`Vector.<String>` 等顶层元素仍是短名，逐项对过 Main12）。
+6. **`Math.round` 是 ES3 的 `floor(x + 0.5)`，不是 C 的 `round()`**：`round(-0.5)` 是 **+0**
+   （C 给 -1）、`round(-2.5)` 是 **-2**（C 给 -3）、`round(0.49999999999999994)` 是 **1**
+   （C 给 0，因为 `x+0.5` 在 double 里先舍入成 1.0）。Main8 的 14 个样本 + `1/r` 符号逐行对齐；
+   `ceil`/`floor` 在负零上本来就对（`ceil(-0.5)`/`floor(-0.0)` 都是 `-0`），不动。
+
+7. **`describeType` 的数值 `@name` 同口径**：`describeType(1).@name` 是 `"int"`、`describeType(1.5)` 与
+   `describeType(268435456)` 是 `"Number"`（Main13 实测）。此前我们一律报 `"Number"`，且
+   `examples/describe-type.as` 把这一处错值钉成了期望值；现与 `getQualifiedClassName` 共用同一个
+   值域判定，示例改为三条（1 / 1.5 / 2^28）。
+
+**顺带量到但**没有**修的一条**（已登记为遗留）：AIR 的 int/uint 算术**在 double 里算、不回绕**
+（`2147483647 + 1 = 2147483648`、`2000000000 * 2 = 4000000000`、`46341 * 46341 = 2147488281`、
+`-1 * 0` 得 **-0**），只有落到 int 变量时才按 ToInt32 回绕；我们按 C 的 int32 算，故这些
+「溢出后仍当 Number 用」的形态会差。这不是反射问题，属跨切面数值口径，单独登记。
+
+**为什么窗口要照抄而不是「按 AS3 语义更合理」的 int32**：AGENTS §1.5 的第一条是「AIR 已定义的
+语义逐字对齐」。这里 AIR 的行为稳定、可复现、不自相矛盾（`-0.0` 的例外也稳定），没有 §1.5
+所说的「AIR 自己跑不通」的证据，所以按实测窗口实现，并在 `docs/zh-cn/as3-semantics.md` 写清
+它与 `is int` 的口径差异。将来若 AIR 改口径，`unit: reflection/NumericNameCaliber` 的
+四道窗口钉会先红。
+
+**验收**：`examples/reflection-name.as`（5 节，28 条断言：窗口四边界、静态类型无关、负零、
+`Dictionary`、`Vector.<接口>` 元素名）与 `examples/math-round.as`（21 条断言：三个 C `round()`
+会错的值 + 负零 + 极值 + NaN/±Infinity）；`unit: reflection/NumericNameCaliber` 新增 11 钉
+（tag-1 分支按值回答、窗口常量、`signbit` 排除负零、`GCT_DICT` 两个方向、`Math.round` 的
+`floor((x) + 0.5)` 形态、接口元素名的生成 C、两份示例的黄金值）；`examples/describe-type.as`
+的数值 `@name` 三条改为实测值。全量 `node test.ts` ⇒ **569 passed / 0 failed**。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百三十四：反射名的数值口径 · `Dictionary` · `Vector.<接口>` 元素名 · `Math.round`）**：**新登记 1 行 / 改写 1 行 / 移出 0 行**。**改写的 1 行**是「反射 API 的内建类名口径不忠实」⇒ 转**已完成**：② int/uint 装箱（值域窗口 [-2^28, 2^28-1] + 负零例外）、③ `Dictionary`（报 `flash.utils::Dictionary`）、以及 `Vector.<T>` 的内建/接口元素名（改查 `interfaces` 表的 `reflectFqn`）三处都已双端对齐，①（内建类 vtable `fqn`）与 ④（内建类/接口作 Class 值）在阶段一百二十七 / 三百三十三 已收口。**新登记 1 行**是本轮为对齐反射名而量到、但**不属于反射**的一条真分歧：AIR 的 int/uint 算术在 double 里做、不回绕（`2147483647 + 1` 得 `2147483648`、`-1 * 0` 得 `-0`），我们按 C 的 int32 算会回绕——跨切面改数值域，单独一行记账。**本阶段顺带修净、不占表的一条**：`Math.round` 此前用 C 的 `round()`（`round(-0.5)` 给 -1、`round(-2.5)` 给 -3、`round(0.49999999999999994)` 给 0 三处与 AIR 不同），同阶段改为 `floor(x + 0.5)`。
 > **2026-10-30 追加（阶段三百三十三：值位置上的类名）**：**新登记 2 行 / 改写 1 行 / 移出 0 行**。**改写的 1 行**是「包装类（`String`/`Number`/`int`/`uint`/`Boolean`）作 Class 值一律 `CodegenError`」⇒ 转**已完成**（连同接口、`Vector.<T>`、`Function`/`Class` 一起）。**新登记的第 1 行**是同一面上量出来、但不在本轮范围的**潜在面**：`Function`/`Class` 这两个**类值本身**现在是合法值，但把一个 `Class` 类型的变量当**函数调用**（`var c:Class = Class; c()`）仍走「不是函数」的路径报 `#1006`，而 AIR 在 `Class` 上是 `#1112 Argument count mismatch on class coercion`（`temp/gprobe N6`）—— `new (c)()` 已按 AIR 对齐，纯调用形态没动。**新登记的第 2 行**是 `getQualifiedClassName(5)`（AIR 是 `int`、我们仍是 `Number`），本轮**顺带量到但没有一起改**：`5 is <int class>` 的值域口径已对齐（`as_class_is_val`），而**反射名**走的是另一条路（box tag → 类型名），改它要动 `as_v_typeof` 的同族映射，属独立立项。
 >
 > **2026-10-30 追加（阶段三百三十二：属性接收者的括号读）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**。本条是阶段三百二十六 引入的**回归**（不是既存遗留），同阶段修净，按表头「已完成项一经落地即从本表移出」不入表。**如实留一笔潜在面**：`classRefName` 的裸名分支对**任何**未识别标识符都返回类名（历史行为，服务于 `String`/`Number`/`Math` 这类无 `ClassInfo` 的静态类），本轮只在 `varInScope` 侧把「实例访问器也是值」补齐；若将来再出现新的「裸名非值」形态（例如同名**方法**取函数值后下标），仍需在 `varInScope` 这一处统一收口，而不是在 `emitIndex` 逐分支打补丁。
@@ -18496,7 +18550,8 @@ AGENTS §1.5 记为增强面（下方增强表），示例里不对它们作运�
 | `with` 作用域**不进入闭包体**（`adl` 会把 with 作用域捕获进闭包链） | 未开始（2026-10-03 阶段九十四·二 主动登记的实现边界） | 实现上用 `this.withScopes` 栈表示作用域链，而 `emit` 的匿名函数体发射会**临时清空该栈**（`anonFuncs` 循环里 save → `[]` → restore），故 `with (o) { var f = function():* { return x; } }` 里的 `x` **不会**解析到 `o`；`adl` 里闭包按创建时的作用域链捕获，`x` 解析到 `o.x`。当前是**明确的未支持**：闭包体里若含未定义名会照常报编译期错误（不静默取错值）。 | 若要落地需给「闭包创建点」保存一份 with 作用域快照并在闭包体内发射时还原；与 `x4/x5`（`this` 绑定）同一段代码路径，宜同批做 |
 | `with` 体内给「对象与词法作用域都没有」的名字赋值仍是**编译期错误**（`adl` 会创建隐式全局） | **部分完成**（2026-10-30 阶段三百三十：**脚本层**已实现，含 `with` 落回；**函数体内**仍是编译期错误） | `mxmlc 51.4.1` 实测把边界钉在**作用域**上：同一个 `gvar = 42` 写在类方法里是硬错误（「所访问的属性 gvar 可能未定义」），读写都一样；帧脚本的非严格半边 mxmlc 无法产出（时间轴脚本只来自 `.fla`），故按 ES3 规则实现并在文档里标明「唯一一处以规范作裁判」。隐式全局槽初值 **undefined**（不是 `*` 默认的 null），与声明/函数/类同名的名字一律排除 | 残留：**函数体**（含函数体内的 `with`）内的未声明名赋值仍报 `undefined variable`；若将来可造出帧脚本对照，再决定是否放开 |
 | VM 抛错文案与未捕获打印格式与 `adl` **不逐字一致**（编号/异常类/时机一致） | 未开始（2026-10-03 阶段九十四·二 实测登记；**既有全局差异**，with 只是又新增 4 个发射点） | `adl 51.4.1` 实测（探针 `temp/errprobe/`）：`e.message` 对 VM 抛错是**短式**——`with (null)` → `Error #1009`、`with (undefined)` → `Error #1010`、`f()`（`f:Function = null`）→ `Error #1006`、`throw new Error("custom")` → `custom`（自定义 `Error` 保留用户文案）、`throw new TypeError("tmsg",1234)` → `tmsg`；`Error.getErrorMessage(1009)` 同样是 `Error #1009`；`String(e)`/`e.toString()` = `TypeError: Error #1009`；**未捕获**打印恰好是 `<异常类名>: <message>`（无前缀）。本子集自阶段「异常」起用带描述的长文案（`Error #1009: Cannot access a property or method of a null object reference.` 等，约 36 处发射点），未捕获走 `Uncaught exception: <message>`；`e.name` 在本子集是**编译期错误**（未声明）。**结论**：编号、异常类与抛出时机全部一致，仅**文案与打印前缀**不同，故登记为遗留而非误实现。 | 若要逐字对齐：把 VM 抛错文案统一改为短式 `Error #<id>`（`Error.getErrorMessage` 走同一表；用户文案的自定义 `Error` 保持原样），未捕获打印改为 `<类名>: <message>`，并给 `Error` 补 `name`/`getErrorMessage`。属跨切面改动（约 36 个发射点 + runtime 助手），宜单独立项、一次性对齐 + 全量 `test.ts` 回归 |
-| 反射 API 的**内建类名口径**不忠实（`getQualifiedClassName`/`getQualifiedSuperclassName`） | **部分完成**（2026-10-03 阶段九十四·三 登记；**2026-10-09 阶段一百二十七 实测：①④ 已对齐/部分对齐，②③ 仍缺**） | **更正（2026-10-09 阶段一百二十七 实测，探针 `temp/pkg1d/Qn.as`）**：① **已对齐** —— `getQualifiedClassName(new Sprite())` = `flash.display::Sprite`、`getQualifiedSuperclassName(new Sprite())` = `flash.display::DisplayObjectContainer`、`qc(new BitmapData(1,1))` = `flash.display::BitmapData`、`qs(new Sprite())` = `Object`（与 `adl` 的 A1/B1/A2 逐字相同：内建类的 vtable `fqn` 槽早已是包限定名，本行 ① 属**陈旧记载**）；**同一根因下 `getDefinitionByName("flash.display.BitmapData")` 也已可用**（注册表已收录内建类，阶段一百二十七）。④ **部分对齐** —— 内建**类**作 Class 值已可（`var c:Class = Object`、`BitmapData is Class`），**接口**仍不可（`getQualifiedClassName(IDataInput)` 报 `undefined variable`）。**仍缺**：② `int`/`uint` 装箱成 number ⇒ `getQualifiedClassName(5)` 给 `"Number"` 而非 `"int"`（实测 Q3；`boxExpr` 的 tag 1，数字与整型不区分）；③ `Dictionary` 是特殊 C 类型（`kind:'dict'`）而非建模类 ⇒ `getQualifiedClassName(new Dictionary())` 给 `"Object"`、`getQualifiedSuperclassName` 给 `"Object"`（实测 Q4），而 `adl` 给 `"flash.utils::Dictionary"`/`"Object"`。`Vector.<T>` 的元素名口径见下段阶段九十四·五 证据（未变）。 | 修法：给 `int`/`uint` 单独一个 box tag（tag 引入需同步补 `as_v_typeof`/`as_v_truthy`/`as_v_eq`/`as_v_str_val`/`gc_mark_value`/写屏障，见 AGENTS.md §2.4 红线）；`dict` 需要一条「虚拟 vtable」才能参与反射。属跨切面改动，宜单独立项。 **阶段九十四·五 新增证据（`Vector` 类名已部分修复，本行剩余口径仍适用）**：`adl 51.4.1` 实测（探针 `temp/a5probe/`）——`getQualifiedClassName(Vector.<T>)` 的**元素名**对**内建类/接口**元素（`String`/`Boolean`/`Object`/`Array`/`Date`/`XML`/`XMLList`/`IEventDispatcher`）均给**包限定名**（如 `__AS3__.vec::Vector.<String>`），只有**数值**元素（`int`/`uint`/`Number`）与用户自定义类给短名/C 名；本子集已按「静态已知元素类型 + 类 fqn 查表」给出 `__AS3__.vec::Vector.<…>`（含数值元素保持 `int`/`uint` 与 `adl` 一致），但**内建类/接口元素仍是短名/C 名**（同属本行的「内建类无 fqn」根因，故不另立行）|
+| 反射 API 的**内建类名口径**不忠实（`getQualifiedClassName`/`getQualifiedSuperclassName`） | **已完成**（2026-10-03 阶段九十四·三 登记；阶段一百二十七 收口 ①④；**阶段三百三十四 收口 ②③ 与 `Vector.<T>` 元素名**） | **更正（2026-10-09 阶段一百二十七 实测，探针 `temp/pkg1d/Qn.as`）**：① **已对齐** —— `getQualifiedClassName(new Sprite())` = `flash.display::Sprite`、`getQualifiedSuperclassName(new Sprite())` = `flash.display::DisplayObjectContainer`、`qc(new BitmapData(1,1))` = `flash.display::BitmapData`、`qs(new Sprite())` = `Object`（与 `adl` 的 A1/B1/A2 逐字相同：内建类的 vtable `fqn` 槽早已是包限定名，本行 ① 属**陈旧记载**）；**同一根因下 `getDefinitionByName("flash.display.BitmapData")` 也已可用**（注册表已收录内建类，阶段一百二十七）。④ **部分对齐** —— 内建**类**作 Class 值已可（`var c:Class = Object`、`BitmapData is Class`），**接口**仍不可（`getQualifiedClassName(IDataInput)` 报 `undefined variable`）。**仍缺**：② `int`/`uint` 装箱成 number ⇒ `getQualifiedClassName(5)` 给 `"Number"` 而非 `"int"`（实测 Q3；`boxExpr` 的 tag 1，数字与整型不区分）；③ `Dictionary` 是特殊 C 类型（`kind:'dict'`）而非建模类 ⇒ `getQualifiedClassName(new Dictionary())` 给 `"Object"`、`getQualifiedSuperclassName` 给 `"Object"`（实测 Q4），而 `adl` 给 `"flash.utils::Dictionary"`/`"Object"`。`Vector.<T>` 的元素名口径见下段阶段九十四·五 证据（未变）。 | 修法：给 `int`/`uint` 单独一个 box tag（tag 引入需同步补 `as_v_typeof`/`as_v_truthy`/`as_v_eq`/`as_v_str_val`/`gc_mark_value`/写屏障，见 AGENTS.md §2.4 红线）；`dict` 需要一条「虚拟 vtable」才能参与反射。属跨切面改动，宜单独立项。 **阶段九十四·五 新增证据（`Vector` 类名已部分修复，本行剩余口径仍适用）**：`adl 51.4.1` 实测（探针 `temp/a5probe/`）——`getQualifiedClassName(Vector.<T>)` 的**元素名**对**内建类/接口**元素（`String`/`Boolean`/`Object`/`Array`/`Date`/`XML`/`XMLList`/`IEventDispatcher`）均给**包限定名**（如 `__AS3__.vec::Vector.<String>`），只有**数值**元素（`int`/`uint`/`Number`）与用户自定义类给短名/C 名；本子集已按「静态已知元素类型 + 类 fqn 查表」给出 `__AS3__.vec::Vector.<…>`（含数值元素保持 `int`/`uint` 与 `adl` 一致），但**内建类/接口元素仍是短名/C 名**（同属本行的「内建类无 fqn」根因，故不另立行）| **阶段三百三十四 收口（2026-10-30，证据 `temp/qcn/`）**：② **数值反射名改为值域判定** —— `getQualifiedClassName` 对 int/uint/Number 一律按**值**回答，整数值落在 **[-2^28, 2^28-1]** 给 `"int"`、其余 `"Number"`（窗口是 2^28 而非 int32：AVM2 的 int 原子用 3 个低位做 tag、在 2^28 处饱和；实测 `268435455 → int`、`268435456 → Number`、`2147483647 → Number`），**负零是窗口内唯一例外**（`-0.0 → Number`、`+0.0 → int`），`uint` **永不出现**（`uint(5) → int`）；`x is int` 仍是 int32 值域（阶段三百二十八），两条口径在 AIR 里本来就不同。③ **`Dictionary` 报 `flash.utils::Dictionary`**（父类仍 `Object`）。另 **`Vector.<T>` 的接口元素名**改为带包限定名（`__AS3__.vec::Vector.<flash.events::IEventDispatcher>`，`symbols.interfaces` 的 `reflectFqn`）。钉子：`examples/reflection-name.as` + `unit: reflection/NumericNameCaliber`。`describeType` 的数值 `@name` 同口径（`describeType(1)` 是 `int`、`1.5`/`2^28` 是 `Number`，`temp/qcn/Main13` 实测），此前错钉成 `Number` 的示例断言一并改正。
+| **int/uint 算术在 C 侧按 int32 回绕，AIR 在 double 里算、只在落到 int 槽时才回绕**（`adl 51.4.1`：`2147483647 + 1` 得 `2147483648`、`2000000000 * 2` 得 `4000000000`、`46341 * 46341` 得 `2147488281`、`-1 * 0` 得 **`-0`**；同一批值赋回 `int` 变量时才是 `-2147483648` / `-294967296`） | 未开始（2026-10-30 阶段三百三十四 顺带量到并登记） | 证据：`temp/qcn/Main10.as`、`Main11.as`（adl，运行期从 Array/Vector 取值以排除 `mxmlc` 常量折叠）× `temp/qcn/ours/m10.as`（我们）。**不溢出的形态两侧一致**（`5+5`、`7%2`、`100-3`、`-5` 都是 `int`），分歧只在结果超出 int32 或需要保留 `-0` 时：我们输出 `-294967296` / `1` / `-2`，AIR 输出 `4000000000` / `4611686014132420600` / `4294967294`。根因是发射层给 int×int 直接发 C 的 `int` 运算：C 的 int 加法/乘法溢出是 UB（实际回绕），而 AIR 走 ES3 的 double 加法后按值域归一 | 修法（跨切面，须独立阶段）：`+`/`-`/`*` 的 int×int 发射改 double 运算并保持结果类型为 double，**只在写入 `int`/`uint` 槽（或显式 `int()`/`uint()`）时**才 `as_to_int32`/`as_to_uint32`；同时要重新量 `%`/位运算（实测 `7 % 2` 仍是 `int`、`uint` 的 `%` 语义未测）与所有依赖 int 算术的示例（哈希、索引、坐标取整），并复核 `-0` 在 `trace` 外的可见面。**风险高**：影响所有整型热点路径的生成形态，须先有性能对照再落地。
 | 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |
 | `URLStream.readObject` 要求 `Loader` **已完成**（AMF 值须已完整缓冲） | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `URLStream` 的读取在本运行时是**缓冲式**：`readObject` 直接从已下载的字节缓冲解（此前也如此），若加载**在飞**（`_job != NULL`）则**响亮抛错**并说明「本子集需要 URLStream 已完成加载」。`adl` 支持流式（边下边解） | 若要流式须让 AMF 读侧与异步 IO 的增量到达打通（读侧要能「不够就等下一块」——与既有 `as_async` 的 pump 模型耦合），成本中；真实工程（`as3swf` 读远程 SWF）通常先整体下载再解析 |
 | `wasm`/`web` 目标**不链接 `iconv`** ⇒ 除 `utf-8`/`unicode` 外的字符集**响亮抛错** | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `build.ts` 的 `platformLinkLibs()` 只在 **darwin** 追加 `iconv`；`AS_HAVE_ICONV=0`（`__EMSCRIPTEN__`/`__wasi__`）时 `writeMultiByte`/`readMultiByte` 遇到非 UTF-8/UTF-16 字符集走 `as_throw_charset_unsupported`（**不静默降级**成 UTF-8——静默会给错字节）。工程的真实用法里 `gbk`/`gb2312`/`shift-jis`/`IBM437`/`iso-8859-*` 都有使用 ⇒ web 目标上这些路径当前**不可用** | emscripten 侧需带 `iconv` 或内置精简代码页表（GBK/Big5/Shift-JIS 三张表即可覆盖工程里的字符集），或改链 ICU/`libiconv` 到 wasm。成本中，且**只影响非 UTF-8 字符集**的 web 构建 |

@@ -239,7 +239,7 @@ cause of the real app freezing on a meeting click). Stage one-hundred-eighty-six
 | `<constructor>` | only when the constructor **has parameters** (the signature lives in the `as_dt_ctors[]` side table -- a class with a parameterized ctor and no methods of its own has no place for it in the method tables) |
 | interface names | via the `as_dt_iface_names[]` side table (an interface vtable has only a 5-field prefix, no `fqn` slot) |
 | `Object`'s own traits | **never listed** (neither for a subclass nor for a plain object) ⇒ `describeType({})` is a bare `<type name="Object" isDynamic="true" isFinal="false" isStatic="false"/>` |
-| primitives / containers | `int`/`Number`/`String`/`Boolean` → `isDynamic=false`, `isFinal=true` (plus a readonly `length` for `String`); `Array` → dyn=true/fin=false + a readwrite `length`(uint); `Vector.<int>` → dyn=true/**fin=true**; `flash.utils::Dictionary` → dyn=true; `Date` has no package |
+| primitives / containers | `int`/`Number`/`String`/`Boolean` → `isDynamic=false`, `isFinal=true` (plus a readonly `length` for `String`); **a number's `@name` answers by value** (the same caliber as `getQualifiedClassName`, stage three hundred and thirty-four: `describeType(1)` is `int` while `1.5` and `2^28` are `Number`, measured in `temp/qcn/Main13`); `Array` → dyn=true/fin=false + a readwrite `length`(uint); `Vector.<int>` → dyn=true/**fin=true**; `flash.utils::Dictionary` → dyn=true; `Date` has no package |
 | `describeType(null)` | the **empty string**; `describeType(undefined)` throws `#1010` |
 | member order | AIR uses an **unreproducible hash order**; we use declaration order -- a **deliberate** difference (`adl`'s own order varies between runs) |
 

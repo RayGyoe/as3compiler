@@ -152,7 +152,9 @@ check(describeType([])..accessor[0].@name == "length", "array length accessor");
 check(describeType(new Vector.<int>()).@name == "__AS3__.vec::Vector.<int>", "vector name");
 check(describeType(new Vector.<int>()).@isFinal == "true", "a Vector is final");
 check(describeType(new Dictionary()).@name == "flash.utils::Dictionary", "dictionary name");
-check(describeType(1).@name == "Number", "int boxes as Number");
+check(describeType(1).@name == "int", "an integral value reflects as int (adl: describeType(1) is int)");
+check(describeType(1.5).@name == "Number", "a fractional value reflects as Number");
+check(describeType(268435456).@name == "Number", "a value above the 2^28 window reflects as Number");
 check(String(describeType(null)) == "", "describeType(null) is empty");
 
 // --- the model-mapper pattern the runtime change had to unblock ----------
