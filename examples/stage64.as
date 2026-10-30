@@ -13,13 +13,14 @@ check(FileMode.READ == "read" && FileMode.WRITE == "write", "FileMode READ/WRITE
 check(FileMode.APPEND == "append" && FileMode.UPDATE == "update", "FileMode APPEND/UPDATE");
 
 // --- File: path bundle + url + existence ---
-// temp/ is the repo's scratch area (gitignored): the example must not litter its
-// source dir. The suite runs every example with cwd = the repo root, so a bare
-// relative path here lands in the checkout itself.
-var f:File = new File("temp/stage64_test.txt");
+// AIR rejects a RELATIVE path in the File constructor with #2004 (this build used
+// to keep one verbatim; that deviation is closed), so the scratch file lives in an
+// OS temp directory -- absolute everywhere, and it never litters the repo.
+var scratch:File = File.createTempDirectory();
+var f:File = scratch.resolvePath("stage64_test.txt");
 check(f is File && f is EventDispatcher, "File is EventDispatcher");
-check(f.nativePath == "temp" + File.separator + "stage64_test.txt", "File nativePath stored");
-check(f.url == "file://temp/stage64_test.txt", "File url is file:// + path");
+check(f.nativePath == scratch.nativePath + File.separator + "stage64_test.txt", "File nativePath stored");
+check(f.url == "file://" + f.nativePath, "File url is file:// + path");
 // A leftover from an earlier run that threw mid-way (this example deletes its
 // file at the end, so an aborted run leaves one behind) would fail the
 // fresh-path assertion below for the wrong reason -- and does so only on the
@@ -46,9 +47,9 @@ inp.close();
 
 // --- File: resolvePath + directory create/delete ---
 var child:File = f.resolvePath("subdir");
-check(child.nativePath == ["temp", "stage64_test.txt", "subdir"].join(File.separator),
+check(child.nativePath == scratch.nativePath + File.separator + "stage64_test.txt" + File.separator + "subdir",
       "resolvePath joins with the host separator");
-var d:File = new File("temp/stage64_dir");
+var d:File = scratch.resolvePath("stage64_dir");
 d.createDirectory();
 check(d.exists && d.isDirectory, "createDirectory makes a directory");
 d.deleteDirectory();

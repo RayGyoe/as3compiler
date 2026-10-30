@@ -30,7 +30,9 @@ import flash.filesystem.File;
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
-var dbFile:File = new File("temp/sqlite-phase-d.db");
+// AIR rejects a relative path in the File constructor (#2004): OS temp dir instead.
+var scratch:File = File.createTempDirectory();
+var dbFile:File = scratch.resolvePath("sqlite-phase-d.db");
 if (dbFile.exists) dbFile.deleteFile();
 
 var conn:SQLConnection = new SQLConnection();
@@ -162,7 +164,7 @@ check(lastSqlError.detailArguments.length == 2 && lastSqlError.detailArguments[0
 
 // ---- an empty database: detailID 1010, arguments (database) -------------------
 var blank:SQLConnection = new SQLConnection();
-var blankFile:File = new File("temp/sqlite-phase-d-blank.db");
+var blankFile:File = scratch.resolvePath("sqlite-phase-d-blank.db");
 if (blankFile.exists) blankFile.deleteFile();
 blank.open(blankFile, SQLMode.CREATE);
 lastError = attempt(function():void { blank.loadSchema(null); });

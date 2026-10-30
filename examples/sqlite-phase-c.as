@@ -30,7 +30,9 @@ class Person {
   public var v:String = null;
 }
 
-var dbFile:File = new File("temp/sqlite-phase-c.db");
+// AIR rejects a relative path in the File constructor (#2004): OS temp dir instead.
+var scratch:File = File.createTempDirectory();
+var dbFile:File = scratch.resolvePath("sqlite-phase-c.db");
 if (dbFile.exists) dbFile.deleteFile();
 
 var conn:SQLConnection = new SQLConnection();

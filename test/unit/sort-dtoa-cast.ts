@@ -33,7 +33,15 @@ function cFunction(src: string, signature: string): string {
   return end < 0 ? src.slice(at) : src.slice(at, end + 2);
 }
 
-// ---- A) Array.sort / sortOn: stable merge sort, not insertion sort ----
+// ---- A) Array.sort / sortOn: stable merge on the five option bits ----
+// Two things are pinned here, both measured against adl 51.4.1 (temp/sortprobe/):
+//   1. stability — ties keep their original relative order. AIR itself does NOT
+//      guarantee that (its qsort permutes equal keys), which is why the reference
+//      tables in temp/sortprobe differ from ours only inside tie groups; keeping
+//      our order deterministic is a deliberate decision, documented in the stage.
+//   2. the five option bits — CASEINSENSITIVE / DESCENDING / UNIQUESORT /
+//      RETURNINDEXEDARRAY / NUMERIC all used to be discarded, so every flag
+//      combination produced the same array as sort().
 function checkArraySortMerge(): string[] {
   let ok = 0;
   const bad: string[] = [];
@@ -43,39 +51,79 @@ function checkArraySortMerge(): string[] {
   };
 
   const runtime = readSrc('runtime.ts');
-  const impl = cFunction(runtime, 'static void as_array_sort_impl(as_array* a, as_cmp_fn cmp, void* ctx) {');
+  const impl = cFunction(runtime, 'static as_value as_array_sort_ex(as_array* a, as_sort_ctx* ctx) {');
+  const merge = cFunction(runtime, 'static void as_sort_order(int* ord, int* aux, int k, as_array* a, as_cmp_fn cmp, void* ctx) {');
 
-  check('as_array_sort_impl exists', impl.length > 0);
-  // The O(n^2) core is gone: bottom-up merge passes doubling a window.
-  check('the core is a bottom-up merge (width doubling)', /for \(width = 1; width < n0; width \*= 2\)/.test(impl));
+  check('as_array_sort_ex exists', impl.length > 0);
+  check('as_sort_order exists', merge.length > 0);
+  // Bottom-up merge, window doubling: the O(n^2) core must not come back.
+  check('the core is a bottom-up merge (width doubling)', /for \(int width = 1; width < k; width \*= 2\)/.test(merge));
   // Stability is the AS3 contract (and the reason qsort is not an option):
   // taking the left run on equality is the only place it comes from.
-  check('ties take the left run (this is the stability)', /cmp\(src\[p\], src\[q\], ctx\) <= 0/.test(impl));
-  // The scratch run is plain memory holding tagged as_value: never GC-scanned.
-  check('the scratch run is a malloc of n as_value', /malloc\(\(size_t\)n \* sizeof\(as_value\)\)/.test(impl));
-  check('the scratch run is freed', /free\(tmp\)/.test(impl));
-  // A comparator is user AS3: it may push/splice the very array being sorted and
-  // realloc a->data, so every pass re-reads it instead of caching a pointer.
-  check('each pass re-reads a->data (comparator may realloc it)', /as_value\* src = in_tmp \? tmp : a->data;/.test(impl));
-  check('a result left in the scratch run is copied back', /if \(in_tmp\) memcpy\(a->data, tmp,/.test(impl));
+  check('ties take the left run (this is the stability)', /cmp\(a->data\[src\[p\]\], a->data\[src\[q\]\], ctx\) <= 0/.test(merge));
+  // The comparator is user AS3: it may push/splice the array being sorted, so we
+  // sort an INDEX table and re-read a->data on every comparison.
+  check('the sort orders indices, not a cached value buffer', /as_sort_order\(ord, aux, k, a, as_cmp_opts, ctx\)/.test(impl));
+  check('a pass left in the scratch table is copied back', /if \(in_aux\) memcpy\(ord, aux,/.test(merge));
+  check('the scratch tables are freed on every exit path',
+    (impl.match(/free\(ord\); free\(aux\);/g) || []).length >= 3);
   // The insertion loop survives only as the out-of-memory fallback (same semantics,
-  // just slow) -- pinning the count is what keeps it from silently becoming the core.
+  // just slow) -- pinning the count keeps it from silently becoming the core.
   const insertionSites = (impl.match(/as_value key = a->data\[i\];/g) || []).length;
-  check('the insertion loop remains only in the allocation-failure fallback', insertionSites === 1 && /if \(tmp == NULL\) \{/.test(impl));
-  // n<2 short-circuits, and the pass count is fixed from the original length so a
-  // comparator that grows the array cannot leave the merge reading past what it merged.
-  check('trivial arrays short-circuit', /int n = a->length;\n    if \(n < 2\) return;/.test(impl));
-  check('the pass count is pinned to the entry length', /int n0 = n;  \/\/ 趟数按初始长度固定/.test(impl));
+  check('the insertion loop remains only in the allocation-failure fallback',
+    insertionSites === 1 && /if \(ord == NULL \|\| aux == NULL \|\| vals == NULL\) \{/.test(impl));
 
-  // All four entry points share the one core -- if any of them grew its own sort,
-  // the fixes above would stop covering it.
+  // --- the five option bits ---
+  check('CASEINSENSITIVE has its own ASCII-folding comparator',
+    /static int as_str_cmp_ci\(const char\* x, const char\* y\)/.test(runtime) &&
+    /\(c->flags & AS_SORT_CI\) != 0/.test(runtime));
+  check('DESCENDING negates the comparison (not a post-reverse)',
+    /return \(\(c->flags & AS_SORT_DESC\) != 0\) \? -r : r;/.test(runtime));
+  // UNIQUESORT: a duplicate returns Number 0 and leaves the array untouched.
+  check('UNIQUESORT returns Number 0 without touching the array',
+    /if \(dup\) \{ free\(ord\); free\(aux\); free\(vals\); return as_v_num\(0\); \}/.test(impl));
+  check('UNIQUESORT counts >=2 holes as a duplicate', /\(n - k\) >= 2/.test(impl));
+  // RETURNINDEXEDARRAY: index table out, original array untouched, holes last.
+  check('RETURNINDEXEDARRAY emits defined indices then hole indices',
+    /for \(int i = 0; i < k; i\+\+\) as_array_push\(r, as_v_num\(\(double\)ord\[i\]\)\);/.test(impl) &&
+    /if \(a->data\[i\].tag == 5\) as_array_push\(r, as_v_num\(\(double\)i\)\);/.test(impl));
+  // NUMERIC sorts NaN last (AIR: [NaN,1].sort(NUMERIC) is 1,NaN) and `sort`
+  // raises #1034 for a value ToNumber cannot parse (sortOn does not).
+  check('NUMERIC puts NaN after every number', /if \(isnan\(na\)\) r = isnan\(nb\) \? 0 : 1;/.test(runtime));
+  check('numeric validation is sort-only (sortOn compares as NaN)',
+    /if \(ctx->field == NULL && ctx->cb == NULL && \(ctx->flags & AS_SORT_NUMERIC\) != 0\)/.test(impl) &&
+    /as_throw_1034\(v, "Number"\)/.test(runtime));
+  // 32 and every unknown bit must stay a no-op: sort(32) == sort(0).
+  check('unknown flag bits are ignored', !/AS_SORT_[A-Z]+ *32|0x20/.test(runtime.split('AS_SORT_NUMERIC 16')[1].slice(0, 400)));
+
+  // --- sparse slots ---
+  // adl: 'var a=[5,4,3]; a[10]=1; a.sort()' => join "1,3,4,5,,,,,,,", '4 in a' false.
+  check('sort compacts defined elements and holes the tail',
+    /for \(int i = k; i < n; i\+\+\) \{ as_value u = \{5, 0.0, NULL\}; a->data\[i\] = u; \}/.test(impl));
+  check('only defined slots are collected for sorting',
+    /if \(a->data\[i\].tag != 5\) ord\[k\+\+\] = i;/.test(impl));
+
+  // All entry points share the one core -- if any of them grew its own sort, the
+  // fixes above would stop covering it.
   const wrappers = [
-    'static as_array* as_array_sort_str(as_array* a) { as_array_sort_impl(a, as_cmp_str, NULL); return a; }',
-    'static as_array* as_array_sort_num(as_array* a) { as_array_sort_impl(a, as_cmp_num, NULL); return a; }',
-    'static as_array* as_array_sort_cb(as_array* a, as_fn cb) { as_array_sort_impl(a, as_cmp_cb, (void*)cb); return a; }',
+    'as_array_sort_flags(as_array* a, int options)',
+    'as_array_sort_arr(as_array* a, int options)',
+    'as_array_sort_any(as_array* a, as_value v)',
   ];
-  for (const w of wrappers) check(`the shared core still serves ${w.slice('static as_array* '.length, w.indexOf('('))}`, runtime.includes(w));
-  check('sortOn shares the same core', /as_array_sort_impl\(a, as_cmp_sorton, &ctx\)/.test(runtime));
+  for (const w of wrappers) check(`shared core serves ${w.slice(0, w.indexOf('('))}`, runtime.includes(w));
+  check('sort()/sortOn()/comparator forms all reach as_array_sort_ex',
+    (runtime.match(/as_array_sort_ex\(a, &ctx\)/g) || []).length >= 4);
+
+  // Emitter: an UNIQUESORT-bearing (or unknown) flag set keeps the boxed result,
+  // because that call can return Number 0. A statically known set stays Array.
+  const gen = generateC(parse('var a:Array = ["b","a"]; a.sort(Array.NUMERIC); a.sort(Array.UNIQUESORT); a.sortOn("k", Array.NUMERIC);'));
+  // Only the call sites matter here: the runtime preamble owns the definitions.
+  const callSites = String(gen.c).split('\n').filter((l) => /^\s+(as_array_sort\w*\(|as_array_sortOn_\w*\()/.test(l)).join('\n');
+  check('known flag bits take the typed array path', /as_array_sort_arr\(.*, 16\);/.test(callSites));
+  check('UNIQUESORT takes the boxed path', /as_array_sort_flags\(.*, 4\);/.test(callSites));
+  check('sortOn keeps the typed path for known bits', /as_array_sortOn_arr\(.*, "k", 16\);/.test(callSites));
+  check('an unknown flag argument takes the boxed path', /as_array_sort_flags\(/.test(
+    String(generateC(parse('var a:Array = ["b","a"]; var f:int = 16; a.sort(f);')).c)));
 
   if (ok > 0) console.log(`[sortmerge] ${ok} Array.sort/sortOn checks passed`);
   return bad;

@@ -359,7 +359,7 @@ trash — both fixture trees are built with `node:fs` by that same file, and `li
 | `File.documentsDirectory.url` | `file:///C:/Users/<u>/Documents` | same |
 | `new File(<that url>).nativePath` | the native path (backslashes) | same |
 | `Loader.load(<that url>)` | `COMPLETE`, `content` is a `Bitmap` | same |
-| `new File("relative.txt")` | throws `Error #2004` | **keeps the string** (§11.5) |
+| `new File("relative.txt")` | throws `Error #2004` | same since stage 323 (the old deviation kept the string, §11.5) |
 
 **Encoding rule** (measured per character): the path part uses `encodeURIComponent`'s safe set
 plus exactly two characters — `/` (separators, kept) and `:` (the drive letter, kept). Measured
@@ -435,13 +435,48 @@ Both sides must print `COMPLETE content=[object Bitmap] w=8` for all three `load
 through the URL, and the deviation in §11.5); `unit: file-url/mapping` + `unit: file-url/preamble`
 (16 source-level checks, of which "no `path += 7` survives" is the anti-drift one).
 
-### 11.5 The one remaining deviation: a relative path
+### 11.5 The constructor contract (the old deviation closed in stage 323)
 
-AIR rejects a relative path in the constructor (`#2004`). We keep the string (`stage64.as` has
-pinned `new File("temp/x.txt").nativePath == "temp/x.txt"` since stage sixty-four), so such a
-`File`'s `url` is `file://` + the path. AIR cannot construct that object at all, so this is the
-"AIR has no counterpart" kind rather than a rewrite of defined AIR behaviour; it is asserted
-explicitly in `examples/file-url.as` so it stays a decision rather than an accident.
+From stage sixty-four this build accepted `new File("temp/x.txt")` and kept the string verbatim
+(`url` was therefore `file://` + a relative path). That WAS a deviation: `adl` rejects a relative
+path in the constructor with `#2004`, i.e. AIR cannot construct that object. Stage 323 closed it
+from the measurements in `temp/fileempty/`:
+
+| Construction | `adl 51.4.1` | this build |
+|---|---|---|
+| `new File()` | the empty `File` (every path member is `#2037`) | same (`File_new_empty`) |
+| `new File(null)` | `#2037` (NOT an empty `File`) | same |
+| `new File("a/b.txt")` / `""` / `"./x"` / `"~/x"` / `"http://…"` | `#2004` | same |
+| `new File("/tmp//a/../b")` | normalised to `/tmp/b` | same |
+| `new File("file:///a%20b")` / `"app:/q"` / `"app-storage:/q"` | decoded/expanded to a native path | same |
+
+`new File()` and `new File(null)` share one emitted default-argument list, so the C side cannot
+tell them apart — hence **two entry points**: the no-argument form emits `File_new_empty()`, every
+other form emits `File_new(path)` (which URL-decodes first, then requires an absolute path). The
+examples moved to absolute paths under `File.createTempDirectory()` (`stage64.as`,
+`urlloader-contract.as`, `sqlite-*.as`) and `file-url.as` asserts the `#2004` matrix instead.
+
+### 11.5.1 The empty-`File` member table (stage 323)
+
+`nativePath` became an accessor (private `_nativePath` + `File_get_nativePath`/`File_set_nativePath`)
+with one `as_file_has_path()` guard covering every path member. Measured (`temp/fileempty/`):
+
+- **throws `#2037`**: `nativePath`, `url`, `name`, `extension`, `type`, `parent`, `exists`,
+  `isDirectory`, `isHidden`, `isSymbolicLink`, `isPackage`, `size`, `spaceAvailable`,
+  `creationDate`, `modificationDate`, `downloaded`, `creator`, `icon`;
+- **does not throw**: `preventBackup` (`false`), `data` (`null`), `toString()` (`"[object File]"`),
+  `clone()` (another empty `File`).
+
+### 11.5.2 Delivery timing of the three async members (stage 323)
+
+`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync` used to do the work AND dispatch inside
+the same call. `adl` does not: the file is still there when the call returns, the event arrives
+later, a second call while one is in flight is `#2037`, and `cancel()` drops the event without
+undoing the completed work. All three now run on the job thread (`AS_JOB_FS_OP`, operation code in
+`j->binary`) and report from a frame-boundary thunk; the job body `as_file_op_run(path, op)` only
+touches its own copy of the path and **never the GC heap** (which is why `as_file_delete_err` was
+split into the pure-C `as_file_path_delete_err`, and why the Linux arm of `as_trash_note` moved
+from `as_str_alloc` to `malloc`/`free`).
 
 ### 11.6 Host-split measured on Windows (stage 300)
 
@@ -542,8 +577,8 @@ untouched** (its prefix is meaningful and must not be folded).
 There is no `url` setter (AIR has none either), but `nativePath` gained a real **setter** in this
 batch, with the measured rules: relative path / empty string / URL form ⇒ `#2004`, `null` ⇒
 `#2007` (message with the same **double space** as `moveTo`: `Error #2007: Parameter  must be
-non-null.` — the parameter name is the empty string). The **constructor still accepts a relative
-path** (the pre-existing deviation in §11.5), so the rejection applies to the setter only.
+non-null.` — the parameter name is the empty string). Since stage 323 the constructor follows the
+same rules (the old deviation is documented in §11.5).
 
 ### 12.3 Reproduce
 

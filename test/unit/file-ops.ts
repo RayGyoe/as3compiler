@@ -18,7 +18,13 @@
 // av2.txt / av3.txt.
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup } from '../harness.ts';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { registerGroup, root } from '../harness.ts';
+
+function readNorm(p: string): string {
+  return readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
+}
 
 // The smallest program that drags in every member pinned below.
 const PROG = `
@@ -65,14 +71,16 @@ function checkContract(): string[] {
   check('the sync deletes share as_file_delete_err',
     c.includes('void File_deleteFile(void* _this) { int err = as_file_delete_err((File*)_this, 0, 0);')
     && c.includes('void File_deleteDirectory(void* _this, bool recursive) { int err = as_file_delete_err((File*)_this, 1, recursive ? 1 : 0);'));
-  check('the async deletes route through File__deleteDispatch',
-    c.includes('File__deleteDispatch((File*)_this, as_file_delete_err((File*)_this, 0, 0));')
-    && c.includes('File__deleteDispatch((File*)_this, as_file_delete_err((File*)_this, 1, recursive ? 1 : 0));'));
+  // The async pair now runs its filesystem work on the job thread (AS_JOB_FS_OP)
+  // and reports from the finish thunk, so both shapes go through File__submitOp.
+  check('the async deletes go through the shared submitter',
+    c.includes('File__submitOp((File*)_this, 0);')
+    && c.includes('File__submitOp((File*)_this, recursive ? 2 : 1);'));
   // The bug this batch fixed: COMPLETE must be conditional on err == 0.
   check('COMPLETE is only dispatched when the delete succeeded',
     c.includes('if (err == 0) { EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false)); return; }'));
   check('#2037 still THROWS from the async members (measured)',
-    c.includes('if (err == 2037) { as_throw(Error_new((char*)as_file_err_text(err), err)); return; }'));
+    /static void File__submitOp\(File\* o, int op\) \{\n  if \(o->_nativePath == NULL \|\| as_async_op_pending/.test(c));
 
   // ---- the measured error table ---------------------------------------------
   for (const [id, sentence] of [
@@ -122,22 +130,22 @@ function checkContract(): string[] {
   // `nativePath =` alone would also match the `nativePath == NULL` guards, so the
   // pin has to name the assignment the old code made.
   check('moveTo leaves the receiver on its OLD path (measured)',
-    moveBody != null && !/o->nativePath\s*=\s*newFile/.test(moveBody[1]));
+    moveBody != null && !/o->_nativePath\s*=\s*newFile/.test(moveBody[1]));
   check('a cross-volume move copies and then deletes instead of giving up',
     moveBody != null
-    && /rename\(o->nativePath, as_file_path_of\(\(void\*\)newFile\)\)/.test(moveBody[1])
-    && /err = as_file_copy_any\(o->nativePath, dst\);/.test(moveBody[1])
-    && /if \(err == 0\) err = as_remove_any\(o->nativePath\);/.test(moveBody[1]));
+    && /rename\(o->_nativePath, as_file_path_of\(\(void\*\)newFile\)\)/.test(moveBody[1])
+    && /err = as_file_copy_any\(o->_nativePath, dst\);/.test(moveBody[1])
+    && /if \(err == 0\) err = as_remove_any\(o->_nativePath\);/.test(moveBody[1]));
 
   // ---- size ----------------------------------------------------------------
   check('size throws #3003 for a missing path (the old 0 was wrong)',
-    /double File_get_size[\s\S]*?stat\(o->nativePath, &st\) != 0[\s\S]*?3003/.test(c));
+    /double File_get_size[\s\S]*?stat\(o->_nativePath, &st\) != 0[\s\S]*?3003/.test(c));
   check('size answers 0 for anything that is not a regular file',
     c.includes('if (!S_ISREG(st.st_mode)) return 0.0;'));
 
   // ---- paths ---------------------------------------------------------------
   check('the constructor normalises what it stores',
-    c.includes('o->nativePath = (path != NULL) ? as_path_norm(path) : NULL;'));
+    c.includes('o->_nativePath = (path != NULL) ? as_path_norm(path) : NULL;'));
   check('nativePath has a real setter (not just the field)',
     c.includes('void File_set_nativePath(void* _this, char* path) {')
     && c.includes('->vtable->set_nativePath('));
@@ -145,6 +153,38 @@ function checkContract(): string[] {
     c.includes('if (path[0] == \'\\0\' || !as_path_is_abs(path)) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }'));
   check('resolvePath refuses an empty File (#2037) and a null argument (#2007)',
     /File\* File_resolvePath[\s\S]*?2037[\s\S]*?2007/.test(c));
+
+  // ---- 阶段三百二十二·二：构造函数契约 + 空 File + 异步成员 ----------------
+  // Measured on adl 51.4.1 (temp/fileempty/): the no-argument form builds the empty
+  // File, an explicit null is #2037, and a relative path is #2004. `new File()` and
+  // `new File(null)` share one emitted argument list, so the two shapes need two
+  // entry points -- a single File_new would have to guess which one it is.
+  check('the constructor has two entry points (empty vs validating)',
+    c.includes('static File* File_new_impl(char* path) {')
+    && c.includes('File* File_new_empty(void) { return File_new_impl(NULL); }'));
+  check('null is #2037 and a non-absolute path is #2004',
+    /File\* File_new\(char\* path\) \{\n  char\* local;\n  if \(path == NULL\) \{\n    as_throw\(Error_new\(\(char\*\)"Error #2037/.test(c)
+    && /local\[0\] == '\\0' \|\| !as_path_is_abs\(local\)/.test(c));
+  check('the emitter routes the no-argument form to File_new_empty',
+    c.includes('File* _recv0 = File_new_empty();') || /File_new_empty\(\);/.test(c));
+  // Every path member of an empty File throws #2037 (only preventBackup, data,
+  // toString and clone answer), so the guard cannot be per-member ad-hoc.
+  check('one guard serves every path member',
+    /static bool as_file_has_path\(File\* o\) \{/.test(c)
+    && (c.match(/as_file_has_path\(o\)/g) || []).length >= 10);
+  check('the private field sits behind a real accessor pair',
+    c.includes('char* File_get_nativePath(void* _this)')
+    && c.includes('void File_set_nativePath(void* _this, char* path) {'));
+  // The three async members run on the job thread now: a dedicated kind, the
+  // shared finish thunk, and the "one in flight" guard AIR answers with #2037.
+  check('the job pool has an off-thread File-op kind',
+    readNorm(join(root, 'src', 'runtime.ts')).includes('#define AS_JOB_FS_OP      11'));
+  check('the async members submit instead of running inline',
+    c.includes('as_async_submit(AS_JOB_FS_OP, (void*)o, File__opFinish, o->_nativePath, NULL, op);'));
+  check('the worker runs the op through a GC-free helper',
+    /static int as_file_op_run\(const char\* path, int op\) \{/.test(c));
+  check('a second call while one is in flight is #2037',
+    /static void File__submitOp\(File\* o, int op\) \{\n  if \(o->_nativePath == NULL \|\| as_async_op_pending/.test(c));
 
   if (ok > 0) console.log(`[fileops] ${ok} emit checks passed`);
   return bad;

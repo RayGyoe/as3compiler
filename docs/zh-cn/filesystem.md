@@ -309,7 +309,7 @@ cd temp/trashprobe && cc -O1 -Wall -Wextra -o trash_impl trash_impl.c && HOME=/t
 | `File.documentsDirectory.url` | `file:///C:/Users/<u>/Documents` | 同 |
 | `new File(<上面那个 url>).nativePath` | 原生路径（反斜杠） | 同 |
 | `Loader.load(<那个 url>)` | `COMPLETE`，`content` 是 `Bitmap` | 同 |
-| `new File("relative.txt")` | 抛 `Error #2004` | **保留字符串**（见 §11.5 偏差） |
+| `new File("relative.txt")` | 抛 `Error #2004` | 同（阶段三百二十三 起；此前保留字符串，见 §11.5） |
 
 **编码规则**（逐字符实测）：路径部分用 `encodeURIComponent` 的安全集，另加两个字符——
 `/`（分隔符，保留）与 `:`（盘符，保留）。实测被编码：空格 `%20`、`#` `?` `&` `%` `+`
@@ -373,12 +373,44 @@ temp/urlprobe/UrlProbeSkia.exe
 的偏差）；`unit: file-url/mapping` + `unit: file-url/preamble`（16 条源级结构钉，其中
 「不再有 `path += 7`」是防漂移的那一条）。
 
-### 11.5 唯一保留的偏差：相对路径
+### 11.5 构造器契约（阶段三百二十三 已关闭原偏差）
 
-AIR 在构造器里就拒绝相对路径（`#2004`）。我们保留字符串（`stage64.as` 自阶段六十四起就钉着
-`new File("temp/x.txt").nativePath == "temp/x.txt"`），因此这种 File 的 `url` 是
-`file://` + 路径。AIR 造不出这个对象，所以这不是「我们对 AIR 已有行为的改写」，而是**AIR
-没有对应物**的那一类；它同时是 `examples/file-url.as` 的一条显式断言，不是为了好看。
+阶段六十四 起，本仓允许 `new File("temp/x.txt")` 并原样保留字符串（`url` 因此是 `file://` +
+相对路径）。这是一条**偏差**：`adl` 在构造器里就拒绝相对路径（`#2004`），也就是说 AIR 造不出
+这个对象。阶段三百二十三 按 `temp/fileempty/` 的实测把它关掉了：
+
+| 构造形式 | `adl 51.4.1` | 本仓 |
+|---|---|---|
+| `new File()` | 空 `File`（路径成员全部 `#2037`） | 同（`File_new_empty`） |
+| `new File(null)` | `#2037`（**不是**空 `File`） | 同 |
+| `new File("a/b.txt")` / `""` / `"./x"` / `"~/x"` / `"http://…"` | `#2004` | 同 |
+| `new File("/tmp//a/../b")` | 归一化成 `/tmp/b` | 同 |
+| `new File("file:///a%20b")` / `"app:/q"` / `"app-storage:/q"` | 解码/展开成原生路径 | 同 |
+
+`new File()` 与 `new File(null)` 共用一份默认参数发射，C 侧从参数值区分不出来，因此**两个入口**：
+无参形式发 `File_new_empty()`，其余发 `File_new(path)`（内部先按 URL 解码再判绝对）。示例侧随之
+改用 `File.createTempDirectory()` 下的绝对路径（`stage64.as`、`urlloader-contract.as`、
+`sqlite-*.as`），`file-url.as` 的偏差断言改成 `#2004` 矩阵。
+
+### 11.5.1 空 `File` 的成员表（阶段三百二十三）
+
+`nativePath` 由普通字段改为访问器（私有 `_nativePath` + `File_get_nativePath`/`File_set_nativePath`），
+一个 `as_file_has_path()` 守卫覆盖全部路径成员。实测（`temp/fileempty/`）：
+
+- **抛 `#2037`**：`nativePath`、`url`、`name`、`extension`、`type`、`parent`、`exists`、
+  `isDirectory`、`isHidden`、`isSymbolicLink`、`isPackage`、`size`、`spaceAvailable`、
+  `creationDate`、`modificationDate`、`downloaded`、`creator`、`icon`；
+- **不抛**：`preventBackup`（`false`）、`data`（`null`）、`toString()`（`"[object File]"`）、
+  `clone()`（返回另一个空 `File`）。
+
+### 11.5.2 三个异步成员的投递时机（阶段三百二十三）
+
+`moveToTrashAsync`/`deleteFileAsync`/`deleteDirectoryAsync` 过去在**同一次调用内**做完并派发。
+`adl` 不是：调用返回时文件还在，事件在之后到达，在飞时再调一次是 `#2037`，`cancel()` 丢弃事件
+但不撤销已完成的工作。三者现在走作业线程（`AS_JOB_FS_OP`，操作码在 `j->binary`），完成 thunk
+在帧边界派发；作业体 `as_file_op_run(path, op)` 只碰路径副本、**不碰 GC 堆**（为此把
+`as_file_delete_err` 拆出纯 C 的 `as_file_path_delete_err`，并把 Linux 分支的 `as_trash_note`
+从 `as_str_alloc` 改为 `malloc/free`）。
 
 ### 11.6 Windows 宿主上的实测差异（阶段三百）
 
@@ -472,8 +504,8 @@ implemented」（不静默 no-op，也不做「复制+删除」的静默替代�
 
 `url` 的 setter 不存在（AIR 也没有），`nativePath` 的 **setter** 则是本阶段新补的，且按实测：
 相对路径/空串/URL 形式 ⇒ `#2004`，`null` ⇒ `#2007`（消息与 `moveTo` 同样带**双空格**：
-`Error #2007: Parameter  must be non-null.` —— 参数名是空串）。**构造器仍接受相对路径**（见
-§11.5 的既有偏差），故这条只在 setter 上生效。
+`Error #2007: Parameter  must be non-null.` —— 参数名是空串）。阶段三百二十三 起构造器与
+setter **同一口径**（原偏差见 §11.5）。
 
 ### 12.3 复现
 

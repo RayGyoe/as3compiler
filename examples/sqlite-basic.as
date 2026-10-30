@@ -31,8 +31,11 @@ import flash.filesystem.File;
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
-// temp/ is the repo's scratch area: the example must not litter its source dir.
-var dbFile:File = new File("temp/sqlite-basic.db");
+// AIR rejects a RELATIVE path in the File constructor (#2004), so the scratch
+// database lives in an OS temp directory: absolute on every platform, and it does
+// not litter the repo.
+var scratch:File = File.createTempDirectory();
+var dbFile:File = scratch.resolvePath("sqlite-basic.db");
 if (dbFile.exists) dbFile.deleteFile();
 
 var events:Array = [];

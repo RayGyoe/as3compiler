@@ -64,6 +64,9 @@ function trashDirs():Array {
 
 function recycleBinDirs():Array {
   var out:Array = [];
+  // Windows only: on POSIX "C:/$Recycle.Bin" is a RELATIVE path, which AIR's File
+  // constructor rejects with #2004 (and this build now does too).
+  if (File.separator != "\\") return out;
   var root:File = new File("C:" + File.separator + "$Recycle.Bin");
   if (!root.exists) return out;
   try {
@@ -188,12 +191,17 @@ var missing:File = base.resolvePath("never-existed.txt");
 check(errorIdOf(function():void { missing.moveToTrash(); }) == 3003, "a missing path throws #3003");
 check(errorIdOf(function():void { new File().moveToTrash(); }) == 2037, "an empty File throws #2037");
 
-// --- the async half: events, not exceptions ----------------------------------
+// --- the async half: events, not exceptions, and LATER ------------------------
+// Measured on adl 51.4.1 (temp/fileempty/): the move has not happened when the
+// call returns and the event arrives on a following frame, so the assertions pump
+// one frame with tickTimers() after each call.
 var c:File = base.resolvePath("stage243-async.txt");
 write(c, "async");
 var events:Array = [];
 c.addEventListener(Event.COMPLETE, function(ev:Event):void { events.push("complete"); });
 c.moveToTrashAsync();
+check(events.length == 0, "nothing is dispatched synchronously");
+tickTimers();
 check(events.indexOf("complete") >= 0, "moveToTrashAsync dispatches COMPLETE");
 check(c.exists == false, "the async form moved the file");
 check(findInTrash("stage243-async.txt") != null, "the async form landed in the trash");
@@ -202,6 +210,7 @@ var ioId:int = 0;
 var n:File = base.resolvePath("never-existed-async.txt");
 n.addEventListener(IOErrorEvent.IO_ERROR, function(ev:IOErrorEvent):void { ioId = ev.errorID; });
 n.moveToTrashAsync();
+tickTimers();
 check(ioId == 3003, "moveToTrashAsync reports a missing path as ioError 3003 (got " + ioId + ")");
 check(errorIdOf(function():void { new File().moveToTrashAsync(); }) == 2037, "the async form still throws #2037 on an empty File");
 

@@ -3611,11 +3611,12 @@ export class SymbolTable {
     // answers -- measured: on a File they never throw #2037, they read the path.
     this.classMap.set('File', {
       fields: new Map([
-        // nativePath must stay PUBLICLY READABLE: AIR exposes it as a read-write
-        // property and existing code reads it (`f.nativePath`), while the write path
-        // is intercepted by the declared setter below. The field itself therefore
-        // stays public and the setter only adds the normalisation + validation.
-        ['nativePath', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'File', isStatic: false, isConst: false }],
+        // The path lives in a PRIVATE field so it can sit behind a real accessor
+        // pair: AIR throws #2037 from BOTH `nativePath` itself and every member
+        // derived from it when the File has no path yet (measured on adl 51.4.1,
+        // temp/fileempty/: `new File().nativePath` throws, it does not answer ""),
+        // and a plain field can neither throw on read nor normalise on write.
+        ['_nativePath', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'File', isStatic: false, isConst: false }],
         // preventBackup is an ordinary stored flag: AIR accepts the assignment and
         // then reads back FALSE on macOS (measured), so there is nothing to tell the
         // OS here -- the field is the honest model, exactly as it was for the shell's
@@ -3725,6 +3726,9 @@ export class SymbolTable {
         ['getRootDirectories', frStatic('File', { kind: 'array' }, [])],
       ]),
       getters: new Map([
+        // nativePath: the read half of the accessor pair. Throws #2037 on a File
+        // that has no path yet -- measured, not inferred (temp/fileempty/).
+        ['nativePath', frGet('File', { kind: 'string' })],
         // url: "file://" + encoded nativePath, or the app:/app-storage: virtual
         // schemes for paths inside those two roots (see File_get_url in emit.ts).
         ['url', frGet('File', { kind: 'string' })],
@@ -3799,11 +3803,10 @@ export class SymbolTable {
         ['preventBackup', frGet('File', { kind: 'bool' })],
       ]),
       setters: new Map([
-        // nativePath stays a FIELD (reflection, GC scanning and every hand-written
-        // C body go through it); the declared setter only exists so an AS3-level
-        // assignment is NORMALISED and validated the way AIR does it. The emitter
-        // prefers a declared setter over the field on the write path, so
-        // `f.nativePath = x` reaches File_set_nativePath (see emit.ts).
+        // nativePath: the write half of the accessor pair (see the private field's
+        // comment). AIR exposes it as a read-write property but implements it as a
+        // setter: assigning normalises the string, and the argument must be an
+        // absolute NATIVE path (#2004 for a relative one, #2007 for null).
         ['nativePath', frSet('File', 'String')],
         // url = "file:///..." -- AIR accepts ONLY the file scheme, decodes
         // percent-escapes (measured: file:///tmp/a%20b.txt -> /tmp/a b.txt), and

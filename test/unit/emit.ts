@@ -2002,7 +2002,7 @@ function checkAneExtensionContextSurface(): string[] {
   check('…and reports the gap instead of silently returning a pathless File',
     dir !== null && /as_shell_unsupported\("/.test(dir[0]));
   check('…still returns a live File so a caller can inspect it',
-    dir !== null && /return File_new\(NULL\);/.test(dir[0]));
+    dir !== null && /return File_new_empty\(\);/.test(dir[0]));
   // …and the report is not a guess about the platform: it names this build's own
   // staging layout and what is missing from it, which is what a reader needs to know
   // to work around it.
@@ -3333,8 +3333,12 @@ function checkEmitFileMoveToTrash(): string[] {
   // The async half reports through events (measured), and carries errorID.
   check('moveToTrashAsync dispatches COMPLETE',
     c.includes('EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false));'));
-  check('moveToTrashAsync dispatches ioError with the AIR error id',
-    c.includes('IOErrorEvent_new((char*)"ioError", false, false, (char*)text)') && c.includes('ev->errorID = (int)err;'));
+  // The async forms now run on the job thread (AS_JOB_FS_OP) and report from the
+  // shared finish thunk, so the event shapes are pinned there.
+  check('the async File operations report from one finish thunk',
+    /static void File__opFinish\(void\* job\) \{[\s\S]*?IOErrorEvent_new\(\(char\*\)"ioError", false, false, \(char\*\)as_file_err_text\(err\)\);[\s\S]*?ev->errorID = err;/.test(c));
+  check('moveToTrashAsync submits the trash operation instead of running inline',
+    /void File_moveToTrashAsync\(void\* _this\) \{\n  File\* o = \(File\*\)_this;\n  if \(o->_nativePath == NULL \|\| as_async_op_pending/.test(c));
 
   // Trash layouts: Finder's on macOS, the freedesktop.org pair on other POSIX, the
   // shell's Recycle Bin on Windows (stage 244 -- pinned by platform/WindowsHostBackends),
@@ -3450,7 +3454,7 @@ function checkEmitDirListingAsync(): string[] {
   //    with the finish thunk, and the async member's body no longer enumerates.
   check('the job pool has a directory-listing kind', /#define AS_JOB_DIR\s+10\n/.test(pre));
   check('the async member submits that kind rather than enumerating',
-    emitSrc.includes("as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->nativePath, NULL, 0);"));
+    emitSrc.includes("as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->_nativePath, NULL, 0);"));
   check('the async member no longer calls the sync member',
     !emitSrc.substring(
       emitSrc.indexOf("'void File_getDirectoryListingAsync(void* _this) {'"),
@@ -3498,15 +3502,15 @@ function checkEmitDirListingAsync(): string[] {
   //    it THROWS where the async member completes, so sharing an assertion between
   //    the two would be wrong.
   check('sync throws #2037 for an empty File',
-    emitSrc.includes('if (o->nativePath == NULL) as_throw(Error_new((char*)"Error #2037:'));
+    emitSrc.includes('if (o->_nativePath == NULL) as_throw(Error_new((char*)"Error #2037:'));
   check('sync throws #3003 for a path that does not exist',
-    emitSrc.includes('if (!as_path_exists(o->nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));'));
+    emitSrc.includes('if (!as_path_exists(o->_nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));'));
   check('sync throws #3007 for a path that is not a directory',
-    emitSrc.includes('if (!as_path_is_dir(o->nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));'));
+    emitSrc.includes('if (!as_path_is_dir(o->_nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));'));
   // The guards must precede the opendir body, or an unreadable directory would be
   // reported as one of them instead of as the empty listing adl answers.
   check('the guards run before the enumeration body',
-    emitSrc.indexOf('Error #3007: Not a directory.') < emitSrc.indexOf('opendir(o->nativePath)'));
+    emitSrc.indexOf('Error #3007: Not a directory.') < emitSrc.indexOf('opendir(o->_nativePath)'));
 
   console.log(`     [dirasync] ${ok} check(s) passed`);
   return bad;

@@ -33,9 +33,12 @@ import flash.filesystem.File;
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
-var dbFile:File = new File("temp/sqlite-phase-b.db");
-var attached:File = new File("temp/sqlite-phase-b-attached.db");
-var missing:File = new File("temp/sqlite-phase-b-missing.db");
+// AIR rejects a relative path in the File constructor (#2004): an OS temp
+// directory keeps these fixtures absolute and outside the repo.
+var scratch:File = File.createTempDirectory();
+var dbFile:File = scratch.resolvePath("sqlite-phase-b.db");
+var attached:File = scratch.resolvePath("sqlite-phase-b-attached.db");
+var missing:File = scratch.resolvePath("sqlite-phase-b-missing.db");
 for each (var f:File in [dbFile, attached, missing]) { if (f.exists) f.deleteFile(); }
 
 var events:Array = [];

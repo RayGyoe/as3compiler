@@ -3334,6 +3334,12 @@ static as_value as_array_get(as_array* a, int i) {
 static as_value as_array_set(as_array* a, int i, as_value v) {
     if (i < 0) return v;
     as_array_ensure(a, i + 1);
+    // 索引跳跃写入留下的**空槽**必须是 undefined（tag 5），不是 gc_alloc 清零的
+    // tag 0（null）：'var a=[]; a[10]=1; 4 in a' 在 adl 51.4.1 上是 false，而 tag 0
+    // 会让 as_array_has（判据是 tag != 5）把它当成「在」。同理 'a[4] === undefined'
+    // 在 AIR 上是 true、'a[4] === null' 是 false（temp/sortprobe/）。新槽不持指针，
+    // 不需要写屏障。
+    for (int j = a->length; j < i; j++) { as_value u = {5, 0.0, NULL}; a->data[j] = u; }
     if (i >= a->length) a->length = i + 1;
     a->data[i] = v;
     gc_write_barrier_value(v);
@@ -3508,8 +3514,8 @@ static as_value as_array_removeAt(as_array* a, int index) {
 
 // Array higher-order methods (map/filter) and sorting (sort/reverse). Callbacks
 // are as_fn closure pointers invoked with AS3's (element, index, array)
-// argument layout; sort shares one stable insertion-sort core across three
-// comparator flavors (string default / numeric / custom function).
+// argument layout; every sort flavor (string default / numeric / custom
+// function / sortOn field) shares one stable merge core.
 typedef int (*as_cmp_fn)(as_value a, as_value b, void* ctx);
 
 static int as_cmp_str(as_value a, as_value b, void* ctx) {
@@ -3535,9 +3541,21 @@ static int as_cmp_cb(as_value a, as_value b, void* ctx) {
     return 0;
 }
 
-// Stable insertion sort over the raw as_value buffer. O(n^2) worst case but
-// simple and dependency-free — sufficient for the teaching-compiler subset.
-// 稳定归并（自底向上），取代原来的插入排序。
+// ---------- 排序：稳定归并 + Array 的五个选项位 ----------
+//
+// 选项位与 Array.* 常量一致（emit.ts 的 emitArrayConst 同源）。adl 51.4.1 实测
+// （temp/sortprobe/，Main.as + Main2.as + Main3.as + Main4.as）：
+//   CASEINSENSITIVE  1  只折 ASCII 大小写
+//   DESCENDING       2  反向比较（不是「排完再 reverse」）
+//   UNIQUESORT       4  有重复键 ⇒ 返回 Number 0 且**数组一个字节都不动**
+//   RETURNINDEXEDARRAY 8  返回下标表、原数组不动；稀疏槽的下标排在最后
+//   NUMERIC          16 按数值比较；sort 遇到转不成数值的值抛 #1034，
+//                       sortOn 不抛（按 NaN 参与比较，实测 keys=9 10 a B）
+//   32 与其余未知位无效果（sort(32) 与 sort(0) 逐字相同）。
+// 这五个位在旧实现里被整个丢掉（sort 只看「参数是不是 Function」，否则一律按
+// NUMERIC 或按字符串），是 sort.ci 在一个 8 元素数组上就与 AIR 分叉的根因。
+//
+// 稳定归并（自底向上）。
 //
 // 为什么必须稳定：AS3 的 Array.sort / sortOn 是稳定排序（AIR 内部走归并），
 // 「相等键保持原相对次序」是作者依赖的语义 —— 先按名字排、再按时间 sortOn 这种
@@ -3551,50 +3569,162 @@ static int as_cmp_cb(as_value a, as_value b, void* ctx) {
 // 18:16 Bench2.exe 被 Windows 判 App Hang（事件 1002）关掉的直接原因，也是
 // 「打开参会人/文件/聊天列表就卡一下」的形状。
 //
-// 缓冲：tmp 是裸内存，装的是带 tag 的 as_value，不参与 GC 扫描。GC 不搬动对象本体
-// （见 gc_alloc 契约），但比较器是用户 AS3 代码，它可能 push/splice 同一个数组而使
-// data 被 realloc，因此每一趟归并都重新取 a->data；趟内的写回也走当时的 a->data。
-static void as_array_sort_impl(as_array* a, as_cmp_fn cmp, void* ctx) {
+// 缓冲全走裸 malloc 的 as_value/int 数组，不参与 GC 扫描。GC 不搬动对象本体（见
+// gc_alloc 契约），但比较器是用户 AS3 代码，它可能 push/splice 同一个数组而使
+// a->data 被 realloc，所以每次比较都重新读 a->data，我们自己持有的只有下标表。
+#define AS_SORT_CI      1
+#define AS_SORT_DESC    2
+#define AS_SORT_UNIQUE  4
+#define AS_SORT_INDEXED 8
+#define AS_SORT_NUMERIC 16
+
+// as_throw_1034 由 emitSealedPropErrors() 在类体区无条件发射（它在 preamble 之后），
+// 这里只要原型。NUMERIC 排序的报错文案必须与 AIR 逐字一致。
+static void as_throw_1034(as_value v, const char* fqn);
+
+// 大小写不敏感比较只折 ASCII A-Z：AIR 的 CASEINSENSITIVE 只承诺拉丁字母等价，
+// 我们不复刻 ICU 的 locale 折叠（那需要一张表，且 AIR 的表现随宿主 locale 变）。
+static int as_lower_ascii(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+static int as_str_cmp_ci(const char* x, const char* y) {
+    while (*x != '\0' && *y != '\0') {
+        int a = as_lower_ascii((unsigned char)*x);
+        int b = as_lower_ascii((unsigned char)*y);
+        if (a != b) return a < b ? -1 : 1;
+        x++; y++;
+    }
+    if (*x != '\0') return 1;
+    if (*y != '\0') return -1;
+    return 0;
+}
+
+// 一次排序的全部参数：选项位 + sortOn 的字段名 + sort(compareFunction) 的比较器。
+// field != NULL 表示 sortOn（键要从元素上反射取），cb != NULL 表示自定义比较器。
+typedef struct { int flags; const char* field; as_fn cb; } as_sort_ctx;
+
+static int as_cmp_opts(as_value a, as_value b, void* ctx) {
+    as_sort_ctx* c = (as_sort_ctx*)ctx;
+    as_value va = a, vb = b;
+    if (c->field != NULL) {
+        va = as_dyn_get(as_v_obj_val(a), c->field);
+        vb = as_dyn_get(as_v_obj_val(b), c->field);
+    }
+    int r;
+    if (c->cb != NULL) {
+        r = as_cmp_cb(va, vb, (void*)c->cb);
+    } else if ((c->flags & AS_SORT_NUMERIC) != 0) {
+        double na = as_v_to_number(va);
+        double nb = as_v_to_number(vb);
+        // NaN 在 adl 上排在所有数值**之后**（升序）：[NaN,1].sort(NUMERIC) 得
+        // 1,NaN，sortOn("k",NUMERIC) 把转不成数值的字段全放在末尾。这不是
+        // 「NaN 与谁都相等」——那样稳定归并会原序不动，整组留在原位。
+        if (isnan(na)) r = isnan(nb) ? 0 : 1;
+        else if (isnan(nb)) r = -1;
+        else r = (na < nb) ? -1 : (na > nb) ? 1 : 0;
+    } else if ((c->flags & AS_SORT_CI) != 0) {
+        r = as_str_cmp_ci(as_v_str_val(va), as_v_str_val(vb));
+    } else {
+        r = strcmp(as_v_str_val(va), as_v_str_val(vb));
+    }
+    return ((c->flags & AS_SORT_DESC) != 0) ? -r : r;
+}
+
+// NUMERIC 的严格口径只对 Array.sort 生效（sortOn 不抛，实测）。AIR 在比较时做
+// ToNumber：Number/Boolean/null/可解析字符串（含 "0x10"、前后空白）通过，
+// undefined / 对象 / 数组 / 函数 / "12abc" / "NaN" 抛 TypeError #1034。
+// AIR 的报错点名的是它内部算法先碰到的那个元素（["a","B"] 报 "B"），我们按
+// 数组顺序预检 —— 确定性优先，文案本身与 AIR 逐字一致。
+static void as_sort_check_numeric(as_array* a) {
+    for (int i = 0; i < a->length; i++) {
+        as_value v = a->data[i];
+        int ok;
+        switch (v.tag) {
+            case 0: case 1: case 2: case 8: case 9: ok = 1; break;
+            case 3: ok = (v.ptr != NULL) && !isnan(as_str_to_number((const char*)v.ptr)); break;
+            default: ok = 0; break;
+        }
+        if (!ok) as_throw_1034(v, "Number");
+    }
+}
+
+// 稳定归并（自底向上），排序对象是「已定义元素的下标序列」而不是值本身：
+// ① RETURNINDEXEDARRAY 的输出就是这趟结果；② 写回时不会与「比较器改了数组」
+// 打架。比较器的 <=0 取左边，这就是稳定性的来源（相等键不交换）。
+static void as_sort_order(int* ord, int* aux, int k, as_array* a, as_cmp_fn cmp, void* ctx) {
+    int in_aux = 0;
+    for (int width = 1; width < k; width *= 2) {
+        int* src = in_aux ? aux : ord;
+        int* dst = in_aux ? ord : aux;
+        for (int i = 0; i < k; i += width * 2) {
+            int lo = i;
+            int mid = (i + width < k) ? i + width : k;
+            int hi = (i + width * 2 < k) ? i + width * 2 : k;
+            int p = lo, q = mid, t = lo;
+            while (p < mid && q < hi) {
+                dst[t++] = (cmp(a->data[src[p]], a->data[src[q]], ctx) <= 0) ? src[p++] : src[q++];
+            }
+            while (p < mid) dst[t++] = src[p++];
+            while (q < hi)  dst[t++] = src[q++];
+        }
+        in_aux = !in_aux;
+    }
+    if (in_aux) memcpy(ord, aux, (size_t)k * sizeof(int));
+}
+
+// 排序核心。**稀疏槽**（tag 5 的洞）的口径来自 adl 51.4.1 实测：排序只搬已定义
+// 的元素，把它们压实到前部，长度不变、尾部一律变成洞 ——
+//   var a=[5,4,3]; a[10]=1; a.sort();  ⇒ join "1,3,4,5,,,,,,,"、4 in a 为 false
+// （旧实现把 11 个槽一起排，于是 4 in a 为 true，且洞被搬到中间）。
+// 洞之间按「undefined」参与 UNIQUESORT：≥2 个洞即算重复（1 个洞不算，实测）。
+static as_value as_array_sort_ex(as_array* a, as_sort_ctx* ctx) {
     int n = a->length;
-    if (n < 2) return;
-    as_value* tmp = (as_value*)malloc((size_t)n * sizeof(as_value));
-    if (tmp == NULL) {
-        // 内存不够时退回就地插入排序：慢但语义一致，不能因为分配失败而改变排序结果。
-        for (int i = 1; i < a->length; i++) {
+    if (n == 0) {
+        if ((ctx->flags & AS_SORT_INDEXED) != 0) return as_v_arr((void*)as_array_new());
+        return as_v_arr((void*)a);
+    }
+    if (ctx->field == NULL && ctx->cb == NULL && (ctx->flags & AS_SORT_NUMERIC) != 0)
+        as_sort_check_numeric(a);
+    int* ord = (int*)malloc((size_t)n * sizeof(int));
+    int* aux = (int*)malloc((size_t)n * sizeof(int));
+    as_value* vals = (as_value*)malloc((size_t)n * sizeof(as_value));
+    if (ord == NULL || aux == NULL || vals == NULL) {
+        // 分配失败：先压实，再做插入排序 —— 慢但语义一致（稳定性不变），
+        // 不能因为分配失败而改变排序结果。UNIQUE/INDEXED 在这种规模下退化
+        // 成「就地排」，是既有行为，不额外伪造返回值。
+        free(ord); free(aux); free(vals);
+        int k = 0;
+        for (int i = 0; i < n; i++)
+            if (a->data[i].tag != 5) a->data[k++] = a->data[i];
+        for (int i = 1; i < k; i++) {
             as_value key = a->data[i];
             int j = i - 1;
-            while (j >= 0 && cmp(a->data[j], key, ctx) > 0) {
-                a->data[j + 1] = a->data[j];
-                j--;
-            }
+            while (j >= 0 && as_cmp_opts(a->data[j], key, ctx) > 0) { a->data[j + 1] = a->data[j]; j--; }
             a->data[j + 1] = key;
         }
-        return;
+        for (int i = k; i < n; i++) { as_value u = {5, 0.0, NULL}; a->data[i] = u; }
+        return as_v_arr((void*)a);
     }
-    int n0 = n;  // 趟数按初始长度固定；比较器若改长则多余元素原样保留
-    int width;
-    // 第一趟从 a->data 归并进 tmp，以后交替 ping-pong。
-    int in_tmp = 0;   // 上一趟的结果现在在哪个缓冲：0=a->data, 1=tmp
-    for (width = 1; width < n0; width *= 2) {
-        as_value* src = in_tmp ? tmp : a->data;
-        as_value* dst = in_tmp ? a->data : tmp;
-        for (int i = 0; i < n0; i += width * 2) {
-            int lo = i;
-            int mid = i + width < n0 ? i + width : n0;
-            int hi = i + width * 2 < n0 ? i + width * 2 : n0;
-            int p = lo, q = mid, k = lo;
-            while (p < mid && q < hi) {
-                // <=0 取左边，这就是稳定性的来源（相等键不交换）。
-                dst[k++] = (cmp(src[p], src[q], ctx) <= 0) ? src[p++] : src[q++];
-            }
-            while (p < mid) dst[k++] = src[p++];
-            while (q < hi)  dst[k++] = src[q++];
-        }
-        in_tmp = !in_tmp;
+    int k = 0;
+    for (int i = 0; i < n; i++) if (a->data[i].tag != 5) ord[k++] = i;
+    if (k > 1) as_sort_order(ord, aux, k, a, as_cmp_opts, ctx);
+    if ((ctx->flags & AS_SORT_UNIQUE) != 0) {
+        int dup = (n - k) >= 2;
+        for (int i = 1; i < k && !dup; i++)
+            if (as_cmp_opts(a->data[ord[i - 1]], a->data[ord[i]], ctx) == 0) dup = 1;
+        if (dup) { free(ord); free(aux); free(vals); return as_v_num(0); }
     }
-    // in_tmp==1 代表上一结把结果写进了 tmp，那就补一次整体回写；否则结果已在 a->data。
-    if (in_tmp) memcpy(a->data, tmp, (size_t)n0 * sizeof(as_value));
-    free(tmp);
+    if ((ctx->flags & AS_SORT_INDEXED) != 0) {
+        as_array* r = as_array_new();
+        for (int i = 0; i < k; i++) as_array_push(r, as_v_num((double)ord[i]));
+        for (int i = 0; i < n; i++) if (a->data[i].tag == 5) as_array_push(r, as_v_num((double)i));
+        free(ord); free(aux); free(vals);
+        return as_v_arr((void*)r);
+    }
+    // 就地写回：ord 是原下标的一个置换，直接写会覆盖还没读的源 ⇒ 先取快照。
+    for (int i = 0; i < k; i++) vals[i] = a->data[ord[i]];
+    for (int i = 0; i < k; i++) a->data[i] = vals[i];
+    for (int i = k; i < n; i++) { as_value u = {5, 0.0, NULL}; a->data[i] = u; }
+    free(ord); free(aux); free(vals);
+    return as_v_arr((void*)a);
 }
 
 // map(callback): apply callback(element, index, array) and collect the results.
@@ -3640,9 +3770,35 @@ static as_array* as_array_reverse(as_array* a) {
 
 // sort()：三种形态共用一个稳定归并核心。默认按字符串排（AS3），Array.NUMERIC 按数值，
 // 传 Function 则作比较器。
-static as_array* as_array_sort_str(as_array* a) { as_array_sort_impl(a, as_cmp_str, NULL); return a; }
-static as_array* as_array_sort_num(as_array* a) { as_array_sort_impl(a, as_cmp_num, NULL); return a; }
-static as_array* as_array_sort_cb(as_array* a, as_fn cb) { as_array_sort_impl(a, as_cmp_cb, (void*)cb); return a; }
+// 静态发射入口。flags 已知不含 UNIQUESORT 时用 *_arr（返回 as_array*，保持调用点
+// 的数组静态类型）；含或未知时用 *(_flags/_v) 的装箱版，因为 UNIQUESORT 命中重复
+// 会返回 Number 0（adl 实测：var r:Array = a.sort(4) 于是抛 #1034，var q:* 得到 0）。
+static as_value as_array_sort_flags(as_array* a, int options) {
+    as_sort_ctx ctx;
+    ctx.flags = options; ctx.field = NULL; ctx.cb = NULL;
+    return as_array_sort_ex(a, &ctx);
+}
+static as_array* as_array_sort_arr(as_array* a, int options) {
+    as_value r = as_array_sort_flags(a, options);
+    return (as_array*)as_v_obj_val(r);
+}
+// sort(x) 的 x 静态类型是 '*': 运行期才知道它是比较器还是选项位（AIR 同样按
+// 「是不是 Function」分流）。静态已知是函数的分支由发射器直接走 as_array_sort_cb。
+static as_value as_array_sort_any(as_array* a, as_value v) {
+    if (v.tag == 7) {
+        as_sort_ctx ctx;
+        ctx.flags = 0; ctx.field = NULL; ctx.cb = (as_fn)v.ptr;
+        return as_array_sort_ex(a, &ctx);
+    }
+    return as_array_sort_flags(a, as_v_to_int(v));
+}
+static as_array* as_array_sort_str(as_array* a) { return as_array_sort_arr(a, 0); }
+static as_array* as_array_sort_num(as_array* a) { return as_array_sort_arr(a, AS_SORT_NUMERIC); }
+static as_array* as_array_sort_cb(as_array* a, as_fn cb) {
+    as_sort_ctx ctx;
+    ctx.flags = 0; ctx.field = NULL; ctx.cb = cb;
+    return (as_array*)as_v_obj_val(as_array_sort_ex(a, &ctx));
+}
 
 // ---------- object literal (associative map) ----------
 // AS3 object literals like { x: 1, y: "a" } are simplified here to a string-keyed
@@ -6172,28 +6328,17 @@ static as_value as_add_v(as_value a, as_value b) {
 }
 
 // Array.sortOn(field, options): sort objects in place by a named property. The
-// field value is fetched reflectively via as_dyn_get. Options honor Array.NUMERIC
-// (16, compare as numbers) and Array.DESCENDING (2, reverse order); other flags
-// (unique/return-indexed/case-insensitive) are outside this subset.
-typedef struct { const char* field; int numeric; int desc; } as_sorton_ctx;
-static int as_cmp_sorton(as_value a, as_value b, void* ctx) {
-    as_sorton_ctx* c = (as_sorton_ctx*)ctx;
-    as_value fa = as_dyn_get(as_v_obj_val(a), c->field);
-    as_value fb = as_dyn_get(as_v_obj_val(b), c->field);
-    int r;
-    if (c->numeric) {
-        double na = as_v_to_number(fa);
-        double nb = as_v_to_number(fb);
-        r = (na < nb) ? -1 : (na > nb) ? 1 : 0;
-    } else {
-        r = strcmp(as_v_str_val(fa), as_v_str_val(fb));
-    }
-    return c->desc ? -r : r;
+// field value is fetched reflectively via as_dyn_get. Options are the same five
+// bits Array.sort honors (see as_cmp_opts); the one deliberate asymmetry is that
+// a value that will not convert to Number does NOT raise #1034 here -- AIR's
+// sortOn compares it as NaN (measured: keys 9 10 a B).
+static as_value as_array_sortOn_v(as_array* a, const char* field, int options) {
+    as_sort_ctx ctx;
+    ctx.flags = options; ctx.field = field; ctx.cb = NULL;
+    return as_array_sort_ex(a, &ctx);
 }
-static as_array* as_array_sortOn(as_array* a, const char* field, int options) {
-    as_sorton_ctx ctx = { field, (options & 16) != 0, (options & 2) != 0 };
-    as_array_sort_impl(a, as_cmp_sorton, &ctx);
-    return a;
+static as_array* as_array_sortOn_arr(as_array* a, const char* field, int options) {
+    return (as_array*)as_v_obj_val(as_array_sortOn_v(a, field, options));
 }
 
 // Dynamic dispatch of the Array built-in method set on a star-typed receiver
@@ -6250,12 +6395,14 @@ static as_value as_arr_call(void* av, const char* name, as_value* args, int argc
     }
     if (strcmp(name, "sort") == 0) {
         if (argc > 0 && args[0].tag == 7) return as_v_arr((void*)as_array_sort_cb(a, (as_fn)args[0].ptr));
-        if (argc > 0 && (args[0].tag == 1 || args[0].tag == 8 || args[0].tag == 9) && (as_v_to_int(args[0]) & 16) != 0)
-            return as_v_arr((void*)as_array_sort_num(a));
-        return as_v_arr((void*)as_array_sort_str(a));
+        return as_array_sort_flags(a, argc > 0 ? as_v_to_int(args[0]) : 0);
     }
-    if (strcmp(name, "sortOn") == 0)
-        return as_v_arr((void*)as_array_sortOn(a, argc > 0 ? as_v_str_val(args[0]) : "", argc > 1 ? as_v_to_int(args[1]) : 0));
+    if (strcmp(name, "sortOn") == 0) {
+        // A null/undefined field name reaches us as a NULL char*; the static path
+        // spells it "null" (toStringExpr), and as_dyn_get must never see NULL.
+        const char* fld = argc > 0 ? as_v_str_val(args[0]) : NULL;
+        return as_array_sortOn_v(a, fld != NULL ? fld : "null", argc > 1 ? as_v_to_int(args[1]) : 0);
+    }
     // Object's inherited four: an Array answers hasOwnProperty (an index or an added
     // named property), propertyIsEnumerable (the same, but "length" is a trait) and
     // valueOf (handled above); measured on adl 51.4.1 -- temp/g14/DictAir.as.
@@ -10747,6 +10894,16 @@ static void as_gradient_linearrgb_report(void) {
 // the NAMES are staged here: a worker must never touch the GC heap, and the
 // File objects are generated in the finish thunk, on the AS3 thread.
 #define AS_JOB_DIR        10
+// File.deleteFileAsync / deleteDirectoryAsync / moveToTrashAsync: same shape as
+// AS_JOB_DIR (the filesystem work moves off the AS3 thread, the event arrives at a
+// frame boundary), with the operation itself carried in the job's 'binary' field.
+// These three used to do the work AND dispatch the event inside the call, so
+// f.deleteFileAsync() had already deleted the file when it returned and a listener
+// added right afterwards never fired -- both measured wrong against adl 51.4.1
+// (temp/fileempty/): the file still exists right after the call, the event arrives
+// later, a second call while one is in flight throws #2037, and cancel() drops the
+// event without undoing the work.
+#define AS_JOB_FS_OP      11
 
 #define AS_JOB_QUEUED 0
 #define AS_JOB_RUNNING 1
@@ -11775,6 +11932,12 @@ static int as_job_dir_push(as_job* j, const char* name) {
     return 1;
 }
 
+// Implemented beside the File class (emit.ts): the async delete/trash members run
+// their filesystem work on the job thread, so the operation lives with the rest of
+// the File helpers and is declared here for the worker's dispatch below. Pure C by
+// contract -- a worker must never touch the GC heap.
+static int as_file_op_run(const char* path, int op);
+
 static void as_job_run(as_job* j) {
     switch (j->kind) {
         case AS_JOB_READ_TEXT:
@@ -11892,6 +12055,13 @@ static void as_job_run(as_job* j) {
               fseek((FILE*)h, cur, SEEK_SET);
             }
 #endif
+            break;
+        }
+        case AS_JOB_FS_OP: {
+            // j->binary carries the operation (see as_file_op_run). The result is an
+            // AIR error id, not an AS_JOB_ERR_* code, because the finish thunk has to
+            // report the SAME id and sentence the synchronous member would throw.
+            j->error = as_file_op_run(j->path, j->binary);
             break;
         }
         case AS_JOB_DIR: {
@@ -13182,13 +13352,23 @@ static void as_async_mark_roots(void) {
 // guard cannot be "just submit another job" -- as_job_publish would supersede
 // the in-flight one and dispatch only one event, which is the opposite outcome.
 // No lock: the job table belongs to the AS3 thread (same rule as as_async_cancel).
-static int as_async_dir_pending(void* obj) {
+static int as_async_kind_pending(void* obj, int kind) {
     for (int i = 0; i < as_job_count; i++) {
         as_job* j = as_jobs[i];
-        if (j == NULL || j->kind != AS_JOB_DIR || j->obj != obj) continue;
+        if (j == NULL || j->kind != kind || j->obj != obj) continue;
         if (!j->dead && j->state != AS_JOB_FINISHING) return 1;
     }
     return 0;
+}
+
+static int as_async_dir_pending(void* obj) {
+    return as_async_kind_pending(obj, AS_JOB_DIR);
+}
+
+// The same "one in flight at a time" rule for the delete/trash members: AIR rejects
+// a second call with #2037 while the first has not reported yet (measured).
+static int as_async_op_pending(void* obj) {
+    return as_async_kind_pending(obj, AS_JOB_FS_OP);
 }
 
 static int as_async_cancel(void* obj) {

@@ -2344,6 +2344,11 @@ export class Emitter {
       const params = this.paramDecls(info.constructor.params, info.importAlias);
       this.line(`void ${name}_ctor(${name}* o${params ? ', ' + params : ''});`);
       this.line(`${name}* ${name}_new(${params || 'void'});`);
+      // File has TWO construction shapes because AIR does: the no-argument one
+      // builds the empty File, everything else goes through the validating
+      // File_new (see its body). Declared here so user code emitted earlier in the
+      // file can call it.
+      if (name === 'File') this.line('File* File_new_empty(void);');
       // Classes that are constructible with no arguments (every parameter has a
       // default) but whose constructor still takes parameters need a genuine
       // no-argument entry point for the reflection factory.
@@ -4818,7 +4823,7 @@ static _Noreturn void as_sql_fail(void* db, const char* op, const char* fallback
 // or a plain Object must NOT be read as a File).
 static const char* as_sql_ref_path(Object* ref) {
   if (ref == NULL) return NULL;
-  if (*(void**)ref == (void*)&File_vt) return ((File*)ref)->nativePath;
+  if (*(void**)ref == (void*)&File_vt) return ((File*)ref)->_nativePath;
   return NULL;
 }
 // One result column as a boxed AS3 value. AIR maps SQLite's storage classes onto
@@ -14890,7 +14895,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // which is the shape AGENTS.md section 1.5 forbids: it reports instead, and the
     // gap is registered in TODO.md 遗留待开发. Fixing it means unpacking the whole
     // .ane into <extensionID>/, not just its native library.
-    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) { (void)extensionID; as_shell_unsupported("ExtensionContext.getExtensionDirectory (this build stages only the native library, under extensions/<extensionID>/<platform>; the rest of the package is not unpacked)"); return File_new(NULL); }');
+    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) { (void)extensionID; as_shell_unsupported("ExtensionContext.getExtensionDirectory (this build stages only the native library, under extensions/<extensionID>/<platform>; the rest of the package is not unpacked)"); return File_new_empty(); }');
     // ---- flash.net.NetConnection / NetStream + flash.media.Video (stage 110) ----
     // The transport surface away3d's SimpleVideoPlayer drives. There is no media
     // transport and no video decoder in this subset: the connection state machine
@@ -17165,7 +17170,7 @@ static char* as_file_working_dir(void) {
     // path is accepted and kept, which is where this build's documented deviation
     // lives (AIR rejects one with #2004, see TODO #240); it is normalised too.
     this.line('if (path != NULL && (strncmp(path, "file://", 7) == 0 || strncmp(path, "app-storage:", 12) == 0 || strncmp(path, "app:", 4) == 0)) path = as_local_path_from_url(path);');
-    this.line('o->nativePath = (path != NULL) ? as_path_norm(path) : NULL; gc_write_barrier((void*)o->nativePath);');
+    this.line('o->_nativePath = (path != NULL) ? as_path_norm(path) : NULL; gc_write_barrier((void*)o->_nativePath);');
     this.indent--;
     this.line('}');
     // nativePath setter. AIR exposes this as a PROPERTY but implements it as a
@@ -17186,11 +17191,56 @@ static char* as_file_working_dir(void) {
     this.line('File* o = (File*)_this;');
     this.line('if (path == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter  must be non-null.", 2007)); return; }');
     this.line('if (path[0] == \'\\0\' || !as_path_is_abs(path)) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }');
-    this.line('o->nativePath = as_path_norm(path);');
-    this.line('gc_write_barrier((void*)o->nativePath);');
+    this.line('o->_nativePath = as_path_norm(path);');
+    this.line('gc_write_barrier((void*)o->_nativePath);');
     this.indent--;
     this.line('}');
-    this.line('File* File_new(char* path) { File* o = (File*)gc_alloc(GCT_CLASS, sizeof(File)); o->vtable = &File_vt; File_ctor(o, path); return o; }');
+    this.line('static File* File_new_impl(char* path) { File* o = (File*)gc_alloc(GCT_CLASS, sizeof(File)); o->vtable = &File_vt; File_ctor(o, path); return o; }');
+    // The constructor contract, measured on adl 51.4.1 (temp/fileempty/):
+    //   new File()                 -> the EMPTY File; every path member then throws
+    //                                 #2037, which is a state, not an error.
+    //   new File(null)             -> #2037. A null argument is REFUSED; it does not
+    //                                 mean "empty" (that is what the no-arg form is).
+    //   new File("a/b.txt")        -> ArgumentError #2004, likewise "", "./x",
+    //                                 "~/x", "temp/x.db" and "http://host/x".
+    //   new File("file:///a%20b")  -> decoded to a native path, as are app:/ and
+    //                                 app-storage:/ (the URL forms AIR accepts).
+    // Accepting a relative path here (and keeping it verbatim) was a registered
+    // deviation until this stage; it is closed now, so the two call shapes are
+    // split into two entry points instead of guessing from a NULL argument.
+    this.cblock(`File* File_new_empty(void) { return File_new_impl(NULL); }
+File* File_new(char* path) {
+  char* local;
+  if (path == NULL) {
+    as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));
+    return NULL;
+  }
+  // as_local_path_from_url answers the argument unchanged when it names none of
+  // the three schemes, so a bare word lands in the absolute-path test below.
+  local = as_local_path_from_url(path);
+  if (local == NULL || local[0] == '\\0' || !as_path_is_abs(local)) {
+    as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004));
+    return NULL;
+  }
+  return File_new_impl(local);
+}`);
+    // AIR throws #2037 from EVERY member that needs a path when the File has none
+    // yet -- `new File()` is legal, so this is a reachable state, not a misuse.
+    // Measured on adl 51.4.1 (temp/fileempty/): nativePath, url, name, extension,
+    // parent, exists, isDirectory, isHidden, isSymbolicLink, isPackage, size,
+    // spaceAvailable, creationDate, modificationDate, downloaded, creator, type and
+    // icon all raise #2037; only preventBackup (false), data (null), toString() and
+    // clone() answer. This build used to return "" / false / 0 from all of them,
+    // which silently turned "not initialised" into "an empty path" -- a real bug:
+    // `f.exists` answered false instead of telling the caller it was too early.
+    this.line('static bool as_file_has_path(File* o) {');
+    this.indent++;
+    this.line('if (o->_nativePath != NULL) return true;');
+    this.line('as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));');
+    this.line('return false;');
+    this.indent--;
+    this.line('}');
+    this.line('char* File_get_nativePath(void* _this) { File* o = (File*)_this; if (!as_file_has_path(o)) return (char*)""; return o->_nativePath; }');
     // The two app roots become their own schemes, everything else "file:///".
     // as_app_storage_dir() is asked on every read rather than cached in a static:
     // its result is a GC string and a plain C static is not a GC root, so a cached
@@ -17198,8 +17248,8 @@ static char* as_file_working_dir(void) {
     this.line('char* File_get_url(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('const char* path = o->nativePath;');
-    this.line('if (path == NULL) return (char*)"file://";');
+    this.line('if (!as_file_has_path(o)) return (char*)"";');
+    this.line('const char* path = o->_nativePath;');
     this.line('char* store = as_app_storage_dir();');
     this.line('if (as_path_under(path, store)) { const char* rel = path + strlen(store); while (rel[0] == \'/\' || rel[0] == \'\\\\\') rel++; return as_str_concat((char*)"app-storage:/", as_file_url_encode(rel)); }');
     this.line('char* appdir = as_app_dir();');
@@ -17210,12 +17260,12 @@ static char* as_file_working_dir(void) {
     this.indent--;
     this.line('}');
     this.line();
-    this.line('bool File_get_exists(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_exists(o->nativePath); }');
-    this.line('bool File_get_isDirectory(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_dir(o->nativePath); }');
+    this.line('bool File_get_exists(void* _this) { File* o = (File*)_this; if (!as_file_has_path(o)) return false; return as_path_exists(o->_nativePath); }');
+    this.line('bool File_get_isDirectory(void* _this) { File* o = (File*)_this; if (!as_file_has_path(o)) return false; return as_path_is_dir(o->_nativePath); }');
     // isSymbolicLink: about the link, not its target (AIR 1.0). A path that does not
     // exist is false, a dangling link is true -- lstat() answers both without
     // resolving, so no extra existence gate is needed.
-    this.line('bool File_get_isSymbolicLink(void* _this) { File* o = (File*)_this; return o->nativePath != NULL && as_path_is_symlink(o->nativePath); }');
+    this.line('bool File_get_isSymbolicLink(void* _this) { File* o = (File*)_this; if (!as_file_has_path(o)) return false; return as_path_is_symlink(o->_nativePath); }');
     // size: the length in bytes, measured with stat() (AIR's File.size is a
     // Number). Measured on adl 51.4.1 (temp/fileaudit/adl/av.txt D1-D3), the
     // three shapes are distinct and none of them is "0 for a missing path":
@@ -17226,9 +17276,9 @@ static char* as_file_working_dir(void) {
     // rather than truncated to int (a >2 GB file must not go negative).
     this.cblock(`double File_get_size(void* _this) {
   File* o = (File*)_this;
-  if (o->nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return 0.0; }
+  if (o->_nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return 0.0; }
   struct stat st;
-  if (stat(o->nativePath, &st) != 0) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return 0.0; }
+  if (stat(o->_nativePath, &st) != 0) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return 0.0; }
   if (!S_ISREG(st.st_mode)) return 0.0;
   return (double)st.st_size;
 }`);
@@ -17282,15 +17332,15 @@ static char* as_file_working_dir(void) {
     this.line('#endif');
     this.indent--;
     this.line('}');
-    this.line('double File_get_spaceAvailable(void* _this) { File* o = (File*)_this; return as_file_space_available(o->nativePath); }');
+    this.line('double File_get_spaceAvailable(void* _this) { File* o = (File*)_this; if (!as_file_has_path(o)) return 0.0; return as_file_space_available(o->_nativePath); }');
     // name: the last component of the path (AIR's File.name). BOTH separators count,
     // so a Windows nativePath ("C:\\Users\\x\\a.log") names the file and not the
     // drive, and a trailing separator is ignored ("/a/b/" names "b").
     this.line('char* File_get_name(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('if (o->nativePath == NULL) return (char*)"";');
-    this.line('const char* s = o->nativePath;');
+    this.line('if (!as_file_has_path(o)) return (char*)"";');
+    this.line('const char* s = o->_nativePath;');
     this.line('int n = (int)strlen(s);');
     this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
     this.line('int start = 0;');
@@ -17307,8 +17357,8 @@ static char* as_file_working_dir(void) {
     this.line('char* File_get_extension(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('if (o->nativePath == NULL) return (char*)"";');
-    this.line('const char* s = o->nativePath;');
+    this.line('if (!as_file_has_path(o)) return (char*)"";');
+    this.line('const char* s = o->_nativePath;');
     this.line('int n = (int)strlen(s);');
     this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
     this.line('int base = 0;');
@@ -17350,8 +17400,8 @@ static char* as_file_working_dir(void) {
     this.line('File* File_get_parent(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('if (o->nativePath == NULL) return NULL;');
-    this.line('const char* s = o->nativePath;');
+    this.line('if (!as_file_has_path(o)) return NULL;');
+    this.line('const char* s = o->_nativePath;');
     this.line('int n = (int)strlen(s);');
     this.line('while (n > 1 && (s[n - 1] == \'/\' || s[n - 1] == \'\\\\\')) n--;');
     this.line('int cut = -1;');
@@ -17373,9 +17423,9 @@ static char* as_file_working_dir(void) {
     this.line('bool File_get_isHidden(void* _this) {');
     this.indent++;
     this.line('File* o = (File*)_this;');
-    this.line('if (o->nativePath == NULL) return false;');
-    this.line('const char* base = o->nativePath;');
-    this.line('for (const char* p = o->nativePath; *p; p++) if (*p == \'/\' || *p == \'\\\\\') base = p + 1;');
+    this.line('if (!as_file_has_path(o)) return false;');
+    this.line('const char* base = o->_nativePath;');
+    this.line('for (const char* p = o->_nativePath; *p; p++) if (*p == \'/\' || *p == \'\\\\\') base = p + 1;');
     this.line('return base[0] == \'.\';');
     this.indent--;
     this.line('}');
@@ -17385,9 +17435,9 @@ static char* as_file_working_dir(void) {
     // up, and an ABSOLUTE argument replaces the base (all in av.txt G1-G11).
     this.cblock(`File* File_resolvePath(void* _this, char* path) {
   File* o = (File*)_this;
-  if (o->nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return NULL; }
+  if (o->_nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return NULL; }
   if (path == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter  must be non-null.", 2007)); return NULL; }
-  return File_new(as_path_join(o->nativePath, path));
+  return File_new(as_path_join(o->_nativePath, path));
 }`);
     // ---- File deletion --------------------------------------------------------
     // The contract, measured on adl 51.4.1 (temp/fileaudit/adl/av.txt, av3.txt):
@@ -17487,9 +17537,7 @@ static int as_rmdir_empty(const char* p) {
 #endif
 }
 // 0 ok, else the AIR error id. isDir picks the member; recursive is the flag.
-static int as_file_delete_err(File* o, int isDir, int recursive) {
-  if (o->nativePath == NULL) return 2037;
-  const char* p = o->nativePath;
+static int as_file_path_delete_err(const char* p, int isDir, int recursive) {
   if (!as_path_exists_l(p)) return 3003;
   if (isDir) {
     if (recursive) return as_remove_any(p);
@@ -17500,6 +17548,10 @@ static int as_file_delete_err(File* o, int isDir, int recursive) {
   // deleteFile: a REAL directory is #3006; a symlink to one is not.
   if (as_path_is_dir(p) && !as_path_is_symlink(p)) return 3006;
   return (remove(p) == 0) ? 0 : 3001;
+}
+static int as_file_delete_err(File* o, int isDir, int recursive) {
+  if (o->_nativePath == NULL) return 2037;
+  return as_file_path_delete_err(o->_nativePath, isDir, recursive);
 }
 static const char* as_file_err_text(int err) {
   switch (err) {
@@ -17633,9 +17685,9 @@ static int as_file_time_ms(const char* p, int creation, double* out) {
 #endif
 }
 static Date* as_file_date(File* o, int creation) {
-  if (o->nativePath == NULL) { as_file_throw(2037); return NULL; }
+  if (o->_nativePath == NULL) { as_file_throw(2037); return NULL; }
   double ms = 0.0;
-  if (!as_file_time_ms(o->nativePath, creation, &ms)) { as_file_throw(3003); return NULL; }
+  if (!as_file_time_ms(o->_nativePath, creation, &ms)) { as_file_throw(3003); return NULL; }
   return Date_new_ms(ms);
 }`);
     // downloaded: AIR's "this file carries the quarantine flag" bit. On macOS that
@@ -17844,7 +17896,7 @@ static char* as_file_temp_path(int isDir) {
     this.indent++;
     this.line('if (obj == NULL) return NULL;');
     this.line('if (((void**)obj)[0] != (void*)&File_vt) return NULL;');
-    this.line('return ((File*)obj)->nativePath;');
+    this.line('return ((File*)obj)->_nativePath;');
     this.indent--;
     this.line('}');
     // A recursive copy, used by copyTo/copyToAsync. The caller has already removed
@@ -17940,18 +17992,18 @@ static char* as_file_temp_path(int isDir) {
     // #2037, and a path that names an existing FILE throws #3003 (not #3006).
     this.cblock(`void File_createDirectory(void* _this) {
   File* o = (File*)_this;
-  if (o->nativePath == NULL) { as_file_throw(2037); return; }
-  if (as_path_exists_l(o->nativePath) && !as_path_is_dir(o->nativePath)) { as_file_throw(3003); return; }
-  as_mkdirs(o->nativePath);
+  if (o->_nativePath == NULL) { as_file_throw(2037); return; }
+  if (as_path_exists_l(o->_nativePath) && !as_path_is_dir(o->_nativePath)) { as_file_throw(3003); return; }
+  as_mkdirs(o->_nativePath);
 }`);
     // clone(): a new File for the same path (measured: equal nativePath, different
     // object).
-    this.line('File* File_clone(void* _this) { File* o = (File*)_this; if (o->nativePath == NULL) { as_file_throw(2037); return NULL; } return File_new(o->nativePath); }');
+    this.line('File* File_clone(void* _this) { File* o = (File*)_this; return (o->_nativePath == NULL) ? File_new_empty() : File_new(o->_nativePath); }');
     // canonicalize(): rewrite the receiver IN PLACE (AIR declares it void).
     this.cblock(`void File_canonicalize(void* _this) {
   File* o = (File*)_this;
-  o->nativePath = as_path_realpath(o->nativePath);
-  gc_write_barrier((void*)o->nativePath);
+  o->_nativePath = as_path_realpath(o->_nativePath);
+  gc_write_barrier((void*)o->_nativePath);
 }`);
     // getRelativePath(ref, useDotDot): from the receiver to `ref`. The argument is
     // declared FileReference in AIR (File's superclass), so a plain FileReference --
@@ -17961,8 +18013,8 @@ static char* as_file_temp_path(int isDir) {
   const char* to;
   if (ref == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter ref must be non-null.", 2007)); return NULL; }
   to = as_file_path_of((void*)ref);
-  if (o->nativePath == NULL || to == NULL) { as_file_throw(2037); return NULL; }
-  return as_file_relpath(o->nativePath, to, useDotDot ? 1 : 0);
+  if (o->_nativePath == NULL || to == NULL) { as_file_throw(2037); return NULL; }
+  return as_file_relpath(o->_nativePath, to, useDotDot ? 1 : 0);
 }`);
     // copyTo / moveTo share one measured contract (temp/fileaudit2/AC.as,
     // temp/fileaudit/adl/av3.txt C1-C7):
@@ -17983,7 +18035,7 @@ static char* as_file_temp_path(int isDir) {
     // deletes, and so does this now (as_file_copy_any + as_remove_any), so a move
     // between volumes works instead of reporting that it cannot.
     this.cblock(`static int as_file_transfer_err(File* o, FileReference* target, int overwrite, int* nullArg) {
-  const char* src = o->nativePath;
+  const char* src = o->_nativePath;
   const char* dst;
   char* parent;
   *nullArg = 0;
@@ -18020,7 +18072,7 @@ static void as_file_null_dest(void) {
   if (nullArg) { as_file_null_dest(); return; }
   if (err == 3014) { as_file_throw_contained(); return; }
   if (err != 0) { as_file_throw(err); return; }
-  err = as_file_copy_any(o->nativePath, as_file_path_of((void*)newFile));
+  err = as_file_copy_any(o->_nativePath, as_file_path_of((void*)newFile));
   if (err == 3014) as_file_throw_contained();
   else if (err != 0) as_file_throw(err);
 }
@@ -18029,7 +18081,7 @@ void File_copyToAsync(void* _this, FileReference* newFile, bool overwrite) {
   int nullArg = 0;
   int err = as_file_transfer_err(o, newFile, overwrite ? 1 : 0, &nullArg);
   if (nullArg) { as_file_null_dest(); return; }
-  if (err == 0) err = as_file_copy_any(o->nativePath, as_file_path_of((void*)newFile));
+  if (err == 0) err = as_file_copy_any(o->_nativePath, as_file_path_of((void*)newFile));
   if (err == 3014) { as_throw(Error_new((char*)"Error #3014: Cannot copy or move a file or directory to overwrite a containing directory.", 3014)); return; }
   as_file_io_dispatch(o, err);
 }
@@ -18040,9 +18092,9 @@ void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
   if (nullArg) { as_file_null_dest(); return; }
   if (err == 0) {
     const char* dst = as_file_path_of((void*)newFile);
-    if (rename(o->nativePath, dst) != 0) {
-      err = as_file_copy_any(o->nativePath, dst);
-      if (err == 0) err = as_remove_any(o->nativePath);
+    if (rename(o->_nativePath, dst) != 0) {
+      err = as_file_copy_any(o->_nativePath, dst);
+      if (err == 0) err = as_remove_any(o->_nativePath);
     }
   }
   if (err == 3014) { as_throw(Error_new((char*)"Error #3014: Cannot copy or move a file or directory to overwrite a containing directory.", 3014)); return; }
@@ -18056,7 +18108,7 @@ void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
     // a real file (the field is dead on modern macOS) and #2037 without a path.
     this.cblock(`char* File_get_creator(void* _this) {
   File* o = (File*)_this;
-  if (o->nativePath == NULL) { as_file_throw(2037); return NULL; }
+  if (o->_nativePath == NULL) { as_file_throw(2037); return NULL; }
   return NULL;
 }`);
     // data: only a FileReference LOAD fills this, and File never loads -- measured
@@ -18070,7 +18122,7 @@ void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
     this.cblock(`Icon* File_get_icon(void* _this) {
   File* o = (File*)_this;
   Icon* ic;
-  if (o->nativePath == NULL) { as_file_throw(2037); return NULL; }
+  if (o->_nativePath == NULL) { as_file_throw(2037); return NULL; }
   ic = Icon_new();
   ic->_bitmaps = as_array_new();
   gc_write_barrier((void*)ic->_bitmaps);
@@ -18081,13 +18133,13 @@ void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
     // as_file_downloaded and the _preventBackup field note in symbols.ts).
     this.cblock(`bool File_get_downloaded(void* _this) {
   File* o = (File*)_this;
-  if (o->nativePath == NULL) { as_file_throw(2037); return false; }
-  return as_file_downloaded(o->nativePath);
+  if (o->_nativePath == NULL) { as_file_throw(2037); return false; }
+  return as_file_downloaded(o->_nativePath);
 }
 void File_set_downloaded(void* _this, bool value) {
   File* o = (File*)_this;
-  if (o->nativePath == NULL) { as_file_throw(2037); return; }
-  as_file_set_downloaded(o->nativePath, value ? 1 : 0);
+  if (o->_nativePath == NULL) { as_file_throw(2037); return; }
+  as_file_set_downloaded(o->_nativePath, value ? 1 : 0);
 }
 bool File_get_preventBackup(void* _this) { return ((File*)_this)->_preventBackup; }
 // Measured on adl 51.4.1 (temp/fileaudit2/af.txt): setting preventBackup = true and
@@ -18095,7 +18147,7 @@ bool File_get_preventBackup(void* _this) { return ((File*)_this)->_preventBackup
 // no OS "exclude from backup" bit it could report. The setter therefore stores
 // nothing rather than inventing a state AIR does not have.
 void File_set_preventBackup(void* _this, bool value) { (void)_this; (void)value; }
-bool File_get_isPackage(void* _this) { return as_file_is_package(((File*)_this)->nativePath); }`);
+bool File_get_isPackage(void* _this) { File* o = (File*)_this; if (!as_file_has_path(o)) return false; return as_file_is_package(o->_nativePath); }`);
     // url setter: only the file/app/app-storage schemes are accepted, the value is
     // percent-decoded and normalised, and everything else is #2004 -- measured on
     // adl 51.4.1 (ac.txt): file:///tmp/a%20b.txt -> /tmp/a b.txt, app:/q.txt ->
@@ -18112,8 +18164,8 @@ bool File_get_isPackage(void* _this) { return as_file_is_package(((File*)_this)-
     as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004));
     return;
   }
-  o->nativePath = as_path_norm(path);
-  gc_write_barrier((void*)o->nativePath);
+  o->_nativePath = as_path_norm(path);
+  gc_write_barrier((void*)o->_nativePath);
 }`);
     // The File statics (the only three AIR declares: temp/fileaudit2/desc.txt).
     this.line('File* File_createTempFile_static(void) { char* p = as_file_temp_path(0); if (p == NULL) { as_file_throw(2038); return NULL; } return File_new(p); }');
@@ -18537,27 +18589,43 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('#endif');
     this.line('}');
     this.line('');
+    this.line('// Worker-side entry point for the three async members. Pure C by contract: this');
+    this.line('// runs on the job thread, so it may read only the job\'s own copy of the path --');
+    this.line('// never a File object, and never the GC heap.');
+    this.line('//   op 0 = deleteFile, 1 = deleteDirectory(false), 2 = deleteDirectory(true),');
+    this.line('//   3 = moveToTrash. The return value is an AIR error id (0 = success).');
+    this.line('static void File__opFinish(void* job) {');
+    this.line('  File* o = (File*)as_job_obj(job);');
+    this.line('  if (o == NULL) return;');
+    this.line('  int err = as_job_failed(job);');
+    this.line('  if (err == 0) { EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false)); return; }');
+    this.line('  IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)as_file_err_text(err));');
+    this.line('  ev->errorID = err;');
+    this.line('  EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('}');
+    this.line('static int as_file_op_run(const char* path, int op) {');
+    this.line('  if (path == NULL) return 3003;');
+    this.line('  if (op == 3) return (int)as_trash_move(path);');
+    this.line('  return as_file_path_delete_err(path, op == 0 ? 0 : 1, op == 2 ? 1 : 0);');
+    this.line('}');
+    this.line('');
     this.line('void File_moveToTrash(void* _this) {');
-    this.line('  long err = as_trash_move(((File*)_this)->nativePath);');
+    this.line('  long err = as_trash_move(((File*)_this)->_nativePath);');
     this.line('  if (err == 0) return;');
     this.line('  if (err == 2037) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return; }');
     this.line('  if (err == 3003) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return; }');
     this.line('  as_throw(IOError_new((char*)"Error #2038: File I/O Error.", 2038));');
     this.line('}');
-    this.line('// moveToTrashAsync dispatches its outcome instead of throwing (measured: a');
-    this.line('// missing path is an ioError, not an exception). AIR delivers the event from');
-    this.line('// its own IO thread; this build performs the move inline and dispatches from');
-    this.line('// the same call -- the convention every other async member of File follows');
-    this.line('// here (see File_getDirectoryListingAsync).');
+    // moveToTrashAsync dispatches its outcome instead of throwing (a missing path is
+    // an ioError, not an exception). Measured on adl 51.4.1 (temp/fileempty/): the
+    // call returns BEFORE the move, the event arrives later, a second call while one
+    // is in flight throws #2037, and cancel() drops the event without undoing the
+    // move. It therefore runs on the job thread like the listing member; only the
+    // no-path case still throws synchronously.
     this.line('void File_moveToTrashAsync(void* _this) {');
     this.line('  File* o = (File*)_this;');
-    this.line('  long err = as_trash_move(o->nativePath);');
-    this.line('  if (err == 2037) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return; }');
-    this.line('  if (err == 0) { EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false)); return; }');
-    this.line('  const char* text = (err == 3003) ? "Error #3003: File or directory does not exist." : "Error #2038: File I/O Error.";');
-    this.line('  IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)text);');
-    this.line('  ev->errorID = (int)err;');
-    this.line('  EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('  if (o->_nativePath == NULL || as_async_op_pending((void*)o)) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return; }');
+    this.line('  as_async_submit(AS_JOB_FS_OP, (void*)o, File__opFinish, o->_nativePath, NULL, 3);');
     this.line('}');
     // File.moveTo(newFile, overwrite = false): rename() the path. AIR declares
     // EXACTLY two parameters (measured: mxmlc rejects a third -- "参数的数量不正确.
@@ -18587,11 +18655,11 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('if (err != 0) { as_file_throw(err); return; }');
     // A cross-volume move makes rename() fail (EXDEV). AIR copies and then deletes,
     // and so does this: as_file_copy_any moves the whole tree, then the source goes.
-    this.line('if (rename(o->nativePath, as_file_path_of((void*)newFile)) != 0) {');
+    this.line('if (rename(o->_nativePath, as_file_path_of((void*)newFile)) != 0) {');
     this.indent++;
     this.line('const char* dst = as_file_path_of((void*)newFile);');
-    this.line('err = as_file_copy_any(o->nativePath, dst);');
-    this.line('if (err == 0) err = as_remove_any(o->nativePath);');
+    this.line('err = as_file_copy_any(o->_nativePath, dst);');
+    this.line('if (err == 0) err = as_remove_any(o->_nativePath);');
     this.line('if (err != 0) { as_file_throw(err); return; }');
     this.indent--;
     this.line('}');
@@ -18648,7 +18716,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.indent++;
     this.line('char* nm = as_job_dir_name(job, i);');
     this.line('if (nm == NULL) continue;');
-    this.line('as_array_push(files, as_v_obj((void*)File_new(as_path_join(o->nativePath, nm))));');
+    this.line('as_array_push(files, as_v_obj((void*)File_new(as_path_join(o->_nativePath, nm))));');
     this.indent--;
     this.line('}');
     // FileListEvent's fifth parameter is 'files'; our shell also declares a fourth
@@ -18663,34 +18731,35 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('File* o = (File*)_this;');
     // Both guards report the SAME #2037 text, which is what adl does: an empty
     // File and a call-while-in-flight are one error id and one message there.
-    this.line('if (o->nativePath == NULL || as_async_dir_pending((void*)o)) {');
+    this.line('if (o->_nativePath == NULL || as_async_dir_pending((void*)o)) {');
     this.indent++;
     this.line('as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));');
     this.line('return;');
     this.indent--;
     this.line('}');
-    this.line('as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->nativePath, NULL, 0);');
+    this.line('as_async_submit(AS_JOB_DIR, (void*)o, File__dirFinish, o->_nativePath, NULL, 0);');
     this.indent--;
     this.line('}');
     // The async delete pair shares ONE implementation with the sync members and
     // only differs in HOW the outcome is reported. Measured on adl 51.4.1
-    // (temp/fileaudit/adl/av.txt H0, av3.txt I0): a failure arrives as
-    // ioError carrying the SAME id and sentence the sync member throws
+    // (temp/fileaudit/adl/av.txt H0, av3.txt I0, temp/fileempty/): a failure
+    // arrives as ioError carrying the SAME id and sentence the sync member throws
     // (deleteFileAsync on a directory is #3006, deleteDirectoryAsync(false) on a
     // non-empty directory #3010, either on a missing path #3003), success is
     // Event.COMPLETE, and #2037 (no nativePath) still throws synchronously.
     // The old bodies called the sync member and dispatched COMPLETE
-    // unconditionally, which reported success for a delete that never happened.
-    this.cblock(`static void File__deleteDispatch(File* o, int err) {
-  if (err == 2037) { as_throw(Error_new((char*)as_file_err_text(err), err)); return; }
-  if (err == 0) { EventDispatcher_dispatchEvent((void*)o, Event_new((char*)"complete", false, false)); return; }
-  IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, (char*)as_file_err_text(err));
-  ev->errorID = err;
-  EventDispatcher_dispatchEvent((void*)o, (Event*)ev);
+    // unconditionally, which reported success for a delete that never happened --
+    // and did it before returning, so a listener added right afterwards never ran.
+    this.cblock(`static void File__submitOp(File* o, int op) {
+  if (o->_nativePath == NULL || as_async_op_pending((void*)o)) {
+    as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));
+    return;
+  }
+  as_async_submit(AS_JOB_FS_OP, (void*)o, File__opFinish, o->_nativePath, NULL, op);
 }`);
     this.line('void File_deleteFileAsync(void* _this) {');
     this.indent++;
-    this.line('File__deleteDispatch((File*)_this, as_file_delete_err((File*)_this, 0, 0));');
+    this.line('File__submitOp((File*)_this, 0);');
     this.indent--;
     this.line('}');
     // File.cancel(): cancels the pending directory listing (the only async member
@@ -18702,7 +18771,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('void File_cancel(void* _this) { as_async_cancel((void*)_this); }');
     this.line('void File_deleteDirectoryAsync(void* _this, bool recursive) {');
     this.indent++;
-    this.line('File__deleteDispatch((File*)_this, as_file_delete_err((File*)_this, 1, recursive ? 1 : 0));');
+    this.line('File__submitOp((File*)_this, recursive ? 2 : 1);');
     this.indent--;
     this.line('}');
     // No backend here: a native file dialog / the OS shell. These report
@@ -18731,9 +18800,9 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     // so neither may be derived from the other. An UNREADABLE directory is the one
     // odd shape that does NOT throw: opendir() fails and adl answers an empty
     // listing, sync and async alike -- which is what the body below already does.
-    this.line('if (o->nativePath == NULL) as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));');
-    this.line('if (!as_path_exists(o->nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));');
-    this.line('if (!as_path_is_dir(o->nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));');
+    this.line('if (o->_nativePath == NULL) as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037));');
+    this.line('if (!as_path_exists(o->_nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));');
+    this.line('if (!as_path_is_dir(o->_nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));');
     this.line('as_array* result = as_array_new();');
     this.line('#ifdef _WIN32');
     this.line('// MSVC has no dirent.h; enumerate with FindFirstFile/FindNextFile, which');
@@ -18741,10 +18810,10 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('// produces), so build a "<dir>\\*" pattern and swap separators as we copy.');
     this.line('{');
     this.indent++;
-    this.line('size_t n = strlen(o->nativePath);');
+    this.line('size_t n = strlen(o->_nativePath);');
     this.line('char* pat = (char*)malloc(n + 3);');
     this.line('size_t i;');
-    this.line('memcpy(pat, o->nativePath, n);');
+    this.line('memcpy(pat, o->_nativePath, n);');
     this.line('for (i = 0; i < n; i++) if (pat[i] == \'/\') pat[i] = \'\\\\\';');
     this.line('pat[n] = \'\\\\\'; pat[n + 1] = \'*\'; pat[n + 2] = \'\\0\';');
     this.line('WIN32_FIND_DATAA fd;');
@@ -18754,20 +18823,20 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('do {');
     this.indent++;
     this.line('if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;');
-    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->nativePath, fd.cFileName))));');
+    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->_nativePath, fd.cFileName))));');
     this.indent--;
     this.line('} while (FindNextFileA(h, &fd) != 0);');
     this.line('FindClose(h);');
     this.indent--;
     this.line('}');
     this.line('#else');
-    this.line('DIR* d = opendir(o->nativePath);');
+    this.line('DIR* d = opendir(o->_nativePath);');
     this.line('if (d == NULL) return result;');
     this.line('struct dirent* e;');
     this.line('while ((e = readdir(d)) != NULL) {');
     this.indent++;
     this.line('if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;');
-    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->nativePath, e->d_name))));');
+    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->_nativePath, e->d_name))));');
     this.indent--;
     this.line('}');
     this.line('closedir(d);');
@@ -18954,10 +19023,10 @@ static long long as_fs_avail(FileStream* o) {
   if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; o->_mode = 0; }
   if (file == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter file must be non-null.", 2007)); return; }
   mc = as_fs_mode_class(fileMode);
-  err = as_fs_open_err(file->nativePath, mc);
+  err = as_fs_open_err(file->_nativePath, mc);
   if (err == 2004) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }
   if (err != 0) { as_file_throw(err); return; }
-  err = as_fs_begin(o, file->nativePath, mc);
+  err = as_fs_begin(o, file->_nativePath, mc);
   if (err != 0) as_file_throw(err);
 }`);
     // Completion thunk for openAsync, run on the AS3 thread inside a frame
@@ -19004,8 +19073,8 @@ static long long as_fs_avail(FileStream* o) {
   if (file == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter file must be non-null.", 2007)); return; }
   mc = as_fs_mode_class(fileMode);
   if (mc == 0) { as_throw(ArgumentError_new((char*)"Error #2004: One of the parameters is invalid.", 2004)); return; }
-  if (file->nativePath == NULL) { as_file_throw(2037); return; }
-  as_async_submit(AS_JOB_FS_OPEN, (void*)o, FileStream__openFinish, file->nativePath, fileMode, 0);
+  if (file->_nativePath == NULL) { as_file_throw(2037); return; }
+  as_async_submit(AS_JOB_FS_OPEN, (void*)o, FileStream__openFinish, file->_nativePath, fileMode, 0);
 }`);
     this.line('void FileStream_close(void* _this) { FileStream* o = (FileStream*)_this; if (o->_handle != NULL) { fclose((FILE*)o->_handle); o->_handle = NULL; } o->_mode = 0; }');
     // truncate(): cut the file at the current position (measured: #2029 on a
@@ -36514,17 +36583,36 @@ void FileStream_writeObject(void* _this, as_value v) {
         const field = this.emitExpr(args[0]);
         const fieldStr = field.type.kind === 'string' ? field.code : this.toStringExpr(field);
         const opts = args.length >= 2 ? this.convert(this.emitExpr(args[1]), { kind: 'int' }) : '0';
-        return { code: `as_array_sortOn(${a}, ${fieldStr}, ${opts})`, type: { kind: 'array' } };
+        const bits = args.length >= 2 ? this.staticSortBits(args[1]) : 0;
+        if (bits === null || (bits & 4) !== 0) {
+          return { code: `as_array_sortOn_v(${a}, ${fieldStr}, ${opts})`, type: { kind: 'any' } };
+        }
+        return { code: `as_array_sortOn_arr(${a}, ${fieldStr}, ${opts})`, type: { kind: 'array' } };
       }
       case 'sort': {
         // AS3 sort() default = string sort; a Function arg = custom comparator;
-        // any other single numeric arg (Array.NUMERIC == 16) = numeric sort.
-        if (args.length === 0) return { code: `as_array_sort_str(${a})`, type: { kind: 'array' } };
+        // anything else is sort-option bits (Array.CASEINSENSITIVE 1 /
+        // DESCENDING 2 / UNIQUESORT 4 / RETURNINDEXEDARRAY 8 / NUMERIC 16).
+        if (args.length === 0) return { code: `as_array_sort_arr(${a}, 0)`, type: { kind: 'array' } };
         const arg = this.emitExpr(args[0]);
         if (arg.type.kind === 'function') {
           return { code: `as_array_sort_cb(${a}, ${arg.code})`, type: { kind: 'array' } };
         }
-        return { code: `as_array_sort_num(${a})`, type: { kind: 'array' } };
+        // A '*' argument may be a comparator Function at run time -- same split
+        // AIR makes -- so it goes through as_array_sort_any.
+        if (arg.type.kind === 'any') {
+          return { code: `as_array_sort_any(${a}, ${this.boxExpr(arg)})`, type: { kind: 'any' } };
+        }
+        const flagsCode = this.convert(arg, { kind: 'int' });
+        const bits = this.staticSortBits(args[0]);
+        // UNIQUESORT can make sort() return Number 0 on a duplicate, and AIR's
+        // declared Array return type is not honored in that case; an unknown or
+        // UNIQUESORT-bearing flag set therefore keeps the boxed result so that
+        // `var q:* = a.sort(...)` sees 0 and `var r:Array = ...` raises #1034.
+        if (bits === null || (bits & 4) !== 0) {
+          return { code: `as_array_sort_flags(${a}, ${flagsCode})`, type: { kind: 'any' } };
+        }
+        return { code: `as_array_sort_arr(${a}, ${flagsCode})`, type: { kind: 'array' } };
       }
       // Inherited Object members on an Array (measured on adl 51.4.1: an in-range
       // index, `length` and an added named property are all OWN properties, a missing
@@ -36928,6 +37016,32 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'NUMERIC': return { code: '16', type: { kind: 'int' } };
       default: return null;
     }
+  }
+
+  // Compile-time value of a sort-option expression, or null when it is not a
+  // constant we can read without evaluating user code. Used ONLY to decide the
+  // static type of the result (`UNIQUESORT` can turn sort()'s return value into
+  // Number 0 on a duplicate), never to fold or to skip the argument: the
+  // argument is still emitted and evaluated exactly once.
+  private staticSortBits(e: Expr | undefined): number | null {
+    if (!e) return 0;
+    if (e.kind === 'Num') return Number.isInteger(e.value) ? e.value : null;
+    if (e.kind === 'Member' && e.object.kind === 'Var' && e.object.name === 'Array') {
+      switch (e.property) {
+        case 'CASEINSENSITIVE': return 1;
+        case 'DESCENDING': return 2;
+        case 'UNIQUESORT': return 4;
+        case 'RETURNINDEXEDARRAY': return 8;
+        case 'NUMERIC': return 16;
+        default: return null;
+      }
+    }
+    if (e.kind === 'Binary' && e.op === '|') {
+      const l = this.staticSortBits(e.left);
+      const r = this.staticSortBits(e.right);
+      return (l === null || r === null) ? null : (l | r);
+    }
+    return null;
   }
 
   // Number/int/uint static constants.
@@ -38295,6 +38409,11 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (e instanceof CodegenError) throw new CodegenError(`${codegenBareMessage(e)} (constructor of ${cname}, args=${expr.args.length}, params=[${cinfo.constructor.params.map((p) => `${p.name}${p.defaultValue !== null ? '?' : ''}`).join(', ')}])`, e.line, e.col);
       throw e;
     }
+    // `new File()` and `new File(null)` share one emitted argument list (both fall
+    // through to the declared default), but AIR tells them apart: the no-arg form
+    // builds the empty File, the explicit null is #2037. Route the no-arg form to
+    // File_new_empty so the constructor keeps AIR's contract.
+    if (cname === 'File' && expr.args.length === 0) return { code: 'File_new_empty()', type: { kind: 'object', className: cname } };
     return { code: `${cname}_new(${args})`, type: { kind: 'object', className: cname } };
   }
 

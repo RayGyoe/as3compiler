@@ -79,13 +79,24 @@ inp.close();
 target.deleteFile();
 check(target.exists == false, "cleanup removed the test file");
 
-// --- documented deviation: a relative path stays a relative path ---
-// AIR throws #2004 in the constructor; this build keeps the string (stage64.as
-// pins the same behaviour for nativePath), so its url is "file://" + path.
-var rel:File = new File("temp/file-url-rel.txt");
-// The separators inside a relative path follow the host (Windows stores it with a
-// backslash); the path is still relative, which is the point of the deviation.
-check(rel.nativePath == "temp" + File.separator + "file-url-rel.txt", "relative nativePath kept verbatim");
-check(rel.url == "file://temp/file-url-rel.txt", "relative url is file:// + path (deviation, AIR throws #2004)");
+// --- a relative path is refused by the constructor (#2004), as in AIR ---
+// This used to be a registered deviation: the string was kept and its url was
+// "file://" + that relative path. AIR's constructor requires an absolute native
+// path (or one of the three URL schemes), so the same call now raises #2004 and
+// an empty string is refused with the same id.
+function ctorThrows(value:String, label:String):void {
+  try { new File(value); throw new Error("FAIL: " + label); }
+  catch (e:ArgumentError) { check(e.errorID == 2004, label + " is #2004"); }
+}
+ctorThrows("temp/file-url-rel.txt", "relative path");
+ctorThrows("", "empty string");
+ctorThrows("x", "bare word");
+ctorThrows("http://example.com/a", "non-file url");
+try { new File(null); throw new Error("FAIL: new File(null) must throw"); }
+catch (e2:Error) { check(e2.errorID == 2037, "an explicit null is #2037, not an empty File"); }
+// `new File()` is the empty File: constructing it must NOT throw (only its path
+// members do, which is the #2037 contract pinned in file-ops.as).
+var empty:File = new File();
+check(empty != null, "new File() builds the empty File without throwing");
 
 trace("file-url: all File.url assertions passed");

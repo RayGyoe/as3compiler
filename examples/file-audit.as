@@ -244,7 +244,7 @@ eq(baDst.readUTFBytes(2), "XY", "the bytes survived the round trip");
 check(scalars.creationDate is Date, "creationDate is a Date");
 check(scalars.modificationDate.time >= scalars.creationDate.time, "modificationDate is not earlier than creationDate");
 threw(function():void { var v:* = work.resolvePath("nope.bin").creationDate; }, 3003, "creationDate on a missing path is #3003");
-threw(function():void { var v:* = new File(null).creationDate; }, 2037, "creationDate on an empty File is #2037");
+threw(function():void { var v:* = new File().creationDate; }, 2037, "creationDate on an empty File is #2037");
 
 // clone() (af.txt 35).
 var cl:File = scalars.clone();

@@ -54,6 +54,49 @@ var work:File = File.userDirectory.resolvePath("work");
 if (work.exists) work.deleteDirectory(true);
 work.createDirectory();
 
+// ------------------------------------------------------- constructor contract
+// Measured on adl 51.4.1 (temp/fileempty/): the constructor requires an ABSOLUTE
+// native path or one of the three URL schemes AIR accepts, an explicit null is
+// #2037 (it does NOT mean "empty"), and only the no-argument form builds the empty
+// File. This used to accept a relative path and keep it verbatim -- a registered
+// deviation that this stage closes.
+threw(function():void { new File("temp/a.txt"); }, 2004, "the ctor rejects a relative path");
+threw(function():void { new File("./a.txt"); }, 2004, "the ctor rejects ./a.txt");
+threw(function():void { new File("../a.txt"); }, 2004, "the ctor rejects ../a.txt");
+threw(function():void { new File(""); }, 2004, "the ctor rejects an empty string");
+threw(function():void { new File("a"); }, 2004, "the ctor rejects a bare word");
+threw(function():void { new File("http://example.com/a"); }, 2004, "the ctor rejects a non-file url");
+threw(function():void { new File(null); }, 2037, "the ctor refuses an explicit null with #2037");
+noThrow(function():void { new File(); }, "the no-argument form builds the empty File");
+eq(new File("/tmp//a/../b").nativePath, "/tmp/b", "an absolute path is still normalised");
+
+// ------------------------------------------------- empty File answers #2037 only
+// Every member that needs a path throws #2037 on a File built with `new File()`;
+// only preventBackup, data, toString() and clone() answer (all measured).
+var blank:File = new File();
+threw(function():void { var v:* = blank.nativePath; }, 2037, "nativePath on an empty File");
+threw(function():void { var v:* = blank.url; }, 2037, "url on an empty File");
+threw(function():void { var v:* = blank.name; }, 2037, "name on an empty File");
+threw(function():void { var v:* = blank.extension; }, 2037, "extension on an empty File");
+threw(function():void { var v:* = blank.type; }, 2037, "type on an empty File");
+threw(function():void { var v:* = blank.parent; }, 2037, "parent on an empty File");
+threw(function():void { var v:* = blank.exists; }, 2037, "exists on an empty File");
+threw(function():void { var v:* = blank.isDirectory; }, 2037, "isDirectory on an empty File");
+threw(function():void { var v:* = blank.isHidden; }, 2037, "isHidden on an empty File");
+threw(function():void { var v:* = blank.isSymbolicLink; }, 2037, "isSymbolicLink on an empty File");
+threw(function():void { var v:* = blank.isPackage; }, 2037, "isPackage on an empty File");
+threw(function():void { var v:* = blank.size; }, 2037, "size on an empty File");
+threw(function():void { var v:* = blank.spaceAvailable; }, 2037, "spaceAvailable on an empty File");
+threw(function():void { var v:* = blank.creationDate; }, 2037, "creationDate on an empty File");
+threw(function():void { var v:* = blank.modificationDate; }, 2037, "modificationDate on an empty File");
+threw(function():void { var v:* = blank.downloaded; }, 2037, "downloaded on an empty File");
+threw(function():void { var v:* = blank.creator; }, 2037, "creator on an empty File");
+threw(function():void { var v:* = blank.icon; }, 2037, "icon on an empty File");
+eq(blank.preventBackup, false, "preventBackup answers false on an empty File");
+eq(blank.data, null, "data answers null on an empty File");
+eq(String(blank), "[object File]", "toString still works on an empty File");
+noThrow(function():void { blank.clone(); }, "clone() on an empty File does not throw");
+
 // ---------------------------------------------------------------- path strings
 // Lexical normalisation, measured in av.txt E1-E5 / av2.txt J1-J5.
 eq(new File("/tmp//a/../b").nativePath, "/tmp/b", "ctor folds // and ..");
@@ -65,7 +108,7 @@ eq(new File("/tmp/a b //x.txt").nativePath, "/tmp/a b /x.txt", "ctor keeps space
 eq(new File("/tmp/a\\b").nativePath, "/tmp/a\\b", "ctor keeps a backslash on POSIX");
 
 // The setter normalises too, and rejects what AIR rejects (av.txt F1-F6).
-var np:File = new File(null);
+var np:File = new File();
 noThrow(function():void { np.nativePath = "/tmp/a/"; }, "nativePath setter accepts an absolute path");
 eq(np.nativePath, "/tmp/a", "nativePath setter strips the trailing separator");
 threw(function():void { np.nativePath = "rel/a/../b.txt"; }, 2004, "nativePath setter rejects a relative path");
@@ -86,7 +129,7 @@ eq(base.resolvePath("a//b").nativePath, "/tmp/asaot-base/a/b", "resolvePath fold
 eq(base.resolvePath("/abs/./q").nativePath, "/abs/q", "an absolute argument REPLACES the base");
 eq(base.resolvePath("~/x").nativePath, "/tmp/asaot-base/~/x", "no '~' expansion");
 eq(base.resolvePath("../../../../x").nativePath, "/x", ".. clamps at the root");
-threw(function():void { new File(null).resolvePath("x"); }, 2037, "resolvePath on an empty File");
+threw(function():void { new File().resolvePath("x"); }, 2037, "resolvePath on an empty File");
 threw(function():void { base.resolvePath(null); }, 2007, "resolvePath(null)");
 
 // ---------------------------------------------------------------- deleteFile
@@ -95,7 +138,7 @@ var st:FileStream = new FileStream();
 st.open(f1, FileMode.WRITE); st.writeUTFBytes("hello"); st.close();
 eq(f1.size, 5, "size of a 5-byte file");
 threw(function():void { work.resolvePath("nope.txt").deleteFile(); }, 3003, "deleteFile on a missing path");
-threw(function():void { new File(null).deleteFile(); }, 2037, "deleteFile on an empty File");
+threw(function():void { new File().deleteFile(); }, 2037, "deleteFile on an empty File");
 var d1:File = work.resolvePath("d1"); d1.createDirectory();
 threw(function():void { d1.deleteFile(); }, 3006, "deleteFile on a real directory is #3006");
 check(d1.exists, "the directory survives the refused deleteFile");
@@ -139,7 +182,7 @@ st3.open(f3, FileMode.WRITE); st3.writeUTFBytes("z"); st3.close();
 threw(function():void { f3.deleteDirectory(false); }, 3007, "deleteDirectory(file, false) is #3007");
 check(f3.exists, "the file survives the refused deleteDirectory");
 threw(function():void { work.resolvePath("nope2").deleteDirectory(true); }, 3003, "deleteDirectory on a missing path");
-threw(function():void { new File(null).deleteDirectory(); }, 2037, "deleteDirectory on an empty File");
+threw(function():void { new File().deleteDirectory(); }, 2037, "deleteDirectory on an empty File");
 f3.deleteFile();
 
 // ------------------------------------------------------------------ moveTo
@@ -171,15 +214,18 @@ check(!dest.exists && !d3.isDirectory && d3.exists, "the directory was replaced 
 
 // ------------------------------------------------------------- size / #3003
 threw(function():void { work.resolvePath("missing-size.bin").size; }, 3003, "size of a missing path throws");
-threw(function():void { new File(null).size; }, 2037, "size of an empty File throws");
+threw(function():void { new File().size; }, 2037, "size of an empty File throws");
 var dd:File = work.resolvePath("sizedir"); dd.createDirectory();
 eq(dd.size, 0, "size of a directory is 0, not its st_size");
 eq(other.size, 1, "size of a 1-byte file");
 
 // ---------------------------------------------------------- async delivery
 // The async members report the SAME ids as events instead of throwing
-// (av.txt H0, av3.txt I0). This build performs the work inline and dispatches
-// from the same call -- the convention every async member of File follows here.
+// (av.txt H0, av3.txt I0), and they deliver them LATER: measured on adl 51.4.1
+// (temp/fileempty/), the file still exists right after deleteFileAsync() returns,
+// the event arrives on a following frame, a second call while one is in flight
+// throws #2037, and cancel() drops the event without undoing the work. So every
+// assertion below pumps one frame with tickTimers() before it looks at `seen`.
 var seen:String = "";
 var got:IOErrorEvent = null;
 f3 = work.resolvePath("a1.txt");
@@ -188,6 +234,8 @@ st.open(f3, FileMode.WRITE); st.writeUTFBytes("a"); st.close();
 f3.addEventListener(Event.COMPLETE, function(e:Event):void { seen += "complete "; });
 f3.addEventListener(IOErrorEvent.IO_ERROR, function(e:IOErrorEvent):void { seen += "error" + e.errorID + " "; });
 f3.deleteFileAsync();
+eq(seen, "", "nothing is delivered synchronously");
+tickTimers();
 eq(seen, "complete ", "deleteFileAsync on a file completes");
 check(!f3.exists, "the async delete really deleted");
 seen = "";
@@ -195,6 +243,7 @@ var miss:File = work.resolvePath("a2.txt");
 miss.addEventListener(Event.COMPLETE, function(e:Event):void { seen += "complete "; });
 miss.addEventListener(IOErrorEvent.IO_ERROR, function(e:IOErrorEvent):void { seen += "error" + e.errorID + " "; got = e; });
 miss.deleteFileAsync();
+tickTimers();
 eq(seen, "error3003 ", "deleteFileAsync on a missing path is ioError #3003");
 check(got != null && got.text == "Error #3003: File or directory does not exist.", "the ioError carries AIR's sentence");
 seen = "";
@@ -205,13 +254,37 @@ st6.open(ad.resolvePath("x.txt"), FileMode.WRITE); st6.writeUTFBytes("x"); st6.c
 ad.addEventListener(Event.COMPLETE, function(e:Event):void { seen += "complete "; });
 ad.addEventListener(IOErrorEvent.IO_ERROR, function(e:IOErrorEvent):void { seen += "error" + e.errorID + " "; });
 ad.deleteDirectoryAsync(false);
+tickTimers();
 eq(seen, "error3010 ", "deleteDirectoryAsync(false) on a non-empty directory is ioError #3010");
 check(ad.exists, "the non-empty directory survives");
 seen = "";
 ad.deleteDirectoryAsync(true);
+tickTimers();
 eq(seen, "complete ", "deleteDirectoryAsync(true) recurses and completes");
 check(!ad.exists, "the tree is gone");
-threw(function():void { new File(null).deleteDirectoryAsync(true); }, 2037, "deleteDirectoryAsync on an empty File still throws");
+threw(function():void { new File().deleteDirectoryAsync(true); }, 2037, "deleteDirectoryAsync on an empty File still throws");
+
+// A second call before the first reports is #2037 (measured on adl 51.4.1).
+seen = "";
+var twice:File = work.resolvePath("a4.txt");
+st = new FileStream();
+st.open(twice, FileMode.WRITE); st.writeUTFBytes("x"); st.close();
+twice.addEventListener(Event.COMPLETE, function(e:Event):void { seen += "complete "; });
+twice.deleteFileAsync();
+threw(function():void { twice.deleteFileAsync(); }, 2037, "a second deleteFileAsync in flight is #2037");
+tickTimers();
+eq(seen, "complete ", "the FIRST call still reports");
+
+// cancel() drops the pending event (the work itself is already done, as in AIR).
+seen = "";
+var cancelled:File = work.resolvePath("a5.txt");
+st = new FileStream();
+st.open(cancelled, FileMode.WRITE); st.writeUTFBytes("x"); st.close();
+cancelled.addEventListener(Event.COMPLETE, function(e:Event):void { seen += "complete "; });
+cancelled.deleteFileAsync();
+cancelled.cancel();
+tickTimers();
+eq(seen, "", "cancel() suppresses the pending event");
 
 // ------------------------------------------------------------------- cleanup
 work.deleteDirectory(true);
