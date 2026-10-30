@@ -72,6 +72,33 @@ function run():void {
   var live:Object = { fqnprobe: { C: { field: 77 } } };
   check(live.fqnprobe.C.field == 77, "a live value chain resolves through the object");
   check(live.fqnprobe.C["field"] == 77, "a live value chain resolves through the bracket form too");
+
+  // ⑧ 阶段三百三十二：接收者是**属性**（访问器）而不是变量时，字面量键的括号读仍然是
+  //    运行期查表。Starling 的 ConcretePotTexture 用 `base["uploadFromBitmapDataAsync"]`
+  //    探测平台的异步上传能力（`base` 是 `get base():TextureBase`）—— AIR 上这是运行期
+  //    动态读，缺名抛 `ReferenceError #1069`，被调用方的 catch 吃掉后回落到同步上传。
+  //    把接收者当类引用会在**编译期**报 undefined field，整个应用编不出来。
+  var gp:GetterProbe = new GetterProbe();
+  check(gp.probe() == 1069, "a property receiver reads the bracket key at run time");
+  check(gp.live() == 7, "a property receiver resolves a live key");
+}
+
+// ⑧ 的探针类：`base`/`liveBase` 是访问器（不是变量、不是字段），类型分别为密封类与
+// Object —— 前者缺名时 AIR 抛 #1069，后者命中时给出真值。
+class SealedProbe {
+  public function SealedProbe() {}
+}
+
+class GetterProbe {
+  private var _sealed:SealedProbe = new SealedProbe();
+  private var _live:Object = { ping: 7 };
+  public function get base():SealedProbe { return _sealed; }
+  public function get liveBase():Object { return _live; }
+  public function probe():int {
+    try { base["uploadFromBitmapDataAsync"](null, 0); } catch (err:Error) { return err.errorID; }
+    return 0;
+  }
+  public function live():int { return liveBase["ping"]; }
 }
 
 run();

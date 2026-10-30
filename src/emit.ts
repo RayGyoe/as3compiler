@@ -1425,9 +1425,9 @@ export class Emitter {
     return cname !== null && cname !== undefined && this.swcCharClass.has(cname);
   }
 
-  // Whether a name is bound as a local/parameter/closure capture, or as a field
-  // or static field of the class being emitted. Used to decide if the root of a
-  // dot chain is a VARIABLE (a member chain) rather than the first package
+  // Whether a name is bound as a local/parameter/closure capture, or as a field,
+  // accessor or static field of the class being emitted. Used to decide if the root
+  // of a dot chain is a VARIABLE (a member chain) rather than the first package
   // segment of a fully-qualified class name.
   private varInScope(name: string): boolean {
     if (this.currentClosureCaptures?.has(name) || this.enclosingCaptured.has(name)) return true;
@@ -1436,6 +1436,17 @@ export class Emitter {
       if (this.symbols.fieldSlot(this.currentClass, name)) return true;
       const cinfo = this.symbols.getClass(this.currentClass);
       if (cinfo?.staticFields.has(name)) return true;
+      // An instance ACCESSOR is a value just like a field: Starling's
+      // `get base():TextureBase` is how ConcretePotTexture names its texture, and
+      // `base["uploadFromBitmapDataAsync"](...)` must therefore be a member walk on
+      // that property. Without this the name was not "in scope", so the literal-key
+      // bracket normalization in emitIndex took `base` for a CLASS reference and
+      // routed the read through emitMember ⇒ "undefined field '…' on class
+      // 'TextureBase'" (talkmed-meeting build; a real AIR build runs the same line).
+      // The setter arm matters for the same reason on the WRITE side (`base["x"] = v`);
+      // both walks run the super chain, so an accessor declared on a base class counts.
+      if (this.symbols.findGetter(this.currentClass, name) !== undefined) return true;
+      if (this.symbols.findSetter(this.currentClass, name) !== undefined) return true;
     }
     return false;
   }

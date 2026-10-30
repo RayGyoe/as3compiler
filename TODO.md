@@ -18176,7 +18176,38 @@ empty: size=12 color=0 underline=false url=null
 **验收**：`examples/textformat-members.as`（13 参逐字段 + 7 个新字段 + 第 6 参是 underline）；
 `test/unit/emit.ts` 新增 `unit: emit/TextFormatMembers` 11 钉。全量 `node test.ts` ⇒ 565 passed / 0 failed。
 
+### 阶段三百三十二：接收者是**属性**时括号读仍是动态读（v0.4.292 → v0.4.293）
+
+**范围**：阶段三百二十六 引入的**回归**——talkmed-meeting 编译报
+`Codegen error at 153:23: undefined field 'uploadFromBitmapDataAsync' on class 'TextureBase'`
+（`starling.textures.ConcretePotTexture.uploadAsync`）。
+
+**根因**：三百二十六 把「字符串字面量键的括号读」在 `emitIndex` 里**编译期规约成点式**（正确的：
+`Cls["name"]` 与 `Cls.name` 在 AIR 里是同一个 trait 查询），闸门是 `classRefName(expr.object)`。
+而 `classRefName` 的**裸名分支**对**任何**裸标识符都返回一个类名（它返回 `resolveClassName(name)`，
+未知名字原样返回——那一支是给 `String`/`Number`/`Math` 这类**没有 ClassInfo** 的静态类服务的），
+前置的遮蔽闸门 `chainRootIsValue` → `varInScope` 又只认「局部变量 / 字段 / 静态字段」。
+**实例属性（访问器）不在其中**：Starling 的 `get base():TextureBase` 因此被当成**类引用**，
+括号读走 `emitMember` ⇒ 编译期 `undefined field`。
+
+**修复**：`varInScope` 增认**实例访问器**（`findGetter` / `findSetter`，两者都沿 super 链走，
+故基类声明的访问器同样生效）。语义上这是对的：AS3 的裸名首先解析到本类 trait，属性就是一个值，
+`base["x"]` 必须是**值上的动态读**；AIR 同一行抛 `ReferenceError #1069`，Starling 正是 catch 它
+（`errorID == 3708 || 1069`）后关掉异步上传、回落同步上传。
+
+**为什么回归没被拦住**：只有 `examples/air-starling-demo` 与 `examples/Flappy-Starling`（**都在
+`test/examples.ts` 的 `SKIP_DIRS` 里**，不进 CI 回归）带这句 Starling 源码；本轮用
+`--air-app --dry` 直接编这两份源码做了人工复核（127 个 `.as` 全过，生成的 C 与修复前的历史产物
+同形：`as_fn_call_dyn(as_dyn_get(... "uploadFromBitmapDataAsync"), …)`）。
+
+**验收**：`unit: fqn/BracketAndShadowing` 7 钉（新增「属性接收者的字面量键仍是运行期读」，
+修复前必红）；`examples/fqn-static/main.as` 新增 ⑧ 段运行期断言（`GetterProbe.probe() == 1069`、
+活键 `7`）。全量 `node test.ts` ⇒ 565 passed / 0 failed；talkmed-meeting 用
+`bin-aot/build-aot.sh` 复编通过（`bin-aot/TalkMED Meeting.c` 两处退回 `as_fn_call_dyn(as_dyn_get(…))`）。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百三十二：属性接收者的括号读）**：**新登记 0 行 / 改写 0 行 / 移出 0 行**。本条是阶段三百二十六 引入的**回归**（不是既存遗留），同阶段修净，按表头「已完成项一经落地即从本表移出」不入表。**如实留一笔潜在面**：`classRefName` 的裸名分支对**任何**未识别标识符都返回类名（历史行为，服务于 `String`/`Number`/`Math` 这类无 `ClassInfo` 的静态类），本轮只在 `varInScope` 侧把「实例访问器也是值」补齐；若将来再出现新的「裸名非值」形态（例如同名**方法**取函数值后下标），仍需在 `varInScope` 这一处统一收口，而不是在 `emitIndex` 逐分支打补丁。
+>
 > **2026-10-30 追加（阶段三百三十一：`TextFormat` 成员表 + 13 参构造器）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「`TextFormat` 未设字段语义与成员表不全」转**部分完成**（成员表与 13 参顺序已完成，『未设则保持』的合并仍未做）。
 >
 > **2026-10-30 追加（阶段三百三十：脚本层隐式全局）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「`with` 体内隐式全局」转**部分完成**：脚本层已实现（含 `with` 落回），残留为**函数体内**赋值。

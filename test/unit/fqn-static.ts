@@ -201,6 +201,40 @@ function checkBracketAndShadowing(): string[] {
     !modShadow.includes('as_system_gc') && !modShadow.includes('as_class_call_static')
     && modShadow.includes('as_fn_call_dyn(as_dyn_get(') && modShadow.includes('as_req_obj('));
 
+  // ---- stage 332: a PROPERTY receiver is a value too ----
+  // Starling's ConcretePotTexture probes platform support with
+  // `base["uploadFromBitmapDataAsync"](...)`, where `base` is `get base():TextureBase`.
+  // An accessor is not a C local, so the "is the chain root a value?" predicate used to
+  // say no ⇒ the literal-key normalization took the receiver for a CLASS reference and
+  // the read died at COMPILE time ("undefined field 'uploadFromBitmapDataAsync' on class
+  // 'TextureBase'", the talkmed-meeting build). On AIR the same line is a runtime
+  // dynamic read that throws ReferenceError #1069 and is caught.
+  const GETTER_RECV = `package {
+    public class SealedProbe { public function SealedProbe() {} }
+    public class GetterProbe {
+      private var _b:SealedProbe = new SealedProbe();
+      public function get base():SealedProbe { return _b; }
+      public function probe():int {
+        try { base["uploadFromBitmapDataAsync"](null, 0); } catch (e:Error) { return e.errorID; }
+        return 0;
+      }
+    }
+  }`;
+  let getterC = '';
+  let getterThrew = '';
+  try {
+    getterC = emit(GETTER_RECV, 'trace("" + new GetterProbe().probe());');
+  } catch (e) {
+    getterThrew = e instanceof Error ? e.message : String(e);
+  }
+  // The probe lives in the method body, so slice its DEFINITION (the prototype earlier
+  // in the unit does not carry the shape being pinned).
+  const defIdx = getterC.search(/GetterProbe_probe\(void\* _this\) \{/);
+  const getterBody = defIdx < 0 ? getterC : getterC.slice(defIdx, defIdx + 2000);
+  check('a property receiver keeps the literal bracket key a runtime read',
+    getterThrew === '' && getterBody.includes('as_dyn_get(')
+    && getterBody.includes('"uploadFromBitmapDataAsync"'));
+
   if (ok > 0) console.log(`[fqnbr] ${ok} bracket/shadow checks passed`);
   return bad;
 }
