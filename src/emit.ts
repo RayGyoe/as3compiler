@@ -47,6 +47,10 @@ export type ScriptDecl = {
   init: Expr | null;
   isConst: boolean;
   loop?: { kind: 'in' | 'each'; iterable: Expr; declared: ASType | null };
+  // A name only ASSIGNED at script level (non-strict implicit global): its slot is
+  // `*`-typed and starts as `undefined`, so a read before the write yields
+  // undefined rather than a bogus default of some other type.
+  implicit?: boolean;
 };
 
 // One active `with (object)` scope. The object is evaluated ONCE into a C local of
@@ -121,6 +125,73 @@ function collectScriptDecls(body: Stmt[]): ScriptDecl[] {
   };
   walk(body);
   return decls;
+}
+
+// Names ASSIGNED at script level without ever being declared there. AIR's frame
+// scripts are non-strict, so `gvar = 42;` creates a global instead of failing;
+// mxmlc rejects the very same statement inside a class method ("Access of
+// possibly undefined property gvar", measured with 51.4.1, temp/implicit/), which
+// is why this walk stops at the script level and does not descend into function
+// bodies: package/class scopes stay strict and keep the compile error.
+//
+// A frame script cannot be produced by mxmlc (timeline scripts only come from a
+// .fla), so the non-strict half is inferred from ES3's rule -- the one place in
+// this compiler where the referee is the spec rather than an adl measurement. The
+// strict half IS measured, and the two must not be conflated.
+function collectImplicitGlobals(body: Stmt[]): string[] {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  const push = (n: string): void => { if (!seen.has(n)) { seen.add(n); names.push(n); } };
+  const scanExpr = (e: Expr): void => {
+    switch (e.kind) {
+      case 'Assign':
+        // `=` and every compound form: with no prior value the slot reads back
+        // `undefined`, which is exactly what a fresh global holds.
+        if (e.target.kind === 'Var') push(e.target.name);
+        scanExpr(e.value);
+        break;
+      case 'Binary': scanExpr(e.left); scanExpr(e.right); break;
+      case 'Conditional': scanExpr(e.cond); scanExpr(e.then); scanExpr(e.else); break;
+      case 'Call': scanExpr(e.callee); for (const a of e.args) scanExpr(a); break;
+      case 'Paren': scanExpr(e.expr); break;
+      case 'Unary': scanExpr(e.operand); break;
+      case 'Sequence': for (const x of e.exprs) scanExpr(x); break;
+      default: break; // literals, member access, function expressions (own scope)
+    }
+  };
+  const walk = (stmts: Stmt[]): void => {
+    for (const s of stmts) {
+      switch (s.kind) {
+        case 'ExprStmt': scanExpr(s.expr); break;
+        case 'VarDecl': if (s.init) scanExpr(s.init); break;
+        case 'VarDecls': for (const d of s.decls) if (d.init) scanExpr(d.init); break;
+        case 'ConstDecl': if (s.init) scanExpr(s.init); break;
+        case 'ConstDecls': for (const d of s.decls) if (d.init) scanExpr(d.init); break;
+        case 'If': scanExpr(s.cond); walk([s.then]); if (s.else) walk([s.else]); break;
+        case 'While': case 'DoWhile': scanExpr(s.cond); walk([s.body]); break;
+        case 'For':
+          if (s.init) { if (s.init.kind === 'VarDecl' && s.init.init) scanExpr(s.init.init); else scanExpr(s.init as Expr); }
+          if (s.cond) scanExpr(s.cond);
+          if (s.update) scanExpr(s.update);
+          walk([s.body]);
+          break;
+        case 'ForIn': case 'ForEachIn': scanExpr(s.iterable); walk([s.body]); break;
+        case 'Block': walk(s.body); break;
+        case 'Switch': scanExpr(s.disc); for (const c of s.cases) walk(c.body); break;
+        case 'With': scanExpr(s.obj); walk([s.body]); break;
+        case 'Try':
+          walk(s.tryBody.body);
+          for (const c of s.catches) walk(c.body.body);
+          if (s.finallyBody) walk(s.finallyBody.body);
+          break;
+        case 'Label': walk([s.body]); break;
+        case 'Return': if (s.value) scanExpr(s.value); break;
+        default: break; // nested function/class declarations own their scopes
+      }
+    }
+  };
+  walk(body);
+  return names;
 }
 
 export function collectScriptVars(body: Stmt[]): Set<string> {
@@ -30310,10 +30381,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     // `var` inside a top-level block/`if`/`for` init shares the same slot as a
     // top-level one and survives the block.
     const vars = collectScriptDecls(this.program.body);
-    if (vars.length === 0) return;
+    // Script-level assignments to names nobody declared become `*`-typed globals
+    // (non-strict frame-script rule; see collectImplicitGlobals). A name that
+    // already resolves to a declaration, a free function, a class or a core
+    // language class is NOT one of them -- moduleScope is consulted before the
+    // function/class tables, so registering such a name would shadow the real one.
+    const declared = new Set(vars.map((v) => v.name));
+    const implicit: ScriptDecl[] = collectImplicitGlobals(this.program.body)
+      .filter((n) => !declared.has(n)
+        && this.symbols.getFunc(n) === undefined
+        && !this.symbols.hasClass(n)
+        && Emitter.CORE_CLASS_VT[n] === undefined)
+      .map((n) => ({ name: n, type: null, init: null, isConst: false, implicit: true }));
+    if (vars.length === 0 && implicit.length === 0) return;
+    vars.push(...implicit);
 
     for (const v of vars) {
-      const ctype = v.type !== null
+      const ctype = v.implicit
+        ? ({ kind: 'any' } as CType)
+        : v.type !== null
         ? this.ann(v.type)
         : v.loop
           ? this.loopVarType(v.loop.kind, this.probeExprType(v.loop.iterable), v.loop.declared)
@@ -30327,7 +30413,13 @@ void FileStream_writeObject(void* _this, as_value v) {
       } else {
         // Mutable file-scope slot; a var's (or runtime-init const's) initializer
         // runs in main() (emitTopLevel) in source order.
-        this.line(`static ${this.cTypeName(ctype)} ${cn} = ${this.defaultInit(ctype)};`);
+        // An implicit global starts as UNDEFINED, not as the `*` default (null):
+        // ES3 creates the binding with the undefined value, and AS3's `===` tells
+        // the two apart (`g === null` is false, `g === undefined` is true).
+        // A static initializer cannot be a function call, so the undefined value
+        // is spelled as its literal form (tag 5 == as_v_undefined's tag).
+        const init = v.implicit ? '(as_value){5, 0.0, NULL}' : this.defaultInit(ctype);
+        this.line(`static ${this.cTypeName(ctype)} ${cn} = ${init};`);
       }
     }
     this.line('');

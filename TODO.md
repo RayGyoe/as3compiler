@@ -18111,7 +18111,38 @@ playerglobal 窄，误判方向是拒绝合法 AIR 代码，比漏报更糟。
 Number→Function、`return` 位 DisplayObject→Sprite）+ 4 正例（Object/Boolean/`*` 目标、`*` 源、
 数值族互转、XML→String）；全量 `node test.ts` ⇒ 561 passed / 0 failed。
 
+### 阶段三百三十：脚本层隐式全局（非严格模式）（v0.4.290 → v0.4.291）
+
+**范围**：遗留表「`with` 体内给『对象与词法作用域都没有』的名字赋值仍是编译期错误」。
+
+**实测边界**（`mxmlc 51.4.1`，`temp/implicit/`）：同一个语句 `gvar = 42;` 写在**类方法**里被
+mxmlc 直接拒绝——「所访问的属性 gvar 可能未定义」；连**读**也一样。所以严格性是**作用域**问题，
+不是语句问题：类作用域严格，脚本作用域宽松。帧脚本（宽松那半边）无法用 mxmlc 产出
+（时间轴脚本只能来自 `.fla`），是**全仓唯一一处以 ES3 规范而非 adl 读数作裁判**的地方，
+文档与代码注释都已写明这个区别，不混为一谈。
+
+**实现**：`collectImplicitGlobals` 遍历**脚本层**语句（含 `if`/循环/`switch`/`try`/`with`/`label`
+内部，**不下潜函数体**），把「被赋值但从未声明」的名字登记成 `*` 型模块变量：
+- 初值 `(as_value){5, …}`（**undefined**）——不是 `*` 默认的 `null`，因为 AS3 的 `===` 区分二者；
+- 与既有声明、自由函数、类、核心语言类同名的**一律排除**（`moduleScope` 的查找早于函数/类表，
+  登记同名项会遮蔽真名）；
+- 栈上/类里的严格作用域不受影响，仍报 `undefined variable`。
+
+`with` 侧不需要新代码：给「对象没有、词法也没有」的名字赋值时，`emitWithAssign` 返回 null，
+自然落回变量写路径并命中隐式全局槽（ES3 只在对象**有**该属性时才把引用基址交给它，所以
+`obj.missing` 保持 `undefined`）。
+
+**验收**：`examples/implicit-global.as`（5 组断言：基本写读、数值不被当字符串拼接、复合赋值、
+`with` 落回、已声明变量不受影响）；`test/unit/emit.ts` 新增 `unit: emit/ImplicitGlobal` 6 钉
+（槽位存在、初值为 undefined、赋值走动态装箱、类方法/函数体仍严格、已声明变量仍是带类型的槽）。
+全量 `node test.ts` ⇒ 563 passed / 0 failed。
+
+**残留（已登记）**：赋值写在**函数体**内（含函数体内的 `with`）仍是编译期错误 —— 严格半边实测过，
+宽松半边无法实测，不做猜测。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百三十：脚本层隐式全局）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「`with` 体内隐式全局」转**部分完成**：脚本层已实现（含 `with` 落回），残留为**函数体内**赋值。
+>
 > **2026-10-30 追加（阶段三百二十九：隐式强制转换对齐 mxmlc 拒绝面）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「编译期缺少隐式强制转换检查」转**已完成**（12×10 矩阵实测，只在声明型强制点检查；接口目标刻意不查）。
 >
 > **2026-10-30 追加（阶段三百二十八：`String(Number)` 必须读得回 + `is int/uint` 是值域 + 整数字面量按值定型）**：**新登记 0 行 / 改写 2 行 / 移出 0 行** ⇒ 主表项数不变。**改写 2 行**均转**已完成**：「定长小数分支的 17 位上限把 round-trip 弄断」、「极值的 `String()` 表示与 AIR 不同」（后者口径**定案**为「能读回的最短十进制」，写进双语义速查表；AIR 在三个极值上**自己读不回**，不照抄）。**本阶段顺带修净、不占表的两条**：整数字面量按值定型（`3000000000` 曾是**负** int、`123456789012345680000` 曾打成clang 拒绝的 C 整数常量 ⇒ 合法 AS3 编译不过）、`is int`/`is uint` 改为 AIR 的**值域**测试。
@@ -18342,7 +18373,7 @@ Number→Function、`return` 位 DisplayObject→Sprite）+ 4 正例（Object/Bo
 | `Proxy.getDescendants` 在 **`..` 作用于 Proxy 接收者**时仍不可达 | 未开始（2026-10-03 阶段九十四·一 登记；**本轮（阶段一百零六）改写**：`..` 语法与 XML/XMLList 分派已落地） | 十个拦截器里 `getDescendants` 由 `p..foo`（E4X 后代访问）触发。**阶段一百零六 已补上 `..` 语法**（`Descendants` 节点 + `as_xml_descendants`/`as_xml_list_descendants`，`examples/lang-superset.as` 与 `temp/langair/cases.as` 都覆盖），但生成侧只在接收者静态类型是 `XML`/`XMLList` 时发射 XML 遍历，其余类型抛**响亮**的 `CodegenError("'..' requires an XML or XMLList value, got <kind>")` ⇒ `as_proxy_descendants`（运行时已实现且与 `adl` 编号对照通过）**仍无调用点**。`adl` 侧 `p..foo` 能跑 ⇒ 按 §1.5 是**遗留**，但今日是**响亮失败**而非静默 | 在 `emitExpr` 的 `Descendants` 分支按接收者类型分派：类实例/`Proxy`/动态对象走 `as_proxy_descendants`（`as_proxy_descendants` 已就位），数组/字符串等 AIR 也按动态属性解析的接收者另议。成本低-中，需先用 `adl` 采 `p..foo` 在「有/无 `getDescendants` 拦截器」两态下的返回 |
 | `with` 接收者的**静态类型**只支持类实例 / `Object` / `*`（其余响亮报错） | 未开始（2026-10-03 阶段九十四·二 主动登记的实现边界） | `with` 的接收者在编译期分两类：**类实例**（含前向/继承链）走编译期成员解析并发射无分支 C，**`*`/`Object`/动态类/`Proxy`** 走运行时 `as_dyn_has` 判定。静态类型为 `Array`/`Vector.<T>`/`String`/`Function`/`Dictionary`/接口时 `emitWith` 直接抛 `CodegenError`（如 `with: a array-typed receiver is not supported (needs a class instance, Object or *)`）——**响亮失败，不静默降级**。`adl` 对数组/字符串接收者按元素的动态属性解析（探针 `x12 len=2`/`x13 len=1`）。**判据（§1.5）**：`adl` 能跑 ⇒ 遗留。 | 在 `emitWith` 的接收者分类里为 `Array`/`Vector`/`String` 增设运行时记录槽分支（`Array` 已自带 `_dyn` 槽表，主要是放开拦截并核对 `hasProperty` 语义）；接口接收者需先确定 `adl` 的成员查找口径 |
 | `with` 作用域**不进入闭包体**（`adl` 会把 with 作用域捕获进闭包链） | 未开始（2026-10-03 阶段九十四·二 主动登记的实现边界） | 实现上用 `this.withScopes` 栈表示作用域链，而 `emit` 的匿名函数体发射会**临时清空该栈**（`anonFuncs` 循环里 save → `[]` → restore），故 `with (o) { var f = function():* { return x; } }` 里的 `x` **不会**解析到 `o`；`adl` 里闭包按创建时的作用域链捕获，`x` 解析到 `o.x`。当前是**明确的未支持**：闭包体里若含未定义名会照常报编译期错误（不静默取错值）。 | 若要落地需给「闭包创建点」保存一份 with 作用域快照并在闭包体内发射时还原；与 `x4/x5`（`this` 绑定）同一段代码路径，宜同批做 |
-| `with` 体内给「对象与词法作用域都没有」的名字赋值仍是**编译期错误**（`adl` 会创建隐式全局） | 未开始（2026-10-03 阶段九十四·二 登记；**与本子集裸 `x = 1` 的既有口径一致**，非 with 特有） | `adl` 实测：`with (h) { brandNew = 1 }`（`brandNew` 既不在 `h` 上也不在词法作用域）在**非严格模式**下创建隐式全局并成功；本子集对「裸标识符赋值给未声明名」一律在编译期报 `undefined variable`（`with` 路径经 `withLexical` 归一为 `as_throw_var_not_defined` 的**读**路径，写路径仍编译期报错）。**这是子集既有缺口**，with 只是又暴露一次。 | 与「隐式全局」统一立项（顶层/函数内/with 内三处同一规则）：可在写路径回落 `as_global_set(name, v)`（模块级名字表），并核对 `adl` 对已存在全局的写与 `delete` 语义 |
+| `with` 体内给「对象与词法作用域都没有」的名字赋值仍是**编译期错误**（`adl` 会创建隐式全局） | **部分完成**（2026-10-30 阶段三百三十：**脚本层**已实现，含 `with` 落回；**函数体内**仍是编译期错误） | `mxmlc 51.4.1` 实测把边界钉在**作用域**上：同一个 `gvar = 42` 写在类方法里是硬错误（「所访问的属性 gvar 可能未定义」），读写都一样；帧脚本的非严格半边 mxmlc 无法产出（时间轴脚本只来自 `.fla`），故按 ES3 规则实现并在文档里标明「唯一一处以规范作裁判」。隐式全局槽初值 **undefined**（不是 `*` 默认的 null），与声明/函数/类同名的名字一律排除 | 残留：**函数体**（含函数体内的 `with`）内的未声明名赋值仍报 `undefined variable`；若将来可造出帧脚本对照，再决定是否放开 |
 | VM 抛错文案与未捕获打印格式与 `adl` **不逐字一致**（编号/异常类/时机一致） | 未开始（2026-10-03 阶段九十四·二 实测登记；**既有全局差异**，with 只是又新增 4 个发射点） | `adl 51.4.1` 实测（探针 `temp/errprobe/`）：`e.message` 对 VM 抛错是**短式**——`with (null)` → `Error #1009`、`with (undefined)` → `Error #1010`、`f()`（`f:Function = null`）→ `Error #1006`、`throw new Error("custom")` → `custom`（自定义 `Error` 保留用户文案）、`throw new TypeError("tmsg",1234)` → `tmsg`；`Error.getErrorMessage(1009)` 同样是 `Error #1009`；`String(e)`/`e.toString()` = `TypeError: Error #1009`；**未捕获**打印恰好是 `<异常类名>: <message>`（无前缀）。本子集自阶段「异常」起用带描述的长文案（`Error #1009: Cannot access a property or method of a null object reference.` 等，约 36 处发射点），未捕获走 `Uncaught exception: <message>`；`e.name` 在本子集是**编译期错误**（未声明）。**结论**：编号、异常类与抛出时机全部一致，仅**文案与打印前缀**不同，故登记为遗留而非误实现。 | 若要逐字对齐：把 VM 抛错文案统一改为短式 `Error #<id>`（`Error.getErrorMessage` 走同一表；用户文案的自定义 `Error` 保持原样），未捕获打印改为 `<类名>: <message>`，并给 `Error` 补 `name`/`getErrorMessage`。属跨切面改动（约 36 个发射点 + runtime 助手），宜单独立项、一次性对齐 + 全量 `test.ts` 回归 |
 | 反射 API 的**内建类名口径**不忠实（`getQualifiedClassName`/`getQualifiedSuperclassName`） | **部分完成**（2026-10-03 阶段九十四·三 登记；**2026-10-09 阶段一百二十七 实测：①④ 已对齐/部分对齐，②③ 仍缺**） | **更正（2026-10-09 阶段一百二十七 实测，探针 `temp/pkg1d/Qn.as`）**：① **已对齐** —— `getQualifiedClassName(new Sprite())` = `flash.display::Sprite`、`getQualifiedSuperclassName(new Sprite())` = `flash.display::DisplayObjectContainer`、`qc(new BitmapData(1,1))` = `flash.display::BitmapData`、`qs(new Sprite())` = `Object`（与 `adl` 的 A1/B1/A2 逐字相同：内建类的 vtable `fqn` 槽早已是包限定名，本行 ① 属**陈旧记载**）；**同一根因下 `getDefinitionByName("flash.display.BitmapData")` 也已可用**（注册表已收录内建类，阶段一百二十七）。④ **部分对齐** —— 内建**类**作 Class 值已可（`var c:Class = Object`、`BitmapData is Class`），**接口**仍不可（`getQualifiedClassName(IDataInput)` 报 `undefined variable`）。**仍缺**：② `int`/`uint` 装箱成 number ⇒ `getQualifiedClassName(5)` 给 `"Number"` 而非 `"int"`（实测 Q3；`boxExpr` 的 tag 1，数字与整型不区分）；③ `Dictionary` 是特殊 C 类型（`kind:'dict'`）而非建模类 ⇒ `getQualifiedClassName(new Dictionary())` 给 `"Object"`、`getQualifiedSuperclassName` 给 `"Object"`（实测 Q4），而 `adl` 给 `"flash.utils::Dictionary"`/`"Object"`。`Vector.<T>` 的元素名口径见下段阶段九十四·五 证据（未变）。 | 修法：给 `int`/`uint` 单独一个 box tag（tag 引入需同步补 `as_v_typeof`/`as_v_truthy`/`as_v_eq`/`as_v_str_val`/`gc_mark_value`/写屏障，见 AGENTS.md §2.4 红线）；`dict` 需要一条「虚拟 vtable」才能参与反射。属跨切面改动，宜单独立项。 **阶段九十四·五 新增证据（`Vector` 类名已部分修复，本行剩余口径仍适用）**：`adl 51.4.1` 实测（探针 `temp/a5probe/`）——`getQualifiedClassName(Vector.<T>)` 的**元素名**对**内建类/接口**元素（`String`/`Boolean`/`Object`/`Array`/`Date`/`XML`/`XMLList`/`IEventDispatcher`）均给**包限定名**（如 `__AS3__.vec::Vector.<String>`），只有**数值**元素（`int`/`uint`/`Number`）与用户自定义类给短名/C 名；本子集已按「静态已知元素类型 + 类 fqn 查表」给出 `__AS3__.vec::Vector.<…>`（含数值元素保持 `int`/`uint` 与 `adl` 一致），但**内建类/接口元素仍是短名/C 名**（同属本行的「内建类无 fqn」根因，故不另立行）|
 | 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |

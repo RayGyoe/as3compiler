@@ -4235,3 +4235,41 @@ function checkEmitSystemTrayIcon(): string[] {
   return bad;
 }
 registerGroup('unit: emit/SystemTrayIcon', checkEmitSystemTrayIcon);
+
+// ---- non-strict script scope: an undeclared name becomes a global ----
+//
+// mxmlc rejects `gvar = 42` inside a class method ("Access of possibly undefined
+// property gvar", measured on 51.4.1, temp/implicit/), so the strictness boundary
+// must be the script scope: the walk that collects implicit globals deliberately
+// does not descend into function bodies. A frame script cannot be produced by
+// mxmlc, so the permissive half follows ES3's rule; what is pinned here is that
+// the slot shape is right and the strict scopes keep failing.
+function checkEmitImplicitGlobal(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [implglob] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [implglob] ${label}`); }
+  };
+
+  const c = generateC(parse('gvar = 42;\ntrace(gvar);\n')).c;
+  check('an assigned-but-undeclared script name gets a file-scope slot', /static as_value g_gvar = /.test(c));
+  check('the slot starts as undefined, not as the `*` default (null)',
+    c.includes('static as_value g_gvar = (as_value){5, 0.0, NULL};')
+    && /static as_value as_v_undefined\(void\) \{ as_value v = \{5, /m.test(RUNTIME_PREAMBLE));
+  check('the assignment boxes through the dynamic store', c.includes('g_gvar = as_v_num((double)(42))'));
+
+  const err = (src: string): string => {
+    try { generateC(parse(src)); return ''; } catch (e) { return String(e); }
+  };
+  check('a class method keeps the strict error',
+    err('class A { public function m():void { gvar = 42; } }').includes("undefined variable 'gvar' in class A"));
+  check('a top-level FUNCTION body keeps the strict error too',
+    err('function f():void { gvar = 1; }').includes("undefined variable 'gvar' at top level"));
+  check('a declared top-level var is still a real typed slot, not an implicit one',
+    /static int g_x = 0;/.test(generateC(parse('var x:int = 1;\ntrace(x);\n')).c));
+
+  console.log(`     [implglob] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ImplicitGlobal', checkEmitImplicitGlobal);
