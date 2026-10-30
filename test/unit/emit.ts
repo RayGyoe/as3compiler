@@ -4397,3 +4397,242 @@ function checkEmitTextFormatTable(): string[] {
   return bad;
 }
 registerGroup('unit: emit/TextFormatMembers', checkEmitTextFormatTable);
+
+// ---- `..` on a value that is not statically XML/XMLList (Package H-2) ----
+// AIR resolves `..` on the VALUE at run time and supports exactly three shapes
+// (measured on adl 51.4.1, temp/proxyany G1..G6 + H1..H6 + M1..M3):
+//   XML/XMLList -> the descendant axis
+//   Proxy       -> the flash_proxy getDescendants interceptor, with the LITERAL
+//                  "*" for `..*` (the XML axis uses an empty name instead)
+//   anything else -> TypeError #1016 "Descendants operator (..) not supported on
+//                  type <class>.", and a null receiver is #1009.
+// The emitter keeps the inline axis for a statically typed XML/XMLList, calls the
+// interceptor directly for a statically typed Proxy subclass, and hands every
+// other receiver to the run-time dispatcher.
+function checkDescendantsDispatch(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++; else bad.push(label);
+  };
+  const c = generateC(parse(
+    'dynamic class P extends Proxy { flash_proxy override function getDescendants(n:*):* { return n; } }\n' +
+    'var x:XML = <a><b>1</b></a>;\n' +
+    'var l:XMLList = x.b;\n' +
+    'var p:P = new P();\n' +
+    'var anyv:* = p;\n' +
+    'trace(x..b); trace(l..b); trace(p..b); trace(p..*); trace(anyv..b);\n',
+  )).c;
+  check('an XML receiver still walks the axis inline', c.includes('as_xml_descendants('));
+  check('an XMLList receiver still walks the axis inline', c.includes('as_xml_list_descendants('));
+  check('a statically typed Proxy calls its interceptor directly',
+    /as_proxy_descendants\(\(void\*\)\(/.test(c));
+  check('the wildcard is "b" on the XML axis and "*" for the interceptor',
+    c.includes('as_xml_descendants(((as_xml_node*)as_req_obj((void*)(g_x))), "b")')
+    && c.includes('as_proxy_descendants((void*)(((P*)as_req_obj((void*)(g_p)))), "*")'));
+  check('every other receiver goes through the run-time dispatcher',
+    c.includes('as_descendants_v('));
+  check('the dispatcher walks XML/XMLList boxes through their vtables',
+    c.includes('if (as_is(v.ptr, (void*)&as_xml_vt)) return as_v_obj((void*)as_xml_descendants((as_xml_node*)v.ptr, name));')
+    && c.includes('if (as_is(v.ptr, (void*)&as_xml_list_vt)) return as_v_obj((void*)as_xml_list_descendants((as_xml_list*)v.ptr, name));'));
+  check('the dispatcher routes a Proxy box to getDescendants',
+    c.includes('if (as_is_proxy(v.ptr)) return as_proxy_descendants(v.ptr, name);'));
+  check('the Proxy probe is guarded by as_has_vtable (an Array/Vector has no vtable)',
+    c.includes('if (v.tag == 4 && v.ptr != NULL && as_has_vtable(v.ptr)) {'));
+  check('everything else raises TypeError #1016 with AIR\'s text',
+    c.includes('parts[0] = "Error #1016: Descendants operator (..) not supported on type ";')
+    && c.includes('as_throw(TypeError_new(as_str_concat_n(3, parts), 1016));'));
+  const at = c.indexOf('static as_value as_descendants_v(as_value v, const char* name) {');
+  const body = c.slice(at, c.indexOf('\n}\n', at));
+  check('a null receiver is #1009, not #1016 (checked in the dispatcher itself)',
+    at >= 0 && body.indexOf('#1009') >= 0 && body.indexOf('#1016') > body.indexOf('#1009'));
+  const ex = readFileSync(join(root, 'examples', 'proxy.as'), 'utf8');
+  check('the example pins interceptor dispatch, the #2093 base error and #1016',
+    ex.includes("'..' routes to getDescendants")
+    && ex.includes("'..*' passes the literal '*' as the name")
+    && ex.includes("bare proxy '..' -> #2093")
+    && ex.includes("'..' on a String value -> #1016")
+    && ex.includes("'..' on an XML value in a '*' slot still walks the XML axis"));
+  console.log(`     [descendants] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/DescendantsDispatch', checkDescendantsDispatch);
+
+// ---- `in` membership on a boxed/primitive receiver, and `with` over the
+// dynamically resolved receiver kinds (Package H-3) ----
+// adl 51.4.1 measured (temp/proxyany MainI..MainI4, MainW): `key in value` is a
+// membership test on the value's RUNTIME class -- a String answers "length" and
+// its method names but never a character index, an Array also answers its method
+// names, null is #1009 and undefined #1010. A boxed String used to reach
+// as_dyn_has and read the string body as an object (segfault). `with` resolves an
+// Array / Dictionary / interface receiver through the dynamic member helpers, and
+// a String / Vector through a closed name set.
+function checkInAndWithReceivers(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++; else bad.push(label);
+  };
+  const em = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const rt = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+
+  // --- the drift guard: every name a `with` claims must be one the static
+  // String/Vector method emitter actually implements, or AIR's lexical fallback
+  // becomes a build error.
+  const setOf = (name: string): string[] | null => {
+    const at = em.indexOf(`const ${name} = new Set<string>([`);
+    if (at < 0) return null;
+    const body = em.slice(at, em.indexOf(']);', at));
+    return [...body.matchAll(/'([A-Za-z]+)'/g)].map((m) => m[1]!);
+  };
+  const strSet = setOf('STRING_WITH_MEMBERS');
+  const vecSet = setOf('VECTOR_WITH_MEMBERS');
+  check('STRING_WITH_MEMBERS is declared', strSet !== null && strSet.length > 10);
+  check('VECTOR_WITH_MEMBERS is declared', vecSet !== null && vecSet.length > 10);
+  const methodBody = (sig: string): string => {
+    const at = em.indexOf(sig);
+    if (at < 0) return '';
+    const next = em.indexOf('\n  private ', at + sig.length);
+    return em.slice(at, next < 0 ? at + 6000 : next);
+  };
+  const strBody = methodBody('private emitStringMethod(');
+  const vecBody = methodBody('private emitVectorMethod(');
+  const missingStr = (strSet ?? []).filter((n) => n !== 'length' && !strBody.includes(`case '${n}':`));
+  const missingVec = (vecSet ?? []).filter((n) => n !== 'length' && n !== 'fixed' && !vecBody.includes(`case '${n}':`));
+  check('every STRING_WITH_MEMBERS name is implemented by emitStringMethod, missing: ' + missingStr.join(','),
+    missingStr.length === 0);
+  check('every VECTOR_WITH_MEMBERS name is implemented by emitVectorMethod, missing: ' + missingVec.join(','),
+    missingVec.length === 0);
+
+  // --- the Array member set used by `in` must track as_arr_call.
+  check('as_array_has consults the Array method-name set', rt.includes('if (as_array_method_name(key)) return true;'));
+  for (const name of ['push', 'join', 'toString', 'splice']) {
+    check(`as_array_method_name lists ${name}`, rt.includes(`"${name}"`) && rt.includes('static bool as_array_method_name('));
+  }
+
+  const c = generateC(parse(
+    'var s:String = "ab";\n' +
+    'var o:* = s;\n' +
+    'var a:Array = [1, 2];\n' +
+    'var d:Dictionary = new Dictionary();\n' +
+    'trace("length" in s); trace("length" in o); trace("0" in o); trace("x" in a);\n' +
+    'with (a) { trace(length); }\n' +
+    'with (d) { trace(k); }\n' +
+    'with (s) { trace(length); }\n' +
+    'var v:Vector.<int> = new Vector.<int>();\n' +
+    'with (v) { trace(length); }\n',
+  )).c;
+  // The `in` SITES never hand a boxed value to as_dyn_has; the only remaining
+  // occurrence is as_in_v's own tag==4 branch (a real object body).
+  const inSites = c.slice(c.indexOf('int main('));
+  check('a boxed value no longer reaches as_dyn_has from an `in` site',
+    !inSites.includes('as_dyn_has(as_v_obj_val(') && inSites.includes('as_in_v('));
+  check("'*' `in` goes through the tag dispatcher",
+    c.includes('if (v.tag == 3) return strcmp(key, "constructor") == 0 || as_str_has_member(key);'));
+  check('a String receiver answers its member set and never a character index',
+    !c.includes('(void)(0), (void)(false)') && c.includes('as_str_has_member('));
+  check('null/undefined receivers keep their distinct error ids',
+    c.includes('Error #1009: Cannot access a property or method of a null object reference.", 1009));')
+    && c.includes('Error #1010: A term is undefined and has no properties.", 1010));'));
+  check('the String member list is generated from STRING_WITH_MEMBERS',
+    c.includes('static bool as_str_has_member(const char* key) {') && c.includes('"charCodeAt"'));
+  check('a statically typed String `in` uses the same member set',
+    c.includes('|| as_str_has_member(') && !c.includes('as_in_v((as_value){ 3, 0.0, (void*)as_str'));
+
+  // --- `with` dispatch: Array/Dictionary/interface dynamic, String/Vector static.
+  check('a with over an Array / a Dictionary is a run-time has-test',
+    /as_dyn_has\(\(void\*\)__w[0-9]+, "length"\)/.test(c)
+    && /as_dyn_has\(\(void\*\)__w[0-9]+, "k"\)/.test(c));
+  check('a with over a String resolves length statically (no has-test)',
+    /char\* __w[0-9]+ = g_s;/.test(c) && /"\)\)\);/.test(c));
+  check('a with over a Vector resolves length statically',
+    /as_vector_int\* __w[0-9]+ = g_v;/.test(c));
+  check('the String case reuses the static length path', c.includes('((int)strlen('));
+  check('a String/Vector with receiver is a builtin (name-set) scope',
+    em.includes("mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : 'sealed',"));
+  check('assigning a builtin with member fails loudly instead of emitting a non-lvalue',
+    em.includes('with: assigning the member') && em.includes('with: updating the member'));
+  check('the dynamic with receivers are Array/Dictionary/interface only',
+    em.includes("const dynReceiver = k === 'array' || k === 'dict' || k === 'interface';")
+    && em.includes("const builtinReceiver = k === 'string' || k === 'vector';"));
+
+  const ex = readFileSync(join(root, 'examples', 'proxy.as'), 'utf8');
+  check('the example pins the with receivers and the `in` answers',
+    ex.includes('with(Array) resolves length and falls through')
+    && ex.includes('with(Dictionary) resolves a key and falls through')
+    && ex.includes("with(interface) sees the concrete instance's traits")
+    && ex.includes("'in' on a boxed String finds a method name")
+    && ex.includes("'in' on undefined -> #1010"));
+  console.log(`     [in+with] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/InAndWithReceivers', checkInAndWithReceivers);
+
+// ---- a closure created inside a `with` body captures the with OBJECT (H-4) ----
+// adl 51.4.1 measured (temp/proxyany/wcap, wcap/Main2): the closure resolves the
+// with object's names at CALL time, so a later write is visible and an assignment
+// inside the closure lands on the object; nested with blocks are all captured; a
+// String/Vector receiver keeps its closed member set; two sequential `with` blocks
+// give the two closures two DIFFERENT receivers.
+function checkWithClosureCapture(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++; else bad.push(label);
+  };
+  const em = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  check('the pre-pass tracks with bodies as a typed stack',
+    em.includes('private walkWithStack: CType[] = [];')
+    && em.includes('this.walkWithStack.push(rt.kind === \'string\' || rt.kind === \'vector\' ? rt : { kind: \'any\' })'));
+  check('a closure in a with body gets a synthetic capture per enclosing with',
+    em.includes('this.walkWithStack.forEach((t, id) => seen.set(WITH_CAP_PREFIX + id, t));'));
+  check('the synthetic name cannot collide with an AS3 identifier',
+    em.includes("const WITH_CAP_PREFIX = 'with#';"));
+  check('the C field name sanitizes the impossible character',
+    em.includes("return this.cIdent(name.includes('#') ? name.replace(/#/g, '$') : name);"));
+  check('the nested body restores the scope chain instead of clearing it',
+    em.includes('this.withScopes = this.restoreWithScopes(fn);') && !em.includes('this.withScopes = [];\n      this.hoistFunctionLocals'));
+  check('a runtime receiver is read through the soft (non-throwing) box',
+    em.includes('return (v.tag == 4 || v.tag == 6) ? v.ptr : NULL;') && em.includes('as_with_box_soft('));
+  check('a sibling merge keeps each closure\'s own with capture',
+    em.includes('if (c.name.startsWith(WITH_CAP_PREFIX)) continue;')
+    && em.includes('const ownWiths = fn.captures.filter((c) => c.name.startsWith(WITH_CAP_PREFIX));'));
+  check('a shared cell with two different with receivers is refused loudly',
+    em.includes('cannot both be declared inside a `with` block'));
+
+  const c = generateC(parse(
+    'var o:Object = { x: 1 };\n' +
+    'var f:Function;\n' +
+    'with (o) { f = function():* { return x; }; }\n' +
+    'var s:String = "ab";\n' +
+    'var g:Function;\n' +
+    'with (s) { g = function():* { return length; }; }\n' +
+    'trace(f()); trace(g());\n',
+  )).c;
+  const envMakes = [...c.matchAll(/static (_fn\d+)_env\* _fn\d+_env_make\(([^)]*)\)/g)];
+  check('every closure in a with body carries an env', envMakes.length === 2);
+  check('the untyped receiver is captured BOXED',
+    envMakes.some((m) => /\bas_value with\$0\b/.test(m[2] ?? '')));
+  check('the String receiver is captured as its own C type',
+    envMakes.some((m) => /\bchar\* with\$0\b/.test(m[2] ?? '')));
+  check('the runtime scope dispatches through the captured box',
+    /as_dyn_has\(as_with_box_soft\(env->with\$0\), "x"\)/.test(c));
+  check('the builtin scope reuses the static String path from the env copy',
+    /char\* __wc\d+ = env->with\$0;/.test(c) && c.includes('((int)strlen('));
+  check('the capture is filled from the with receiver temp',
+    /_fn\d+_env_make\(__w\d+\)/.test(c) || /_fn\d+_env_make\(as_v_obj\(\(void\*\)\(__w\d+\)\)\)/.test(c));
+
+  const ex = readFileSync(join(root, 'examples', 'proxy.as'), 'utf8');
+  check('the example pins the captured receiver, its reference semantics and the member sets',
+    ex.includes('a closure created in a with body resolves against the object')
+    && ex.includes('the captured with object is a reference, not a snapshot')
+    && ex.includes('an assignment in the closure writes to the with object')
+    && ex.includes('nested with blocks are both captured')
+    && ex.includes('a String with receiver keeps its members inside the closure')
+    && ex.includes('each closure keeps its own with object'));
+  console.log(`     [with-closure] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/WithClosureCapture', checkWithClosureCapture);
+
+

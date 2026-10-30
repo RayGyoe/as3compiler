@@ -351,6 +351,36 @@ API 面、错误码或事件顺序，只决定同样的信息写进 stderr 时�
 要整体对齐需要把全部绘制入口（`drawCircle`、九宫格、文本、Stage3D）都接进折叠通道，已登记在
 `TODO.md` 的遗留表里；判据与取舍见 [`skia.md`](skia.md) §6.14。
 
+### 3.8 `with` 的作用域、`in` 的成员判定、以及函数值里的 `this`（阶段三百三十八～三百四十一 · adl 51.4.1 实测）
+
+三件事都围绕「一段名字到底在哪一层解析」，所以放在一起记。证据台 `temp/proxyany/`：`MainW.as`（`with`
+接收者矩阵 W1–W8）、`MainI2.as`/`MainI3.as`/`MainI4.as`（`in` 的 J/K/L 三组）、`wcap/Main.as` 与
+`wcap/Main2.as`（闭包捕获 A–N）、`thisbp/Main.as`（`this` 的 U1–U9），每份都有 `ours*.as` 镜像。
+
+**1. `with` 只改「名字的基址」，不改对象**。`with (obj) { x }` 在 `obj` **有** `x` 时把引用基址交给
+`obj`，否则落回词法作用域（ES3 原文）。因此接收者的成员面决定了一切：Array / `Dictionary` / 接口
+走运行时的 `as_dyn_*`；`String` / `Vector` 是**编译期封闭集**（名字表 + 静态发射器，写形态暂不接）；
+函数 / 类 / 正则仍**响亮拒绝**（见 `TODO.md` 遗留表）。
+
+**2. `key in value` 判的是「值的运行期类有没有这个成员」**，与 `value` 的静态类型无关。`adl` 的读数：
+`"0" in "abc"` 与 `"x" in "abc"` 都是 **false**（`String` 只认方法名与 `constructor`）、
+`"2" in [1,2]` 是 false（`Array` 只认方法与 `length`，**不认下标**）、`"bar" in obj` 在
+`obj["bar"] = 1` 之后才变 true、`"x" in null` 是 `#1009`、`"x" in undefined` 是 `#1010`、
+`"toString" in 5` 是 **true**（包装类成员）。**这一条同时修掉一个真崩溃**：盒化字符串进 `in`
+时若按 record 走 `as_dyn_has`，就是把字符串体当结构体解引用 ⇒ 段错误。
+
+**3. `with` 体内的闭包捕获的是**对象**，不是名字快照**。`with (o) { f = function(){ return x } }`
+之后：`o.x` 改写对 `f()` 可见、`f` 里的 `x = v` 落到 `o` 上、嵌套 `with` 全被捕获且内层优先、
+闭包能活过块的退出。**但**闭包体里 `var` 出来的东西仍是普通函数局部，`this` 也仍是**创建点**的
+（见下一条）。
+
+**4. 函数值里的 `this` 由呼叫点决定，我们对不上（已登记）**。`adl`：`o.cb()` → `this = o`、
+裸 `fn()` → `this` 是**全局对象**、`fn.call(a)`/`apply(a,…)` → `a`（普通函数认 `thisArg`）、
+`with (d) { cb() }` → `d`。同一个闭包里**不带 `this.` 前缀**的名字却仍走创建点的词法作用域，
+两者可以不同（`name` 得创建者实例、`this.name` 得接收者）。本子集把 `this` 词法捕获进 `env->this`
+⇒ 九个探针全不同。要忠实需要「`as_fn` 带 self 槽 + 全局对象」两件表示层改动，见 `TODO.md` 遗留表
+（**未静默吞掉**：`examples/proxy.as` §12 的断言只钉我们自己的行为面，不假装对齐）。
+
 
 ## 4. 保真与增强原则
 

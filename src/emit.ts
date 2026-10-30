@@ -70,12 +70,55 @@ type WithScope = {
   //           it does not have falls through to the lexical binding);
   // 'runtime': the object may have keys this subset cannot see (any / Object /
   //           dynamic class / Proxy), so membership is tested with as_dyn_has.
-  mode: 'sealed' | 'runtime';
+  // 'builtin': a closed builtin receiver (String, Vector.<T>) whose member set is
+  //           known at compile time but is NOT a class trait table, so membership
+  //           is a name-set test and the read/call goes through the ordinary
+  //           static String/Vector member paths.
+  mode: 'sealed' | 'runtime' | 'builtin';
   className: string | null;
   // C expression yielding the object pointer the as_dyn_* helpers take.
   ptr: string;
+  // The same receiver BOXED (an `as_value`), which is what a closure created in
+  // this body captures.
+  capBox: string;
   declared: Set<string>;
 };
+
+// `with` over a closed builtin receiver: the names AIR resolves on the object
+// instead of falling through to the enclosing scope. Measured on adl 51.4.1
+// (temp/proxyany W4..W6): `with (s) { length }` 3, `with (s) { charAt(1) }` 'b',
+// `with (s) { toUpperCase() }` 'ABC', `with (v) { length }` 2, `with (v) { push(7) }`
+// appends, and a name the receiver lacks (`lexFoo`) reads the lexical binding.
+// Each name here must be one emitStringMethod / emitVectorMethod actually
+// implements -- a name listed here but unimplemented would turn AIR's lexical
+// fallback into a compile error, and a name implemented but not listed would
+// silently read the wrong binding.
+const STRING_WITH_MEMBERS = new Set<string>([
+  'length', 'hasOwnProperty', 'propertyIsEnumerable', 'charAt', 'charCodeAt',
+  'indexOf', 'lastIndexOf', 'substring', 'substr', 'slice', 'split',
+  'toUpperCase', 'toLowerCase', 'toLocaleLowerCase', 'toLocaleUpperCase',
+  'match', 'search', 'replace', 'concat', 'localeCompare', 'startsWith',
+  'endsWith', 'valueOf', 'toString',
+]);
+const VECTOR_WITH_MEMBERS = new Set<string>([
+  'length', 'fixed', 'hasOwnProperty', 'propertyIsEnumerable', 'concat',
+  'filter', 'forEach', 'includes', 'indexOf', 'insertAt', 'join', 'map', 'pop',
+  'push', 'removeAt', 'reverse', 'shift', 'slice', 'sort', 'splice',
+  'toString', 'unshift',
+]);
+
+// A closure created INSIDE a `with` body captures the with object itself, not just
+// its name bindings: AIR keeps the object in the closure's scope chain, so the
+// captured reference is resolved at CALL time and a later write to the object is
+// visible (measured on adl 51.4.1, temp/proxyany/wcap: A 'OBJ-X', B 'OBJ-X2',
+// C the closure's `x = "SET"` lands on the object, D nested with scopes are both
+// captured with the inner one winning, E the reference survives the block exit).
+// Such a capture is recorded under a synthetic name -- the prefix cannot collide
+// with an AS3 identifier -- whose value is the with OBJECT, boxed. A capture's
+// env field is typed `as_value` because the with receiver's static type is not
+// known to the free-variable pre-pass (it is filled in at the make site, where
+// the with scope is live).
+const WITH_CAP_PREFIX = 'with#';
 
 function collectScriptDecls(body: Stmt[]): ScriptDecl[] {
   const decls: ScriptDecl[] = [];
@@ -390,6 +433,12 @@ export class Emitter {
   // so a stale value from an unrelated member read can never leak into a write.
   private lastDoNameTarget = false;
   private anonFuncs: { name: string; asName: string | null; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[]; cname: string | null; isStatic: boolean; depth: number; methodName: string | null }[] = [];
+  // Free-variable pre-pass: the stack of `with` bodies currently being walked, by
+  // the receiver's static type (the capture's env field type). An entry's INDEX is
+  // the synthetic capture id (WITH_CAP_PREFIX + index) and is also the scope's index
+  // in `withScopes` at emit time. A receiver the pass cannot type is recorded as
+  // `*`, which restores as a runtime scope.
+  private walkWithStack: CType[] = [];
   private anonIndex = new Map<object, string>();
   private anonSeq = 0;
   private vectorSpecs = new Map<string, CType>();
@@ -1199,7 +1248,7 @@ export class Emitter {
           for (const c of g.varCaps) {
             if (c.name === 'this') continue;
             if (!this.hoistedLocals.has(c.name)) continue;
-            this.enclosingCaptured.set(c.name, { type: c.type, cell: g.cellLocal, field: this.cIdent(c.name) });
+            this.enclosingCaptured.set(c.name, { type: c.type, cell: g.cellLocal, field: this.cCapName(c.name) });
           }
         }
       }
@@ -1244,7 +1293,7 @@ export class Emitter {
       for (const c of g.varCaps) {
         if (this.enclosingCaptured.has(c.name)) continue;
         const v = this.emitVar(c.name);
-        this.line(`${g.cellLocal}->${this.cIdent(c.name)} = ${v.code};`);
+        this.line(`${g.cellLocal}->${this.cCapName(c.name)} = ${v.code};`);
       }
     }
   }
@@ -1326,6 +1375,13 @@ export class Emitter {
   // Prefix style, unchanged since the beginning (see sanitizeCIdent): the
   // hand-written builtin bodies below spell their fields literally (`o->_time`),
   // so a different spelling here would disconnect a struct from its own bodies.
+  // A capture's C field name. A synthetic with-scope capture carries '#' (an
+  // impossible character in an AS3 identifier, so it cannot collide with a user
+  // capture in the env); C field names get '$' instead, which is legal.
+  private cCapName(name: string): string {
+    return this.cIdent(name.includes('#') ? name.replace(/#/g, '$') : name);
+  }
+
   private cIdent(name: string): string {
     const cached = this.cNameCache.get(name);
     if (cached !== undefined) return cached;
@@ -2377,14 +2433,27 @@ export class Emitter {
     this.line('}');
     // `with` object checks. AIR distinguishes a null receiver (#1009) from an
     // undefined one (#1010) for a with statement, unlike a plain null dereference.
-    // Only an object receiver (tag 4) can host a with scope: the other tags hold a
-    // non-object pointer (string/function/array), so they yield NULL and the body
-    // resolves lexically — see the known-limitations table.
+    // Tags 4 (object) and 6 (Array) both carry an object body the as_dyn_* helpers
+    // can dispatch on: as_dyn_kind identifies an Array by its GC header, so a with
+    // over an Array held in a '*' slot resolves `length`/indices/methods like the
+    // statically typed one does. A String (tag 3) and a Function (tag 7) hold a
+    // non-object pointer, so they yield NULL and the body resolves lexically — see
+    // the known-limitations table.
     this.line('static void* as_with_box(as_value v) {');
     this.indent++;
     this.line('if (v.tag == 0) as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));');
     this.line('if (v.tag == 5) as_throw(TypeError_new((char*)"Error #1010: A term is undefined and has no properties.", 1010));');
-    this.line('return v.tag == 4 ? v.ptr : NULL;');
+    this.line('return (v.tag == 4 || v.tag == 6) ? v.ptr : NULL;');
+    this.indent--;
+    this.line('}');
+    // The closure-capture form of the above: no #1009/#1010 (the enclosing With
+    // statement already performed those checks) and NULL for anything without an
+    // object body, which makes a half-populated capture claim NOTHING at run time
+    // (as_dyn_has(NULL, ...) is false). Only a closure that merged into a sibling
+    // group it does not belong to sees the NULL case.
+    this.line('static void* as_with_box_soft(as_value v) {');
+    this.indent++;
+    this.line('return (v.tag == 4 || v.tag == 6) ? v.ptr : NULL;');
     this.indent--;
     this.line('}');
     // Writing a read-only property through a with object (a getter with no setter,
@@ -2460,6 +2529,92 @@ export class Emitter {
     this.indent--;
     this.line('}');
     this.line('');
+    // E4X `..name` on a receiver whose STATIC type is not XML/XMLList. AIR decides
+    // on the VALUE at run time and supports exactly three shapes -- measured on
+    // adl 51.4.1 (temp/proxyany H1..H6 + M1..M3): an XML/XMLList value walks the
+    // descendant axis, a Proxy routes to its flash_proxy getDescendants, a null
+    // receiver is the usual #1009, and EVERY other value raises TypeError #1016
+    // naming the value's class: 'Descendants operator (..) not supported on type
+    // String.' (also Array, a sealed instance, an object literal).
+    //
+    // as_has_vtable() is the guard that makes the Proxy probe safe: an Array and a
+    // monomorphized Vector start with a data pointer / mark callback, not a
+    // vtable, so as_is_proxy() on one would read a function pointer as a header.
+    this.line('static as_value as_descendants_v(as_value v, const char* name) {');
+    this.indent++;
+    this.line('if (v.tag == 0 || v.tag == 5) {');
+    this.indent++;
+    this.line('as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('if (v.tag == 4 && v.ptr != NULL && as_has_vtable(v.ptr)) {');
+    this.indent++;
+    this.line('if (as_is(v.ptr, (void*)&as_xml_vt)) return as_v_obj((void*)as_xml_descendants((as_xml_node*)v.ptr, name));');
+    this.line('if (as_is(v.ptr, (void*)&as_xml_list_vt)) return as_v_obj((void*)as_xml_list_descendants((as_xml_list*)v.ptr, name));');
+    this.line('if (as_is_proxy(v.ptr)) return as_proxy_descendants(v.ptr, name);');
+    this.indent--;
+    this.line('}');
+    this.line('const char* fqn = as_get_qualified_class_name(v);');
+    this.line('const char* short_name = fqn;');
+    this.line('for (const char* p = fqn; *p != 0; p++) if (*p == \':\' || *p == \'.\') short_name = p + 1;');
+    this.line('static ASC_TLS const char* parts[3];');
+    this.line('parts[0] = "Error #1016: Descendants operator (..) not supported on type ";');
+    this.line('parts[1] = short_name;');
+    this.line('parts[2] = ".";');
+    this.line('as_throw(TypeError_new(as_str_concat_n(3, parts), 1016));');
+    this.line('return as_v_null();');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // `key in receiver` when the receiver's STATIC type is '*': AIR answers
+    // membership of the value's RUNTIME class -- measured on adl 51.4.1
+    // (temp/proxyany MainI/MainI2/MainI3/MainI4): an Array answers length, its
+    // in-range indices, its named properties and its method names; a Dictionary its
+    // keys; a class instance its traits; a String its length and its method names
+    // ('"length" in "abc"' true, '"0" in "abc"' false); null throws #1009 and
+    // undefined #1010. A boxed String must NEVER reach as_dyn_has -- a string body
+    // has no vtable, so the trait walk read its first bytes as a vtable header and
+    // segfaulted (measured: 'var o:* = "abc"; "length" in o').
+    //
+    // The remaining gap (Number/Boolean/Function receivers answer false here and on
+    // their statically typed path, where AIR answers the wrapper's members) is
+    // registered in TODO.md; it is the pre-existing behaviour, not a new one.
+    {
+      const strNames = [...STRING_WITH_MEMBERS].filter((n) => n !== 'length');
+      // One source of truth for the String member names: the same set `with`
+      // resolves against (STRING_WITH_MEMBERS).
+      this.line('static bool as_str_has_member(const char* key) {');
+      this.indent++;
+      this.line('if (strcmp(key, "length") == 0) return true;');
+      this.line(`static const char* const names[] = { ${strNames.map((n) => `"${n}"`).join(', ')}, NULL };`);
+      this.line('for (int i = 0; names[i] != NULL; i++) if (strcmp(names[i], key) == 0) return true;');
+      this.line('return false;');
+      this.indent--;
+      this.line('}');
+      this.line('static bool as_in_v(as_value v, const char* key) {');
+      this.indent++;
+      this.line('if (v.tag == 0) {');
+      this.indent++;
+      this.line('as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));');
+      this.line('return false;');
+      this.indent--;
+      this.line('}');
+      this.line('if (v.tag == 5) {');
+      this.indent++;
+      this.line('as_throw(TypeError_new((char*)"Error #1010: A term is undefined and has no properties.", 1010));');
+      this.line('return false;');
+      this.indent--;
+      this.line('}');
+      // A String's only own property is length; 'constructor' is Object's trait
+      // every value answers (adl 51.4.1 J15).
+      this.line('if (v.tag == 3) return strcmp(key, "constructor") == 0 || as_str_has_member(key);');
+      this.line('if (v.tag == 4 || v.tag == 6) return as_dyn_has(as_v_obj_val(v), key);');
+      this.line('return false;');
+      this.indent--;
+      this.line('}');
+      this.line('');
+    }
     // TypeError #1006 for calling a value that is not a function (probe 94a: an
     // any-typed callee such as `proxy["m"](1,2)`, where the Proxy's getProperty
     // result is not callable). The id is what AIR reports; the message follows
@@ -6950,6 +7105,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
   }
 
+  // A closure declared inside a `with` body captures the with OBJECT itself, so a
+  // name it resolves against that object is decided at CALL time, not at closure
+  // creation (adl 51.4.1, temp/proxyany/wcap). The capture is added AFTER the
+  // free-variable analysis and unconditionally: a name the with object also has
+  // must route through the captured scope even when it resolves lexically too.
+  private addWithCaptures(seen: Map<string, CType>): void {
+    this.walkWithStack.forEach((t, id) => seen.set(WITH_CAP_PREFIX + id, t));
+  }
+
   // Sibling nested functions declared in the SAME method share one lexical scope
   // in AS3. When one references another (`onIoError` calls `cleanup`, which reads
   // `loaderInfo`), the referenced function's captured variables must also be
@@ -6994,6 +7158,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       const seen = new Set<string>();
       for (const fn of siblings) for (const c of fn.captures) {
         if (isSiblingRef(c)) continue;
+        // One shared cell means one field type per name, so two siblings with
+        // different `with` receivers cannot both be served. (AIR handles this; this
+        // subset refuses loudly rather than handing a closure the wrong object.)
+        if (c.name.startsWith(WITH_CAP_PREFIX)) {
+          throw new CodegenError('a mutually recursive pair of nested functions cannot both be declared inside a `with` block');
+        }
         if (!seen.has(c.name)) { seen.add(c.name); plainCaps.push(c); }
       }
       const idx = this.anonSeq++;
@@ -7016,12 +7186,18 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       // avoids forcing every sibling to capture a param only one of them uses.)
       const mergedVars = new Map<string, CType>();
       for (const fn of siblings) for (const c of fn.captures) {
+        // A `with` capture is NOT a shared lexical variable: two siblings in two
+        // different `with` bodies capture two different RECEIVERS (and possibly
+        // different types), so merging them would hand one sibling the other's
+        // object. Each keeps its own.
+        if (c.name.startsWith(WITH_CAP_PREFIX)) continue;
         if (c.type.kind !== 'function' && !mergedVars.has(c.name)) mergedVars.set(c.name, c.type);
       }
       const mergedVarCaps = [...mergedVars.entries()].map(([name, type]) => ({ name, type }));
       for (const fn of siblings) {
         const ownFuncs = fn.captures.filter((c) => c.type.kind === 'function');
-        fn.captures = [...ownFuncs, ...mergedVarCaps];
+        const ownWiths = fn.captures.filter((c) => c.name.startsWith(WITH_CAP_PREFIX));
+        fn.captures = [...ownFuncs, ...ownWiths, ...mergedVarCaps];
       }
     }
     for (const fn of siblings) {
@@ -7288,7 +7464,20 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       case 'SuperCall': for (const a of s.args) this.walkExpr(a); break;
       case 'Throw': this.walkExpr(s.value); break;
       case 'Try': for (const c of s.catches) this.noteType(c.type); this.walkStmts(s.tryBody.body); for (const c of s.catches) this.walkStmts(c.body.body); if (s.finallyBody) this.walkStmts(s.finallyBody.body); break;
-      case 'With': this.walkExpr(s.obj); this.walkStmt(s.body); break;
+      case 'With': {
+        this.walkExpr(s.obj);
+        // A closure declared inside this body captures the with OBJECT (see
+        // WITH_CAP_PREFIX). The id is the scope's index in the enclosing with
+        // chain, which is exactly the emit-time index in `withScopes`.
+        // Only a String/Vector receiver is captured as its own C type (the closed
+        // member sets need the static path); every other receiver is captured BOXED,
+        // because that is the one shape whose C type the pre-pass can guarantee
+        // matches the temp the With statement fills (see emitWith's capBox).
+        const rt = this.walkInferType(s.obj) ?? { kind: 'any' };
+        this.walkWithStack.push(rt.kind === 'string' || rt.kind === 'vector' ? rt : { kind: 'any' });
+        try { this.walkStmt(s.body); } finally { this.walkWithStack.pop(); }
+        break;
+      }
       case 'FuncDecl': {
         this.noteType(s.returnType);
         if (this.funcVars.length === 1) {
@@ -7332,6 +7521,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
             if (r.name === name) continue;
             if (!local.has(r.name) && this.lookupEnclosingVar(r.name, local)) seen.set(r.name, r.type);
           }
+          this.addWithCaptures(seen);
           this.propagateNestedCaptures(local, seen, nestedStart);
           if (this.currentAnonNeedsThis && this.currentWalkClass && !this.currentWalkIsStatic) {
             seen.set('this', { kind: 'object', className: this.currentWalkClass } as CType);
@@ -7738,6 +7928,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         for (const r of this.currentAnonRefs) {
           if (!local.has(r.name) && this.lookupEnclosingVar(r.name, local)) seen.set(r.name, r.type);
         }
+        this.addWithCaptures(seen);
         this.propagateNestedCaptures(local, seen, nestedStart);
         // A closure defined in an instance method that reaches the receiver (bare
         // `this`, `this.method`, or an unqualified instance-method call) captures
@@ -7909,7 +8100,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     for (const g of cellGroups) {
       const fields = g.members
         .map((m) => `as_fn ${m};`)
-        .concat(g.varCaps.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)};`))
+        .concat(g.varCaps.map((c) => `${this.cTypeName(c.type)} ${this.cCapName(c.name)};`))
         .join(' ');
       this.line(`typedef struct { void (*mark)(void*); ${fields} } ${g.cellName};`);
     }
@@ -7920,20 +8111,20 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       for (const m of g.members) this.line(`gc_mark_ptr((void*)e->${m});`);
       for (const c of g.varCaps) {
         const k = this.captureMarkKind(c.type);
-        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cIdent(c.name)});`);
-        else if (k === 'value') this.line(`gc_mark_value(e->${this.cIdent(c.name)});`);
+        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cCapName(c.name)});`);
+        else if (k === 'value') this.line(`gc_mark_value(e->${this.cCapName(c.name)});`);
       }
       this.indent--;
       this.line('}');
     }
     for (const fn of this.anonFuncs) {
       if (fn.captures.length === 0 || this.closureGroups.has(fn.name)) continue;
-      const fields = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)};`).join(' ');
+      const fields = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cCapName(c.name)};`).join(' ');
       this.line(`typedef struct { void (*mark)(void*); ${fields} } ${fn.name}_env;`);
     }
     for (const fn of this.anonFuncs) {
       if (fn.captures.length === 0 || this.closureGroups.has(fn.name)) continue;
-      const params = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cIdent(c.name)}`).join(', ');
+      const params = fn.captures.map((c) => `${this.cTypeName(c.type)} ${this.cCapName(c.name)}`).join(', ');
       // GC mark callback for the captured environment: trace each captured field
       // that carries a GC pointer (raw object/string) or a boxed as_value. The
       // env is a GCT_CUSTOM object so gc_scan dispatches to this callback, which
@@ -7943,8 +8134,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(`${fn.name}_env* e = (${fn.name}_env*)self;`);
       for (const c of fn.captures) {
         const k = this.captureMarkKind(c.type);
-        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cIdent(c.name)});`);
-        else if (k === 'value') this.line(`gc_mark_value(e->${this.cIdent(c.name)});`);
+        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cCapName(c.name)});`);
+        else if (k === 'value') this.line(`gc_mark_value(e->${this.cCapName(c.name)});`);
       }
       this.indent--;
       this.line('}');
@@ -7952,7 +8143,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.indent++;
       this.line(`${fn.name}_env* e = (${fn.name}_env*)gc_alloc(GCT_CUSTOM, sizeof(${fn.name}_env));`);
       this.line(`e->mark = ${fn.name}_env_mark;`);
-      for (const c of fn.captures) this.line(`e->${this.cIdent(c.name)} = ${this.cIdent(c.name)};`);
+      for (const c of fn.captures) this.line(`e->${this.cCapName(c.name)} = ${this.cCapName(c.name)};`);
       this.line('return e;');
       this.indent--;
       this.line('}');
@@ -8003,7 +8194,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         if (nf) this.line(`e->${m} = as_fn_make(${m}__call, (void*)e, ${this.requiredArity(nf.params)});`);
       }
       for (const c of g.varCaps) {
-        if (c.type.kind === 'number') this.line(`e->${this.cIdent(c.name)} = NAN;`);
+        if (c.type.kind === 'number') this.line(`e->${this.cCapName(c.name)} = NAN;`);
       }
       this.line('return e;');
       this.indent--;
@@ -8033,13 +8224,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         this.currentClosureCells = this.closureCellEnv.get(fn.name)?.resolve ?? null;
       }
       this.indent++;
-      // A `with` object scope lives in a C local of the *enclosing* function body
-      // and its names resolve to that local, so a nested function body (a closure
-      // or a local function) cannot see it: AIR captures the with scope in the
-      // closure's scope chain, this subset does not (see the known-limitations
-      // table). Scopes are suspended for the whole nested body.
+      // A closure declared inside a `with` body keeps that scope: AIR captures the
+      // with OBJECT in the closure's chain, so the names it serves are decided at
+      // CALL time (adl 51.4.1, temp/proxyany/wcap). The captures were recorded by
+      // the free-variable pre-pass (WITH_CAP_PREFIX) and typed at the make site;
+      // restoreWithScopes turns them back into scope entries reading `env->field`.
       const savedWithScopes = this.withScopes;
-      this.withScopes = [];
+      this.withScopes = this.restoreWithScopes(fn);
       this.hoistFunctionLocals(fn.body.body);
       this.currentFuncCName = fn.name;
       this.currentFuncAsName = fn.asName;
@@ -32215,6 +32406,66 @@ void FileStream_writeObject(void* _this, as_value v) {
   // codebase. Any other reflectable receiver (`*`/Object/dynamic class/Proxy)
   // takes a runtime `as_dyn_has` branch, which is also what routes a Proxy
   // through its interceptors.
+  // The value a closure's env field takes for one capture. A with capture is the
+  // receiver temp of the enclosing With statement (typed like the env field); a
+  // plain capture reads the variable in the enclosing scope. A with capture that
+  // has no live scope — a sibling-group merge handed this closure the field — takes
+  // the type's zero value, which a runtime scope treats as "claims nothing".
+  private captureValue(c: { name: string; type: CType }): string {
+    if (!c.name.startsWith(WITH_CAP_PREFIX)) return this.emitVar(c.name).code;
+    const sc = this.withScopes[Number(c.name.slice(WITH_CAP_PREFIX.length))];
+    if (sc !== undefined) return sc.capBox;
+    return c.type.kind === 'any' ? 'as_v_null()' : 'NULL';
+  }
+
+  // Rebuild a closure body's with-scope chain from the with objects captured into
+  // its environment, in chain order (outermost first — the same order `withScopes`
+  // uses). The capture's own CType is the receiver's static type, so the mode is a
+  // function of it: a String/Vector scope is a closed builtin member set, a sealed
+  // class instance is a trait table, everything else (`*`, Object/record, Array,
+  // Dictionary, interface, a dynamic/Proxy class) is resolved at run time.
+  private restoreWithScopes(fn: { name: string; body: Block; captures: { name: string; type: CType }[] }): WithScope[] {
+    const out: WithScope[] = [];
+    const declared = this.withBodyDeclaredNames(fn.body);
+    const ids = fn.captures
+      .filter((c) => c.name.startsWith(WITH_CAP_PREFIX))
+      .map((c) => Number(c.name.slice(WITH_CAP_PREFIX.length)))
+      .sort((a, b) => a - b);
+    for (const id of ids) {
+      const cap = fn.captures.find((c) => c.name === WITH_CAP_PREFIX + id);
+      if (cap === undefined) continue;
+      const t = cap.type;
+      const field = `env->${this.cCapName(cap.name)}`;
+      const mode = this.withModeForType(t);
+      if (mode === 'runtime') {
+        out.push({ tmp: WITH_CAP_PREFIX + id, type: t, mode, className: null, ptr: this.runtimeScopePtr(t, field), capBox: field, declared });
+        continue;
+      }
+      // sealed / builtin: the field is already the receiver's own C type, so a
+      // plain local keeps the static member paths usable inside the body.
+      const local = this.tmpName('wc');
+      this.line(`${this.cTypeName(t)} ${this.cIdent(local)} = ${field};`);
+      this.declareVar(local, t);
+      out.push({ tmp: local, type: t, mode, className: null, ptr: `(void*)${this.cIdent(local)}`, capBox: field, declared });
+    }
+    return out;
+  }
+
+  // Which resolution a `with` receiver of this static type needs (see WithScope).
+  private withModeForType(t: CType): WithScope['mode'] {
+    return t.kind === 'string' || t.kind === 'vector' ? 'builtin' : 'runtime';
+  }
+
+  // The object body a restored runtime scope hands the as_dyn_* helpers. An
+  // untyped capture is boxed (and becomes NULL when the field was never filled,
+  // which claims nothing); an Array/Dictionary/Object body is the pointer itself;
+  // an interface is the pair's instance half.
+  private runtimeScopePtr(t: CType, field: string): string {
+    if (t.kind === 'any') return `as_with_box_soft(${field})`;
+    if (t.kind === 'interface') return `(void*)${field}.obj`;
+    return `(void*)${field}`;
+  }
+
   private emitWith(stmt: Extract<Stmt, { kind: 'With' }>): void {
     this.sequenceValueExpr(stmt.obj, true, true);
     const obj = this.emitExpr(stmt.obj);
@@ -32227,6 +32478,22 @@ void FileStream_writeObject(void* _this, as_value v) {
     // `Object` is the dynamic-record convention (`as_object*`, see boxExpr /
     // emitDelete): its members are runtime keys, not a known trait list.
     const recordLike = k === 'record' || (k === 'object' && obj.type.kind === 'object' && obj.type.className === 'Object');
+    // Package H-3: an Array, a Dictionary and an INTERFACE receiver go through the
+    // same runtime has/get/set/call/del path a '*' receiver does. There is nothing
+    // new to model: as_dyn_* already dispatches an Array (as_dyn_kind 2: length,
+    // in-range indices, named properties, the Array method table), a Dictionary
+    // (kind 1: its keys) and any class instance (the trait walk, so an interface
+    // receiver sees the CONCRETE instance's members). Measured on adl 51.4.1
+    // (temp/proxyany W1..W8): `with (a) { length }` 2, `with (a) { push(30) }`
+    // appends, `with (d) { k }` reads the key, and a name the receiver lacks falls
+    // through to the enclosing scope, exactly like the '*' case.
+    const dynReceiver = k === 'array' || k === 'dict' || k === 'interface';
+    // A String or a Vector.<T> is a CLOSED member set, but not a trait table, so
+    // membership is the name-set test in withBuiltinMembers() and the access
+    // reuses the ordinary static String/Vector paths. Function, Class and RegExp
+    // receivers still have no modelling: those are rejected loudly instead of
+    // silently resolving the body lexically.
+    const builtinReceiver = k === 'string' || k === 'vector';
     if (k === 'object' && !recordLike) {
       classInstance = true;
       className = obj.type.className;
@@ -32234,15 +32501,21 @@ void FileStream_writeObject(void* _this, as_value v) {
       // A dynamic class (or Proxy) has runtime-only keys, so a name its sealed
       // traits do not declare still needs the runtime has-check.
       runtime = cinfo !== undefined && (cinfo.isDynamic || cinfo.isProxy);
-    } else if (k === 'any' || recordLike) {
+    } else if (k === 'any' || recordLike || dynReceiver) {
       runtime = true;
+    } else if (builtinReceiver) {
+      // sealed-mode machinery, but with a name set instead of a class
     } else {
-      // Array/Vector/String/function/Dictionary/interface receivers: this subset
-      // cannot reflect their members, so a `with` over them is rejected loudly
-      // rather than silently resolving the body lexically (which would be a
-      // semantically wrong translation). See the known-limitations table.
-      throw new CodegenError(`with: a ${k}-typed receiver is not supported (needs a class instance, Object or *)`);
+      // String/Vector receivers are CLOSED member sets, and function/class/regexp
+      // receivers have no dynamic table at all, so each of those still needs its
+      // own modelling: a `with` over them is rejected loudly rather than silently
+      // resolving the body lexically (which would be a semantically wrong
+      // translation). See the known-limitations table.
+      throw new CodegenError(`with: a ${k}-typed receiver is not supported (needs a class instance, Object, Array, Dictionary, an interface or *)`);
     }
+    // The C temp of the branch below: an `as_value` for a '*'/Object receiver, the
+    // receiver's own type otherwise.
+    const capturedBoxed = !classInstance && !dynReceiver && !builtinReceiver;
     let ptr = '';
     this.line('{');
     this.indent++;
@@ -32250,6 +32523,20 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (classInstance) {
       this.line(`${this.cTypeName(obj.type)} ${cid} = ${obj.code};`);
       // A null receiver is a runtime TypeError in AIR (measured #1009).
+      this.line(`if (${cid} == NULL) as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));`);
+      ptr = `(void*)${cid}`;
+    } else if (dynReceiver) {
+      // The receiver already IS the dynamic table as_dyn_* dispatch on: an Array /
+      // Dictionary body is identified by its GC header (as_dyn_kind), and an
+      // interface is a {vtable, obj} pair whose .obj is the concrete instance.
+      this.line(`${this.cTypeName(obj.type)} ${cid} = ${obj.code};`);
+      this.line(`if (${k === 'interface' ? `${cid}.obj` : cid} == NULL) as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));`);
+      ptr = `(void*)${k === 'interface' ? `${cid}.obj` : cid}`;
+    } else if (builtinReceiver) {
+      // No dynamic table: every access is a static member on the receiver, so the
+      // C local is just the value itself (a String is a char*, a Vector a
+      // monomorphized struct pointer).
+      this.line(`${this.cTypeName(obj.type)} ${cid} = ${obj.code};`);
       this.line(`if (${cid} == NULL) as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));`);
       ptr = `(void*)${cid}`;
     } else {
@@ -32265,9 +32552,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.withScopes.push({
       tmp,
       type: obj.type,
-      mode: runtime ? 'runtime' : 'sealed',
+      mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : 'sealed',
       className,
       ptr,
+      // What a closure created in this body captures (see addWithCaptures): a
+      // String/Vector receiver as its typed temp, every other receiver BOXED into an
+      // `as_value` — the shape the pre-pass recorded. The temp was filled before any
+      // body statement runs, so the capture never re-evaluates the receiver.
+      capBox: capturedBoxed || builtinReceiver ? cid : `as_v_obj((void*)(${k === 'interface' ? `${cid}.obj` : cid}))`,
       declared: this.withBodyDeclaredNames(stmt.body),
     });
     this.emitStmt(stmt.body);
@@ -32395,6 +32687,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // A scope's own temp object never shadows itself.
     if (name === sc.tmp) return false;
     if (sc.mode === 'runtime') return true;
+    if (sc.mode === 'builtin') return (sc.type.kind === 'string' ? STRING_WITH_MEMBERS : VECTOR_WITH_MEMBERS).has(name);
     return sc.className !== null && this.withClassHasMember(sc.className, name);
   }
 
@@ -32434,6 +32727,11 @@ void FileStream_writeObject(void* _this, as_value v) {
         // Known trait: a plain member access on the scope's object (branch-free).
         return this.emitExpr(this.withMemberNode(sc, name));
       }
+      if (sc.mode === 'builtin') {
+        // Same shape, resolved by the ordinary String/Vector member emitter
+        // ('length' -> strlen, a method value -> the static member path).
+        return this.emitExpr(this.withMemberNode(sc, name));
+      }
       const rest = this.boxExpr(this.withReadFrom(i - 1, name, lexical));
       const key = `"${this.escapeCString(name)}"`;
       const dyn = `as_dyn_get(${sc.ptr}, ${key})`;
@@ -32446,10 +32744,12 @@ void FileStream_writeObject(void* _this, as_value v) {
   private emitWithAssign(expr: Extract<Expr, { kind: 'Assign' }>): { code: string; type: CType; discard?: boolean } | null {
     const target = expr.target;
     if (target.kind !== 'Var' || !this.withAnyClaim(target.name)) return null;
-    // The lexical fallback is a plain assignment: a name that resolves nowhere is a
-    // compile error, exactly as an undeclared assignment target outside a `with`
-    // is (AIR would create an implicit global there — pre-existing subset gap).
-    const lexical = () => this.withoutWithTarget(target.name, () => this.emitAssign(expr));
+    // The lexical fallback is a plain assignment. A target that resolves NOWHERE is
+    // a #1065 at run time rather than a build error: the with object may well serve
+    // it (that is the whole point of the scope), and the lexical branch only runs
+    // when it does not. (AIR would create an implicit global there — the same
+    // pre-existing subset gap as an undeclared assignment outside a `with`.)
+    const lexical = () => this.withLexical(() => this.withoutWithTarget(target.name, () => this.emitAssign(expr)));
     return this.withAssignFrom(this.withScopes.length - 1, target, expr, lexical);
   }
 
@@ -32469,6 +32769,12 @@ void FileStream_writeObject(void* _this, as_value v) {
         // Desugar into an ordinary `obj.name = v`: field writes, accessor writes,
         // compound reads/writes and the GC barrier all come from that path.
         return this.emitAssign({ kind: 'Assign', op: expr.op, target: this.withMemberNode(sc, name), value: expr.value });
+      }
+      if (sc.mode === 'builtin') {
+        // AIR allows some of these (Vector.length truncates, Vector.fixed toggles);
+        // the static paths for those are not wired into an assignment target yet,
+        // so this fails loudly rather than emitting a non-lvalue String length.
+        throw new CodegenError(`with: assigning the member '${name}' of a ${sc.type.kind} receiver is not supported`);
       }
       const rest = this.boxExpr(this.withAssignFrom(i - 1, target, expr, lexical));
       const key = `"${this.escapeCString(name)}"`;
@@ -32525,6 +32831,11 @@ void FileStream_writeObject(void* _this, as_value v) {
         }
         throw new CodegenError(`with: calling the member '${name}' of '${sc.className}' is not supported (only methods and Function fields are)`);
       }
+      if (sc.mode === 'builtin') {
+        // A closed builtin receiver: an ordinary call on `obj.name(...)`, so the
+        // static String/Vector method emitter handles both dispatch and arity.
+        return this.emitCall({ kind: 'Call', callee: this.withMemberNode(sc, name), args: expr.args });
+      }
       // A void lexical fallback (the call's result is discarded) must keep the CALL:
       // boxExpr maps void to as_v_null(), which would silently drop the call whenever
       // the object lacks the member. The comma expression keeps both ternary
@@ -32561,6 +32872,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     for (const sc of this.withScopes) if (this.withScopeClaims(sc, expr.target.name)) claimed++;
     const sc = this.withScopes[this.withScopes.length - 1];
     if (sc.mode === 'sealed') return null; // handled by the ordinary lvalue/setter paths
+    if (sc.mode === 'builtin') throw new CodegenError(`with: updating the member '${expr.target.name}' of a ${sc.type.kind} receiver is not supported`);
     if (claimed > 1) {
       throw new CodegenError(`with: updating '${expr.target.name}' across nested with scopes is not supported`);
     }
@@ -32591,6 +32903,9 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (!this.withScopeClaims(sc, t.name)) continue;
       if (sc.mode === 'sealed') {
         throw new CodegenError(`delete of the fixed property '${t.name}' of '${sc.className}' (mxmlc rejects this too)`);
+      }
+      if (sc.mode === 'builtin') {
+        throw new CodegenError(`delete of the fixed property '${t.name}' of a ${sc.type.kind} receiver (mxmlc rejects this too)`);
       }
       const key = `"${this.escapeCString(t.name)}"`;
       return { code: `(as_dyn_has(${sc.ptr}, ${key}) ? as_dyn_del(${sc.ptr}, ${key}) : false)`, type: { kind: 'bool' } };
@@ -33810,7 +34125,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           return { code: `as_fn_make(${name}__call, NULL, ${arity})`, type: { kind: 'function' } };
         }
         // Capture each free variable's current value into a heap-allocated env.
-        const vals = captures.map((c) => this.emitVar(c.name).code).join(', ');
+        const vals = captures.map((c) => this.captureValue(c)).join(', ');
         return { code: `as_fn_make(${name}__call, ${name}_env_make(${vals}), ${arity})`, type: { kind: 'function' } };
       }
 
@@ -33842,17 +34157,31 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
 
       case 'Descendants': {
-        // E4X `x..name` / `x..*`: XML/XMLList in, XMLList out. An empty name means
-        // "match any name", the same convention as_xml_children uses.
+        // E4X `x..name` / `x..*`. An XML/XMLList receiver walks the descendant axis
+        // inline (an empty name means "match any", the convention as_xml_children
+        // uses). AIR also accepts a PROXY receiver -- `p..foo` calls the flash_proxy
+        // getDescendants interceptor, with the literal "*" for `..*` -- and REJECTS
+        // everything else at run time with TypeError #1016 (or #1009 for null),
+        // decided by the VALUE, not by the declared type (measured on adl 51.4.1,
+        // temp/proxyany G1..G6 + H1..H6). A statically known Proxy subclass calls
+        // its interceptor directly; every other receiver takes the run-time
+        // dispatcher so a `*` slot holding XML still works.
         const o = this.emitExpr(expr.object);
-        const name = `"${this.escapeCString(expr.name === '*' ? '' : expr.name)}"`;
+        const xmlName = `"${this.escapeCString(expr.name === '*' ? '' : expr.name)}"`;
         if (o.type.kind === 'xmllist') {
-          return { code: `as_xml_list_descendants(${this.guardRecv(expr.object, o)}, ${name})`, type: { kind: 'xmllist' } };
+          return { code: `as_xml_list_descendants(${this.guardRecv(expr.object, o)}, ${xmlName})`, type: { kind: 'xmllist' } };
         }
         if (o.type.kind === 'xml') {
-          return { code: `as_xml_descendants(${this.guardRecv(expr.object, o)}, ${name})`, type: { kind: 'xmllist' } };
+          return { code: `as_xml_descendants(${this.guardRecv(expr.object, o)}, ${xmlName})`, type: { kind: 'xmllist' } };
         }
-        throw new CodegenError(`'..' requires an XML or XMLList value, got ${o.type.kind}`);
+        // The interceptor receives the E4X name as text; `..*` passes "*" (measured:
+        // adl gives getDescendants("*") for `p..*`, not the empty wildcard the XML
+        // axis uses).
+        const pname = `"${this.escapeCString(expr.name === '*' ? '*' : expr.name)}"`;
+        if (o.type.kind === 'object' && this.symbols.getClass(o.type.className)?.isProxy === true) {
+          return { code: `as_proxy_descendants((void*)(${this.guardRecv(expr.object, o)}), ${pname})`, type: { kind: 'any' } };
+        }
+        return { code: `as_descendants_v(${this.boxExpr(o)}, ${pname})`, type: { kind: 'any' } };
       }
 
       case 'XmlLit': {
@@ -34038,7 +34367,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (this.buildingClosures.has(nfKey)) return { code: 'NULL', type: { kind: 'function' } };
       this.buildingClosures.add(nfKey);
       try {
-        const vals = nf.captures.map((c) => this.emitVar(c.name).code).join(', ');
+        const vals = nf.captures.map((c) => this.captureValue(c)).join(', ');
         return { code: `as_fn_make(${nfKey}__call, ${nfKey}_env_make(${vals}), ${this.requiredArity(nf.params)})`, type: { kind: 'function' } };
       } finally {
         this.buildingClosures.delete(nfKey);
@@ -38678,9 +39007,9 @@ void FileStream_writeObject(void* _this, as_value v) {
       return { code: `as_object_has(${obj.code}, ${keyStr})`, type: { kind: 'bool' } };
     }
     if (obj.type.kind === 'any') {
-      // A boxed value: could be a record or a class instance, so route through the
-      // vtable-aware membership check (falls back to record slot lookup).
-      return { code: `as_dyn_has(as_v_obj_val(${obj.code}), ${keyStr})`, type: { kind: 'bool' } };
+      // A boxed value: dispatch on its runtime tag. as_dyn_has alone is not enough
+      // -- a boxed String/Number has no object body to walk (see as_in_v).
+      return { code: `as_in_v(${obj.code}, ${keyStr})`, type: { kind: 'bool' } };
     }
     if (obj.type.kind === 'object') {
       // Class instance: `in` reflects fields/getters/methods (and _dyn slots for
@@ -38701,9 +39030,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (obj.type.kind === 'vector') {
       return { code: `as_vec_has_len(${keyStr}, as_vec_get_hook != NULL ? as_v_int_cast(as_vec_get_hook((void*)(${obj.code}), "length")) : 0)`, type: { kind: 'bool' } };
     }
-    // A primitive receiver autoboxes to a Sealed wrapper with no dynamic members,
-    // so every key is false; both operands are still evaluated.
-    if (obj.type.kind === 'bool' || obj.type.kind === 'number' || obj.type.kind === 'int' || obj.type.kind === 'uint' || obj.type.kind === 'string') {
+    // A primitive receiver autoboxes to a wrapper whose members are its own
+    // closed set: a String answers length and its method names (measured on adl
+    // 51.4.1: '"length" in "abc"' true, '"charAt" in s' true, '"0" in s' false),
+    // which is the same set `with (s) { ... }` resolves against. Number/Boolean
+    // still answer false (registered gap); both operands are evaluated either way.
+    if (obj.type.kind === 'string') {
+      return { code: `(strcmp(${keyStr}, "constructor") == 0 || as_str_has_member(${keyStr}))`, type: { kind: 'bool' } };
+    }
+    if (obj.type.kind === 'bool' || obj.type.kind === 'number' || obj.type.kind === 'int' || obj.type.kind === 'uint') {
       return { code: `((void)(${obj.code}), (void)(${keyStr}), false)`, type: { kind: 'bool' } };
     }
     throw new CodegenError(`'in' requires a dynamic Object, found ${obj.type.kind}`);

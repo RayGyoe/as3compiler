@@ -276,7 +276,60 @@ registerGroup('unit: reflection/AsObjectCast', checkAsObjectCast);
 registerGroup('unit: reflection/FunctionMemberCall', checkFunctionMemberCall);
 registerGroup('unit: reflection/VectorReflectionNames', checkVectorReflectionNames);
 registerGroup('unit: reflection/QualifiedSuperclassName', checkQualifiedSuperclassName);
+// ---- for-in / for-each over a '*' or Object slot holding a Proxy (Package H-1) ----
+// AIR picks the enumeration protocol by the VALUE's class ('vp is Proxy'), not by
+// the declared type, so a '*'/Object receiver must reach the same interceptor
+// methods a statically typed one does (measured on adl 51.4.1, temp/proxyany
+// A1..A5 + B1..B4: identical names, values AND the ni/nn (ni/nv) call sequence).
+// The emitter still emits the unbranched protocol inline for a statically known
+// Proxy subclass; the runtime helpers carry the dynamic half.
+function checkProxyRuntimeEnum(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const preamble = RUNTIME_PREAMBLE;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++; else bad.push(label);
+  };
+  const bodyOf = (sig: string): string => {
+    const at = preamble.indexOf(sig);
+    return at < 0 ? '' : preamble.slice(at, preamble.indexOf('\n}\n', at) + 3);
+  };
+  const en = bodyOf('static int as_enum_next(as_value coll, int* idx, as_value* out) {');
+  const fe = bodyOf('static int as_foreach_next(as_value coll, int* idx, as_value* out) {');
+  check('as_enum_next was found', en.length > 0);
+  check('as_foreach_next was found', fe.length > 0);
+  check('for-in dispatches a proxy VALUE to the nextName protocol',
+    /if \(hv->is_proxy\)/.test(en)
+    && en.indexOf('as_proxy_next_index(p, *idx)') > en.indexOf('if (hv->is_proxy)')
+    && en.indexOf('as_proxy_next_name(p, ni)') > en.indexOf('as_proxy_next_index(p, *idx)'));
+  check('for-each dispatches a proxy VALUE to the nextValue protocol',
+    /if \(hv->is_proxy\)/.test(fe)
+    && fe.indexOf('as_proxy_next_index(p, i)') > fe.indexOf('if (hv->is_proxy)')
+    && fe.indexOf('as_proxy_next_value(p, ni)') > fe.indexOf('as_proxy_next_index(p, i)'));
+  check('a proxy value is no longer an EMPTY enumeration',
+    !/if \(hv->is_proxy\) return 0;/.test(en) && !/if \(hv->is_proxy\) return 0;/.test(fe));
+  // The statically typed fast path must survive: the emitter still inlines the
+  // protocol (no as_enum_next round trip) when the declared type is a Proxy.
+  const em = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  check('the emitter still inlines the protocol for a statically typed receiver',
+    em.includes('const isProxy = it.type.kind === \'object\' && this.symbols.getClass(it.type.className)?.isProxy === true;')
+    && em.includes('as_proxy_next_name((void*)(\${it.code}), \${idx})'));
+  const ex = readFileSync(join(root, 'examples', 'proxy.as'), 'utf8');
+  check('the example pins the run-time dispatch through a * and an Object slot',
+    ex.includes("for-in through a '*' receiver runs the proxy protocol")
+    && ex.includes('for-each through an Object receiver runs the proxy protocol')
+    && ex.includes("for-in '*' call sequence"));
+  check('the example keeps the negative and non-proxy regressions',
+    ex.includes('over an unoverriding proxy -> #2105')
+    && ex.includes('over a nextNameIndex-only proxy -> #2106')
+    && ex.includes('over a nextNameIndex-only proxy -> #2107')
+    && ex.includes('still enumerates its indices'));
+  if (ok > 0) console.log(`[proxyenum] ${ok} run-time dispatch checks passed`);
+  return bad;
+}
+
 registerGroup('unit: reflection/DynGetTraitPriority', checkDynGetTraitPriority);
+registerGroup('unit: reflection/ProxyRuntimeEnum', checkProxyRuntimeEnum);
 
 // ---- `is` / `as` with a runtime Class VALUE as the right operand (stage 99) ----
 // adl 51.4.1 measured (temp/cisprobe/cis-result.txt): AS3 resolves `x is Name` in

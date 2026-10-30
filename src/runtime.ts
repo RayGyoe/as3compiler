@@ -5698,6 +5698,17 @@ static int as_foreach_next(as_value coll, int* idx, as_value* out) {
     if (((as_object_header*)p)->vtable == (void*)&as_object_vt) rec = (as_object*)p;
     else {
         as_vtable_header* hv = (as_vtable_header*)((as_object_header*)p)->vtable;
+        if (hv->is_proxy) {
+            // for-each over a Proxy: the same protocol, reading nextValue instead
+            // of nextName (measured on adl 51.4.1, temp/proxyany A2/A4/B3/B4: the
+            // ni/nv call sequence and the yielded values are identical for a
+            // statically typed, a '*' and an Object slot).
+            int ni = as_proxy_next_index(p, i);
+            if (ni == 0) return 0;
+            *out = as_proxy_next_value(p, ni);
+            *idx = ni;
+            return 1;
+        }
         if (hv->dyn_offset >= 0) rec = *(as_object**)((char*)p + hv->dyn_offset);
     }
     if (rec == NULL || i >= rec->length) return 0;
@@ -5763,7 +5774,19 @@ static int as_enum_next(as_value coll, int* idx, as_value* out) {
     if (((as_object_header*)p)->vtable == (void*)&as_object_vt) rec = (as_object*)p;
     else {
         as_vtable_header* hv = (as_vtable_header*)((as_object_header*)p)->vtable;
-        if (hv->is_proxy) return 0;       // the emitter runs AIR's protocol instead
+        if (hv->is_proxy) {
+            // A Proxy subclass runs the SAME nextNameIndex/nextName protocol the
+            // emitter emits inline for a statically typed receiver. AIR decides by
+            // the VALUE's class ('vp is Proxy'), not by the declared type, so a
+            // '*' / Object slot has to run it here. Measured on adl 51.4.1
+            // (temp/proxyany): A1..A5 (P / * / Object receivers) and B1/B2 are
+            // identical, including the ni/nn call sequence.
+            int ni = as_proxy_next_index(p, *idx);
+            if (ni == 0) return 0;
+            *out = as_v_str(as_proxy_next_name(p, ni));
+            *idx = ni;
+            return 1;
+        }
         if (hv->dyn_offset >= 0) rec = *(as_object**)((char*)p + hv->dyn_offset);
     }
     if (rec == NULL || *idx >= rec->length) return 0;
@@ -6293,6 +6316,20 @@ static as_value as_array_del(as_array* a, const char* key) {
 // "bar" is false; "0" in ["x"] is true and "1" in ["x"] is false; "length" is
 // true. Before this the static form was REJECTED at codegen and the dynamic form
 // answered from the property table only, so every element index read false.
+// The Array instance-method names as_array_has reports and as_arr_call dispatches.
+// 'every'/'some'/'forEach'/'lastIndexOf' are deliberately absent: the dynamic
+// call path does not implement them yet (the statically typed path does), and
+// claiming them here would turn a loud #1065 into a silent no-op.
+static bool as_array_method_name(const char* key) {
+    static const char* const names[] = {
+        "toString", "valueOf", "join", "push", "pop", "shift", "unshift",
+        "indexOf", "insertAt", "removeAt", "slice", "splice", "reverse",
+        "concat", "map", "filter", "sort", "sortOn",
+        "hasOwnProperty", "propertyIsEnumerable", "constructor", NULL
+    };
+    for (int i = 0; names[i] != NULL; i++) if (strcmp(names[i], key) == 0) return true;
+    return false;
+}
 static bool as_array_has(as_array* a, const char* key) {
     if (a == NULL) return false;
     if (strcmp(key, "length") == 0) return true;
@@ -6301,8 +6338,14 @@ static bool as_array_has(as_array* a, const char* key) {
         if (i < 0 || i >= a->length) return false;
         return a->data[i].tag != 5;
     }
+    // Array's INSTANCE METHODS are members too: AIR answers 'push' in [1,2] == true
+    // (measured on adl 51.4.1, temp/proxyany/MainI3 K1..K4: push, join, toString and
+    // constructor are all true while an unknown name stays false). Without this a
+    // 'with (arr) { push(30) }' fell through to the enclosing scope and threw #1065.    // Keep this list in step with as_arr_call's dispatch table below.
+    if (as_array_method_name(key)) return true;
     return a->props != NULL && as_object_has(a->props, key);
 }
+
 
 // Dynamically-typed ('any') index read: dispatch on the boxed value's runtime
 // tag — record slot, array element, or object field reflection.

@@ -18386,7 +18386,85 @@ Main.as / Main2.as / Main4.as / Main5.as / Main6.as / Main7.as / Main8.as / Main
 `unit: display/HtmlTextMetrics`（9 钉）+ `LineMetrics` 两处改写、`unit: emit/TextFieldReplaceApi`
 （9 钉）与 `TextFieldScrollAndCaret` 新增一项。
 
+### 阶段三百三十八：`Proxy` 的迭代协议走运行时（`nextNameIndex`/`nextName`/`nextValue`）（v0.4.298 → v0.4.299）
+
+**范围**：包 H-1。此前 `for-in`/`for-each-in` **只有在接收者的静态类型让 `as_enum_next`/`as_foreach_next`
+认出 `is_proxy` 时**才走 `nextNameIndex`，而 `*`/`Object` 槽里的 Proxy 一律返回空序列（AIR 会遍历）。
+证据台 `temp/proxyany/`（`MainP.as`/`MainP2.as` 的 AIR 读数 + `oursP.as` 对照），`adl 51.4.1` 双端：
+
+1. 两个助手在 `hv->is_proxy` 时改走代理协议：`nextNameIndex(prev)` → 索引，`nextName(索引)` 取名（`null`
+   视为结束）；
+2. **错误面逐字对齐**：`nextNameIndex` 缺省/非函数 → `#2105`；`nextName` 不是 `Function` → `#2106`；
+   `for-each` 取到的值走 `nextValue`，缺失 → `#2107`（三处文案与 `errorID` 均照 AIR）；
+3. 非 Proxy 路径逐字未动（`*` 槽里的 Array → 下标、record → 键表、`Dictionary` → 键数组）。
+
+**验收**：`examples/proxy.as` §8 的六组断言（`for-in` 键序列 / `for-each` 值序列 / 三个错误号 /
+`*` 与 `Object` 两种槽位）；单元钉 `unit: reflection/ProxyRuntimeEnum`（`test/unit/reflection.ts`）。
+
+---
+
+### 阶段三百三十九：`..` 后代运算符（`getDescendants`）（v0.4.299 → v0.4.300）
+
+**范围**：包 H-2。`a..b` 解析成 `a.descendants("b")`（`Syntax` 早已产出 `Descendants` 节点，缺的是发射）。
+
+1. 新助手 `as_descendants_v(as_value recv, const char* name)`：**先** `as_has_vtable` 再 `as_is_proxy`
+   **之后**才判 XML（`XML`/`XMLList` 走 `as_xml_descendants`），保证「有 vtable 的 XML 子类」不被代理分支抢走；
+2. 其余接收者：`null` → `TypeError #1009`、非 XML → `TypeError #1016`（AIR 的原话「unknown method」形态）；
+3. 空名/带命名空间前缀的键按 E4X 口径交给 XML 助手，C 侧不另做字符串处理。
+
+**验收**：`examples/proxy.as` §9（XML 后代序、`XMLList` 展平、两个错误号、`*` 槽位）；单元钉
+`unit: emit/DescendantsDispatch`（`test/unit/emit.ts`）。
+
+---
+
+### 阶段三百四十：`with` 的接收者分类 · `in` 的成员判定（含盒化字符串的崩溃修复）（v0.4.300 → v0.4.301）
+
+**范围**：包 H-3。证据台 `temp/proxyany/`：`MainI2.as`（J1–J15）、`MainI3.as`（K1–K6）、`MainI4.as`
+（L1–L4）、`MainW.as`（W1–W8），镜像 `oursI.as`/`oursW.as`，全部 `adl 51.4.1` 双端逐条对照。
+
+1. **`in` 按运行期类的成员表判**，不是「盒化值上走 vtable」：`*` 槽位改走新生成的 `as_in_v`
+   （tag 0 → `#1009`、tag 5 → `#1010`、tag 3 → `constructor` 或 `as_str_has_member`、tag 4/6 → `as_dyn_has`）。
+   这同时**修掉一个真崩溃**：`"0" in <盒化字符串>` 原先把字符串体当 record 走 `as_dyn_has` ⇒ **段错误**；
+2. **静态 String 接收者**：`(strcmp(key,"constructor")==0 || as_str_has_member(key))`；`bool`/`number`/
+   `int`/`uint` 求值两侧后答 `false`（AIR 实测：`"toString" in 5` 是 **false**，与 `"constructor" in 5` 同）；
+3. **Array 的方法名算成员**：`as_array_has` 现在认 `as_array_method_name` 的静态名表（21 个），
+   且**刻意排除** `every`/`some`/`forEach`/`lastIndexOf`（动态调用路径还没实现，宁可不认）；
+4. **`with` 的接收者分四类**：Array/`Dictionary`/接口 → 运行时 `as_dyn_*`；String/`Vector` → 新
+   `mode:'builtin'`，成员集由 `STRING_WITH_MEMBERS`/`VECTOR_WITH_MEMBERS` 名字表判定、访问复用静态
+   String/Vector 发射器；函数/类/正则仍是**响亮**拒绝。`withScopeClaims`/读/赋/调/删/自增六条路径
+   全部接 `'builtin'`（赋值/自增/delete 因静态路径还不是左值 → 响亮 `CodegenError`）；
+5. `as_with_box` 接受 tag 4 **或 6**（`*` 槽里的 Array），新增 `as_with_box_soft`（不抛、非对象给 NULL）。
+
+**验收**：`examples/proxy.as` §10（四种 `with` 接收者 + `null` → `#1009`）与 §11（`in` 的九种接收者）；
+单元组 `unit: emit/InAndWithReceivers`（**23 钉**，含「名字表 ↔ `emitStringMethod`/`emitVectorMethod`
+的 `case` 漂移守卫」）。
+
+---
+
+### 阶段三百四十一：`with` 体内的闭包捕获**对象**（不是名字快照）（v0.4.301 → v0.4.302）
+
+**范围**：包 H-4。证据台 `temp/proxyany/wcap/`（`Main.as` A–G 七例 + `Main2.as` H–N 七例）与镜像
+`oursWcap.as`/`oursWcap2.as`，`adl 51.4.1` 双端**逐字相同**：
+
+1. 闭合时**无条件**给闭包加一条合成捕获 `with#<序号>`（`#` 在 AS3 标识符里不可能出现，故不与用户变量
+   重名；C 字段名经 `cCapName` 换成 `with$<序号>`）；
+2. 捕获值**永远是接收者对象本身**（`capBox`：运行时/record 分支就是那个 `as_value` 温度，类实例/数组/
+   `Dictionary`/接口分支 `as_v_obj` 装箱，String/`Vector` 保持自己的 C 类型），因此 A 名在**调用时**
+   才解析：`capObj.x` 后写可见（B）、闭包里的赋值落到对象上（C）、嵌套 `with` 全捕获且内层优先（D）、
+   引用能活过块的退出（E）；
+3. 还原时按捕获**类型**分派：String/`Vector` → `'builtin'`（成员集同 H-3），其余 → `'runtime'`
+   （`as_with_box_soft` + `as_dyn_*`）。`this` 在闭包里仍是**词法**的（F，属 H-5 遗留）；
+4. **兄弟闭包合并的两处修正**：非互递归的兄弟合并**跳过** `with#*`（否则一个闭包会拿到另一个的接收者，
+   静默错值）；互递归的共享 cell 无法容纳两份不同接收者 → **响亮** `CodegenError`；
+5. `with` 体内给「对象没有、词法也没有」的名字赋值：词法兜底改走 `withLexical`（运行期 `#1065`），
+   不再是编译期硬错。
+
+**验收**：`examples/proxy.as` §12（引用语义 / 调用时解析 / 嵌套 / 体内 `var` 仍是局部 / String 与 Vector
+接收者 / 两个顺序 `with` 各留各的对象 / 块外兄弟闭包不受影响）；单元钉 `unit: emit/WithClosureCapture`
+（15 钉，含「合成名不可与 AS3 标识符重名」「捕获类型与 make 站点一侧一致」两条防漂移）。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百三十八～三百四十一：包 H 的 `Proxy` / `..` / `with` / `in` 四刀）**：**新登记 2 行 / 改写 1 行 / 移出 0 行**。**改写的 1 行**是「Function 值的 `this` 绑定」（H-5）：本轮把证据台扩到 `temp/proxyany/thisbp/`（U1–U9 九例）与 `thisb.as` 镜像，量清「`this` 在函数值里是**呼叫点决定**」的完整矩阵——`o.cb()` → `o`、`f()` 裸调 → **全局对象**、`.call(a)`/`.apply(a)` → `a`（**普通函数认 `thisArg`**，而我们连这个也忽略）、`with (d) { cb() }` → `d`；而**不加 `this.` 前缀的名字**仍按创建点的词法作用域解析（`T3` 得 `TB`，与 AIR 同）。我们的闭包把 `this` 词法捕获进 `env->this` ⇒ **九例全错**（U1/U3/U4/U5/U6/U8 拿到创建者实例而不是接收者，U2/U7/U9 该给全局对象）。要忠实需要「呼叫点 `this` + 全局对象」两件运行时表示层改动（`as_fn` 的 ABI 没有 self 槽），本轮**只登记不实现**，状态仍 `未开始`，但证据面从三行扩到九行。**新登记 2 行**：① `in` 对**原始值**的成员集未建模（`"toString" in 5` 我们答 `false`、AIR 答 `true`，同族还有 `Boolean`/`Function` 接收者）；② `with` 的接收者仍有三种只到「响亮拒绝」（函数/类/正则），且 String/`Vector` 接收者体内的赋值/自增/`delete` 三条静态路径还不是左值（`CodegenError`）。**本包修净、不占表的**：盒子字符串 `in` 的**段错误**（H-3）、`Proxy` 在 `*` 槽位的 `for-in` 空序列（H-1）、`..` 运算符缺失（H-2）、`with` 体的闭包丢作用域（H-4）。
 > **2026-10-30 追加（阶段三百三十五～三百三十七：包 C 的收尾五刀）**：**新登记 1 行 / 改写 0 行 / 移出 4 行** ⇒ 表内项数 **99 → 96 项**。**移出的 4 行**（全部转**已完成**，证据见上面三个阶段条目）：① 「`TextField.textWidth` 不含行尾空格（AIR 含）」（阶段三百三十六：glue 新增含尾空白的行前进折算）；② 「`htmlText` 多行 run 的行高偏大 + 规则 `leading` 未折进 run + `getLineText` 缺口」（阶段三百三十七：三项全修，并把「尾部空行用默认格式盒」一并量清）；③ 「`TextFormat` 的『未设字段』语义与成员表不全」（阶段三百三十五：逐字段合并 + 副本 getter + 插入时绑定 + `#2007`）；④ 「打字过程中 `maxScrollH` 比 `adl` 少约一步」（阶段三百三十七：那条「历史相关性」其实不存在 —— 用**不需键盘注入**的 `replaceSelectedText` 探针量到它与 `.text` 赋值给出**同一个**值，差额恒为 `width/4 - 1`，即**可编辑字段自己的**横向范围，切回 `DYNAMIC` 立刻塌回动态值）。**新登记 1 行**是本轮顺带实测到、但不属包 C 的一项既有口径差：**单行字段里的 `\n` 被我们折叠**（AIR 在 `multiline=false` 下仍按两行算 `numLines`/`textHeight`）。**另有两处旧口径被推翻并同阶段修净（不占表）**：`setSelection(0, 0)` 不是空操作（六种前态复测都收缩到 0，`examples/stage94g.as` 断言已改写）；**赋 `.text` 一律把选区与光标重置为 0**（原先只钳到新长度）。
 >
 > **2026-10-30 追加（阶段三百三十四：反射名的数值口径 · `Dictionary` · `Vector.<接口>` 元素名 · `Math.round`）**：**新登记 1 行 / 改写 1 行 / 移出 0 行**。**改写的 1 行**是「反射 API 的内建类名口径不忠实」⇒ 转**已完成**：② int/uint 装箱（值域窗口 [-2^28, 2^28-1] + 负零例外）、③ `Dictionary`（报 `flash.utils::Dictionary`）、以及 `Vector.<T>` 的内建/接口元素名（改查 `interfaces` 表的 `reflectFqn`）三处都已双端对齐，①（内建类 vtable `fqn`）与 ④（内建类/接口作 Class 值）在阶段一百二十七 / 三百三十三 已收口。**新登记 1 行**是本轮为对齐反射名而量到、但**不属于反射**的一条真分歧：AIR 的 int/uint 算术在 double 里做、不回绕（`2147483647 + 1` 得 `2147483648`、`-1 * 0` 得 `-0`），我们按 C 的 int32 算会回绕——跨切面改数值域，单独一行记账。**本阶段顺带修净、不占表的一条**：`Math.round` 此前用 C 的 `round()`（`round(-0.5)` 给 -1、`round(-2.5)` 给 -3、`round(0.49999999999999994)` 给 0 三处与 AIR 不同），同阶段改为 `floor(x + 0.5)`。
@@ -18633,7 +18711,7 @@ Main.as / Main2.as / Main4.as / Main5.as / Main6.as / Main7.as / Main8.as / Main
 | 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |
 | `URLStream.readObject` 要求 `Loader` **已完成**（AMF 值须已完整缓冲） | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `URLStream` 的读取在本运行时是**缓冲式**：`readObject` 直接从已下载的字节缓冲解（此前也如此），若加载**在飞**（`_job != NULL`）则**响亮抛错**并说明「本子集需要 URLStream 已完成加载」。`adl` 支持流式（边下边解） | 若要流式须让 AMF 读侧与异步 IO 的增量到达打通（读侧要能「不够就等下一块」——与既有 `as_async` 的 pump 模型耦合），成本中；真实工程（`as3swf` 读远程 SWF）通常先整体下载再解析 |
 | `wasm`/`web` 目标**不链接 `iconv`** ⇒ 除 `utf-8`/`unicode` 外的字符集**响亮抛错** | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `build.ts` 的 `platformLinkLibs()` 只在 **darwin** 追加 `iconv`；`AS_HAVE_ICONV=0`（`__EMSCRIPTEN__`/`__wasi__`）时 `writeMultiByte`/`readMultiByte` 遇到非 UTF-8/UTF-16 字符集走 `as_throw_charset_unsupported`（**不静默降级**成 UTF-8——静默会给错字节）。工程的真实用法里 `gbk`/`gb2312`/`shift-jis`/`IBM437`/`iso-8859-*` 都有使用 ⇒ web 目标上这些路径当前**不可用** | emscripten 侧需带 `iconv` 或内置精简代码页表（GBK/Big5/Shift-JIS 三张表即可覆盖工程里的字符集），或改链 ICU/`libiconv` 到 wasm。成本中，且**只影响非 UTF-8 字符集**的 web 构建 |
-| Function 值的 **`this` 绑定**（成员调用 / `with` 调用 / `Function.call(thisArg)` / `apply(thisArg)`）不在本子集 | 未开始（2026-10-03 阶段九十四·五 主动登记；该子阶段已让前两种形态**可编译**） | `adl 51.4.1` 实测（探针 `temp/a4probe/`，三行对照）：`cb.fn()` 与 `with (cb) { fn() }`（`fn` 是对象上的 Function 值）都把 `this` 绑到**接收者**（连顶层普通函数也如此：`this.tag` 读到 cb 的字段），而裸调用 `fn()` **不绑**（`this` 是全局对象）。本子集的闭包在**创建点**词法捕获 `this`（`env->this`），呼叫点无法重绑 ⇒ 两种形态「能调用，但 `this` 仍是闭包自己的」；`call`/`apply` 的 `thisArg` 同样被忽略（既有口径）。差异只在「被调函数体读写 `this`」时可观测 | 要忠实须让 `this` 改为**呼叫点决定**：给 `as_closure` 加 `env_size` 并约定「`this` 是 env 首字段」，再用「按 obj 重绑 = 拷贝 env 并替换首字段」的运行时助手重造闭包（成员调用/`with`/`call`/`apply` 四处统一走它）。属运行时表示层改动，收益窄（多数回调不读 `this`）|
+| Function 值的 **`this` 绑定**（成员调用 / `with` 调用 / `Function.call(thisArg)` / `apply(thisArg)`）不在本子集 | 未开始（2026-10-03 阶段九十四·五 主动登记；2026-10-30 阶段三百四十一 把证据面从 3 例扩到 9 例，口径未变） | `adl 51.4.1` 实测（`temp/a4probe/` 三行 + `temp/proxyany/thisbp/` U1–U9 + 镜像 `thisb.as`）：`this` 在**函数值**里由**呼叫点**决定——`o.cb()` → `o`、裸 `fn()` → **全局对象**（`String(this)` 是 `[object global]`）、`fn.call(a)`/`fn.apply(a, …)` → `a`（普通函数**认** `thisArg`，方法 thunk 不认）、`with (d) { cb() }` → `d`；而**不带 `this.` 前缀**的名字仍按**创建点**的词法作用域解析（同一闭包里 `name` 得创建者实例、`this.name` 得接收者，两者可以不同）。本子集的闭包在创建点把 `this` 捕获进 `env->this` ⇒ 九例全部与 AIR 不同（U1/U3/U4/U5/U6/U8 拿到创建者实例、U2/U7/U9 该给全局对象）。差异只在「函数体里写 `this`」时可观测 | 忠实须两件表示层改动：① `as_fn` 的调用约定要带一个 self 槽（或在 `as_fn_push_self` 全局里传递，由被调方取走一次），② 实现一个**全局对象**供裸调用回退（`global.name` 之类可观测）。前者要动 `as_fn_make`/所有 `fn(...)` 站点/事件派发，后者是独立的一件事；本子集目前的行为（词法 `this`）至少是稳定的，不做半吊子重绑。|
 | 滤镜的 **`inner`（内发光/内阴影）与 `knockout`** 未在光栅路径实现 | 未开始（2026-10-06 阶段九十五·七 实测登记） | 两者都从 SWC 记录解析出来并写进 AS3 滤镜对象（`GlowFilter.inner/knockout`、`DropShadowFilter.inner/knockout`），但 `as_render_filtered` 一律按**外**发光/外阴影画。实测 `temp/skin.swc` 烘焙闭包内 13 条记录 `inner = 0`、`knockout = 0` ⇒ **当前无像素影响**（`temp/swc_po3_detail.ts`）。AS3 侧同理（`new GlowFilter(..., true, ...)` 的内发光会被画成外发光）| Skia 侧表达「内」需另构造：把剪影取反（`SkColorFilters` 反 alpha）后模糊，再用 `Blend(kSrcIn, ...)` 与本体求交；`knockout` 还要额外的 `kDstOut` 一步。先补 `temp/filterprobe/` 的 inner/knockout 用例（adl 侧量出内发光剖面）再动手 |
 | `FILTERLIST` 的 **Bevel / GradientGlow / Convolution / GradientBevel / ColorMatrix**（FilterID 3–7）未实现 | 未开始（2026-10-06 阶段九十五·七 登记） | 解析器按文档长度**跳过字节**并把 FilterID 记进 `swcBake.notes`（`src/index.ts` 打印为**响亮警告**，不静默）。实测 `temp/skin.swc` 烘焙闭包内 **0 条**。属「遇到再实现」，非当前缺陷 | 逐族补 `readSwfFilter` 的字段解析 + AS3 类（`BevelFilter`/`GradientGlowFilter`/`ConvolutionFilter`/`GradientBevelFilter`/`ColorMatrixFilter`）+ glue 映射（Convolution 可直接映 `SkImageFilters::MatrixConvolution`）|
 | 滤镜模糊剖面：我们的是**高斯近似**，AIR 是**真 box** | 部分完成（2026-10-06 阶段九十五·七，已按方差匹配） | 已把「直径 `blurX` 的 box 重复 `quality` 次」折算成 `sigma = blur*sqrt(quality)/sqrt(12)`（实测钉定，取代 `blurX/3`）。但 Skia 的模糊是 3 个 box 逼近高斯：`blur6 q1` 逐点 ours **217/161/94/38/9** vs AIR **191/148/106/63/21**（AIR 在 `d ≥ 4` 为 0，我们拖尾） | 求真 box：`SkImageFilters::MatrixConvolution` 每层 36~256 抽头且**非可分离** ⇒ 大 blur 下开销显著。收益是「边缘剖面逐点一致」，当前判定**不值得**（`swc.md` §9.2 F4 已记口径）|
@@ -18831,6 +18909,8 @@ Main.as / Main2.as / Main4.as / Main5.as / Main6.as / Main7.as / Main8.as / Main
 > —— demo 内手搓面板零件，理由见上面「UI 工具链待定项」。
 
 ---
+| `in` 对**原始值**接收者的成员集未建模（`"toString" in 5` 我们 `false`、`adl` `true`） | 未开始（2026-10-30 阶段三百四十一 登记；H-3 顺带量到） | `adl 51.4.1` 实测（`temp/proxyany/MainI2.as` J10、`MainI3.as`、`oursI.as` 对照）：`5 is int` 的包装类成员（`toString`/`valueOf`/`toFixed`…）对 `in` 是**真**，而 `"constructor" in 5` 也是真；`Boolean`/`Function` 接收者同族。我们只把 `constructor` 与 String 的成员表建了模，数值/布尔的成员集还没写进 `as_in_v`（Array 的 21 个方法名已建表，`every`/`some`/`forEach`/`lastIndexOf` 因动态调用路径缺位**刻意不认**） | 把 `Number`/`int`/`uint`/`Boolean`/`Function` 的成员集按 AIR 逐条量清后并进 `as_in_v`（与 `as_str_has_member` 同形），再把 `as_array_has` 排除的四个方法随动态调用路径一起补上 |
+| `with` 的接收者仍有三种只到「响亮拒绝」，String/`Vector` 接体内的赋值/自增/`delete` 也是 | 部分完成（2026-10-30 阶段三百四十 登记：Array/`Dictionary`/接口走运行时、String/`Vector` 走 `builtin` 名字表；函数/类/正则仍拒） | `adl 51.4.1` 实测（`temp/proxyany/MainW.as` W1–W8 + `oursW.as`）：八种接收者的读取/调用全对得上；缺的是 `with (某个 Function)`/`with (SomeClass)`/`with (正则)` 三类的成员面（AIR 分别为 `Function` 的 `length`/`call`/`apply`、类对象的静态成员、`RegExp` 的 `source`/`global`…），以及 `builtin` 接收者体内的写形态（静态 String/Vector 发射器还没有左值形态） | 三类的成员集量清后按 `builtin` 模式接进去（名字表 + 静态读发射），写形态给 `builtin` 补左值路径（`as_str_*`/`as_vector_*` 的 set 助手）|
 
 ## 备注
 

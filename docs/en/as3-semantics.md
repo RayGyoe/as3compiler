@@ -266,6 +266,39 @@ boundary rule (closed interval, stroke included) is pinned by `examples/hit-boun
 later changes it into a fuzzy test without knowing about this measurement.
 
 ---
+### 3.8 `with` scoping, `in` membership, and `this` inside function values (stages 338-341, measured on adl 51.4.1)
+
+All three answer "which layer does a name resolve in". Probes live in `temp/proxyany/` (`MainW.as` for the
+`with` receiver matrix, `MainI2/3/4.as` for `in`, `wcap/Main{,2}.as` for closure capture, `thisbp/Main.as`
+for `this`), each with an `ours*.as` mirror.
+
+**1. `with` only rebases names.** `with (obj) { x }` gives the reference base to `obj` **only** when `obj`
+actually has `x`; otherwise resolution falls back to the lexical scope (ES3). The receiver's member surface
+therefore decides everything: Array / `Dictionary` / interfaces go through the runtime `as_dyn_*` path,
+`String` / `Vector` use a compile-time closed set (names + the static emitters; write forms not yet wired),
+and function / class / RegExp receivers are still **refused loudly** (tracked in `TODO.md`).
+
+**2. `key in value` asks the value's *runtime class*, not its static type.** `adl` reads: `"0" in "abc"`
+and `"x" in "abc"` are both **false** (a `String` has methods plus `constructor`), `"2" in [1,2]` is false
+(an `Array` has methods and `length`, **not** indices), `"bar" in obj` flips to true only after
+`obj["bar"] = 1`, `"x" in null` throws `#1009`, `"x" in undefined` throws `#1010`, and `"toString" in 5` is
+**true**. This also fixed a real **segfault**: a boxed `String` used to be handed to `as_dyn_has` as if its
+body were a record.
+
+**3. A closure created inside a `with` body captures the OBJECT, not a snapshot of names.** After
+`with (o) { f = function(){ return x } }`: later writes to `o.x` are visible to `f()`, an assignment inside
+`f` lands on `o`, nested `with` blocks are all captured with the inner one winning, and the closure
+outlives the block. Variables declared with `var` in the body stay ordinary function locals, and `this`
+stays the **creation-site** receiver (see next).
+
+**4. `this` inside a function value is decided by the CALL SITE — we do not match it (registered).**
+`adl`: `o.cb()` gives `this = o`, a bare `fn()` gives the **global object**, `fn.call(a)`/`apply(a, ...)`
+give `a` (plain functions honour `thisArg`), and `with (d) { cb() }` gives `d`. Unqualified names inside
+the same closure still resolve lexically at the creation site, so `name` and `this.name` can differ. This
+subset captures `this` lexically into `env->this`, so all nine probes differ. Matching AIR needs a self
+slot in the `as_fn` calling convention **plus** a global object; tracked in `TODO.md` (not swept under the
+rug: `examples/proxy.as` section 12 pins only our own behaviour, it does not pretend to match).
+
 
 ## 4. Fidelity and Enhancement Principles
 
