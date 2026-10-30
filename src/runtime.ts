@@ -9779,6 +9779,10 @@ extern void* sk_textlayout_new(const char* text, const char* family, double size
 extern void* sk_textlayout_new_leading(const char* text, const char* family, double size, int bold, int italic, unsigned color, double leading, double width, int align, int collapseNewlines);
 extern double sk_textlayout_height(void* para);
 extern double sk_textlayout_max_width(void* para);
+// Longest line INCLUDING trailing blanks = AIR's TextField.textWidth. Skia's own
+// sk_textlayout_max_width above stops at the last visible glyph, which is why the C
+// property used to ignore trailing spaces (adl 51.4.1: "abc " is 3 px wider than "abc").
+extern double sk_textlayout_max_width_incl_spaces(void* para);
 extern int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops, double* bottoms, int cap);
 extern int sk_textlayout_line_box(void* para, int idx, double leading, const char* family, double size, int bold, int italic, double* ascent, double* descent, double* left, double* width);
 extern int sk_textlayout_line_count(void* para);
@@ -9995,6 +9999,7 @@ static inline void* as_skia_textlayout_new_leading(const char* t, const char* fa
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { return sk_textlayout_new_runs(t, def, runs, n, w, align, collapse); }
 static inline double as_skia_textlayout_height(void* p) { return sk_textlayout_height(p); }
 static inline double as_skia_textlayout_max_width(void* p) { return sk_textlayout_max_width(p); }
+static inline double as_skia_textlayout_text_width(void* p) { return sk_textlayout_max_width_incl_spaces(p); }
 static inline int as_skia_textlayout_line_count(void* p) { return sk_textlayout_line_count(p); }
 static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { return sk_textlayout_line_metrics(p, s, e, t, b, cap); }
 static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { return sk_textlayout_line_box(p, i, ld, fam, sz, b, it, a, d, l, w); }
@@ -10024,6 +10029,7 @@ static inline void* as_skia_textlayout_new_leading(const char* t, const char* fa
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
+static inline double as_skia_textlayout_text_width(void* p) { (void)p; return 0.0; }
 static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
 static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { (void)p; (void)s; (void)e; (void)t; (void)b; (void)cap; return 0; }
 static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { (void)p; (void)i; (void)ld; (void)fam; (void)sz; (void)b; (void)it; (void)a; (void)d; (void)l; (void)w; return 0; }
@@ -10742,6 +10748,7 @@ static inline void* as_skia_textlayout_new_leading(const char* t, const char* fa
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
+static inline double as_skia_textlayout_text_width(void* p) { (void)p; return 0.0; }
 static inline int as_skia_textlayout_line_count(void* p) { (void)p; return 0; }
 static inline int as_skia_textlayout_line_metrics(void* p, int* s, int* e, double* t, double* b, int cap) { (void)p; (void)s; (void)e; (void)t; (void)b; (void)cap; return 0; }
 static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { (void)p; (void)i; (void)ld; (void)fam; (void)sz; (void)b; (void)it; (void)a; (void)d; (void)l; (void)w; return 0; }

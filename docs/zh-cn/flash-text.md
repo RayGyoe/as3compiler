@@ -48,7 +48,7 @@
 | 能力 | 状态 | 落点 |
 |---|---|---|
 | 单行/多行排版（SkParagraph + HarfBuzz，UAX#14 断行） | ✅ | 阶段 38/44、`vendor/skia_glue.cc` `sk_textlayout_*` |
-| `TextFormat` 的子集样式（`font/size/color/bold/italic/underline/leading/align/kerning/letterSpacing`） | ✅（子集） | 阶段 38/72/89·17 |
+| `TextFormat` 全 19 字段 + AIR 的 13 参构造器 + 「未设则保持」语义（逐字段合并、getter 返回副本、赋 dtf 不重排、null 抛 `#2007`） | ✅ | 阶段 38/72/89·17/331/335 |
 | 水平对齐（有排版宽交 Skia 逐行；无排版宽由 `as_tf_align_dx` 整块平移） | ✅ | 阶段 89·17/135 |
 | 富文本：`htmlText` 子集（`span,p,b,i,u,font,a,li,br,img,textformat`）+ `setTextFormat` 区间 | ✅ | 阶段 72/148 |
 | `StyleSheet` 真类 + 块级 HTML 模型（break-after） | ✅ | 阶段 148 |
@@ -146,12 +146,38 @@ divergence（见 [`swc.md`](swc.md) §9.2 F5 与 AGENTS.md 的 SWC 实测口径�
 | # | 现象 | 根因 | 代码位置 | 证据 |
 |---|---|---|---|---|
 | **D-T20** | AI 同传列表项的 `ctime` 比 `adl` **左 12pt**（真窗口 ink 起点 `30 vs 54` 设备像素），卡片高与字宽都已对齐后，它是该窗口**最后一条**残差 | SWC 烘焙把文本子的 `RECT` 原点当成**平移量**（`x = matrix.tx + xmin`），而 AIR 把原点当作**角色自己空间里的一个点**：先走 placement 的**线性部分**，再把结果落到它的 **twip 栅格**（1/20 px）——`x = round20(tx + a·xmin + c·ymin)`、`y = round20(ty + b·xmin + d·ymin)`。老口径在**单位缩放**的子件上与 AIR 逐字相同，故 `temp/childfx` 的 99 个子件（全为 scale 1）测不出来 | `src/emit.ts`：新增 `Emitter.swcTextChildXY(m, ox, oy)`，帧 1 的 `emitSwcPlacement` 与时间轴 modify 两条路径都收敛到它；`src/swc.ts` 的接口注释同步 | `adl 51.4.1` 双端同源探针 `temp/tfswc` case ⑰：`subtitleskin.ctime` 老 `0.30` / 新 `11.9913→12.0000` / adl **`12.0000`**；另三个判别例 `filesskin.tab1` `0.0500`、`filesskin.tab2` `90.1000`、`logintabskin.tab1` `0.0000`（老口径分别 `-0.40`/`89.65`/`-0.10`）修后六行逐字相同；钉 `unit: swc/TextChildOrigin`（7 钉，变异后转红）；真窗口 `ctime` ink `53..393` vs adl `54..394` |
-| **D-T21** | 同一轮登记、**未修**：① `defaultTextFormat = new TextFormat()`（字段全 null）在我们这里把字体/字号/颜色/粗体/`leading` 全抹成默认值，`adl` 则**一个字段都不改**（等于没设）⇒ 丢掉 SWF 声明的 `leading=2`（`textHeight` 名义值 `14.02 → 12.00`）、`dtf.size = null` 更得到 `size=0` 的退化版面；② `TextFormat` 成员表缺 `indent`/`blockIndent`/`bullet`/`tabStops`/`target`/`url`，构造器 **6 参 vs AIR 13 参** ⇒ AIR 合法的代码我们**编不过** | ① 字段类型是 `number`/`bool`，**表达不了「未设」**，setter 又是整体覆盖；② 成员表/构造器没按 AIR 的类文档补全 | 未改（修法方向：字段改用能表达「未设」的表示 + setter 逐字段「未设则保持」合并 + 补 6 个成员与 13 参构造器） | `temp/tfswc` case TF0–TF8（`adl` 侧）：TF7 全 null 的 `TextFormat` 读回**原值**（我们 `font=null size=12 color=0 bold=false lead=0`）、TF2 换 `dtf` 后 `th` 我们 `9.80` vs adl `11.45`、TF3/TF4 显式 `leading=0/2` 两端一致（`9.80/11.45`，证明差只在「未设」这一态）、TF5/TF8 证明 `adl` 对 `size`/`leading` 的 null **保持原值**；`indent` 在我方 `Codegen error: undefined field 'indent' on class 'TextFormat'`。差异清单 **D41 / R28**，遗留表已登记 |
+| **D-T21** | **① 已修（阶段三百三十五 / v0.4.296，见 §2H），② 已修（阶段三百三十一）**。原登记：① `defaultTextFormat = new TextFormat()`（字段全 null）在我们这里把字体/字号/颜色/粗体/`leading` 全抹成默认值，`adl` 则**一个字段都不改**（等于没设）⇒ 丢掉 SWF 声明的 `leading=2`（`textHeight` 名义值 `14.02 → 12.00`）、`dtf.size = null` 更得到 `size=0` 的退化版面；② `TextFormat` 成员表缺 `indent`/`blockIndent`/`bullet`/`tabStops`/`target`/`url`，构造器 **6 参 vs AIR 13 参** ⇒ AIR 合法的代码我们**编不过** | ① 字段类型是 `number`/`bool`，**表达不了「未设」**，setter 又是整体覆盖；② 成员表/构造器没按 AIR 的类文档补全 | 未改（修法方向：字段改用能表达「未设」的表示 + setter 逐字段「未设则保持」合并 + 补 6 个成员与 13 参构造器） | `temp/tfswc` case TF0–TF8（`adl` 侧）：TF7 全 null 的 `TextFormat` 读回**原值**（我们 `font=null size=12 color=0 bold=false lead=0`）、TF2 换 `dtf` 后 `th` 我们 `9.80` vs adl `11.45`、TF3/TF4 显式 `leading=0/2` 两端一致（`9.80/11.45`，证明差只在「未设」这一态）、TF5/TF8 证明 `adl` 对 `size`/`leading` 的 null **保持原值**；`indent` 在我方 `Codegen error: undefined field 'indent' on class 'TextFormat'`。差异清单 **D41 / R28**，遗留表已登记 |
 
 > **口径教训（值得记）**：D-T20 躲在「99 个子件逐项对齐」的验收背后 —— 那轮采样**全是单位缩放**，
 > 而两种口径只在 placement 带缩放时才分叉。**采样的覆盖维度**（此处 = 缩放）与**样本数量**同等重要。
 > D-T20 **已修**（阶段一百七十 / v0.4.141），D-T21 **本轮只登记实测**：它改的是 `TextFormat` 的默认值通路
 > （触及全部文本示例与皮肤字段的初始版面），须单开阶段 + 全量回归。
+
+### H. `TextFormat` 的「未设」语义与「插入时绑定」（阶段三百三十五 / v0.4.296）
+
+双端同源探针 `temp/tfc2/`（`adl 51.4.1` 的 `Main.as`/`Main2.as`/`Main3.as`/`Main4.as`，我方脚本层
+`ours.as`/`ours2.as` 逐条对照）。四条口径，全部按 adl 实测落地：
+
+| # | AIR 口径 | 实测证据（adl） | 落地 |
+|---|---|---|---|
+| **H1** | 零参 `new TextFormat()` 字段**全 null**，只有 `display="block"`；**每一个**参数都默认 null（`font/size/color/bold/italic/underline/url/target/align/leftMargin/rightMargin/indent/leading` 全是 `Object`） | E0：18 个 null + `display=block` | 构造器 13 参全改 `as_value`（`TextFormat_new(as_value …×13)`），`font/align/url/target` 用 C `NULL` 表 null，标量字段 tag 0 表 null |
+| **H2** | 新 `TextField` 的隐式默认格式是**完整值**（size 12 / color 0 / bold·italic·underline false / leading 0 / align `"left"` / 三向 margin·indent 0 / bullet false / display `"block"` / `url`·`target` `""` / `tabStops` `[]`） | D0 | 新增 `as_tf_fmt_make()`（运行时自用的完整格式构造），`TextField_ctor` 用它；`as_tf_fmt_blank()` 供 AS3 侧的全 null 语义 |
+| **H3** | `defaultTextFormat` 的 setter **逐字段合并**：源字段为 null 就保持目标现值；**显式 null 与「没传」等价**；赋全 null 格式 = 无操作 | G0/H0/I0/J0 | `as_tf_fmt_merge(over, base)`；`TextField_set_defaultTextFormat` 走它 |
+| **H4** | getter **返回副本**（两次读不是同一个对象，改返回值不影响字段） | F2/K0/K1 | `TextField_get_defaultTextFormat` → `as_tf_fmt_clone` |
+| **H5** | 赋 `defaultTextFormat` **不重排**已有文本；格式在**插入时绑定**，只有重新赋 `.text` 才应用新格式 | A1/B1/C1/P3/P4 | 新增 `_insFmt`（插入时快照）+ `as_tf_base_fmt()`：排版/度量读 `_insFmt`，`defaultTextFormat` 读写 `_dtf` |
+| **H6** | `defaultTextFormat = null` 与 `setTextFormat(null, …)` 都抛 `TypeError #2007 "Parameter format must be non-null."` | F1/G1 | 两处 setter 入口显式抛（原先 `setTextFormat(null)` 是静默无操作） |
+| **H7** | `setTextFormat(fmt, b, e)` 同样逐字段合并，且「保持」的基准是 **`b` 处当前生效的格式**（run），不是字段默认 | L1/L2 | `format = as_tf_fmt_merge(format, as_tf_fmt_at(tf, begin))` |
+| **H8** | `appendText` 的两个怪癖：① 追加的字符取**前一字符**的格式；② 调用后 `defaultTextFormat` 被改写成**下标 0 字符**的格式副本 | P4/Q2/Q3/J4 | `TextField_appendText` 内两处显式写出（注释标明是实测口径，不是推导） |
+
+配套的结构改动：`TextField` 的 `defaultTextFormat` 由**字段**改为**访问器对**（AIR 里它本来就是
+property），C 存储换成运行时槽 `_dtf`/`_insFmt`（进 props 表的 GC 标记，不暴露给 AS3）；
+`as_tf_fmt_eq/clone/blank/make/merge` 与 `as_tf_fmt_at()` 成为格式逻辑的唯一入口。
+
+**仍然存在的读回差（不修，登记）**：`font` 为 null 时 `defaultTextFormat.font`，adl 报平台设备字体名
+`"Times Roman"`，我们报 `null`。**不能**照抄这个名字：adl 的名义度量（12px `"abc"` 宽 `16.5`）与我们
+**null 字体**的默认朴素字体一致（`16.65`），而把面名写成 `"Times Roman"` 在我们的 Skia 栈里会解析到
+**真 Times**（同串宽 `19.35`）⇒ 照抄会把每一项文本度量都改错 ~17%。渲染与度量已对齐，差的只是这个
+字符串读回（原 N2 项，现明确为「有意不修」）。
 
 ### C. 首次实测新发现（`examples/textfield` 双端报告，2026-10-14）
 
@@ -160,8 +186,8 @@ divergence（见 [`swc.md`](swc.md) §9.2 F5 与 AGENTS.md 的 SWC 实测口径�
 
 | # | 现象（adl → 我们） | 归属 | 备注 |
 |---|---|---|---|
-| **N1** | `defaultTextFormat.align` 默认值：adl `"left"` → 我们 `null` | 新，B 包 | 影响**每一条** case 行（差异行数因此被放大） |
-| **N2** | `font=null` 时 `defaultTextFormat.font`：adl 报 `"Times Roman"` → 我们报 `null` | 新，B 包 | 只影响读回值（渲染已是 Times） |
+| **N1** | ~~`defaultTextFormat.align` 默认值：adl `"left"` → 我们 `null`~~ **✅ 已修（阶段三百三十五，见 §2H H2）** | 新，B 包 | 影响**每一条** case 行（差异行数因此被放大）；现两端都是 `"left"` |
+| **N2** | `font=null` 时 `defaultTextFormat.font`：adl 报 `"Times Roman"` → 我们报 `null` | 新，B 包 | **有意不修**（见 §2H 末段：照抄面名会让我们的 Skia 栈解析到真 Times，度量差 ~17%） |
 | **N3** | ~~`autoSize` 会**回填字段盒**：adl `auto-left` → `52×19.5` → 我们仍是 `100×100`~~ **✅ 已修（阶段一百六十八，见 §2E D-T16）** | 新，B 包 | `textWidth/Height` 正确，差在**字段自身** `width/height`；`width`/`height` 读取现在都会刷新 autoSize |
 | **N4** | `displayAsPassword` 的 setter **不使既有排版失效**：先 `text` 后设密码，adl `tw` 仍是**明文**宽（`WWWWWW` → 67.50 = `plain-W`）；先设密码后 `text` 才是**星号**宽（28.00） | 新，**收窄 D-T6** | 我们**恒按星号**排版 ⇒ 设置顺序在 adl 可观测、我们不可观测 |
 | **N5** | 星号字形宽度我们与 adl **一致**（6 星 `28.02` vs `28.00`） | 收窄 D-T6 | 差的只有**计数口径**（CJK 按字节 ⇒ 3 星）而非字宽 |
@@ -475,13 +501,155 @@ sh examples/textfield/run-aot.sh                    # -> aot.txt
 
 ### 11.4 已知残差
 
-- 打字过程中的 `maxScrollH` **比 AIR 多约一步**（AIR 在已滚动态下报 `tw + 4 - width + 步长`，
-  如 60 字符时 274 而我们 236）。程序化赋 `scrollH` 时 AIR 又回到 `tw + 4 - width`，说明它不是
-  纯函数——我们没有复刻这个历史相关性；光标可见性不受影响。
+- **（已在 §11.5 结案）** 原先登记的「打字过程中 `maxScrollH` 比 AIR 多约一步」不是历史相关性，
+  而是**可编辑字段的口径本身**：它多出的正好是「一个水平平移单元减一像素」。见 §11.5。
 - `textWidth` 本身仍有每字符 7.2002 vs AIR 7.135 的进位残差（既有条目），所以 `scrollH` 绝对值
   会有几像素差；断言写成关系式，绝对数值只作参考。
+
+### 11.5 可编辑字段的横向范围（阶段三百三十七 / v0.4.298）
+
+§11.4 里那条「打字时比 AIR 少约一步」的残差，用**不需要键盘注入**的探针一次问清了：
+`TextField.replaceSelectedText` 与 `.text` 赋值在 AIR 里给出**同一个** `maxScrollH`，所以它不是
+编辑历史，而是 **`type` 决定的纯函数**。证据台 `temp/maxsh/Main4.as`（`mxmlc` + `adl 51.4.1`，
+`_typewriter` 12，四档宽度 × 六档长度 × 动态/可编辑两态，输出 `temp/maxsh/adl-w.txt`；我方
+脚本层对照 `temp/maxsh/ours4.as`）：
+
+| 宽度 | 动态字段 `maxScrollH`（tw 144/216/288/360/432） | 可编辑字段 |
+|---|---|---|
+| 100 | 0 / 48 / 120 / 192 / 264 / 336 | 0 / **72** / **144** / **216** / **288** / **360** |
+| 200 | 0 / 0 / 20 / 92 / 164 / 236 | 0 / 0 / **69** / **141** / **213** / **285** |
+| 300 | 0 / 0 / 0 / 0 / 64 / 136 | 0 / 0 / 0 / **66** / **138** / **210** |
+| 400 | 0 / 0 / 0 / 0 / 0 / 36 | 0 / 0 / 0 / 0 / **63** / **135** |
+
+差值恒为 `width/4 - 1`（100→24、200→49、300→74、400→99），于是：
+
+- 动态：`trunc(tw + 4 - width)`
+- 可编辑：`trunc(tw + 4 - width + width/4 - 1)`
+
+两者都在 0 处截断。**关键的一条反证**：把同一个字段的 `type` 从 `INPUT` 改回 `DYNAMIC`，范围
+**立刻塌回**动态值（`temp/maxsh/adl-w.txt` 的 `asDyn` 行与 `caret0`/`caretEnd` 行），说明这一项
+跟「有没有光标」「光标在哪」都无关，只跟**可编辑性**有关——这也解释了为什么它看起来像「打字
+时多一步」：可编辑字段每平移一次正好是 `width/4`。
+
+落地：`TextField_get_maxScrollH` 在 `over` 上加一项 `as_tf_is_input(tf) ? width/4 - 1 : 0`；
+`examples/textrich.as` 断言「可编辑 = 动态 + `int(width/4) - 1`」且切回 `DYNAMIC` 后复原
+（关系式，两种构建都成立）；`test/unit/emit.ts` 的 `unit: emit/TextFieldScrollAndCaret` 加一项。
 
 **钉**：`test/unit/emit.ts` 的 `unit: emit/TextFieldScrollAndCaret`（15 项，含「属性表里不得再有
 `hscroll`」与「光标闸门必须多一个 `as_tf_is_input`」）；`examples/tf-scale-metrics.as` §③ 在 Skia
 构建下打字 60 字符断言 `maxScrollH > 0`、`scrollH` 单调且夹紧、换行字段纵向跟随；
 `examples/textrich.as` 把原来「没有 `hscroll` 就 `maxScrollH == 0`」的断言反了过来。
+
+## 12. 输入字符的 run 格式与 `textWidth` 的行尾空白（阶段三百三十六 / v0.4.297）
+
+两项都是「AIR 有定义、我们缺」的遗留（`TODO.md` 遗留表两行），本轮按 `adl 51.4.1` 双端实测落地。
+
+### 12.1 打字沿用**前一字符**的 run 格式
+
+AIR 的插入位置格式是「插入点**前一字符**的 run」：字段默认黑色时，先把 `[0,2)` 涂红，再在
+下标 2 处插入一个字符，插入的字符**是红色**；在下标 0 处插入则取「原下标 0 字符」的格式（同一
+段红 ⇒ 红）。证据 `temp/maxsh/Main5.as`（`adl 51.4.1`，`replaceSelectedText` 走同一条插入路径）：
+`R1 inserted color=16711680` / `R1 tail color=0` / `R2 at0 color=16711680`，
+我方对照 `temp/maxsh/ours5.as` 逐行相同。我们此前把新字符一律按字段默认格式记录
+（于是新字符落回默认色）。
+
+落地：`as_tf_splice` 的插入分支调 `as_tf_runs_edit(tf, lo, hi, insLen, as_tf_fmt_at(tf, lo > 0 ? lo - 1 : 0))`
+——即「取插入点前一字符处生效的格式」，`lo == 0` 时取下标 0；删除分支传 `NULL`（只做偏移平移）。
+该助手只在「插入格式 ≠ 字段插入时默认格式」时才真的写一条 run，避免每条输入都堆一条冗余 run。
+
+### 12.2 `textWidth` **含**行尾空白
+
+AIR 的 `textWidth` 把行尾空格算进去（`"Multitouch"` 53 → `"Multitouch "` 56 → 两个空格 59，
+每空格 3px；空串以外的纯空格行 `"  "` **6** / `"   "` **9**，但 `getLineMetrics(0).width` 仍 **0**），
+而 Skia 的 `getLongestLine()` 与 `LineMetrics::fWidth` 都会**扣掉**尾部空白 cluster
+（`build-tools/skia-src/modules/skparagraph/src/ParagraphImpl.cpp` 的 `longestLine` 与
+`TextLine` 的 `fWidth`）。
+
+落地（`vendor/skia_text_glue.cc`）：新增 `sk_line_advance_incl_spaces()`——当该行有尾部空白时，
+用 `getRectsForRange(start, end, kTight, kTight)` 拿到**分开的尾部空格盒**，按
+`max(right) - min(left)` 折回行宽；整行都是空白（`fEndExcludingWhitespaces <= fStartIndex`）时
+保持 `fWidth` 不变（与 AIR 的「纯空白行 `getLineMetrics` 宽 0」一致）。新公共缝
+`sk_textlayout_max_width_incl_spaces(para)` 取 `getLongestLine()` 与该逐行折算的最大值，
+`sk_textlayout_line_metrics` 的 `width` 也改用同一折算；`as_tf_longest_line` 与两处对齐探针
+（`new_runs` / `new_leading` 的测宽）统一读 `as_skia_textlayout_text_width()`。
+
+`examples/textwidth-trailing.as` 只用**关系式**断言（一个空格的增量、纯空白行的行宽 0、
+`getLineMetrics` 与 `textWidth` 同源、跨行取最长、`autoSize` 宽 = `textWidth + 4`），无文本后端时
+自跳过。**注意**：该示例显式设了 `multiline = true`——单行字段里的 `\n` 我们仍会折叠（与 AIR 不符，
+见 §14 新登记项）。
+
+### 12.3 替换 API 与选区口径（阶段三百三十七顺带补齐）
+
+C-3 的对照探针需要 `replaceSelectedText`，而我们**根本没有**这个方法（连同 `replaceText`）。
+两者都是 AIR 的文档 API，补齐时一次量清了口径（`temp/maxsh/Main6.as`、`Main7.as`、`Main8.as`、
+`Main9.as`、`MainA.as`、`MainB.as`）：
+
+| 观测 | adl 51.4.1 |
+|---|---|
+| `replaceText(b,e,s)` / `replaceSelectedText(s)` 之后的选区 | **不动**（只把越界端点钳到新长度） |
+| 负下标 / 反向区间（`b > e`） | **静默无操作** |
+| 端点越界 | 钳到文本长度（`begin` 超出 ⇒ 追加到末尾） |
+| `newText` 为 `null` | 抛 `TypeError #2007 "Parameter text must be non-null."`（**不是**空串） |
+| 赋 `.text` 之后的选区与光标 | **一律重置为 0**（同串、更长、更短、空串、INPUT 字段都是 0,0） |
+| `setSelection(0, 0)` | 与其它写法一样**收缩**到 0 |
+
+最后一条推翻了阶段九十四 的一条旧口径（当时把它记成「空操作」，`TextField_setSelection` 里还有
+一行早退）；`examples/stage94g.as` 的对应断言已按复测改写。同理，赋 `.text` 原先只把光标/选区
+**钳到新长度**，现在按实测**重置为 0**（`TextField_set_text`）。
+
+## 13. `htmlText` 的块级行高、规则 `leading` 与 `getLineText`（阶段三百三十七 / v0.4.298）
+
+阶段一百四十八登记的第二、三项（多行 run 行高偏大、规则 `leading` 未生效）加上顺带登记的
+`getLineText` 缺口，本轮一次修完。证据台 `temp/htmlprobe/`（`adl 51.4.1` 的 `Main.as`、
+`Main2.as`；我方 `ours.as`、`ours2.as`），`12px` 默认格式。
+
+### 13.1 `getLineText(lineIndex)`
+
+`"ab\ncd"` → `'ab'` / `'cd'`；`"ab\n"` → `'ab'` / `''`（`numLines` 是 2，但 `textHeight` 仍是 **12**）；
+下标 `-1`/`numLines`/更大 → `RangeError #2006`。落地为 `TextField_getLineText`：走
+`as_tf_line_table` + `as_tf_line_end`，越界抛 `Error #2006: The supplied index is out of bounds.`，
+返回 `as_str_substring(t, ls, le)`（不含换行字节）。
+
+### 13.2 行高：每行自己的格式盒 + 尾部空行用**默认**格式
+
+`getLineMetrics(i)` 的 `ascent/descent` 现在按**该行**生效的 `TextFormat`（`as_tf_fmt_at(tf, 行首)`）
+取，`leading` 也从那里取——此前一律读 `defaultTextFormat`，于是带规则 `leading` 的行报
+`h=18 asc=13.5 desc=4.5 lead=0`（AIR 是 `h=18 asc=9 desc=3 lead=6`）。
+
+**尾部空行**（`htmlText` 块末尾自然产生的那一行）在 AIR 里报的是**默认格式的盒**（`12/9/3/0`），
+不是邻行的 18px 盒；我们在 C 侧判「该行没有字符」（`as_tf_line_end(...) <= 行首`）后，用 `idx = -1`
+向 glue 要「默认脸盒」，glue 的 `sk_textlayout_line_box` 新增该分支。
+
+`textHeight` 同时对齐「尾部空行不加高、也不计它的 `leading`」：Skia 路径走
+`as_tf_line_table` 的 `tops`，把尾部空行（`line_end(k-1) <= starts[k-1]`）一格格退掉，取
+`tops[k]` 后再**减一份最后一行的 `leading`**（两行 18px + 规则 leading 6 → AIR 30，不是 36）；
+纯 C 路径按同一规则写成 `lk*(size*1.2+lead) - (lk>1 ? lead : 0)`。
+
+**顺带把一条错误的不变量改掉**：`examples/textflow.as` 原来断言「`textHeight / numLines` 在
+`appendText` 前后不变」——AIR 里 `appendText("appended\n")` 会让 `numLines` +1 而 `textHeight`
+**不变**（`temp/htmlprobe/Main2.as` K0/K1：10 行 120px，追加后 n=11、th 仍 120），该不变量本身
+就是错的，已改成「`textHeight` 是整数个行盒」。
+
+### 13.3 规则里的 `leading`
+
+`as_tf_html_emit_run` 多了 `lead` 参数，`as_tf_html_set` 维护 `st_lead[]` 栈（压栈/出栈与
+`face/size/color` 一致），规则读 `as_ss_str(rule, "leading")`，回落到 `"line-height"`，经 `as_css_num`
+解析后**加在**默认格式的 `leading` 上（`leading:6px` ⇒ 6）。嵌套块/内联标签恢复时同样复原。
+
+### 13.4 钉
+
+- `examples/htmltext-metrics.as`（Skia 清单，`examples/autosize-metrics.build.json`）：`getLineText`
+  三态 + `#2006`、尾部空行不加高、两个 `<p>` = 3 行 / 两行盒、规则 `leading` 的 `h/asc/desc/lead`
+  与 `textHeight = 2*(box+6) - 6`、尾部空行仍是默认盒且 `leading == 0`；无文本后端时自跳过行高部分。
+- `test/unit/display.ts` 新增 `unit: display/HtmlTextMetrics`（9 项）与 `LineMetrics` 两处改写
+  （leading 改读行格式、空行走 `idx = -1`）；`test/unit/emit.ts` 的 `TextFieldScrollAndCaret`
+  加「可编辑字段多一个平移单元」。
+
+## 14. 本轮新登记（未修）
+
+- **单行字段里的 `\n` 我们仍会折叠**：AIR 在 `multiline = false` 的字段里 `tf.text = "ab\ncd"`
+  给出 `len 5 / numLines 2 / tw 11 / th 24`（`numLines` 与 `textHeight` 都是**两行**），我们把
+  `\n` 折叠成空格（`as_tf_*` 的 `collapse = (multiline || _html_block) ? 0 : 1`）。**不是**本轮的
+  回归，是既有口径差；本轮只是把它从「隐藏」变成「在 `examples/textwidth-trailing.as` 里显式
+  用 `multiline = true` 规避并注明」。修它要动 `collapse` 的默认语义，会波及全部单行文本示例与
+  `getLineMetrics`/`selection` 的索引域，故独立立项。

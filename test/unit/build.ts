@@ -2806,20 +2806,21 @@ function checkTextEngineSplit(): string[] {
   check('the graphics half uses no skparagraph type',
     !/skia::textlayout::/.test(gfxCode));
 
-  // (2) Every seam entry point lives in the text half -- the 15-function seam the
+  // (2) Every seam entry point lives in the text half -- the 17-function seam the
   // generated C calls (docs/zh-cn/rust-text-backend.md §1.1) plus the two direct
   // draw paths that bypass the paragraph.
   const seam = [
     'sk_text_measure', 'sk_text_measure_n',
     'sk_textlayout_new', 'sk_textlayout_new_leading', 'sk_textlayout_new_runs',
-    'sk_textlayout_height', 'sk_textlayout_max_width', 'sk_textlayout_line_metrics',
+    'sk_textlayout_height', 'sk_textlayout_max_width', 'sk_textlayout_max_width_incl_spaces',
+    'sk_textlayout_line_metrics',
     'sk_textlayout_line_box', 'sk_textlayout_line_count', 'sk_textlayout_paint',
     'sk_textlayout_delete', 'sk_textlayout_glyph_position_at',
     'sk_textlayout_rects_for_range', 'sk_textlayout_caret_rect',
     'sk_canvas_draw_text', 'sk_canvas_draw_text_n',
   ];
   const missing = seam.filter((n) => !new RegExp(`^(void|double|int)\\*?\\s+${n}\\(`, 'm').test(txt));
-  check('the text half defines all 16 text seam entry points', missing.length === 0);
+  check('the text half defines all 17 text seam entry points', missing.length === 0);
   if (missing.length > 0) console.log('  missing: ' + missing.join(', '));
 
   // (3) The one symbol BOTH halves need stays in the graphics half: the SVG

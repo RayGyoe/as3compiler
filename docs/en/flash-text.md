@@ -57,7 +57,7 @@ table below is the **pre-work inventory**, so we do not redo capabilities that a
 | Capability | Status | Landing |
 |---|---|---|
 | Single/multi-line layout (SkParagraph + HarfBuzz, UAX#14 line breaking) | ✅ | stages 38/44, `vendor/skia_glue.cc` `sk_textlayout_*` |
-| `TextFormat` subset (`font/size/color/bold/italic/underline/leading/align/kerning/letterSpacing`) | ✅ (subset) | stages 38/72/89·17 |
+| `TextFormat` full 19 fields + AIR's 13-parameter constructor + "unset means keep" (per-field merge, getter returns a copy, assigning dtf does not reflow, null throws `#2007`) | ✅ | stages 38/72/89·17/331/335 |
 | Horizontal alignment (with layout width → Skia per-line; without → `as_tf_align_dx` block shift) | ✅ | stages 89·17/135 |
 | Rich text: `htmlText` subset (`span,p,b,i,u,font,a,li,br,img,textformat`) + `setTextFormat` ranges | ✅ | stages 72/148 |
 | `StyleSheet` real class + block-level HTML model (break-after) | ✅ | stage 148 |
@@ -164,13 +164,41 @@ defect** (AGENTS §1.5).
 | # | Symptom | Root cause | Code location | Evidence |
 |---|---|---|---|---|
 | **D-T20** | The AI subtitle item's `ctime` sits **12pt to the left** of adl (real window: ink starts at `30` vs `54` device px). With the card height and text width already aligned, this was the window's **last** residual | The SWC bake treated a text child's `RECT` origin as a **translation** (`x = matrix.tx + xmin`), while AIR treats the origin as a **point in the character's own space**: it goes through the placement's **linear part**, and AIR then stores the result on its **twip grid** (1/20 px) — `x = round20(tx + a·xmin + c·ymin)`, `y = round20(ty + b·xmin + d·ymin)`. The old form matches AIR exactly for **unit-scaled** children, which is why `temp/childfx`'s 99 children (all scale 1) never caught it | `src/emit.ts`: new `Emitter.swcTextChildXY(m, ox, oy)`; both the frame-1 `emitSwcPlacement` and the timeline modify path now funnel through it; the interface comment in `src/swc.ts` was updated to match | `adl 51.4.1` dual-end probe `temp/tfswc` case ⑰: `subtitleskin.ctime` old `0.30` / new `11.9913→12.0000` / adl **`12.0000`**; three more discriminating cases `filesskin.tab1` `0.0500`, `filesskin.tab2` `90.1000`, `logintabskin.tab1` `0.0000` (old form: `-0.40`/`89.65`/`-0.10`); all six rows identical after the fix; pinned by `unit: swc/TextChildOrigin` (7 pins, goes red under mutation); real window `ctime` ink `53..393` vs adl `54..394` |
-| **D-T21** | Registered the same round, **not fixed**: ① `defaultTextFormat = new TextFormat()` (all fields null) wipes font/size/color/bold/`leading` to their defaults on our side, whereas adl **changes nothing** (it is a no-op) ⇒ we lose the SWF-declared `leading=2` (`textHeight` nominal `14.02 → 12.00`), and `dtf.size = null` degenerates to `size=0`; ② our `TextFormat` member table is missing `indent`/`blockIndent`/`bullet`/`tabStops`/`target`/`url` and the constructor takes **6 params vs AIR's 13** ⇒ AIR-valid code **fails to compile** here | ① fields are typed `number`/`bool` so they **cannot express "unset"**, and the setter overwrites wholesale; ② the member table/constructor were never completed against AIR's class docs | unchanged (direction: represent "unset" explicitly + merge per field in the setter + add the 6 members and 13-param constructor) | `temp/tfswc` cases TF0–TF8 (adl side): TF7 reads back the **original values** after an all-null `TextFormat` (ours: `font=null size=12 color=0 bold=false lead=0`), TF2 `th` ours `9.80` vs adl `11.45`, TF3/TF4 explicit `leading=0/2` agree on both ends (`9.80/11.45`, proving the gap is only in the "unset" state), TF5/TF8 show adl **keeps** `size`/`leading` when they are null; `indent` fails on our side with `Codegen error: undefined field 'indent' on class 'TextFormat'`. Diff list **D41 / R28**; registered in the backlog table |
+| **D-T21** | **① fixed (stage 335 / v0.4.296, see §2H), ② fixed (stage 331)**. As originally registered: ① `defaultTextFormat = new TextFormat()` (all fields null) wipes font/size/color/bold/`leading` to their defaults on our side, whereas adl **changes nothing** (it is a no-op) ⇒ we lose the SWF-declared `leading=2` (`textHeight` nominal `14.02 → 12.00`), and `dtf.size = null` degenerates to `size=0`; ② our `TextFormat` member table is missing `indent`/`blockIndent`/`bullet`/`tabStops`/`target`/`url` and the constructor takes **6 params vs AIR's 13** ⇒ AIR-valid code **fails to compile** here | ① fields are typed `number`/`bool` so they **cannot express "unset"**, and the setter overwrites wholesale; ② the member table/constructor were never completed against AIR's class docs | unchanged (direction: represent "unset" explicitly + merge per field in the setter + add the 6 members and 13-param constructor) | `temp/tfswc` cases TF0–TF8 (adl side): TF7 reads back the **original values** after an all-null `TextFormat` (ours: `font=null size=12 color=0 bold=false lead=0`), TF2 `th` ours `9.80` vs adl `11.45`, TF3/TF4 explicit `leading=0/2` agree on both ends (`9.80/11.45`, proving the gap is only in the "unset" state), TF5/TF8 show adl **keeps** `size`/`leading` when they are null; `indent` fails on our side with `Codegen error: undefined field 'indent' on class 'TextFormat'`. Diff list **D41 / R28**; registered in the backlog table |
 
 > **A lesson worth keeping**: D-T20 hid behind a "99 children matched item by item" acceptance run — that sample was
 > **entirely unit-scaled**, and the two forms only diverge when the placement carries a scale. The **coverage
 > dimension** of a sample (here: scale) matters as much as its size. D-T20 is **fixed** (stage 170 / v0.4.141);
 > D-T21 is **measured and registered only** this round: it changes `TextFormat`'s default-value path (touching every
 > text example and skin field's initial layout), so it needs its own stage plus a full regression.
+
+### H. `TextFormat`'s "unset" semantics and insert-time binding (stage 335 / v0.4.296)
+
+Dual-end same-source probe `temp/tfc2/` (adl 51.4.1 `Main.as`/`Main2.as`/`Main3.as`/`Main4.as` against our
+script-level `ours.as`/`ours2.as`, case by case). Four calibers, all taken from measured adl behaviour:
+
+| # | AIR behaviour | Evidence (adl) | Implementation |
+|---|---|---|---|
+| **H1** | A zero-argument `new TextFormat()` leaves **every** field null except `display="block"`; **all thirteen** parameters default to null (AIR declares them `Object`) | E0: 18 nulls + `display=block` | the constructor now takes 13 `as_value`s (`TextFormat_new(as_value …×13)`); `font/align/url/target` use C `NULL` for unset, scalar fields use tag 0 |
+| **H2** | A new `TextField`'s implicit default format is a **complete** value (size 12 / color 0 / bold·italic·underline false / leading 0 / align `"left"` / margins·indent 0 / bullet false / display `"block"` / `url`·`target` `""` / `tabStops` `[]`) | D0 | new `as_tf_fmt_make()` (the runtime's own complete-format builder) is used by `TextField_ctor`; `as_tf_fmt_blank()` serves the AS3 all-null side |
+| **H3** | The `defaultTextFormat` setter **merges field by field**: a null source field keeps the target's current value, an **explicit** null is the same as omitted, and assigning an all-null format is a no-op | G0/H0/I0/J0 | `as_tf_fmt_merge(over, base)`, called from `TextField_set_defaultTextFormat` |
+| **H4** | The getter returns a **copy** (two reads are different objects; mutating the result changes nothing) | F2/K0/K1 | `TextField_get_defaultTextFormat` → `as_tf_fmt_clone` |
+| **H5** | Assigning `defaultTextFormat` does **not** reflow existing text; the format is bound at **insertion** time, so only re-assigning `.text` applies a new default | A1/B1/C1/P3/P4 | new `_insFmt` (insertion snapshot) + `as_tf_base_fmt()`: layout/metrics read `_insFmt`, the `defaultTextFormat` accessor reads/writes `_dtf` |
+| **H6** | Both `defaultTextFormat = null` and `setTextFormat(null, …)` throw `TypeError #2007 "Parameter format must be non-null."` | F1/G1 | both setter entry points throw (the old `setTextFormat(null)` was a silent no-op) |
+| **H7** | `setTextFormat(fmt, b, e)` merges too, and the base it keeps from is **the format in effect at `b`** (a run), not the field default | L1/L2 | `format = as_tf_fmt_merge(format, as_tf_fmt_at(tf, begin))` |
+| **H8** | Two `appendText` quirks: ① appended characters take the **preceding** character's format; ② afterwards `defaultTextFormat` is rewritten to a copy of the format at index 0 | P4/Q2/Q3/J4 | both written out explicitly in `TextField_appendText`, commented as measured rather than derived |
+
+Structural change: `TextField.defaultTextFormat` went from a **field** to an **accessor pair** (it is a property
+in AIR too), with the C storage moved to the runtime-only slots `_dtf`/`_insFmt` (marked through the props
+table, not visible to AS3); `as_tf_fmt_eq/clone/blank/make/merge` plus `as_tf_fmt_at()` are now the single
+entry points for format logic.
+
+**Known read-back difference (not fixed, registered)**: with `font` null, `defaultTextFormat.font` is the
+platform device-font name `"Times Roman"` in adl and `null` here. Copying that name would be **wrong**: adl's
+nominal metrics (12px `"abc"` = `16.5`) match our **null-font** default face (`16.65`), while the face literally
+named `"Times Roman"` resolves to real Times in our Skia stack (same string = `19.35`) ⇒ copying it would shift
+**every** text metric by ~17%. Rendering and metrics already agree; only this string differs (formerly N2, now
+explicitly "intentionally not fixed").
 
 ### C. First measurement findings (dual-end `examples/textfield` report, 2026-10-14)
 
@@ -179,8 +207,8 @@ A line-by-line diff of the two reports (`temp/textfield-oracle/{adl,aot}.txt`, *
 
 | # | Symptom (adl → us) | Belongs to | Note |
 |---|---|---|---|
-| **N1** | `defaultTextFormat.align` default: adl `"left"` → us `null` | new, package B | affects **every** case line (that is why the differ count is inflated) |
-| **N2** | With `font=null`, `defaultTextFormat.font`: adl reports `"Times Roman"` → us `null` | new, package B | read-back only (rendering is already Times) |
+| **N1** | ~~`defaultTextFormat.align` default: adl `"left"` → us `null`~~ **✅ fixed (stage 335, see §2H H2)** | new, package B | affects **every** case line (that is why the differ count is inflated); both ends now report `"left"` |
+| **N2** | With `font=null`, `defaultTextFormat.font`: adl reports `"Times Roman"` → us `null` | new, package B | **intentionally not fixed** (see the end of §2H: adopting the name would resolve to real Times in our stack, ~17% off) |
 | **N3** | ~~`autoSize` **resizes the field box**: adl `auto-left` → `52×19.5` → us still `100×100`~~ **✅ fixed (stage 168, see §2E D-T16)** | new, package B | `textWidth/Height` are right; the **field's own** `width/height` differ — a `width`/`height` read now refreshes `autoSize` |
 | **N4** | The `displayAsPassword` setter **does not invalidate the existing layout**: text first, then password ⇒ adl `tw` is still the **plaintext** width (`WWWWWW` → 67.50 = `plain-W`); password first, then text ⇒ star width (28.00) | new, **narrows D-T6** | we **always** lay out the star string ⇒ the set order is observable in adl, invisible to us |
 | **N5** | Our star glyph width **matches** adl (6 stars `28.02` vs `28.00`) | narrows D-T6 | the only gap is the **count contract** (CJK per byte ⇒ 3 stars), not the glyph width |
@@ -532,10 +560,9 @@ horizontally it steps by a quarter of the inner width, clamped to `maxScrollH`.
 
 ### 11.4 Known residuals
 
-- While typing, AIR's `maxScrollH` is about **one step larger** than ours (`tw + 4 - width + step`, e.g.
-  274 vs our 236 at 60 characters); a programmatic `scrollH` assignment puts AIR back at
-  `tw + 4 - width`, so it is not a pure function of the layout. We did not model that history dependence;
-  caret visibility is unaffected.
+- **(closed in §11.5)** The old "while typing, `maxScrollH` is about one step larger" residual is not
+  history dependence at all: it is the **editable field's own** extent, which is exactly one horizontal
+  pan cell minus a pixel wider. See §11.5.
 - `textWidth` still carries the per-character residual (7.2002 vs AIR 7.135), so absolute `scrollH` values
   differ by a few pixels; assertions are written as relations and absolute numbers are informative only.
 
@@ -544,3 +571,158 @@ in the props table" and "the caret gate must also test `as_tf_is_input`"); `exam
 §③ types 60 characters under the Skia build and asserts `maxScrollH > 0`, monotone clamped `scrollH`, and
 vertical follow for the wrapping field; `examples/textrich.as` inverted its old
 "`maxScrollH == 0` without `hscroll`" assertion.
+
+### 11.5 The editable field's horizontal extent (stage 337 / v0.4.298)
+
+The residual in §11.4 was settled with a probe that needs **no keyboard injection**:
+`TextField.replaceSelectedText` and a plain `.text` assignment report the **same** `maxScrollH` in AIR,
+so the value is a pure function of `type`, not of the editing history. Evidence: `temp/maxsh/Main4.as`
+(`mxmlc` + `adl 51.4.1`, `_typewriter` 12, four widths x six lengths x dynamic/editable;
+`temp/maxsh/adl-w.txt`; our script-layer twin `temp/maxsh/ours4.as`):
+
+| width | dynamic `maxScrollH` (tw 144/216/288/360/432) | editable |
+|---|---|---|
+| 100 | 0 / 48 / 120 / 192 / 264 / 336 | 0 / **72** / **144** / **216** / **288** / **360** |
+| 200 | 0 / 0 / 20 / 92 / 164 / 236 | 0 / 0 / **69** / **141** / **213** / **285** |
+| 300 | 0 / 0 / 0 / 0 / 64 / 136 | 0 / 0 / 0 / **66** / **138** / **210** |
+| 400 | 0 / 0 / 0 / 0 / 0 / 36 | 0 / 0 / 0 / 0 / **63** / **135** |
+
+The delta is always `width/4 - 1` (24 / 49 / 74 / 99), hence:
+
+- dynamic: `trunc(tw + 4 - width)`
+- editable: `trunc(tw + 4 - width + width/4 - 1)`
+
+both clamped at 0. The decisive control: switching the same field's `type` back to `DYNAMIC` collapses
+the extent to the dynamic value immediately (`asDyn` rows in `temp/maxsh/adl-w.txt`), and neither the
+`caret0` nor the `caretEnd` rows change it -- the term follows **editability**, not the caret. That is
+also why it looked like "one step more while typing": an editable field pans by exactly `width/4`.
+
+Implementation: `TextField_get_maxScrollH` adds `as_tf_is_input(tf) ? width/4 - 1 : 0`;
+`examples/textrich.as` asserts "editable = dynamic + `int(width/4) - 1`" and that switching back to
+`DYNAMIC` restores the dynamic value (a relation, so both build flavours pass);
+`unit: emit/TextFieldScrollAndCaret` gained one check.
+
+## 12. Typed-character runs and `textWidth`'s trailing blanks (stage 336 / v0.4.297)
+
+Both items were "defined by AIR, missing in ours" rows of the `TODO.md` backlog; both were landed against
+dual-end `adl 51.4.1` measurements.
+
+### 12.1 Typing inherits the **preceding character's** run
+
+AIR's insert-position format is the run of the character **before** the insertion point: with a black
+field default, painting `[0,2)` red and then inserting at index 2 yields a **red** character; inserting at
+index 0 takes the format of whatever character was at index 0 (red in that same setup). Evidence
+`temp/maxsh/Main5.as` (`replaceSelectedText` goes through the same insert path):
+`R1 inserted color=16711680`, `R1 tail color=0`, `R2 at0 color=16711680`; our twin
+`temp/maxsh/ours5.as` matches line for line. We used to record every new character in the field's default
+format, so typed text fell back to the default colour.
+
+Implementation: the insert branch of `as_tf_splice` calls
+`as_tf_runs_edit(tf, lo, hi, insLen, as_tf_fmt_at(tf, lo > 0 ? lo - 1 : 0))`; the delete branch passes
+`NULL` (offset shift only). The helper only materialises a run when the insert format differs from the
+field's insert-time default format, so plain typing does not pile up redundant runs.
+
+### 12.2 `textWidth` **includes** trailing blanks
+
+AIR counts trailing spaces (`"Multitouch"` 53 -> `"Multitouch "` 56 -> two spaces 59, i.e. 3 px each;
+a blanks-only line `"  "` is **6** and `"   "` is **9**, while `getLineMetrics(0).width` stays **0**),
+whereas Skia's `getLongestLine()` and `LineMetrics::fWidth` subtract every trailing whitespace cluster
+(`build-tools/skia-src/modules/skparagraph/src/ParagraphImpl.cpp` and `TextLine`).
+
+Implementation (`vendor/skia_text_glue.cc`): `sk_line_advance_incl_spaces()` asks
+`getRectsForRange(start, end, kTight, kTight)` for the separate trailing-space box and folds it back in as
+`max(right) - min(left)`; a line that is entirely whitespace
+(`fEndExcludingWhitespaces <= fStartIndex`) keeps `fWidth` (matching AIR's `getLineMetrics` width 0). The
+new public seam `sk_textlayout_max_width_incl_spaces(para)` takes the max of `getLongestLine()` and the
+per-line folded advance; `sk_textlayout_line_metrics` reports the same folded width;
+`as_tf_longest_line` and both alignment probes (`new_runs` / `new_leading`) read
+`as_skia_textlayout_text_width()`.
+
+`examples/textwidth-trailing.as` asserts only relations (one space's advance, a blanks-only line width 0,
+`getLineMetrics` and `textWidth` agreeing, longest line across lines, `autoSize` width = `textWidth + 4`)
+and self-skips without a text backend. Note it sets `multiline = true` explicitly: a single-line field
+with `\n` still collapses in ours, which contradicts AIR (see §14).
+
+### 12.3 The replacement APIs and the selection contract (landed with stage 337)
+
+The C-3 probe needed `replaceSelectedText`, which we did not have at all (nor `replaceText`). Both are
+documented AIR APIs; filling them in came with a measured contract (`temp/maxsh/Main6.as`, `Main7.as`,
+`Main8.as`, `Main9.as`, `MainA.as`, `MainB.as`):
+
+| Observation | adl 51.4.1 |
+|---|---|
+| Selection after `replaceText(b,e,s)` / `replaceSelectedText(s)` | **unchanged** (endpoints only clamped to the new length) |
+| Negative index / inverted range (`b > e`) | **silent no-op** |
+| Out-of-range endpoints | clamped to the text length (`begin` past the end appends) |
+| `newText == null` | throws `TypeError #2007 "Parameter text must be non-null."` (not an empty string) |
+| Selection and caret after assigning `.text` | **reset to 0** (same string, longer, shorter, empty, INPUT field alike) |
+| `setSelection(0, 0)` | collapses to 0 like any other pair |
+
+The last row overturns a stage-94 contract that recorded it as a no-op (and left an early-return in
+`TextField_setSelection`); the matching `examples/stage94g.as` assertion was rewritten from the
+re-measurement. Likewise, assigning `.text` used to clamp the caret/selection to the new length and now
+**resets them to 0** (`TextField_set_text`).
+
+## 13. `htmlText` line heights, rule `leading` and `getLineText` (stage 337 / v0.4.298)
+
+Stage 148's second and third items (multi-line run heights ~1.5x too tall, rule `leading` ignored) plus the
+`getLineText` gap it registered are all landed. Evidence `temp/htmlprobe/` (`adl 51.4.1` `Main.as`,
+`Main2.as`; our `ours.as`, `ours2.as`), 12 px default format.
+
+### 13.1 `getLineText(lineIndex)`
+
+`"ab\ncd"` -> `'ab'` / `'cd'`; `"ab\n"` -> `'ab'` / `''` (`numLines` is 2 but `textHeight` stays **12**);
+an index of `-1`, `numLines` or beyond throws `RangeError #2006`. Implemented as
+`TextField_getLineText` over `as_tf_line_table` + `as_tf_line_end`, throwing
+`Error #2006: The supplied index is out of bounds.` and returning `as_str_substring(t, ls, le)` (no break
+byte).
+
+### 13.2 Line heights: each line's own format box, the default box for the empty line
+
+`getLineMetrics(i)` now takes `ascent`/`descent` from the `TextFormat` in effect on **that line**
+(`as_tf_fmt_at(tf, line start)`) and `leading` from there too -- it used to read `defaultTextFormat`
+unconditionally, which reported `h=18 asc=13.5 desc=4.5 lead=0` for a rule-`leading` line where AIR says
+`h=18 asc=9 desc=3 lead=6`.
+
+The **trailing empty line** (which an `htmlText` block leaves behind) reports the **default format's** box
+in AIR (`12/9/3/0`), not its neighbour's 18 px box; the C side detects "this line has no characters"
+(`as_tf_line_end(...) <= line start`) and asks the glue for the default face box with `idx = -1`, a new
+branch in `sk_textlayout_line_box`.
+
+`textHeight` follows: the trailing empty line adds neither a box nor its `leading`. The Skia path walks
+`tops` from `as_tf_line_table`, steps `k` down past empty trailing lines
+(`line_end(k-1) <= starts[k-1]`), takes `tops[k]` and subtracts **one** leading of the last counted line
+(two 18 px rule lines -> AIR 30, not 36); the pure-C path mirrors it as
+`lk*(size*1.2+lead) - (lk>1 ? lead : 0)`.
+
+**A wrong invariant was retired**: `examples/textflow.as` used to assert that `textHeight / numLines` is
+constant across `appendText` -- in AIR `appendText("appended\n")` raises `numLines` by one while
+`textHeight` stays put (`temp/htmlprobe/Main2.as` K0/K1: ten lines at 120 px, n=11, th still 120). The
+assertion is now "`textHeight` is a whole number of line boxes".
+
+### 13.3 The rule's `leading`
+
+`as_tf_html_emit_run` gained a `lead` parameter, `as_tf_html_set` maintains an `st_lead[]` stack
+(pushed/popped with `face/size/color`), and a rule reads `as_ss_str(rule, "leading")` (falling back to
+`"line-height"`), parsed by `as_css_num` and **added to** the default format's `leading` (`leading:6px`
+-> 6). Nested blocks and inline tags restore it on the way out.
+
+### 13.4 Pins
+
+- `examples/htmltext-metrics.as` (Skia manifest `examples/autosize-metrics.build.json`): `getLineText`
+  in three states + `#2006`, the trailing empty line adding no height, two `<p>`s = 3 lines / two boxes,
+  the rule `leading`'s `h/asc/desc/lead` and `textHeight = 2*(box+6) - 6`, and the trailing empty line
+  keeping the default box with `leading == 0`; the height half self-skips without a text backend.
+- `test/unit/display.ts` gained `unit: display/HtmlTextMetrics` (9 checks) and two rewritten
+  `LineMetrics` checks (leading from the line's format, the empty line via `idx = -1`);
+  `unit: emit/TextFieldScrollAndCaret` gained "an editable field adds one pan cell".
+
+## 14. Registered this round (not fixed)
+
+- **`\n` in a single-line field is still collapsed**: with `multiline = false`, AIR answering
+  `tf.text = "ab\ncd"` gives `len 5 / numLines 2 / tw 11 / th 24` (both `numLines` and `textHeight` are
+  two-line), while we collapse the break into a space (`collapse = (multiline || _html_block) ? 0 : 1`).
+  This is a pre-existing contract gap, not a regression from this round; this round only made it visible
+  by using `multiline = true` in `examples/textwidth-trailing.as` and saying so. Fixing it moves the
+  default meaning of `collapse` and would touch every single-line text example plus the index domains of
+  `getLineMetrics`/`selection`, so it is registered separately.

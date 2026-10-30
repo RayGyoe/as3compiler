@@ -378,11 +378,13 @@ function checkTextInput(): string[] {
     /static void as_tf_copy_selection\(TextField\* tf\) \{[\s\S]{0,600}?if \(tf->displayAsPassword\) return;/.test(c));
   check('and refuses to cut (the text survives, the pasteboard stays empty)',
     /static void as_tf_cut\(TextField\* tf\) \{[\s\S]{0,300}?if \(tf->displayAsPassword\) return;/.test(c));
-  // 实测：光标在 7 时 `text = "zz"` 读回 caretIndex 2、SEL 2,2（不是 0、也不是陈旧的 7）。
-  check('text=... clamps the caret and the selection to the new length',
-    c.includes('if (tf->_sel_caret > len) tf->_sel_caret = len;')
-    && c.includes('if (tf->_sel_begin > len) tf->_sel_begin = len;')
-    && c.includes('if (tf->_sel_end > len) tf->_sel_end = len;'));
+  // 阶段三百三十七 复测（temp/maxsh/Main9.as）：赋 `.text` 一律把选区与光标**重置为 0**，
+  // 不是「钳到新长度」—— 同串、更长、更短、空串、INPUT 字段五种情形全部读到 0,0。
+  check('text=... resets the caret and the selection to 0',
+    c.includes('tf->_sel_caret = 0;')
+    && c.includes('tf->_sel_begin = 0;')
+    && c.includes('tf->_sel_end = 0;')
+    && !c.includes('if (tf->_sel_caret > len) tf->_sel_caret = len;'));
 
   // dispatchEvent 的返回值 = 未被取消（textInput/change 的取消语义就靠它）。
   check('dispatchEvent returns whether the event survived',

@@ -117,11 +117,13 @@ s.setSelection(9, 3);
 // AIR 把反向选区规范化成 (3,9)，caret 仍在 9（本次调用给定的端）。
 eq(s.selectionBeginIndex, 3, "reversed setSelection normalises begin");
 eq(s.selectionEndIndex, 9, "reversed setSelection normalises end");
-// 反直觉但实测 4/4 的quirk：setSelection(0, 0) 是**空操作**，不会把光标collapse
-// 到 0（证据：temp/xformcmp/seldir round 8，四种前态都一致）。
+// setSelection(0, 0) 与其它写法一样**收缩**到 0，没有特殊豁免。曾按阶段九十四的
+// 一次探针（temp/xformcmp/seldir round 8）记成「空操作」，阶段三百三十七 用六种前态
+// 复测（temp/maxsh/Main8.as：新建字段 / 刚设过范围 / 刚收缩过光标 / replaceSelectedText
+// 之后 / INPUT 字段）**全部**收缩到 0,0 —— 那次是把「没生效」当成了语义。
 s.setSelection(0, 0);
-eq(s.selectionBeginIndex, 3, "setSelection(0,0) is a no-op: begin unchanged");
-eq(s.selectionEndIndex, 9, "setSelection(0,0) is a no-op: end unchanged");
+eq(s.selectionBeginIndex, 0, "setSelection(0,0) collapses begin");
+eq(s.selectionEndIndex, 0, "setSelection(0,0) collapses end");
 // (n,n) 的其它写法正常收缩（实测 (3,3) 正常）。
 s.setSelection(4, 4);
 eq(s.selectionBeginIndex, 4, "collapsed selection begin");

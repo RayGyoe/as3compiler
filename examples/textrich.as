@@ -35,6 +35,11 @@ var lh0:Number = h0 / tf.numLines;
 var lf:TextFormat = new TextFormat(null, 12, 0x000000, false, false, false);
 lf.leading = 8;   // 6th ctor arg is `underline` in AIR, not `leading`
 tf.defaultTextFormat = lf;
+// The default format is bound at INSERTION time: changing it does not re-format
+// text that is already there, so the text has to be re-assigned for the leading
+// to take effect (measured on adl 51.4.1, temp/tfc2/Main2.as: "text then
+// dtf=30" keeps the old height, "dtf=30 then text" grows).
+tf.text = "a\nb";
 var h1:Number = tf.textHeight;
 var lh1:Number = h1 / tf.numLines;
 if (lh1 <= lh0) {
@@ -67,6 +72,35 @@ if (tf.scrollH < 0 || tf.scrollH > mh) {
 }
 tf.scrollH = 0;
 if (tf.scrollH != 0) throw new Error("scrollH should stick to 0, got " + tf.scrollH);
+
+// An EDITABLE field exposes a WIDER extent than a dynamic one: AIR pans it in cells
+// of a quarter of its width and its extent carries one such cell minus a pixel.
+// Measured on adl 51.4.1 (temp/maxsh/Main4.as, `_typewriter` 12, widths
+// 100/200/300/400): input = trunc(tw + 4 - width + width/4 - 1) exactly, and it
+// collapses back to the dynamic value the moment `type` goes back to DYNAMIC.
+var editTf:TextField = new TextField();
+editTf.width = 200;
+editTf.height = 30;
+editTf.multiline = false;
+editTf.wordWrap = false;
+editTf.defaultTextFormat = new TextFormat(null, 12, 0x000000, false, false);
+editTf.text = "this is a much longer single line that overflows";
+var dynExtent:int = editTf.maxScrollH;
+if (dynExtent > 0) {
+  editTf.type = TextFieldType.INPUT;
+  var editExtent:int = editTf.maxScrollH;
+  // 200/4 - 1; derived from the field width so the assertion stays readable.
+  var cell:int = int(editTf.width / 4) - 1;
+  if (editExtent != dynExtent + cell) {
+    throw new Error("an editable field's extent must be dynamic + width/4 - 1: "
+      + editExtent + " vs " + dynExtent + " + " + cell);
+  }
+  editTf.type = TextFieldType.DYNAMIC;
+  if (editTf.maxScrollH != dynExtent) {
+    throw new Error("switching back to DYNAMIC must restore the dynamic extent: "
+      + editTf.maxScrollH + " vs " + dynExtent);
+  }
+}
 
 // --- autoSize: the field shrinks/grows to hug its text -----------------------
 var autoTf:TextField = new TextField();

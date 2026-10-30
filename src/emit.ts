@@ -1912,6 +1912,15 @@ export class Emitter {
           this.line('int _sel_begin;');
           this.line('int _sel_end;');
           this.line('int _sel_caret;');
+          // `defaultTextFormat` and the format the CURRENT text was inserted
+          // with. Both are runtime-only: the AS3 surface is the
+          // defaultTextFormat accessor pair (a copy on read, a per-field merge
+          // on write), and `_insFmt` is the snapshot AIR binds at insertion
+          // time -- changing defaultTextFormat afterwards does NOT re-format
+          // text that is already there (measured on adl 51.4.1, temp/tfc2:
+          // "text then dtf=30" keeps th 12, "dtf=30 then text" gives th 34).
+          this.line('TextFormat* _dtf;');
+          this.line('TextFormat* _insFmt;');
           this.line('as_array* _runs;');
           this.line('int _html_dirty;');
           this.line('int _scroll_h;');
@@ -4100,6 +4109,8 @@ export class Emitter {
       // explicitly rather than via a declared field.
       if (name === 'TextField') {
         this.line(`{ "_runs", 6, offsetof(TextField, _runs), NULL, NULL, 1 },`);
+        this.line(`{ "_dtf", 6, offsetof(TextField, _dtf), NULL, NULL, 1 },`);
+        this.line(`{ "_insFmt", 6, offsetof(TextField, _insFmt), NULL, NULL, 1 },`);
       }
       // StyleSheet's rule table is a GC record in a C-runtime-only slot: type 6 makes
       // gc_scan follow it (阶段一百四十八). Its declaration records are reachable from
@@ -9786,10 +9797,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           const face = e.font === null ? 'NULL' : `(char*)${cStringLiteral(Buffer.from(e.font, 'utf8'))}`;
           const size = e.size > 0 ? e.size : 12;
           const color = e.color === null ? 0 : e.color;
-          steps.push(`t->defaultTextFormat = TextFormat_new(${face}, ${this.formatDouble(size)}, 0x${color.toString(16).padStart(6, '0')}u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), ${this.formatDouble(e.leading)});`);
-          if (e.align !== null) steps.push(`t->defaultTextFormat->align = (char*)"${e.align}";`);
-          if (e.leftMargin > 0) steps.push(`t->defaultTextFormat->leftMargin = as_v_num(${this.formatDouble(e.leftMargin)});`);
-          if (e.rightMargin > 0) steps.push(`t->defaultTextFormat->rightMargin = as_v_num(${this.formatDouble(e.rightMargin)});`);
+          steps.push(`t->_dtf = as_tf_fmt_make(${face}, ${this.formatDouble(size)}, 0x${color.toString(16).padStart(6, '0')}u, 0, 0, 0, ${this.formatDouble(e.leading)});`);
+          if (e.align !== null) steps.push(`t->_dtf->align = (char*)"${e.align}";`);
+          if (e.leftMargin > 0) steps.push(`t->_dtf->leftMargin = as_v_num(${this.formatDouble(e.leftMargin)});`);
+          if (e.rightMargin > 0) steps.push(`t->_dtf->rightMargin = as_v_num(${this.formatDouble(e.rightMargin)});`);
           steps.push(`t->multiline = ${e.multiline ? 'true' : 'false'};`);
           steps.push(`t->wordWrap = ${e.wordWrap ? 'true' : 'false'};`);
           steps.push(`t->selectable = ${e.selectable ? 'true' : 'false'};`);
@@ -12957,6 +12968,48 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return units;');
     this.indent--;
     this.line('}');
+    // The format the field is CURRENTLY using, i.e. the one new characters take.
+    // AIR binds a format at INSERTION time and keeps it for as long as the text
+    // survives: assigning `tf.text` re-binds it to the then-current
+    // defaultTextFormat, but assigning defaultTextFormat afterwards does NOT
+    // re-format text that is already there (measured on adl 51.4.1,
+    // temp/tfc2/Main2.as: "text then dtf=30" keeps textHeight 12, "dtf=30 then
+    // text" gives 34, and re-assigning .text is what finally applies 30). That is
+    // why the layout reads `_insFmt` (the snapshot taken by TextField_set_text)
+    // rather than the live defaultTextFormat.
+    this.line('static TextFormat* as_tf_implicit(void) {');
+    this.indent++;
+    this.line('static TextFormat idd; static int idd_init = 0;');
+    this.line('if (!idd_init) { idd.font = NULL; idd.size = as_v_num(12.0); idd.color = as_v_num(0.0); idd.bold = as_v_bool(false); idd.italic = as_v_bool(false); idd.underline = as_v_bool(false); idd.leading = as_v_num(0.0); idd.kerning = as_v_bool(false); idd.letterSpacing = as_v_num(0.0); idd.leftMargin = as_v_num(0.0); idd.rightMargin = as_v_num(0.0); idd.indent = as_v_num(0.0); idd.blockIndent = as_v_num(0.0); idd.bullet = as_v_bool(false); idd.align = (char*)"left"; idd.display = (char*)"block"; idd.url = (char*)""; idd.target = (char*)""; idd.tabStops = as_v_null(); idd_init = 1; }');
+    this.line('return &idd;');
+    this.indent--;
+    this.line('}');
+    this.line('static TextFormat* as_tf_base_fmt(TextField* tf) {');
+    this.indent++;
+    this.line('if (tf == NULL) return as_tf_implicit();');
+    this.line('if (tf->_insFmt != NULL) return tf->_insFmt;');
+    this.line('if (tf->_dtf != NULL) return tf->_dtf;');
+    this.line('return as_tf_implicit();');
+    this.indent--;
+    this.line('}');
+    // The format in effect at one byte offset: the run covering it, else the base.
+    // Every AS3 read that has to answer "what format is this character in" goes
+    // through here (getTextFormat, setTextFormat's merge base, caret colour,
+    // appendText), so they can never disagree with the paint pass.
+    this.line('static TextFormat* as_tf_fmt_at(TextField* tf, int idx) {');
+    this.indent++;
+    this.line('if (tf == NULL) return NULL;');
+    this.line('int n = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('int s0 = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int s1 = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('if (idx >= s0 && idx < s1) { TextFormat* f = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]); if (f != NULL) return f; }');
+    this.indent--;
+    this.line('}');
+    this.line('return as_tf_base_fmt(tf);');
+    this.indent--;
+    this.line('}');
     // The colour the field actually PAINTS at a byte offset (阶段二百九十七). AIR's
     // insertion caret takes the colour of the character it sits on, NOT the field's
     // default format: measured on the TalkMED setup window (AOT), a field whose text
@@ -12969,7 +13022,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static unsigned as_tf_color_at(TextField* tf, int byteIndex) {');
     this.indent++;
     this.line('if (tf == NULL) return 0u;');
-    this.line('TextFormat* dflt = tf->defaultTextFormat;');
+    this.line('TextFormat* dflt = as_tf_base_fmt(tf);');
     this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
     this.line('int at = byteIndex;');
     this.line('if (at < 0) at = 0;');
@@ -13053,6 +13106,40 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // Defined next to the caret-scroll machinery far below, but called from every
     // edit -- a forward declaration keeps the emission order readable.
     this.line('static void as_tf_scroll_after_edit(TextField* tf);');
+    // Shift the run table across an edit. The format table is byte-indexed, so a
+    // splice has to move every run after the cut and give the inserted range the
+    // format that is in effect AT the insertion point -- AIR types with the
+    // PREVIOUS character's format, not the field default (measured on adl 51.4.1,
+    // temp/tfc2/Main3.as J2/K1: appending or typing after a red run produces red
+    // characters). A run straddling the cut is split in two; a run the cut erases
+    // vanishes. The table stays sorted and non-overlapping, which getTextFormat,
+    // as_tf_fmt_at and the layout's `pos` cursor all rely on.
+    this.line('static void as_tf_runs_edit(TextField* tf, int lo, int hi, int insLen, TextFormat* insFmt) {');
+    this.indent++;
+    this.line('int n = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
+    this.line('if (n == 0 && insLen <= 0) return;');
+    this.line('if (n == 0 && (insFmt == NULL || insFmt == as_tf_base_fmt(tf))) return;');
+    this.line('int d = insLen - (hi - lo);');
+    this.line('as_array* out = as_array_new();');
+    this.line('int placed = 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('int b = as_v_int_val(tf->_runs->data[i * 3]);');
+    this.line('int e = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
+    this.line('as_value f = tf->_runs->data[i * 3 + 2];');
+    this.line('if (!placed && e > lo) { placed = 1; if (insLen > 0 && insFmt != NULL && insFmt != as_tf_base_fmt(tf)) { as_array_push(out, as_v_num((double)lo)); as_array_push(out, as_v_num((double)(lo + insLen))); as_array_push(out, as_v_obj((void*)insFmt)); } }');
+    this.line('if (e <= lo) { as_array_push(out, as_v_num((double)b)); as_array_push(out, as_v_num((double)e)); as_array_push(out, f); continue; }');
+    this.line('if (b >= hi) { as_array_push(out, as_v_num((double)(b + d))); as_array_push(out, as_v_num((double)(e + d))); as_array_push(out, f); continue; }');
+    this.line('if (b < lo) { as_array_push(out, as_v_num((double)b)); as_array_push(out, as_v_num((double)lo)); as_array_push(out, f); }');
+    this.line('if (e > hi) { as_array_push(out, as_v_num((double)(hi + d))); as_array_push(out, as_v_num((double)(e + d))); as_array_push(out, f); }');
+    this.indent--;
+    this.line('}');
+    this.line('if (!placed && insLen > 0 && insFmt != NULL && insFmt != as_tf_base_fmt(tf)) { as_array_push(out, as_v_num((double)lo)); as_array_push(out, as_v_num((double)(lo + insLen))); as_array_push(out, as_v_obj((void*)insFmt)); }');
+    this.line('tf->_runs = out;');
+    this.line('gc_write_barrier((void*)out);');
+    this.line('tf->_runs_gen++;');
+    this.indent--;
+    this.line('}');
     this.line('static bool as_tf_splice(TextField* tf, int lo, int hi, const char* ins) {');
     this.indent++;
     this.line('int len = (int)strlen(as_tf_text(tf));');
@@ -13073,6 +13160,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('strcpy(out + lo + insLen, as_tf_text(tf) + hi);');
     this.line('tf->text = out;');
     this.line('gc_write_barrier((void*)out);');
+    // Runs are byte-indexed, so they move with the text. The inserted range takes
+    // the format of the character BEFORE the insertion point (the base format when
+    // there is none), which is AIR's typing rule -- measured on adl 51.4.1: typing
+    // into a field whose text is red through a run produces red characters, while
+    // our inserted text used to fall back to defaultTextFormat (the IME commit
+    // probe temp/imelive showed a red 框 where adl showed a black one).
+    this.line('if (insLen > 0) as_tf_runs_edit(tf, lo, hi, insLen, as_tf_fmt_at(tf, (lo > 0) ? lo - 1 : 0));');
+    this.line('else if (hi > lo) as_tf_runs_edit(tf, lo, hi, 0, NULL);');
     // The layout cache is keyed on the text pointer so a new string invalidates it
     // anyway, but drop it explicitly: a stale paragraph would render (or measure)
     // the text that was just replaced.
@@ -23091,19 +23186,101 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('');
     this.emitClipboardClass();
     // ---- flash.text (stage 38) ----
-    this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, bool underline, char* url, char* target, char* align, as_value leftMargin, as_value rightMargin, as_value indent, double leading) {');
+    // ---- TextFormat: "unset" is a first-class value (阶段三百三十五) ----
+    // AIR's TextFormat fields are `Object`, and its constructor leaves EVERY
+    // omitted field null: measured on adl 51.4.1 (temp/tfc2/Main.as, case E0)
+    // `new TextFormat()` reads back 18 nulls plus `display == "block"`. Such a
+    // null field means "I have no opinion" everywhere it is consumed:
+    //   * installing it (`tf.defaultTextFormat = fmt`) MERGES field by field,
+    //     keeping the target's current value for every null (temp/tfc2/Main.as
+    //     G0/H0/I0/J0: an all-null format is a no-op, `size=30` moves only the
+    //     size, and an EXPLICIT `fmt.size = null` also keeps the old value);
+    //   * the defaultTextFormat getter hands out a COPY (same probe, F2:
+    //     `tf.defaultTextFormat === tf.defaultTextFormat` is false), so a caller
+    //     mutating the result changes nothing (K0).
+    // The C fields therefore have to distinguish null from 0/false/12, which is
+    // why every scalar field below is `as_value` (tag 0 == unset) and every
+    // string field is a `char*` whose C NULL means unset.
+    // Defined further down with the rest of the run/format helpers, but needed by
+    // the merge/setter above, so they are declared here.
+    this.line('static TextFormat* as_tf_fmt_blank(void);');
+    this.line('static TextFormat* as_tf_fmt_clone(TextFormat* src);');
+    this.line('static char* as_tf_str_or_null(as_value v) { return (v.tag == 0) ? NULL : as_v_str_val(v); }');
+    this.line('static as_value as_tf_num_or_null(as_value v) { return (v.tag == 0) ? as_v_null() : as_v_num(as_v_to_number(v)); }');
+    this.line('static as_value as_tf_bool_or_null(as_value v) { return (v.tag == 0) ? as_v_null() : as_v_bool(as_v_truthy(v) != 0); }');
+    this.line('void TextFormat_ctor(TextFormat* o, as_value font, as_value size, as_value color, as_value bold, as_value italic, as_value underline, as_value url, as_value target, as_value align, as_value leftMargin, as_value rightMargin, as_value indent, as_value leading) {');
     this.indent++;
-    this.line('o->font = font; o->size = as_v_num(size); o->color = as_v_num((double)color); o->bold = as_v_bool(bold); o->italic = as_v_bool(italic); o->underline = as_v_bool(underline); o->url = url; o->target = target; o->align = align;');
-    this.line('o->leftMargin = leftMargin; o->rightMargin = rightMargin; o->indent = indent; o->blockIndent = as_v_null(); o->bullet = as_v_null(); o->display = NULL; o->tabStops = as_v_null();');
-    this.line('o->leading = as_v_num(leading); o->kerning = as_v_bool(false); o->letterSpacing = as_v_num(0.0);');
-    this.line('gc_write_barrier((void*)font); gc_write_barrier((void*)url); gc_write_barrier((void*)target); gc_write_barrier((void*)align);');
+    this.line('o->font = as_tf_str_or_null(font);');
+    this.line('o->size = as_tf_num_or_null(size); o->color = as_tf_num_or_null(color); o->leading = as_tf_num_or_null(leading);');
+    this.line('o->bold = as_tf_bool_or_null(bold); o->italic = as_tf_bool_or_null(italic); o->underline = as_tf_bool_or_null(underline);');
+    this.line('o->url = as_tf_str_or_null(url); o->target = as_tf_str_or_null(target); o->align = as_tf_str_or_null(align);');
+    this.line('o->leftMargin = as_tf_num_or_null(leftMargin); o->rightMargin = as_tf_num_or_null(rightMargin); o->indent = as_tf_num_or_null(indent);');
+    this.line('o->blockIndent = as_v_null(); o->bullet = as_v_null(); o->tabStops = as_v_null();');
+    this.line('o->kerning = as_v_null(); o->letterSpacing = as_v_null();');
+    // `display` is the ONE field AIR fills in even for a bare `new TextFormat()`.
+    this.line('o->display = (char*)"block";');
+    this.line('gc_write_barrier((void*)o->font); gc_write_barrier((void*)o->url); gc_write_barrier((void*)o->target); gc_write_barrier((void*)o->align);');
     this.indent--;
     this.line('}');
-    this.line('TextFormat* TextFormat_new(char* font, double size, unsigned color, bool bold, bool italic, bool underline, char* url, char* target, char* align, as_value leftMargin, as_value rightMargin, as_value indent, double leading) {');
+    this.line('TextFormat* TextFormat_new(as_value font, as_value size, as_value color, as_value bold, as_value italic, as_value underline, as_value url, as_value target, as_value align, as_value leftMargin, as_value rightMargin, as_value indent, as_value leading) {');
     this.indent++;
     this.line('TextFormat* o = (TextFormat*)gc_alloc(GCT_CLASS, sizeof(TextFormat));');
     this.line('o->vtable = &TextFormat_vt;');
     this.line('TextFormat_ctor(o, font, size, color, bold, italic, underline, url, target, align, leftMargin, rightMargin, indent, leading);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    // The runtime's OWN full format: every field concrete. The layout/metrics
+    // paths read fields unconditionally (a null size would lay out at 0px), so
+    // anything the runtime builds for itself -- a field's implicit default, an
+    // htmlText run, a clone target -- goes through here, and only the AS3-facing
+    // constructor above produces "unset" fields.
+    this.line('static TextFormat* as_tf_fmt_make(char* font, double size, unsigned color, int bold, int italic, int underline, double leading) {');
+    this.indent++;
+    this.line('TextFormat* o = (TextFormat*)gc_alloc(GCT_CLASS, sizeof(TextFormat));');
+    this.line('o->vtable = &TextFormat_vt;');
+    this.line('o->font = font;');
+    this.line('o->size = as_v_num(size); o->color = as_v_num((double)color); o->leading = as_v_num(leading);');
+    this.line('o->bold = as_v_bool(bold != 0); o->italic = as_v_bool(italic != 0); o->underline = as_v_bool(underline != 0);');
+    this.line('o->align = (char*)"left"; o->url = as_str_empty(); o->target = as_str_empty();');
+    this.line('o->leftMargin = as_v_num(0.0); o->rightMargin = as_v_num(0.0); o->indent = as_v_num(0.0);');
+    this.line('o->blockIndent = as_v_num(0.0); o->bullet = as_v_bool(false);');
+    this.line('o->kerning = as_v_bool(false); o->letterSpacing = as_v_num(0.0);');
+    this.line('o->display = (char*)"block";');
+    this.line('as_array* ts = as_array_new(); o->tabStops = as_v_obj((void*)ts);');
+    this.line('gc_write_barrier((void*)font); gc_write_barrier((void*)o->url); gc_write_barrier((void*)o->target); gc_write_barrier((void*)ts);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
+    // Field-by-field "unset means keep": `over` wins wherever it has an opinion.
+    // This is what AIR's defaultTextFormat/setTextFormat setters do, and it is the
+    // ONLY place a partial format is allowed to meet a complete one.
+    this.line('static TextFormat* as_tf_fmt_merge(TextFormat* over, TextFormat* base) {');
+    this.indent++;
+    this.line('if (over == NULL) return as_tf_fmt_clone(base);');
+    this.line('if (base == NULL) return as_tf_fmt_clone(over);');
+    this.line('TextFormat* o = as_tf_fmt_clone(base);');
+    this.line('if (over->font != NULL) o->font = over->font;');
+    this.line('if (over->size.tag != 0) o->size = over->size;');
+    this.line('if (over->color.tag != 0) o->color = over->color;');
+    this.line('if (over->bold.tag != 0) o->bold = over->bold;');
+    this.line('if (over->italic.tag != 0) o->italic = over->italic;');
+    this.line('if (over->underline.tag != 0) o->underline = over->underline;');
+    this.line('if (over->leading.tag != 0) o->leading = over->leading;');
+    this.line('if (over->kerning.tag != 0) o->kerning = over->kerning;');
+    this.line('if (over->letterSpacing.tag != 0) o->letterSpacing = over->letterSpacing;');
+    this.line('if (over->leftMargin.tag != 0) o->leftMargin = over->leftMargin;');
+    this.line('if (over->rightMargin.tag != 0) o->rightMargin = over->rightMargin;');
+    this.line('if (over->indent.tag != 0) o->indent = over->indent;');
+    this.line('if (over->blockIndent.tag != 0) o->blockIndent = over->blockIndent;');
+    this.line('if (over->bullet.tag != 0) o->bullet = over->bullet;');
+    this.line('if (over->tabStops.tag != 0) o->tabStops = over->tabStops;');
+    this.line('if (over->align != NULL) o->align = over->align;');
+    this.line('if (over->url != NULL) o->url = over->url;');
+    this.line('if (over->target != NULL) o->target = over->target;');
+    this.line('if (over->display != NULL) o->display = over->display;');
+    this.line('gc_write_barrier((void*)o->font); gc_write_barrier((void*)o->align); gc_write_barrier((void*)o->url);');
+    this.line('gc_write_barrier((void*)o->target); gc_write_barrier((void*)o->display);');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -23137,7 +23314,18 @@ void FileStream_writeObject(void* _this, as_value v) {
     // mouseWheelEnabled is AIR-true on a fresh field (condenseWhite is AIR-false,
     // so its zeroed slot is already right).
     this.line('o->mouseWheelEnabled = true;');
-    this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
+    // AIR's implicit default TextFormat is a COMPLETE format (measured on adl
+    // 51.4.1, temp/tfc2/Main.as D0: size 12, color 0, bold/italic/underline
+    // false, leading 0, align "left", margins/indent 0, bullet false, display
+    // "block", url/target "" and tabStops []). It MUST be complete: every
+    // `defaultTextFormat = partial` assignment merges on top of it, and a null
+    // surviving the merge would leave the layout reading 0.
+    // `font` stays NULL -- AIR reports the platform device-font name ("Times
+    // Roman" on macOS) but lays out with the default face (our fresh "abc" at 12
+    // measures 16.65 vs AIR's 16.5, while the face named "Times Roman" measures
+    // 19.35 in our stack). The read-back difference is registered in TODO.md.
+    this.line('o->_dtf = as_tf_fmt_make(NULL, 12.0, 0x000000u, 0, 0, 0, 0.0);');
+    this.line('o->_insFmt = NULL;');
     this.line('o->multiline = false;');
     this.line('o->wordWrap = false;');
     this.line('o->background = false;');
@@ -23248,7 +23436,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (size 12, black, family _sans), which is what a TextField uses before
     // defaultTextFormat is ever assigned.
     this.line('if (tf->text == NULL) return NULL;');
-    this.line('TextFormat* dflt = tf->defaultTextFormat;');
+    this.line('TextFormat* dflt = as_tf_base_fmt(tf);');
     this.line('if (dflt == NULL) { static TextFormat idd; static int idd_init = 0; if (!idd_init) { idd.font = (char*)"_sans"; idd.size = as_v_num(12.0); idd.color = as_v_num(0.0); idd.bold = as_v_bool(false); idd.italic = as_v_bool(false); idd.leading = as_v_num(0.0); idd_init = 1; } dflt = &idd; }');
     this.line('TextFormat* fmt = dflt;');
     this.line('double size = as_v_num_val(fmt->size);');
@@ -23300,7 +23488,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // offset for ANY M (the M terms cancel), which is why the +1 margin there is
     // free. justify (3) keeps the old behaviour: it needs a wrap width to stretch
     // into and as_tf_align_dx leaves it alone.
-    this.line('int align = as_tf_align_index(tf->defaultTextFormat);');
+    this.line('int align = as_tf_align_index(as_tf_base_fmt(tf));');
     this.line('int layoutAlign = (w > 0.0) ? align : 0;');
     this.line('if (w <= 0.0 && (align == 1 || align == 2)) layoutAlign = align;');
     // The runs DO survive the mask (measured on adl 51.3.2, temp/pwdhtml: a field
@@ -23361,7 +23549,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w <= 0.0 && layoutAlign != 0) {');
     this.indent++;
     this.line('void* pr = as_skia_textlayout_new_runs(ltext, &dr, runs, n, 0.0, 0, collapse);');
-    this.line('double m = as_skia_textlayout_max_width(pr);');
+    this.line('double m = as_skia_textlayout_text_width(pr);');
     this.line('as_skia_textlayout_delete(pr);');
     this.line('if (m > 0.0) pw = m + 1.0; else pa = 0;');
     this.indent--;
@@ -23374,7 +23562,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w <= 0.0 && layoutAlign != 0) {');
     this.indent++;
     this.line('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, 0.0, 0, collapse);');
-    this.line('double m = as_skia_textlayout_max_width(pp);');
+    this.line('double m = as_skia_textlayout_text_width(pp);');
     this.line('as_skia_textlayout_delete(pp);');
     this.line('if (m > 0.0) pw = m + 1.0; else pa = 0;');
     this.indent--;
@@ -23413,15 +23601,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Clamp at the single read point instead of at each of the five use sites.
     this.line('static double as_tf_longest_line(void* para) {');
     this.indent++;
-    this.line('double w = as_skia_textlayout_max_width(para);');
+    // Trailing BLANKS count towards AIR's textWidth (阶段三百三十六): `"abc "` is
+    // one space wider than `"abc"` (adl 51.4.1, temp/tfw2/Main.as: 56 vs 53 at
+    // 12px, 3 px per space; getLineMetrics().width agrees), while Skia's own
+    // longest-line accessor stops at the last visible glyph. The glue helper folds
+    // the line's trailing-space box back in; it is the single source for
+    // textWidth, autoSize, maxScrollH and the align origin.
+    this.line('double w = as_skia_textlayout_text_width(para);');
     this.line('return (w > 0.0 && w < 1e30) ? w : 0.0;');
     this.indent--;
     this.line('}');
     this.line('static double as_tf_align_dx(TextField* tf) {');
     this.indent++;
-    this.line('if (tf->defaultTextFormat == NULL) return 0.0;');
+    this.line('if (as_tf_base_fmt(tf) == NULL) return 0.0;');
     this.line('if (tf->wordWrap && tf->_fieldWidth > 0.0) return 0.0;');
-    this.line('int a = as_tf_align_index(tf->defaultTextFormat);');
+    this.line('int a = as_tf_align_index(as_tf_base_fmt(tf));');
     this.line('if (a != 1 && a != 2) return 0.0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return 0.0;');
@@ -23444,8 +23638,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (n > 0 && h > 0.0) return h / (double)n;');
     this.indent--;
     this.line('}');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
+    this.line('double size = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->size) : 12.0;');
+    this.line('double lead = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->leading) : 0.0;');
     this.line('if (lead < 0.0) lead = 0.0;');
     this.line('return size * 1.2 + lead;');
     this.indent--;
@@ -23590,9 +23784,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     // format's metrics). Skia's paragraph height for the empty text is one strut
     // box, so it has to be dropped explicitly.
     this.line('if (as_skia_textlayout_line_count(para) == 0) return 0.0;');
-    this.line('double h = as_skia_textlayout_height(para);');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
-    this.line('if (lead != 0.0 && as_skia_textlayout_line_count(para) > 1) h -= lead;');
+    // TRAILING EMPTY LINES do not count towards textHeight, although they DO count
+    // towards numLines (阶段三百三十六, adl 51.4.1 temp/htmlprobe/Main.as): `"ab\n"`
+    // reports numLines 2 but textHeight 12, `getLineText(1)` is "", and an htmlText of
+    // two <p> elements reports 3 lines / 24 px. Skia's paragraph height counts every
+    // line box, so the trailing empty ones have to be dropped by hand -- `k` is the
+    // line count up to the last line that has a character, and the paragraph height
+    // of the first k lines is the TOP of line k (line tops accumulate the boxes).
+    this.line('const char* et = as_tf_text(tf);');
+    this.line('int elen = (int)strlen(et);');
+    this.line('int starts[AS_TF_MAX_LINES]; double tops[AS_TF_MAX_LINES];');
+    this.line('int n = as_tf_line_table(tf, starts, NULL, tops, AS_TF_MAX_LINES);');
+    this.line('int k = n;');
+    this.line('while (k > 1 && as_tf_line_end(et, starts, n, k - 1, elen) <= starts[k - 1]) k--;');
+    this.line('double h = (k < n) ? tops[k] : as_skia_textlayout_height(para);');
+    // ...and the leading it drops is the LAST counted line's own (a stylesheet rule's
+    // `leading` lives on the run, not on defaultTextFormat): adl reports 30 for two
+    // 18 px rule lines, i.e. 36 minus one 6 px leading.
+    this.line('TextFormat* hf = as_tf_fmt_at(tf, starts[k - 1]);');
+    this.line('if (hf == NULL) hf = as_tf_base_fmt(tf);');
+    this.line('double lead = (hf != NULL) ? as_v_num_val(hf->leading) : 0.0;');
+    this.line('if (lead != 0.0 && k > 1) h -= lead;');
     this.line('return h * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
@@ -23602,13 +23814,41 @@ void FileStream_writeObject(void* _this, as_value v) {
     // not of the text backend.
     this.line('const char* t = as_tf_layout_text(tf);');
     this.line('if (t == NULL || t[0] == 0) return 0.0;');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
+    this.line('int lens = (int)strlen(t);');
+    this.line('int lstarts[AS_TF_MAX_LINES];');
+    this.line('int ln = as_tf_line_table(tf, lstarts, NULL, NULL, AS_TF_MAX_LINES);');
+    // Same "trailing empty lines do not count" rule as the Skia path above, so the
+    // stub and the real backend agree on the number they multiply.
+    this.line('int lk = ln;');
+    this.line('while (lk > 1 && as_tf_line_end(t, lstarts, ln, lk - 1, lens) <= lstarts[lk - 1]) lk--;');
+    this.line('double size = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->size) : 12.0;');
+    this.line('double lead = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->leading) : 0.0;');
     this.line('if (lead < 0.0) lead = 0.0;');
-    this.line('return (double)as_tf_line_count(tf) * (size * 1.2 + lead) * as_tf_scale_ratio(tf);');
+    this.line('double lh = (double)lk * (size * 1.2 + lead) - ((lk > 1) ? lead : 0.0);');
+    this.line('return lh * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     this.line('int TextField_get_numLines(void* _this) { return as_tf_line_count((TextField*)_this); }');
+    // getLineText(index) -- the line's characters WITHOUT its break byte, measured on
+    // adl 51.4.1 (temp/htmlprobe/Main.as, G0/G1): 'ab\ncd' answers 'ab' then 'cd' (no
+    // '\n' in either), and 'ab\n' answers 'ab' then '' -- the trailing empty line is
+    // a real line with empty text. An index outside [0, numLines) throws
+    // RangeError #2006, the same answer getLineMetrics gives (line[-1]/[2]/[3] ->
+    // 2006), so the two APIs share one bounds rule.
+    this.line('char* TextField_getLineText(void* _this, int lineIndex) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('const char* t = as_tf_text(tf);');
+    this.line('int len = (int)strlen(t);');
+    this.line('int starts[AS_TF_MAX_LINES];');
+    this.line('int n = as_tf_line_table(tf, starts, NULL, NULL, AS_TF_MAX_LINES);');
+    this.line('if (lineIndex < 0 || lineIndex >= n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }');
+    this.line('int ls = starts[lineIndex];');
+    this.line('int le = as_tf_line_end(t, starts, n, lineIndex, len);');
+    this.line('if (le < ls) le = ls;');
+    this.line('return as_str_substring(t, ls, le);');
+    this.indent--;
+    this.line('}');
     // getLineMetrics(index) -- flash.text.TextLineMetrics, measured against adl
     // 51.4.1 line by line (temp/metricprobe/Metrics6.as vs Metrics6Aot.as):
     //   * an out-of-range index (negative, >= numLines) throws RangeError #2006
@@ -23629,14 +23869,29 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int starts[AS_TF_MAX_LINES];');
     this.line('int n = as_tf_line_table(tf, starts, NULL, NULL, AS_TF_MAX_LINES);');
     this.line('if (index < 0 || index >= n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }');
-    this.line('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
-    this.line('char* fam = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
-    this.line('int bold = (tf->defaultTextFormat != NULL && as_v_bool_val(tf->defaultTextFormat->bold)) ? 1 : 0;');
-    this.line('int italic = (tf->defaultTextFormat != NULL && as_v_bool_val(tf->defaultTextFormat->italic)) ? 1 : 0;');
+    // The leading comes from the format IN EFFECT ON THE LINE, not from the field
+    // default: a stylesheet rule whose `leading:6px` produced an 18 px line must
+    // report leading 6 / ascent 9 / descent 3, which is exactly what adl answers for
+    // that line (阶段三百三十六, temp/htmlprobe/Main.as H1: lm h=18 asc=9 desc=3
+    // lead=6 while the field default has leading 0).
+    // An EMPTY line (no characters, e.g. the trailing one an htmlText block leaves
+    // behind) reports the DEFAULT format's box in AIR -- 12/9/3/0 in the measured
+    // case, not the 18 px its neighbour's rule gave it -- so the default format is
+    // what gets looked up, and idx -1 tells the glue not to read Skia's line box.
+    this.line('const char* lt = as_tf_text(tf);');
+    this.line('int llen = (int)strlen(lt);');
+    this.line('int le0 = as_tf_line_end(lt, starts, n, index, llen);');
+    this.line('int lempty = (le0 <= starts[index]) ? 1 : 0;');
+    this.line('TextFormat* lf = lempty ? as_tf_base_fmt(tf) : as_tf_fmt_at(tf, starts[index]);');
+    this.line('if (lf == NULL) lf = as_tf_base_fmt(tf);');
+    this.line('double lead = (lf != NULL) ? as_v_num_val(lf->leading) : 0.0;');
+    this.line('double size = (lf != NULL) ? as_v_num_val(lf->size) : 12.0;');
+    this.line('char* fam = (lf != NULL) ? lf->font : NULL;');
+    this.line('int bold = (lf != NULL && as_v_bool_val(lf->bold)) ? 1 : 0;');
+    this.line('int italic = (lf != NULL && as_v_bool_val(lf->italic)) ? 1 : 0;');
     this.line('double asc = 0.0, desc = 0.0, left = 0.0, w = 0.0;');
     this.line('void* para = as_tf_paragraph(tf);');
-    this.line('if (para != NULL) as_skia_textlayout_line_box(para, index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);');
+    this.line('if (para != NULL) as_skia_textlayout_line_box(para, lempty ? -1 : index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);');
     // x is the line's left edge: AIR's 2 px text inset, the block shift that
     // places the aligned block inside the field box (as_tf_align_dx -- 0 when the
     // field wraps, because Skia then aligns inside the layout width itself), plus
@@ -23668,6 +23923,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and not gated on any user switch. AIR has NO `hscroll` property (assigning one
     // throws #1056), so the extent exists for every wordWrap=false field; a wrapping
     // field reports 0 because nothing can be panned sideways (same probe).
+    //
+    // An EDITABLE field has a WIDER extent than a dynamic one: AIR pans it in cells
+    // of a quarter of its width, and the extent carries one such cell minus a pixel
+    // (阶段三百三十七, temp/maxsh/Main4.as, `_typewriter` 12, tw = 144/216/288/360/432):
+    //   width 100 -> inp 0/72/144/216/288/360   (dynamic 0/48/120/192/264/336)
+    //   width 200 -> inp 0/0/69/141/213/285     (dynamic 0/0/20/92/164/236)
+    //   width 300 -> inp 0/0/0/66/138/210       (dynamic 0/0/0/0/64/136)
+    //   width 400 -> inp 0/0/0/0/63/135         (dynamic 0/0/0/0/0/36)
+    // i.e. input = trunc(tw + 4 - width + width/4 - 1), dynamic = trunc(tw + 4 - width),
+    // both clamped at 0; switching `type` back to DYNAMIC collapses it to the dynamic
+    // value again (same probe), so the term follows the EDITABILITY, not the caret.
     this.line('int TextField_get_maxScrollH(void* _this) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
@@ -23676,6 +23942,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (para == NULL) return 0;');
     this.line('double tw = as_tf_longest_line(para);');
     this.line('double over = tw + 4.0 - tf->_fieldWidth;');
+    this.line('if (as_tf_is_input(tf)) over += tf->_fieldWidth / 4.0 - 1.0;');
     this.line('return (over > 0.0) ? (int)over : 0;');
     this.indent--;
     this.line('}');
@@ -23784,12 +24051,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_setSelection(void* _this, int begin, int end) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
-    // AIR quirk, measured 4/4 on adl 51.4.1 (temp/xformcmp/seldir round 8):
-    // setSelection(0, 0) is a NO-OP — it leaves whatever selection was there
-    // untouched instead of collapsing the caret to index 0. Reproduced against
-    // 4 different previous states, and (0,1)/(3,3)/(0,33) all behave normally,
-    // so the guard is on the exact pair, not on "beg==end" or on "0".
-    this.line('if (begin == 0 && end == 0) return;');
+    // setSelection(0, 0) collapses the selection like any other pair. An earlier
+    // stage recorded it as a NO-OP (temp/xformcmp/seldir round 8); that was a
+    // measurement artefact, re-measured on adl 51.4.1 across six previous states
+    // (temp/maxsh/Main8.as): fresh field, after a range, after a collapsed caret,
+    // after replaceSelectedText, on an INPUT field -- every one collapses to 0,0.
+    // The stale guard also made `setSelection(0, 0)` useless, which broke the
+    // replace-text path (temp/maxsh/Main7.as T3/T4).
     this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
     this.line('if (begin < 0) begin = 0;');
     this.line('if (end < 0) end = 0;');
@@ -23808,11 +24076,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_setTextFormat(void* _this, TextFormat* format, int begin, int end) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
-    this.line('if (format == NULL) return;');
+    // AIR refuses a null format here exactly like the defaultTextFormat setter
+    // does (measured on adl 51.4.1, temp/tfc2/Main3.as G1: setTextFormat(null,0,2)
+    // throws TypeError #2007 "Parameter format must be non-null."), so this used
+    // to be a silent no-op where AIR throws.
+    this.line('if (format == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter format must be non-null.", 2007)); return; }');
     this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
     this.line('if (begin < 0) begin = 0;');
     this.line('if (end < 0 || end > len) end = len;');
     this.line('if (begin > end) { int t = begin; begin = end; end = t; }');
+    // "unset means keep" applies to this setter too, and the value kept is the
+    // one already in effect at `begin` -- not the field default. Measured on adl
+    // 51.4.1 (temp/tfc2/Main3.as L): a colour-only format applied over a
+    // 20px/red run answers 20/blue afterwards, so size (null in the source)
+    // survived from the run.
+    this.line('if (begin < end) format = as_tf_fmt_merge(format, as_tf_fmt_at(tf, begin));');
     // setTextFormat REPLACES the formatting of the range; it does not stack a second
     // one on top (ActionScript 3.0 reference, TextField.setTextFormat: "sets the
     // format of the text in the range"). This used to append a run unconditionally,
@@ -23872,12 +24150,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     // inner text is kept. The result reuses setTextFormat's run encoding (three
     // as_value slots per run: begin, end, TextFormat object), so as_tf_paragraph
     // lays it out through sk_textlayout_new_runs exactly like setTextFormat runs.
-    this.line('static void as_tf_html_emit_run(TextField* tf, int begin, int end, char* face, double size, unsigned color, bool bold, bool italic, bool underline) {');
+    this.line('static void as_tf_html_emit_run(TextField* tf, int begin, int end, char* face, double size, unsigned color, bool bold, bool italic, bool underline, double lead) {');
     this.indent++;
     this.line('(void)underline; // underline not yet modeled by the TextStyle subset');
     this.line('if (begin >= end) return;');
     this.line('if (tf->_runs == NULL) tf->_runs = as_array_new();');
-    this.line('TextFormat* f = TextFormat_new(face, size, color, bold, italic, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
+    // `lead` is this run's own leading: the field's default plus whatever the
+    // enclosing stylesheet rules added (measured on adl 51.4.1, temp/htmlprobe/Main.as
+    // H1: a `leading:6px` rule makes its lines 18 px tall -- ascent 9 + descent 3 +
+    // leading 6 -- instead of 12). The glue turns it into AIR's per-run line box, and
+    // sk_textlayout_line_box strips it back out of the ascent/descent split.
+    this.line('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, 0, lead);');
     this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
     this.line('as_array_push(tf->_runs, as_v_num((double)end));');
     this.line('as_array_push(tf->_runs, as_v_obj((void*)f));');
@@ -24044,10 +24327,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('size_t n = strlen(html);');
     this.line('char* out = as_str_alloc(n + 1);');
     this.line('int opos = 0;');
-    this.line('char* face = (tf->defaultTextFormat != NULL) ? tf->defaultTextFormat->font : NULL;');
-    this.line('double size = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->size) : 12.0;');
-    this.line('unsigned color = (tf->defaultTextFormat != NULL) ? (unsigned)as_v_num_val(tf->defaultTextFormat->color) : 0x000000u;');
+    this.line('char* face = (as_tf_base_fmt(tf) != NULL) ? as_tf_base_fmt(tf)->font : NULL;');
+    this.line('double size = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->size) : 12.0;');
+    this.line('unsigned color = (as_tf_base_fmt(tf) != NULL) ? (unsigned)as_v_num_val(as_tf_base_fmt(tf)->color) : 0x000000u;');
     this.line('bool bold = false, italic = false, underline = false;');
+    this.line('double lead = (as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->leading) : 0.0;');
     this.line('int runStart = 0;');
     this.line('int i = 0;');
     // Style stack (阶段一百四十八): each open element saves the style in effect
@@ -24058,6 +24342,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#define AS_TF_STACK 32');
     this.line('char* st_face[AS_TF_STACK]; double st_size[AS_TF_STACK]; unsigned st_color[AS_TF_STACK];');
     this.line('int st_bold[AS_TF_STACK], st_italic[AS_TF_STACK], st_under[AS_TF_STACK], st_block[AS_TF_STACK];');
+    this.line('double st_lead[AS_TF_STACK];');
     this.line('int depth = 0;');
     // >0 while inside a `display:none` element: its text is dropped (measured on
     // adl: display:none produces empty lines in the same places).
@@ -24101,7 +24386,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('while (name[nl] && name[nl] != \' \' && name[nl] != \'/\' && name[nl] != \'=\' ) nl++;');
     this.line('char nm[24]; int k = 0; while (k < nl && k < 23) { nm[k] = name[k]; k++; } nm[k] = 0;');
     // Flush the run ending here BEFORE any style/break change.
-    this.line('#define AS_TF_FLUSH() do { as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline); runStart = opos; } while (0)');
+    this.line('#define AS_TF_FLUSH() do { as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline, lead); runStart = opos; } while (0)');
     this.line('as_object* rule = (tf->styleSheet != NULL) ? as_ss_lookup(tf->styleSheet->_rules, nm) : NULL;');
     this.line('char* disp = (rule != NULL) ? as_ss_str(rule, "display") : NULL;');
     this.line('if (closing) {');
@@ -24113,7 +24398,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('AS_TF_FLUSH();');
     this.line('if (depth > 0) { depth--; if (depth < AS_TF_STACK) {');
     this.indent++;
-    this.line('face = st_face[depth]; size = st_size[depth]; color = st_color[depth];');
+    this.line('face = st_face[depth]; size = st_size[depth]; color = st_color[depth]; lead = st_lead[depth];');
     this.line('bold = st_bold[depth] != 0; italic = st_italic[depth] != 0; underline = st_under[depth] != 0;');
     // A rule'd tag that AIR does not render inline is a BLOCK: its CLOSE ends the
     // line. Break AFTER, not before -- measured on adl 51.4.1 (temp/blockprobe):
@@ -24137,6 +24422,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('st_face[depth] = face; st_size[depth] = size; st_color[depth] = color;');
     this.line('st_bold[depth] = bold ? 1 : 0; st_italic[depth] = italic ? 1 : 0; st_under[depth] = underline ? 1 : 0;');
+    this.line('st_lead[depth] = lead;');
     this.line('st_block[depth] = 0;');
     this.indent--;
     this.line('}');
@@ -24160,6 +24446,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('v = as_ss_str(rule, "fontstyle"); if (v != NULL) italic = as_str_ieq(v, "italic");');
     this.line('v = as_ss_str(rule, "fontweight"); if (v != NULL) bold = as_str_ieq(v, "bold");');
     this.line('v = as_ss_str(rule, "textdecoration"); if (v != NULL) underline = as_str_ieq(v, "underline");');
+    // CSS `leading` (AIR also accepts `line-height` as the same knob): added to the
+    // enclosing leading, which is what makes the rule's lines taller (temp/htmlprobe
+    // H1). as_css_num already handles the "6px" form.
+    this.line('v = as_ss_str(rule, "leading"); if (v == NULL) v = as_ss_str(rule, "line-height"); if (v != NULL) { double d = as_css_num(v); if (d >= 0.0) lead = ((as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->leading) : 0.0) + d; }');
     this.indent--;
     this.line('}');
     this.line('if (strcmp(nm, "b") == 0) bold = true;');
@@ -24198,7 +24488,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
-    this.line('as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline);');
+    this.line('as_tf_html_emit_run(tf, runStart, opos, face, size, color, bold, italic, underline, lead);');
     this.line('out[opos] = 0;');
     this.line('tf->text = out;');
     this.indent--;
@@ -24249,9 +24539,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return true;');
     this.indent--;
     this.line('}');
+    this.line('static TextFormat* as_tf_fmt_blank(void) {');
+    this.indent++;
+    this.line('TextFormat* o = (TextFormat*)gc_alloc(GCT_CLASS, sizeof(TextFormat));');
+    this.line('o->vtable = &TextFormat_vt;');
+    this.line('o->font = NULL; o->align = NULL; o->url = NULL; o->target = NULL; o->display = (char*)"block";');
+    this.line('o->size = as_v_null(); o->color = as_v_null(); o->bold = as_v_null(); o->italic = as_v_null();');
+    this.line('o->underline = as_v_null(); o->leading = as_v_null(); o->kerning = as_v_null();');
+    this.line('o->letterSpacing = as_v_null(); o->leftMargin = as_v_null(); o->rightMargin = as_v_null();');
+    this.line('o->indent = as_v_null(); o->blockIndent = as_v_null(); o->bullet = as_v_null(); o->tabStops = as_v_null();');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
     this.line('static TextFormat* as_tf_fmt_clone(TextFormat* src) {');
     this.indent++;
-    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
+    this.line('TextFormat* o = as_tf_fmt_blank();');
     this.line('o->font = src->font; o->align = src->align; o->url = src->url; o->target = src->target; o->display = src->display;');
     this.line('o->size = src->size; o->color = src->color; o->bold = src->bold; o->italic = src->italic;');
     this.line('o->underline = src->underline; o->leading = src->leading; o->kerning = src->kerning;');
@@ -24264,12 +24566,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static TextFormat* as_tf_fmt_empty(void) {');
     this.indent++;
-    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
-    this.line('o->size = as_v_null(); o->color = as_v_null(); o->bold = as_v_null(); o->italic = as_v_null();');
-    this.line('o->underline = as_v_null(); o->leading = as_v_null(); o->kerning = as_v_null();');
-    this.line('o->letterSpacing = as_v_null(); o->leftMargin = as_v_null(); o->rightMargin = as_v_null();');
-    this.line('o->indent = as_v_null(); o->blockIndent = as_v_null(); o->bullet = as_v_null(); o->tabStops = as_v_null();');
-    this.line('o->url = NULL; o->target = NULL; o->display = NULL; o->align = NULL;');
+    this.line('TextFormat* o = as_tf_fmt_blank();');
+    this.line('o->display = NULL;');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -24288,14 +24586,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('if (b >= e) return as_tf_fmt_empty();');
-    this.line('TextFormat* dflt = tf->defaultTextFormat;');
-    this.line('if (dflt == NULL) {');
-    this.indent++;
-    this.line('static TextFormat idd; static int idd_init = 0;');
-    this.line('if (!idd_init) { idd.font = (char*)"_sans"; idd.size = as_v_num(12.0); idd.color = as_v_num(0.0); idd.bold = as_v_bool(false); idd.italic = as_v_bool(false); idd.underline = as_v_bool(false); idd.leading = as_v_num(0.0); idd.kerning = as_v_bool(false); idd.letterSpacing = as_v_num(0.0); idd.leftMargin = as_v_num(0.0); idd.rightMargin = as_v_num(0.0); idd_init = 1; }');
-    this.line('dflt = &idd;');
-    this.indent--;
-    this.line('}');
+    this.line('TextFormat* dflt = as_tf_base_fmt(tf);');
     this.line('int n = (tf->_runs != NULL) ? (int)(tf->_runs->length / 3) : 0;');
     this.line('int pos = b; int i = 0;');
     this.line('TextFormat* first = NULL;');
@@ -24331,15 +24622,24 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('tf->_runs = NULL;');
     this.line('tf->text = value;');
     this.line('gc_write_barrier((void*)value);');
-    // AIR clamps the caret and the selection to the new length on assignment:
-    // measured on adl 51.4.1 (temp/editprobe/src/Ed16.as + drive_ed16.py, F4 step)
-    // -- with the caret at 7, `p1.text = "zz"` reads back caretIndex 2 AND
-    // selectionBegin/End 2,2, not the stale 7 and not 0. Without this the caret
-    // stays past the end of the text (the renderer then measures a bogus rect).
-    this.line('int len = (value != NULL) ? (int)strlen(value) : 0;');
-    this.line('if (tf->_sel_caret > len) tf->_sel_caret = len;');
-    this.line('if (tf->_sel_begin > len) tf->_sel_begin = len;');
-    this.line('if (tf->_sel_end > len) tf->_sel_end = len;');
+    // Insertion-time format snapshot: the characters just installed are laid out
+    // with the CURRENT defaultTextFormat, and they keep it even if
+    // defaultTextFormat moves later (see as_tf_base_fmt). A run installed by
+    // setTextFormat belongs to the OLD text and is gone with it, which is why
+    // `_runs` is cleared above -- AIR re-assigns formatting together with the
+    // text, and re-assigning .text after setTextFormat drops the run
+    // (temp/tfc2/Main2.as C1).
+    this.line('tf->_insFmt = (tf->_dtf != NULL) ? as_tf_fmt_clone(tf->_dtf) : NULL;');
+    this.line('gc_write_barrier((void*)tf->_insFmt);');
+    // Assigning .text RESETS the selection and the caret to 0, whatever they were:
+    // measured on adl 51.4.1 (temp/maxsh/Main9.as P/Q/R/S/T) for the same string,
+    // a longer one, a shorter one, an empty one and on an INPUT field -- every case
+    // reads back selectionBegin/End 0,0 and caretIndex 0. (An earlier stage clamped
+    // them to the new length instead, from an edit-probe step that had actually
+    // typed into the field rather than assigning .text.)
+    this.line('tf->_sel_caret = 0;');
+    this.line('tf->_sel_begin = 0;');
+    this.line('tf->_sel_end = 0;');
     this.indent--;
     this.line('}');
     // ".type = ..." setter. AIR's type setter has a side effect that its getter does
@@ -24359,6 +24659,30 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (strcmp(cur, nv) != 0) tf->tabEnabled = (strcmp(nv, "input") == 0);');
     this.line('tf->type = value;');
     this.line('gc_write_barrier((void*)value);');
+    this.indent--;
+    this.line('}');
+    // defaultTextFormat (阶段三百三十五): a getter that hands out a COPY and a
+    // setter that MERGES. AIR's own docs call the getter "the format of the text
+    // ... a new TextFormat object", and the probe agrees on both halves: two
+    // reads are never the same object, mutating the result changes nothing, and
+    // assigning a partial format keeps every field it does not mention
+    // (temp/tfc2/Main.as F2/G0/H0/I0/J0/K0).
+    this.line('TextFormat* TextField_get_defaultTextFormat(void* _this) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('return as_tf_fmt_clone((tf->_dtf != NULL) ? tf->_dtf : as_tf_implicit());');
+    this.indent--;
+    this.line('}');
+    this.line('void TextField_set_defaultTextFormat(void* _this, TextFormat* value) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('if (value == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter format must be non-null.", 2007)); return; }');
+    this.line('tf->_dtf = as_tf_fmt_merge(value, (tf->_dtf != NULL) ? tf->_dtf : as_tf_implicit());');
+    this.line('gc_write_barrier((void*)tf->_dtf);');
+    // NO layout work here: AIR does not re-format existing text when the default
+    // format changes (temp/tfc2/Main2.as B1: text laid out at 12 stays 12px tall
+    // after dtf=30; only re-assigning .text applies it). Dropping the cached
+    // paragraph would re-read `_insFmt` anyway, so leaving it is also cheaper.
     this.indent--;
     this.line('}');
     this.line('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); }');
@@ -26210,11 +26534,69 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (_fguard) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
+    // appendText (阶段三百三十五). Two rules, both measured on adl 51.4.1
+    // (temp/tfc2/Main4.as):
+    //   1. the appended characters take the format in effect at the END of the
+    //      existing text (P4: appending to 12px text keeps 12px even though
+    //      defaultTextFormat was moved to 30 first; Q3: appending after a 40px
+    //      run still lands on 12, i.e. the LAST character's format, not the run's);
+    //   2. the call REPLACES defaultTextFormat with a copy of the format at index
+    //      0 (P4: dtf 30 -> 12; Q2: dtf 12 -> the 40/blue run). That is an AIR
+    //      quirk -- setTextFormat does not move dtf, only this call does -- but it
+    //      is observable through a defaultTextFormat read-back, so it is modelled.
     this.line('void TextField_appendText(void* _this, char* s) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
     this.line('if (s == NULL) return;');
+    this.line('int oldLen = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
+    this.line('int addLen = (int)strlen(s);');
+    this.line('TextFormat* endFmt = as_tf_fmt_at(tf, (oldLen > 0) ? oldLen - 1 : 0);');
     this.line('tf->text = (tf->text == NULL) ? as_str_concat("", s) : as_str_concat(tf->text, s);');
+    this.line('gc_write_barrier((void*)tf->text);');
+    this.line('if (addLen > 0) as_tf_runs_edit(tf, oldLen, oldLen, addLen, endFmt);');
+    this.line('if (oldLen > 0) { tf->_dtf = as_tf_fmt_clone(as_tf_fmt_at(tf, 0)); gc_write_barrier((void*)tf->_dtf); }');
+    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_para_text = NULL;');
+    this.indent--;
+    this.line('}');
+    // replaceText / replaceSelectedText (阶段三百三十七). AIR's replacement APIs do
+    // NOT move the selection or the caret -- they splice the range and leave the
+    // pre-existing selection in place, clamped to the new length. Measured on adl
+    // 51.4.1 (temp/maxsh/Main6.as):
+    //   sel [1,2) + replaceSelectedText("XY") -> "aXYc",   caret 2, sel [1,2)
+    //   sel [2,4) + replaceSelectedText("")   -> "Qac",    caret 3, sel [2,3) (end clamped)
+    //   sel [4,5) + replaceText(2,3,"ZZ")     -> "abZZdef", caret 5, sel [4,5)
+    // The range goes through the same splice the editor uses, so run offsets move
+    // and the inserted characters inherit the preceding format.
+    //
+    // Range handling, also measured (temp/maxsh/MainA.as, MainB.as): a NEGATIVE
+    // index and an INVERTED range are SILENT NO-OPS ("abcdef" unchanged for
+    // replaceText(3,1,"Q") and replaceText(-5,-1,"R")), an end past the text clamps
+    // ("abcdef!"), a begin past the text clamps to the end and appends ("abcdefx"),
+    // and a null string throws TypeError #2007 "Parameter text must be non-null.".
+    this.line('void TextField_replaceText(void* _this, int beginIndex, int endIndex, char* newText) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('if (newText == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter text must be non-null.", 2007)); return; }');
+    this.line('if (beginIndex < 0 || endIndex < 0 || beginIndex > endIndex) return;');
+    this.line('int len = (int)strlen(as_tf_text(tf));');
+    this.line('if (beginIndex > len) beginIndex = len;');
+    this.line('if (endIndex > len) endIndex = len;');
+    this.line('int sb = tf->_sel_begin, se = tf->_sel_end, sc = tf->_sel_caret;');
+    this.line('as_tf_splice(tf, beginIndex, endIndex, (newText != NULL) ? newText : "");');
+    this.line('int nlen = (int)strlen(as_tf_text(tf));');
+    this.line('if (sb >= 0) tf->_sel_begin = (sb > nlen) ? nlen : sb;');
+    this.line('if (se >= 0) tf->_sel_end = (se > nlen) ? nlen : se;');
+    this.line('if (sc >= 0) tf->_sel_caret = (sc > nlen) ? nlen : sc;');
+    this.line('as_tf_scroll_after_edit(tf);');
+    this.indent--;
+    this.line('}');
+    this.line('void TextField_replaceSelectedText(void* _this, char* value) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('int lo = (tf->_sel_begin >= 0) ? tf->_sel_begin : 0;');
+    this.line('int hi = (tf->_sel_end >= 0) ? tf->_sel_end : lo;');
+    this.line('if (hi < lo) hi = lo;');
+    this.line('TextField_replaceText(_this, lo, hi, value);');
     this.indent--;
     this.line('}');
     // Recursive render: depth order = low first (children[0..n-1]); the type-
@@ -27054,10 +27436,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} else if (as_is(o, &TextField_vt)) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)o;');
-    this.line('h = as_fp_ptr(h, tf->text); h = as_fp_ptr(h, tf->defaultTextFormat);');
-    this.line('if (tf->defaultTextFormat != NULL) {');
+    this.line('h = as_fp_ptr(h, tf->text); h = as_fp_ptr(h, tf->_dtf); h = as_fp_ptr(h, tf->_insFmt);');
+    this.line('if (as_tf_base_fmt(tf) != NULL) {');
     this.indent++;
-    this.line('TextFormat* f = tf->defaultTextFormat;');
+    this.line('TextFormat* f = as_tf_base_fmt(tf);');
     this.line('h = as_fp_ptr(h, f->font); h = as_fp_dbl(h, as_v_num_val(f->size)); h = as_fp_u32(h, (uint32_t)as_v_num_val(f->color));');
     this.line('h = as_fp_bool(h, as_v_bool_val(f->bold)); h = as_fp_bool(h, as_v_bool_val(f->italic)); h = as_fp_dbl(h, as_v_num_val(f->leading));');
     // align is an input too: as_tf_paragraph folds it into layoutAlign (the
@@ -27811,7 +28193,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_paint_delete(bd);');
     this.indent--;
     this.line('}');
-    this.line('if (tf->text != NULL && tf->defaultTextFormat != NULL) {');
+    this.line('if (tf->text != NULL && as_tf_base_fmt(tf) != NULL) {');
     this.indent++;
     this.line('as_tf_apply_autosize(tf);');
     this.line('void* para = as_tf_paragraph(tf);');
@@ -27975,7 +28357,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('double kdx = 0.0;');
     this.line('if (tf->_comp != NULL && tf->_comp[0] != 0) {');
     this.indent++;
-    this.line('TextFormat* kcf = tf->defaultTextFormat;');
+    this.line('TextFormat* kcf = as_tf_base_fmt(tf);');
     this.line('void* kcp = as_skia_textlayout_new_leading(tf->_comp, kcf->font, as_v_num_val(kcf->size), as_v_bool_val(kcf->bold) ? 1 : 0, as_v_bool_val(kcf->italic) ? 1 : 0, 0u, as_v_num_val(kcf->leading), 0.0, 0, 1);');
     this.line('if (kcp != NULL) { kdx = as_tf_longest_line(kcp); as_skia_textlayout_delete(kcp); }');
     this.indent--;
@@ -28009,7 +28391,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('double ccx = 0.0, ccy = 0.0, cch = 0.0;');
     this.line('if (as_skia_textlayout_caret_rect(para, as_tf_utf16_index(tf, as_tf_caret(tf)), &ccx, &ccy, &cch)) {');
     this.indent++;
-    this.line('TextFormat* cf = tf->defaultTextFormat;');
+    this.line('TextFormat* cf = as_tf_base_fmt(tf);');
     this.line('unsigned ccol = as_tf_color_at(tf, as_tf_caret(tf));');
     // The paint side: the geometry and colour the preview is drawn with, which is what
     // a caret/preview mismatch in the field is diagnosed against.

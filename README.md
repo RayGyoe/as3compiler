@@ -536,6 +536,10 @@ The full 19-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/displaylist-removechildren.as` — AIR's `removeChildren()`: **ascending** from `beginIndex`, `endIndex` **inclusive** (adl-measured, four children A..D over five ranges), plus removing a later sibling from inside a `removedFromStage` handler still works (what the real app's `VideoRootView.removeStage()` does while closing a meeting); the tail also pins that `hitTestPoint(…, true)` is **not** clipped by `scrollRect`
 - `examples/stage94t.as` — `int64`/`uint64` 64-bit integers (enhancement, see `docs/en/enhancements.md` §4.7)
 - `examples/textline.as` — `TextField.getLineMetrics` / `TextLineMetrics`
+- `examples/htmltext-metrics.as` — `TextField.getLineText`, `htmlText` block line heights, a stylesheet rule's `leading`, and "a trailing empty line adds no `textHeight`" (needs a text backend for the height half)
+- `examples/textwidth-trailing.as` — `textWidth`/`getLineMetrics` **include** trailing blanks (relational assertions; self-skips without a text backend)
+- `examples/text-edit-api.as` — `replaceText`/`replaceSelectedText` range+selection contract, assigning `.text` resets the caret/selection to 0, `setSelection(0,0)` collapses
+- `examples/textformat-merge.as` — `TextFormat`'s "unset means keep" per-field merge, the copy-returning getter, insert-time binding
 - `examples/bytearray-index.as` — the full semantics of the `ByteArray` index form
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` is a conversion, `new Vector.<T>(length)` is a construction
 - `examples/vector-dynamic.as` — `Vector.<*>` and dynamic access on a `*` receiver

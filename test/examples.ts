@@ -397,6 +397,16 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 而不是叠加：判据全是 Skia 文本后端下的关系式（textWidth / 墨迹宽），修前「每重绘一次就把
   // 字符排一遍」。故与 autosize-metrics.as 共用同一份 Skia 清单。
   'settextformat-runs.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // textwidth-trailing.as（阶段三百三十六 · D-T22）断言的是 textWidth / getLineMetrics().width
+  // 对**行尾空白**的口径（adl 含尾空格，Skia 的 getLongestLine 不含），全是 Skia 文本后端下的
+  // 关系式；纯 C 构建下 textWidth 恒 0，示例自行 skip。同样共用这份 Skia 清单。
+  'textwidth-trailing.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // text-edit-api.as（阶段三百三十七）钉 replaceText/replaceSelectedText 的区间与
+  // 选区口径、赋 .text 重置光标、setSelection(0,0) 收缩；与字体无关，无特殊清单。
+  'text-edit-api.as': [],
+  // htmltext-metrics.as（阶段三百三十六 · D-T23/D-T24）断言 getLineText、htmlText 块级行高、
+  // 规则 leading 与「尾部空行不计 textHeight」，行高相关部分只在 Skia 后端成立（示例自行跳过）。
+  'htmltext-metrics.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
   // tf-scale-metrics.as 断言的是**字体度量 + 字形光栅**（缩放字段的 textWidth/textHeight 口径，
   // 以及「字形按 scaleY 整体缩放、scaleX 不拉宽」的 ink 宽），两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十九的缩放口径回归）。

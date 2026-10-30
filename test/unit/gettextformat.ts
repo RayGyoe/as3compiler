@@ -90,19 +90,28 @@ function checkGetTextFormat(): string[] {
     body.includes('beginIndex < 0 && endIndex < 0'));
 
   // ---- the empty answer really is all-null ----
-  const emptyAt = c.indexOf('static TextFormat* as_tf_fmt_empty(void)');
-  check('as_tf_fmt_empty exists in the generated C', emptyAt > 0);
-  if (emptyAt > 0) {
-    const end = c.indexOf('}', c.indexOf('return o;', emptyAt));
-    const emptyBody = c.slice(emptyAt, end);
-    for (const f of ['size', 'color', 'bold', 'italic', 'underline', 'leading', 'kerning', 'letterSpacing', 'leftMargin', 'rightMargin']) {
-      check(`the empty TextFormat nulls ${f}`, emptyBody.includes(`o->${f} = as_v_null();`));
+  // 阶段三百三十五 moved the all-null body into as_tf_fmt_blank (a bare AS3
+  // TextFormat is now exactly that), so the pin follows it there: `empty` must
+  // delegate to the blank builder and clear `display` on top.
+  const blankAt = c.lastIndexOf('static TextFormat* as_tf_fmt_blank(void) {');
+  check('as_tf_fmt_blank exists in the generated C', blankAt > 0);
+  if (blankAt > 0) {
+    const end = c.indexOf('return o;', blankAt);
+    const blankBody = c.slice(blankAt, end);
+    for (const f of ['size', 'color', 'bold', 'italic', 'underline', 'leading', 'kerning', 'letterSpacing', 'leftMargin', 'rightMargin', 'indent', 'blockIndent', 'bullet', 'tabStops']) {
+      check(`the blank TextFormat nulls ${f}`, blankBody.includes(`o->${f} = as_v_null();`));
+    }
+    for (const f of ['font', 'align', 'url', 'target']) {
+      check(`the blank TextFormat leaves ${f} as C NULL`, blankBody.includes(`o->${f} = NULL;`));
     }
   }
+  const emptyAt = c.lastIndexOf('static TextFormat* as_tf_fmt_empty(void) {');
+  check('as_tf_fmt_empty builds on the blank format', emptyAt > 0 && c.slice(emptyAt, emptyAt + 200).includes('as_tf_fmt_blank()'));
 
   // ---- the constructor boxes, so a fresh TextFormat reads back numbers ----
+  // (Null-preserving boxing: an omitted field must stay null, not become 0.)
   check('TextFormat_ctor boxes its Object fields',
-    c.includes('o->size = as_v_num(size);') && c.includes('o->bold = as_v_bool(bold);'));
+    c.includes('o->size = as_tf_num_or_null(size);') && c.includes('o->bold = as_tf_bool_or_null(bold);'));
 
   if (ok > 0) console.log(`[getfmt] ${ok} getTextFormat checks passed`);
   return bad;

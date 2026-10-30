@@ -6766,25 +6766,30 @@ export class SymbolTable {
       // Our old 6-parameter list put `leading` SIXTH, where AIR has `underline`,
       // so `new TextFormat(null, 12, 0, false, false, 8)` silently set the wrong
       // field (it still does in AIR -- underline=8 -- but the two compilers
-      // disagreed about what the program meant). Defaults keep this build's
-      // historical values (size 12, color 0, bold/italic false) so that adding the
-      // mxmlc-accepted arities changes no existing rendering; AIR's own defaults
-      // are all null and its "unset means keep the current value" merge is still
-      // the open 遗留 item.
+      // disagreed about what the program meant).
+      //
+      // EVERY parameter is optional and defaults to NULL (AIR declares them all
+      // `Object`): measured on adl 51.4.1 (temp/tfc2/Main.as, case E0),
+      // `new TextFormat()` leaves 18 fields null and only `display` set
+      // ("block"), and such a format means "keep the current value" for every
+      // field when it is installed -- see TextField_set_defaultTextFormat.
+      // The parameters are therefore typed `any` (not Number/Boolean) so that
+      // "omitted" travels as a null BOX instead of collapsing to 0/false at the
+      // declaration site.
       constructor: { params: [
-        { name: 'font', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
-        { name: 'size', type: 'Number', defaultValue: { kind: 'Num', value: 12, isInt: false }, isRest: false },
-        { name: 'color', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
-        { name: 'bold', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
-        { name: 'italic', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
-        { name: 'underline', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
-        { name: 'url', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
-        { name: 'target', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
-        { name: 'align', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'font', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'size', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'color', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'bold', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'italic', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'underline', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'url', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'target', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'align', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'leftMargin', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'rightMargin', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'indent', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
-        { name: 'leading', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
+        { name: 'leading', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
       ] },
       superClass: 'Object',
       isFinal: false,
@@ -7024,7 +7029,6 @@ export class SymbolTable {
         // field to AIR's TextField default (true, measured).
         ['displayAsPassword', txf({ kind: 'bool' })],
         ['restrict', txf({ kind: 'string' })],
-        ['defaultTextFormat', txf({ kind: 'object', className: 'TextFormat' })],
         ['multiline', txf({ kind: 'bool' })],
         ['wordWrap', txf({ kind: 'bool' })],
         ['background', txf({ kind: 'bool' })],
@@ -7061,7 +7065,18 @@ export class SymbolTable {
         // out-of-range index throws RangeError #2006 (measured on adl 51.4.1,
         // temp/metricprobe/Metrics6.as).
         ['getLineMetrics', txm({ kind: 'object', className: 'TextLineMetrics' }, [{ name: 'index', type: 'int', defaultValue: null, isRest: false }])],
+        // getLineText(index): the line without its break byte, RangeError #2006 out
+        // of range (measured on adl 51.4.1, temp/htmlprobe/Main.as G0/G1).
+        ['getLineText', txm({ kind: 'string' }, [{ name: 'lineIndex', type: 'int', defaultValue: null, isRest: false }])],
         ['appendText', txm({ kind: 'void' }, [{ name: 's', type: 'String', defaultValue: null, isRest: false }])],
+        // replaceText / replaceSelectedText: AIR splices the range and leaves the
+        // selection alone (measured on adl 51.4.1, temp/maxsh/Main6.as).
+        ['replaceText', txm({ kind: 'void' }, [
+          { name: 'beginIndex', type: 'int', defaultValue: null, isRest: false },
+          { name: 'endIndex', type: 'int', defaultValue: null, isRest: false },
+          { name: 'newText', type: 'String', defaultValue: null, isRest: false },
+        ])],
+        ['replaceSelectedText', txm({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])],
         ['setSelection', txm({ kind: 'void' }, [{ name: 'begin', type: 'int', defaultValue: null, isRest: false }, { name: 'end', type: 'int', defaultValue: null, isRest: false }])],
         ['setTextFormat', txm({ kind: 'void' }, [{ name: 'format', type: 'TextFormat', defaultValue: null, isRest: false }, { name: 'begin', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }, { name: 'end', type: 'int', defaultValue: { kind: 'Num', value: -1, isInt: true }, isRest: false }])],
         // getTextFormat: AIR returns a snapshot of the character formatting over a
@@ -7087,6 +7102,15 @@ export class SymbolTable {
         ['selectionEndIndex', txg({ kind: 'int' }, 'selectionEndIndex')],
         ['caretIndex', txg({ kind: 'int' }, 'caretIndex')],
         ['htmlText', txg({ kind: 'string' }, 'htmlText')],
+        // defaultTextFormat is an ACCESSOR in AIR, not a variable, and its two
+        // halves are both observable: the getter hands out a COPY (adl 51.4.1,
+        // temp/tfc2/Main.as: `tf.defaultTextFormat === tf.defaultTextFormat` is
+        // false and mutating the result changes nothing), and the setter MERGES
+        // field by field -- a null source field keeps the target's current value
+        // (assigning `new TextFormat()` over any format is a no-op). The C
+        // storage lives in the runtime-only slot `_dtf`; the AS3 surface is this
+        // pair, exactly like AIR's.
+        ['defaultTextFormat', txg({ kind: 'object', className: 'TextFormat' }, 'defaultTextFormat')],
       ]),
       setters: new Map([
         // `text` stays a FIELD so reads stay a plain `tf->text` load, but writes go
@@ -7112,6 +7136,10 @@ export class SymbolTable {
         ['borderColor', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
         ['backgroundColor', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
         ['textColor', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'uint', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+        // `tf.defaultTextFormat = null` is a TypeError #2007 in AIR ("Parameter
+        // format must be non-null."), not a silent no-op -- measured on adl
+        // 51.4.1 (temp/tfc2/Main2.as, case F1).
+        ['defaultTextFormat', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'TextFormat', defaultValue: null, isRest: false }], owner: 'TextField', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
       ]),
       constructor: { params: [] },
       superClass: 'InteractiveObject',

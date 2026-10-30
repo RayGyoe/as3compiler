@@ -3124,6 +3124,30 @@ function checkTextFieldLongestLine(): string[] {
   check('no size decision is left reading as_skia_textlayout_max_width directly',
     !/double tw = as_skia_textlayout_max_width\(para\);/.test(c));
 
+  // ---- 阶段三百三十六 · D-T22：行尾空白算进 textWidth --------------------------
+  // adl 51.4.1 实测（temp/tfw2/Main.as）：`"Multitouch "` 比 `"Multitouch"` 宽一个空格、
+  // `"a "` 比 `"a"` 宽一个空格前进量，`getLineMetrics().width` 同口径，而纯空白的行宽仍是 0。
+  // Skia 的 getLongestLine()/LineMetrics::fWidth 会把行尾空白簇减掉，故新增一条专用接缝。
+  const glueText = readFileSync(join(root, 'vendor', 'skia_text_glue.cc'), 'utf8');
+  check('the text glue exposes a trailing-blank-inclusive longest line',
+    /^double sk_textlayout_max_width_incl_spaces\(void\* para\) \{/m.test(glueText));
+  check('...and folds the line trailing-space box back into a line advance',
+    glueText.includes('static double sk_line_advance_incl_spaces(')
+    && glueText.includes('getRectsForRange((unsigned)m.fStartIndex, (unsigned)m.fEndIndex'));
+  check('an all-blank line keeps width 0 (adl: textWidth 6 but line width 0)',
+    glueText.includes('if (m.fEndExcludingWhitespaces <= m.fStartIndex) return w;'));
+  check('getLineMetrics width uses the same helper as textWidth',
+    glueText.includes('if (width) *width = sk_line_advance_incl_spaces((Paragraph*)para, m);'));
+  check('as_tf_longest_line reads the inclusive accessor',
+    c.includes('double w = as_skia_textlayout_text_width(para);'));
+  check('the alignment probe and the paragraph measure agree on the width caliber',
+    c.includes('double m = as_skia_textlayout_text_width(pr);')
+    && c.includes('double m = as_skia_textlayout_text_width(pp);'));
+  const rt = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  check('the runtime declares the new seam and stubs it in BOTH no-text paths',
+    rt.includes('extern double sk_textlayout_max_width_incl_spaces(void* para);')
+    && (rt.match(/as_skia_textlayout_text_width\(void\* p\)/g) || []).length === 3);
+
   console.log(`     [tf-line] ${ok} TextField longest-line check(s) passed`);
   return bad;
 }
@@ -3170,7 +3194,13 @@ function checkTextFieldScrollAndCaret(): string[] {
   check('maxScrollH ignores wrapping only (no hscroll gate)',
     /int TextField_get_maxScrollH\(void\* _this\) \{\s*TextField\* tf = \(TextField\*\)_this;\s*if \(tf->wordWrap\) return 0;/.test(c));
   check('maxScrollH truncates textWidth + 4 - width (AIR reports 18 for 214.1 in a 200 px box)',
-    /double over = tw \+ 4\.0 - tf->_fieldWidth;\s*return \(over > 0\.0\) \? \(int\)over : 0;/.test(c));
+    /double over = tw \+ 4\.0 - tf->_fieldWidth;\s*(if \(as_tf_is_input\(tf\)\) over \+= tf->_fieldWidth \/ 4\.0 - 1\.0;\s*)?return \(over > 0\.0\) \? \(int\)over : 0;/.test(c));
+  // 阶段三百三十七: an EDITABLE field's extent carries one horizontal pan cell minus
+  // a pixel (adl: 200 px field is +49; 100/300/400 are +24/+74/+99), and drops back
+  // to the dynamic value when `type` returns to DYNAMIC (temp/maxsh/Main4.as).
+  check('an editable field adds one pan cell (width/4 - 1) to the extent',
+    c.includes('if (as_tf_is_input(tf)) over += tf->_fieldWidth / 4.0 - 1.0;')
+    && c.indexOf('if (as_tf_is_input(tf)) over += tf->_fieldWidth / 4.0 - 1.0;') > c.indexOf('int TextField_get_maxScrollH(void* _this) {'));
 
   // ③ Every painter/hit-tester pans by _scroll_h directly.
   const leftpx = c.match(/int leftpx = tf->_scroll_h;/g) ?? [];
@@ -3206,6 +3236,60 @@ function checkTextFieldScrollAndCaret(): string[] {
   console.log(`     [tfscroll] ${ok} TextField scroll/caret check(s) passed`);
   return bad;
 }
+// ---- TextField 的替换 API 与「赋 .text 重置光标」（阶段三百三十七）----------------
+// adl 51.4.1 实测（temp/maxsh/Main6/Main7/Main8/Main9/MainA/MainB.as）：
+//   * replaceText / replaceSelectedText 不动选区与光标（只把越界的端点钳到新长度）；
+//   * 负下标与反向区间是静默无操作，null 文本抛 #2007；
+//   * 赋 .text 一律把选区与光标重置为 0；
+//   * setSelection(0, 0) 与其它写法一样收缩（阶段九十四 的「空操作」口径已证伪）。
+function checkTextFieldReplaceApi(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tfreplace] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tfreplace] ${label}`); }
+  };
+
+  const symbols = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const c = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+
+  check('replaceText is declared as void replaceText(beginIndex:int, endIndex:int, newText:String)',
+    symbols.includes("['replaceText', txm({ kind: 'void' }, [")
+    && symbols.includes("{ name: 'beginIndex', type: 'int', defaultValue: null, isRest: false },")
+    && symbols.includes("{ name: 'newText', type: 'String', defaultValue: null, isRest: false },"));
+  check('replaceSelectedText is declared as void replaceSelectedText(value:String)',
+    symbols.includes("['replaceSelectedText', txm({ kind: 'void' }, [{ name: 'value', type: 'String', defaultValue: null, isRest: false }])]"));
+
+  const body = c.slice(c.indexOf('void TextField_replaceText(void* _this'));
+  const scoped = body.slice(0, body.indexOf('void TextField_replaceSelectedText'));
+  check('a null string throws #2007 (AIR: it is NOT an empty replacement)',
+    scoped.includes('as_throw(TypeError_new((char*)"Error #2007: Parameter text must be non-null.", 2007));'));
+  check('negative indices and an inverted range are silent no-ops',
+    scoped.includes('if (beginIndex < 0 || endIndex < 0 || beginIndex > endIndex) return;'));
+  check('the endpoints clamp to the text length (so a begin past the end appends)',
+    scoped.includes('if (beginIndex > len) beginIndex = len;')
+    && scoped.includes('if (endIndex > len) endIndex = len;'));
+  check('the selection is saved before the splice and re-applied clamped afterwards',
+    scoped.includes('int sb = tf->_sel_begin, se = tf->_sel_end, sc = tf->_sel_caret;')
+    && scoped.includes('if (sb >= 0) tf->_sel_begin = (sb > nlen) ? nlen : sb;')
+    && scoped.includes('if (se >= 0) tf->_sel_end = (se > nlen) ? nlen : se;'));
+
+  check('replaceSelectedText delegates to replaceText over the selection',
+    /void TextField_replaceSelectedText\(void\* _this, char\* value\) \{[\s\S]{0,400}?TextField_replaceText\(_this, lo, hi, value\);/.test(c));
+
+  check('assigning .text resets the selection and the caret to 0 (no length clamp)',
+    /void TextField_set_text\(void\* _this, char\* value\) \{[\s\S]{0,2500}?tf->_sel_caret = 0;[\s\S]{0,200}?tf->_sel_begin = 0;[\s\S]{0,200}?tf->_sel_end = 0;/.test(c)
+    && !/if \(tf->_sel_end > len\) tf->_sel_end = len;/.test(c));
+
+  check('setSelection(0, 0) is not special-cased any more',
+    !c.includes('if (begin == 0 && end == 0) return;'));
+
+  if (ok > 0) console.log(`[tfreplace] ${ok} replace-API checks passed`);
+  return bad;
+}
+registerGroup('unit: emit/TextFieldReplaceApi', checkTextFieldReplaceApi);
+
 registerGroup('unit: emit/TextFieldScrollAndCaret', checkTextFieldScrollAndCaret);
 
 // Top-level FREE FUNCTIONS were the last identifier class outside the C naming
@@ -4295,10 +4379,17 @@ function checkEmitTextFormatTable(): string[] {
   for (const field of ['url', 'target', 'indent', 'blockIndent', 'bullet', 'display', 'tabStops']) {
     check(`the struct has the ${field} member`, new RegExp(`^  [A-Za-z_][\\w ]*\\*? ${field};$`, 'm').test(c));
   }
-  check('TextFormat_new takes thirteen parameters', /TextFormat\* TextFormat_new\(char\* font, double size, unsigned color, bool bold, bool italic, bool underline, char\* url, char\* target, char\* align, as_value leftMargin, as_value rightMargin, as_value indent, double leading\)/.test(c));
+  // 阶段三百三十五: every parameter is `any` and defaults to null, because AIR
+  // leaves an omitted field UNSET and only a null can carry that. A `double`/
+  // `bool` signature would collapse "not given" to 0/false at the call site.
+  check('TextFormat_new takes thirteen as_value parameters', /TextFormat\* TextFormat_new\(as_value font, as_value size, as_value color, as_value bold, as_value italic, as_value underline, as_value url, as_value target, as_value align, as_value leftMargin, as_value rightMargin, as_value indent, as_value leading\)/.test(c));
   check('the constructor stores underline from its own parameter, not a hardcoded false',
-    c.includes('o->underline = as_v_bool(underline);'));
-  check('leading is bound from the 13th parameter', c.includes('o->leading = as_v_num(leading);'));
+    c.includes('o->underline = as_tf_bool_or_null(underline);'));
+  check('leading is bound from the 13th parameter', c.includes('o->leading = as_tf_num_or_null(leading);'));
+  check('an omitted string field stays unset (C NULL) instead of becoming ""',
+    c.includes('o->font = as_tf_str_or_null(font);'));
+  check('display is the one field a bare format fills in',
+    c.includes('o->display = (char*)"block";'));
   check('clone copies the table-only members too',
     c.includes('o->indent = src->indent; o->blockIndent = src->blockIndent; o->bullet = src->bullet; o->tabStops = src->tabStops;'));
 

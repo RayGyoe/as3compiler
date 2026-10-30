@@ -741,6 +741,65 @@ double sk_textlayout_max_width(void* para) {
   return (double)((skia::textlayout::Paragraph*)para)->getLongestLine();
 }
 
+// Advance width of ONE line INCLUDING its trailing whitespace.
+//
+// AIR counts the trailing blanks: measured on adl 51.4.1 (temp/tfw2/Main.as)
+// `"Multitouch"` is 53 and `"Multitouch "` / `"Multitouch  "` are 56 / 59 --
+// one 3 px space each -- and `getLineMetrics(0).width` reports the same numbers.
+// Skia strips them instead: TextLine subtracts every trailing whitespace cluster
+// from `fAdvance`, so both `getLongestLine()` and `LineMetrics::fWidth` stop at
+// the last visible glyph, and our textWidth used to be blank-insensitive.
+//
+// The public API does expose the full advance indirectly: `getRectsForRange`
+// emits a SEPARATE box for the trailing blanks (TextLine.cpp, "Separate trailing
+// spaces") whose right edge sits one `spacesWidth` past the line's advance, so
+// (max right - min left) over the line's boxes IS the advance including them.
+// A line made only of blanks has no such box (there are no non-blank glyphs to
+// trim down to) and AIR reports width 0 for it, which is what `fWidth` already
+// says -- so falling back to `fWidth` reproduces AIR there as well.
+static double sk_line_advance_incl_spaces(skia::textlayout::Paragraph* p,
+                                          const skia::textlayout::LineMetrics& m) {
+  double w = m.fWidth;
+  // An all-blank line keeps Skia's 0: AIR reports getLineMetrics().width 0 for a
+  // line of spaces (temp/tfw2/Main.as B3/B4, `"  "` -> textWidth 6 but line width
+  // 0), so only a line with visible content has blanks added to it.
+  if (m.fEndExcludingWhitespaces <= m.fStartIndex) return w;
+  if (m.fEndIndex <= m.fEndExcludingWhitespaces) return w;
+  using namespace skia::textlayout;
+  auto boxes = p->getRectsForRange((unsigned)m.fStartIndex, (unsigned)m.fEndIndex,
+                                   RectHeightStyle::kTight, RectWidthStyle::kTight);
+  if (boxes.empty()) return w;
+  double lo = 0.0, hi = 0.0;
+  for (size_t i = 0; i < boxes.size(); i++) {
+    double l = (double)boxes[i].rect.fLeft, r = (double)boxes[i].rect.fRight;
+    if (i == 0) { lo = l; hi = r; continue; }
+    if (l < lo) lo = l;
+    if (r > hi) hi = r;
+  }
+  double full = hi - lo;
+  // Alignment shifts every box by the same offset, which the (hi - lo) difference
+  // cancels -- this is the line's advance, not its right edge.
+  return (full > w) ? full : w;
+}
+
+// AS3 TextField.textWidth: the longest line, trailing blanks included. The
+// paragraph-level max keeps Skia's own fallback for an all-blank field (where
+// getLongestLine() is the full advance while every line box is 0 -- AIR reports
+// textWidth 6 for two spaces but getLineMetrics().width 0).
+double sk_textlayout_max_width_incl_spaces(void* para) {
+  if (para == NULL) return 0.0;
+  using namespace skia::textlayout;
+  auto p = (Paragraph*)para;
+  double w = (double)p->getLongestLine();
+  std::vector<LineMetrics> lm;
+  p->getLineMetrics(lm);
+  for (auto& m : lm) {
+    double lw = sk_line_advance_incl_spaces(p, m);
+    if (lw > w) w = lw;
+  }
+  return w;
+}
+
 int sk_textlayout_line_count(void* para) {
   return (int)((skia::textlayout::Paragraph*)para)->lineNumber();
 }
@@ -784,11 +843,25 @@ int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops,
 int sk_textlayout_line_box(void* para, int idx, double leading, const char* family, double size,
                            int bold, int italic,
                            double* ascent, double* descent, double* left, double* width) {
-  if (para == NULL || idx < 0) return 0;
+  if (para == NULL || idx < -1) return 0;
   using namespace skia::textlayout;
   std::vector<LineMetrics> lm;
   ((Paragraph*)para)->getLineMetrics(lm);
   int n = (int)lm.size();
+  // idx == -1 asks for the "no characters on this line" answer, which the caller
+  // detects from the text (a trailing empty line still HAS a line box in Skia, and
+  // it is styled by whatever run Skia guessed). AIR reports the DEFAULT format's box
+  // there: measured on adl 51.4.1 (temp/htmlprobe/Main.as H1), the empty line after
+  // two 18 px rule lines answers 12/9/3/0 -- the 12 px defaultTextFormat box.
+  if (idx == -1) {
+    SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
+    if (am.model <= 0.0) return 0;
+    if (ascent) *ascent = am.asc;
+    if (descent) *descent = am.desc;
+    if (left) *left = 0.0;
+    if (width) *width = 0.0;
+    return 1;
+  }
   if (idx >= n) {
     // An empty field still has one line (AIR: numLines == 1) and reports the
     // default format's font metrics with width 0 -- Skia has no line box to read
@@ -824,7 +897,10 @@ int sk_textlayout_line_box(void* para, int idx, double leading, const char* fami
   if (ascent) *ascent = asc;
   if (descent) *descent = desc;
   if (left) *left = (double)m.fLeft;
-  if (width) *width = (double)m.fWidth;
+  // AIR's getLineMetrics().width counts trailing blanks exactly like textWidth
+  // does (measured on adl 51.4.1, temp/tfw2/Main.as: `"ab  \ncd"` line 0 is 17 =
+  // 11 + 2*3, and a blanks-only line is 0), while Skia's fWidth strips them.
+  if (width) *width = sk_line_advance_incl_spaces((Paragraph*)para, m);
   return 1;
 }
 

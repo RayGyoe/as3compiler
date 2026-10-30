@@ -604,11 +604,17 @@ function checkLineMetrics(): string[] {
   // for a clamp would false-positive. getLineMetrics must pass it through verbatim.
   const lmBody = gen.slice(gen.indexOf('static TextLineMetrics* TextField_getLineMetrics(void* _this, int index) {'));
   const lmBodyScoped = lmBody.slice(0, lmBody.indexOf('\n}\n'));
-  check('the leading comes from defaultTextFormat and is NOT clamped',
-    lmBodyScoped.includes('double lead = (tf->defaultTextFormat != NULL) ? as_v_num_val(tf->defaultTextFormat->leading) : 0.0;') &&
+  // 阶段三百三十六: the leading comes from the format IN EFFECT ON THE LINE (a
+  // stylesheet rule's `leading` lives on the run, adl reports asc 9 / desc 3 /
+  // lead 6 for such a line), not from defaultTextFormat -- and it is still not
+  // clamped, unlike textHeight's no-Skia approximation.
+  check('the leading comes from the line\'s own format and is NOT clamped',
+    lmBodyScoped.includes('double lead = (lf != NULL) ? as_v_num_val(lf->leading) : 0.0;') &&
+    lmBodyScoped.includes('TextFormat* lf = lempty ? as_tf_base_fmt(tf) : as_tf_fmt_at(tf, starts[index]);') &&
     !/lead\s*<\s*0/.test(lmBodyScoped));
-  check('the per-line box is asked for the default format face plus that leading',
-    emitted.includes('as_skia_textlayout_line_box(para, index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);'));
+  check('an empty line is measured with the DEFAULT format box (idx -1)',
+    lmBodyScoped.includes('int lempty = (le0 <= starts[index]) ? 1 : 0;') &&
+    lmBodyScoped.includes('as_skia_textlayout_line_box(para, lempty ? -1 : index, lead, fam, size, bold, italic, &asc, &desc, &left, &w);'));
   check('x is the 2px inset, the block align shift and the line box left offset',
     emitted.includes('double x = 2.0 + as_tf_align_dx(tf) + left;'));
   // A field with no layout width (wordWrap off) still honours horizontalAlign PER
@@ -685,7 +691,7 @@ function checkLineMetrics(): string[] {
     !glue.includes('if (leading < 0.0) {'));
   check('left/width come from the line box itself',
     glue.includes('if (left) *left = (double)m.fLeft;') &&
-    glue.includes('if (width) *width = (double)m.fWidth;'));
+    glue.includes('if (width) *width = sk_line_advance_incl_spaces((Paragraph*)para, m);'));
 
   // ---- runtime plumbing: extern + BOTH stubs ---------------------------
   check('runtime declares the extern so C99 does not reject the call',
@@ -918,7 +924,8 @@ function checkTfScaleMetrics(): string[] {
   check('textHeight is scaled by the ratio (Skia path)',
     emitted.includes('return h * as_tf_scale_ratio(tf);'));
   check('textHeight is scaled by the ratio (pure-C path)',
-    emitted.includes('return (double)as_tf_line_count(tf) * (size * 1.2 + lead) * as_tf_scale_ratio(tf);'));
+    emitted.includes('double lh = (double)lk * (size * 1.2 + lead) - ((lk > 1) ? lead : 0.0);')
+    && emitted.includes('return lh * as_tf_scale_ratio(tf);'));
 
   // ③ 绘制前把 CTM 归一成 scaleY 的均匀缩放；基准必须是**画布实际缩放**。
   //
@@ -1417,4 +1424,57 @@ registerGroup('unit: display/Scale9Grid', checkScale9Grid);
 registerGroup('unit: display/LineMetrics', checkLineMetrics);
 registerGroup('unit: display/AutoSizeMetrics', checkAutoSizeMetrics);
 registerGroup('unit: display/TfScaleMetrics', checkTfScaleMetrics);
+// ---- htmlText 的块级行高、规则 leading 与 getLineText（阶段三百三十六）----------
+// 三项都在阶段一百四十八登记为未修，本轮按 adl 51.4.1 双端实测落地（temp/htmlprobe）：
+//   * 规则 `leading:6px` 折进 run 自己的 TextFormat（行盒 18 = 9+3+6，而不是 12）；
+//   * 尾部空行不计入 textHeight（`"ab\\n"` 是 numLines 2 / textHeight 12）；
+//   * getLineText(index) 存在，越界抛 RangeError #2006，行尾不带宽字符。
+function checkHtmlTextMetrics(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [htmlmeta] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [htmlmeta] ${label}`); }
+  };
+
+  const glue = readGlue();
+  const symbols = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+
+  check('getLineText is declared as String getLineText(lineIndex:int)',
+    symbols.includes("['getLineText', txm({ kind: 'string' }, [{ name: 'lineIndex', type: 'int', defaultValue: null, isRest: false }])]"));
+  check('getLineText throws #2006 for an index outside [0, numLines)',
+    emitted.includes('char* TextField_getLineText(void* _this, int lineIndex) {')
+    && emitted.includes('if (lineIndex < 0 || lineIndex >= n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }'));
+  check('...and returns the line WITHOUT its break byte',
+    emitted.includes('int le = as_tf_line_end(t, starts, n, lineIndex, len);')
+    && emitted.includes('return as_str_substring(t, ls, le);'));
+
+  check('textHeight drops trailing EMPTY lines (their boxes are not charged)',
+    emitted.includes('int k = n;')
+    && emitted.includes('while (k > 1 && as_tf_line_end(et, starts, n, k - 1, elen) <= starts[k - 1]) k--;')
+    && emitted.includes('double h = (k < n) ? tops[k] : as_skia_textlayout_height(para);'));
+  check('the pure-C textHeight applies the same rule and drops ONE trailing leading',
+    emitted.includes('int lk = ln;')
+    && emitted.includes('double lh = (double)lk * (size * 1.2 + lead) - ((lk > 1) ? lead : 0.0);'));
+
+  check('the html run carries its own leading',
+    emitted.includes('static void as_tf_html_emit_run(TextField* tf, int begin, int end, char* face, double size, unsigned color, bool bold, bool italic, bool underline, double lead) {')
+    && emitted.includes('TextFormat* f = as_tf_fmt_make(face, size, color, bold, italic, 0, lead);'));
+  check('the style stack saves and restores it',
+    emitted.includes('double st_lead[AS_TF_STACK];')
+    && emitted.includes('st_lead[depth] = lead;')
+    && emitted.includes('face = st_face[depth]; size = st_size[depth]; color = st_color[depth]; lead = st_lead[depth];'));
+  check('a stylesheet rule folds `leading` (and `line-height`) in',
+    emitted.includes('v = as_ss_str(rule, "leading"); if (v == NULL) v = as_ss_str(rule, "line-height"); if (v != NULL) { double d = as_css_num(v); if (d >= 0.0) lead = ((as_tf_base_fmt(tf) != NULL) ? as_v_num_val(as_tf_base_fmt(tf)->leading) : 0.0) + d; }'));
+  check('an empty line box is asked for with idx -1 (the default format box)',
+    glue.includes('if (idx == -1) {')
+    && glue.includes('if (para == NULL || idx < -1) return 0;'));
+
+  if (ok > 0) console.log(`[htmlmeta] ${ok} htmlText metric checks passed`);
+  return bad;
+}
+registerGroup('unit: display/HtmlTextMetrics', checkHtmlTextMetrics);
+
 registerGroup('unit: display/ListEvents', checkListEvents);

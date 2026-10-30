@@ -645,6 +645,10 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/swc-mask-frames.as` — `clipDepth` 遮罩是**活对象引用**、stencil 每帧从遮罩兄弟对象重建：morph 遮罩随 `PlaceObject2.Ratio` 变形、sprite 遮罩取子件并集、时间轴移动/替换遮罩都跟着走（帧 100 换字符后 `numChildren` 仍是 4，与 adl 一致；morph 遮罩跟随 ratio 是**刻意保留**的偏差，见 `docs/zh-cn/swc.md` §9.2 F12）
 - `examples/stage94t.as` — `int64`/`uint64` 64 位整数（增强，见 `docs/zh-cn/enhancements.md` §4.7）
 - `examples/textline.as` — `TextField.getLineMetrics` / `TextLineMetrics`
+- `examples/htmltext-metrics.as` — `TextField.getLineText`、`htmlText` 块级行高、规则 `leading`、以及「尾部空行不计 `textHeight`」（行高部分需文本后端）
+- `examples/textwidth-trailing.as` — `textWidth`/`getLineMetrics` **含**行尾空白（关系式断言，无文本后端自跳过）
+- `examples/text-edit-api.as` — `replaceText`/`replaceSelectedText` 的区间与选区口径、赋 `.text` 重置光标/选区、`setSelection(0,0)` 收缩
+- `examples/textformat-merge.as` — `TextFormat` 的「未设则保持」逐字段合并、返回副本的 getter、插入时绑定
 - `examples/bytearray-index.as` — `ByteArray` 下标形式的完整语义
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` 是转换、`new Vector.<T>(length)` 是构造
 - `examples/vector-dynamic.as` — `Vector.<*>` 与 `*` 接收者的动态访问

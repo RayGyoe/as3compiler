@@ -95,7 +95,12 @@ function checkSetTextFormat(): string[] {
     body.includes('if (begin < 0) begin = 0;') && body.includes('if (end < 0 || end > len) end = len;')
     && body.includes('if (begin > end) { int t = begin; begin = end; end = t; }'));
   check('an empty range is a no-op', body.includes('if (begin >= end) return;'));
-  check('a null format is a no-op', body.includes('if (format == NULL) return;'));
+  // 阶段三百三十五: null is a TypeError #2007 in AIR ("Parameter format must be
+  // non-null."), measured on adl 51.4.1 (temp/tfc2/Main3.as G1) -- it used to be
+  // a silent no-op here.
+  check('a null format throws #2007', body.includes('if (format == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter format must be non-null.", 2007)); return; }'));
+  check('an unset field keeps the format already in effect at begin',
+    body.includes('if (begin < end) format = as_tf_fmt_merge(format, as_tf_fmt_at(tf, begin));'));
   check('the paragraph cache is invalidated', body.includes('tf->_runs_gen++;')
     && body.includes('as_skia_textlayout_delete(tf->_para); tf->_para = NULL;'));
 

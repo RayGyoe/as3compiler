@@ -101,8 +101,8 @@ key(h, 34, 0);
 eq(h.caretIndex, 35, "PageDown again keeps it on line 4 (31 + 4)");
 
 // ---- D. 短行钳位 + 列位记忆（箭头）----
-// setSelection(0, 0) 在 adl 上是**no-op**（实测口径，见 TextField_setSelection），所以
-// 这里用 Home/End 把光标放到文本两端。
+// setSelection(0, 0) 与其它写法一样收缩到 0（阶段三百三十七 复测，见
+// TextField_setSelection）；这里仍然用显式下标把光标放到文本两端。
 h.setSelection(9, 9);                // 行 0 第 9 列
 key(h, 40, 0);                       // Down
 hteq2(h, 13, "Down onto the 2-char line clamps the caret to its end");

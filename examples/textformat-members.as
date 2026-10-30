@@ -11,10 +11,9 @@
 //    false, 8)` meant two different things in the two compilers -- and AIR's
 //    reading (underline = 8) is the one that has to win.
 //
-// Still open (registered in TODO.md): a zero-argument `new TextFormat()` yields
-// all-null fields in AIR and "keep whatever is set" when assigned to
-// defaultTextFormat; here it fills in this build's historical defaults. That item
-// needs the field-by-field merge, which is a separate stage.
+// The zero-argument form and the field-by-field merge it feeds were finished in
+// 阶段三百三十五 (see examples/textformat-merge.as); ④ below pins the part that
+// belongs to this member table.
 
 function check(cond:Boolean, msg:String):void { if (!cond) throw new Error("FAIL: " + msg); }
 
@@ -43,10 +42,24 @@ check(f.display == "block", "display");
 check(f.tabStops.length == 2 && f.tabStops[1] == 20, "tabStops");
 
 // ③ The 6th positional argument is `underline`: passing 8 there sets underline,
-//    and `leading` keeps its default. This is the mapping AIR uses, so a program
-//    that means "leading 8" must say so.
+//    and `leading` stays UNSET (null, not 0) -- AIR's constructor leaves every
+//    omitted field null, and a null field means "keep the current value" when the
+//    format is installed (阶段三百三十五). This is the mapping AIR uses, so a
+//    program that means "leading 8" must say so.
 var six:TextFormat = new TextFormat("_typewriter", 12, 0x000000, false, false, 8);
 check(six.underline == true, "the 6th argument is underline (AIR order)");
-check(six.leading == 0, "leading is untouched by the 6th argument");
+check(six.leading == null, "leading is untouched by the 6th argument");
+
+// ④ A zero-argument format is ALL NULL apart from `display` -- measured on adl
+//    51.4.1 (temp/tfc2/Main.as, case E0). This is what makes the merge in ⑤
+//    meaningful: an unset field carries no opinion.
+var bare:TextFormat = new TextFormat();
+check(bare.font == null && bare.size == null && bare.color == null, "bare: font/size/color unset");
+check(bare.bold == null && bare.italic == null && bare.underline == null, "bare: bold/italic/underline unset");
+check(bare.leading == null && bare.kerning == null && bare.letterSpacing == null, "bare: leading/kerning/letterSpacing unset");
+check(bare.align == null && bare.leftMargin == null && bare.rightMargin == null, "bare: align/margins unset");
+check(bare.indent == null && bare.blockIndent == null && bare.bullet == null, "bare: indent/blockIndent/bullet unset");
+check(bare.url == null && bare.target == null && bare.tabStops == null, "bare: url/target/tabStops unset");
+check(bare.display == "block", "bare: display is the one field AIR fills in");
 
 trace("textformat-members: OK");

@@ -63,10 +63,19 @@ if (tf.numLines != before + 1) {
   throw new Error("appendText should add a line: " + before + " -> " + tf.numLines);
 }
 
-// --- textHeight tracks the layout; the line height stays constant ------------
-var lineHeight2:Number = tf.textHeight / tf.numLines;
-if (lineHeight2 < lineHeight - 0.01 || lineHeight2 > lineHeight + 0.01) {
-  throw new Error("line height drifted: " + lineHeight + " -> " + lineHeight2);
+// --- textHeight counts only lines that HAVE characters ------------------------
+// AIR does not charge the trailing empty line to textHeight, although it does count
+// it in numLines (measured on adl 51.4.1, temp/htmlprobe/Main2.as K0..K4): the ten
+// lines above are 120 px tall, and after `appendText("appended\n")` the field still
+// reports the SAME 120 px while numLines goes 10 -> 11 -- the appended line's own box
+// and the trailing empty one cancel out against the previous trailing line. The old
+// `textHeight / numLines` invariant therefore cannot hold across that call; what
+// holds in both build flavors is "textHeight is a whole number of line boxes".
+var textHeight2:Number = tf.textHeight;
+var boxes:Number = textHeight2 / lineHeight;
+if (boxes < 1 || Math.abs(boxes - Math.round(boxes)) > 0.01) {
+  throw new Error("textHeight must be a whole number of line boxes: " + textHeight2 + " / " + lineHeight);
 }
+if (textHeight2 <= 0) throw new Error("textHeight must stay positive: " + textHeight2);
 
 trace("textflow: numLines/maxScrollV/scrollV/appendText/textHeight OK");
