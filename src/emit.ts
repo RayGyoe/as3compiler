@@ -70,11 +70,15 @@ type WithScope = {
   //           it does not have falls through to the lexical binding);
   // 'runtime': the object may have keys this subset cannot see (any / Object /
   //           dynamic class / Proxy), so membership is tested with as_dyn_has.
-  // 'builtin': a closed builtin receiver (String, Vector.<T>) whose member set is
-  //           known at compile time but is NOT a class trait table, so membership
-  //           is a name-set test and the read/call goes through the ordinary
-  //           static String/Vector member paths.
-  mode: 'sealed' | 'runtime' | 'builtin';
+  // 'builtin': a closed builtin receiver (String, Vector.<T>, a Function value)
+  //           whose member set is known at compile time but is NOT a class trait
+  //           table, so membership is a name-set test and the read/call goes
+  //           through the ordinary static String/Vector/Function member paths.
+  // 'class':   a Class value (statically known or a Class-typed variable) whose
+  //           member set is the class's STATIC traits plus the Class prototype's
+  //           own members (toString / valueOf / hasOwnProperty /
+  //           propertyIsEnumerable).
+  mode: 'sealed' | 'runtime' | 'builtin' | 'class';
   className: string | null;
   // C expression yielding the object pointer the as_dyn_* helpers take.
   ptr: string;
@@ -105,6 +109,27 @@ const VECTOR_WITH_MEMBERS = new Set<string>([
   'filter', 'forEach', 'includes', 'indexOf', 'insertAt', 'join', 'map', 'pop',
   'push', 'removeAt', 'reverse', 'shift', 'slice', 'sort', 'splice',
   'toString', 'unshift',
+]);
+// `with (f)` where f is a Function value: the members AIR resolves on the
+// function instead of falling through to the enclosing scope (measured on adl
+// 51.4.1, temp/with3/): `length` (declared arity), the Function.prototype
+// methods (toString / valueOf / hasOwnProperty / propertyIsEnumerable / call /
+// apply). `prototype` is deliberately ABSENT: AIR answers a plain Object for it
+// and as_closure carries no prototype slot, so the name falls through lexically
+// instead of being claimed with a fabricated value. `name` is absent too (AIR
+// falls through to `this.name`, temp/with3 P11). Each name here must be one
+// emitFunctionMethod / emitCall / emitMember actually implements.
+const FUNCTION_WITH_MEMBERS = new Set<string>([
+  'length', 'toString', 'valueOf', 'hasOwnProperty', 'propertyIsEnumerable',
+  'call', 'apply', 'prototype',
+]);
+// The Class prototype's own members, visible on a Class value (temp/with3/:
+// `with (KC) { toString() }` is "[class KC]", valueOf() is the class itself,
+// hasOwnProperty("toString") is TRUE -- toString/valueOf are OWN properties of a
+// class object -- while hasOwnProperty/propertyIsEnumerable are inherited
+// methods and propertyIsEnumerable is false for statics).
+const CLASS_WITH_PROTO_MEMBERS = new Set<string>([
+  'toString', 'valueOf', 'hasOwnProperty', 'propertyIsEnumerable', 'prototype',
 ]);
 
 // A closure created INSIDE a `with` body captures the with object itself, not just
@@ -185,55 +210,68 @@ function collectImplicitGlobals(body: Stmt[]): string[] {
   const names: string[] = [];
   const seen = new Set<string>();
   const push = (n: string): void => { if (!seen.has(n)) { seen.add(n); names.push(n); } };
-  const scanExpr = (e: Expr): void => {
+  // AIR: an undeclared assignment at SCRIPT level is an implicit GLOBAL (the
+  // pre-existing non-strict frame-script rule). Inside a FUNCTION an undeclared
+  // assignment is a local -- UNLESS it sits lexically inside a `with` body, where
+  // AIR again creates an implicit GLOBAL: a write inside one closure's with body
+  // is read back from another closure's with body (measured on adl 51.4.1,
+  // temp/with3n C/F/G). fnDepth tracks closure nesting, withDepth the `with`
+  // nesting (a closure created inside a with body keeps its flag for ITS OWN
+  // with bodies).
+  const scanExpr = (e: Expr, withDepth: number, fnDepth: number): void => {
     switch (e.kind) {
       case 'Assign':
         // `=` and every compound form: with no prior value the slot reads back
         // `undefined`, which is exactly what a fresh global holds.
-        if (e.target.kind === 'Var') push(e.target.name);
-        scanExpr(e.value);
+        if (e.target.kind === 'Var' && (fnDepth === 0 || withDepth > 0)) push(e.target.name);
+        scanExpr(e.value, withDepth, fnDepth);
         break;
-      case 'Binary': scanExpr(e.left); scanExpr(e.right); break;
-      case 'Conditional': scanExpr(e.cond); scanExpr(e.then); scanExpr(e.else); break;
-      case 'Call': scanExpr(e.callee); for (const a of e.args) scanExpr(a); break;
-      case 'Paren': scanExpr(e.expr); break;
-      case 'Unary': scanExpr(e.operand); break;
-      case 'Sequence': for (const x of e.exprs) scanExpr(x); break;
-      default: break; // literals, member access, function expressions (own scope)
+      case 'Binary': scanExpr(e.left, withDepth, fnDepth); scanExpr(e.right, withDepth, fnDepth); break;
+      case 'Conditional': scanExpr(e.cond, withDepth, fnDepth); scanExpr(e.then, withDepth, fnDepth); scanExpr(e.else, withDepth, fnDepth); break;
+      case 'Call': scanExpr(e.callee, withDepth, fnDepth); for (const a of e.args) scanExpr(a, withDepth, fnDepth); break;
+      case 'Paren': scanExpr(e.expr, withDepth, fnDepth); break;
+      case 'Unary': scanExpr(e.operand, withDepth, fnDepth); break;
+      case 'Sequence': for (const x of e.exprs) scanExpr(x, withDepth, fnDepth); break;
+      case 'FunctionExpr':
+        // A function expression does not end the with context: its own body's
+        // with statements raise the depth again.
+        walk([e.body], withDepth, fnDepth + 1);
+        break;
+      default: break; // literals, member access (a member's own scope is not a with)
     }
   };
-  const walk = (stmts: Stmt[]): void => {
+  const walk = (stmts: Stmt[], withDepth: number, fnDepth: number): void => {
     for (const s of stmts) {
       switch (s.kind) {
-        case 'ExprStmt': scanExpr(s.expr); break;
-        case 'VarDecl': if (s.init) scanExpr(s.init); break;
-        case 'VarDecls': for (const d of s.decls) if (d.init) scanExpr(d.init); break;
-        case 'ConstDecl': if (s.init) scanExpr(s.init); break;
-        case 'ConstDecls': for (const d of s.decls) if (d.init) scanExpr(d.init); break;
-        case 'If': scanExpr(s.cond); walk([s.then]); if (s.else) walk([s.else]); break;
-        case 'While': case 'DoWhile': scanExpr(s.cond); walk([s.body]); break;
+        case 'ExprStmt': scanExpr(s.expr, withDepth, fnDepth); break;
+        case 'VarDecl': if (s.init) scanExpr(s.init, withDepth, fnDepth); break;
+        case 'VarDecls': for (const d of s.decls) if (d.init) scanExpr(d.init, withDepth, fnDepth); break;
+        case 'ConstDecl': if (s.init) scanExpr(s.init, withDepth, fnDepth); break;
+        case 'ConstDecls': for (const d of s.decls) if (d.init) scanExpr(d.init, withDepth, fnDepth); break;
+        case 'If': scanExpr(s.cond, withDepth, fnDepth); walk([s.then], withDepth, fnDepth); if (s.else) walk([s.else], withDepth, fnDepth); break;
+        case 'While': case 'DoWhile': scanExpr(s.cond, withDepth, fnDepth); walk([s.body], withDepth, fnDepth); break;
         case 'For':
-          if (s.init) { if (s.init.kind === 'VarDecl' && s.init.init) scanExpr(s.init.init); else scanExpr(s.init as Expr); }
-          if (s.cond) scanExpr(s.cond);
-          if (s.update) scanExpr(s.update);
-          walk([s.body]);
+          if (s.init) { if (s.init.kind === 'VarDecl' && s.init.init) scanExpr(s.init.init, withDepth, fnDepth); else scanExpr(s.init as Expr, withDepth, fnDepth); }
+          if (s.cond) scanExpr(s.cond, withDepth, fnDepth);
+          if (s.update) scanExpr(s.update, withDepth, fnDepth);
+          walk([s.body], withDepth, fnDepth);
           break;
-        case 'ForIn': case 'ForEachIn': scanExpr(s.iterable); walk([s.body]); break;
-        case 'Block': walk(s.body); break;
-        case 'Switch': scanExpr(s.disc); for (const c of s.cases) walk(c.body); break;
-        case 'With': scanExpr(s.obj); walk([s.body]); break;
+        case 'ForIn': case 'ForEachIn': scanExpr(s.iterable, withDepth, fnDepth); walk([s.body], withDepth, fnDepth); break;
+        case 'Block': walk(s.body, withDepth, fnDepth); break;
+        case 'Switch': scanExpr(s.disc, withDepth, fnDepth); for (const c of s.cases) walk(c.body, withDepth, fnDepth); break;
+        case 'With': scanExpr(s.obj, withDepth, fnDepth); walk([s.body], withDepth + 1, fnDepth); break;
         case 'Try':
-          walk(s.tryBody.body);
-          for (const c of s.catches) walk(c.body.body);
-          if (s.finallyBody) walk(s.finallyBody.body);
+          walk(s.tryBody.body, withDepth, fnDepth);
+          for (const c of s.catches) walk(c.body.body, withDepth, fnDepth);
+          if (s.finallyBody) walk(s.finallyBody.body, withDepth, fnDepth);
           break;
-        case 'Label': walk([s.body]); break;
-        case 'Return': if (s.value) scanExpr(s.value); break;
+        case 'Label': walk([s.body], withDepth, fnDepth); break;
+        case 'Return': if (s.value) scanExpr(s.value, withDepth, fnDepth); break;
         default: break; // nested function/class declarations own their scopes
       }
     }
   };
-  walk(body);
+  walk(body, 0, 0);
   return names;
 }
 
@@ -1628,7 +1666,7 @@ export class Emitter {
   // the subclass happened to put there. emitStructs therefore emits each of these
   // right after the owning base class's own declared fields (阶段一百四十五).
   private hasBaseClassSlots(cls: string): boolean {
-    if (cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject' || cls === 'ScreenMouseEvent') return true;
+    if (cls === 'Screen' || cls === 'NativeWindow' || cls === 'Matrix3D' || cls === 'SharedObject' || cls === 'ScreenMouseEvent' || cls === 'RegExp') return true;
     return this.trailingSlotLines(cls).length > 0;
   }
 
@@ -1641,6 +1679,24 @@ export class Emitter {
       // entry and no GC root.
       this.line('double _screen_x;');
       this.line('double _screen_y;');
+      return;
+    }
+    if (cls === 'RegExp') {
+      // RegExp's read-only surface (source/global/ignoreCase/multiline/dotall/
+      // extended) and its internal state (the compiled program, the flag chars)
+      // live in C-runtime-only slots behind getter-only accessors -- AIR rejects
+      // a write to any of the six and has no `flags` member at all (measured on
+      // adl 51.4.1, temp/with3/). `_source`/`_flags` are GC strings marked by the
+      // props table (see emitPropTables); `_compiled` is malloc'd by
+      // as_regex_compile and needs no entry.
+      this.line('char* _source;');
+      this.line('char* _flags;');
+      this.line('as_regex* _compiled;');
+      this.line('bool _global;');
+      this.line('bool _ignoreCase;');
+      this.line('bool _multiline;');
+      this.line('bool _dotall;');
+      this.line('bool _extended;');
       return;
     }
     if (cls === 'Screen') {
@@ -2321,6 +2377,21 @@ export class Emitter {
     this.line('return c;');
     this.indent--;
     this.line('}');
+    // `x is c` / `x as c` where c is a *-typed slot holding the class value at
+    // run time. AIR validates the value BEFORE the subtype test, with two distinct
+    // errors: undefined is #1010 and EVERYTHING ELSE that is not a class object
+    // (null included) is #1009 -- a number or a string throws the same as null
+    // (measured on adl 51.4.1, temp/isany/: `new Sprite() is bad` with bad=5
+    // throws #1009, `is und` throws #1010, O3-O5/A1-A4). The left side is
+    // evaluated FIRST (A5/A6: the side-effect counter reads 1 despite the throw),
+    // so the caller must sequence the left operand into a temp before this call.
+    this.line('static as_class* as_class_req_any(as_value c) {');
+    this.indent++;
+    this.line('if (c.tag == 5) { as_throw(TypeError_new((char*)"Error #1010: A term is undefined and has no properties.", 1010)); return NULL; }');
+    this.line('if (c.tag != 4 || c.ptr == NULL || !as_v_is_class(c)) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return NULL; }');
+    this.line('return (as_class*)as_v_obj_val(c);');
+    this.indent--;
+    this.line('}');
     // The subtype test itself is the same vtable walk the static form uses
     // (`as_is`), but with AS3's AUTOBOXING on top: every non-null, non-undefined
     // value IS an Object, so a primitive/array/function/record asked `is <Object>`
@@ -2471,6 +2542,133 @@ export class Emitter {
     this.line('parts[1] = name;');
     this.line('parts[2] = ".";');
     this.line('as_throw(ReferenceError_new(as_str_concat_n(3, parts), 1074));');
+    this.indent--;
+    this.line('}');
+    // The same #1074 / #1037 errors with a RECEIVER named (AIR spells the receiver
+    // in a Function/Class with body, measured on adl 51.4.1, temp/with3f:
+    // "Illegal write to read-only property length on Function.", "Cannot assign to
+    // a method call on Function.", "... read-only property sg on class
+    // FilePrivateNS:Main6.KC." -- our subset has no file-private namespace, so the
+    // class half prints the class's own fqn).
+    this.line('static void as_throw_fn_readonly(const char* name) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[5];');
+    this.line('parts[0] = "Error #1074: Illegal write to read-only property ";');
+    this.line('parts[1] = name;');
+    this.line('parts[2] = " on Function.";');
+    this.line('parts[3] = "";');
+    this.line('parts[4] = "";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1074));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_throw_fn_method_assign(const char* name) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[5];');
+    this.line('parts[0] = "Error #1037: Cannot assign to a method ";');
+    this.line('parts[1] = name;');
+    this.line('parts[2] = " on Function.";');
+    this.line('parts[3] = "";');
+    this.line('parts[4] = "";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1037));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_throw_cls_readonly(const char* name, const char* fqn) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[5];');
+    this.line('parts[0] = "Error #1074: Illegal write to read-only property ";');
+    this.line('parts[1] = name;');
+    this.line('parts[2] = " on class ";');
+    this.line('parts[3] = fqn != NULL ? fqn : "Class";');
+    this.line('parts[4] = ".";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1074));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_throw_cls_method_assign(const char* name, const char* fqn) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[5];');
+    this.line('parts[0] = "Error #1037: Cannot assign to a method ";');
+    this.line('parts[1] = name;');
+    this.line('parts[2] = " on class ";');
+    this.line('parts[3] = fqn != NULL ? fqn : "Class";');
+    this.line('parts[4] = ".";');
+    this.line('as_throw(ReferenceError_new(as_str_concat_n(5, parts), 1037));');
+    this.indent--;
+    this.line('}');
+    // The Class prototype's OWN members in a with body (temp/with3g: toString /
+    // valueOf are own properties of a class object, hasOwnProperty("toString") is
+    // true, propertyIsEnumerable of a static is false). as_class_static_find is
+    // defined further down with the class registry, so it is declared here.
+    this.line('static int as_class_static_find(as_class* c, const char* name);');
+    this.line('static bool as_cls_own_has(as_class* c, const char* k) {');
+    this.indent++;
+    this.line('if (k != NULL && (strcmp(k, "toString") == 0 || strcmp(k, "valueOf") == 0)) return true;');
+    this.line('return as_class_static_find(c, k) >= 0;');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_cls_hasOwn_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('return as_v_bool(argc > 0 && as_cls_own_has((as_class*)env, as_coerce_str(args[0])));');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_cls_pie_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)env; (void)args; (void)argc;');
+    this.line('return as_v_bool(false);');
+    this.indent--;
+    this.line('}');
+    // Function member VALUES (temp/with3i): f2.call / f2.apply read as values are
+    // methods BOUND to the receiver with declared arity 1; f2.toString / f2.valueOf
+    // are the generic prototypes (arity 0). Invoking a bound member re-invokes the
+    // receiver with the remaining arguments, so the receiver's own #1063 arity
+    // rules surface (V1: call(1,2) -> f2(1) -> #1063; V10: call(1,2,3) -> f2(2,3)).
+    this.line('static as_value as_fn_bound_call_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('as_fn f = (as_fn)env;');
+    this.line('if (f == NULL || f->fn == NULL) return as_throw_not_function("call");');
+    this.line('return f->fn(f->env, argc >= 1 ? args + 1 : NULL, argc >= 1 ? argc - 1 : 0);');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_fn_bound_apply_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('as_fn f = (as_fn)env;');
+    this.line('if (f == NULL || f->fn == NULL) return as_throw_not_function("apply");');
+    this.line('as_value argsbox = argc >= 2 ? args[1] : ((as_value){5, 0.0, NULL});');
+    this.line('return as_fn_apply_v(as_v_fn(f), argsbox);');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_fn_to_string_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)env; (void)args; (void)argc;');
+    this.line('return as_v_str((char*)"function Function() {}");');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_fn_value_of_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)args; (void)argc;');
+    this.line('return as_v_fn(env);');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_fn_own_has_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)env;');
+    this.line('const char* k = argc > 0 ? as_coerce_str(args[0]) : NULL;');
+    this.line('return as_v_bool(k != NULL && (strcmp(k, "length") == 0 || strcmp(k, "prototype") == 0));');
+    this.indent--;
+    this.line('}');
+    this.line('static as_value as_fn_pie_thunk(void* env, as_value* args, int argc) {');
+    this.indent++;
+    this.line('(void)env; (void)args; (void)argc;');
+    this.line('return as_v_bool(false);');
+    this.indent--;
+    this.line('}');
+    // The Function object's own sealed member set for `key in fn` (temp/with3m).
+    this.line('static bool as_fn_has_member(const char* k) {');
+    this.indent++;
+    this.line('if (k == NULL) return false;');
+    this.line('return strcmp(k, "call") == 0 || strcmp(k, "apply") == 0 || strcmp(k, "length") == 0');
+    this.line('    || strcmp(k, "toString") == 0 || strcmp(k, "valueOf") == 0');
+    this.line('    || strcmp(k, "hasOwnProperty") == 0 || strcmp(k, "propertyIsEnumerable") == 0');
+    this.line('    || strcmp(k, "prototype") == 0;');
     this.indent--;
     this.line('}');
     // A name that resolves in no scope at all: ReferenceError #1065. Reachable only
@@ -3325,6 +3523,12 @@ export class Emitter {
     this.line('}');
     this.line('static as_value as_class_member_value(as_class* c, const char* name) {');
     this.indent++;
+    // The Class prototype's OWN members read as VALUES (temp/with3g X13: `var t =
+    // toString` detaches a NON-function, so `t()` is #1006 "value is not a
+    // function"; the CALL form is served by as_class_call_static below).
+    this.line('if (strcmp(name, "toString") == 0) return as_v_str(as_class_str(c));');
+    this.line('if (strcmp(name, "valueOf") == 0) return as_v_obj((void*)c);');
+    this.line('if (strcmp(name, "prototype") == 0) return as_v_obj((void*)as_class_proto(c));');
     this.line('int i = as_class_static_find(c, name);');
     this.line('if (i < 0) return as_v_undefined();  /* AIR: unknown name on a Class value reads undefined */');
     this.line('const as_class_static* e = &c->statics[i];');
@@ -3383,7 +3587,14 @@ export class Emitter {
     this.line('}');
     this.line('static void as_class_set_static(as_class* c, const char* name, as_value v) {');
     this.indent++;
+    // The Class prototype's own members: toString/valueOf are AIR's dynamic
+    // own-prop creation (temp/with3g X1/X2, no storage here, so the write is a
+    // LOUD refusal), the two predicates are inherited methods (#1037).
+    this.line('if (strcmp(name, "hasOwnProperty") == 0 || strcmp(name, "propertyIsEnumerable") == 0) { as_throw_cls_method_assign(name, c != NULL ? c->fqn : NULL); return; }');
     this.line('int i = as_class_static_find(c, name);');
+    this.line('if (i >= 0 && c->statics[i].kind == 1) { as_throw_cls_method_assign(name, c != NULL ? c->fqn : NULL); return; }');
+    this.line('if (i >= 0 && c->statics[i].kind == 4) { as_throw_cls_readonly(name, c != NULL ? c->fqn : NULL); return; }');
+    this.line('if (i >= 0 && c->statics[i].kind == 3) { if (c->statics[i].setfn != NULL) { c->statics[i].setfn(v); } else { as_throw_cls_readonly(name, c != NULL ? c->fqn : NULL); } return; }');
     this.line('if (i >= 0 && c->statics[i].addr != NULL && c->statics[i].kind == 2) { as_class_static_write(&c->statics[i], v); return; }');
     this.line('static ASC_TLS const char* parts[4];');
     this.line('parts[0] = "Writing ";');
@@ -3395,6 +3606,12 @@ export class Emitter {
     this.line('}');
     this.line('static as_value as_class_call_static(as_class* c, const char* name, as_value* args, int argc) {');
     this.indent++;
+    // The Class prototype's own members in CALL position (temp/with3/: `with (KC)
+    // { toString() }` is "[class KC]" while the detached VALUE is not callable).
+    this.line('if (strcmp(name, "toString") == 0) return as_v_str(as_class_str(c));');
+    this.line('if (strcmp(name, "valueOf") == 0) return as_v_obj((void*)c);');
+    this.line('if (strcmp(name, "hasOwnProperty") == 0) return as_v_bool(argc > 0 && as_cls_own_has(c, as_coerce_str(args[0])));');
+    this.line('if (strcmp(name, "propertyIsEnumerable") == 0) return as_v_bool(false);');
     this.line('int i = as_class_static_find(c, name);');
     this.line('if (i >= 0 && c->statics[i].kind == 1) return c->statics[i].fn(NULL, args, argc);');
     this.line('static ASC_TLS const char* parts[3];');
@@ -3434,15 +3651,18 @@ export class Emitter {
           }
           const sf = info.staticFields.get(mname);
           if (sf) {
-            // kind 2 = static field/const: the row carries the C slot's address and
-            // kind, so `Cls[key]` reads AND writes the DECLARED static (AIR resolves
-            // the name against the static traits). A slot kind we cannot store
-            // generically (an interface struct, say) stays addr-less and fails
-            // loudly on access instead of writing a wrong-sized value.
+            // kind 2 = writable static field, kind 4 = CONST static (the same slot
+            // shape, but a dynamic write through a Class value raises #1074 -- AIR
+            // treats the const as read-only, measured on adl 51.4.1, temp/with3f
+            // C9). The row carries the C slot's address and kind, so `Cls[key]`
+            // reads AND writes the DECLARED static (AIR resolves the name against
+            // the static traits). A slot kind we cannot store generically (an
+            // interface struct, say) stays addr-less and fails loudly on access
+            // instead of writing a wrong-sized value.
             const slot = this.staticSlotKind(sf.type);
             const addr = slot > 0 ? `(void*)&${sf.owner}_${mname}` : 'NULL';
             const cinit = this.cinitClasses.has(sf.owner) ? `${sf.owner}_cinit` : 'NULL';
-            rows.push(`{ "${this.escapeCString(mname)}", 2, NULL, 0, ${addr}, ${slot}, ${cinit} }`);
+            rows.push(`{ "${this.escapeCString(mname)}", ${sf.isConst ? 4 : 2}, NULL, 0, ${addr}, ${slot}, ${cinit} }`);
             continue;
           }
           if (info.staticGetters?.has(mname) ?? false) {
@@ -3451,7 +3671,9 @@ export class Emitter {
             // result (the same shape as the static-method __call thunk), and mark
             // the row kind 3. AIR resolves the name and calls the accessor. The
             // declaring class's static initializer runs first, exactly as the
-            // direct C read path sequences it.
+            // direct C read path sequences it. A setter half gets a thunk too, so
+            // a dynamic write through a Class value can reach it (a getter-only
+            // property leaves setfn NULL and the write raises #1074).
             const sg = info.staticGetters.get(mname)!;
             const thunk = `${name}__statget_${mname}`;
             this.line(`static as_value ${thunk}(void* env, as_value* args, int argc) {`);
@@ -3460,8 +3682,21 @@ export class Emitter {
             this.line(`return ${this.boxExpr({ code: `${sg.owner}_get_${mname}_static(NULL)`, type: sg.returnType })};`);
             this.indent--;
             this.line('}');
+            let setfn = 'NULL';
+            const ss = info.staticSetters?.get(mname);
+            if (ss !== undefined) {
+              const st = `${name}__statset_${mname}`;
+              this.line(`static void ${st}(as_value v) {`);
+              this.indent++;
+              const pt = this.setterParamType(ss);
+              const cv = this.convert({ code: 'v', type: { kind: 'any' } }, pt);
+              this.line(`${ss.owner}_set_${mname}_static(NULL, ${cv});`);
+              this.indent--;
+              this.line('}');
+              setfn = st;
+            }
             const cinit = this.cinitClasses.has(sg.owner) ? `${sg.owner}_cinit` : 'NULL';
-            rows.push(`{ "${this.escapeCString(mname)}", 3, ${thunk}, 0, NULL, 0, ${cinit} }`);
+            rows.push(`{ "${this.escapeCString(mname)}", 3, ${thunk}, 0, NULL, 0, ${cinit}, ${setfn} }`);
           }
         }
         if (rows.length === 0) continue;
@@ -4332,6 +4567,14 @@ export class Emitter {
       if (name === 'Screen') {
         this.line(`{ "_bounds", 6, offsetof(Screen, _bounds), NULL, NULL, 1 },`);
         this.line(`{ "_visible_bounds", 6, offsetof(Screen, _visible_bounds), NULL, NULL, 1 },`);
+      }
+      // RegExp's source and flag characters are GC strings in C-runtime-only
+      // slots (the read-only surface is getter-only accessors, so nothing else
+      // keeps them alive); type 3 is the char* slot code a declared String field
+      // gets. `_compiled` is malloc'd by as_regex_compile, never marked.
+      if (name === 'RegExp') {
+        this.line(`{ "_source", 3, offsetof(RegExp, _source), NULL, NULL, 1 },`);
+        this.line(`{ "_flags", 3, offsetof(RegExp, _flags), NULL, NULL, 1 },`);
       }
       this.line('{ NULL, 0, 0, NULL, NULL, 0 }');
       this.indent--;
@@ -11752,17 +11995,17 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // runs fine on adl but threw here and swallowed the whole subtitle stream.
     this.line('void RegExp_ctor(RegExp* o, char* pattern, char* flags) {');
     this.indent++;
-    this.line('o->source = pattern;');
-    this.line('o->flags = flags;');
+    this.line('o->_source = pattern;');
+    this.line('o->_flags = flags;');
     this.line('gc_write_barrier((void*)pattern);');
     this.line('gc_write_barrier((void*)flags);');
     this.line('o->lastIndex = 0;');
-    this.line('o->global = (flags != NULL && strchr(flags, \'g\') != NULL);');
-    this.line('o->ignoreCase = (flags != NULL && strchr(flags, \'i\') != NULL);');
-    this.line('o->multiline = (flags != NULL && strchr(flags, \'m\') != NULL);');
-    this.line('o->dotall = (flags != NULL && strchr(flags, \'s\') != NULL);');
-    this.line('o->extended = (flags != NULL && strchr(flags, \'x\') != NULL);');
-    this.line('o->compiled = as_regex_compile(pattern, flags);');
+    this.line('o->_global = (flags != NULL && strchr(flags, \'g\') != NULL);');
+    this.line('o->_ignoreCase = (flags != NULL && strchr(flags, \'i\') != NULL);');
+    this.line('o->_multiline = (flags != NULL && strchr(flags, \'m\') != NULL);');
+    this.line('o->_dotall = (flags != NULL && strchr(flags, \'s\') != NULL);');
+    this.line('o->_extended = (flags != NULL && strchr(flags, \'x\') != NULL);');
+    this.line('o->_compiled = as_regex_compile(pattern, flags);');
     this.line('// Inert when the pattern failed to compile: as_regex_search returns -1 on err.');
     this.indent--;
     this.line('}');
@@ -11774,33 +12017,56 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return o;');
     this.indent--;
     this.line('}');
+    // The read-only six as getter-only accessors over the C-runtime-only slots
+    // (a declared field would accept the write AIR rejects, and would show up as
+    // writable in describeType; measured on adl 51.4.1, temp/with3/).
+    this.line('char* RegExp_get_source(void* _this) { return ((RegExp*)_this)->_source; }');
+    this.line('bool RegExp_get_global(void* _this) { return ((RegExp*)_this)->_global; }');
+    this.line('bool RegExp_get_ignoreCase(void* _this) { return ((RegExp*)_this)->_ignoreCase; }');
+    this.line('bool RegExp_get_multiline(void* _this) { return ((RegExp*)_this)->_multiline; }');
+    this.line('bool RegExp_get_dotall(void* _this) { return ((RegExp*)_this)->_dotall; }');
+    this.line('bool RegExp_get_extended(void* _this) { return ((RegExp*)_this)->_extended; }');
+    // AIR's RegExp toString is the literal spelling back: source + "/" + flags
+    // (no flags still prints the trailing slash, measured: /cd/g -> "/cd/g",
+    // /cd/ -> "/cd/"), NOT Object's "[object RegExp]".
+    this.line('char* RegExp_toString(void* _this) {');
+    this.indent++;
+    this.line('RegExp* re = (RegExp*)_this;');
+    this.line('const char* parts[4];');
+    this.line('parts[0] = "/";');
+    this.line('parts[1] = re->_source != NULL ? re->_source : "";');
+    this.line('parts[2] = "/";');
+    this.line('parts[3] = re->_flags != NULL ? re->_flags : "";');
+    this.line('return as_str_concat_n(4, parts);');
+    this.indent--;
+    this.line('}');
     this.line('as_array* RegExp_exec(void* _this, char* s) {');
     this.indent++;
     this.line('RegExp* re = (RegExp*)_this;');
-    this.line('if (re->compiled == NULL || re->compiled->err) return NULL;');
+    this.line('if (re->_compiled == NULL || re->_compiled->err) return NULL;');
     this.line('int len = (int)strlen(s);');
     this.line('int cap[2 * (AS_RE_MAX_GROUPS + 1)];');
-    this.line('for (int i = 0; i < 2 * (re->compiled->ngroups + 1); i++) cap[i] = -1;');
-    this.line('int start = re->global ? re->lastIndex : 0;');
+    this.line('for (int i = 0; i < 2 * (re->_compiled->ngroups + 1); i++) cap[i] = -1;');
+    this.line('int start = re->_global ? re->lastIndex : 0;');
     this.line('int end = -1;');
-    this.line('int m = as_regex_search(re->compiled, s, len, start, cap, &end);');
-    this.line('if (m < 0) { if (re->global) re->lastIndex = 0; return NULL; }');
-    this.line('if (re->global) re->lastIndex = end;');
-    this.line('return as_regex_make_result(s, m, end, re->compiled, cap);');
+    this.line('int m = as_regex_search(re->_compiled, s, len, start, cap, &end);');
+    this.line('if (m < 0) { if (re->_global) re->lastIndex = 0; return NULL; }');
+    this.line('if (re->_global) re->lastIndex = end;');
+    this.line('return as_regex_make_result(s, m, end, re->_compiled, cap);');
     this.indent--;
     this.line('}');
     this.line('bool RegExp_test(void* _this, char* s) {');
     this.indent++;
     this.line('RegExp* re = (RegExp*)_this;');
-    this.line('if (re->compiled == NULL || re->compiled->err) return false;');
+    this.line('if (re->_compiled == NULL || re->_compiled->err) return false;');
     this.line('int len = (int)strlen(s);');
     this.line('int cap[2 * (AS_RE_MAX_GROUPS + 1)];');
-    this.line('for (int i = 0; i < 2 * (re->compiled->ngroups + 1); i++) cap[i] = -1;');
-    this.line('int start = re->global ? re->lastIndex : 0;');
+    this.line('for (int i = 0; i < 2 * (re->_compiled->ngroups + 1); i++) cap[i] = -1;');
+    this.line('int start = re->_global ? re->lastIndex : 0;');
     this.line('int end = -1;');
-    this.line('int m = as_regex_search(re->compiled, s, len, start, cap, &end);');
-    this.line('if (m < 0) { if (re->global) re->lastIndex = 0; return false; }');
-    this.line('if (re->global) re->lastIndex = end;');
+    this.line('int m = as_regex_search(re->_compiled, s, len, start, cap, &end);');
+    this.line('if (m < 0) { if (re->_global) re->lastIndex = 0; return false; }');
+    this.line('if (re->_global) re->lastIndex = end;');
     this.line('return true;');
     this.indent--;
     this.line('}');
@@ -11832,14 +12098,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (strcmp(name, "propertyIsEnumerable") == 0) return as_v_bool(false);');
     this.line('if (strcmp(name, "match") == 0) {');
     this.indent++;
-    this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->compiled : as_regex_compile(as_v_str_val(args[0]), "");');
-    this.line('int global = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->global : 0;');
+    this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->_compiled : as_regex_compile(as_v_str_val(args[0]), "");');
+    this.line('int global = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->_global : 0;');
     this.line('return as_v_arr((void*)as_str_match_regex(s, re, global));');
     this.indent--;
     this.line('}');
     this.line('if (strcmp(name, "search") == 0) {');
     this.indent++;
-    this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->compiled : as_regex_compile(as_v_str_val(args[0]), "");');
+    this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->_compiled : as_regex_compile(as_v_str_val(args[0]), "");');
     this.line('return as_v_num((double)as_str_search_regex(s, re));');
     this.indent--;
     this.line('}');
@@ -11848,7 +12114,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (args[0].tag == 4) {');
     this.indent++;
     this.line('RegExp* re = (RegExp*)args[0].ptr;');
-    this.line('return as_v_str(as_str_replace_regex(s, re->compiled, argc >= 2 ? as_v_str_val(args[1]) : "undefined", re->global));');
+    this.line('return as_v_str(as_str_replace_regex(s, re->_compiled, argc >= 2 ? as_v_str_val(args[1]) : "undefined", re->_global));');
     this.indent--;
     this.line('}');
     this.line('return as_v_str(as_str_replace(s, as_v_str_val(args[0]), argc >= 2 ? as_v_str_val(args[1]) : "undefined"));');
@@ -15871,7 +16137,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('else if (as_v_is_inst(pattern, (void*)&RegExp_vt)) {');
     this.indent++;
     this.line('RegExp* re = (RegExp*)pattern.ptr;');
-    this.line('if (replace != NULL && re->compiled != NULL && !re->compiled->err) out = as_str_replace_regex(out, re->compiled, replace, re->global);');
+    this.line('if (replace != NULL && re->_compiled != NULL && !re->_compiled->err) out = as_str_replace_regex(out, re->_compiled, replace, re->_global);');
     this.indent--;
     this.line('}');
     this.line('o->url = out; gc_write_barrier((void*)out);');
@@ -32658,7 +32924,9 @@ void FileStream_writeObject(void* _this, as_value v) {
 
   // Which resolution a `with` receiver of this static type needs (see WithScope).
   private withModeForType(t: CType): WithScope['mode'] {
-    return t.kind === 'string' || t.kind === 'vector' ? 'builtin' : 'runtime';
+    if (t.kind === 'string' || t.kind === 'vector' || t.kind === 'function') return 'builtin';
+    if (t.kind === 'class') return 'class';
+    return 'runtime';
   }
 
   // The object body a restored runtime scope hands the as_dyn_* helpers. An
@@ -32693,12 +32961,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     // appends, `with (d) { k }` reads the key, and a name the receiver lacks falls
     // through to the enclosing scope, exactly like the '*' case.
     const dynReceiver = k === 'array' || k === 'dict' || k === 'interface';
-    // A String or a Vector.<T> is a CLOSED member set, but not a trait table, so
-    // membership is the name-set test in withBuiltinMembers() and the access
-    // reuses the ordinary static String/Vector paths. Function, Class and RegExp
-    // receivers still have no modelling: those are rejected loudly instead of
-    // silently resolving the body lexically.
-    const builtinReceiver = k === 'string' || k === 'vector';
+    // A String, a Vector.<T> or a Function VALUE is a CLOSED member set, but not
+    // a trait table, so membership is the name-set test in withScopeClaims and
+    // the access reuses the ordinary static String/Vector/Function member paths
+    // (measured on adl 51.4.1, temp/with3/: `with (f2) { length }` is the arity,
+    // `with (f2) { call(null, 3, 4) }` invokes the function, an unknown name
+    // falls through lexically).
+    const builtinReceiver = k === 'string' || k === 'vector' || k === 'function';
+    // A Class VALUE receiver: the class object's static traits plus the Class
+    // prototype's own members (temp/with3/: `with (KC) { sv }` reads the static,
+    // `with (KC) { sm(10) }` calls it, `with (KC) { toString() }` is "[class
+    // KC]", an instance field or an unknown name falls through lexically). A
+    // statically-known class carries its name for the compile-time trait check;
+    // a Class-typed VARIABLE has none and resolves statics at run time through
+    // the statics table.
+    const classReceiver = k === 'class';
     if (k === 'object' && !recordLike) {
       classInstance = true;
       className = obj.type.className;
@@ -32710,17 +32987,20 @@ void FileStream_writeObject(void* _this, as_value v) {
       runtime = true;
     } else if (builtinReceiver) {
       // sealed-mode machinery, but with a name set instead of a class
+    } else if (classReceiver) {
+      // The receiver records the statically-known class's name (null for a
+      // Class-typed variable), see withClassHasStatic.
+      className = this.classRefName(stmt.obj);
     } else {
-      // String/Vector receivers are CLOSED member sets, and function/class/regexp
-      // receivers have no dynamic table at all, so each of those still needs its
-      // own modelling: a `with` over them is rejected loudly rather than silently
-      // resolving the body lexically (which would be a semantically wrong
-      // translation). See the known-limitations table.
-      throw new CodegenError(`with: a ${k}-typed receiver is not supported (needs a class instance, Object, Array, Dictionary, an interface or *)`);
+      // Everything left (regexp internals, int64 boxes, ...) has no with-scope
+      // modelling: rejected loudly rather than silently resolving the body
+      // lexically (which would be a semantically wrong translation). See the
+      // known-limitations table.
+      throw new CodegenError(`with: a ${k}-typed receiver is not supported (needs a class instance, Object, Array, Dictionary, an interface, a Function or *)`);
     }
     // The C temp of the branch below: an `as_value` for a '*'/Object receiver, the
     // receiver's own type otherwise.
-    const capturedBoxed = !classInstance && !dynReceiver && !builtinReceiver;
+    const capturedBoxed = !classInstance && !dynReceiver && !builtinReceiver && !classReceiver;
     let ptr = '';
     this.line('{');
     this.indent++;
@@ -32740,8 +33020,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     } else if (builtinReceiver) {
       // No dynamic table: every access is a static member on the receiver, so the
       // C local is just the value itself (a String is a char*, a Vector a
-      // monomorphized struct pointer).
+      // monomorphized struct pointer, a Function an as_fn).
       this.line(`${this.cTypeName(obj.type)} ${cid} = ${obj.code};`);
+      this.line(`if (${cid} == NULL) as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));`);
+      ptr = `(void*)${cid}`;
+    } else if (classReceiver) {
+      // The class object itself (an as_class*). A null Class slot throws the same
+      // #1009 a null object receiver does (measured on adl 51.4.1, temp/with3g
+      // X8).
+      this.line(`as_class* ${cid} = ${obj.code};`);
       this.line(`if (${cid} == NULL) as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009));`);
       ptr = `(void*)${cid}`;
     } else {
@@ -32757,14 +33044,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.withScopes.push({
       tmp,
       type: obj.type,
-      mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : 'sealed',
+      mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : classReceiver ? 'class' : 'sealed',
       className,
       ptr,
       // What a closure created in this body captures (see addWithCaptures): a
-      // String/Vector receiver as its typed temp, every other receiver BOXED into an
-      // `as_value` — the shape the pre-pass recorded. The temp was filled before any
-      // body statement runs, so the capture never re-evaluates the receiver.
-      capBox: capturedBoxed || builtinReceiver ? cid : `as_v_obj((void*)(${k === 'interface' ? `${cid}.obj` : cid}))`,
+      // String/Vector receiver as its typed temp, every other receiver BOXED into
+      // an `as_value` — the shape the pre-pass recorded (function receivers box
+      // as a function value, class receivers as an object). The temp was filled
+      // before any body statement runs, so the capture never re-evaluates the
+      // receiver.
+      capBox: capturedBoxed || builtinReceiver || classReceiver
+        ? (builtinReceiver && k === 'function' ? `as_v_fn((void*)${cid})`
+          : classReceiver ? `as_v_obj((void*)${cid})`
+          : k === 'interface' ? `as_v_obj((void*)(${cid}.obj))`
+          : cid)
+        : `as_v_obj((void*)(${k === 'interface' ? `${cid}.obj` : cid}))`,
       declared: this.withBodyDeclaredNames(stmt.body),
     });
     this.emitStmt(stmt.body);
@@ -32892,8 +33186,45 @@ void FileStream_writeObject(void* _this, as_value v) {
     // A scope's own temp object never shadows itself.
     if (name === sc.tmp) return false;
     if (sc.mode === 'runtime') return true;
-    if (sc.mode === 'builtin') return (sc.type.kind === 'string' ? STRING_WITH_MEMBERS : VECTOR_WITH_MEMBERS).has(name);
+    if (sc.mode === 'builtin') {
+      if (sc.type.kind === 'string') return STRING_WITH_MEMBERS.has(name);
+      if (sc.type.kind === 'vector') return VECTOR_WITH_MEMBERS.has(name);
+      return FUNCTION_WITH_MEMBERS.has(name);
+    }
+    if (sc.mode === 'class') return CLASS_WITH_PROTO_MEMBERS.has(name) || this.withClassHasStatic(sc, name);
+    // A sealed instance receiver additionally claims Object.prototype.valueOf
+    // (temp/with3d P27): the vtable keeps it out of the methods map, so the
+    // ordinary member walk misses it.
+    if (name === 'valueOf') return true;
     return sc.className !== null && this.withClassHasMember(sc.className, name);
+  }
+
+  // The C string literal naming a class receiver in the #1074/#1037 messages
+  // (AIR spells "on class <fqn>"; our subset has no file-private namespace, so a
+  // statically-known class prints its own fqn and a Class-typed variable prints
+  // "Class").
+  private classFqnLiteral(sc: WithScope): string {
+    const fqn = sc.className !== null ? this.symbols.getClass(sc.className)?.fqn ?? sc.className : 'Class';
+    return `"${this.escapeCString(fqn)}"`;
+  }
+
+  // Whether a Class receiver's static traits contain `name` (a static field /
+  // getter / setter / method). Instance traits are NOT visible on the class
+  // object (temp/with3/ P30: `with (KC) { iv }` is #1065, the instance field
+  // falls through lexically). Mirrors the withClassHasMember precedence.
+  private withClassHasStatic(sc: WithScope, name: string): boolean {
+    // A class-kind CType carries no className, so the receiver records the
+    // statically-known class's name at With-statement time; a Class-typed
+    // variable has none and claims only the prototype members (its static
+    // traits are resolved at run time through the statics table).
+    if (sc.className === null) return false;
+    const cinfo = this.symbols.getClass(sc.className);
+    if (cinfo === undefined) return false;
+    const members = [cinfo.staticFields.get(name), cinfo.staticGetters?.get(name), cinfo.staticSetters?.get(name), cinfo.staticMethods.get(name)];
+    for (const m of members) {
+      if (m && this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) return true;
+    }
+    return false;
   }
 
   // Does any active with scope claim `name`? (Cheap pre-pass so the lexical
@@ -32924,6 +33255,48 @@ void FileStream_writeObject(void* _this, as_value v) {
     return this.withReadFrom(this.withScopes.length - 1, name, () => this.withLexical(lexical));
   }
 
+  // A CALL of an unqualified name inside a with body, when the claiming scope
+  // is a Class receiver: AIR resolves the name through the class object's call
+  // mechanism, which differs from the VALUE read for the prototype members
+  // (temp/with3g X13: `toString` as a value is not callable, while `with (KC) {
+  // toString() }` is "[class KC]"). Returns null when the name is not a static
+  // method or a Class-prototype member (the caller keeps the ordinary member
+  // desugar).
+  private withClassCall(sc: WithScope, name: string, expr: Extract<Expr, { kind: 'Call' }>): { code: string; type: CType } | null {
+    const cinfo = sc.className !== null ? this.symbols.getClass(sc.className) : undefined;
+    const sm = cinfo?.staticMethods.get(name);
+    if (sm !== undefined) {
+      if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) return null;
+      const argv = this.emitArgs(sm.params, expr.args, this.declAliasOf(sm.owner));
+      return { code: `${sm.owner}_${name}_static(${argv})`, type: sm.returnType };
+    }
+    // The Class prototype's own members, in call position.
+    if (name === 'toString') return { code: `as_class_str(${sc.ptr})`, type: { kind: 'string' } };
+    if (name === 'valueOf') return { code: `as_v_obj(${sc.ptr})`, type: { kind: 'any' } };
+    if (name === 'hasOwnProperty') {
+      // A literal key on a statically-known class answers at compile time:
+      // toString/valueOf are the class object's own members and a DECLARED
+      // static is one too (temp/with3g X4 / temp/with3d P25) -- the statics
+      // TABLE only knows dynamically-looked-up names, which a string literal
+      // argument is not. Instance traits are not on the class object.
+      const arg0 = expr.args[0];
+      if (sc.className !== null && arg0 !== undefined && arg0.kind === 'Str') {
+        const cinfo = this.symbols.getClass(sc.className);
+        const own = arg0.value === 'toString' || arg0.value === 'valueOf' || (cinfo !== undefined && (
+          cinfo.staticFields.has(arg0.value) || cinfo.staticMethods.has(arg0.value) ||
+          (cinfo.staticGetters?.has(arg0.value) ?? false) || (cinfo.staticSetters?.has(arg0.value) ?? false)));
+        return { code: own ? 'true' : 'false', type: { kind: 'bool' } };
+      }
+      const key = expr.args.length > 0 ? `as_coerce_str(${this.boxExpr(this.emitExpr(expr.args[0]))})` : 'NULL';
+      return { code: `as_cls_own_has((${sc.ptr}), ${key})`, type: { kind: 'bool' } };
+    }
+    if (name === 'propertyIsEnumerable') return { code: 'false', type: { kind: 'bool' } };
+    // A static FIELD holding a callable value, or an unknown name: the ordinary
+    // member-call desugar (as_class_member_value / as_class_call_static) is
+    // AIR's dispatch too.
+    return null;
+  }
+
   private withReadFrom(i: number, name: string, lexical: () => { code: string; type: CType }): { code: string; type: CType } {
     for (; i >= 0; i--) {
       const sc = this.withScopes[i];
@@ -32933,9 +33306,33 @@ void FileStream_writeObject(void* _this, as_value v) {
         return this.emitExpr(this.withMemberNode(sc, name));
       }
       if (sc.mode === 'builtin') {
-        // Same shape, resolved by the ordinary String/Vector member emitter
-        // ('length' -> strlen, a method value -> the static member path).
+        // Same shape, resolved by the ordinary String/Vector/Function member
+        // emitter ('length' -> strlen / fn arity, a method call -> the static
+        // member path).
         return this.emitExpr(this.withMemberNode(sc, name));
+      }
+      if (sc.mode === 'class') {
+        // A statically-known class: compile-time static-trait reads. A
+        // Class-typed VARIABLE (className null) has no compile-time traits, so
+        // it desugars into a member read on the class value, which routes
+        // through as_class_member_value at run time.
+        if (sc.className !== null) {
+          const r = this.withClassStaticRead(sc, name);
+          if (r !== null) return r;
+        }
+        // The Class prototype's own members (toString / valueOf read as
+        // VALUES; hasOwnProperty / propertyIsEnumerable as bound thunks). The
+        // VALUE forms match AIR: `var t:Function = toString` then `t()` is
+        // #1006 (temp/with3g X13) because the value is NOT a function -- the
+        // CALL form is special-cased in emitCall (see withClassCall).
+        if (name === 'toString') return { code: `as_v_str(as_class_str(${sc.ptr}))`, type: { kind: 'any' } };
+        if (name === 'valueOf') return { code: `as_v_obj(${sc.ptr})`, type: { kind: 'any' } };
+        if (name === 'prototype') return { code: `as_v_obj((void*)as_class_proto(${sc.ptr}))`, type: { kind: 'any' } };
+        if (name === 'hasOwnProperty') return { code: `as_fn_make(as_cls_hasOwn_thunk, ${sc.ptr}, 1)`, type: { kind: 'function' } };
+        if (name === 'propertyIsEnumerable') return { code: `as_fn_make(as_cls_pie_thunk, ${sc.ptr}, 1)`, type: { kind: 'function' } };
+        // Every other name falls through to the lexical binding (AIR's runtime
+        // #1065 when it exists nowhere) -- see withScopeClaims for the claim set.
+        continue;
       }
       const rest = this.boxExpr(this.withReadFrom(i - 1, name, lexical));
       const key = `"${this.escapeCString(name)}"`;
@@ -32943,6 +33340,32 @@ void FileStream_writeObject(void* _this, as_value v) {
       return { code: `(as_dyn_has(${sc.ptr}, ${key}) ? ${dyn} : ${rest})`, type: { kind: 'any' } };
     }
     return lexical();
+  }
+
+  // A compile-time static-trait read through a statically-known Class receiver
+  // (mode 'class'), or null when `name` is not a static trait (the caller then
+  // tries the Class prototype members and the lexical fallthrough).
+  private withClassStaticRead(sc: WithScope, name: string): { code: string; type: CType } | null {
+    const cinfo = this.symbols.getClass(sc.className!);
+    if (cinfo === undefined) return null;
+    const sm = cinfo.staticMethods.get(name);
+    if (sm !== undefined) {
+      if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) return null;
+      // The same Function VALUE the dotted `KC.sm` spelling produces: calling it
+      // (in the body) goes through the ordinary as_fn machinery (temp/with3/ C3).
+      return { code: `as_fn_make(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+    }
+    const sf = cinfo.staticFields.get(name);
+    if (sf !== undefined) {
+      if (!this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) return null;
+      return { code: this.sfRead(sf.owner, name), type: sf.type };
+    }
+    const sg = cinfo.staticGetters?.get(name);
+    if (sg !== undefined) {
+      if (!this.symbols.isAccessible(sg.visibility, sg.owner, this.currentClass)) return null;
+      return { code: `${sg.owner}_get_${name}_static(NULL)`, type: sg.returnType };
+    }
+    return null;
   }
 
   // `name = v` / `name OP= v` where a with object serves `name`.
@@ -32965,8 +33388,13 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (!this.withScopeClaims(sc, name)) continue;
       if (sc.mode === 'sealed') {
         const cinfo = this.symbols.getClass(sc.className!);
-        // A read-only trait (a getter with no setter, or a method) raises
-        // ReferenceError #1074 in AIR (measured via `with (ro) { ro = 6 }`).
+        // A read-only trait (a getter with no setter) raises ReferenceError
+        // #1074, and writing a METHOD is ReferenceError #1037 in AIR (measured
+        // via `with (ro) { ro = 6 }` and temp/with3f W10: `with (re) { exec =
+        // null }` is #1037 while `source = null` is #1074).
+        if (cinfo?.methods.has(name) === true) {
+          return { code: `(as_throw_cls_method_assign("${this.escapeCString(name)}", "${this.escapeCString(sc.className ?? 'Class')}"), as_v_null())`, type: { kind: 'any' } };
+        }
         const writable = this.symbols.fieldSlot(sc.className!, name) !== undefined || cinfo?.setters.has(name) === true;
         if (!writable) {
           return { code: `(as_throw_readonly("${this.escapeCString(name)}"), as_v_null())`, type: { kind: 'any' } };
@@ -32976,10 +33404,59 @@ void FileStream_writeObject(void* _this, as_value v) {
         return this.emitAssign({ kind: 'Assign', op: expr.op, target: this.withMemberNode(sc, name), value: expr.value });
       }
       if (sc.mode === 'builtin') {
-        // AIR allows some of these (Vector.length truncates, Vector.fixed toggles);
-        // the static paths for those are not wired into an assignment target yet,
-        // so this fails loudly rather than emitting a non-lvalue String length.
+        // A Function receiver's fixed members: AIR throws #1074 for `length` and
+        // #1037 for the methods (measured on adl 51.4.1, temp/with3f W1/W4/F12).
+        // toString/valueOf writes are AIR's dynamic own-prop creation on the
+        // function, which as_closure has no storage for -- loud rather than
+        // silently dropped. String/Vector member writes keep the pre-existing
+        // loud boundary (their static paths have no assignment-target form yet).
+        if (sc.type.kind === 'function') {
+          if (name === 'length') {
+            return { code: `(as_throw_fn_readonly("${this.escapeCString(name)}"), as_v_null())`, type: { kind: 'any' } };
+          }
+          if (name === 'call' || name === 'apply' || name === 'hasOwnProperty' || name === 'propertyIsEnumerable') {
+            return { code: `(as_throw_fn_method_assign("${this.escapeCString(name)}"), as_v_null())`, type: { kind: 'any' } };
+          }
+        }
         throw new CodegenError(`with: assigning the member '${name}' of a ${sc.type.kind} receiver is not supported`);
+      }
+      if (sc.mode === 'class') {
+        const cinfo = sc.className !== null ? this.symbols.getClass(sc.className) : undefined;
+        const sf = cinfo?.staticFields.get(name);
+        if (sf !== undefined && !sf.isConst && this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) {
+          // A declared static var: write the C slot (sfWrite runs the class's
+          // _cinit first, the same as the dotted `KC.sv = v` path). Compound ops
+          // fold the current value in, like the sealed branch does.
+          const v = expr.op === '=' ? this.convert(this.emitExpr(expr.value), sf.type)
+            : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), sf.type);
+          return { code: this.sfWrite(sf.owner, name, v), type: sf.type };
+        }
+        const ss = cinfo?.staticSetters?.get(name);
+        if (ss !== undefined && this.symbols.isAccessible(ss.visibility, ss.owner, this.currentClass)) {
+          const paramType = this.setterParamType(ss);
+          const v = expr.op === '=' ? this.convert(this.emitExpr(expr.value), paramType)
+            : this.convert(this.emitBinary({ kind: 'Binary', op: COMPOUND_BASE[expr.op], left: target, right: expr.value }), paramType);
+          return { code: `${ss.owner}_set_${name}_static(NULL, ${v})`, type: { kind: 'void' }, discard: true };
+        }
+        const sm = cinfo?.staticMethods.get(name);
+        if (sm !== undefined) {
+          // AIR: #1037 (measured on adl 51.4.1, temp/with3f W-err/C10).
+          return { code: `(as_throw_cls_method_assign("${this.escapeCString(name)}", ${this.classFqnLiteral(sc)}), as_v_null())`, type: { kind: 'any' } };
+        }
+        const sg = cinfo?.staticGetters?.get(name);
+        if ((sf !== undefined && sf.isConst) || sg !== undefined || name === 'hasOwnProperty' || name === 'propertyIsEnumerable') {
+          // AIR: #1074 for a static const / getter-only (C9/W6) and #1037 for the
+          // inherited predicate methods (X3) -- but `toString`/`valueOf` writes
+          // are dynamic own-prop creation AIR allows and as_class has no storage
+          // for, so those fall through to the loud boundary below.
+          if (name === 'hasOwnProperty' || name === 'propertyIsEnumerable') {
+            return { code: `(as_throw_cls_method_assign("${this.escapeCString(name)}", ${this.classFqnLiteral(sc)}), as_v_null())`, type: { kind: 'any' } };
+          }
+          return { code: `(as_throw_cls_readonly("${this.escapeCString(name)}", ${this.classFqnLiteral(sc)}), as_v_null())`, type: { kind: 'any' } };
+        }
+        // toString/valueOf (AIR stores a dynamic own property -- unmodelled) and
+        // a Class-typed VARIABLE receiver (runtime statics) stay loud.
+        throw new CodegenError(`with: assigning the member '${name}' of a class receiver is not supported`);
       }
       const rest = this.boxExpr(this.withAssignFrom(i - 1, target, expr, lexical));
       const key = `"${this.escapeCString(name)}"`;
@@ -33016,6 +33493,11 @@ void FileStream_writeObject(void* _this, as_value v) {
         const cinfo = this.symbols.getClass(sc.className!);
         const m = cinfo?.methods.get(name);
         const cid = this.cIdent(sc.tmp);
+        // Object.prototype.valueOf: no methods-map entry, answered directly
+        // (temp/with3d P27).
+        if (m === undefined && name === 'valueOf') {
+          return { code: `as_v_obj((void*)(${cid}))`, type: { kind: 'any' } };
+        }
         if (m && !m.isProxyNs) {
           const args = this.emitArgs(m.params, expr.args, this.declAliasOf(m.owner));
           const callArgs = args ? ', ' + args : '';
@@ -33038,7 +33520,17 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
       if (sc.mode === 'builtin') {
         // A closed builtin receiver: an ordinary call on `obj.name(...)`, so the
-        // static String/Vector method emitter handles both dispatch and arity.
+        // static String/Vector/Function method emitter handles both dispatch and
+        // arity.
+        return this.emitCall({ kind: 'Call', callee: this.withMemberNode(sc, name), args: expr.args });
+      }
+      if (sc.mode === 'class') {
+        // A statically-known static method or a Class-prototype member call
+        // (temp/with3/: `with (KC) { sm(10) }`, `with (KC) { toString() }`).
+        // Anything else falls through to the ordinary member-call desugar, whose
+        // class-kind receiver routes through as_class_call_static at run time.
+        const r = this.withClassCall(sc, name, expr);
+        if (r !== null) return r;
         return this.emitCall({ kind: 'Call', callee: this.withMemberNode(sc, name), args: expr.args });
       }
       // A void lexical fallback (the call's result is discarded) must keep the CALL:
@@ -33106,11 +33598,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     for (let i = this.withScopes.length - 1; i >= 0; i--) {
       const sc = this.withScopes[i];
       if (!this.withScopeClaims(sc, t.name)) continue;
-      if (sc.mode === 'sealed') {
-        throw new CodegenError(`delete of the fixed property '${t.name}' of '${sc.className}' (mxmlc rejects this too)`);
-      }
-      if (sc.mode === 'builtin') {
-        throw new CodegenError(`delete of the fixed property '${t.name}' of a ${sc.type.kind} receiver (mxmlc rejects this too)`);
+      // A fixed trait of any receiver (sealed member, String/Vector/Function
+      // member, static or prototype member of a Class) cannot be deleted: AIR
+      // answers false WITHOUT throwing (measured on adl 51.4.1, temp/with3f
+      // W8/W9 and F19: `with (KC) { delete sm }` and `with (f2) { delete
+      // length }` both false, and mxmlc compiles the with body). The old loud
+      // build error claimed mxmlc rejects it -- the probe disproved that.
+      if (sc.mode === 'sealed' || sc.mode === 'builtin' || sc.mode === 'class') {
+        return { code: 'false', type: { kind: 'bool' } };
       }
       const key = `"${this.escapeCString(t.name)}"`;
       return { code: `(as_dyn_has(${sc.ptr}, ${key}) ? as_dyn_del(${sc.ptr}, ${key}) : false)`, type: { kind: 'bool' } };
@@ -35196,6 +35691,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (l.type.kind === 'object' && r.type.kind === 'object' && (l.type as { className: string }).className !== (r.type as { className: string }).className) {
       return `${neg}(((void*)(${l.code})) == ((void*)(${r.code})))`;
     }
+    // Function values are `as_fn` pointers to `as_closure` structs; a raw
+    // pointer compare would see two materializations of the same top-level
+    // function as unequal (as_fn_make allocates a fresh closure each time).
+    // AIR's equality is identity of the closure: same function body AND same
+    // captured environment (measured on adl 51.4.1, temp/with3/ F8: `with (f2)
+    // { valueOf() == f2 }` is true for the same top-level function, while two
+    // closures of one site differ).
+    if (l.type.kind === 'function' && r.type.kind === 'function') {
+      return `${neg}((${l.code})->fn == (${r.code})->fn && (${l.code})->env == (${r.code})->env && (${l.code})->arity == (${r.code})->arity)`;
+    }
     return `${neg}(${l.code} == ${r.code})`;
   }
 
@@ -36360,6 +36865,15 @@ void FileStream_writeObject(void* _this, as_value v) {
         const arr = n > 0 ? `(as_value[${n}]){ ${items.join(', ')} }` : 'NULL';
         return { code: `as_dyn_call(${obj.code}, "${this.escapeCString(callee.property)}", ${arr}, ${n})`, type: { kind: 'any' } };
       }
+      // Object.prototype.valueOf on a SEALED instance returns the receiver itself
+      // (temp/with3e D3: re.valueOf() === re; the methods maps have no valueOf
+      // entry because the generated vtables keep it out of the listed slots). An
+      // Object-TYPED slot is handled above through as_dyn_call, which knows a
+      // boxed primitive's valueOf answers the PRIMITIVE (stage 344's
+      // dyn-prim-methods contract).
+      if (!m && callee.property === 'valueOf') {
+        return { code: `as_v_obj((void*)(${obj.code}))`, type: { kind: 'any' } };
+      }
       // Proxy subclass: an undeclared method name is not a compile error in AIR —
       // a dynamic Proxy receiver routes the call to its callProperty override
       // (measured: `p.m2()` on `dynamic class ... extends Proxy` calls
@@ -37100,6 +37614,11 @@ void FileStream_writeObject(void* _this, as_value v) {
       const cname = this.resolveClassName(expr.object.name);
       if (this.symbols.hasClass(cname)) {
         const cinfo = this.symbols.getClass(cname)!;
+        // Class.prototype (temp/with3k B): a distinct empty dynamic Object per
+        // class, created lazily.
+        if (expr.property === 'prototype') {
+          return { code: `(as_object*)as_class_proto(&${cname}_cls)`, type: { kind: 'record' } };
+        }
         const sf = cinfo.staticFields.get(expr.property);
         if (sf) {
           if (!this.symbols.isAccessible(sf.visibility, sf.owner, this.currentClass)) {
@@ -37159,6 +37678,38 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (obj.type.kind === 'function' && expr.property === 'length') {
       // AS3 Function.length is the declared parameter count.
       return { code: `(${recv}->arity)`, type: { kind: 'int' } };
+    }
+    // Object.prototype.valueOf on any instance reads back as a function bound
+    // to the object itself (temp/with3d P27: `with (re) { valueOf() === re }`;
+    // the detached value, invoked, returns the receiver too). The methods maps
+    // have no valueOf entry, so the value form is answered here like the call
+    // forms are in emitCall / withCallFrom.
+    if (obj.type.kind === 'object' && expr.property === 'valueOf') {
+      return { code: `as_fn_make(as_fn_value_of_thunk, (void*)(${recv}), 0)`, type: { kind: 'function' } };
+    }
+    // Function member VALUES (temp/with3i V1-V11): call/apply are methods bound to
+    // the receiver (declared arity 1), toString/valueOf the generic prototypes
+    // (arity 0), and the two Object predicates bind the receiver as their env.
+    if (obj.type.kind === 'function' && expr.property === 'prototype') {
+      return { code: `(as_object*)as_fn_proto(${recv})`, type: { kind: 'record' } };
+    }
+    if (obj.type.kind === 'function' && expr.property === 'call') {
+      return { code: `as_fn_make(as_fn_bound_call_thunk, (void*)(${recv}), 1)`, type: { kind: 'function' } };
+    }
+    if (obj.type.kind === 'function' && expr.property === 'apply') {
+      return { code: `as_fn_make(as_fn_bound_apply_thunk, (void*)(${recv}), 1)`, type: { kind: 'function' } };
+    }
+    if (obj.type.kind === 'function' && expr.property === 'toString') {
+      return { code: `as_fn_make(as_fn_to_string_thunk, NULL, 0)`, type: { kind: 'function' } };
+    }
+    if (obj.type.kind === 'function' && expr.property === 'valueOf') {
+      return { code: `as_fn_make(as_fn_value_of_thunk, (void*)(${recv}), 0)`, type: { kind: 'function' } };
+    }
+    if (obj.type.kind === 'function' && expr.property === 'hasOwnProperty') {
+      return { code: `as_fn_make(as_fn_own_has_thunk, (void*)(${recv}), 1)`, type: { kind: 'function' } };
+    }
+    if (obj.type.kind === 'function' && expr.property === 'propertyIsEnumerable') {
+      return { code: `as_fn_make(as_fn_pie_thunk, (void*)(${recv}), 1)`, type: { kind: 'function' } };
     }
     // E4X all-children wildcard `x.*` (a Member named '*', see the parser): the
     // XMLList of every child node -- the same axis children() exposes (our E4X model
@@ -38021,7 +38572,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'match': {
         const arg = this.emitExpr(args[0]);
         if (arg.type.kind === 'object' && arg.type.className === 'RegExp') {
-          return { code: `as_str_match_regex(${s}, ${arg.code}->compiled, ${arg.code}->global)`, type: { kind: 'array' } };
+          return { code: `as_str_match_regex(${s}, ${arg.code}->_compiled, ${arg.code}->_global)`, type: { kind: 'array' } };
         }
         // String.match(pattern) also accepts a String, implicitly converted to a
         // RegExp (the string is the raw regex pattern, not a literal substring).
@@ -38031,7 +38582,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'search': {
         const arg = this.emitExpr(args[0]);
         if (arg.type.kind === 'object' && arg.type.className === 'RegExp') {
-          return { code: `as_str_search_regex(${s}, ${arg.code}->compiled)`, type: { kind: 'int' } };
+          return { code: `as_str_search_regex(${s}, ${arg.code}->_compiled)`, type: { kind: 'int' } };
         }
         // String.search(pattern) also accepts a String, implicitly converted to a
         // RegExp (e.g. line.search("//") finds the literal "//" comment marker).
@@ -38043,10 +38594,10 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (arg.type.kind === 'object' && arg.type.className === 'RegExp') {
           const repl: { code: string; type: CType } = args.length >= 2 ? this.emitExpr(args[1]) : { code: '""', type: { kind: 'string' } };
           if (repl.type.kind === 'function') {
-            return { code: `as_str_replace_regex_fn(${s}, ${arg.code}->compiled, ${repl.code})`, type: { kind: 'string' } };
+            return { code: `as_str_replace_regex_fn(${s}, ${arg.code}->_compiled, ${repl.code})`, type: { kind: 'string' } };
           }
           const replStr = repl.type.kind === 'string' ? repl.code : this.toStringExpr(repl);
-          return { code: `as_str_replace_regex(${s}, ${arg.code}->compiled, ${replStr}, ${arg.code}->global)`, type: { kind: 'string' } };
+          return { code: `as_str_replace_regex(${s}, ${arg.code}->_compiled, ${replStr}, ${arg.code}->_global)`, type: { kind: 'string' } };
         }
         return { code: `as_str_replace(${s}, ${argStr(0)}, ${argStr(1)})`, type: { kind: 'string' } };
       }
@@ -38119,6 +38670,7 @@ void FileStream_writeObject(void* _this, as_value v) {
   private emitFunctionMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
     switch (method) {
       case 'toString': return { code: '(char*)"function Function() {}"', type: { kind: 'string' } };
+      case 'valueOf': return { code: obj.code, type: { kind: 'function' } };
       case 'hasOwnProperty': {
         const key = this.propNameArg(args);
         return { code: `(strcmp(${key}, "length") == 0 || strcmp(${key}, "prototype") == 0)`, type: { kind: 'bool' } };
@@ -38871,6 +39423,18 @@ void FileStream_writeObject(void* _this, as_value v) {
     }
   }
 
+  // The left operand of `is`/`as` against a runtime Class value, as an as_value:
+  // an Object/interface/primitive/array/function all go through their ordinary
+  // box forms, null is the null box (as_class_is_val answers false for it,
+  // matching `null is c` == false, temp/isany/ O23).
+  private classTestValue(o: { code: string; type: CType }): string {
+    if (o.type.kind === 'any') return o.code;
+    if (o.type.kind === 'interface') return `as_v_obj(${o.code}.obj)`;
+    if (o.type.kind === 'object') return `as_v_obj((void*)(${o.code}))`;
+    if (o.type.kind === 'null') return 'as_v_null()';
+    return this.boxExpr(o);
+  }
+
   private emitIs(expr: Extract<Expr, { kind: 'Is' }>): { code: string; type: CType } {
     const o = this.emitExpr(expr.obj);
     // `x is cls` where `cls` names an in-scope VALUE holding a Class reference
@@ -38878,9 +39442,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     // resolves the name in the scope first, so a variable shadows a class of the
     // same name and the check becomes a runtime subtype test on the class object
     // (as_class_is_obj / as_class_is_val). Must precede the type-name resolution
-    // below.
-    const clsVal = this.classValueOperand(expr.typeName);
-    if (clsVal !== null) {
+    // below. A *-typed operand is validated at run time first (#1010 undefined /
+    // #1009 null or non-Class, temp/isany/); an Object-typed one is the mxmlc
+    // compile-time implicit-coercion error.
+    const clsOp = this.isAsOperand(expr.typeName);
+    if (clsOp === 'objectTyped') {
+      throw this.implicitCoercionError({ kind: 'object', className: 'Object' }, { kind: 'class' });
+    }
+    if (clsOp !== null) {
+      const clsVal = clsOp.mode === 'cls' ? clsOp.code : null;
+      if (clsOp.mode === 'any') {
+        // AIR evaluates the left side first, then validates the right operand
+        // (temp/isany/ A5: the side effect fires even though the RHS throws), so
+        // the left value is sequenced into a temp before as_class_req_any runs.
+        const lval = this.tmpName('islhs');
+        this.line(`as_value ${lval} = ${this.classTestValue(o)};`);
+        return { code: `as_class_is_val(${lval}, as_class_req_any(${clsOp.code}))`, type: { kind: 'bool' } };
+      }
       if (o.type.kind === 'any') return { code: `as_class_is_val(${o.code}, ${clsVal})`, type: { kind: 'bool' } };
       if (o.type.kind === 'interface') return { code: `as_class_is_obj(${o.code}.obj, ${clsVal})`, type: { kind: 'bool' } };
       // A null literal (or any object) goes through the object form: as_is(NULL,..)
@@ -39280,6 +39858,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (obj.type.kind === 'bool' || obj.type.kind === 'number' || obj.type.kind === 'int' || obj.type.kind === 'uint') {
       return { code: `((void)(${obj.code}), (void)(${keyStr}), false)`, type: { kind: 'bool' } };
     }
+    // `key in fn`: the Function object's own sealed surface (call/apply/length/
+    // toString/valueOf/hasOwnProperty/propertyIsEnumerable/prototype); `name` and
+    // `arguments` are NOT members (measured on adl 51.4.1, temp/with3m).
+    if (obj.type.kind === 'function') {
+      return { code: `((void)(${obj.code}), as_fn_has_member(${keyStr}))`, type: { kind: 'bool' } };
+    }
     throw new CodegenError(`'in' requires a dynamic Object, found ${obj.type.kind}`);
   }
 
@@ -39291,9 +39875,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     // as c` is null -- measured on adl 51.4.1, temp/cisprobe/cis-result.txt
     // B1-B4). The result is a `*` (AS3 types it as the untyped `x as c`), and a
     // right operand that holds no class object throws #1009 like the `is` form.
-    const clsVal = this.classValueOperand(expr.typeName);
-    if (clsVal !== null) {
+    // A *-typed operand validates at run time with the same two errors as `is`
+    // (#1010 undefined / #1009 null or non-Class, temp/isany/ A1-A4); an
+    // Object-typed one is the mxmlc compile-time implicit-coercion error.
+    const clsOp = this.isAsOperand(expr.typeName);
+    if (clsOp === 'objectTyped') {
+      throw this.implicitCoercionError({ kind: 'object', className: 'Object' }, { kind: 'class' });
+    }
+    if (clsOp !== null) {
       const anyType: CType = { kind: 'any' };
+      if (clsOp.mode === 'any') {
+        // Left side first, then the right operand's validation (temp/isany/ A6:
+        // the side effect fires even though the RHS throws).
+        const lval = this.tmpName('aslhs');
+        this.line(`as_value ${lval} = ${this.classTestValue(o)};`);
+        return { code: `as_class_as_val(${lval}, as_class_req_any(${clsOp.code}))`, type: anyType };
+      }
+      const clsVal = clsOp.code;
       if (o.type.kind === 'any') return { code: `as_class_as_val(${o.code}, ${clsVal})`, type: anyType };
       if (o.type.kind === 'interface') return { code: `as_class_as_val(as_v_obj((void*)(${o.code}.obj)), ${clsVal})`, type: anyType };
       if (o.type.kind === 'object') return { code: `as_class_as_val(as_v_obj((void*)(${o.code})), ${clsVal})`, type: anyType };
@@ -39531,11 +40129,57 @@ void FileStream_writeObject(void* _this, as_value v) {
   // type grammar). `lookupClassVar` already resolves closures, block locals, class
   // fields/static fields and module variables — the same scope order AS3 uses, so
   // a `Class` variable correctly shadows a class of the same name.
-  private classValueOperand(name: string): string | null {
-    if (name.includes('.') || name.includes('::') || name.includes('<')) return null;
-    if (this.isScalarTypeName(name)) return null;
-    const v = this.lookupClassVar(name);
-    return v ? v.code : null;
+  // The `is`/`as` right operand resolved in the SCOPE (AIR resolves the name in
+  // scope first, so a variable shadows a class of the same name):
+  //   - a Class-typed variable: the static as_class* (mode 'cls'),
+  //   - a *-typed variable: an as_value validated at run time (mode 'any';
+  //     undefined -> #1010, null / any non-Class -> #1009, temp/isany/),
+  //   - an Object-typed variable: mxmlc REJECTS it at compile time with the
+  //     implicit-coercion error (measured: 'error: implicit coercion of a value
+  //     of type Object to an unrelated type Class', temp/isany/ first run), so
+  //     'objectTyped' makes the caller throw the same-shaped error.
+  private isAsOperand(name: string): { code: string; mode: 'cls' | 'any' } | 'objectTyped' | null {
+    const pick = (t: CType | undefined): { code: string; mode: 'cls' | 'any' } | 'objectTyped' | null => {
+      if (t === undefined) return null;
+      if (t.kind === 'class') return { code: '', mode: 'cls' };
+      if (t.kind === 'any') return { code: '', mode: 'any' };
+      if (t.kind === 'object') return 'objectTyped';
+      return null;
+    };
+    if (this.currentClosureCaptures?.has(name)) {
+      const t = this.currentClosureCaptures.get(name)!;
+      const r = pick(t);
+      return r === null || r === 'objectTyped' ? r : { code: `env->${this.cIdent(name)}`, mode: r.mode };
+    }
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      const lt = this.scopes[i].get(name);
+      if (lt === undefined) continue;
+      const r = pick(lt);
+      return r === null || r === 'objectTyped' ? r : { code: this.cIdent(name), mode: r.mode };
+    }
+    // A Class/any-typed instance field (`private var _rootClass:Class`) is
+    // `this->_rootClass`.
+    if (this.currentClass) {
+      const cinfo = this.symbols.getClass(this.currentClass);
+      const f = this.symbols.fieldSlot(this.currentClass, name);
+      if (f && !this.symbols.shadowedForRead(this.currentClass, f.owner, name)) {
+        const r = pick(f.type);
+        return r === null || r === 'objectTyped' ? r : { code: `this->${this.cIdent(f.cName ?? name)}`, mode: r.mode };
+      }
+      const sf = cinfo?.staticFields.get(name);
+      if (sf) {
+        const r = pick(sf.type);
+        return r === null || r === 'objectTyped' ? r : { code: this.sfRead(sf.owner, name), mode: r.mode };
+      }
+    }
+    if (this.currentClass === null) {
+      const mt = this.moduleScope.get(name);
+      if (mt !== undefined) {
+        const r = pick(mt);
+        return r === null || r === 'objectTyped' ? r : { code: this.moduleCName(name), mode: r.mode };
+      }
+    }
+    return null;
   }
 
   // Like lookupClassVar, but returns an Object/any-typed variable holding a Class
@@ -40241,7 +40885,12 @@ void FileStream_writeObject(void* _this, as_value v) {
         }
         return `(${iname}){ (void*)as_v_obj_val(${e.code}), (${iname}_vtable*)as_iface_lookup(as_v_obj_val(${e.code}), "${iname}") }`;
       }
-      case 'function': return `((as_fn)as_v_obj_val(${e.code}))`;
+      // A dynamic value landing in a Function slot is UNCHECKED in AIR (no
+      // #1034; temp/with3g X13: `var t:Function = toString` inside `with (KC)`
+      // holds the string, and only `t()` raises #1006). A non-function box
+      // therefore becomes a NULL closure here, which the call site's as_req_fn
+      // turns into that same #1006 instead of a wild dereference.
+      case 'function': return `((as_fn)as_v_as_fn(${e.code}))`;
       case 'class': return `((as_class*)as_v_obj_val(${e.code}))`;
       case 'dict': return `((as_dict*)as_v_obj_val(${e.code}))`;
       case 'xml': return `((as_xml_node*)as_v_obj_val(${e.code}))`;
@@ -40417,6 +41066,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         case 'number': return 'Number';
         case 'array': return 'Array';
         case 'function': return 'Function';
+        case 'class': return 'Class';
         case 'xmllist': return 'XMLList';
         case 'xml': return 'XML';
         case 'record': case 'dict': return 'Object';

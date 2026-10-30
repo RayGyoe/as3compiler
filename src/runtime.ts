@@ -1215,6 +1215,22 @@ static void gc_root_register(void** slot) {
     gc_roots[gc_root_count++] = slot;
 }
 
+// Typedefs referenced by the early prelude before the class typedef block
+// (the GC forward decls below and as_fn_apply_v's RangeError #1116 check).
+// A typedef of an incomplete struct tag forward-declares the tag, so the
+// later full typedef/definition of the same type is a legal re-declaration.
+typedef struct as_object_s as_object;
+typedef struct RangeError RangeError;
+// as_fn_proto / as_class_proto (defined with the early helpers below) lazily
+// create their prototype object through as_object_new, whose body comes with
+// the object typedef block further down.
+static as_object* as_object_new(void);
+
+// Prototype for the generated RangeError constructor: as_fn_apply_v (below in
+// this prelude) throws #1116 through it, and the class body is emitted much
+// later by the codegen.
+static RangeError* RangeError_new(char* message, int id);
+
 // Forward declarations (bodies follow after all runtime structs are defined).
 static void gc_mark_ptr(void* p);
 static void gc_scan(gc_header* h);
@@ -2584,6 +2600,34 @@ static as_fn as_fn_make(as_fn_impl fn, void* env, int arity) {
     f->arity = arity;
     return f;
 }
+// Function.prototype (temp/with3k A): each function owns a DISTINCT empty
+// dynamic Object. The object is keyed by the closure's (fn, env) IDENTITY
+// rather than stored on the closure itself: a module-level function reference
+// is re-materialized per use (as_fn_make at the capture site), so the cache
+// makes f.prototype == f.prototype true across materializations (P2/P13)
+// while two different closures still get distinct prototypes. Cache entries
+// are arena-permanent; each proto is registered as a GC root.
+typedef struct { as_fn_impl fn; void* env; as_object* proto; } as_proto_cache_e;
+static as_proto_cache_e* as_proto_cache = NULL;
+static int as_proto_cache_n = 0;
+static int as_proto_cache_cap = 0;
+static as_object* as_fn_proto(as_fn f) {
+    if (f == NULL) return NULL;
+    for (int i = 0; i < as_proto_cache_n; i++) {
+        if (as_proto_cache[i].fn == f->fn && as_proto_cache[i].env == f->env)
+            return as_proto_cache[i].proto;
+    }
+    if (as_proto_cache_n == as_proto_cache_cap) {
+        as_proto_cache_cap = as_proto_cache_cap == 0 ? 32 : as_proto_cache_cap * 2;
+        as_proto_cache = (as_proto_cache_e*)realloc(as_proto_cache, (size_t)as_proto_cache_cap * sizeof(as_proto_cache_e));
+    }
+    as_proto_cache_e* e = &as_proto_cache[as_proto_cache_n++];
+    e->fn = f->fn;
+    e->env = f->env;
+    e->proto = as_object_new();
+    gc_root_register((void**)&e->proto);
+    return e->proto;
+}
 
 // ---------- setTimeout / setInterval (+ their clear functions) ----------
 // AS3 flash.utils.setTimeout(closure, delay, ...) schedules a Function call after
@@ -2995,6 +3039,12 @@ typedef struct {
     // X_cinit() a direct C read/write sequences first, so a name-looked-up static
     // never observes its slot before the initializer ran.
     void (*cinit)(void);
+    // A kind-3 (getter/setter pair) row's SETTER thunk: receives one boxed
+    // argument and calls the static setter (NULL when the property is getter-only,
+    // which makes a dynamic write the #1074 AIR raises). Appended LAST so the
+    // shorter initializers emitted for kinds 1/2 stay valid (C zero-fills the
+    // trailing fields).
+    void (*setfn)(as_value v);
 } as_class_static;
 
 typedef struct {
@@ -3029,7 +3079,22 @@ typedef struct {
     // compares reflect names through as_vec_is_name -- the same strict, exact
     // element-type test the static form uses (measured: temp/gprobe C3-C10).
     const char* vecfqn;
+    // Lazily-created prototype object (AIR: every class owns a distinct empty
+    // dynamic Object; temp/with3k B/C/D). NULL until first read; registered as
+    // a GC root on creation because as_class lives in a static C table the
+    // marker does not scan.
+    void* proto;
 } as_class;
+// Class.prototype (temp/with3k B/C/D): a distinct empty dynamic Object per
+// class, created on first read.
+static as_object* as_class_proto(as_class* c) {
+    if (c == NULL) return NULL;
+    if (c->proto == NULL) {
+        c->proto = as_object_new();
+        gc_root_register(&c->proto);
+    }
+    return (as_object*)c->proto;
+}
 
 // x as Class for a BOXED operand: keep the value when it really is a class
 // reference, else null (measured on adl 51.4.1: Object(Foo) as Class is Foo,
@@ -3342,6 +3407,13 @@ static as_value as_fn_apply(as_fn f, as_array* args) {
 static as_value as_fn_apply_v(as_value fbox, as_value argsbox) {
     if (fbox.tag != 7) return as_v_null();
     as_fn f = (as_fn)as_v_obj_val(fbox);
+    // A second argument that is present and neither an Array nor null/undefined
+    // is RangeError #1116 in AIR (temp/with3j E1/E2/E7: apply(null, 2) throws,
+    // apply(null, null) and a missing argument do not).
+    if (argsbox.tag != 6 && argsbox.tag != 0 && argsbox.tag != 5) {
+        as_throw(RangeError_new((char*)"Error #1116", 1116));
+        return as_v_null();
+    }
     as_array* args = (argsbox.tag == 6) ? (as_array*)as_v_obj_val(argsbox) : NULL;
     return as_fn_apply(f, args);
 }

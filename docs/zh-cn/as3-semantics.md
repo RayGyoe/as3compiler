@@ -111,7 +111,7 @@ AGENTS.md §2.4 语义红线（已定的硬性决策）
 | **`is int` / `is uint` 是值域测试，不是类型身份**：`int 5` 既是 int 也是 uint、`int -1` 是 int 不是 uint、`Number 5` 两者皆是、`Number 5.5` 两者皆非、`2^32` 不是 uint、`null` 两者皆非，`*` 槽同规则 | AS3 参考 + `adl 51.4.1` 13 例实测（`temp/rtprobe2/Lit.as`，`lit-out.txt`） | 数值操作数上 emit 走 `as_num_is_int32((double)x)` / `as_num_is_uint32(...)`（`floor` 相等 + 区间），`*` 操作数走 `as_v_is_int32` / `as_v_is_uint32`（先判数值 tag 再判值域）；`is Number` 仍是 tag 测试。原先按静态 C 类型折叠 ⇒ `int 5 is uint` 答 false、`Number 5.5 is int` 答 true，两条都与 AIR 相反 | ✅ 已实现（阶段三百二十八；`examples/num-to-string.as` 断言 int/uint/Number 三种静态类型 + 字面量） |
 | **纯数字整数**字面量按**值**定型，不按拼写：`≤ 2^31-1` 是 `int`、`2^31..2^32-1` 是 `uint`、`≥ 2^32` 是 `Number` | AS3 参考 + `adl 51.4.1` 实测（同上 `Lit.as`：`2147483647` 两种 `is` 都真、`2147483648` `is int` 假、`4294967296` 是 Number） | `emit.ts` 的 `case 'Num'` 按 `expr.isInt` + 值分段：`int` 输出裸十进制、`uint` 输出 `<v>u`、`Number` 走 `formatDouble`。**旧规则一律当 `int`** ⇒ `3000000000` 变成**负** int、`is uint` 答 false，且 `123456789012345680000` 被打印成 C 整数常量，clang 直接报 `integer literal is too large to be represented in any integer type`（合法 AS3 编译不过） | ✅ 已实现（阶段三百二十八；`examples/num-to-string.as` + 实机编译通过） |
 | **隐式强制转换按 mxmlc 的拒绝面拒绝**：`*` 源、`Object` 目标、`Boolean` 目标是放行的三角；数值族内部可互转但**与 String 不相通**；其余全部要求真实子类关系（`Object→Array/Number/String`、`DisplayObject→Sprite`、`XML→XMLList` 都是错误） | `mxmlc 51.4.1` 实测：`temp/coerce/` 的 12 目标 × 10 源矩阵、`Q.as`（`return` 位）、`X.as`（E4X 例外） | 新增 `checkImplicitCoercion`，只在**声明型强制点**调用（变量初始化、赋值到已声明槽、`return`、字段/静态初值）；**不放进 `convert()`**——那也是内部统一路径（三元两支合一等），放进去会把 `cond ? "s" : 5` 判成错误。E4X 例外：XML/XMLList→String 放行（mxmlc 实测允许）。接口目标**刻意不查**（我们的内建接口表比 playerglobal 窄，误判会拒绝合法 AIR 代码） | ✅ 已实现（阶段三百二十九；`unit: diagnostics/Codegen` 5 负例 + 4 正例钉）。修后 `examples/stage34.as` 的 `var removed:Sprite = s.removeChildAt(0)` 与 `examples/xml-dynamic-str.as` 的 `var s0:String = emptyList` 被正确定性为非法 AS3 并改写成 `DisplayObject` / `String(...)` |
-| **脚本层给未声明名字赋值 = 隐式全局**（非严格）：`gvar = 42;` 之后 `gvar` 可读，初值 `undefined`；**类/包作用域保持严格**（同一个语句在类方法里是硬错误） | `mxmlc 51.4.1` 实测**严格半边**（`temp/implicit/`：类方法里 `gvar = 42` 报「所访问的属性 gvar 可能未定义」）；**非严格半边**帧脚本无法用 mxmlc 产出（时间轴脚本只能来自 `.fla`），故按 ES3 自身规则实现——全仓唯一一处「裁判是规范而非 adl 读数」 | `collectImplicitGlobals` 只遍历**脚本层**语句（不下潜函数体），命中的名字登记为 `*` 型模块变量，初值 `(as_value){5,…}`（**undefined**，不是 `*` 默认的 null——AS3 的 `===` 能区分二者）；函数/类/内建类同名者一律排除（`moduleScope` 的查找早于函数/类表，登记会遮蔽真名）。`with` 内给「对象没有、词法也没有」的名字赋值自然落回同一槽位（ES3：`with` 只在对象**有**该属性时把引用基址给它） | ✅ 已完成（阶段三百三十；`examples/implicit-global.as` 5 组断言 + `unit: emit/ImplicitGlobal` 6 钉）。**残留**：赋值写在**函数体内**（含函数体内的 `with`）仍是编译期错误——严格半边已实测，宽松半边无法实测，不做猜测 |
+| **脚本层给未声明名字赋值 = 隐式全局**（非严格）：`gvar = 42;` 之后 `gvar` 可读，初值 `undefined`；**类/包作用域保持严格**（同一个语句在类方法里是硬错误） | `mxmlc 51.4.1` 实测**严格半边**（`temp/implicit/`：类方法里 `gvar = 42` 报「所访问的属性 gvar 可能未定义」）；**非严格半边**帧脚本无法用 mxmlc 产出（时间轴脚本只能来自 `.fla`），故按 ES3 自身规则实现——全仓唯一一处「裁判是规范而非 adl 读数」 | `collectImplicitGlobals` 按 **fnDepth/withDepth** 双深度扫描：脚本层赋值恒收、闭包内**仅 `with` 体内**的赋值收（闭包里的裸赋值是局部，不是全局），命中的名字登记为 `*` 型模块变量，初值 `(as_value){5,…}`（**undefined**，不是 `*` 默认的 null——AS3 的 `===` 能区分二者）；函数/类/内建类同名者一律排除（`moduleScope` 的查找早于函数/类表，登记会遮蔽真名）。`with` 内给「对象没有、词法也没有」的名字赋值自然落回同一槽位（ES3：`with` 只在对象**有**该属性时把引用基址给它），且**跨闭包可见**（`temp/with3n`：闭包 A 的 with 体写、闭包 B 的 with 体读得到——AIR 实测它是模块级共享槽，不是闭包局部） | ✅ 已完成（阶段三百三十脚本层 / 阶段三百四十五函数体；`examples/implicit-global.as` 5 组断言 + `examples/with-fn-class-regexp.as` 隐式全局 3 断言 + `unit: emit/ImplicitGlobal` 6 钉） |
 | **`TextFormat` 成员表 = AIR 全表（19 字段）+ 构造器 = AIR 的 13 参且**顺序一致** | `adl 51.4.1` 同源双端实测（`temp/implicit/Main.as` 同一份源码分别由 mxmlc 与我们编译，一次读回） | 补齐 `url`/`target`/`indent`/`blockIndent`/`bullet`/`display`/`tabStops`；构造器改为 `font,size,color,bold,italic,underline,url,target,align,leftMargin,rightMargin,indent,leading`。**旧的第 6 参是 `leading`、AIR 是 `underline`** —— 同一个调用在两端含义不同，`examples/textrich.as` 里唯一一处 6 参调用已改写为显式 `lf.leading = 8`。C 侧 `TextFormat_ctor/TextFormat_new` 同步扩到 13 参，`clone`/`empty` 同步搬新字段 | ✅ 已完成（阶段三百三十一）。**仍未做**：零参 `new TextFormat()` 在 AIR 里字段全 null、赋给 `defaultTextFormat` 时是逐字段「未设则保持」，我们仍填本构建的历史默认值 —— 见下一行 |
 ---
 
@@ -359,8 +359,37 @@ API 面、错误码或事件顺序，只决定同样的信息写进 stderr 时�
 
 **1. `with` 只改「名字的基址」，不改对象**。`with (obj) { x }` 在 `obj` **有** `x` 时把引用基址交给
 `obj`，否则落回词法作用域（ES3 原文）。因此接收者的成员面决定了一切：Array / `Dictionary` / 接口
-走运行时的 `as_dyn_*`；`String` / `Vector` 是**编译期封闭集**（名字表 + 静态发射器，写形态暂不接）；
-函数 / 类 / 正则仍**响亮拒绝**（见 `TODO.md` 遗留表）。
+走运行时的 `as_dyn_*`；`String` / `Vector` 是**编译期封闭集**（名字表 + 静态发射器，体内写形态暂不接，
+见 `TODO.md` 遗留表）；**Function / 类 / RegExp 三类接收者的成员面已在阶段三百四十五 全部落地**
+（证据台 `temp/with3/`，Main1..14 探针 + `ourall.as` 镜像双端 diff=IDENTICAL）：
+
+- **Function 接收者**（`with (f2)`）：`length`=实参个数；`toString()`=`"function Function() {}"`；
+  `call`/`apply` 是**绑定到接收者**的方法（arity 1，缺参按接收者 arity 报 `#1063`）；`valueOf()` 是
+  函数本身（`valueOf() == f2` 为 true）；`hasOwnProperty('length'/'prototype')`=true、
+  `propertyIsEnumerable` 恒 false；`prototype` 是**每函数独立**的空动态 Object（同一函数的两次读取
+  同一身份，跨函数不相等——按 (fn, env) 身份缓存，与函数相等比较同口径）；`"call" in f2` 的成员集 =
+  call/apply/length/toString/valueOf/hasOwnProperty/propertyIsEnumerable/prototype 八个（`name`/`arguments`
+  **不是**成员）；未知名 → `#1065`；`length` 写 → `#1074`（"on Function."）；方法写 → `#1037`。
+- **类接收者**（`with (KC)`）：静态字段/方法/getter/setter/const 全通（编译期直接发射）；实例字段
+  不可见（`#1065`）；`toString()`=`"[class KC]"`、`valueOf()` 是类本身；`hasOwnProperty('toString')`
+  =true 且**声明的静态成员也算 own**（`hasOwnProperty('sv')`=true）；`propertyIsEnumerable` 恒 false；
+  const 写 → `#1074`（"on class <fqn>."）、方法写 → `#1037`、getter-only 写 → `#1074`；`delete` 静态
+  成员 = **false**（不是编译错）；null Class 接收者 → `#1009`；`with (KC) { var t:Function = toString;
+  t() }` → `#1006`（值形态不可调，只有 with 体内的调用形态是 `"[class KC]"`；隐式强制转换 `* →
+  Function` 不检查）。
+- **RegExp 接收者**（`with (re)`）：`source`/`global`/`ignoreCase`/`multiline`/`dotall`/`extended` 六个
+  **只读 getter**（写 → `#1074`；此前是普通字段、写不报错）；`lastIndex` 可写；`exec`/`test` 共享
+  lastIndex 状态；`toString()`=`"/ab/gi"`（无 flag 是 `"/cd/"`，保留斜杠）；**`flags` 从来不是成员**
+  （`#1065`——此前我们暴露了 `flags`/`compiled` 可读字段，已移入内部槽 `_flags`/`_compiled`）；
+  方法写 → `#1037`。
+
+三类接收者之外的同批实测：`f2.call`/`f2.apply` 作为**值**是绑定方法（`c(1,2,3)`=接收者的 `(2,3)`
+调用、`c.length`=1、`f2.toString.length`=0、`f2.call == f2.call`=true、apply 值第二参非数组且非
+null/undefined → `#1116`）；`KC.prototype`/`f2.prototype` 是每类/每函数独立的空动态 Object；
+Function 相等改 **(fn, env, arity)** 身份比较（原来对 `as_fn` 指针直接 `==`，两个材质化实例恒不等）；
+密封实体的 `valueOf()` 静态路径返接收者本身（`Object` 槽仍走 `as_dyn_call` 保 §3.9 的盒装原始值契约）。
+**with 体内给「对象没有、词法也没有」的名字赋值 = 隐式全局**（`with (KC) { noSuchStatic = 5 }` 不抛错、
+跨闭包可见，见隐式全局行）。
 
 **2. `key in value` 判的是「值的运行期类有没有这个成员」**，与 `value` 的静态类型无关。`adl` 的读数：
 `"0" in "abc"` 与 `"x" in "abc"` 都是 **false**（`String` 只认方法名与 `constructor`）、

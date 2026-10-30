@@ -2295,13 +2295,13 @@ function checkRegExpInertConstruction(): string[] {
   const ctor = body('void RegExp_ctor(RegExp* o, char* pattern, char* flags) {');
   check('RegExp_ctor is emitted', ctor.length > 0);
   check('RegExp_ctor does not throw on a bad pattern', !/as_throw|SyntaxError_new/.test(ctor));
-  check('RegExp_ctor still compiles the pattern', ctor.includes('o->compiled = as_regex_compile(pattern, flags);'));
+  check('RegExp_ctor still compiles the pattern', ctor.includes('o->_compiled = as_regex_compile(pattern, flags);'));
 
   // 2. Every consumer must consult that error flag, or the zero-instruction
   //    program would run and match at position 0.
   check('as_regex_search bails out on err', c.includes('if (re == NULL || re->err) return -1;'));
-  check('RegExp_exec bails out on err', c.includes('if (re->compiled == NULL || re->compiled->err) return NULL;'));
-  check('RegExp_test bails out on err', c.includes('if (re->compiled == NULL || re->compiled->err) return false;'));
+  check('RegExp_exec bails out on err', c.includes('if (re->_compiled == NULL || re->_compiled->err) return NULL;'));
+  check('RegExp_test bails out on err', c.includes('if (re->_compiled == NULL || re->_compiled->err) return false;'));
 
   // 3. A stray ')' must be a COMPILE error, not a silent stop. A sequence
   //    compiler that merely stops at the ')' leaves a zero-instruction program,
@@ -4548,13 +4548,13 @@ function checkInAndWithReceivers(): string[] {
   check('a with over a Vector resolves length statically',
     /as_vector_int\* __w[0-9]+ = g_v;/.test(c));
   check('the String case reuses the static length path', c.includes('((int)strlen('));
-  check('a String/Vector with receiver is a builtin (name-set) scope',
-    em.includes("mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : 'sealed',"));
+  check('a String/Vector/Function with receiver is a builtin (name-set) scope',
+    em.includes("mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : classReceiver ? 'class' : 'sealed',"));
   check('assigning a builtin with member fails loudly instead of emitting a non-lvalue',
     em.includes('with: assigning the member') && em.includes('with: updating the member'));
   check('the dynamic with receivers are Array/Dictionary/interface only',
     em.includes("const dynReceiver = k === 'array' || k === 'dict' || k === 'interface';")
-    && em.includes("const builtinReceiver = k === 'string' || k === 'vector';"));
+    && em.includes("const builtinReceiver = k === 'string' || k === 'vector' || k === 'function';"));
 
   const ex = readFileSync(join(root, 'examples', 'proxy.as'), 'utf8');
   check('the example pins the with receivers and the `in` answers',

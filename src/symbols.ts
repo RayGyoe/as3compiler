@@ -1059,26 +1059,37 @@ export class SymbolTable {
     // built-in RegExp class: wraps a compiled regex program plus source/flags
     // metadata. `exec` returns an Array (or null) and `test` a Boolean; both take
     // the subject string. `lastIndex` is writable and drives `g` matching.
+    //
+    // AIR surface (measured on adl 51.4.1, temp/with3/): source/global/ignoreCase/
+    // multiline/dotall/extended are READ-ONLY (`re.source = "zz"` is an mxmlc
+    // compile error, a dynamic write is #1074), lastIndex is writable, and there
+    // is NO `flags` member (it falls through to #1065 in a with body). The
+    // read-only six and the internal storage (compiled program, flag chars) live
+    // in C-runtime-only slots (see emitBaseClassSlots) behind getter-only
+    // accessors -- declared fields would accept the write AIR rejects and show up
+    // as writable in describeType.
     const rf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'RegExp', isStatic: false, isConst: false });
     this.classMap.set('RegExp', {
       fields: new Map([
-        ['compiled', rf({ kind: 'regexp' })],
-        ['source', rf({ kind: 'string' })],
-        ['flags', rf({ kind: 'string' })],
         ['lastIndex', rf({ kind: 'int' })],
-        ['global', rf({ kind: 'bool' })],
-        ['ignoreCase', rf({ kind: 'bool' })],
-        ['multiline', rf({ kind: 'bool' })],
-        ['dotall', rf({ kind: 'bool' })],
-        ['extended', rf({ kind: 'bool' })],
       ]),
       methods: new Map([
         ['exec', { returnType: { kind: 'array' }, params: [{ name: 's', type: 'String', defaultValue: null, isRest: false }], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         ['test', { returnType: { kind: 'bool' }, params: [{ name: 's', type: 'String', defaultValue: null, isRest: false }], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+        // AIR: /ab/gi.toString() is "/ab/gi" (source + "/" + flags; no flags
+        // prints a trailing slash, "/cd/"), not Object's "[object RegExp]".
+        ['toString', { returnType: { kind: 'string' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
+      getters: new Map([
+        ['source', { returnType: { kind: 'string' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['global', { returnType: { kind: 'bool' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['ignoreCase', { returnType: { kind: 'bool' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['multiline', { returnType: { kind: 'bool' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['dotall', { returnType: { kind: 'bool' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['extended', { returnType: { kind: 'bool' }, params: [], owner: 'RegExp', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),
-      getters: new Map(),
       setters: new Map(),
       constructor: { params: [
         { name: 'pattern', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false },

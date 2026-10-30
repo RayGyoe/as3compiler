@@ -438,14 +438,14 @@ function checkClassStaticMember(): string[] {
 
   check('a Class-value member read goes through as_class_member_value',
     c.includes('as_class_member_value((as_class*)'));
-  check('a static getter gets a kind 3 row pointing at a boxed thunk',
-    /\{ "thing", 3, Holder__statget_thing, 0, NULL, 0, (NULL|Holder_cinit) \}/.test(c));
+  check('a static getter gets a kind 3 row pointing at a boxed thunk (with a NULL setter tail)',
+    /\{ "thing", 3, Holder__statget_thing, 0, NULL, 0, (NULL|Holder_cinit), NULL \}/.test(c));
   check('the thunk invokes the _static getter and boxes its result',
     c.includes('static as_value Holder__statget_thing(void* env, as_value* args, int argc) {')
     && c.includes('return as_v_str(Holder_get_thing_static(NULL));'));
-  check('a static var/const keeps its addressed kind 2 slot',
+  check('a static var keeps its addressed kind 2 slot and a const its kind 4',
     /\{ "plain", 2, NULL, 0, \(void\*\)&Holder_plain, 5, /.test(c)
-    && /\{ "KONST", 2, NULL, 0, \(void\*\)&Holder_KONST, 5, /.test(c));
+    && /\{ "KONST", 4, NULL, 0, \(void\*\)&Holder_KONST, 5, /.test(c));
   check('a static method keeps its boxed __call thunk (kind 1)',
     /\{ "greet", 1, Holder_greet__call, 0 \}/.test(c));
   check('the runtime dispatches kind 3 by INVOKING the accessor thunk',
@@ -680,8 +680,8 @@ function checkMemberShadow(): string[] {
   check('the rule is a single named helper (shadowedForRead), not inlined twice',
     symbolsSrc.includes('shadowedForRead(cls: string, fieldOwner: string, name: string): boolean {'));
   const emitSrc = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
-  check('all six resolution sites consult it (4 reads + 2 type inferences)',
-    (emitSrc.match(/shadowedForRead\(/g) ?? []).length === 6);
+  check('all seven resolution sites consult it (5 reads + 2 type inferences)',
+    (emitSrc.match(/shadowedForRead\(/g) ?? []).length === 7);
 
   // The example pins the measured AIR goldens end to end.
   const ex = readFileSync(join(dir, 'member-shadow.as'), 'utf8');
@@ -932,6 +932,47 @@ function checkClassValues(): string[] {
   check('...and the inherited-interface is/as results',
     ex.includes('check((new Sprite() is cIE), "a Sprite is <IEventDispatcher class>")')
     && ex.includes('check((new Sprite() as cIE) != null, "as <IEventDispatcher class>")'));
+
+  // ---- *-typed right operand (stage 345 / v0.4.306, temp/isany/) ----
+  // `var ca:* = Sprite; x is ca`: AIR validates the runtime value first, with two
+  // distinct errors -- undefined -> #1010, and EVERYTHING else that is not a class
+  // object (null, numbers, strings) -> #1009 -- then runs the subtype test. The
+  // left side is evaluated FIRST (A5/A6: the side-effect counter reads 1 despite
+  // the throw), so the emitter sequences it into a temp. An Object-typed operand
+  // is the mxmlc compile-time implicit-coercion error.
+  const cAny = generateC(parse([
+    'var cc:Class = Sprite; var ca:* = cc;',
+    'var co:Object = cc;',
+    'var b1:Boolean = new Sprite() is ca;',
+    'var b2:* = new Sprite() as ca;',
+    '',
+  ].join('\n'))).c;
+  check('a *-typed is-operand validates through as_class_req_any',
+    cAny.includes('static as_class* as_class_req_any(as_value c) {')
+    && cAny.includes('if (c.tag == 5) { as_throw(TypeError_new((char*)"Error #1010: A term is undefined and has no properties.", 1010))')
+    && cAny.includes('if (c.tag != 4 || c.ptr == NULL || !as_v_is_class(c)) { as_throw(TypeError_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009))')
+    && cAny.includes('as_class_is_val(') && cAny.includes('as_class_req_any('));
+  check('a *-typed as-operand routes through the same validation',
+    cAny.includes('as_class_as_val(') && cAny.includes('as_class_req_any('));
+  check('the left side is sequenced into a temp before the RHS validation',
+    /as_value _islhs\d* = as_v_obj/.test(cAny) || /as_value _islhs\d* = as_v_obj/.test(cAny));
+  let objErr = '';
+  try {
+    generateC(parse([
+      'var co:Object = Sprite;',
+      'var b:Boolean = new Sprite() is co;',
+      '',
+    ].join('\n')));
+  } catch (e) { objErr = String(e); }
+  check('an Object-typed is-operand is the implicit-coercion compile error',
+    /implicit coercion of a value of type Object to a possibly unrelated type Class/.test(objErr));
+
+  // The example pins the *-operand goldens end to end.
+  const exAny = readFileSync(join(dir, 'is-as-any-class.as'), 'utf8');
+  check('the example pins the #1009/#1010 and evaluation-order goldens',
+    exAny.includes('expectThrow(1010, function():void { var r:Boolean = new Sprite() is und; }')
+    && exAny.includes('check(counter == 1, "is: left side evaluated before the RHS throws")')
+    && exAny.includes('check(bad as ca == null, "bad as ca null")'));
 
   if (ok > 0) console.log(`[clsval] ${ok} class-value checks passed`);
   return bad;

@@ -321,7 +321,7 @@ function checkStackCanary(): string[] {
   // ordinary automatic table: their result is consumed by as_str_concat_n before
   // they return too, but a table that outlives nothing is simply not a TLS case,
   // and these three are cold. The assertion is that they are the ONLY ones left.
-  const RETURNERS = ['as_class_str', 'Error_toString', 'SQLError_toString'];
+  const RETURNERS = ['as_class_str', 'Error_toString', 'SQLError_toString', 'RegExp_toString'];
   const autoSites: string[] = [];
   {
     const re = /this\.line\('(?:static )?char\* [A-Za-z0-9_]+\(/g;
@@ -334,7 +334,7 @@ function checkStackCanary(): string[] {
     }
   }
   check(`only the message-returning builders keep an automatic table (${autoSites.join(', ') || 'none'})`,
-    autoSites.length === 3 && autoSites.every((s) => RETURNERS.includes(s)));
+    autoSites.length === RETURNERS.length && autoSites.every((s) => RETURNERS.includes(s)));
 
   // 2. Non-vacuity, then the assembly half on the shape that regressed.
   const c = generateC(parse(CANARY_PROBE_SRC)).c;

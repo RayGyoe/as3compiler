@@ -131,7 +131,7 @@ function checkPrimMethods(): string[] {
   check('a missing String argument is an undefined stand-in, not NULL',
     dyn.includes('_undef_args[0] = as_v_undefined();') && dyn.includes('if (args == NULL) args = _undef_args;'));
   check('replace() without a replacement inserts the text "undefined"',
-    dyn.includes(': "undefined", re->global));') && dyn.includes('argc >= 2 ? as_v_str_val(args[1]) : "undefined"'));
+    dyn.includes(': "undefined", re->_global));') && dyn.includes('argc >= 2 ? as_v_str_val(args[1]) : "undefined"'));
 
   // ---- the example pins the measured values ----
   const ex = readFileSync(join(root, 'examples', 'dyn-prim-methods.as'), 'utf8');
