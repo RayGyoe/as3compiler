@@ -157,4 +157,53 @@ function checkFqnStaticClassRef(): string[] {
   return bad;
 }
 
+// ---- bracket form and shadowed chain roots (stage 326) ----
+// `Cls["name"]` is the same trait query as `Cls.name` (measured on adl 51.4.1): the
+// LITERAL key must therefore compile to the very same direct slot read, for both
+// spellings. A chain whose FIRST segment is a variable is a member walk on that
+// value, so a null receiver throws #1009 instead of answering the static's value --
+// the silent-wrong-value class of bug, pinned here at the emitted-C layer because
+// the difference is which C was emitted.
+function checkBracketAndShadowing(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [fqnbr] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [fqnbr] ${label}`); }
+  };
+  const body = (src: string): string => mainTail(emit(PKG, src));
+  const literal = body('trace("" + C["field"]);\ntrace("" + pkg.C["field"]);');
+  check('a literal bracket key is the dotted read (both spellings, no runtime table)',
+    count(literal, '(pkg_C_cinit(), pkg_C_field)') === 2
+    && !literal.includes('as_class_member_value'));
+  const litConst = body('trace("" + C["K"]);');
+  check('a literal bracket key reaches a static const too',
+    litConst.includes('(pkg_C_cinit(), pkg_C_K)'));
+  const litGet = body('trace("" + pkg.C["seven"]);');
+  check('a literal bracket key reaches a static getter',
+    litGet.includes('pkg_C_get_seven_static(NULL)'));
+
+  // A shadowed root: the chain must NOT collapse to the static slot. It becomes a
+  // dynamic read of the local, and the null receiver is guarded at run time.
+  const shadowed = body('var pkg:Object = null;\nvar v:* = pkg.C.field;');
+  check('a shadowed chain root is a member walk, not a class reference',
+    !shadowed.includes('(pkg_C_cinit(), pkg_C_field)') && shadowed.includes('as_dyn_get('));
+  // ... and the same for the bracket spelling.
+  const shadowedBr = body('var pkg:Object = null;\nvar v:* = pkg.C["field"];');
+  check('a shadowed chain root keeps the bracket form dynamic too',
+    !shadowedBr.includes('(pkg_C_cinit(), pkg_C_field)'));
+
+  // A MODULE-scope variable shadows the class name in the call form as well (this is
+  // the `System[*]()` normalization the call path performs).
+  const modShadowAll = emit(PKG, 'var System:Object = null;\nSystem["gc"]();');
+  const modShadow = mainTail(modShadowAll);
+  check('a module-scope variable shadows a class name in Cls["m"]()',
+    !modShadow.includes('as_system_gc') && !modShadow.includes('as_class_call_static')
+    && modShadow.includes('as_fn_call_dyn(as_dyn_get(') && modShadow.includes('as_req_obj('));
+
+  if (ok > 0) console.log(`[fqnbr] ${ok} bracket/shadow checks passed`);
+  return bad;
+}
+
 registerGroup('unit: fqn/StaticClassRef', checkFqnStaticClassRef);
+registerGroup('unit: fqn/BracketAndShadowing', checkBracketAndShadowing);

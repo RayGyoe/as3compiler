@@ -17951,6 +17951,42 @@ Proxy、`Object`、Array 子类 backing、`_dyn` 槽表这些兜底分支原样�
 `#1037`、未知名 `#1056`、读值不变、被拒的写不落盘）；`unit: emit/*` 里 5 处旧钉改指 `_` 前缀
 （派发器、`ScreenMouseEvent.clone`、菜单 select）；全量示例 / 单元组见提交说明。
 
+| **`Cls[计算键]` 读静态成员仍回 `undefined`**（用户类的静态字段/常量/getter；`adl` 走类 trait 表给出真值） | 未开始（2026-10-30 阶段三百二十六 收口「字面量键」时**量出**：字面量键已在编译期规约成点式，运行期那张静态表只收 emit 阶段定型过的名字，`walkInferType` 给不出用户类的静态名 ⇒ 计算键读回 undefined。修法是让每个类把**全部**静态字段/getter 都排进 `as_class_statics`，代价是表体积与 `-O2` 剪枝面的变化，收益仅一个拼写形态，故先记录） |
+### 阶段三百二十六：链首段被变量遮蔽 + 括号形式读静态成员（v0.4.286 → v0.4.287）
+
+**范围**：遗留表「点链首段被变量遮蔽时仍被当类引用解析」（阶段二百一十七 登记）。顺带收口同一族
+里量出来的两处相邻缺口。
+
+**实测口径**：`adl 51.4.1`（`temp/fqnadl/`）在 `var pkg:Object = null; pkg.C.field` 上抛
+`#1009`（那是**值上的成员链**，null 接收者）；我们按包路径解析 ⇒ 直接读出静态值 5。**静默错值**
+按 AGENTS §2.5 是最重的一类。
+
+**实现**：把「链首段是作用域内变量」这一个判定提到三处解析入口（`chainRootIsValue`，内部查
+`scopes` + `moduleScope`）：
+
+1. **全限定名静态读分支**（`emitMember`）：闸门不成立就直接跳过，让链落到普通成员走查 ——
+   `pkg.C` 变动态读、`pkg` 的 null 接收者由 `as_req_obj` 守卫抛 `#1009`。
+2. **全限定名的 Class 值分支**：原判定用的是 `varInScope`（只管局部），module 作用域的 `var`
+   漏掉，`pkg.C` 仍解析成 `&pkg_C_cls` ⇒ 换成 `chainRootIsValue`。
+3. **`classRefName` 的裸名分支**：补同一条闸门。这一处是实测撞出来的 —— `var System:Object = null;
+   System.gc()` 之前仍发 `as_system_gc()`（静态只读类的硬编码分支根本没看作用域），`adl` 抛
+   `#1009`。同类名字（`Math`/`Capabilities`/`JSON`/`File`）一并按 AS3 作用域处理。
+
+**顺带收口一处「AIR 跑得对我们跑不出」**：`Cls["name"]` 与 `Cls.name` 在 AIR 里是同一个 trait
+查询，我们的括号形式却一律走运行期 `as_class_member_value`，而那张表只收 emit 阶段定型过的名字
+⇒ 内置静态（`File["separator"]`）与用户类静态（`C["field"]`）都读回 `undefined`。现在**字符串
+字面量键**在编译期规约成点式（`emitIndex` 入口，先于接收者发射，因为接收者本身是类名而不是
+变量），**计算**键保持运行期路径。
+
+**如实留下的残差**（新登记一行）：计算键 `Cls[n]` 对用户类静态仍读回 `undefined` —— 要修得让每个
+类把全部静态 trait 排进 `as_class_statics`，改的是表体积与 `-O2` 剪枝面，收益只是一个拼写形态，
+先记录不修。
+
+**验收**：`unit: fqn/BracketAndShadowing` 6 钉（字面量键两种拼写都发直接槽读、常量与静态
+getter 同样、遮蔽首段不折叠成静态槽、module 作用域遮蔽让调用变动态）；`examples/fqn-static/main.as`
+新增 ⑤ 段运行期断言（`C["field"]` 同槽、`File["separator"]` 同值、遮蔽链抛 `#1009`、活值链走
+对象）。全量 `node test.ts` ⇒ 559 passed / 0 failed。
+
 ### 遗留待开发
 > **2026-10-30 追加（阶段三百二十一：叶子类普通方法去虚化）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表仍 **115 项**。本阶段只改变有封闭编译面证明的 C 调用形态，不改 AS3 可见语义；访问器、`final`、private 与方法值 thunk 属设计文档中既定的后续独立阶段，不作为本轮新遗留重复登记。
 > **2026-10-30 追加（阶段三百二十：Stage3D 六个上传入口的边界契约）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表（`遗留项|状态|说明|建议`）行数 **114 → 115**（`未开始` 按列二含该词重数 **92 → 93**；上一轮 note 标 90，与实测差 2，本轮按实测记账，与阶段三百一十四/三百一十五 记过的同类偏差同因）。**本阶段修净的全都不占表**：`uploadFromByteArray` 的静默截断、负目标的越界写、短数组错报 `#2004`、`Texture.uploadFromByteArray` 的 `miplevel > 0` 报明、`uploadFromVector` 按 `startVertex` 起读、`uploadFromBitmapData` 越界 level 静默 `return` —— 六处都是「`adl` 跑得对我们跑不出/跑错」，属 §1.5 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记 1 行**＝`CubeTexture.uploadFromByteArray`（仍是响亮 stub；`adl` 支持逐面从 ByteArray 上传，本轮未测它的字节布局与 `side` 语义，故只登记不改）。**顺带修掉一处文档错位**：阶段三百一十九 的章节此前被错插在阶段六十四 的正文里（还留下一行带反引号的 `### 遗留待开发`），本次搬回本节序列尾部。口径与实测表见 `docs/zh-cn/display3d.md` §9.15。
@@ -18223,7 +18259,7 @@ Proxy、`Object`、Array 子类 backing、`_dyn` 槽表这些兜底分支原样�
 | SWC **库里非符号类的代码**（库自带的基类/工具类）不参与编译 ⇒ 符号的工程基类缺失时只能回落成 `MovieClip` 子类 | 未开始（2026-10-19 阶段一百九十六 修复 SWC 示例时实测登记） | 阶段一百九十一 起，符号类按它 `DoABC` 里的**真基类**绑定（`skin.swc` 的四个组合框都继承 App 自己的 `com.vsdevelop.controls.ComBoBox`，`swc.ts` 的 `availableProjectBase`）。但库的**其余**类（含这个基类在库里的那份副本）是 ABC 代码，不参与编译（`docs/zh-cn/swc.md` §3.3 明列范围外）⇒ 当**编译单元里没有**这个基类时（`examples/swc-*.as` 这类只烘美术的示例，或 App 少编译了一个文件），我们改成「烘成 `MovieClip`/`SimpleButton` 子类 + **响亮告警一次**」，而 `adl` 在同一份输入上**照跑不误**（AIR 会执行库里自带的那个基类）⇒ 按 §1.5 硬判据是**遗留缺陷**。本行只登记**没修的那部分**：库内基类的**行为**（它自己的字段/方法与 `this["title"]` 之类的动态访问）我们一律没有，符号只能退化成纯美术子类 | 立项：把 SWC 的 `DoABC` 里**非符号类**也编译进来（需要 `swc.ts` 把库内 ABC 里的类声明/方法解码成 AST 并注入程序，等价于把 `abc.ts` 的范围从「符号类的帧脚本+方法」扩到「整库 ABC」），那之后 `availableProjectBase` 的回落可以只留给「App 与库都没有」的真缺失。验收：以 `temp/skin.swc` 为输入，`ComBox`/`AIAsrComBox` 的 `currentLabels`/`title`/`selectedIndex` 行为与 `adl` 逐项对照 |
 | **窗口几何的 Windows 端残余**（Windows 端 `<transparent>` 仍未实现 / 四类未测面剩下的两项） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：原来列的四处里，① 最大化尺寸口径 **已定** —— 那是 `WS_MAXIMIZEBOX` 这一位（在 ⇒ 可用区 `2576x1675`，不在 ⇒ 整块显示器 `2576x1723`，adl 与我们在两档描述符下**逐字相同**），② 横向边框 **已修**（`b_left` 四处同源），③ 描述符成员 **已接线**（`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>`），只剩下面两处；**2026-10-23 阶段二百五十七 再收窄**：① 的**生成侧与 macOS 侧已接线**，剩下的只是 Windows 的原生实现） | **① `<transparent>` 的 Windows 端**：描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions.transparent` → `sk_window_set_transparent`、合成步清 alpha 0、macOS 的 `NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明，**全部已在阶段二百五十七 落地**；Windows 侧仍要 `WS_EX_LAYERED` + 逐帧 alpha（当前**报明一次**，不给假透明窗）；**② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没接线/没量」：① Windows 端需要一张分层窗（`WS_EX_LAYERED` + 逐帧 alpha）并把同样的「清 alpha 0」口径搬过去；② `closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
 | **初始窗的框/客户区单位**（描述符 `<width>/<height>` 是**框**，我们当**客户区** ⇒ 窗大一圈、舞台也大一圈） | 未开始（2026-10-19 阶段二百零五 实测登记；**两端同源，非 Windows 专属**） | Windows 实机孪生探针（`temp/nwwin/wprobe/`，`<width>366</width><height>630</height>`）：adl `bounds=366x630` + `stage=350x591`；我们 `bounds=382x669` + `stage=366x630`，**恰好差 16x39 = 左右边框 8+8 与标题栏 31 + 下边框 8**。根因在生成侧：引导代码把描述符的 `width`/`height` 当**客户区**交给 `Stage_showWindow`（它拿同一对数去置 `design_w/h`、`lw/lh`、`pw/ph`），窗口又按同一对数开 ⇒ **两道都大一圈**（AIR 的 `stage` 才是客户区，`NativeWindow.bounds` 是框）。macOS 走同一条生成路径 ⇒ 同一缺陷在 macOS 上应表现为差一个 `32pt` 标题栏，**本机不可实测** | 需与之俱动：① 窗口按**框**尺寸建（或建完读回客户区再定尺寸）；② 舞台/表面用**真实客户区**；③ `Stage.stageWidth/Height` 与 `design_*` 的口径一次对齐；④ 全 GUI 示例 + 像素 harness 同批回归（改的是**每扇窗的初始几何**）。半修（只改窗口不改舞台）会得到**被缩放**的画面，比现状更糟 ⇒ 必须成批做，先立项再动手。 |
-| **点链首段被变量遮蔽时仍被当类引用解析**（`var pkg:Object = null; pkg.C.field` —— 我们静默给出静态值/undefined，`adl` 抛 `#1009`） | 未开始（阶段二百一十七 实测登记；**先于该阶段就存在**；阶段二百一十八 追加实测证据：**全限定名读一个不存在的静态成员是静默 `undefined`**，而短名当场报编译错 —— 见行内证据） | 证据：`adl 51.4.1`（`temp/fqnadl/`）在两种拼写上都抛 `Error #1009`（那是**值上的成员链**，null 接收者）；我们在 HEAD（`5ce625b`）上就已发射 `(pkg_C_cinit(), pkg_C_field)`（静态字段直接读出 5），本轮加闸门后该名字改走 `as_class_member_value(&pkg_C_cls, "field")`（仍把 `pkg.C` 当 Class 值）。**静默错值**按 AGENTS §2.5 是最重的一类。同源面比「静态字段读」更宽：`emitMember` 的全限定名分支（读数整体不查闸门；本轮只为新增的 getter 路径在 `classRefName` 内加闸门 `chainRootIsValue`，旧分支保留原行为以免扩散风险）、「点链当 Class 值解析」、`Cls["member"]` 的 `expr.object.kind === 'Var'` 分支 | 把「链首段是作用域内变量」这一判定提到**所有**点链解析的必经处（单一入口 `resolveFqnClass(chain)`，内部查 `scopes` + `moduleScope`），再逐处替换；钉子必须能区分「值上的链」与「包路径」，且**必须是运行期断言**（`#1009` vs 静默值）—— 源级钉只能看形状 |
+| **点链首段被变量遮蔽时仍被当类引用解析**（`var pkg:Object = null; pkg.C.field` —— 我们静默给出静态值/undefined，`adl` 抛 `#1009`） | **已完成**（2026-10-30 阶段三百二十六：三处解析入口统一挂 `chainRootIsValue` 闸门 —— 全限定名静态读分支、`Cls["member"]` 的括号形式（字面量键在编译期规约成点式，计算键仍走运行期表）、以及 `classRefName` 本身（补上 `System.gc()` 这类静态只读类被同名 module var 遮蔽时仍发静态调用的问题）。`unit: fqn/BracketAndShadowing` 6 钉 + `examples/fqn-static/main.as` 运行期断言） | 证据：`adl 51.4.1`（`temp/fqnadl/`）在两种拼写上都抛 `Error #1009`（那是**值上的成员链**，null 接收者）；我们在 HEAD（`5ce625b`）上就已发射 `(pkg_C_cinit(), pkg_C_field)`（静态字段直接读出 5），本轮加闸门后该名字改走 `as_class_member_value(&pkg_C_cls, "field")`（仍把 `pkg.C` 当 Class 值）。**静默错值**按 AGENTS §2.5 是最重的一类。同源面比「静态字段读」更宽：`emitMember` 的全限定名分支（读数整体不查闸门；本轮只为新增的 getter 路径在 `classRefName` 内加闸门 `chainRootIsValue`，旧分支保留原行为以免扩散风险）、「点链当 Class 值解析」、`Cls["member"]` 的 `expr.object.kind === 'Var'` 分支 | 把「链首段是作用域内变量」这一判定提到**所有**点链解析的必经处（单一入口 `resolveFqnClass(chain)`，内部查 `scopes` + `moduleScope`），再逐处替换；钉子必须能区分「值上的链」与「包路径」，且**必须是运行期断言**（`#1009` vs 静默值）—— 源级钉只能看形状 |
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
 | **浮点纹理 `Context3DTextureFormat.RGBA_HALF_FLOAT`** | 未开始（阶段二百二十六 分档实测登记：`baselineExtended` 抛 `#3759`，`standard` 起接受） | 我方 `Context3DTextureFormat` **无该常量**（编译期即报 undefined），三后端只建 `BGRA8`（`stage3d_d3d.cc` 的 `DXGI_FORMAT` 选择、`stage3d_glue.mm` 的 `MTLPixelFormat` 选择、WebGL 的 `internalformat`）。Starling 不用它，但 `RenderTexture` 的 HDR 路径会 |
 | **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |

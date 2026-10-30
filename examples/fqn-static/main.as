@@ -51,6 +51,27 @@ function run():void {
   check(fqnprobe.C.s == 6, "static setter: FQN getter sees a short-form write");
   fqnprobe.C.s = 4;
   check(C.s == 8, "static setter: short getter sees an FQN write");
+
+  // ⑥ 阶段三百二十六：括号形式读静态成员
+  //    `Cls["name"]` 与 `Cls.name` 在 AIR 里是同一个 trait 查询，两式必须同值；
+  //    字符串字面量键在编译期规约成点式，**计算**键才走运行期查表。
+  check(C["field"] == 65, "Cls['field'] reads the same slot as Cls.field");
+  check(flash.filesystem.File["separator"] == File.separator, "FQN Cls['separator'] == short");
+  // 计算键（`Cls[n]`）仍走运行期静态表，而那张表只收 emit 阶段定型过的名字 —— 用户类
+  // 的静态成员因此还会读回 undefined。AIR 会回到真值，故这是**已登记**的遗留项，
+  // 不在这里断言成「正确行为」。
+
+  // ⑦ 阶段三百二十六：链首段被变量遮蔽 ⇒ 整条链是**值上的成员走查**，不是包路径。
+  //    AIR 在 null 接收者上抛 #1009；把链当类引用会静默读出静态值（最坏的一类错）。
+  function errId(fn:Function):int {
+    try { fn(); } catch (err:Error) { return err.errorID; }
+    return 0;
+  }
+  var pkg:Object = null;
+  check(errId(function():void { var v:* = pkg.fqnprobe.C.field; }) == 1009, "a shadowed chain root is a null receiver (#1009)");
+  var live:Object = { fqnprobe: { C: { field: 77 } } };
+  check(live.fqnprobe.C.field == 77, "a live value chain resolves through the object");
+  check(live.fqnprobe.C["field"] == 77, "a live value chain resolves through the bracket form too");
 }
 
 run();

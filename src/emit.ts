@@ -1376,6 +1376,13 @@ export class Emitter {
   // in emitMember for why the two spellings must resolve alike -- the FQN spelling
   // used to degrade to the dynamic Class-value path and read undefined.
   private classRefName(e: Expr): string | null {
+    // A variable that shadows the name wins over the class it names -- AS3 scoping,
+    // and the same rule the dotted-chain gate applies (chainRootIsValue). Without
+    // this a module-scope `var System:Object = null` still emitted `as_system_gc()`
+    // for `System.gc()`: the shadow was honoured for package chains but not for the
+    // static-only classes, so the call silently hit the builtin instead of throwing
+    // #1009 on the null receiver (measured on adl 51.4.1).
+    if (e.kind === 'Var' && this.chainRootIsValue(e.name)) return null;
     if (e.kind === 'Var') {
       // A BARE spelling of a package-less language built-in (System/Capabilities/
       // Math/JSON/int/uint) denotes the built-in, not a package class that merely
@@ -34825,8 +34832,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the same special-case emission as the dotted spelling -- e.g.
     // `System["disposeXML"](xml)` (com/vsdevelop/system/Gc.as:36), whose callee
     // would otherwise be treated as an index read of a variable named `System`.
+    // ... and a MODULE-scope `var` shadows the class name too (`var System:Object` at
+    // script scope makes `System["x"]()` a member walk on that value). Both tables
+    // must be consulted, exactly like chainRootIsValue does for dotted chains.
     if (expr.callee.kind === 'Index' && expr.callee.index.kind === 'Str' && expr.callee.object.kind === 'Var' &&
-        !this.varInScope(expr.callee.object.name)) {
+        !this.chainRootIsValue(expr.callee.object.name)) {
       const name = expr.callee.object.name;
       if (this.symbols.hasClass(this.resolveClassName(name)) || Emitter.STATIC_ONLY_CLASSES.has(name)) {
         return this.emitCall({ kind: 'Call', callee: { kind: 'Member', object: expr.callee.object, property: expr.callee.index.value }, args: expr.args });
@@ -35766,13 +35776,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     // The parser emits a nested Member chain rooted at a Var holding the package's
     // first segment; flatten it and resolve the longest class prefix, the trailing
     // segment being a static member of that class (e.g. `starling.events.Event.ROOT_CREATED`).
-    // NOTE: this pre-existing branch does NOT consult chainRootIsValue, so a variable
-    // that shadows a package root is still read as a class reference here (AIR throws
-    // #1009 instead) -- a family-wide gap logged in TODO.md 遗留待开发, deliberately not
-    // changed in this phase because it predates the FQN work and covers more paths
-    // (this branch, the Class-value resolution, `Cls["member"]`).
     const chain = this.flattenDotChain(expr);
-    if (chain && chain.length >= 2) {
+    // A variable that shadows the chain's first segment makes this a member walk on
+    // that VALUE, not a package path: `var pkg:Object = null; pkg.C.field` must throw
+    // #1009 on the null receiver (measured on adl 51.4.1, temp/fqnadl/) instead of
+    // answering the static's value -- a silent wrong value, the worst kind per
+    // AGENTS 2.5. Falling through here sends the chain to the ordinary member path,
+    // which resolves `pkg.C` dynamically and then guards the null receiver.
+    if (chain && chain.length >= 2 && !this.chainRootIsValue(chain[0])) {
       for (let split = chain.length - 1; split >= 1; split--) {
         const cname = this.resolveClassName(chain.slice(0, split).join('.'));
         if (!this.symbols.hasClass(cname)) continue;
@@ -35829,7 +35840,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // same `&X_cls` the bare-name path in emitVarLexical produces. Without this the
     // chain fell through to the member path, whose root `com` is not a variable
     // ('undefined variable com at top level').
-    if (chain && chain.length >= 2 && !this.varInScope(chain[0])) {
+    // `chainRootIsValue` (not `varInScope`) on purpose: a MODULE-scope `var` shadows a
+    // package root as well, and resolving the chain as a class object there answered
+    // the static's value where AIR throws #1009 on the null receiver.
+    if (chain && chain.length >= 2 && !this.chainRootIsValue(chain[0])) {
       const fq = this.resolveClassName(chain.join('.'));
       const ci = this.symbols.getClass(fq);
       if (ci && (ci.fqn !== undefined || ci.reflectFqn !== undefined)) {
@@ -38608,6 +38622,18 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   private emitIndex(expr: Extract<Expr, { kind: 'Index' }>): { code: string; type: CType } {
+    // A STRING-LITERAL key spelled on a class NAME means exactly the dotted read:
+    // `File["separator"]` / `flash.filesystem.File["separator"]` are `File.separator`
+    // (measured on adl 51.4.1). Normalizing here -- BEFORE the receiver is emitted,
+    // since the receiver is a class name rather than a variable -- is what makes the
+    // literal form answer the static's value; a COMPUTED key still goes to the
+    // runtime static table below, which is what a genuinely dynamic lookup needs.
+    // `classRefName` is the single gate: it returns null for a chain rooted at a
+    // variable that shadows a package name, so a shadowed root keeps falling through
+    // to the ordinary member walk (AIR: #1009 on the null receiver).
+    if (expr.index.kind === 'Str' && this.classRefName(expr.object) !== null) {
+      return this.emitMember({ kind: 'Member', object: expr.object, property: expr.index.value });
+    }
     // `ClassName["staticMember"]` dynamic static access (e.g. Context3D["supportsVideoTexture"]):
     // resolve the string key against the class's static fields/getters.
     if (expr.object.kind === 'Var' && expr.index.kind === 'Str') {
@@ -38731,6 +38757,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Class-typed receiver indexed by a key: the same lookup as `C["name"]` on a
     // class VALUE, routed through the per-class static table (unknown names read
     // undefined, matching AIR).
+    //
     if (obj.type.kind === 'class') {
       const keyExpr = this.emitExpr(expr.index);
       const key = keyExpr.type.kind === 'string' ? keyExpr.code : this.toStringExpr(keyExpr);
