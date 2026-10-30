@@ -3,6 +3,11 @@
 // is NOT part of the automated regression — run it manually with the window
 // manifest.
 //
+// Since stage 345 the two getters answer the display's USABLE bounds on macOS
+// (AIR's contract: full display minus the menu bar / Dock — sk_window_get_stage_
+// full_size in vendor/window_glue.cc) while Windows keeps the whole display,
+// and Capabilities.screenResolution* stays whole-screen on every platform.
+//
 //   node src/index.ts examples/stage41_window.as \
 //     --manifest examples/window.build.example.json \
 //     -o examples/stage41_window --run

@@ -1620,8 +1620,9 @@ function checkDisplayMetrics(): string[] {
   check('...and nothing refills the cache from the physical display mode (one writer only)',
     !/g_display_[wh] *= *dm\./.test(code)
     && /if \(r\.w > 0\) g_display_w = r\.w;/.test(refresh)
-    // 3 window-show paths + the lazy branch in sk_window_get_display_size.
-    && (code.match(/sk_refresh_display_size_cache\(\);/g) || []).length === 4
+    // 3 window-show paths + the lazy branches in sk_window_get_display_size and
+    // sk_window_get_stage_full_size.
+    && (code.match(/sk_refresh_display_size_cache\(\);/g) || []).length === 5
     && /sk_refresh_display_size_cache\(\);\n\s*if \(we_inited\) SDL_Quit\(\);/.test(size));
   check('the DIP-vs-pixels rationale is written down where it bit',
     glue.includes('SDL_GetDisplayBounds is DIP-aware') && glue.includes('150% scaling')
@@ -1636,13 +1637,18 @@ function checkDisplayMetrics(): string[] {
     /SDL_GetDisplayDPI answers 144/.test(runtime.slice(runtime.indexOf('as_cap_screen_dpi') - 700,
       runtime.indexOf('static double as_cap_screen_dpi('))));
 
-  // One seam for all four accessors: changing the query changes Stage and Capabilities
-  // together, which is what keeps the two from drifting apart.
-  check('Stage.fullScreenWidth/Height read the same seam',
-    (emit.match(/Stage_get_fullScreenWidth\(void\* _this\) \{ \(void\)_this; int w = 0, h = 0; as_window_get_display_size\(&w, &h\); return \(unsigned int\)w; \}/g) || []).length === 1
-    && (emit.match(/as_window_get_display_size\(&w, &h\)/g) || []).length === 2);
-  check('Capabilities.screenResolutionX/Y read the same seam',
+  // Stage and Capabilities deliberately read DIFFERENT seams now (stage 345): AIR's
+  // Stage.fullScreen* answers the display's USABLE bounds on macOS (the whole
+  // display on Windows) while Capabilities.screenResolution* keeps the whole
+  // display everywhere — both measured on adl 51.4.1. Each pair stays on one seam,
+  // which is what keeps the two quantities from silently re-merging.
+  check('Stage.fullScreenWidth/Height read the stage-only usable-bounds seam',
+    (emit.match(/Stage_get_fullScreenWidth\(void\* _this\) \{ \(void\)_this; int w = 0, h = 0; as_window_get_stage_full_size\(&w, &h\); return \(unsigned int\)w; \}/g) || []).length === 1
+    && (emit.match(/as_window_get_stage_full_size\(&w, &h\)/g) || []).length === 2);
+  check('Capabilities.screenResolutionX/Y keep the whole-display seam',
     (runtime.match(/as_window_get_display_size\(&w, &h\)/g) || []).length === 2);
+  check('the Stage/whole-display split is written at the glue site',
+    glue.includes('sk_window_get_stage_full_size') && glue.includes('usable bounds'));
 
   // The remaining half is a KNOWN divergence, so it has to be written down in both
   // places rather than look like an oversight.

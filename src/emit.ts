@@ -14634,8 +14634,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('ASC_app_frame_rate = value;');
     this.indent--;
     this.line('}');
-    this.line('unsigned int Stage_get_fullScreenWidth(void* _this) { (void)_this; int w = 0, h = 0; as_window_get_display_size(&w, &h); return (unsigned int)w; }');
-    this.line('unsigned int Stage_get_fullScreenHeight(void* _this) { (void)_this; int w = 0, h = 0; as_window_get_display_size(&w, &h); return (unsigned int)h; }');
+    this.line('unsigned int Stage_get_fullScreenWidth(void* _this) { (void)_this; int w = 0, h = 0; as_window_get_stage_full_size(&w, &h); return (unsigned int)w; }');
+    this.line('unsigned int Stage_get_fullScreenHeight(void* _this) { (void)_this; int w = 0, h = 0; as_window_get_stage_full_size(&w, &h); return (unsigned int)h; }');
     this.line('bool Stage_get_allowsFullScreen(void* _this) { (void)_this; return true; }');
     this.line('bool Stage_get_allowsFullScreenInteractive(void* _this) { (void)_this; return true; }');
     this.line('double Stage_get_contentsScaleFactor(void* _this) { return ((Stage*)_this)->stage_scale; }');

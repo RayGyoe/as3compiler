@@ -308,6 +308,13 @@ int sk_window_get_display_size(int* w, int* h) {
   return (dw > 0 && dh > 0) ? 1 : 0;
 }
 
+// The browser has no per-display "usable bounds" the native backend models, so
+// the Stage seam answers the same screen size (the canvas, not the screen, is
+// the real stage there — see docs/zh-cn/html5-web.md).
+int sk_window_get_stage_full_size(int* w, int* h) {
+  return sk_window_get_display_size(w, h);
+}
+
 // The browser exposes no physical display refresh rate, so return 0 and let the
 // frame pacer derive it itself: main_loop measures the rAF callback interval and
 // paces in whole vsync ticks (see the pacer comment there). Returning a rate

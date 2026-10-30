@@ -10464,6 +10464,9 @@ extern int sk_window_show(void* surface, int w, int h, int pw, int ph, const cha
                           void (*on_close)(int));
 extern double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph);
 extern int sk_window_get_display_size(int* w, int* h);
+// Stage.fullScreenWidth/fullScreenHeight only: AIR's "usable area" of the
+// display the main window is on (macOS) / the whole display (Windows, measured).
+extern int sk_window_get_stage_full_size(int* w, int* h);
 // Refresh rate of the display a GIVEN window sits on: with several windows open
 // each one paces its own frame clock, so "the app's display" is not well defined.
 extern double sk_window_get_display_refresh(int win);
@@ -11007,6 +11010,18 @@ static inline int as_window_get_display_size(int* w, int* h) {
     if (w) *w = 0; if (h) *h = 0; return 0;
 #endif
 }
+// Stage.fullScreenWidth/fullScreenHeight: the seam splits from
+// as_window_get_display_size because AIR answers a DIFFERENT quantity there
+// (the display's usable bounds on macOS, the whole display on Windows — both
+// measured on adl 51.4.1) while Capabilities.screenResolution* keeps the whole
+// display on every platform. See sk_window_get_stage_full_size.
+static inline int as_window_get_stage_full_size(int* w, int* h) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_get_stage_full_size(w, h);
+#else
+    if (w) *w = 0; if (h) *h = 0; return 0;
+#endif
+}
 // ---- display enumeration (flash.display.Screen) ----
 // The count is never 0: AIR always has a Screen.mainScreen, so an unreadable
 // display list reports one display rather than none.
@@ -11227,6 +11242,7 @@ static inline int as_window_start_move(int id) { (void)id; return 0; }
 static inline int as_window_start_resize(int id, const char* edge) { (void)id; (void)edge; return 0; }
 static inline int as_window_main(void) { return -1; }
 static inline int as_window_get_display_size(int* w, int* h) { if (w) *w = 0; if (h) *h = 0; return 0; }
+static inline int as_window_get_stage_full_size(int* w, int* h) { if (w) *w = 0; if (h) *h = 0; return 0; }
 static inline int as_screen_count(void) { return 1; }
 static inline int as_screen_bounds(int i, int* x, int* y, int* w, int* h) { (void)i; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; return 0; }
 static inline int as_screen_usable_bounds(int i, int* x, int* y, int* w, int* h) { (void)i; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; return 0; }

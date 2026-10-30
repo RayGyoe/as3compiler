@@ -479,6 +479,39 @@ static void sk_menu_ensure(void);
 // -1 until the first window exists; the "main" window is simply the first slot
 // ever filled, so it stays index 0 in every build.
 static int g_main = -1;
+
+// Stage.fullScreenWidth/fullScreenHeight only. AIR answers the USABLE bounds of
+// the display the main window occupies on macOS (measured 1800x1137 vs the
+// 1800x1169 full bounds — the menu-bar strip), while on Windows it answers the
+// WHOLE display like Capabilities.screenResolution* does (measured: adl reports
+// the full 2560x1707 there, the work area never shows up). So only the __APPLE__
+// arm switches to the usable-bounds query; every other platform keeps the
+// full-bounds seam below, and Capabilities keeps it unconditionally (its own
+// wrapper still calls sk_window_get_display_size).
+int sk_window_get_stage_full_size(int* w, int* h) {
+  if (g_display_w <= 0 || g_display_h <= 0) {
+    int we_inited = (SDL_WasInit(SDL_INIT_VIDEO) == 0);
+    if (sk_video_init() != 0) return 0;
+    sk_refresh_display_size_cache();
+    if (we_inited) SDL_Quit();
+  }
+#ifdef __APPLE__
+  if (g_main >= 0 && g_wins[g_main].used && g_wins[g_main].win != NULL) {
+    int disp = SDL_GetWindowDisplayIndex(g_wins[g_main].win);
+    if (disp < 0) disp = 0;
+    int ux = 0, uy = 0, uw = 0, uh = 0;
+    if (sk_display_usable_bounds(disp, &ux, &uy, &uw, &uh) && uw > 0 && uh > 0) {
+      if (w) *w = uw;
+      if (h) *h = uh;
+      return 1;
+    }
+  }
+#endif
+  if (w) *w = g_display_w;
+  if (h) *h = g_display_h;
+  return (g_display_w > 0 && g_display_h > 0) ? 1 : 0;
+}
+
 // Deadline of the next application frame. There is exactly one frame clock for the
 // whole application because AIR's Stage.frameRate is application-wide; per-window
 // deadlines would let a second window tick (and broadcast ENTER_FRAME) on top of
