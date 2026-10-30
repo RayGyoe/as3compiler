@@ -2479,6 +2479,9 @@ export class Emitter {
     // The Function-value #1063 helper is defined with the class registry, which is
     // emitted AFTER every calling thunk that raises it, so it is declared here.
     this.line('static void as_fn_arity_error(const char* qname, int expected, int argc);');
+    // ... and its receiver-derived sibling, which rebuilds the class half of the
+    // qname from the runtime class (see as_method_owner_fqn).
+    this.line('static void as_fn_arity_error_recv(void* recv, const char* mname, const char* fallback, int expected, int argc);');
     for (const [name] of this.symbols.classes) {
       this.line(`static ${name}_vtable ${name}_vt;`);
     }
@@ -2862,6 +2865,43 @@ export class Emitter {
     this.line('parts[5] = as_str_from_int(argc);');
     this.line('parts[6] = ".";');
     this.line('as_throw(ArgumentError_new(as_str_concat_n(7, parts), 1063));');
+    this.indent--;
+    this.line('}');
+    // AIR derives the CLASS HALF of #1063's qname from the RECEIVER'S RUNTIME
+    // class, not from the static type at the call site: it is the nearest class in
+    // the vtable super chain that DECLARES a method of that name. Measured on
+    // adl 51.4.1 (temp/qname, 14 forms): `var c:C = new C()` with `C extends A`
+    // and `m` declared only in A reports `A/m`; `var a:A = new B()` with B
+    // overriding reports `B/m`; a Sprite's inherited dispatchEvent reports
+    // `flash.events::EventDispatcher/dispatchEvent`; an interface-typed reference
+    // to a `W implements IFoo` reports `W/n`. The class tables already carry both
+    // halves (as_vtable_header.super + .fqn, and each class's OWN method names in
+    // its as_method table), so no new metadata is needed -- only a walk at throw
+    // time, which happens at most once per bad call.
+    this.line('static const char* as_method_owner_fqn(void* obj, const char* name) {');
+    this.indent++;
+    this.line('if (obj == NULL || name == NULL) return NULL;');
+    this.line('as_vtable_header* h = (as_vtable_header*)((as_object_header*)obj)->vtable;');
+    this.line('for (; h != NULL; h = (as_vtable_header*)h->super) {');
+    this.indent++;
+    this.line('as_method* m = (as_method*)h->methods;');
+    this.line('if (m == NULL) continue;');
+    this.line('for (; m->name != NULL; m++) if (strcmp(m->name, name) == 0) return h->fqn;');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    // `fallback` is the static qname the emitter computed (right for a class-typed
+    // receiver whose runtime class is unknown, and the only answer for a NULL
+    // receiver). A method the walk cannot find keeps it verbatim.
+    this.line('static void as_fn_arity_error_recv(void* recv, const char* mname, const char* fallback, int expected, int argc) {');
+    this.indent++;
+    this.line('const char* owner = as_method_owner_fqn(recv, mname);');
+    this.line('if (owner == NULL) { as_fn_arity_error(fallback, expected, argc); return; }');
+    this.line('char buf[512];');
+    this.line('snprintf(buf, sizeof buf, "%s/%s", owner, mname);');
+    this.line('as_fn_arity_error(buf, expected, argc);');
     this.indent--;
     this.line('}');
     this.line('static as_value as_dyn_new_args(as_class* c, int argc, as_value* argv) {');
@@ -7099,7 +7139,12 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           const methodName = this.currentWalkMethod;
           this.nestedFuncs.set(uniqueName, { captures, params: s.params, asName: name, methodName });
           this.nestedFuncByAsName.set(`${this.currentWalkClass ?? ''}:${methodName ?? ''}:${name}`, uniqueName);
-          this.anonFuncs.push({ name: uniqueName, asName: null, params: s.params, returnType: s.returnType, body: s.body, captures, cname: this.currentWalkClass, isStatic: this.currentWalkIsStatic, depth, methodName });
+          // `asName` is the function's AS3 name. It stayed null here (a named
+          // function DECLARATION was treated like an anonymous expression), so
+          // #1063 printed "Function/anonymous" for `function inner(x:int)` --
+          // measured on adl 51.4.1 (temp/qname case 19/20): AIR prints
+          // "Function/inner", not an anonymous marker.
+          this.anonFuncs.push({ name: uniqueName, asName: name, params: s.params, returnType: s.returnType, body: s.body, captures, cname: this.currentWalkClass, isStatic: this.currentWalkIsStatic, depth, methodName });
           this.addFnBodyKid(parentBody, uniqueName);
           this.funcVars.pop();
         }
@@ -7543,6 +7588,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         undefined,
         this.fnQName(b.cname, b.mname),
         b.m.owner,
+        // `env` is the receiver: AIR reports the class that declares the reached
+        // implementation, not the static type (a C-typed reference to an inherited
+        // `A.m` reports `A/m`, while a B override reports `B/m`).
+        'env',
       );
     }
     // Interface methods referenced as Function values (`var f:Function = d.describe`
@@ -7569,6 +7618,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           // sub-interface's ('incompatible pointer types passing
           // starling_events_Event* to parameter of type Event*').
           m.owner,
+          // The interface name is only the FALLBACK qname: AIR reports the runtime
+          // class that implements the method (measured: an IFoo-typed reference to
+          // `W implements IFoo` reports `W/n`, not `IFoo/n`).
+          'env',
         );
       }
     }
@@ -7840,7 +7893,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // A calling thunk: unbox each argument from the as_value[] list, call the
   // typed implementation, and box the result back into as_value. `envArg` is the
   // environment expression passed first for capturing closures (null otherwise).
-  private emitThunk(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ownerClass: string | null = null, ctorMax: number | null | undefined = undefined, qname: string | null = null, declOwner: string | null = null): void {
+  private emitThunk(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ownerClass: string | null = null, ctorMax: number | null | undefined = undefined, qname: string | null = null, declOwner: string | null = null, qnameRecv: string | null = null): void {
     // A default parameter value is a constant expression that may name a STATIC
     // const of the owning class (`radiusMode:int = RADIUS` in away3d's
     // SphereMaker). Thunks are emitted from emitFunctionValues, outside any class
@@ -7852,14 +7905,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     const savedIsStatic = this.currentIsStatic;
     if (ownerClass !== null) { this.currentClass = ownerClass; this.currentIsStatic = true; }
     try {
-      this.emitThunkBody(name, callTarget, params, returnType, envArg, ctorMax, qname, declOwner);
+      this.emitThunkBody(name, callTarget, params, returnType, envArg, ctorMax, qname, declOwner, qnameRecv);
     } finally {
       this.currentClass = savedClass;
       this.currentIsStatic = savedIsStatic;
     }
   }
 
-  private emitThunkBody(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ctorMax: number | null | undefined = undefined, qname: string | null = null, declOwner: string | null = null): void {
+  // `qnameRecv` (a C expression for the receiver, or null) switches the #1063
+  // message to AIR's runtime-derived class half; `qname` then serves as the
+  // fallback used when the walk finds no declaring class.
+  private emitThunkBody(name: string, callTarget: string, params: Param[], returnType: CType, envArg: string | null, ctorMax: number | null | undefined = undefined, qname: string | null = null, declOwner: string | null = null, qnameRecv: string | null = null): void {
 
     // Parameter types resolve through the DECLARING class's import alias, exactly
     // like the vtable slot they are passed to (methodPtrField). Resolving with
@@ -7917,7 +7973,17 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         const req = this.requiredArity(params);
         const max = params.some((p) => p.isRest) ? -1 : params.length;
         if (req > 0 || max > 0) {
-          this.line(`if (argc < ${req} || (${max} > 0 && argc > ${max})) { as_fn_arity_error("${this.escapeCString(qname)}", ${req}, argc); return as_v_null(); }`);
+          const arm = `argc < ${req} || (${max} > 0 && argc > ${max})`;
+          if (qnameRecv !== null) {
+            // AIR names the class that DECLARES the method actually reached, so a
+            // bound thunk asks the receiver's runtime class instead of printing the
+            // static type (measured: see as_method_owner_fqn). The member name is
+            // the tail of the qname we would otherwise print.
+            const memberName = qname.slice(qname.lastIndexOf('/') + 1);
+            this.line(`if (${arm}) { as_fn_arity_error_recv((void*)${qnameRecv}, "${this.escapeCString(memberName)}", "${this.escapeCString(qname)}", ${req}, argc); return as_v_null(); }`);
+          } else {
+            this.line(`if (${arm}) { as_fn_arity_error("${this.escapeCString(qname)}", ${req}, argc); return as_v_null(); }`);
+          }
         }
       }
       if (envArg === null) this.line('(void)env;');

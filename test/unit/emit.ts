@@ -262,10 +262,24 @@ function checkEmitFunctionArityQName(): string[] {
     + 'package foo { public class Widget implements IFoo { public function Widget():void {} public function m(a:int):void {} } }\n'
     + 'package { import foo.IFoo; import foo.Widget; public class Main { public function go(i:IFoo, w:Widget):void { var f:Function = i.m; var g:Function = w.m; f(); g(); } } }\n'
     + 'var m:Main = new Main();\n')).c;
-  check('an interface-typed bound method reports the AS3 name, not the C key',
-    i.includes('as_fn_arity_error("foo::IFoo/m"') && !i.includes('as_fn_arity_error("foo_IFoo/m"'));
-  check('a concrete bound method reports the pkg::Class/method spelling (AIR verbatim)',
-    i.includes('as_fn_arity_error("foo::Widget/m"'));
+  // A bound method's class half is decided at RUNTIME (the receiver's chain), so
+  // the static spelling is only the fallback string: measured on adl 51.4.1
+  // (temp/qname, 18 forms) an IFoo-typed reference to a Widget prints
+  // "foo::Widget/m", never "foo::IFoo/m".
+  check('an interface-typed bound method hands the fallback AS3 name, not the C key',
+    i.includes('as_fn_arity_error_recv((void*)env, "m", "foo::IFoo/m", 1, argc)')
+    && !i.includes('foo_IFoo/m'));
+  check('a concrete bound method hands the pkg::Class/method fallback (AIR verbatim)',
+    i.includes('as_fn_arity_error_recv((void*)env, "m", "foo::Widget/m", 1, argc)'));
+  // The walk itself: own-method tables are per class, so the FIRST class in the
+  // chain that lists the name is the declaring class -- exactly AIR's answer for
+  // an inherited member (`Sprite.dispatchEvent` -> flash.events::EventDispatcher).
+  check('the qname walk climbs the vtable super chain over each class\'s own method table',
+    c.includes('static const char* as_method_owner_fqn(void* obj, const char* name) {')
+    && c.includes('for (; h != NULL; h = (as_vtable_header*)h->super) {')
+    && c.includes('for (; m->name != NULL; m++) if (strcmp(m->name, name) == 0) return h->fqn;'));
+  check('a receiver the walk cannot resolve falls back to the static qname',
+    c.includes('if (owner == NULL) { as_fn_arity_error(fallback, expected, argc); return; }'));
 
   console.log(`     [fnarity] ${ok} check(s) passed`);
   return bad;

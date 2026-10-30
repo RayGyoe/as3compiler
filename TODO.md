@@ -17987,7 +17987,54 @@ getter 同样、遮蔽首段不折叠成静态槽、module 作用域遮蔽让调
 新增 ⑤ 段运行期断言（`C["field"]` 同槽、`File["separator"]` 同值、遮蔽链抛 `#1009`、活值链走
 对象）。全量 `node test.ts` ⇒ 559 passed / 0 failed。
 
+### 阶段三百二十七：`#1063` qname 的「类半」取自接收者的运行期类（v0.4.287 → v0.4.288）
+
+**范围**：遗留表「Function 值 `#1063` 的 qname 对接口接收者/匿名闭包/顶层函数不逐字」的**第一部分**
+（接口/父类接收者）。语义（何时抛、编号、`Expected`/`got` 数字）本来就逐字一致，只有文案里的
+类半不对。
+
+**实测口径**（`adl 51.4.1`，`temp/qname/`，18 例，读数 `adl-out.txt`）。AIR **完全不看静态类型**，
+它取的是**接收者运行期类沿 super 链上最近声明该方法的那个类**：
+
+| 形态 | AIR 打印 |
+|---|---|
+| `var c:C = new C()`，`C extends A`，`m` 只在 `A` 声明 | `A/m` |
+| `var b:B = new B()`，`B` 覆写 `m` | `B/m` |
+| `var a:A = new B()`，`B` 覆写 | `B/m`（**不是**静态类型 `A`） |
+| `var i:IFoo = new W()`，`W implements IFoo` | `W/n`（**不是** `IFoo/n`） |
+| `var io:InteractiveObject = new Sprite(); io.dispatchEvent` | `flash.events::EventDispatcher/dispatchEvent` |
+| `var dyn:* = new W()` | `W/n` |
+
+**实现**：不新增元数据 —— 类对象本来就带 `as_vtable_header.super`/`.fqn`，而**每个类自己的**
+`as_method` 名表（`emitMethodTables`）也早就按类发射。新增两个运行时助手（与 `as_fn_arity_error`
+同处，前置声明在 `emitForwardDecls`）：
+
+- `as_method_owner_fqn(recv, name)`：`((as_object_header*)recv)->vtable` 起沿 `super` 逐层查该层名表，
+  首命中返回该层 `fqn`；
+- `as_fn_arity_error_recv(recv, mname, fallback, expected, argc)`：命中则拼 `<owner>/<member>`，
+  未命中（NULL 接收者 / 名表里没有）回落调用方给的静态 qname。
+
+`emitThunkBody` 增加一个 `qnameRecv` 参数，**绑定方法 thunk** 与**接口方法 thunk** 都传 `'env'`
+（两者 `env` 就是接收者指针）。`super.m` 的绑定 thunk 保持静态（`super` 本来就不经 vtable）。
+
+**顺带修对一处**：嵌套**具名**函数被当匿名发射（`asName: null`），`adl` 实测打 `Function/inner`，
+我们打 `Function/anonymous`。改为按声明名发射（`examples/fn-qname.as` 断言）。
+
+**刻意留下的两处不逐字**（均已在表内改写说明）：
+
+1. **匿名闭包**：AIR 打 `Function/<file>.as$N:anonymous`，`N` 是**每文件方法序号**。实测同一个
+   `Main.as` 里三个匿名闭包分别是 `$0`/`$2`/`$3` —— `$1` 被同文件一个具名同胞函数占掉 ⇒ 它数的是
+   **ABC 方法表的槽号**，不是「第几个匿名函数」，按构造不可复现。仍打 `Function/anonymous`。
+2. **包级函数值**：`mxmlc` 直接拒绝该表达式（`Access of possibly undefined property helper`，
+   两个独立文件各试一次都是同一句）⇒ AIR 侧无法构造对照，保持 `Function/<name>`。
+
+**验收**：`examples/fn-qname.as`（12 例运行期断言，覆盖上表六种形态 + 匿名/嵌套具名两种文案）；
+`unit: emit/FunctionArityQName` 由 12 钉扩到 14 钉（接口/具名两钉改成 `as_fn_arity_error_recv`
+形态，新增「走 vtable super 链查各层自己的名表」与「走查不到回落静态 qname」两钉）。全量
+`node test.ts` ⇒ 560 passed / 0 failed。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百二十七：`#1063` qname 的类半取自接收者运行期类）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 主表项数不变。**改写 1 行**＝「Function 值 `#1063` 的 qname 对接口接收者/匿名闭包/顶层函数不逐字」⇒ 接口 / 父类 / 内建继承那一半**已收口**（`adl 51.4.1` 18 例，见该阶段节），剩余两处改为「不可复现（匿名闭包的每文件方法序号）/ 不可构造（`mxmlc` 拒绝包级函数值）」的事实陈述，状态 `未开始` → **`部分完成`**。**本阶段修净、不占表的一条**：嵌套**具名**函数此前被打成 `Function/anonymous`（`adl` 打 `Function/inner`），属「`adl` 跑得对我们跑不出」但同阶段落地。
 > **2026-10-30 追加（阶段三百二十一：叶子类普通方法去虚化）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表仍 **115 项**。本阶段只改变有封闭编译面证明的 C 调用形态，不改 AS3 可见语义；访问器、`final`、private 与方法值 thunk 属设计文档中既定的后续独立阶段，不作为本轮新遗留重复登记。
 > **2026-10-30 追加（阶段三百二十：Stage3D 六个上传入口的边界契约）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表（`遗留项|状态|说明|建议`）行数 **114 → 115**（`未开始` 按列二含该词重数 **92 → 93**；上一轮 note 标 90，与实测差 2，本轮按实测记账，与阶段三百一十四/三百一十五 记过的同类偏差同因）。**本阶段修净的全都不占表**：`uploadFromByteArray` 的静默截断、负目标的越界写、短数组错报 `#2004`、`Texture.uploadFromByteArray` 的 `miplevel > 0` 报明、`uploadFromVector` 按 `startVertex` 起读、`uploadFromBitmapData` 越界 level 静默 `return` —— 六处都是「`adl` 跑得对我们跑不出/跑错」，属 §1.5 遗留缺陷，但同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记 1 行**＝`CubeTexture.uploadFromByteArray`（仍是响亮 stub；`adl` 支持逐面从 ByteArray 上传，本轮未测它的字节布局与 `side` 语义，故只登记不改）。**顺带修掉一处文档错位**：阶段三百一十九 的章节此前被错插在阶段六十四 的正文里（还留下一行带反引号的 `### 遗留待开发`），本次搬回本节序列尾部。口径与实测表见 `docs/zh-cn/display3d.md` §9.15。
 > **2026-10-29 追加（阶段三百一十九：逐帧 `clipDepth` 遮罩）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**113 → 114 行**（`未开始` **89 → 90**，`未开始 / **D43b**` 1 / `部分完成` 16+5 / `调研完成 · 实现暂缓` 1 / `已完成` 1）。**本阶段修净的四条不占表**：morph 遮罩被裁空、sprite 遮罩无裁剪、帧尾换字符少一个子件、以及「遮罩 stencil 混进零宽描边组」——前两条此前是 `notes` 报明的**响亮缺口**、后两条是实错，均同阶段落地（`docs/zh-cn/swc.md` §9.2 F12）。**新登记 1 行**是唯一**刻意保留的偏差**：AIR 的 `clipDepth` stencil 对 morph 遮罩**不跟随 ratio**（f1..f99 同框，只有帧 100 换字符才变），我们跟随当前几何，两侧像素因此在 morph 动画期间不同 —— 复刻路径已探明（`_mdecl` 声明盒），但要不要复刻属产品判断。
@@ -18237,7 +18284,7 @@ getter 同样、遮蔽首段不折叠成静态槽、module 作用域遮蔽让调
 | `x.ns::[expr]` / `x.@[expr]` 的孩子轴按**本地名**匹配（命名空间未建模） | 未开始（2026-10-07 阶段一百零八 实测登记；**已文档化的近似**） | 本子集把自定义命名空间**编译期透明化**（限定词丢弃、前缀不进匹配），故：`<n:item>`（ns=`urn:x`）测 `x.ns::["item"]` 得 **2 = AIR**（阶段一百零八 已让前缀不阻碍本地名匹配），但 `x.item`（无限定）**也给 2**（AIR 为 **0** —— 无前缀的属性名只匹配无命名空间的节点），即「同局部名、不同 uri」无法区分。另：`Namespace` 值本身是**透明占位**（`new Namespace(prefix, uri)` 1/2 参构造器未实现，只认 0 参；`.uri`/`.prefix` 未建模），写示例只能走 `xml.namespace()` | 若要精确：给节点存 `(prefix, uri)` 与一张**作用域内命名空间表**，孩子轴比较「uri + 局部名」，`Namespace` 成为真对象（`uri`/`prefix`/2 参构造器）。**成本高**（XML 与 Namespace 两个模型都要改）；当前 away3d DAEParser 的用法（`xml.namespace()` + `ns::[expr]`）结果已与 AIR 一致，故列为「已知近似」而非阻塞项 |
 | 内置类名**部分**可作 **Class 值**（`trace(BitmapData)` / `var c:Class = BitmapData` / `BitmapData is Class` 已落地；**原始包装类仍不可**） | **部分完成**（2026-10-07 阶段一百一十二 登记；**2026-10-09 阶段一百二十七 落地内建引用类型的 Class 值**） | `adl 51.4.1`：`trace(BitmapData)` ⇒ `[class BitmapData]`、`BitmapData is Class` ⇒ true、`var c:Class = Object; 5 is c` ⇒ true（`temp/pkg1/oracle/adl-pkg1.txt` C1/C4/C7/E2/E3/E8/E9 + `adl-na.txt` 的 `NA=[class NativeApplication]`）。**已落地（阶段一百二十七）**：每个内建类都进注册表并发出 `_cls` 常量、内建类名可在**值位置**解析、`is`/`as` 与字符串转换逐项对 `adl`。**仍不可**：**原始包装类**（`String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class`）作 Class 值 —— `var c:Class = String;` 仍是**响亮**的 `Codegen error: undefined variable 'String' at top level`（`adl` 里 `[class String]` 合法，见 `adl-pkg1.txt` C6）；它们的 `_cls` 需要先有「原始包装类的静态度量」（`int`/`uint` 还要独立 box tag，见反射口径那行）⇒ 与「`getQualifiedClassName(5)` 应给 `int`」同源，宜同批 | 先做 `int`/`uint` 的独立 box tag（反射行已列），再让 `String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class` 各自进注册表（`reflectFqn` 已能用 `adl` 实测：`String`/`Array`/`Boolean`/`Date`/`RegExp` 无包、`int`/`uint` 短名）。**成本中**。 |
 | AIR 的**数值解析/格式化极值**仍与 `adl` 有残差（语言层，窄口径） | 未开始（2026-10-08 阶段一百一十九 `tonum2` 双端探针实测；**2026-10-10 阶段一百三十四 扩证**） | **扩证（2026-10-10，阶段一百三十四）**：原记载「32 行里只剩 1 行不同」是**窄口径**——本轮把矩阵扩到 **48 行**（`temp/qfix/nfAot.as` 双端对照，adl 侧 `temp/qfix/gcadl/result13.txt`），**10 行不同**：① **打印侧**：denormal 不做最短表示（`5e-324` adl 给 `4.9406564584124654e-324`、`1e-323` 给 `9.881312916824931e-324`）；`1.7976931348623157e308` adl 给 **`1.79769313486231e+308`**（**15 位有效数字且截断**，非四舍五入、也不保证回环）；`1234567890123456789` adl 给 **`1234567890123456800`**（十进制最短 + 补零）而我们给精确 double `1234567890123456768`；② **解析侧**：`Number("1.7976931348623157e308")` adl 给 **Infinity**（17 位有效数字即溢出）；`Number("9.999999999999999")` adl 给 **10**（17 位口径的舍入）；`Number("1e100")` 差 1 ulp；③ **同值异文**（`temp/qfix/gcadl/nf3Main.as`）：内联 `String(Number("1e100"))` 给 `1e+100`，而经**变量/数组**取同一字符串再 `Number(...)` 给 `1.00000000000000e+100` —— AVM2 的**运行期** `stringToDouble` 与 mxmlc 的**编译期**常量折叠不是同一个转换器（`0.1+0.2` 亦被 mxmlc 折成 `0.3`），黑盒无法再收敛，必须按 avmplus 的 `doubleToString`/`stringToDouble` **逐字节移植**。其余 38 行（零/负零/常规指数/前导空白/`Infinity` 字面）逐字一致 | **暂缓（2026-10-10 阶段一百三十四 决定不随本轮落地，如实报明）**：原建议「优先 `%.15g`、必要时回退 `%.17g`」**与实测不符**（`1.79769313486231e+308` 是 15 位**截断**且不回环；同值异文说明两条转换链不同源）。真正要做的是移植 avmplus 的 `MathUtils::convertDoubleToString` 与 `stringToDouble` 两段算法 + 全量极值矩阵钉子，属**独立立项**（影响面是所有 `trace(number)` 文本，且要动 `as_str_from_double`/`as_str_to_number`/`as_parse_*` 三方），本轮的工作量大头在配合 `catch`/`undefined`/`parseInt` 三处**已对 `adl` 收口**的改动做全量回归，故不夹带此高风险项。证据已随本行扩写留档 |
-| Function 值 **#1063 的 qname** 对接口接收者/匿名闭包/顶层函数不逐字（**错误文案**层） | 未开始（2026-10-08 阶段一百一十九实现 #1063 时实测；语义（何时抛、编号、Expected/got 数字）**已逐字一致**） | 已对齐：实例方法 `<fqn>/<m>`（`foo::Widget/m`）、静态方法 `<fqn>$/<m>`、具名函数表达式 `Function/<name>`、可选参/rest/0 参的放行规则（`arity`/`arity2`/`arity3` 探针除 qname 外全绿）。**未对齐三处**：① AIR 的类名半取自方法的**定义类** —— `var io:InteractiveObject = new Sprite(); io.dispatchEvent` 的 `adl` qname 是 `flash.events::EventDispatcher/dispatchEvent`（trait 所在类），我们是静态类型 `flash.display::InteractiveObject/dispatchEvent`（接口接收者同理：我们报 `foo::IFoo/m`、`adl` 报 `foo::Widget/m`）；② 匿名闭包 `adl` 报 `Function/<file>.as$N:anonymous`，索引是 **AVM2 内部序号**（与 embed 类名 hash 同类不可复现），我们报 `Function/anonymous`；③ **顶层/包级函数**：`adl` 报 `<EnclosingClass>/<name>`，但 `mxmlc` 不接受「包级函数值 + 主类同文件」，探针无法构造对照，故 `Function/<name>` 未经验证 | 立项：接口/父类接收者的 bound thunk 在**运行期**问对象所属类，并在该类的反射表里找方法的**定义类**（需要「方法 → 定义类」的元数据，当前 vtable 只有方法指针）；找不到时回退到静态类型名。②③ 属可复现性/可测性边界，若要收口需先在 AIR 侧找到能构造「包级函数值」的写法。**成本中**（要扩反射表），收益仅是错误文案 ⇒ 优先级低，但记录在案以免误以为已完全对齐 |
+| Function 值 **#1063 的 qname** 对**匿名闭包**与**包级函数**不逐字（**错误文案**层；语义/编号/`Expected`/`got` 数字本来就逐字一致） | **部分完成**（2026-10-30 阶段三百二十七：**接口/父类/内建继承**接收者的类半已按 AIR 实测改为「接收者运行期类沿 super 链最近声明者」，接口与具名两类钉进 `unit: emit/FunctionArityQName`；剩下两处是**不可复现 / 不可构造**，非实现欠账） | 已对齐：实例方法 `<fqn>/<m>`、静态方法 `<fqn>$/<m>`、具名函数表达式 `Function/<name>`、**嵌套具名函数** `Function/<name>`（阶段三百二十七 修：此前被当匿名）、可选参/rest/0 参的放行规则。**剩余两处**：① 匿名闭包 —— `adl` 打 `Function/<file>.as$N:anonymous`，`N` 是**每文件方法序号**（同一个 `Main.as` 里三个匿名闭包实测 `$0`/`$2`/`$3`，`$1` 被同文件一个具名同胞函数占掉）⇒ 按构造不可复现，我们打 `Function/anonymous`；② 包级函数值 —— `mxmlc` 直接拒绝该表达式（`Access of possibly undefined property`），AIR 侧无法构造对照，保持 `Function/<name>` | 无实现动作可做。若将来「匿名闭包的 `$N`」变成可观测契约，唯一出路是在发射期复刻 `mxmlc` 的**方法表槽序**，代价远大于收益 ⇒ 维持现状并在此登记口径 |
 | **`Vector.<T>` 作 Class 值 / 值表达式**（`Vector.<int>`）—— `adl` 给 `[class Vector.<int>]`、`is Class` 为 true；我们**先是 parse error** | 未开始（2026-10-09 阶段一百二十七 实测发现；与上两行同族，独立立项以免与「内建类 Class 值」混淆） | `adl 51.4.1`（`temp/pkg1/AirV2.as` → `oracle/adl-v2.txt` 的 `bare=[class Vector.<int>]`，`AirV3.as` 的 `var cc:Class = Vector.<int>; cc is Class` 亦为 true）。注意**裸 `Vector` 作类型名我们报 codegen 错是吻合 AIR 的**：`mxmlc` 接受 `var vv:Vector;` 但拒绝 `var vv:Vector = new Vector.<int>();`（「从类型 `Vector.<int>` 的值到不相关类型 `Vector` 之间的隐式强制转换」）⇒ 有意义的那一半 AIR 自己就拒，故**不属缺口**（原 `is`/`as Vector.<T>` 那行的括注已随之移出）。我们：`trace("V=" + Vector.<int>)` ⇒ `Parse error at 1:26: expected '(' but found ')'`（`parser.ts` 的 `parseVectorCall` 把 `Vector.<T>` 一律当**调用**解析）；静态 `is`/`as Vector.<T>`（含动态 `*` 左值，阶段九十八·二）**不受影响** | 在 `parsePrimary` 里按「后面是否跟 `(`」分流：跟则仍是 `Vector.<T>(arrayLike)` 转换（`VectorCoerce`），不跟则是**类值**（新 AST 节点或复用 `Class` 值解析），codegen 侧按元素名映射到该 spec 的 `_cls`（`as_vec_fqn_hook` 已能给出精确元素名，可复用做 `is Class` 与字符串形式）。**成本中**，与接口 Class 值同属「名字进值位置」的分流工作，宜同批 |
 | `Socket.readObject` **未实现**（**响亮**报错）—— 而 `ByteArray.readObject`/`writeObject` 与新增的 `Socket.writeObject` 均精确 | 未开始（2026-10-09 阶段一百二十七 落地 `IDataInput`/`IDataOutput` 时主动登记；**明确的未支持**，非静默降级，符合 §1.5） | socket 的读侧**不可回退**：AMF3 的一个值可能跨多个数据包，解到一半发现字节不够时无法「把已消费的字节放回去」（AIR 有内部缓冲层故能流式解），故 `Socket_readObject` 直接抛 `"Socket.readObject is not supported by this subset: the socket read side is not seekable, so an AMF3 value spanning packets cannot be parsed without consuming the bytes after it. Use Socket.readBytes() with ByteArray.readObject()."`；写侧无此问题（序列化完再交给 `Socket__write`） | 与「`URLStream.readObject` 要求 Loader 已完成」同源（缓冲式读侧）：给 AMF 读侧做**增量缓冲**（不够就等下一块 —— 与 `as_async` 的 pump 模型耦合），或按 AIR 语义在 `Socket` 内维持一个可回退的接收缓冲。成本中 |
 | **web 端从文档类构造器请求 Stage3D 上下文不可用**，且 wasm 上胶水层抛的 JS 异常 AS3 `try/catch` **捕不到** | 未开始（2026-10-09 阶段一百二十八 实测发现，`temp/mipprobe/`） | web 侧的 WebGL2 上下文由 `Stage.showWindow` 创建，而文档类构造器里 `stage.stage3Ds[0].requestContext3D()` ⇒ `s3d_alloc_target` 的 `glGenFramebuffers(1, &c->fbo)` 读到未初始化的 GL 对象，抛 `TypeError: Cannot read properties of undefined (reading 'createFramebuffer')`。两层缺口：① **时机** —— AIR 允许「构造器里 requestContext3D、第一帧等 `CONTEXT3D_CREATE`」（native/adl 都能跑），web 上该形态必然失败（`Stage.showWindow` 后请求则正常）；② **可观测性** —— 该异常是 emscripten 帧里的 JS 抛错，**不经过 AS3 异常通道**，`try { requestContext3D(); } catch (e:Error) {}` 捕不到，用户只看到一个 unhandled rejection。探针因此改成「先 `showWindow`、再在第一帧请求」（三端一致）。 | 若要收口需两处：① web 侧把 Stage3D 目标的创建推迟到 canvas 就绪（`Stage.showWindow` 之后），并对「此前请求过」的 Context3D 补建（与 native 的「构造器即可请求」形态对齐）；② 给 glue 里所有会抛 JS 异常的入口加守卫，失败走 `as_throw` 而不是 JS throw（把不可捕获变成**响亮**的 AS3 错误）。**成本中**，且要保证 native 语义不变。 |
