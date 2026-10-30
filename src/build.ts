@@ -1216,6 +1216,28 @@ export function hostVendorKey(target: Target, platform: string, hostArch: string
   return nonWindowsVendorKey(platform, hostArch);
 }
 
+// Windows zlib: 生成的 C 无条件 `#include <zlib.h>` 并链接 z（ByteArray 的
+// compress/uncompress 后端，在 RUNTIME_PREAMBLE 里）。macOS/Linux 走系统 zlib
+// （posixLinkLibs 的 -lz + SDK 的 <zlib.h>）；Windows 没有系统 zlib，头文件与
+// 库都只能从 vendor/curl 的静态树取——curl 依赖栈构建的是 unprefixed 的 z.lib
+// + curl/include/zlib.h，而 Skia 自带的 bundled zlib 是 Chromium 的 prefixed
+// fork（_Cr_z_compress 等），不暴露生成的 C 调用的那些名字（见 air-app.ts::
+// airManifest 的 zlib 块）。这是每个 Windows native 构建的 runtime 依赖，不是
+// manifest 可选项；--air-app 的 manifest 已在 linkLibs 列 z（去重跳过），无
+// manifest 的直接编译（--package exe/raw、--run）此前漏了，在 `#include
+// <zlib.h>` 处报 fatal error——CI windows-exe smoke 的真因。
+export function windowsZlibArgs(cfg: BuildConfig): string[] {
+  if (process.platform !== 'win32' || cfg.target !== 'native') return [];
+  if (cfg.linkLibs.includes('z')) return [];
+  const vendor = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'vendor');
+  const libDir = hostVendorKey('native', 'win32', process.arch, cfg.architecture);
+  return [
+    '-I', resolve(vendor, 'curl', 'include'),
+    '-L', resolve(vendor, 'curl', 'lib', libDir),
+    '-l', 'z',
+  ];
+}
+
 interface HostTemplate {
   key: string;
   win: boolean;
@@ -1549,6 +1571,7 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   for (const f of cfg.cFlags) args.push(f);
   for (const o of cfg.objects) args.push(o);
   for (const p of cfg.linkPaths) args.push('-L', p);
+  args.push(...windowsZlibArgs(cfg));
   for (const l of cfg.linkLibs) args.push('-l', l);
   args.push(...frameworkFlags(cfg));
   // Static-archive order: libraries must follow the objects that reference

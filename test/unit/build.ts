@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -3155,6 +3155,57 @@ function checkWindowsLinkFlags(): string[] {
 }
 
 registerGroup('unit: build/WindowsLAA', checkWindowsLinkFlags);
+
+// ---- Windows zlib from the curl tree (CI windows-exe smoke) ----------------------
+// 生成的 C 无条件 `#include <zlib.h>` 并链接 z；macOS/Linux 走系统 zlib
+// （posixLinkLibs 的 -lz），Windows 没有系统 zlib，两者都从 vendor/curl 的静态
+// 树取（curl 依赖栈的 unprefixed z.lib + curl/include/zlib.h）。--air-app 的
+// manifest 已列 z（airManifest），无 manifest 的直接编译（--package exe/raw、
+// --run）此前漏了，在 `#include <zlib.h>` 处 fatal error。Host-independent in
+// shape：off-win32 恒为空，win32 下按「是否已链 z」去重。
+function checkWindowsZlib(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [zlib] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [zlib] ${label}`); }
+  };
+  const cfg = (over: Partial<BuildConfig> = {}): BuildConfig =>
+    ({ ...defaultBuildConfig(), target: 'native', ...over });
+
+  const real = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const a = windowsZlibArgs(cfg());
+    check('a manifest-less Windows native build injects the full zlib set',
+      a.length === 6 &&
+      a[0] === '-I' && a[1].includes('curl') && a[1].endsWith('include') &&
+      a[2] === '-L' && a[3].includes('curl') && a[3].includes('windows-x64') &&
+      a[4] === '-l' && a[5] === 'z');
+    check('a manifest that already lists z is not duplicated',
+      windowsZlibArgs(cfg({ linkLibs: ['z'] })).length === 0);
+    check('wasm never asks',
+      windowsZlibArgs(cfg({ target: 'wasm' })).length === 0);
+    // The compile command must carry it, and -l z must land AFTER the source file
+    // (static-archive order) -- unlike posixLinkLibs, which sits in the pre-`-o`
+    // flag block where a system dynamic -lz needs no ordering.
+    const argv = buildCompileCommand(cfg(), 'a.c', 'a.exe');
+    const zlibAt = argv.findIndex((x, i) => x === '-l' && argv[i + 1] === 'z');
+    const srcAt = argv.indexOf('a.c');
+    check('the compile command carries -l z and the curl include tree',
+      zlibAt >= 0 && argv.some((x) => x.includes('curl') && x.includes('include')));
+    check('-l z follows the source (static-archive order)',
+      zlibAt >= 0 && srcAt >= 0 && zlibAt > srcAt);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: real, configurable: true });
+  }
+
+  check('off-win32 the list is empty', windowsZlibArgs(cfg()).length === 0);
+  if (ok > 0) console.log(`[zlib] ${ok} Windows zlib checks passed`);
+  return bad;
+}
+
+registerGroup('unit: build/WindowsZlib', checkWindowsZlib);
 
 // ---- per-config object paths (阶段二百二十三) ----------------------------------
 // Two faces of one defect. The first is silent: two builds that disagree on a flag
