@@ -505,6 +505,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   + `htmlText`/`setTextFormat`/`autoSize`/`scrollH`+`maxScrollH`（打字自动滚动）/`leading` 断言
 - `examples/autosize-metrics.as` — `TextField.autoSize` 的大小口径（`wordWrap=true` 只改高度、宽度保持用户值；
   `wordWrap=false` 才 `width = textWidth + 4` 且两向收放；几何读取即刷新）与**未安装字族**回落到平台默认脸的行盒
+- `examples/overflow-clip.as` — **子树裁剪**的编译器契约（阶段三百四十三，G29）：120 宽父盒里的 200 宽子件在 `scrollRect` 与 `mask` 下都只画到第 120 像素，且**整棵子树**（孙件）、跨界描边、`BlurFilter` 外溢、`cacheAsBitmap`、嵌套裁剪、`TextField` 子件一并被裁，50% alpha 的遮罩不削弱内容 —— 十格与 `adl 51.4.1` 逐像素相同（这就是库侧 `overflow: hidden` 的落点）
 - `examples/text-underline.as` — `TextFormat.underline` / `htmlText` 的 `<u>` **真的被画出来**（阶段三百四十二，G28）：一条 1 设备像素的横线落在 `floor(2 + ascent + descent/2)`（12px `_typewriter` 即 y=15）、覆盖该范围的整个前进宽度（含行尾空格）、取 run 自己的颜色、**每个视觉行**一条、`leading` 不移动它、`underline=false` 的 run 把线断开、混排行按**行盒**落；且 `textWidth`/`textHeight`/`getLineMetrics` **逐位不受影响**
 - `examples/gettextformat.as` — `TextField.getTextFormat()` 读回该区间**生效的**格式（阶段二百七十，G21）：单 run / gap 用默认格式 / 跨边界与反序答**全 null 空格式** / `#2006` 越界 / `-1` 表示未提供 / 返回**副本**
 - `examples/tf-scale-metrics.as` — 被缩放的 `TextField` 口径：`textWidth`/`textHeight` = 名义 extents 乘**累积 `scaleY / scaleX`**

@@ -1711,6 +1711,71 @@ function checkImageFinalizer(): string[] {
   return bad;
 }
 
+// ---- G29: clipping a SUBTREE (the compiler half of `overflow: hidden`) ----
+//
+// The behavioural oracle is examples/overflow-clip.as (ten pixel cases measured against
+// adl 51.4.1 in temp/g29/: a 200-wide child inside a 120-wide parent paints x=20..139
+// under scrollRect AND under mask, and the grandchild, the straddling stroke, a
+// BlurFilter's spill, a cacheAsBitmap bake, nested clips and a TextField child are all
+// cut at the same edge). What a pixel test cannot say is WHY that still holds after a
+// refactor: it would keep passing while a future change re-introduced a clip that
+// wrapped only the object's own geometry. So pin the SCOPE -- the clip is entered
+// before the content call and left after it, and the two clip sources compose.
+function checkOverflowClip(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [overflowclip] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [overflowclip] ${label}`); }
+  };
+  const src = [
+    'import flash.display.Sprite;',
+    'import flash.geom.Rectangle;',
+    'var s:Sprite = new Sprite();',
+    's.scrollRect = new Rectangle(0, 0, 120, 28);',
+    'trace(s.scrollRect.y);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  // The scrollRect clip must enclose as_render_object_content (own geometry AND the
+  // children it recurses into), not just the object's own draws.
+  const clipAt = c.indexOf('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+  const contentAt = c.indexOf('as_render_object_content(canvas, o);', clipAt < 0 ? 0 : clipAt);
+  const restoreAt = c.indexOf('if (scroll_on) as_skia_canvas_restore(canvas);', clipAt < 0 ? 0 : clipAt);
+  check('the scrollRect clip is entered before the content call', clipAt >= 0 && contentAt > clipAt);
+  check('...and left only after it, so the whole subtree is inside the clip',
+    restoreAt > contentAt && contentAt >= 0);
+
+  // The mask is a SIBLING, so its stencil is built in parent space and clipped before
+  // the object's own translate -- otherwise a mask would follow the masked object and
+  // the two would drift apart on every move (measured, temp/maskprobe).
+  const maskAt = c.indexOf('if (o->_mask_ref != NULL) {');
+  const maskClip = c.indexOf('as_skia_canvas_clip_path(canvas, mp, 1);', maskAt < 0 ? 0 : maskAt);
+  const translateAt = c.indexOf('as_skia_canvas_translate(canvas, o->x, o->y);', maskAt < 0 ? 0 : maskAt);
+  check('the mask stencil is clipped before the object transform', maskAt >= 0 && maskClip > maskAt && translateAt > maskClip);
+  // A binary clipPath, not an alpha mask: adl does NOT attenuate by a 50% mask's alpha
+  // (temp/g29 H: a 50%-green mask leaves the content at 0xff0000), and an alpha stencil
+  // would halve it.
+  check('the mask is a binary clipPath (adl does not attenuate by the mask alpha)',
+    !c.includes('as_skia_canvas_clip_alpha_image') &&
+    c.includes('as_skia_canvas_clip_path(canvas, mp, 1);'));
+
+  // Both sources can be armed at once (a masked, scrolled container) and the nesting
+  // order does not matter to the result, but each must have its own save/restore pair
+  // or the restore below would drop the wrong scope.
+  const objStart = c.indexOf('static void as_render_object(void* canvas, DisplayObject* o) {');
+  const firstSave = c.indexOf('as_skia_canvas_save(canvas);', objStart);
+  const saveGap = firstSave < 0 || maskAt < 0 ? 'x' : c.slice(firstSave, maskAt);
+  check('the outer save comes before the mask clip, with no restore in between',
+    firstSave >= 0 && firstSave < maskAt && !saveGap.includes('as_skia_canvas_restore'));
+  check('the scrollRect scope opens its own save (it must be popped by its own restore)',
+    /if \(scroll_on\) \{\s*as_skia_canvas_save\(canvas\);/.test(c));
+
+  console.log(`[overflowclip] ${ok} subtree-clip checks passed`);
+  return bad;
+}
+registerGroup('unit: render/OverflowClip', checkOverflowClip);
 registerGroup('unit: render/SvgChannel', checkSvgChannel);
 registerGroup('unit: render/ImageFinalizer', checkImageFinalizer);
 registerGroup('unit: render/FontMetrics', checkFontMetrics);

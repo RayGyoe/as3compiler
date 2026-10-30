@@ -343,6 +343,12 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // scrollrect-clip.as 断言的也是**像素**（scrollRect 窗口的着色包围盒与窗口左上角
   // 色条），纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
   'scrollrect-clip.as': ['--manifest', join(dir, 'scrollrect-clip.build.json')],
+  // overflow-clip.as（阶段三百四十三 · G29）断言的是「把子树裁到盒子里」这条编译器能力：
+  // 120 宽父盒里的 200 宽子件在 scrollRect/mask 下都只画到第 120 像素，且**整棵子树**
+  // （孙件）、跨界描边、BlurFilter 外溢、cacheAsBitmap、嵌套裁剪、TextField 子件一并被裁，
+  // 半透明 mask 不削弱内容。全部数字与 adl 51.4.1 逐像素相同（temp/g29/ 四份探针双端比对），
+  // 纯 C 构建没有光栅后端，示例自行 skip。故与 scrollrect-clip.as 一样链 Skia。
+  'overflow-clip.as': ['--manifest', join(dir, 'overflow-clip.build.json')],
   // scrollrect-coordinates.as 必须真的执行 stage.render，坐标 API 才会读到 AIR 的
   // 「下一帧串接矩阵」；纯 C 的 surface 空桩会提前 return，故同链 Skia。
   'scrollrect-coordinates.as': ['--manifest', join(dir, 'scrollrect-coordinates.build.json')],

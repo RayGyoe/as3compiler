@@ -874,6 +874,49 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 验收：`examples/display-mask.as`（A~F 六组，数值逐条来自上表）＋ `unit: display/DisplayObjectMask`
 （17 条发射形态断言）；变异 7/7 全红（`temp/mask/mutate.cjs`：不裁剪 / 忽略遮罩祖先链 / 区域测
 不查遮罩 / 遮罩照样绘制 / `mask=null` 不摘标记 / 不递归子件 / 把 `visible` 计入）。
+### 6.16 子树裁剪：`scrollRect` / `mask` 就是 `overflow: hidden` 的落点（阶段三百四十三 · G29）
+
+asaotui 的 `compiler-gaps.md` G29 是「样式字段 `overflow` 被接受、被校验、也进了布局引擎，但
+**两侧画笔都不裁剪**」。判它是不是**编译器缺口**只需要回答一件事：**库要用它的那天，有没有一条
+像素正确的子树裁剪路径可达**。答案是**有**，而且两条都逐像素等于 AIR —— 所以 G29 的判定是
+**不是编译器缺口**（库侧 `PaintKit` 从未消费这个字段），编译器这边要做的是把这条口径量清、钉死。
+
+**adl 51.4.1 双端实测**（证据台 `temp/g29/`：`src/Main.as` … `src4/Main.as` 四份 adl 探针 +
+`ours.as` … `ours4.as` 镜像，全部 `BitmapData.draw` 逐像素取样；父盒 120×28、子件 200×28）：
+
+| 问的 | adl 的答案 | 我们 |
+|---|---|---|
+| 不裁剪（对照） | 着色像素 `x = 20..219` | 同 |
+| `parent.scrollRect = (0,0,120,28)` | `x = 20..139`（第 120 个像素在内、第 121 个在外） | 同 |
+| `child.mask = 120×28 形状` | 与 `scrollRect` 逐像素相同 | 同 |
+| 孙件（`inner.x=50`，200 宽） | `x = 70..139` —— **整棵子树**都进裁剪 | 同 |
+| 子件挂 `BlurFilter(8,8)` | 模糊外溢被**裁掉**（`px140` 是纯白） | 同 |
+| `cacheAsBitmap = true` + `scrollRect` | 先烘焙再裁，边界不变 | 同 |
+| 嵌套（外层 120、内层 `x=70` 宽 80） | `x = 90..139`（取交集） | 同 |
+| `TextField` 子件（300 宽） | `x = 20..139` | 同 |
+| 跨界的 4px 描边（画在 `(2,2,196,24)`） | 只剩 `x = 20..23` | 同 |
+| 50% alpha 的绿遮罩 | 内容**不**被削弱（仍是 `0xFF0000`） | 同（见 §6.15：二值模板） |
+
+**实现口径**（`src/emit.ts`）：
+
+- `scrollRect`：`save` → `clipRect(0,0,w,h)` → `translate(-x,-y)`（顺序见 D29），并且这层
+  `save`/`restore` **夹住 `as_render_object_content`** —— 也就是自身几何**和递归下去的子件**都在
+  裁剪里。这是「子树裁剪」成立的全部秘密，`unit: render/OverflowClip` 就钉这一条作用域：只夹自身
+  绘制、把子件留在外面的写法，像素测试会红，但重构时最容易悄悄退回去。
+- `mask`：二值 `clipPath`（不是 alpha 合成，§6.15），在对象的 `translate/rotate/scale` **之前**
+  裁（遮罩是兄弟，落在两者共同的父空间）；同样夹住整个子树。
+- 两者可叠加（既遮罩又裁的容器），各自一对 `save`/`restore`。
+- 滤镜层在裁剪**之内**，所以模糊/阴影的外溢会被切掉（上表第 5 行）。
+
+**已登记的小数残差**（`TODO.md` `### 遗留待开发`）：裁剪边落在 `.5` 时 AIR 用**银行家舍入**
+（`100.5→100`、`120.5→120`、`122.5→122`、`121.5→122`、`123.5→124`），我们的裁剪半上入
+（`100.5→101`、`120.5→121`、`122.5→123`）⇒ 整数部分为偶数的那一半 `.5` 场合**多画 1 设备像素**。
+整数几何逐位相同（`examples/overflow-clip.as` 只用整数，故稳定）。
+
+验收：`examples/overflow-clip.as`（上表十格，纯 C 构建自跳过——没有光栅后端）＋
+`unit: render/OverflowClip`（6 条作用域钉子：裁剪夹住内容调用、遮罩在对象变换之前、遮罩是二值
+`clipPath`、外层 `save` 与遮罩之间不得有 `restore`、`scrollRect` 自开 `save`）。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

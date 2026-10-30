@@ -773,6 +773,57 @@ re-audited site by site. Source pin: `unit: render/AlphaLayerBalance` (which als
 match in the renderer). Pixel pin: `examples/alpha-sibling.as` (a sibling drawn after a translucent
 subtree stays at its own position, and a second `draw` pass is pixel-identical).
 
+### 6.16 Clipping a subtree: `scrollRect` / `mask` are the landing point for `overflow: hidden` (stage 343, G29)
+
+(§6.12–6.15 of the Chinese document are not translated yet; the numbering here matches it.)
+
+asaotui's `compiler-gaps.md` G29 reads "the style field `overflow` is accepted, validated and fed into the
+layout engine, but **neither painter clips**". Whether that is a **compiler** gap hinges on one question:
+**the day the library consumes it, is there a pixel-correct way to clip a subtree?** There is, and both
+paths are pixel-identical to AIR -- so the verdict is **not a compiler gap** (the library's `PaintKit` never
+consumed the field). The compiler's job is to measure that contract and nail it down.
+
+**Measured on `adl 51.4.1`, both arms** (probes `temp/g29/src/Main.as` … `src4/Main.as` plus the
+`ours*.as` twins, all sampled with `BitmapData.draw`; a 120x28 parent, a 200x28 child):
+
+| Question | adl's answer | Ours |
+|---|---|---|
+| no clip (control) | painted `x = 20..219` | same |
+| `parent.scrollRect = (0,0,120,28)` | `x = 20..139` (the 120th pixel is in, the 121st is out) | same |
+| `child.mask = 120x28 shape` | pixel-identical to `scrollRect` | same |
+| grandchild (`inner.x=50`, 200 wide) | `x = 70..139` -- the **whole subtree** is clipped | same |
+| `BlurFilter(8,8)` on the child | the spill is **cut off** (`px140` is pure white) | same |
+| `cacheAsBitmap = true` + `scrollRect` | bake first, clip after; the edge is unchanged | same |
+| nested (outer 120, inner `x=70` width 80) | `x = 90..139` (intersection) | same |
+| a `TextField` child (300 wide) | `x = 20..139` | same |
+| a 4px stroke straddling the edge (drawn at `(2,2,196,24)`) | only `x = 20..23` | same |
+| a 50%-alpha green mask | the content is **not** attenuated (still `0xFF0000`) | same (see §6.15: binary stencil) |
+
+**How it is implemented** (`src/emit.ts`):
+
+- `scrollRect`: `save` -> `clipRect(0,0,w,h)` -> `translate(-x,-y)` (that order is D29), and that
+  `save`/`restore` pair **brackets `as_render_object_content`** -- so the object's own geometry **and the
+  children it recurses into** are inside the clip. That scope is the whole secret of "subtree clipping", and
+  `unit: render/OverflowClip` pins exactly it: a version that clipped only the object's own drawing would
+  still fail the pixel test, but is the easiest thing to lose in a refactor while every assertion about the
+  object itself keeps passing.
+- `mask`: a binary `clipPath` (not alpha compositing, §6.15), applied **before** the object's
+  `translate/rotate/scale` (a mask is a sibling, so it lives in the space the two share); it also brackets
+  the whole subtree.
+- The two compose (a container that is both masked and clipped), each with its own `save`/`restore`.
+- The filter layer sits **inside** the clip, which is why blur/shadow spill is cut (row 5 above).
+
+**A registered sub-pixel residual** (`TODO.md`, `### 遗留待开发`): when a clip edge lands on `.5`, AIR
+rounds **half to even** (`100.5->100`, `120.5->120`, `122.5->122`, `121.5->122`, `123.5->124`) while our
+clip rounds half up (`100.5->101`, `120.5->121`, `122.5->123`) -- so on the half of the `.5` cases whose
+integer part is even we paint **one extra device pixel**. Integer geometry is bit-identical
+(`examples/overflow-clip.as` only uses integers, so it is stable).
+
+Nails: `examples/overflow-clip.as` (the ten rows above; skipped on pure-C builds, which have no raster
+backend) plus `unit: render/OverflowClip` (6 scope checks: the clip brackets the content call, the mask
+comes before the object transform, the mask is a binary `clipPath`, no `restore` may sit between the outer
+`save` and the mask, and `scrollRect` opens its own `save`).
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.
