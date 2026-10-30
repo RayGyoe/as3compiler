@@ -6730,18 +6730,52 @@ export class SymbolTable {
         // "unset", but the documented default is 0 and callers assign numbers).
         ['leftMargin', tff({ kind: 'any' }, 'TextFormat')],
         ['rightMargin', tff({ kind: 'any' }, 'TextFormat')],
+        // 阶段三百三十一: the rest of AIR's member table. Omitting them made AIR-legal
+        // code fail to COMPILE ("undefined field 'indent' on class 'TextFormat'"),
+        // which is the one failure mode the project forbids least of all. Types are
+        // AIR's own (airsdk.dev/reference/actionscript/3.0/flash/text/TextFormat.html):
+        // `url`/`target`/`display` are Strings, the rest are Object because null
+        // means "unset". NOTE: indent/blockIndent/bullet/tabStops/display are
+        // STORED and read back correctly but the SkParagraph layout does not apply
+        // them yet -- registered in TODO.md's 遗留待开发 as a rendering gap rather
+        // than pretending they work.
+        ['url', tff({ kind: 'string' }, 'TextFormat')],
+        ['target', tff({ kind: 'string' }, 'TextFormat')],
+        ['indent', tff({ kind: 'any' }, 'TextFormat')],
+        ['blockIndent', tff({ kind: 'any' }, 'TextFormat')],
+        ['bullet', tff({ kind: 'any' }, 'TextFormat')],
+        ['display', tff({ kind: 'string' }, 'TextFormat')],
+        ['tabStops', tff({ kind: 'any' }, 'TextFormat')],
       ]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
       setters: new Map(),
+      // AIR's constructor is 13 parameters IN THIS ORDER:
+      //   TextFormat(font, size, color, bold, italic, underline, url, target,
+      //              align, leftMargin, rightMargin, indent, leading)
+      // Our old 6-parameter list put `leading` SIXTH, where AIR has `underline`,
+      // so `new TextFormat(null, 12, 0, false, false, 8)` silently set the wrong
+      // field (it still does in AIR -- underline=8 -- but the two compilers
+      // disagreed about what the program meant). Defaults keep this build's
+      // historical values (size 12, color 0, bold/italic false) so that adding the
+      // mxmlc-accepted arities changes no existing rendering; AIR's own defaults
+      // are all null and its "unset means keep the current value" merge is still
+      // the open 遗留 item.
       constructor: { params: [
         { name: 'font', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'size', type: 'Number', defaultValue: { kind: 'Num', value: 12, isInt: false }, isRest: false },
         { name: 'color', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         { name: 'bold', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
         { name: 'italic', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'underline', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
+        { name: 'url', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'target', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'align', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'leftMargin', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'rightMargin', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
+        { name: 'indent', type: 'any', defaultValue: { kind: 'Null' }, isRest: false },
         { name: 'leading', type: 'Number', defaultValue: { kind: 'Num', value: 0, isInt: false }, isRest: false },
       ] },
       superClass: 'Object',

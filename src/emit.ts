@@ -9654,7 +9654,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           const face = e.font === null ? 'NULL' : `(char*)${cStringLiteral(Buffer.from(e.font, 'utf8'))}`;
           const size = e.size > 0 ? e.size : 12;
           const color = e.color === null ? 0 : e.color;
-          steps.push(`t->defaultTextFormat = TextFormat_new(${face}, ${this.formatDouble(size)}, 0x${color.toString(16).padStart(6, '0')}u, false, false, ${this.formatDouble(e.leading)});`);
+          steps.push(`t->defaultTextFormat = TextFormat_new(${face}, ${this.formatDouble(size)}, 0x${color.toString(16).padStart(6, '0')}u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), ${this.formatDouble(e.leading)});`);
           if (e.align !== null) steps.push(`t->defaultTextFormat->align = (char*)"${e.align}";`);
           if (e.leftMargin > 0) steps.push(`t->defaultTextFormat->leftMargin = as_v_num(${this.formatDouble(e.leftMargin)});`);
           if (e.rightMargin > 0) steps.push(`t->defaultTextFormat->rightMargin = as_v_num(${this.formatDouble(e.rightMargin)});`);
@@ -22959,17 +22959,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('');
     this.emitClipboardClass();
     // ---- flash.text (stage 38) ----
-    this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
+    this.line('void TextFormat_ctor(TextFormat* o, char* font, double size, unsigned color, bool bold, bool italic, bool underline, char* url, char* target, char* align, as_value leftMargin, as_value rightMargin, as_value indent, double leading) {');
     this.indent++;
-    this.line('o->font = font; o->size = as_v_num(size); o->color = as_v_num((double)color); o->bold = as_v_bool(bold); o->italic = as_v_bool(italic); o->underline = as_v_bool(false); o->align = NULL; o->leading = as_v_num(leading); o->kerning = as_v_bool(false); o->letterSpacing = as_v_num(0.0);');
-    this.line('gc_write_barrier((void*)font);');
+    this.line('o->font = font; o->size = as_v_num(size); o->color = as_v_num((double)color); o->bold = as_v_bool(bold); o->italic = as_v_bool(italic); o->underline = as_v_bool(underline); o->url = url; o->target = target; o->align = align;');
+    this.line('o->leftMargin = leftMargin; o->rightMargin = rightMargin; o->indent = indent; o->blockIndent = as_v_null(); o->bullet = as_v_null(); o->display = NULL; o->tabStops = as_v_null();');
+    this.line('o->leading = as_v_num(leading); o->kerning = as_v_bool(false); o->letterSpacing = as_v_num(0.0);');
+    this.line('gc_write_barrier((void*)font); gc_write_barrier((void*)url); gc_write_barrier((void*)target); gc_write_barrier((void*)align);');
     this.indent--;
     this.line('}');
-    this.line('TextFormat* TextFormat_new(char* font, double size, unsigned color, bool bold, bool italic, double leading) {');
+    this.line('TextFormat* TextFormat_new(char* font, double size, unsigned color, bool bold, bool italic, bool underline, char* url, char* target, char* align, as_value leftMargin, as_value rightMargin, as_value indent, double leading) {');
     this.indent++;
     this.line('TextFormat* o = (TextFormat*)gc_alloc(GCT_CLASS, sizeof(TextFormat));');
     this.line('o->vtable = &TextFormat_vt;');
-    this.line('TextFormat_ctor(o, font, size, color, bold, italic, leading);');
+    this.line('TextFormat_ctor(o, font, size, color, bold, italic, underline, url, target, align, leftMargin, rightMargin, indent, leading);');
     this.line('return o;');
     this.indent--;
     this.line('}');
@@ -23003,7 +23005,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // mouseWheelEnabled is AIR-true on a fresh field (condenseWhite is AIR-false,
     // so its zeroed slot is already right).
     this.line('o->mouseWheelEnabled = true;');
-    this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false, 0.0);');
+    this.line('o->defaultTextFormat = TextFormat_new(NULL, 12.0, 0x000000u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
     this.line('o->multiline = false;');
     this.line('o->wordWrap = false;');
     this.line('o->background = false;');
@@ -23743,7 +23745,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('(void)underline; // underline not yet modeled by the TextStyle subset');
     this.line('if (begin >= end) return;');
     this.line('if (tf->_runs == NULL) tf->_runs = as_array_new();');
-    this.line('TextFormat* f = TextFormat_new(face, size, color, bold, italic, 0.0);');
+    this.line('TextFormat* f = TextFormat_new(face, size, color, bold, italic, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
     this.line('as_array_push(tf->_runs, as_v_num((double)begin));');
     this.line('as_array_push(tf->_runs, as_v_num((double)end));');
     this.line('as_array_push(tf->_runs, as_v_obj((void*)f));');
@@ -24117,21 +24119,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static TextFormat* as_tf_fmt_clone(TextFormat* src) {');
     this.indent++;
-    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, 0.0);');
-    this.line('o->font = src->font; o->align = src->align;');
+    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
+    this.line('o->font = src->font; o->align = src->align; o->url = src->url; o->target = src->target; o->display = src->display;');
     this.line('o->size = src->size; o->color = src->color; o->bold = src->bold; o->italic = src->italic;');
     this.line('o->underline = src->underline; o->leading = src->leading; o->kerning = src->kerning;');
     this.line('o->letterSpacing = src->letterSpacing; o->leftMargin = src->leftMargin; o->rightMargin = src->rightMargin;');
+    this.line('o->indent = src->indent; o->blockIndent = src->blockIndent; o->bullet = src->bullet; o->tabStops = src->tabStops;');
     this.line('gc_write_barrier((void*)src->font); gc_write_barrier((void*)src->align);');
+    this.line('gc_write_barrier((void*)src->url); gc_write_barrier((void*)src->target); gc_write_barrier((void*)src->display);');
     this.line('return o;');
     this.indent--;
     this.line('}');
     this.line('static TextFormat* as_tf_fmt_empty(void) {');
     this.indent++;
-    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, 0.0);');
+    this.line('TextFormat* o = TextFormat_new(NULL, 0.0, 0u, false, false, false, NULL, NULL, NULL, as_v_null(), as_v_null(), as_v_null(), 0.0);');
     this.line('o->size = as_v_null(); o->color = as_v_null(); o->bold = as_v_null(); o->italic = as_v_null();');
     this.line('o->underline = as_v_null(); o->leading = as_v_null(); o->kerning = as_v_null();');
     this.line('o->letterSpacing = as_v_null(); o->leftMargin = as_v_null(); o->rightMargin = as_v_null();');
+    this.line('o->indent = as_v_null(); o->blockIndent = as_v_null(); o->bullet = as_v_null(); o->tabStops = as_v_null();');
+    this.line('o->url = NULL; o->target = NULL; o->display = NULL; o->align = NULL;');
     this.line('return o;');
     this.indent--;
     this.line('}');

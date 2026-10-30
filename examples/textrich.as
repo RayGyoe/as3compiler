@@ -32,7 +32,8 @@ tf.text = "a\nb";
 var h0:Number = tf.textHeight;
 var lh0:Number = h0 / tf.numLines;
 
-var lf:TextFormat = new TextFormat(null, 12, 0x000000, false, false, 8);
+var lf:TextFormat = new TextFormat(null, 12, 0x000000, false, false, false);
+lf.leading = 8;   // 6th ctor arg is `underline` in AIR, not `leading`
 tf.defaultTextFormat = lf;
 var h1:Number = tf.textHeight;
 var lh1:Number = h1 / tf.numLines;

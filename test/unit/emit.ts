@@ -4273,3 +4273,36 @@ function checkEmitImplicitGlobal(): string[] {
   return bad;
 }
 registerGroup('unit: emit/ImplicitGlobal', checkEmitImplicitGlobal);
+
+// ---- AIR's TextFormat member table and 13-argument constructor ----
+//
+// Measured on adl 51.4.1 by compiling ONE source with both compilers
+// (temp/implicit/Main.as): the 13 positional arguments land on the same fields on
+// both sides, and the seven table-only fields read back the values that were
+// written. The constructor ORDER is the load-bearing part -- our old 6th parameter
+// was `leading`, AIR's is `underline`, so the same call meant two different things.
+function checkEmitTextFormatTable(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tfmembers] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tfmembers] ${label}`); }
+  };
+
+  const src = 'var f:TextFormat = new TextFormat("_typewriter", 14, 0xFF0000, true, true, true, "u", "t", "center", 3, 4, 5, 6);\ntrace(f.indent);';
+  const c = generateC(parse(src)).c;
+  // The struct carries every member, and the constructor takes all thirteen.
+  for (const field of ['url', 'target', 'indent', 'blockIndent', 'bullet', 'display', 'tabStops']) {
+    check(`the struct has the ${field} member`, new RegExp(`^  [A-Za-z_][\\w ]*\\*? ${field};$`, 'm').test(c));
+  }
+  check('TextFormat_new takes thirteen parameters', /TextFormat\* TextFormat_new\(char\* font, double size, unsigned color, bool bold, bool italic, bool underline, char\* url, char\* target, char\* align, as_value leftMargin, as_value rightMargin, as_value indent, double leading\)/.test(c));
+  check('the constructor stores underline from its own parameter, not a hardcoded false',
+    c.includes('o->underline = as_v_bool(underline);'));
+  check('leading is bound from the 13th parameter', c.includes('o->leading = as_v_num(leading);'));
+  check('clone copies the table-only members too',
+    c.includes('o->indent = src->indent; o->blockIndent = src->blockIndent; o->bullet = src->bullet; o->tabStops = src->tabStops;'));
+
+  console.log(`     [tfmembers] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/TextFormatMembers', checkEmitTextFormatTable);

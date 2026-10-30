@@ -18140,7 +18140,45 @@ mxmlc 直接拒绝——「所访问的属性 gvar 可能未定义」；连**读
 **残留（已登记）**：赋值写在**函数体**内（含函数体内的 `with`）仍是编译期错误 —— 严格半边实测过，
 宽松半边无法实测，不做猜测。
 
+### 阶段三百三十一：`TextFormat` 成员表与 13 参构造器（v0.4.291 → v0.4.292）
+
+**范围**：遗留表「`TextFormat` 的『未设字段』语义与成员表不全」的前半（成员表 + 构造器）。
+
+**实测**（`adl 51.4.1`，`temp/implicit/Main.as`：同一份源码分别交给 mxmlc 与我们，一次读回全部字段）：
+
+```
+AIR : font=_typewriter size=14 color=16711680 b=true i=true u=true
+      url=http://x target=_blank align=center
+      lm=3 rm=4 indent=5 leading=6
+      bi=9 bullet=true display=block ts=2
+empty: size=null color=null underline=null url=null leading=null     ← 只有这一行不同
+我们: 前四行逐字相同
+empty: size=12 color=0 underline=false url=null
+```
+
+**两处真缺陷**：
+1. **成员表缺 7 个字段** ⇒ AIR 合法的 `f.indent = 5` 在我们这里是**编译错误**
+   （`undefined field 'indent' on class 'TextFormat'`）。补齐 `url`/`target`/`indent`/
+   `blockIndent`/`bullet`/`display`/`tabStops`。
+2. **构造器 6 参且顺序不同**：AIR 的第 6 参是 `underline`，我们的是 `leading` ⇒
+   `new TextFormat(f, 12, 0, false, false, 8)` 在两端**含义不同**。改为 AIR 的 13 参顺序
+   `font,size,color,bold,italic,underline,url,target,align,leftMargin,rightMargin,indent,leading`。
+   `examples/textrich.as` 唯一一处 6 参调用改写为显式 `lf.leading = 8`（并注明原因）。
+
+**C 侧**：`TextFormat_ctor`/`TextFormat_new` 扩到 13 参；`as_tf_fmt_clone` 搬新字段并补写屏障；
+`as_tf_fmt_empty` 把新字段也置空；内部 5 处 `TextFormat_new(...)` 调用点全部补齐。
+
+**未做（已登记）**：零参 `new TextFormat()` 在 AIR 里**字段全 null**，赋给 `defaultTextFormat`
+时按「未设则保持当前值」逐字段合并（`leading=2` 因此不会被抹掉，`textHeight` 14.02→12.00 那个
+偏差即来于此）。这需要把「未设」表示打通到排版读取路径，**单开阶段**处理；本阶段刻意保留
+本构建的历史默认值，使得「补成员表 / 改参数顺序」对现有渲染**零影响**。
+
+**验收**：`examples/textformat-members.as`（13 参逐字段 + 7 个新字段 + 第 6 参是 underline）；
+`test/unit/emit.ts` 新增 `unit: emit/TextFormatMembers` 11 钉。全量 `node test.ts` ⇒ 565 passed / 0 failed。
+
 ### 遗留待开发
+> **2026-10-30 追加（阶段三百三十一：`TextFormat` 成员表 + 13 参构造器）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「`TextFormat` 未设字段语义与成员表不全」转**部分完成**（成员表与 13 参顺序已完成，『未设则保持』的合并仍未做）。
+>
 > **2026-10-30 追加（阶段三百三十：脚本层隐式全局）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「`with` 体内隐式全局」转**部分完成**：脚本层已实现（含 `with` 落回），残留为**函数体内**赋值。
 >
 > **2026-10-30 追加（阶段三百二十九：隐式强制转换对齐 mxmlc 拒绝面）**：**新登记 0 行 / 改写 1 行 / 移出 0 行**。「编译期缺少隐式强制转换检查」转**已完成**（12×10 矩阵实测，只在声明型强制点检查；接口目标刻意不查）。
@@ -18409,7 +18447,7 @@ mxmlc 直接拒绝——「所访问的属性 gvar 可能未定义」；连**读
 | **首页 tab 首标签偶尔掉第一个汉字**（`adl` 稳定 `打开网页`，我方**偶尔** `开网页`：首个汉字「打」整字消失、其余三字位置不变） | 未开始（2026-10-15 阶段一百六十五 巡检副产物，**间歇 1/6 次观测**；已排除与 C 名改写相关——同二进制重跑即正常、两版 C 规范化后逐字节相同 `temp/tkmeet-mac/ab.safe.diff`；复跑harness `temp/tkmeet-mac/labelprobe.py` 4/4 绿；待定方向：数据面（多字节串首部丢字节/BOM 误跳）vs 渲染面（字形图集缓存/GC 时序）；**修法**：加「数据到手即打印长度与首字符」探针 + 复现窗口） |
 | **时间轴回退只认「同一 (父, 深度, 角色)」复用**（这是我们**已实现的** AIR 口径；登记的是**残留 D43b**：向前 `Move` 记录**带新字符**时 `adl` 保留原对象身份，我们换新对象——因为烘培出的类把一个角色的图**画进类里**，换角色必然换实例） | 未开始 / **D43b**（2026-10-16 阶段一百七十二 登记，**回退方向已修**） | `adl 51.4.1` 实测：`temp/btnprobe/Rewind2.as` 中「`_over(5) → _up(1)`」深度 2/3 的 `label1`/`label2` **对象编号不变**、深度 1 因角色 524→518 而换新实例（`instance8 → instance28`）；我方 `Rewind3.as` 回退方向已一致。**未修的那条**：`Move` + 新字符在 `adl` 里是**同一个对象换图**（编号 `#0` 不变）、我方造新对象（`#4`）。它不会丢 App 写入的文字（只有角色真变了才触发），故仅登记。差异清单 **D43 / R30** |
 | **`ROLL_OVER` / `ROLL_OUT`（含冒泡的 `mouseOver`/`mouseOut`）事件不派发** | 未开始（2026-10-16 阶段一百七十二 登记；**2026-10-23 阶段二百六十三 实测收窄**） | `adl` 会在这两个时机派发：指针进入/离开一个**可交互**对象（`mouseEnabled`）时对该对象派发 `rollOver`/`rollOut`，若 `bubbles` 允许再冒泡成 `mouseOver`/`mouseOut`。我们 `src/emit.ts` 只派发 `mouseOut` 的**制度性替代物**——指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台上)` 的顺序补一轮（见 `emit.ts` 的`Stage_dispatchMouse`），**没有**逐对象 hover 迁移的发射点，故依赖 `ROLL_OVER`/`ROLL_OUT` 监听的组件收不到通知。**同族里已修的两条不要与本行混记**：`Stage.MOUSE_LEAVE` **已派发**（`src/emit.ts:17682` 的`Event_new("mouseLeave", ...)` 发在舞台自身，`d43` 表内的 `mouseLeave` 一栏已对齐）；「指针移出窗口不 roll-out」**已修**（`vendor/window_glue.cc` 接 `SDL_WINDOWEVENT_LEAVE`，带「指针仍严格在客户区内则不算离开」的守卫）。TalkMED 目前全用 `CLICK`，故真机未暴露。差异清单 **D43 表内** | 在 `Stage_dispatchMouse` 的 hover 迁移点补两个发射点：目标由 `_hover` 变为新对象时，对旧对象发 `rollOut`（`bubbles=true`）、对新对象发 `rollOver`（`bubbles=true`），按 `adl` 的 `mouseOut → rollOut` 顺序；事件类的 `stageX/stageY`、`localX/localY` 与 `buttonDown` 三个字段与 `mouseOut` 同源，复用同一条构造路径。**成本中低**，但**必须先写双端探针**量定「进入/离开嵌套可交互子件时父件是否也收到」（`adl` 的 roll-over 不冒泡穿透到父件的 hover 链，与 `mouseOver` 的冒泡是两件事） |
-| **`TextFormat` 的「未设字段」语义与成员表不全**（① `defaultTextFormat = new TextFormat()`（字段全 null）在 AIR 里是一场 **no-op**——字体/字号/颜色/粗体/`leading` 全保持字段当前值；我们把 null 一律写回 `0`/默认值 ⇒ 丢掉 SWF 声明的 `leading=2`，`textHeight` 名义值 `14.02 → 12.00`；`dtf.size = null` 更得到 `size=0` 的退化版面。② 成员表缺 `indent`/`blockIndent`/`bullet`/`tabStops`/`target`/`url`，构造器 **6 参 vs AIR 13 参** ⇒ AIR 合法的代码我们**编不过**（`Codegen error: undefined field 'indent' on class 'TextFormat'`）） | 未开始（2026-10-16 阶段一百七十 **巡检副产物，本轮只实测登记、不动手**） | `adl 51.4.1` 双端同源探针 `temp/tfswc/` case TF0–TF8：TF7 全 null 的 `TextFormat` 读回**原值**（我们 `font=null size=12 color=0 bold=false lead=0`）、TF2 换 `dtf` 后 `th` 我们 `9.80` vs `adl 11.45`（丢了 `leading=2`）、TF3/TF4 显式 `leading=0/2` 两端一致（`9.80/11.45`，证明差只在「未设」这一态）、TF5 `size=14, lead=null` ⇒ `adl` 保留 `lead`、TF8 `size=null` ⇒ `adl` 保留 `20`（我们 `0`）。修法方向：字段改用能表达「未设」的表示 + setter 逐字段「未设则保持」合并 + 补 6 个成员与 13 参构造器；**风险**：触及全部文本示例的默认值路径，须单开阶段 + 全量回归。差异清单 **D41 / R28**；对决证据索引「D41 `TextFormat` null 语义与成员表」行 |
+| **`TextFormat` 的「未设字段」语义与成员表不全**（① 零参 `new TextFormat()` 在 AIR 里字段全 null、赋给 `defaultTextFormat` 是逐字段『未设则保持』；② 成员表与构造器参数面） | **部分完成**（2026-10-30 阶段三百三十一：② 已完成 —— 19 字段全表 + AIR 的 13 参**同序**构造器；① 仍未做） | ② 的实测（`temp/implicit/Main.as` 同源双端）发现真正的坑不是「少字段」而是**参数顺序**：AIR 第 6 参是 `underline`、我们曾是 `leading`，同一个调用两端含义不同；已在阶段三百三十一改齐并把 `examples/textrich.as` 的 6 参调用改成显式 `lf.leading`。① 的实测仍是阶段一百七十的 TF0–TF8（`temp/tfswc/`）：TF7 全 null 读回原值、TF2 `th` 我们 9.80 vs `adl` 11.45、TF5/TF8 「未设」时 AIR 保留原值、我们归零。结构侧的 `as_tf_fmt_empty()`（全 null）与 `as_tf_fmt_clone()` 已就位，缺的是**排版读取路径对 null 的回落**与 setter 的逐字段合并 | ① 需单开阶段：字段改「可未设」表示（大部分已是 `as_value`，`font`/`align`/`url`/`target`/`display` 是 `char*` 且 NULL 即 null，表示层已经够用）+ setter 合并 + 排版 null 回落 + 全量文本示例回归。**风险**：触及全部文本示例默认值路径 |
 | **`Vector`/`Array` 的逐元素访问守卫把循环挡在向量化之外**（元素级 `Vector.<Number>` 比同形裸 C 慢 **5.4×**、`Vector.<int>` 慢 **12×**） | 未开始（2026-10-22 实测登记） | 实测（`temp/simdprobe/`，Apple M2 Max，`24 × 1M` 元素，`-O2 -ffp-contract=off`）：`c[j]=a[j]+b[j]*1.5` 我们 **38–47 ms** vs **同形裸标量 C 6.3–6.8 ms**；`ic[j]=ia[j]+ib[j]` 我们 **34–36 ms** vs C **2.9–4.0 ms**。**根因不是算力/向量宽度**：把逐元素访问换成裸 `->data[j]`（**其余一字不动**）即 **7 ms / 3 ms**，`-Rpass` 同时显示 clang **自动**给出 `vectorization width: 2`（f64）、**`width: 4`**（int32）且 `interleaved count: 4` —— **与手写 NEON 同形**。生成 C 的 `main` 内层每元素带 **3** 个 `cbz` 空指针守卫 + **4** 次 `length` 比较 + 5 个分支。**为什么挡不住**：循环体里有 `set` ⇒ 与输入 `Vector` **别名** ⇒ `v->length` 不能被证明循环不变 ⇒ 检查留在循环内。**反例（解释了为什么归约不慢）**：归约循环体无 store ⇒ 无别名 ⇒ clang 自动提外检查并向量化 ⇒ `s+=a[j]*b[j]` 我们 **21–22 ms** 与 C **22.3 ms** 持平（这正解释了 `spectralnorm` 的 0.80×），且校验和与 C 的 `volatile` 串行实现**逐位相同** ⇒ 无重结合、语义未破。另有 **~21%**（38→30）来自顶层脚本变量落内存（同三循环放进函数即 30 ms）。**顺带结论**：增强项 E10（显式 SIMD）因此**不排期**——它要的收益已由 `-O2` 自动拿到，剩下的全靠本条 | 方向：**可证明无别名时才把边界/空指针检查提到循环外**（循环体不得对任何 `Vector`/`Array` 写字，且不得调用无法证明不写它们的函数；否则**原样保留**逐元素检查，语义零变化）。**先定调**：这属 §1.1 的「形态转换」还是「前端做优化」需先明确（它改的是**检查放在哪**、不是**检查做不做**）。若做，须同时钉住两条反向钉子：① 有跨 `Vector` 写入/别名时必须**回退**到逐元素检查；② 无跨 `Vector` 写入时必须**确已提外**。**成本中**（需要一个循环级别的别名/写集分析）；探针可提成 `benchmarks/` 一项 |
 | **Windows 32 位（i686）AOT 目标不可构建**（`--target` 只有 `native`/`wasm`，没有位宽轴） | 未开始（2026-10-17 阶段一百七十八·四 实测登记） | 宿主侧**已就绪并实测**：`lib/bin/windows-x86/asaot.{dll,lib}` 由 `build-asaot.bat` 默认一并产出（`machine=x86`、53 导出、导入库记 `asaot.dll`、0 个 `Adobe`），32 位探针扩展真链上它（`machine=x86`、32 个 FRE 全来自 `asaot.dll`，`temp/ane-e2e/x86/`），`--ane-platform Windows-x86` 的链接行确实是 `-L …\lib\bin\windows-x86`；依赖前缀 `build-tools/win-deps-prefix-x86`（含 `zlibstatic.lib`/`zlib.h`）也是齐的。**缺的是**：`--target` 的位宽轴、`c-compiler` 只能给单个可执行名（注入不了 `--target=i686-…`）、`cxxCompiler()` 从它派生名字 ⇒ 需要先立一条 32 位宿主工具链。**影响**：只声明 `Windows-x86` 的 ANE（真 `ANEWinCore.ane` 就带这一项）无法端到端 |
 | **Windows ARM64 依赖构建路径未在本机验证**（`build-windows-deps.ps1 -Arch arm64` 的**产物**没造出来过：本机没有 ARM64 工具集） | 未开始（2026-10-17 阶段一百七十八·五 实测登记） | **已验证**：`-Arch arm64` 在缺工具集时**退出 1** 并点名要装的组件（`MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools`）、**不发生任何下载**；`-Arch x86` 正向自检通过（证明判据非一律拒绝）；`vcvarsall.bat arm64` **退出码 0 却什么都不装** ⇒ 该分支**只能**读文件判（已如此实现：MSVC `lib\arm64` 非空 / `cl.exe` 的 `.Source` 匹配 `\arm64\cl.exe` / SDK `Lib\<ver>\um\arm64` 存在）。**未验证**：装好组件后 `vendor/*/windows-arm64` 的真实产物与其 COFF 机器字段（应为 `0xaa64`）；Skia 的 `extra_cflags` 三元组是否真被 gn 采纳到每个 obj（上游 win 分支 arm64 **不传架构旗标**、`bin` 路径写死 `HostX64` ⇒ 在 x64 宿主上会静默产 x64 对象）。**与 AIR 无关的部分已查清**：AIR 没有 Windows ARM64 运行时（51.4.1 的每个 Windows 运行时各只认一个平台键：`win/` 那份 `Windows-x86`、`win64/` 那份 `Windows-x86-64`），故 ANE 宿主宽度是**闭集**，`lib/bin/windows-arm64` 刻意不建 | 在装了 ARM64 组件的 Windows 上跑 `-Arch arm64`，用 `Assert-LibBitness` 逐库读机器字段应为 `0xaa64`；若 Skia 出了 x64 obj，须把三元组从 `extra_cflags` 迁到工具链自身（arm64 分支补 `--target=`）。**成本低-中** |
