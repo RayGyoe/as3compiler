@@ -228,10 +228,55 @@ function checkQualifiedSuperclassName(): string[] {
   return bad;
 }
 
+// ---- dynamic read trait priority (stage 324) ----
+// adl 51.4.1 measured: `f["parent"]` on a File/DisplayObject returns the SAME
+// object as `f.parent`, i.e. the getter. Our as_dyn_get used to walk the three
+// reflection tables one trait at a time (every field of the whole chain, then
+// every getter), so `EventDispatcher.parent` -- an internal C link field -- won
+// over `DisplayObject.parent`/`File.parent`, both getters, and a dynamic read
+// answered a stale NULL. The fix is one chain walk per level with
+// fields -> getters -> methods at each level, so the nearest declaration wins
+// whatever kind of trait it is. These pins keep the three loops from being split
+// apart again.
+function checkDynGetTraitPriority(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const preamble = RUNTIME_PREAMBLE;
+  const fnAt = preamble.indexOf('static as_value as_dyn_get(void* obj, const char* key) {');
+  const body = preamble.slice(fnAt, preamble.indexOf('\n}\n', fnAt) + 3) || preamble.slice(fnAt);
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++; else bad.push(label);
+  };
+  check('as_dyn_get was found in the preamble', fnAt >= 0);
+  const propAt = body.indexOf('as_prop_read(obj, &props[i])');
+  const getAt = body.indexOf('getters[i].fn(obj, NULL, 0)');
+  const callAt = body.indexOf('as_fn_make(methods[i].fn, obj, -1)');
+  check('fields, getters and methods are resolved in that order',
+    propAt >= 0 && getAt > propAt && callAt > getAt);
+  // Exactly one chain-step back-edge: splitting the walk into three loops puts
+  // three of these between the field read and the method read.
+  const between = body.slice(propAt, callAt);
+  check('the three traits share ONE chain walk (a derived accessor beats a base field)',
+    (between.match(/vt = \(\(as_vtable_header\*\)vt\)->super;/g) || []).length === 0
+    && (body.match(/vt = \(\(as_vtable_header\*\)vt\)->super;/g) || []).length === 1);
+  check('the walk keeps the Proxy / Object / dyn-slot fallbacks after it',
+    body.indexOf('as_proxy_get_miss(obj, key)') > callAt
+    && body.indexOf('return as_object_get((as_object*)obj, key)') > callAt);
+
+  const ex = readFileSync(join(root, 'examples', 'file-ops.as'), 'utf8');
+  check('the example pins the dot/dynamic equivalence on a real getter (File.parent)',
+    ex.includes('["parent"].nativePath')
+    && ex.includes('.parent.nativePath'));
+
+  if (ok > 0) console.log(`[dynget] ${ok} trait-priority checks passed`);
+  return bad;
+}
+
 registerGroup('unit: reflection/AsObjectCast', checkAsObjectCast);
 registerGroup('unit: reflection/FunctionMemberCall', checkFunctionMemberCall);
 registerGroup('unit: reflection/VectorReflectionNames', checkVectorReflectionNames);
 registerGroup('unit: reflection/QualifiedSuperclassName', checkQualifiedSuperclassName);
+registerGroup('unit: reflection/DynGetTraitPriority', checkDynGetTraitPriority);
 
 // ---- `is` / `as` with a runtime Class VALUE as the right operand (stage 99) ----
 // adl 51.4.1 measured (temp/cisprobe/cis-result.txt): AS3 resolves `x is Name` in

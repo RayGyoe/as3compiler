@@ -132,6 +132,20 @@ eq(base.resolvePath("../../../../x").nativePath, "/x", ".. clamps at the root");
 threw(function():void { new File().resolvePath("x"); }, 2037, "resolvePath on an empty File");
 threw(function():void { base.resolvePath(null); }, 2007, "resolvePath(null)");
 
+// ------------------------------------------------- dynamic vs dot member read
+// AIR makes a dynamic read resolve through the SAME trait the dot form uses, so
+// "parent" must reach File's getter even though EventDispatcher declares a
+// (private) parent link field. Stage 324: the runtime resolves one chain level
+// at a time -- fields, then getters, then methods -- instead of one trait at a
+// time across the whole chain, which let the base field win and answer null.
+var pdir:File = new File("/tmp/asaot-dyn-parent");
+eq(pdir["parent"].nativePath, pdir.parent.nativePath, "f['parent'] matches f.parent");
+var pobj:Object = pdir;
+eq(pobj["parent"].nativePath, pdir.parent.nativePath, "Object-slot f['parent'] matches too");
+// The same rule applies upwards: a getter declared in the class beats a field
+// declared in its superclass (name is a File getter, nativePath is not).
+eq(pdir["name"], pdir.name, "f['name'] matches f.name");
+
 // ---------------------------------------------------------------- deleteFile
 var f1:File = work.resolvePath("f1.txt");
 var st:FileStream = new FileStream();

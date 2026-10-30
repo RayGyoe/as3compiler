@@ -5798,6 +5798,13 @@ static as_value as_dyn_get(void* obj, const char* key) {
     // dispatch, because those heap kinds start with a data pointer rather than a
     // vtable -- as_v_class_of() must only see real as_object_header layouts.
     if (strcmp(key, "constructor") == 0) return as_v_class_of(as_v_obj(obj));
+    // ONE chain walk, three traits per level, and the FIRST level that declares the
+    // name wins. That order is what AS3 means by "nearest declaration", and doing
+    // it per trait (all fields of the whole chain first, then all getters) was
+    // wrong: EventDispatcher.parent is an internal C link field while
+    // DisplayObject.parent (and File.parent) is a GETTER, so a dynamic read of
+    // "parent" answered the stale internal null and never reached the getter --
+    // measured on adl 51.4.1, where it returns the real container.
     void* vt = ((as_object_header*)obj)->vtable;
     while (vt != NULL) {
         as_prop* props = (as_prop*)((as_vtable_header*)vt)->props;
@@ -5806,27 +5813,19 @@ static as_value as_dyn_get(void* obj, const char* key) {
                 if (strcmp(props[i].name, key) == 0) return as_prop_read(obj, &props[i]);
             }
         }
-        vt = ((as_vtable_header*)vt)->super;
-    }
-    // Getter reflection: dynamic obj["prop"] reaches read-only properties
-    // (File.exists / File.isDirectory / File.isHidden / File.url) that are not
-    // declared fields. The getter thunk shares the as_method signature and boxes
-    // its typed return value.
-    vt = ((as_object_header*)obj)->vtable;
-    while (vt != NULL) {
+        // Getter reflection: dynamic obj["prop"] reaches read-only properties
+        // (File.exists / File.isDirectory / File.isHidden / File.url) that are not
+        // declared fields. The getter thunk shares the as_method signature and boxes
+        // its typed return value.
         as_method* getters = (as_method*)((as_vtable_header*)vt)->getters;
         if (getters != NULL) {
             for (int i = 0; getters[i].name != NULL; i++) {
                 if (strcmp(getters[i].name, key) == 0) return getters[i].fn(obj, NULL, 0);
             }
         }
-        vt = ((as_vtable_header*)vt)->super;
-    }
-    // Method reflection: dynamic obj["method"] used as a Function value (e.g.
-    // asset["getDirectoryListing"]()) returns a bound-method closure whose env is
-    // the receiver, so as_fn_call_dyn invokes the real implementation.
-    vt = ((as_object_header*)obj)->vtable;
-    while (vt != NULL) {
+        // Method reflection: dynamic obj["method"] used as a Function value (e.g.
+        // asset["getDirectoryListing"]()) returns a bound-method closure whose env is
+        // the receiver, so as_fn_call_dyn invokes the real implementation.
         as_method* methods = (as_method*)((as_vtable_header*)vt)->methods;
         if (methods != NULL) {
             for (int i = 0; methods[i].name != NULL; i++) {
