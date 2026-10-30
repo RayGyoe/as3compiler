@@ -399,6 +399,13 @@ The full 19-item list (the rest being Lottie, native shaders, FFI, server-side r
 - `examples/any-dot-write.as` — dot writes through a dynamically-typed (`*`) receiver, incl. compound writes:
   reflectable fields land on the real field, an unknown property on a sealed instance neither crashes nor corrupts,
   record slots are added, and an array's element buffer is not clobbered (assertion regression for the stage 89-33 crash fix)
+- `examples/dyn-prim-methods.as` — the built-in method surface of a **dynamic** receiver (stage 344): `Number`/`Boolean`/
+  `String`/`Function` members answer the same through a `*` slot, an `Object` slot and a static type (`n.toFixed(2)` no longer
+  returns `null`, `o.toString(16)` no longer throws `#1069`); the radix contract (`toString(10)` keeps the fraction, other
+  radices truncate, `1e21` keeps every hex digit, out of range is `#1003`) and the digit-count contract (`toFixed`/
+  `toExponential` 0..20, `toPrecision` 1..21, out of range or absent is `#1002`; `toPrecision` pads trailing zeros, keeps
+  fixed notation for small magnitudes and drops the sign of negative zero); String methods with a missing argument take
+  their documented defaults; and `var u:*;` starts as `undefined`, not `null` — 80 assertions, all byte-identical to `adl 51.4.1`
 - `examples/stdlib.as` — `String` methods, `Math`, global functions, type conversion, readable object `trace`
 - `examples/oop2.as` — `const`/`static` fields and methods/`get`/`set` accessors
 - `examples/interface.as` — `interface`/`implements`/interface `is`/`as`/interface method dispatch

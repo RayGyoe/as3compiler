@@ -299,6 +299,45 @@ subset captures `this` lexically into `env->this`, so all nine probes differ. Ma
 slot in the `as_fn` calling convention **plus** a global object; tracked in `TODO.md` (not swept under the
 rug: `examples/proxy.as` section 12 pins only our own behaviour, it does not pretend to match).
 
+### 3.9 Boxed primitives: one value, two representations, one door (stage 344, measured on adl 51.4.1)
+
+Evidence bench `temp/dynnum/`: `body.inc` is one shared probe body of 90 assertions, and `mk.sh` wraps
+that same body into an AIR package class and into our script file so both runtimes execute the same source
+and the outputs are `diff`ed (this stage: **byte identical**). `body5.inc` / `ours5b.as` add 27 probes for
+`toFixed` rounding.
+
+**1. A `*` slot and an `Object` slot hold the same value and must answer the same way.** This runtime has
+two representations: a raw box tag inside `as_value` (what `*` and Array slots hold) and a heap box behind
+`as_number_vt` / `as_boolean_vt` / `as_string_vt` / `as_function_vt` (what an `Object` slot holds). AIR's
+rule is that the CLASS decides the member surface: `var o:Object = 12.345; o.toFixed(2)` is `"12.35"` and
+`o.toString(16)` is `"c"`, exactly like `var n:* = 12.345`. Both doors (`as_any_call` and `as_dyn_call`)
+therefore open onto the single `as_prim_call`; there must never be two implementations.
+
+**2. The box's own DATA traits are `length` (plus a function's `prototype`).** `("abc" as Object).length`
+is 3, `hasOwnProperty("length")` is **true**, `hasOwnProperty("0")` is **false** (a character index is not
+an own property), and `propertyIsEnumerable` is always false. A function value's `length` is its declared
+parameter count (`hasOwnProperty("prototype")` true, `"name"` false) and `toString()` is the constant
+`"function Function() {}"`. These reads must be answered BEFORE walking the property table, or the call
+ends in `#1069`.
+
+**3. The formatting contract is enforced by argument validation, never clamped.** A `toString(radix)` radix
+outside 2..36 is `RangeError #1003` (the message names the value); `toFixed`/`toExponential` take 0..20
+digits and `toPrecision` 1..21, and an out-of-range **or absent** count is `RangeError #1002` (one shared
+message across the three formatters; absent means 0). `toPrecision` must pad to the requested digit count
+(`(1.5).toPrecision(3)` is `"1.50"`; `%g` eats the trailing zeros), AIR keeps FIXED notation for every
+small magnitude (`(1e-20).toPrecision(3)` is `"0.0000000000000000000100"`) and only switches to the
+exponent form once the decimal exponent reaches the digit count, and negative zero prints as `"0.00"`, not
+`"-0.00"`.
+
+**4. A missing String argument means the documented default, not `null`.** `("abc":*).charAt()` is `"a"`,
+`substring()` is `"abc"`, `indexOf()` is `-1` (it searches the text `"undefined"`), and `replace("a")` is
+`"undefinedbc"` — an `undefined` stand-in reproduces all of them through the ordinary coercions, with no
+per-method special case.
+
+**5. An uninitialized `*` is `undefined`, not `null`.** `var u:*;`, a class field, a static field and a
+hole in `new Array(n)` are all `undefined` on AIR (`u === undefined` is true), while an `Object`-typed slot
+stays `null`; that difference decides whether `var x:Object; x.foo` raises `#1009` or `#1010`.
+
 
 ## 4. Fidelity and Enhancement Principles
 

@@ -381,6 +381,39 @@ API 面、错误码或事件顺序，只决定同样的信息写进 stderr 时�
 ⇒ 九个探针全不同。要忠实需要「`as_fn` 带 self 槽 + 全局对象」两件表示层改动，见 `TODO.md` 遗留表
 （**未静默吞掉**：`examples/proxy.as` §12 的断言只钉我们自己的行为面，不假装对齐）。
 
+### 3.9 盒化原始值的成员面：一个值、两套表示、一扇门（阶段三百四十四 · adl 51.4.1 实测）
+
+证据台 `temp/dynnum/`：`body.inc` 是 90 条断言的公共探针体，`mk.sh` 把同一份探针体分别包成 AIR 的
+包层类和我们的脚本文件，两端跑同一份源再 `diff`（本轮结论：**逐字节相同**）；`body5.inc` /
+`ours5b.as` 是 `toFixed` 舍入的 27 例补充探针。
+
+**1. `*` 槽与 `Object` 槽存的是同一个值，成员面必须相同。** 本运行时有两套表示：裸 box tag
+（`as_value`，`*` / 数组槽用它）和堆上的盒对象（`as_number_vt` / `as_boolean_vt` / `as_string_vt` /
+`as_function_vt`，`Object` 槽用它）。AIR 的规则是**类决定成员面**：`var o:Object = 12.345;
+o.toFixed(2)` 是 `"12.35"`、`o.toString(16)` 是 `"c"`，与 `var n:* = 12.345` 完全一致 ——
+包装类成员（`toFixed`/`toExponential`/`toPrecision`/`toString(radix)`/`valueOf`）对**两种接收者都可达**。
+实现上两条门（`as_any_call` / `as_dyn_call`）共用同一个 `as_prim_call`，不允许各写一份。
+
+**2. 盒子自己的 DATA trait 只有 `length`（以及函数的 `prototype`）。** `("abc" as Object).length` 是 3，
+`hasOwnProperty("length")` 是 **true**、`hasOwnProperty("0")` 是 **false**（字符下标不是 own property），
+`propertyIsEnumerable` 恒 false；函数值的 `length` 是**声明形参个数**（`hasOwnProperty("prototype")` 为
+true、`"name"` 为 false），`toString()` 是常量 `"function Function() {}"`。这些读在属性表遍历**之前**
+就要答，否则落到 `#1069`。
+
+**3. 格式化契约由实参校验兜住，不能夹取。** `toString(radix)` 的 radix 出 2..36 ⇒ `RangeError #1003`
+（消息带具体值）；`toFixed`/`toExponential` 位数 0..20、`toPrecision` 1..21，越界**或缺失**都是
+`RangeError #1002`（三种格式化器共用一条消息，缺失等于传 0）。`toPrecision` 必须补到指定位数
+（`(1.5).toPrecision(3)` = `"1.50"`，走 `%g` 会把尾零吃掉），且 AIR 对**所有小值都保持定点**
+（`(1e-20).toPrecision(3)` 是 `"0.0000000000000000000100"`），只有小数指数 ≥ 位数才转指数；负零印成
+`"0.00"` 而不是 `"-0.00"`。
+
+**4. 字符串方法的缺参是「按文档默认」，不是 `null`。** `("abc":*).charAt()` 是 `"a"`、`substring()` 是
+`"abc"`、`indexOf()` 是 `-1`（它搜的是文本 `"undefined"`）、`replace("a")` 是 `"undefinedbc"` ——
+缺的实参按 `undefined` 走强制转换即可，无需逐方法特判。
+
+**5. 未初始化的 `*` 是 `undefined`，不是 `null`。** `var u:*;`、类字段、静态字段、`new Array(n)` 的洞
+在 AIR 上都是 `undefined`（`u === undefined` 为 true），而 `Object` 类型仍是 `null`；这个差别决定
+`var x:Object; x.foo` 报 `#1009` 还是 `#1010`。
 
 ## 4. 保真与增强原则
 

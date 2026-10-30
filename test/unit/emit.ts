@@ -172,7 +172,7 @@ function checkEmitArrayToPrimitive(): string[] {
     c.includes('if (v.tag == 6) return as_arr_call((as_array*)v.ptr, name, args, argc);'));
   check('...and keeps the final as_dyn_call fallthrough (records + Vector hooks)',
     c.includes('static as_value as_any_call(as_value v, const char* name, as_value* args, int argc) {')
-    && /static as_value as_any_call\(as_value v, const char\* name, as_value\* args, int argc\) \{\s*v = as_req_box\(v\);\s*if \(v\.tag == 3\) return as_str_dyn_call\(\(char\*\)v\.ptr, name, args, argc\);\s*if \(v\.tag == 6\) return as_arr_call\(\(as_array\*\)v\.ptr, name, args, argc\);\s*return as_dyn_call\(v\.ptr, name, args, argc\);/.test(c.replace(/\r\n/g, '\n')));
+    && /static as_value as_any_call\(as_value v, const char\* name, as_value\* args, int argc\) \{\s*v = as_req_box\(v\);\s*if \(v\.tag == 1 \|\| v\.tag == 2 \|\| v\.tag == 7\) return as_prim_call\(v, name, args, argc\);\s*if \(v\.tag == 3\) return as_str_dyn_call\(\(char\*\)v\.ptr, name, args, argc\);\s*if \(v\.tag == 6\) return as_arr_call\(\(as_array\*\)v\.ptr, name, args, argc\);\s*return as_dyn_call\(v\.ptr, name, args, argc\);/.test(c.replace(/\r\n/g, '\n')));
 
   // join()'s separator: a dynamically-typed argument goes through as_join_sep so
   // null is the literal "null" while undefined selects "," (ES3 15.4.4.5).

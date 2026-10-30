@@ -463,6 +463,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/object.as` — 对象字面量 `{}`（关联数组）、属性读写、嵌套对象
 - `examples/any-add.as` — 动态 `+`（任一侧为 `*`）：运行时判定拼接/相加、`null` 参与、`+=`
 - `examples/any-dot-write.as` — `*` 接收者的点写入（已知字段、密封类未知属性、record 槽、数组元素缓冲）
+- `examples/dyn-prim-methods.as` — **动态接收者上的内建方法面**（阶段三百四十四）：`Number`/`Boolean`/`String`/`Function` 的方法在 `*` 槽、`Object` 槽、静态类型三档上给出**同一套答案**（`n.toFixed(2)` 不再返 `null`、`o.toString(16)` 不再 `#1069`）；radix 契约（`toString(10)` 保留小数、非 10 截断、`1e21` 的高位不丢、越界 `#1003`）、位数契约（`toFixed`/`toExponential` 0..20、`toPrecision` 1..21，越界或缺失 `#1002`，`toPrecision` 补尾零且小值保持定点、负零不带符号）、字符串方法缺参走文档默认值、`var u:*;` 是 `undefined` 而非 `null` —— 80 条断言，全部与 `adl 51.4.1` 逐字相同
 - `examples/stdlib.as` — `String` 方法、`Math`、全局函数、类型转换、对象可读 `trace`
 - `examples/oop2.as` — `const`/`static` 字段与方法、`get`/`set` 访问器
 - `examples/interface.as` — `interface`/`implements`、接口 `is`/`as`、接口方法派发

@@ -2111,6 +2111,28 @@ static as_value as_arr_call(void* a, const char* name, as_value* args, int argc)
 static as_value as_dyn_get(void* obj, const char* key);
 static as_value as_fn_call_dyn(as_value fbox, as_value* args, int argc, const char* name);
 
+// ---- boxed primitives (an Object or star-typed slot holding a
+// Number/Boolean/String/Function) ----
+// These have TWO representations in this runtime: a raw boxed tag in as_value
+// (numbers/booleans/strings/closures, no vtable) and a heap object behind the
+// pre-baked as_number_vt / as_string_vt / as_boolean_vt / as_function_vt (what an
+// Object-typed slot stores). AIR gives both the SAME member surface -- the
+// primitive's, not Object's four -- so the helpers below are shared by both
+// paths: as_any_call routes the boxed tags here, and as_dyn_call/as_dyn_get/
+// as_dyn_has route the heap boxes here by vtable identity. Keeping one
+// implementation is what stops the two receivers from drifting apart (they had:
+// a star-typed receiver answered null for every Number method while an Object
+// receiver reached only Object's four). Measured on adl 51.4.1, temp/dynnum.
+static as_value as_prim_call(as_value v, const char* name, as_value* args, int argc);
+static char* as_num_toString_radix(double v, int radix);
+// 0 = not a boxed primitive, 1 number, 2 boolean, 3 string, 4 function.
+static int as_prim_box_kind(void* obj);
+static as_value as_prim_box_value(int pk, void* obj);
+static bool as_prim_own_get(void* obj, const char* key, as_value* out);
+static bool as_prim_own_has(void* obj, const char* key);
+// The String method table on a bare char* (emitted with the built-in helpers).
+static as_value as_str_dyn_call(char* s, const char* name, as_value* args, int argc);
+
 // Vector.<T> through a dynamically-typed receiver ('var pv:* = vec; pv.length',
 // 'pv[0]', 'pv.push(x)'). A Vector is a GCT_CUSTOM body whose FIRST WORD is its
 // mark callback, not a vtable, so as_dyn_get/as_dyn_set/as_dyn_call would
@@ -2195,6 +2217,16 @@ static as_value as_dyn_call(void* obj, const char* name, as_value* args, int arg
     // 'o.toString()' walked the elements as a vtable header and segfaulted (G14).
     // Same dispatcher the '*' receiver already used (as_any_call's tag-6 branch).
     if (dk == 2) return as_arr_call(obj, name, args, argc);
+    // An Object-typed slot holding a boxed Number/Boolean/String/Function is a real
+    // object (so it can be stored and identified by vtable) whose class is that
+    // primitive, so AIR dispatches on the PRIMITIVE's traits, not Object's four:
+    // 'var o:Object = 12.345; o.toFixed(2)' is "12.35" and o.toString(16) is "c",
+    // while this walk found neither (toFixed was #1069) and the Object four dropped
+    // the radix ("12.345"). Same implementation the '*' receiver uses.
+    {
+        int pk = as_prim_box_kind(obj);
+        if (pk != 0) return as_prim_call(as_prim_box_value(pk, obj), name, args, argc);
+    }
     // A Dictionary has no vtable either (its first word is the pair buffer), so the
     // walk below would dereference it as one: 'var o:Object = new Dictionary();
     // o.toString()' segfaulted. Object's own four methods answer by heap kind.
@@ -3473,6 +3505,13 @@ static int as_any_length(as_value v) {
     if (v.tag == 4 && v.ptr != NULL && as_arrback_hook != NULL) {
         as_array* ab = as_arrback_hook(v.ptr);
         if (ab != NULL) return ab->length;
+    }
+    // A function value's length is its declared parameter count, not 0 (AIR:
+    // 'var f:* = function(a:int,b:int){}; f.length' is 2; measured on adl 51.4.1,
+    // temp/dynnum). Checked last: tag 7 cannot also be a Vector/ByteArray.
+    if (v.tag == 7) {
+        as_fn f = (as_fn)v.ptr;
+        return f != NULL ? f->arity : 0;
     }
     return 0;
 }
@@ -5870,6 +5909,14 @@ static as_value as_dyn_get(void* obj, const char* key) {
         return as_array_key_get((as_array*)obj, key);
     }
     if (dk == 3) return as_vec_get_hook != NULL ? as_vec_get_hook(obj, key) : as_v_null();
+    // A boxed String / Function keeps one DATA trait of its own: length (AIR:
+    // 'var s:Object = "abc"; s.length' is 3, and a function value's is its
+    // declared parameter count). The vtable walk below has no props table for
+    // these classes, so the read has to be answered here or it reaches #1069.
+    {
+        as_value pout;
+        if (as_prim_own_get(obj, key, &pout)) return pout;
+    }
     // 'constructor' is Object's own instance trait, not a reflected field: every
     // object answers it with its Class reference (AIR: 'var o:* = new Foo();
     // o.constructor === Foo' -> true). Handled here, after the dict/array/vector
@@ -5958,6 +6005,9 @@ static bool as_dyn_has(void* obj, const char* key) {
     // 51.4.1, temp/pkg1/oracle/adl-vd.txt: "length" true, "0" true, "5" false,
     // "-1"/"1.5"/"x" false). The element type is irrelevant to the answer.
     if (dk == 3) return as_vec_has_hook != NULL && as_vec_has_hook(obj, key);
+    // Boxed String (length) / Function (length, prototype) own traits, same
+    // reason as as_dyn_get above.
+    if (as_prim_box_kind(obj) != 0) return as_prim_own_has(obj, key);
     if (dk == 1) return as_dict_find((as_dict*)obj, as_v_str((char*)key)) >= 0;
     if (dk == 2) return as_array_has((as_array*)obj, key);
     void* vt = ((as_object_header*)obj)->vtable;
@@ -6740,6 +6790,11 @@ static char* as_str_replace(const char* s, const char* search, const char* repl)
 }
 
 // ---------- Number formatting (toFixed / toExponential / toPrecision) ----------
+// The out-of-range argument errors are RangeError and live in the generated
+// section (Error subclasses are emitted there); forward-declared here.
+static void as_throw_number_format_range(void);
+static void as_throw_radix(int radix);
+static char* as_num_int_radix(double v, int radix);
 // C's %e zero-pads the exponent to two digits ("e+03"); AS3 uses a minimal-width
 // exponent ("e+3"). Strip the leading zeros in place.
 static void as_strip_exp_zeros(char* buf) {
@@ -6753,38 +6808,244 @@ static void as_strip_exp_zeros(char* buf) {
     while (*p) e[k++] = *p++;
     e[k] = 0;
 }
+// AIR validates the digit COUNT before it looks at the value, and the three
+// formatters share one message: toPrecision takes 1..21, toFixed/toExponential
+// take 0..20, and an ABSENT argument is the same error as an out-of-range one
+// (measured on adl 51.4.1, temp/dynnum: toPrecision() and toPrecision(0) both
+// raise #1002 with that same text, toFixed(-1)/toFixed(21) likewise). The old
+// behaviour silently CLAMPED the count, so such a call returned text where AIR
+// aborts the whole script.
+static void as_throw_number_format_range(void);
+static void as_check_fixed_digits(int digits) {
+    if (digits < 0 || digits > 20) as_throw_number_format_range();
+}
+static void as_check_precision(int precision) {
+    if (precision < 1 || precision > 21) as_throw_number_format_range();
+}
+// Negative zero prints UNSIGNED on AIR: '(0-0).toFixed(2)' is "0.00" and
+// '(0-0).toPrecision(3)' is "0.000" (temp/dynnum14), where snprintf would keep
+// the minus sign.
+static double as_clear_neg_zero(double v) { return v == 0.0 ? 0.0 : v; }
+
 static char* as_num_toFixed(double v, int digits) {
     if (isnan(v)) return "NaN";
     if (isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
-    if (digits < 0) digits = 0;
-    if (digits > 20) digits = 20;
+    as_check_fixed_digits(digits);
     char* r = as_str_alloc(128);
-    snprintf(r, 128, "%.*f", digits, v);
+    snprintf(r, 128, "%.*f", digits, as_clear_neg_zero(v));
     return r;
 }
 static char* as_num_toExponential(double v, int digits) {
     if (isnan(v)) return "NaN";
     if (isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
-    if (digits < 0) digits = 0;
-    if (digits > 20) digits = 20;
+    as_check_fixed_digits(digits);
     char buf[128];
-    snprintf(buf, 128, "%.*e", digits, v);
+    snprintf(buf, 128, "%.*e", digits, as_clear_neg_zero(v));
     as_strip_exp_zeros(buf);
     char* r = as_str_alloc(strlen(buf) + 1);
     strcpy(r, buf);
     return r;
 }
+// toPrecision keeps EXACTLY as many significant digits as asked, padding with
+// zeros. printf's %g, which this used to call, strips trailing zeros, so
+// '(1.5).toPrecision(3)' answered "1.5" where AIR answers "1.50" (measured on
+// adl 51.4.1, temp/dynnum12/13 across 28 cases).
+//
+// AIR's notation rule is NOT the ES3 one: it stays in FIXED notation for every
+// small magnitude -- '(1e-20).toPrecision(3)' is "0.0000000000000000000100", not
+// "1.00e-20" -- and switches to the exponent form only when the decimal
+// exponent reaches the requested digit count. Both halves below follow that,
+// which reproduces all 28 measured values except the exact powers of ten below
+// 1e-5, where AIR's own log10 lands one decimal place low (registered as a
+// residual, not replicated).
 static char* as_num_toPrecision(double v, int precision) {
     if (isnan(v)) return "NaN";
     if (isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
-    if (precision < 1) precision = 1;
-    if (precision > 21) precision = 21;
-    char buf[128];
-    snprintf(buf, 128, "%.*g", precision, v);
-    as_strip_exp_zeros(buf);
+    as_check_precision(precision);
+    v = as_clear_neg_zero(v);
+    char buf[512];
+    if (v == 0.0) {
+        // AIR pads a zero to as many DECIMALS as the requested precision, not
+        // precision-1 significant digits.
+        int k = 0;
+        buf[k++] = '0';
+        buf[k++] = '.';
+        for (int i = 0; i < precision; i++) buf[k++] = '0';
+        buf[k] = 0;
+    } else {
+        double av = fabs(v);
+        int e = (int)floor(log10(av));
+        // log10 is inexact at powers of ten; renormalise so the exponent is the
+        // mathematical one. Skipped at extreme magnitudes, where pow would
+        // overflow.
+        if (e > -300 && e < 300) {
+            double m = av / pow(10.0, e);
+            while (m >= 10.0) { m /= 10.0; e++; }
+            while (m < 1.0) { m *= 10.0; e--; }
+        }
+        if (e >= precision) {
+            snprintf(buf, sizeof buf, "%.*e", precision - 1, v);
+            as_strip_exp_zeros(buf);
+        } else {
+            int dec = precision - 1 - e;
+            if (dec < 0) dec = 0;
+            snprintf(buf, sizeof buf, "%.*f", dec, v);
+        }
+    }
     char* r = as_str_alloc(strlen(buf) + 1);
     strcpy(r, buf);
     return r;
+}
+
+// ---------- Number.toString(radix) ----------
+// Three measured rules (adl 51.4.1, temp/dynnum):
+//   1. radix 10 is the ordinary shortest round-trip text, NOT an integer
+//      conversion -- '(12.34).toString(10)' is "12.34" (we truncated to "12").
+//   2. any other radix converts the INTEGER PART by TRUNCATION toward zero:
+//      '(12.34).toString(16)' is "c", '(0.9).toString(16)' is "0",
+//      '(-12.34).toString(16)' is "-c".
+//   3. a radix outside 2..36 is RangeError #1003, and NaN/Infinity answer their
+//      own names regardless of the radix.
+static char* as_num_toString_radix(double v, int radix) {
+    if (radix < 2 || radix > 36) as_throw_radix(radix);
+    if (isnan(v) || isinf(v) || radix == 10) return as_str_from_double(v);
+    return as_num_int_radix(v, radix);
+}
+
+// Integer-part conversion, exact at any magnitude: AIR does not lose the high
+// digits -- '(1e21).toString(16)' is "3635c9adc5dea00000" -- so a 64-bit cast
+// (which is also UB past LLONG_MAX) cannot serve. fmod/divide by 2^32 is EXACT
+// on a binary double, so the integer part becomes exact base-2^32 limbs, and each
+// output digit is then one long division of the limb array.
+static char* as_num_int_radix(double v, int radix) {
+    static const char digits[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    bool neg = v < 0.0;
+    double x = floor(neg ? -v : v);
+    uint32_t limbs[40];          // 1024 exponent bits / 32
+    int nl = 0;
+    while (x > 0.0) {
+        double q = floor(x / 4294967296.0);
+        limbs[nl++] = (uint32_t)(x - q * 4294967296.0);
+        x = q;
+    }
+    char buf[1200];              // base 2 of the largest double, + sign + NUL
+    int i = 0;
+    if (nl == 0) buf[i++] = '0';
+    while (nl > 0) {
+        uint64_t rem = 0;
+        for (int j = nl - 1; j >= 0; j--) {
+            uint64_t cur = (rem << 32) | limbs[j];
+            limbs[j] = (uint32_t)(cur / (uint32_t)radix);
+            rem = cur % (uint32_t)radix;
+        }
+        buf[i++] = digits[rem];
+        while (nl > 0 && limbs[nl - 1] == 0) nl--;
+        if (i >= (int)sizeof(buf) - 2) break;
+    }
+    if (neg) buf[i++] = '-';
+    char* out = as_str_alloc((size_t)i + 1);
+    for (int l = 0; l < i; l++) out[l] = buf[i - 1 - l];
+    out[i] = 0;
+    return out;
+}
+
+// ---------- boxed primitives: one member surface, two representations ----------
+// AIR's Number/Boolean/String/Function inherit Object's four methods and add their
+// own traits; a value of one of those types answers the same way whether it
+// arrived as a raw boxed tag (an Array or star-typed slot) or as a heap box (an
+// Object slot: var o:Object = 12.345). The two dispatch through different
+// doorways -- as_any_call for the tag, as_dyn_call/as_dyn_get/as_dyn_has for the
+// heap box -- and both doors open onto the helpers below.
+static int as_prim_box_kind(void* obj) {
+    if (obj == NULL) return 0;
+    void* vt = ((as_object_header*)obj)->vtable;
+    if (vt == (void*)&as_number_vt) return 1;
+    if (vt == (void*)&as_boolean_vt) return 2;
+    if (vt == (void*)&as_string_vt) return 3;
+    if (vt == (void*)&as_function_vt) return 4;
+    return 0;
+}
+static as_value as_prim_box_value(int pk, void* obj) {
+    switch (pk) {
+        case 1: return as_v_num(as_number_obj_val(obj));
+        case 2: return as_v_bool(as_bool_obj_val(obj));
+        case 3: return as_v_str(as_string_obj_val(obj));
+        case 4: return as_v_fn((void*)as_fn_obj_val(obj));
+    }
+    return as_v_null();
+}
+// The own DATA traits a boxed primitive keeps. AIR (adl 51.4.1): a boxed String
+// answers 3 for 'length' and nothing else (a character index is NOT an own
+// property), a boxed Function answers its declared arity for 'length' and owns
+// 'prototype' as well (hasOwnProperty true for both, false for 'name').
+static bool as_prim_own_get(void* obj, const char* key, as_value* out) {
+    int pk = as_prim_box_kind(obj);
+    if (key == NULL) return false;
+    if (pk == 3 && strcmp(key, "length") == 0) {
+        *out = as_v_num((double)strlen(as_string_obj_val(obj)));
+        return true;
+    }
+    if (pk == 4 && strcmp(key, "length") == 0) {
+        as_fn f = as_fn_obj_val(obj);
+        *out = as_v_num((double)(f != NULL ? f->arity : 0));
+        return true;
+    }
+    return false;
+}
+static bool as_prim_own_has(void* obj, const char* key) {
+    int pk = as_prim_box_kind(obj);
+    if (key == NULL) return false;
+    if (pk == 3) return strcmp(key, "length") == 0;
+    if (pk == 4) return strcmp(key, "length") == 0 || strcmp(key, "prototype") == 0;
+    return false;
+}
+// Method dispatch on a boxed primitive. v carries the primitive (tag 1 number,
+// 2 boolean, 3 string, 7 function); anything else is the caller's bug.
+static as_value as_prim_call(as_value v, const char* name, as_value* args, int argc) {
+    if (name == NULL) return as_v_null();
+    // Object's four, inherited by every primitive. valueOf is the receiver itself
+    // (a boxed Number answers a Number, so 'is Number' stays true).
+    if (strcmp(name, "valueOf") == 0) return v;
+    if (strcmp(name, "hasOwnProperty") == 0) {
+        const char* key = argc > 0 ? as_coerce_str(args[0]) : NULL;
+        bool own = false;
+        if (key != NULL) {
+            if (v.tag == 3) own = strcmp(key, "length") == 0;
+            else if (v.tag == 7) own = strcmp(key, "length") == 0 || strcmp(key, "prototype") == 0;
+        }
+        return as_v_bool(own);
+    }
+    if (strcmp(name, "propertyIsEnumerable") == 0) return as_v_bool(false);
+    if (v.tag == 1) {
+        // Number's own traits. An ABSENT digit count is 0 for toFixed/
+        // toExponential and an out-of-range #1002 for toPrecision (AIR), which is
+        // what passing 0 into the precision validator produces.
+        if (strcmp(name, "toString") == 0)
+            return as_v_str(argc > 0 ? as_num_toString_radix(v.num, as_v_int_val(args[0]))
+                                     : as_str_from_double(v.num));
+        if (strcmp(name, "toFixed") == 0)
+            return as_v_str(as_num_toFixed(v.num, argc > 0 ? as_v_int_val(args[0]) : 0));
+        if (strcmp(name, "toExponential") == 0)
+            return as_v_str(as_num_toExponential(v.num, argc > 0 ? as_v_int_val(args[0]) : 0));
+        if (strcmp(name, "toPrecision") == 0)
+            return as_v_str(as_num_toPrecision(v.num, argc > 0 ? as_v_int_val(args[0]) : 0));
+        return as_v_null();
+    }
+    if (v.tag == 2) {
+        if (strcmp(name, "toString") == 0) return as_v_str(as_str_from_bool(v.num != 0.0));
+        return as_v_null();
+    }
+    if (v.tag == 3) return as_str_dyn_call((char*)v.ptr, name, args, argc);
+    if (v.tag == 7) {
+        if (strcmp(name, "toString") == 0) return as_v_str((char*)"function Function() {}");
+        // call(thisArg, ...args) drops the receiver and invokes with the rest;
+        // apply(thisArg, argsArray) takes the whole argument list as an Array.
+        if (strcmp(name, "call") == 0)
+            return as_fn_call_dyn(v, argc > 0 ? args + 1 : NULL, argc > 0 ? argc - 1 : 0, "call");
+        if (strcmp(name, "apply") == 0) return as_fn_apply_v(v, argc > 1 ? args[1] : as_v_null());
+        return as_v_null();
+    }
+    return as_v_null();
 }
 
 // ---------- Math.random ----------
@@ -8023,7 +8284,9 @@ static void gc_collect(void) {
 // leading '-' plus magnitude (AS3's int.toString uses two's-complement for
 // negative values; we simplify to signed magnitude — documented subset).
 static char* as_int_radix(long long v, int radix) {
-    if (radix < 2 || radix > 36) radix = 10;
+    // An out-of-range radix is RangeError #1003, not a silent base-10 answer
+    // (measured on adl 51.4.1, temp/dynnum).
+    if (radix < 2 || radix > 36) as_throw_radix(radix);
     if (radix == 10) return as_str_from_int((int)v);
     static const char d[] = "0123456789abcdefghijklmnopqrstuvwxyz";
     int neg = v < 0;
@@ -8040,7 +8303,7 @@ static char* as_int_radix(long long v, int radix) {
     return out;
 }
 static char* as_uint_radix(unsigned long long v, int radix) {
-    if (radix < 2 || radix > 36) radix = 10;
+    if (radix < 2 || radix > 36) as_throw_radix(radix);
     if (radix == 10) {
         char* r = as_str_alloc(32);
         snprintf(r, 32, "%llu", v);

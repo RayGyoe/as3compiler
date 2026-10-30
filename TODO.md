@@ -18532,7 +18532,64 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 **二值** `clipPath`（没有 alpha 模板入口）、外层 `save` 与遮罩之间不得夹 `restore`、`scrollRect` 自开 `save`）；
 文档 `docs/{zh-cn,en}/skia.md` §6.16（十格实测表 + 实现口径 + 小数残差）。
 
+### 阶段三百四十四：动态接收者上的内建方法面（`Number`/`Boolean`/`String`/`Function`）（v0.4.304 → v0.4.305）
+
+**起点**：`### 遗留待开发` 表的「动态接收者的 `Number.toString()` / `toFixed()` 返 `null`」
+（2026-10-28 阶段三百一十四 量到；一条缺陷污染差分表 46/72 行）。顺着它把**整张方法面**量了一遍，
+发现不是一条缺陷，而是**同一个值两套表示**在各走各的门：
+
+- 裸 box tag（`*` / 数组槽里的数、布尔、字符串、闭包）从 `as_any_call` 出门：只有 tag 3（字符串）
+  有出口，tag 1/2/7 直接落进 `as_dyn_call(v.ptr, …)`。数字的 `ptr` 是 `NULL`、布尔的 `ptr` 是标志位
+  —— 都不是对象头，于是**每个方法都答 `null`**。
+- `Object` 槽里存的是堆上的盒对象（`as_number_vt` / `as_boolean_vt` / `as_string_vt` /
+  `as_function_vt`），从 `as_dyn_call` 出门：vtable 的成员表只到 `as_dyn_object_builtin` 的四件套
+  （`hasOwnProperty` / `propertyIsEnumerable` / `valueOf` / `toString`），`Number` 自己的
+  `toFixed`/`toExponential`/`toPrecision`/`toString(radix)` 一个都没有 ⇒ **`#1069`**；盒化字符串与
+  函数连 `toUpperCase`/`length`/`call` 也一样 `#1069`。
+
+**先量后改**：证据台 `temp/dynnum/`。`body.inc` 是 **90 条断言**的公共探针体（覆盖 `*` 接收者、
+`Object` 槽、静态类型三档 × Number/Boolean/String/Function 四类，外加 `null`/`undefined` 接收者与
+`#1002`/`#1003` 错参），`mk.sh` 把同一份探针体分别包成 `adl 51.4.1` 的包层类和我们的脚本文件，
+**两端跑同一份源再 `diff`**；本轮结束时的状态是 **IDENTICAL**（90/90 逐字节相同）。`body5.inc` 是
+`toFixed` 舍入的 27 例补充探针（见下）。
+
+**实现**：两条门现在都开在同一个 `as_prim_call` 上（`src/runtime.ts`）—— `as_any_call` 对 tag 1/2/7
+直接转进来；`as_dyn_call` 在字典/数组/向量分支之后、`as_dyn_object_builtin` 之前按 **vtable 身份**
+（`as_prim_box_kind`）识别盒对象再转进来。一个实现，两个接收者不可能再分叉。盒子自己的 **DATA trait**
+（字符串的 `length`、函数的 `length`/`prototype`）由 `as_prim_own_get` / `as_prim_own_has` 在
+`as_dyn_get`/`as_dyn_has` 的属性表遍历**之前**回答。
+
+同族一起对齐的（都是 `adl` 跑得对、我们跑不出，同阶段落地）：
+
+| 项 | 旧行为 | AIR（实测） |
+|---|---|---|
+| `Number.toString(radix)` 的 radix 10 | 走整数转换（`12.34 → "12"`） | **最短往返文本**（`"12.34"`）；非 10 才截断（`"c"`） |
+| 同上，大数 | `as_int_radix((long long)v)`，超 `LLONG_MAX` 是 UB 且丢高位 | `(1e21).toString(16)` = `"3635c9adc5dea00000"` ⇒ 改为按 2^32 limb 的精确长除法 |
+| radix 越界 | 静默回落到 10 | `RangeError #1003`（`…between 2 and 36; got N.`），int/uint 同 |
+| 位数越界**或缺失** | 静默夹取（`digits<0 → 0` …） | `RangeError #1002`（三种格式化器共用一条消息；缺失 = 传 0） |
+| `toPrecision` | `%.*g` 吃掉尾零 ⇒ `(1.5).toPrecision(3)` 给 `"1.5"` | `"1.50"`（补到指定位数）；且**小值一律定点**（`(1e-20).toPrecision(3)` 是 `"0.0000000000000000000100"`，不是指数式），只有小数指数 ≥ 位数才转指数 |
+| `toPrecision()` 无参 | 退化成 `Number.toString()` | `#1002` |
+| 负零 | `printf` 保留 `-` | `(0-0).toFixed(2)` / `toPrecision` **不带负号** |
+| 字符串方法缺参 | `args[0]` 是 `NULL` ⇒ 整个表达式 `null` | 按文档默认值（`charAt()` = 首字符、`substring()` = 全串、`replace(x)` 的第二参是文本 `"undefined"`） |
+| 静态 `Function` 类型的方法 | `toString`/`hasOwnProperty`/`propertyIsEnumerable` 是 `CodegenError` | 都成立（`"function Function() {}"`；own 的只有 `length`/`prototype`） |
+| `var u:*;` | `null`（tag 0） | **`undefined`**（tag 5）；类字段、静态字段、`new Array(n)` 的洞同样 |
+
+`toFixed` 的 `.5` 舍入**刻意没动**：本轮补齐 27 例双端读数后发现 AIR 既非银行家也非半上入
+（`0.5 → "0"`、`0.05 → "0.0"`、`0.5000000000000001 → "0"`，而 `2.5/4.5/6.5/8.5/10.5 → 3/5/7/9/11`、
+`0.25 → "0.3"`），没有单一规则能一次解释 27 个读数；我们走 `printf` 的 half-to-even（正确 IEEE
+舍入），盲目改成半上入会让现在**正确**的 5 例翻红。证据与判定留在 `### 遗留待开发` 的对应行。
+
+**验收**：`examples/dyn-prim-methods.as`（**80** 条断言：`*` 接收者 28 条、`Object` 槽 16 条、静态类型
+16 条、错参 `#1002`/`#1003` 9 条、`undefined`/空接收者 5 条，其余为大数 radix 与默认值）+ 单元钉
+`unit: prim/PrimMethods`（30 条：两条门共用 `as_prim_call`、盒子 own trait 的查询顺序、`as_any_length`
+的 tag 7 分支、`defaultInit` 的 undefined 常量形态与构造器 seed、`toString(radix)`/位数两条 RangeError
+的守卫与消息、`toPrecision` 不再走 `%g`、radix 换算走 2^32 limb、静态 `Function` 方法面、字符串缺参的
+`undefined` 替身）。全量 `node test.ts` **586/586**。
+
+
 ### 遗留待开发
+> **2026-10-31 追加（阶段三百四十四：动态接收者上的内建方法面）**：**新登记 0 行 / 改写 1 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**97 → 96 行**（`未开始` **74**，含 `未开始 / **D43b**` 1 行 / `部分完成` **22** / `已完成` 0）。**移出 1 行**＝「动态接收者的 `Number.toString()` / `toFixed()` 返 `null`」⇒ 转**已完成**：根因是**同一个值有两套表示各走各的门**（裸 box tag 从 `as_any_call` 出门，tag 1/2/7 的 `ptr` 不是对象头 ⇒ 一律 `null`；`Object` 槽的堆盒从 `as_dyn_call` 出门，成员表只有 `Object` 四件套 ⇒ 一律 `#1069`），现在两条门都开在同一个 `as_prim_call` 上。**改写 1 行**＝`toFixed` 的 `.5` 舍入：补齐 27 例双端读数后确认 AIR 既非银行家也非半上入（`0.5`/`0.05` 向下、`2.5`/`0.25` 向上），**只补证据不定口径**（盲目改会弄红现在正确的 5 例）。**本阶段修净、不占表**（全是 `adl` 跑得对我们跑不出）：盒化 `String`/`Function` 的方法面（`#1069`）、静态 `Function` 类型上的 `toString`/`hasOwnProperty`/`propertyIsEnumerable`（曾是 `CodegenError`）、字符串方法**缺参数**返 `null`、`var u:*;` 是 `null` 而非 `undefined`（连同类字段/静态字段/`new Array(n)` 的洞）、`Number.toString(radix)` 的 radix 10 走了整数转换与大数丢高位、radix/位数越界或缺失的静默夹取（应为 `#1003`/`#1002`）、`toPrecision` 走 `%g` 吃掉尾零与无参退化、负零的画法。证据台 `temp/dynnum/`（`body.inc` 90 条断言双端 `diff` = IDENTICAL），钉子 `examples/dyn-prim-methods.as` + `unit: prim/PrimMethods`。
+
 > **2026-10-30 追加（阶段三百四十三：G29 的判定 —— 子树裁剪本就成立，顺带量到一条小数残差）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表（`遗留项|状态|说明|建议`）按表内实际行数重数 **96 → 97 行**。**G29 本身不入表**：asaotui 的登记说「`overflow` 被接受、被校验、也进了布局引擎，但两侧画笔都不裁剪」，本轮按「库要用它的那天有没有像素正确的子树裁剪路径」取证 —— `adl 51.4.1` 与 AOT 双端十格**逐像素相同**（120 宽父盒裁 200 宽子件、孙件、跨界描边、`BlurFilter` 外溢、`cacheAsBitmap`、嵌套裁剪、`TextField` 子件、50% alpha 遮罩不削弱），故判定是**库侧未消费**、不是编译器缺口；口径与实测表见 [`docs/zh-cn/skia.md`](docs/zh-cn/skia.md) §6.16，钉子 `examples/overflow-clip.as` + `unit: render/OverflowClip`。**新登记的 1 行**是同批探针顺带量到的独立偏差：裁剪边恰为 `.5` 时 AIR 用银行家舍入、我们半上入 ⇒ 多画 1 设备像素，与 G29 无关（整数几何与其它小数都逐位相同），按 §1.5 属遗留缺陷，本轮只登记不改。
 > **2026-10-30 追加（遗留表清仓（二）—— 逐行复核：移出 17 行 / 改写 2 行 / 新登记 1 行）**：按表内实际行数重数，主表 **112 → 96 项**（`未开始` **78 → 73** / `部分完成` **20 → 22** / `已完成` **13 → 0** / `调研完成·实现暂缓` 1）。**（a）移出 13 行状态已是「已完成」的行** —— 表头自述「已完成项一经落地即从本表移出」，这 13 行违反了它：`Array.sort` 位标志、定长小数 17 位上限、极值 `String()`、排序边角、鼠标通知 `#1009`、反射内建类名、`File` 路径契约、隐式强制转换检查、点链首段遮蔽、空 `File` `#2037`、`EventDispatcher.parent` 动态读、`File` 三个 async 成员、`Event` 只读访问器。结论与证据都已在各自阶段节里，表里不再留占位。**（b）移出 4 行「状态还是未开始、代码早已落地」**：① `TextField` 输入字符取前一字 run（阶段三百三十六 第 1 条）；② `Proxy` 枚举/点号接管只对静态类型（阶段三百三十八 修了枚举，本轮实测 `var a:* = new MyProxy()` 的点号读、方法调用、`in` 都已进拦截器）；③ `Proxy.getDescendants` 经 `..` 不可达（阶段三百三十九，实测 `p..foo` 与 `*` 槽位都进拦截器）；④ `with` 作用域不进闭包体（阶段三百四十一）。**第 ④ 条要特别记一笔**：包 H 那条 note 把它写成「修净、不占表」，而它**本来就在表里**（2026-10-03 阶段九十四·二 登记，原话是「`emit` 会临时清空 `withScopes`」，与本轮代码相反）——「修净不占表」只适用于**本阶段新量到、同阶段修掉**的项，清掉一张既有登记必须回表下架。**（c）改写 2 行**：`with` 接收者的静态类型（收窄到「函数/类/正则仍响亮拒绝 + `String`/`Vector` 体内三条写路径非左值」）、`TextFormat` 字段子集（阶段三百三十一 已补齐 7 个字段与 13 参 ctor，残留改为「`indent`/`blockIndent`/`bullet`/`display`/`tabStops` 只存不用」）。**（d）新登记 1 行**：`in` 对原始值（`"toString" in 5` 我们 `false`、`adl` `true`）。**（e）顺带修掉两处记账错**：① 包 H 那两行「新登记」确实写了，但**落在文件末尾**（`---` 与 `## 备注` 之间）——`### 遗留待开发` 的主表里一行都没有；本轮把这两行**搬进主表**（保留原有实测细节）并删掉文件末尾的野表。这正是 [`## 备注`](#备注) 里「新阶段节追加到 `### 遗留待开发` 之前（= 末尾），不要插到某个『看起来该在这儿』的锚点」那条提醒的反面教材：按字符串锚点定位会插到文件尾。② 阶段三百四十 节内把 `adl` 对 `"toString" in 5` 的读数写成 `false`，与 `~/Documents/proxyanyi-out.txt` 的 I6=`true` 相反（`src/emit.ts` 的注释本来就是对的）。**口径**：自本轮起「已完成」行不再停在表里等下一次清仓。
 > **2026-10-30 追加（阶段三百三十八～三百四十一：包 H 的 `Proxy` / `..` / `with` / `in` 四刀）**：**新登记 1 行 / 改写 2 行 / 移出 3 行**（初版记「新登记 2 行 / 改写 1 行 / 移出 0 行」，2026-10-30 清仓逐行复核时更正，见下一条 note）。**改写的 1 行**是「Function 值的 `this` 绑定」（H-5）：本轮把证据台扩到 `temp/proxyany/thisbp/`（U1–U9 九例）与 `thisb.as` 镜像，量清「`this` 在函数值里是**呼叫点决定**」的完整矩阵——`o.cb()` → `o`、`f()` 裸调 → **全局对象**、`.call(a)`/`.apply(a)` → `a`（**普通函数认 `thisArg`**，而我们连这个也忽略）、`with (d) { cb() }` → `d`；而**不加 `this.` 前缀的名字**仍按创建点的词法作用域解析（`T3` 得 `TB`，与 AIR 同）。我们的闭包把 `this` 词法捕获进 `env->this` ⇒ **九例全错**（U1/U3/U4/U5/U6/U8 拿到创建者实例而不是接收者，U2/U7/U9 该给全局对象）。要忠实需要「呼叫点 `this` + 全局对象」两件运行时表示层改动（`as_fn` 的 ABI 没有 self 槽），本轮**只登记不实现**，状态仍 `未开始`，但证据面从三行扩到九行。**新登记 1 行**：`in` 对**原始值**的成员集未建模（`"toString" in 5` 我们答 `false`、`adl` 答 `true`，同族还有 `Boolean`/`Function` 接收者）。**改写的另 1 行**：`with` 接收者的静态类型 —— 该项**在表里本来就有登记**（2026-10-03 阶段九十四·二），故只收窄不改写成新行：剩函数/类/正则三种响亮拒绝 + `String`/`Vector` 体内赋值/自增/`delete` 三条静态路径非左值（`CodegenError`）。**本包修净、从表里移出 3 行**：`Proxy` 在 `*`/`Object` 槽位的 `for-in` 空序列（H-1）、`..` 运算符缺失（H-2，含 `Proxy` 接收者）、`with` 体的闭包丢作用域（H-4）—— 最后一条**本来就是登记项**，初版误记「修净不占表」（该口径只适用于本阶段新量到、同阶段修掉的项）；盒子字符串 `in` 的**段错误**（H-3）此前未单独登记，修净后无需入表。
@@ -18730,8 +18787,7 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
-| **动态接收者的 `Number.toString()` / `toFixed()` 返 `null`**（类型化接收者完全正常） | 未开始（2026-10-28 阶段三百一十四 量到；一条缺陷污染了差分表 **46/72 行**，是「跟 AIR 不一致」计数里最大的一块） | `var vals:Array = [0.1, …]; vals[i].toString()` —— `adl` 交 `"0.1"`，我们交 `null`（`semcheck-air.txt` L24 起）；而同一行的 `String(vals[i])` 两端逐字相同 ⇒ **格式化本体没错，错在动态分派**。同一行的 `(vals[i] as String)` **两端都是 `null`** ⇒ 转型面已对齐。**影响面**：应用 157 处 `.toString(` 多数是类型化接收者，所以不是全局灾难，但从 `Array` / `*` / `Object` 取出来那一类会静默变 `null`（拼接时成为 `"null"`） | 先定位动态调用里 `toString`/`toFixed`/`toPrecision` 的分派点（不猜）；修完直接重跑 `cmp3.sh`，预期一次消掉 ≈43 行差异。抽查应用里 `box[0].toString()` 形态的调用点 |
-| **`toFixed` 对 `.5` 的舍入方向与 AIR 不同** | 未开始（2026-10-28 阶段三百一十四 量到） | `SemCheck` 的 `toFixed` 行：`(2.5).toFixed(0)` —— AIR `3` / 我们 `2`；`(-1.25).toFixed(1)` —— AIR `-1.3` / 我们 `-1.2`。即我们走了 `printf` 的 **half-to-even**，AIR 是 **half-away-from-zero**。影响任何金额 / 百分比 / 上报格式（真应用里日志与列表行都有） | 自己算舍入而不是交给 `printf`，钉住 `.5` 的正负两侧；**先补 `adl` 实测**再定口径——尤其是「二进制里根本不是 `.5`」的那些值（如 `2.675.toFixed(2)`）到底舍还是入，没量过就不写 |
+| **`toFixed` 对 `.5` 的舍入方向与 AIR 不同** | 未开始（2026-10-28 阶段三百一十四 量到；2026-10-31 阶段三百四十四 补齐 27 例双端实测，口径仍未定） | AIR 的 `toFixed` 既不是银行家也不是半上入：`2.5/4.5/6.5/8.5/10.5 → 3/5/7/9/11`（整数部分 ≥1 的 `.5` **一律远离零**），但 `0.5 → "0"`、`0.05 → "0.0"`、`0.5000000000000001 → "0"`（恰好落在 / 刚刚跨过阈值的那几档反而**向下**），而 `0.25 → "0.3"`、`0.75 → "0.8"` 又向上；非 `.5` 的值两侧都按**真实二进制值**舍（`2.675 → "2.67"`、`1.005 → "1.00"`、`8.345 → "8.35"`、`1.255 → "1.25"`、`0.15 → "0.1"`、`0.35 → "0.3"`、`0.45 → "0.5"`、`0.85 → "0.8"`、`0.95 → "0.9"`）。我们走 `printf` 的 half-to-even（正确 IEEE 舍入），27 例里 9 例不同，且 `0.5000000000000001 → "1"` 按 ECMA 是对的、AIR 答 `"0"` | **先别动**：没有一条单一规则能同时解释上面 27 个读数（半上入解释不了 `0.5`/`0.05`，银行家解释不了 `2.5`/`0.25`），盲目改成半上入会让现在**正确**的 5 例（`1.5`/`3.5`/`5.5`/`7.5`/`9.5`）翻红。证据台 `temp/dynnum/body5.inc`（AIR）、`ours5b.as`（我方）与 `dynfix2-{air,ours}.txt`；下一轮先补 `sprintf` 以外的假设（例如「先转成有限位十进制、再在十进制上舍」）逐条对照，能一次解释 ≥26/27 再动手 |
 | **`gc_find_block()` 的首次适配是线性扫描：空闲块越多、每次分配越贵**（**我方性能缺口**，不是 `adl` 保真差） | 未开始（2026-10-28 阶段三百一十四 量到并用三段因果实验定案） | 真应用一帧 **4642 ms**，而同一行遥测给出 `gcshare=0.1%` / `worstgc=1.00 ms` / `freeblk=300026` ⇒ **不是 GC**。`temp/perf-b3/src/GeomPerf.as`：干净堆 **0.037 µs/次** → 只造 10 万个空闲块后全部丢弃（存活集几乎不变）**0.548 µs/次**（×15），另驻留 6 万对象 0.667 µs/次（×18）；同相位读路径 `read_cast_frag` **0.000 µs/次** ⇒ 不是「堆变慢」，是「分配变慢」。`gc_find_block()`（`src/runtime.ts:556`）从自己的尺寸类起沿**单向链表**逐节点找第一个够大的块，找不到还要向上爬所有更高的类。**这就是「打开/刷新列表就卡」的直接形状**：一次刷新几千次分配 × 几百 µs = 秒级冻结 | 把「挑一块」做成 **O(1)**（精确尺寸类分箱 / 每链「上次成功位置」游标 / 链内按大小有序），**不要动 GC 预算与切片**（`gcshare=0.1%` 已排除），也别用 `ASC_GC_THRESHOLD` 拖回收（只会让链更长）。口径与读数：`docs/zh-cn/gc.md` §6.17。**2026-10-29 复算（合并到新 base 后）**：AOT 臂在 `pt_4000` 就被外部看门狗判 3 次不响应杀掉（`per=338 µs/次`、`stalls=7`、`gapmax=1675 ms`），**合并前与合并后的 exe 同点位同形状**；同一时刻 adl 臂跑完整轮、同一相位 `per=0.271 µs/次`、0 hang ⇒ 「AOT 连基准都跑不完」本身就是这条的现形，与本轮三处修复无关（读数 `temp/perf-b3/bench3-aot-merged-report.txt` vs `bench3-air-report-1029.txt`）。**验收判据**：Bench3 的 `pt_8000` 相位从 4.6 s 降到 <50 ms 且 `ASC_FRAME_STATS` 的 `p99` 同跌 |
 | **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
 | **`DisplayObject.stage` 对「已不在显示列表上」的对象返回主窗 Stage 而非 `null`**（`DisplayObject_get_stage` 末尾 `return ASC_root_stage;` 对所有孤立对象兜底；`adl 51.4.1` 实测 `after stage=null`，我们答 `stage`，见 `temp/dispabort/`） | 未开始（2026-10-27 阶段二百九十五 做出 A/B 探针时量到；本阶段只修派发时机，未动兜底） | 兜底本身是为 document class **构造期**的 `stage` 非 null（Flash 语义），但它区分不了「document class 实例」与「任意孤立 Sprite」⇒ `if (obj.stage == null)` 这类守卫在对象被摘除后判错，`stage.removeChild(...)` 会打到**另一个窗口**的 Stage 上（找不到子件 ⇒ 返回 null，多数场景无害但语义错）。 | 加 `static void* ASC_doc_root`（窗口创建时指向 document class 实例），只在 `o == ASC_doc_root` 时兜底、其余返回 NULL；改后必须全量回归（`examples/` 里若有孤立对象读 `stage` 的会变红） |

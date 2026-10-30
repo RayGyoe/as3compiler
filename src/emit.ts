@@ -931,7 +931,13 @@ export class Emitter {
       case 'array': return 'NULL';
       case 'vector': return 'NULL';
       case 'record': return 'NULL';
-      case 'any': return '(as_value){0, 0.0, NULL}';
+      case 'any':
+        // UNDEFINED, not null: AIR initialises an untyped (`*`) slot to undefined --
+        // 'var u:*; u === undefined' is true, and so is a class field, a static
+        // field and a hole in 'new Array(n)' (measured on adl 51.4.1,
+        // temp/dynnum/body3). The tag is spelled out as an aggregate so the same
+        // expression also works in a file-scope static initialiser.
+        return '(as_value){5, 0.0, NULL}';
       case 'function': return 'NULL';
       case 'class': return 'NULL';
       case 'dict': return 'NULL';
@@ -2497,6 +2503,28 @@ export class Emitter {
     this.line('parts[0] = "Error #2066: The timer delay must be a non-negative number, got ";');
     this.line('parts[1] = as_str_from_double(delay);');
     this.line('as_throw(RangeError_new(as_str_concat_n(2, parts), 2066));');
+    this.indent--;
+    this.line('}');
+    // Number.toString(radix) with a radix outside 2..36 is RangeError #1003, and
+    // the message names the offending value (measured on adl 51.4.1, temp/dynnum:
+    // (12.34).toString(1) -> "Error #1003: The radix argument must be between 2 and
+    // 36; got 1."). We used to fall back to base 10 and answer text where AIR
+    // aborts the script.
+    this.line('static void as_throw_radix(int radix) {');
+    this.indent++;
+    this.line('static ASC_TLS const char* parts[3];');
+    this.line('parts[0] = "Error #1003: The radix argument must be between 2 and 36; got ";');
+    this.line('parts[1] = as_str_from_int(radix);');
+    this.line('parts[2] = ".";');
+    this.line('as_throw(RangeError_new(as_str_concat_n(3, parts), 1003));');
+    this.indent--;
+    this.line('}');
+    // toFixed/toExponential take 0..20 digits and toPrecision 1..21; anything else
+    // -- an ABSENT argument included -- is the same RangeError #1002 with the same
+    // text on AIR (measured, temp/dynnum). We used to clamp silently.
+    this.line('static void as_throw_number_format_range(void) {');
+    this.indent++;
+    this.line('as_throw(RangeError_new((char*)"Error #1002: Number.toPrecision has a range of 1 to 21. Number.toFixed and Number.toExponential have a range of 0 to 20. Specified value is not within expected range.", 1002));');
     this.indent--;
     this.line('}');
     // IDataInput reads that run past the end of their buffer throw EOFError
@@ -11786,6 +11814,22 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // pattern (tag 3) per AS3 semantics.
     this.line('static as_value as_str_dyn_call(char* s, const char* name, as_value* args, int argc) {');
     this.indent++;
+    // A MISSING argument is AS3's undefined, and the methods below read args[0]
+    // unconditionally. AIR applies each method's documented default to it:
+    // charAt() is "a" (index 0), indexOf() is -1 (it searches "undefined"),
+    // substring()/substr()/slice() keep the whole string and replace(x) inserts
+    // the TEXT "undefined" (measured on adl 51.4.1, temp/dynnum). An undefined
+    // stand-in reproduces all of those through the ordinary coercion paths.
+    this.line('as_value _undef_args[2];');
+    this.line('_undef_args[0] = as_v_undefined();');
+    this.line('_undef_args[1] = as_v_undefined();');
+    this.line('if (args == NULL) args = _undef_args;');
+    // Object's predicates on a boxed String: only `length` is an OWN property
+    // (AIR: "length" true, 0 / "x" false) and a String has no dynamic slots, so
+    // propertyIsEnumerable is always false. Reached from as_any_call (a '*' string)
+    // and from as_prim_call (an Object-slot string).
+    this.line('if (strcmp(name, "hasOwnProperty") == 0) return as_v_bool(argc > 0 && strcmp(as_v_str_val(args[0]), "length") == 0);');
+    this.line('if (strcmp(name, "propertyIsEnumerable") == 0) return as_v_bool(false);');
     this.line('if (strcmp(name, "match") == 0) {');
     this.indent++;
     this.line('as_regex* re = args[0].tag == 4 ? ((RegExp*)args[0].ptr)->compiled : as_regex_compile(as_v_str_val(args[0]), "");');
@@ -11804,10 +11848,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (args[0].tag == 4) {');
     this.indent++;
     this.line('RegExp* re = (RegExp*)args[0].ptr;');
-    this.line('return as_v_str(as_str_replace_regex(s, re->compiled, argc >= 2 ? as_v_str_val(args[1]) : "", re->global));');
+    this.line('return as_v_str(as_str_replace_regex(s, re->compiled, argc >= 2 ? as_v_str_val(args[1]) : "undefined", re->global));');
     this.indent--;
     this.line('}');
-    this.line('return as_v_str(as_str_replace(s, as_v_str_val(args[0]), argc >= 2 ? as_v_str_val(args[1]) : ""));');
+    this.line('return as_v_str(as_str_replace(s, as_v_str_val(args[0]), argc >= 2 ? as_v_str_val(args[1]) : "undefined"));');
     this.indent--;
     this.line('}');
     this.line('if (strcmp(name, "charAt") == 0) return as_v_str(as_str_charAt(s, as_v_int_cast(args[0])));');
@@ -11887,6 +11931,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // Calling a method on null/undefined throws #1009/#1010 (measured on adl
     // 51.4.1: `var y:* = null; y.bar()` -> #1009).
     this.line('v = as_req_box(v);');
+    // A boxed scalar (Number/Boolean/Function) keeps the PRIMITIVE's member
+    // surface, not Object's four: as_dyn_call would dereference the ptr slot as an
+    // object header, and for tag 1/2 that slot is NULL / a flag, so EVERY method
+    // ('o.toFixed(2)', 'o.toString()', a function's 'call') answered null while
+    // the statically-typed receiver answered correctly (measured on adl 51.4.1,
+    // temp/dynnum). The same helper serves the Object-slot heap boxes in
+    // as_dyn_call, so the two receivers cannot drift.
+    this.line('if (v.tag == 1 || v.tag == 2 || v.tag == 7) return as_prim_call(v, name, args, argc);');
     this.line('if (v.tag == 3) return as_str_dyn_call((char*)v.ptr, name, args, argc);');
     // An Array is not an object with a vtable: passing it to as_dyn_call would
     // read the vtable header out of its element buffer and crash (measured:
@@ -30974,14 +31026,18 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.hoistFunctionLocals(ctorBody);
       }
       // gc_alloc zeroes the instance, so every non-`Number` field already holds
-      // its AS3 default (null/0/false/0.0). Only `Number` fields default to NaN,
-      // which is NOT the zero bit pattern, so seed them here — BEFORE super() and
+      // its AS3 default (null/0/false/0.0). The exceptions that are NOT the zero
+      // bit pattern -- `Number` (NaN) and `*` (undefined) -- are seeded here — BEFORE super() and
       // any constructor body statement — so a field default cannot clobber an
       // assignment that ran before super() (the `o->_bounds = NULL` bug). Field
       // *initializers* (`= value`) still run after super(), per AS3.
       for (const [fname, f] of info.fields) {
         if (f.owner !== name) continue;
         if (!f.init && f.type.kind === 'number') this.line(`o->${this.cIdent(fname)} = NAN;`);
+        // An untyped (`*`) field defaults to UNDEFINED, not null (measured on adl
+        // 51.4.1, temp/dynnum/body3: a fresh instance's `*` field is
+        // '=== undefined'). tag 5 is not the zero bit pattern, hence this seed.
+        if (!f.init && f.type.kind === 'any') this.line(`o->${this.cIdent(fname)} = as_v_undefined();`);
       }
       if (hasNestedSuper) {
         // `super()` is inside a nested conditional/loop. Field *defaults* were
@@ -36234,6 +36290,9 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (obj.type.kind === 'bool') {
         return this.emitBoolMethod(obj, callee.property, expr.args);
       }
+      if (obj.type.kind === 'function') {
+        return this.emitFunctionMethod(obj, callee.property, expr.args);
+      }
       if (obj.type.kind === 'any') {
         return this.emitAnyMethod(obj, callee.property, expr.args);
       }
@@ -38019,11 +38078,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     switch (method) {
       case 'toFixed': return { code: `as_num_toFixed(${v}, ${argInt(0)})`, type: { kind: 'string' } };
       case 'toExponential': return { code: `as_num_toExponential(${v}, ${argInt(0)})`, type: { kind: 'string' } };
-      case 'toPrecision': {
-        // no argument => Number.toString() (shortest round-trip representation).
-        if (args.length === 0) return { code: `as_str_from_double(${v})`, type: { kind: 'string' } };
-        return { code: `as_num_toPrecision(${v}, ${argInt(0)})`, type: { kind: 'string' } };
-      }
+      // An ABSENT precision is RangeError #1002 on AIR -- the same error as an
+      // out-of-range one -- so it takes the 0 default straight into the validator
+      // instead of quietly answering Number.toString() (measured on adl 51.4.1,
+      // temp/dynnum: '(2.567).toPrecision()' throws, and so does (0) and (22)).
+      case 'toPrecision': return { code: `as_num_toPrecision(${v}, ${argInt(0)})`, type: { kind: 'string' } };
       case 'toString': {
         // toString(radix=10): Number uses the shortest round-trip for base 10 and
         // truncates to an integer for other bases; int/uint convert directly.
@@ -38035,20 +38094,51 @@ void FileStream_writeObject(void* _this, as_value v) {
         const radix = argInt(0);
         if (obj.type.kind === 'int') return { code: `as_int_radix((long long)(${v}), ${radix})`, type: { kind: 'string' } };
         if (obj.type.kind === 'uint') return { code: `as_uint_radix((unsigned long long)(${v}), ${radix})`, type: { kind: 'string' } };
-        return { code: `as_int_radix((long long)(${v}), ${radix})`, type: { kind: 'string' } };
+        // Number must not go through the integer path: radix 10 is the full text
+        // and a large value keeps every digit (see as_num_toString_radix).
+        return { code: `as_num_toString_radix(${v}, ${radix})`, type: { kind: 'string' } };
       }
       case 'valueOf': return { code: v, type: obj.type };
+      // Object's two predicates, inherited by every numeric primitive: a Number
+      // (or int/uint) keeps no own property at all, so both answer false. AIR
+      // agrees (temp/dynnum) -- and the mechanism is the same one that makes a
+      // boxed Number answer false through an Object-typed receiver.
+      case 'hasOwnProperty':
+      case 'propertyIsEnumerable': return { code: 'false', type: { kind: 'bool' } };
       default:
         if (as3Gap('Number method', `Number.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined Number method '${method}'`);
     }
   }
 
-  // Built-in Boolean methods: toString / valueOf.
+  // Built-in members of a statically-typed Function value beyond call/apply
+  // (handled by the caller): toString and Object's two predicates. AIR (adl
+  // 51.4.1, temp/dynnum) answers 'function Function() {}' for toString and owns
+  // exactly `length` and `prototype`; a refused method here was a codegen error
+  // on valid AIR code.
+  private emitFunctionMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
+    switch (method) {
+      case 'toString': return { code: '(char*)"function Function() {}"', type: { kind: 'string' } };
+      case 'hasOwnProperty': {
+        const key = this.propNameArg(args);
+        return { code: `(strcmp(${key}, "length") == 0 || strcmp(${key}, "prototype") == 0)`, type: { kind: 'bool' } };
+      }
+      case 'propertyIsEnumerable': return { code: 'false', type: { kind: 'bool' } };
+      default:
+        if (as3Gap('Function method', `Function.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
+        throw new CodegenError(`undefined Function method '${method}'`);
+    }
+  }
+
+  // Built-in Boolean methods: toString / valueOf (+ Object's two predicates).
   private emitBoolMethod(obj: { code: string; type: CType }, method: string, args: Expr[]): { code: string; type: CType } {
     switch (method) {
       case 'toString': return { code: `as_str_from_bool(${obj.code})`, type: { kind: 'string' } };
       case 'valueOf': return { code: obj.code, type: { kind: 'bool' } };
+      // A Boolean keeps no own property, so both predicates are false (AIR,
+      // temp/dynnum) -- same answer as the boxed Boolean in an Object slot.
+      case 'hasOwnProperty':
+      case 'propertyIsEnumerable': return { code: 'false', type: { kind: 'bool' } };
       default:
         if (as3Gap('Boolean method', `Boolean.${method}`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined Boolean method '${method}'`);
