@@ -80,11 +80,22 @@ jobs:
   # intentional. Authenticode remains a local/release-machine verification.
   windows-exe:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      # `--cc clang` needs clang, and `--package exe` needs llvm-rc for the
+      # VERSIONINFO resource (src/windows-release.ts). Neither ships on
+      # windows-latest (only MSVC cl.exe does); both come from one LLVM install.
+      # MSVC must be in the environment FIRST so clang can find the CRT headers
+      # and libraries for the -target ...-msvc link.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install LLVM (clang + llvm-rc)
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          Add-Content $env:GITHUB_PATH "C:\Program Files\LLVM\bin"
       - name: Windows exe resource + unsigned run smoke
         run: node src/index.ts examples/hello.as --cc clang --package exe -o build/hello-exe/Hello --run

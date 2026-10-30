@@ -93,8 +93,11 @@ if ((control.getPixel(5, 5) & 0xFFFFFF) != 0xFF00FF) {
   for (var i:int = 0; i < PAGES; i++) showPage(page(0x102030));
   System.gc();
   var p1:Number = System.privateMemory;
-  // 判据取「远小于泄漏量」：39 张 × 8.3 MB = 325 MB，修好后只剩工作集（几张）。
-  expect(p1 - p0 < 100 * 1024 * 1024,
+  // 判据取「远小于泄漏量」：39 张 × 8.3 MB = 325 MB，ASC_NO_FINAL=1 时实测 RSS +342 MB。
+  // 修好后只剩工作集（本机 ~59 MB），但 CI 的 macos-14 runner 工作集更高（Skia 进程级
+  // 缓存 + 不同 macOS 版本的 malloc 归页行为），故阈值放宽到 200 MB —— 仍只有泄漏量的一半
+  // 左右，抓得住真泄漏、又不再被 CI 环境的工作集差异误伤。
+  expect(p1 - p0 < 200 * 1024 * 1024,
          "the dropped pages' SkImages were released (RSS +" + Math.round((p1 - p0) / 1048576)
          + " MB over " + PAGES + " pages; without the finalizer this is +"
          + Math.round(PAGES * IMAGE_BYTES / 1048576) + " MB)");
@@ -107,7 +110,7 @@ if ((control.getPixel(5, 5) & 0xFFFFFF) != 0xFF00FF) {
   for (var j:int = 0; j < PAGES; j++) showPage(page(0x405060));
   System.gc();
   var p2:Number = System.privateMemory;
-  expect(p2 - p0 < 120 * 1024 * 1024,
+  expect(p2 - p0 < 200 * 1024 * 1024,
          "a second deck does not ramp RSS further (+" + Math.round((p2 - p0) / 1048576) + " MB)");
   expect(probePixel() == 0x405060, "second deck's live page paints (got 0x" + probePixel().toString(16) + ")");
 
@@ -119,7 +122,7 @@ if ((control.getPixel(5, 5) & 0xFFFFFF) != 0xFF00FF) {
   disposed = null;
   System.gc();
   var p3:Number = System.privateMemory;
-  expect(p3 - p0 < 120 * 1024 * 1024,
+  expect(p3 - p0 < 200 * 1024 * 1024,
          "dispose() plus the collection releases the image exactly once (+" + Math.round((p3 - p0) / 1048576) + " MB)");
 
   trace("gc-image-free: p0=" + p0 + " p1=" + p1 + " p2=" + p2 + " p3=" + p3);
