@@ -32976,7 +32976,20 @@ void FileStream_writeObject(void* _this, as_value v) {
           const macro = expr.width === 'int64' ? 'INT64_C' : 'UINT64_C';
           return { code: `${macro}(${raw})`, type: { kind: expr.width } };
         }
-        if (expr.isInt) return { code: String(expr.value), type: { kind: 'int' } };
+        // AS3 types an integer literal by its VALUE, not by its spelling
+        // (measured on adl 51.4.1, temp/rtprobe2/Lit.as): 2147483647 is BOTH int
+        // and uint; 2147483648..4294967295 are uint (`is int` false); 4294967296
+        // and above are Number. Declaring every digit-only literal an `int` --
+        // the old rule -- made `3000000000` a negative int, answered `is uint`
+        // false, and printed anything >= 1e19 as a C integer constant that no C
+        // type can hold ("integer literal is too large to be represented in any
+        // integer type" -- a hard compile error on valid AS3).
+        if (expr.isInt) {
+          const v = expr.value;
+          if (v <= 2147483647) return { code: String(v), type: { kind: 'int' } };
+          if (v <= 4294967295) return { code: `${v}u`, type: { kind: 'uint' } };
+          return { code: this.formatDouble(v), type: { kind: 'number' } };
+        }
         if (Number.isNaN(expr.value)) return { code: 'NAN', type: { kind: 'number' } };
         if (expr.value === Infinity) return { code: 'INFINITY', type: { kind: 'number' } };
         if (expr.value === -Infinity) return { code: '(-INFINITY)', type: { kind: 'number' } };
@@ -37639,7 +37652,11 @@ void FileStream_writeObject(void* _this, as_value v) {
   // Runtime `is` expression for a boxed (`any`) value.
   private runtimeScalarIs(v: string, target: string): string {
     switch (target) {
-      case 'int': case 'uint': case 'Number': return `as_v_is_number(${v})`;
+      // `is int`/`is uint` keep AIR's value-range rule on a `*` operand too; only
+      // `is Number` is the plain numeric-tag test.
+      case 'int': return `as_v_is_int32(${v})`;
+      case 'uint': return `as_v_is_uint32(${v})`;
+      case 'Number': return `as_v_is_number(${v})`;
       // The 64-bit tags are their own runtime kinds, so `is int64` is an exact tag
       // test. (`x is Number` still accepts them -- see as_v_is_number.)
       case 'int64': return `as_v_is_i64(${v})`;
@@ -37675,6 +37692,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Primitive scalar `is` checks.
     if (this.isScalarTypeName(expr.typeName)) {
       if (this.isScalarCType(o.type)) {
+        // `is int` / `is uint` on a numeric operand is a RANGE test in AIR, not a
+        // type test (measured, temp/rtprobe2/Lit.as): `int 5 is uint` true, `int
+        // -1 is uint` false, `Number 5.5 is int` false, `Number 5` passes both.
+        if ((expr.typeName === 'int' || expr.typeName === 'uint')
+            && (o.type.kind === 'int' || o.type.kind === 'uint' || o.type.kind === 'number')) {
+          const fn = expr.typeName === 'int' ? 'as_num_is_int32' : 'as_num_is_uint32';
+          return { code: `${fn}((double)(${o.code}))`, type: { kind: 'bool' } };
+        }
         return { code: this.scalarIsCompatible(o.type, expr.typeName) ? 'true' : 'false', type: { kind: 'bool' } };
       }
       if (o.type.kind === 'any') {

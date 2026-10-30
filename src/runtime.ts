@@ -1333,7 +1333,16 @@ static char* as_str_from_double(double v) {
     // double 转字符串抬到 20-24us（同一算法在 AIR 里 <2.5us），而拼字符串在应用里随处可见
     // （日志上报、列表行、拼 URL）。
     // 输出与旧写法逐字节一致：同一谓词、同一格式串、同一搜索区间。
-    int lo = 0, hi = 17;
+    // In FIXED notation the leading zeros after the point eat into the 17
+    // significant digits a double can need: 1.2e-4 round-trips only at 20
+    // decimal places, so the old hard cap of 17 produced "0.00012000000000000000"
+    // -- a string that reads back as a DIFFERENT double (measured on adl 51.4.1,
+    // temp/rtprobe2: AIR prints 0.00012000000000000002 and round-trips, we did
+    // not). Headroom per decade below 1 keeps the predicate and the format string
+    // unchanged; it only widens the search interval (a few more strtod probes).
+    int hi = 17;
+    if (!sci) { double t = av; while (t < 1.0) { t *= 10.0; hi++; } }
+    int lo = 0;
     while (lo < hi) {
         int mid = (lo + hi) >> 1;
         snprintf(buf, sizeof(buf), sci ? "%.*e" : "%.*f", mid, v);
@@ -2351,6 +2360,16 @@ static char* as_coerce_str(as_value v) {
 // Numeric is-check: the 64-bit enhancement types are Number subtypes, exactly as
 // int/uint are (the static rule in scalarIsCompatible mirrors this).
 static bool as_v_is_number(as_value v) { return v.tag == 1 || v.tag == 8 || v.tag == 9; }
+// AIR's "x is int" / "x is uint" are VALUE-RANGE tests, not type identity
+// (measured on adl 51.4.1, temp/rtprobe2/Lit.as): an int 5 is BOTH int and uint;
+// an int -1 is int but not uint; a uint 5 is both; a Number 5 is both; a Number
+// 5.5 is NEITHER; 2^32 is not uint; null is neither. A star-typed operand behaves
+// the same way (star3e9 is uint=true / is int=false). Folding on the static C type
+// therefore disagreed with AIR on every one of those forms.
+static bool as_num_is_int32(double v) { return v == floor(v) && v >= -2147483648.0 && v <= 2147483647.0; }
+static bool as_num_is_uint32(double v) { return v == floor(v) && v >= 0.0 && v <= 4294967295.0; }
+static bool as_v_is_int32(as_value v) { return as_v_is_number(v) && as_num_is_int32(as_v_to_number(v)); }
+static bool as_v_is_uint32(as_value v) { return as_v_is_number(v) && as_num_is_uint32(as_v_to_number(v)); }
 static bool as_v_is_i64(as_value v) { return v.tag == 8; }
 static bool as_v_is_u64(as_value v) { return v.tag == 9; }
 static bool as_v_is_bool(as_value v)   { return v.tag == 2; }

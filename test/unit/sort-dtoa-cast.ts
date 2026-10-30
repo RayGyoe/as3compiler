@@ -145,7 +145,15 @@ function checkDoubleToStringBinary(): string[] {
   // The linear scan is what made one conversion cost up to 18 snprintf+strtod pairs.
   check('the linear precision scan is gone', !/for \(int prec = 0; prec <= 17; prec\+\+\)/.test(fn));
   check('the precision search is a binary search over 0..17',
-    /int lo = 0, hi = 17;/.test(fn) && /while \(lo < hi\) \{/.test(fn) && /int mid = \(lo \+ hi\) >> 1;/.test(fn));
+    /int hi = 17;/.test(fn) && /while \(lo < hi\) \{/.test(fn) && /int mid = \(lo \+ hi\) >> 1;/.test(fn));
+  // Fixed notation needs more DECIMALS than the 17 significant digits a double
+  // can need (leading zeros after the point eat into them), so 1.2e-4 only reads
+  // back at 20 places. The interval is widened per decade below 1; the predicate
+  // and the format strings stay untouched (measured: adl 51.4.1 prints
+  // 0.00012000000000000002 and round-trips, we used to print ...000 and not).
+  check('the fixed-notation interval gains a decimal per decade below 1',
+    /int hi = 17;/.test(fn)
+    && /if \(!sci\) \{ double t = av; while \(t < 1\.0\) \{ t \*= 10\.0; hi\+\+; \} \}/.test(fn));
   check('the monotone predicate is unchanged (strtod round-trip)',
     /if \(strtod\(buf, NULL\) == v\) hi = mid; else lo = mid \+ 1;/.test(fn));
   check('the winning precision is emitted with the same format string',
