@@ -458,6 +458,40 @@ function checkStage3dAgalNrm(): string[] {
 
 registerGroup('stage3d/agal-nrm', checkStage3dAgalNrm);
 
+// AGAL version ceiling. asaot3d assembles with AGAL 4 and asks for the
+// `enhanced` Context3D profile, because that is the only profile AIR 51.4.1
+// accepts v4 under (measured matrix: enhanced takes v2/v3/v4, standardExtended
+// v2/v3, standard v2, baseline/baselineExtended none). The translator's header
+// check used to stop at 3 and rejected those programs with "AGAL: unsupported
+// version" before decoding a single instruction.
+//
+// The instruction budget matters for the same reason: v4 programs are longer
+// (the assembler may need an extra `mov` per constant-only operand), and a cap
+// that is too low reports a bogus "too many instructions" on a program AIR
+// compiles happily.
+function checkStage3dAgalVersions(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+
+  check('the AGAL header accepts versions 1..4 (v4 is the enhanced-profile ceiling)',
+    /if \(version < 1 \|\| version > 4\)/.test(runtime));
+  check('anything above v4 is still rejected, not silently decoded',
+    !/version > 5/.test(runtime));
+  check('the instruction budget is 400 (v4 programs are longer than v3 ones)',
+    /agal_instr ins\[400\]/.test(runtime) && /if \(n >= 400\)/.test(runtime)
+    && !/agal_instr ins\[200\]/.test(runtime));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/agal-versions', checkStage3dAgalVersions);
+
 // Reading a temporary register before writing it is an UPLOAD ERROR on adl, not a
 // zero read: measured in temp/agalprobe (upload.txt, plus bytes2.txt which feeds
 // Adobe's own AGALMiniAssembler output, so this is not an artefact of our hand

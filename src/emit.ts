@@ -26581,11 +26581,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('else { for (int i = 0; i < 16; i++) dst->data[base + i] = m[i]; }');
     this.indent--;
     this.line('}');
-    this.line('void Context3D_setTextureAt(void* _this, int first, Texture* texture) {');
+    // AIR's signature is setTextureAt(sampler:int, texture:TextureBase) -- a CUBE
+    // texture is bound through this same call. Declaring it as Texture* forced
+    // asaot3d to call flash.display3D.Context3D.setCubeTextureAt, which does not
+    // exist in the real runtime at all (#1069 "Property setCubeTextureAt not
+    // found"), so an AOT-green scene died the moment it bound an environment cube.
+    this.line('void Context3D_setTextureAt(void* _this, int first, TextureBase* texture) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
     this.line('switch (first) {');
-    for (let i = 0; i < 8; i++) this.line(`case ${i}: o->tex${i} = texture; break;`);
+    for (let i = 0; i < 8; i++) this.line(`case ${i}: o->tex${i} = (Texture*)texture; break;`);
     this.line('default: break;');
     this.line('}');
     this.line('gc_write_barrier((void*)texture);');

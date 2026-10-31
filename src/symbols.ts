@@ -324,6 +324,14 @@ const C_RESERVED_SEED = new Set<string>([
   'fdatasync', 'pread', 'pwrite', 'environ', 'getopt', 'optarg', 'optind', 'opterr',
   'optopt', 'confstr', 'pathconf', 'fpathconf', 'sysconf', 'chroot', 'vfork',
   'daemon', 'setgroups', 'getgroups',
+  // poll.h / sys/select.h. MISSING FROM BOTH TABLES until a probe named an AS3
+  // function `poll()` and the emitted `static void poll()` collided with the header's
+  // non-static declaration ("static declaration of 'poll' follows non-static
+  // declaration"). `poll.h` IS in gen-c-reserved.ts's POSIX_HEADERS, so the sweep
+  // should have carried it -- it did not reach the committed table, and the seed is
+  // the documented place for "the names one platform's sweep cannot see".
+  'poll', 'ppoll', 'select', 'pselect', 'pollfd', 'nfds_t', 'fd_set',
+  'FD_SET', 'FD_ZERO', 'FD_ISSET', 'FD_CLR', 'timeval',
   // string.h / strings.h (legacy BSD aliases)
   'index', 'rindex', 'bcopy', 'bzero', 'bcmp', 'ffs', 'ffsl', 'ffsll', 'fls',
   'flsl', 'flsll', 'strcasecmp', 'strncasecmp', 'strcpy', 'strncpy', 'strcat',
@@ -7930,7 +7938,10 @@ export class SymbolTable {
           ])],
           ['setTextureAt', c3m({ kind: 'void' }, [
             { name: 'first', type: 'int', defaultValue: null, isRest: false },
-            { name: 'texture', type: 'Texture', defaultValue: null, isRest: false },
+            // AIR takes TextureBase here, not Texture: a CubeTexture (environment
+            // map) is bound through setTextureAt, and narrowing the parameter made
+            // callers reach for setCubeTextureAt -- an API AIR does not have.
+            { name: 'texture', type: 'TextureBase', defaultValue: null, isRest: false },
           ])],
           ['setSamplerStateAt', c3m({ kind: 'void' }, [
             { name: 'sampler', type: 'int', defaultValue: null, isRest: false },

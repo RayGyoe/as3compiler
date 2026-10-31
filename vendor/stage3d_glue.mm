@@ -167,6 +167,7 @@ typedef struct {
   char sf[32];
   char df[32];
   unsigned int writeMask;   // MTLColorWriteMask bits baked into this pipeline
+  int samples;              // MTLRenderPipelineDescriptor.rasterSampleCount
   id<MTLRenderPipelineState> pso;
   unsigned long stamp;
 } S3DBlendVariant;
@@ -234,6 +235,14 @@ struct S3DContext {
   // the render target size changes.
   id<MTLTexture> rtDepthStencil;
   int rtDepthStencilW, rtDepthStencilH;
+  // MSAA (opt-in, ASC_S3D_MSAA=2|4). On-screen passes render into msaaColor /
+  // msaaDepthStencil (sampleCount = msaaCount) and resolve into `target`; a
+  // render-to-texture pass ignores both (see s3d_pass_samples). msaaCount == 1
+  // means the plain AIR-equivalent path.
+  id<MTLTexture> msaaColor;
+  id<MTLTexture> msaaDepthStencil;
+  int msaaCount;
+  int msaaResolvePending;   // an on-screen multisample pass was encoded this frame
   int width, height;
   // current pipeline (one of the cached blend variants below)
   id<MTLRenderPipelineState> pso;
@@ -377,6 +386,62 @@ static id<MTLTexture> s3d_make_depth_stencil(id<MTLDevice> device, int width, in
   td.usage = MTLTextureUsageRenderTarget;
   td.storageMode = MTLStorageModePrivate;
   return [device newTextureWithDescriptor:td];
+}
+
+// ---- MSAA (M10 of asaot3d) ------------------------------------------------
+//
+// AIR's Stage3D has no anti-aliasing knob at all, so this is an OPT-IN
+// divergence: ASC_S3D_MSAA=2|4 turns on multisampling for ON-SCREEN passes, and
+// the default (unset or 1) keeps the exact single-sample path AIR renders.
+// Render-to-texture passes (renderOverride -- shadow maps, drawToBitmapData)
+// always stay single-sample: their textures are created sampleCount 1 and Metal
+// requires every attachment of a pass to match.
+//
+// The multisample colour buffer resolves into c->target at the end of every
+// pass, so the CPU readback / compositing paths see ordinary resolved pixels.
+static int s3d_msaa_from_env(void) {
+  const char* v = getenv("ASC_S3D_MSAA");
+  if (v == NULL || v[0] == '\0') return 1;
+  int n = atoi(v);
+  if (n == 2 || n == 4) return n;
+  return 1;
+}
+
+// Allocate (or reallocate) the multisample colour + depth pair. `n <= 1`
+// releases both and leaves the context single-sample.
+static void s3d_alloc_msaa(S3DContext* c, int w, int h) {
+  if (c->msaaColor != nil) { [c->msaaColor release]; c->msaaColor = nil; }
+  if (c->msaaDepthStencil != nil) { [c->msaaDepthStencil release]; c->msaaDepthStencil = nil; }
+  if (c->msaaCount <= 1 || w <= 0 || h <= 0) return;
+#ifdef ASC_RENDER_DEPTH_STENCIL
+  MTLTextureDescriptor* cd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+      width:w height:h mipmapped:NO];
+  cd.textureType = MTLTextureType2DMultisample;
+  cd.sampleCount = (NSUInteger)c->msaaCount;
+  cd.usage = MTLTextureUsageRenderTarget;
+  // Private storage: the resolved image lands in c->target (Shared, CPU
+  // readable); the multisample buffer itself is never read back.
+  cd.storageMode = MTLStorageModePrivate;
+  c->msaaColor = [c->device newTextureWithDescriptor:cd];
+
+  MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
+      width:w height:h mipmapped:NO];
+  dd.textureType = MTLTextureType2DMultisample;
+  dd.sampleCount = (NSUInteger)c->msaaCount;
+  dd.usage = MTLTextureUsageRenderTarget;
+  dd.storageMode = MTLStorageModePrivate;
+  c->msaaDepthStencil = [c->device newTextureWithDescriptor:dd];
+#else
+  (void)c;
+#endif
+}
+
+// The sample count the NEXT encoded pass will use: multisampling applies to
+// on-screen passes only, so a render-to-texture draw forces 1.
+static int s3d_pass_samples(S3DContext* c) {
+  if (c->renderOverride != nil) return 1;
+  if (c->msaaColor == nil || c->msaaDepthStencil == nil) return 1;
+  return c->msaaCount;
 }
 
 // Create a fragment sampler state (linear or nearest); clamp-to-edge addressing
@@ -612,6 +677,24 @@ static void s3d_flush_impl(void* ctx, int wait) {
   c->batch = nil;
   const int dbg = asc_s3d_stats();
   const double t0 = dbg ? asc_dbg_now_ms() : 0.0;
+  // MSAA: resolve the multisample colour buffer into the CPU-visible target
+  // once per frame. Metal expresses a resolve only as a render-pass store
+  // action (there is no blit resolve), so this is a zero-draw pass whose only
+  // effect is the resolve at endEncoding. loadAction=Load is required: the
+  // resolve reads the attachment's stored content, so the pass must load it
+  // rather than start with undefined tile memory.
+  if (c->msaaColor != nil && c->msaaResolvePending) {
+    @autoreleasepool {
+      MTLRenderPassDescriptor* rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+      rpd.colorAttachments[0].texture = c->msaaColor;
+      rpd.colorAttachments[0].loadAction = MTLLoadActionLoad;
+      rpd.colorAttachments[0].resolveTexture = c->target;
+      rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+      id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:rpd];
+      if (renc != nil) [renc endEncoding];
+    }
+    c->msaaResolvePending = 0;
+  }
   // Same autorelease-pool wrap as before: commit may autorelease driver objects
   // and the C++ SDL loop has no pool of its own (the air-native leak).
   @autoreleasepool {
@@ -702,7 +785,7 @@ void* s3d_create(int width, int height) {
   c->ffn = nil;
   c->nbvars = 0;
   c->bstamp = 0;
-  for (int i = 0; i < S3D_MAX_BLEND_VARIANTS; i++) { c->bvars[i].pso = nil; c->bvars[i].sf[0] = '\0'; c->bvars[i].df[0] = '\0'; c->bvars[i].writeMask = 0; c->bvars[i].stamp = 0; }
+  for (int i = 0; i < S3D_MAX_BLEND_VARIANTS; i++) { c->bvars[i].pso = nil; c->bvars[i].sf[0] = '\0'; c->bvars[i].df[0] = '\0'; c->bvars[i].writeMask = 0; c->bvars[i].samples = 0; c->bvars[i].stamp = 0; }
   c->numStreams = 0;
   c->indexBuffer = nil;
   c->numIndices = 0;
@@ -759,6 +842,18 @@ void* s3d_create(int width, int height) {
   c->depthStencil = s3d_make_depth_stencil(device, c->width, c->height);
   if (c->depthStencil == nil) { fprintf(stderr, "stage3d_glue: failed to create depth/stencil target\n"); }
 #endif
+  // MSAA is opt-in (ASC_S3D_MSAA=2|4). Allocated here so a resize only has to
+  // reallocate, never re-read the environment.
+  c->msaaColor = nil;
+  c->msaaDepthStencil = nil;
+  c->msaaCount = s3d_msaa_from_env();
+  s3d_alloc_msaa(c, c->width, c->height);
+  if (c->msaaCount > 1) {
+    // One-line startup trace: the only observable handle for "MSAA is on".
+    // Probes use it to prove the multisample path was actually taken.
+    fprintf(stderr, "stage3d_glue: MSAA %dx (%s)\n", c->msaaCount,
+            (c->msaaColor != nil && c->msaaDepthStencil != nil) ? "allocated" : "FAILED to allocate");
+  }
   s3d_register_ctx(c);
   return (void*)c;
 }
@@ -792,6 +887,8 @@ void s3d_destroy(void* ctx) {
   if (c->target != nil) [c->target release];
   if (c->depthStencil != nil) [c->depthStencil release];
   if (c->rtDepthStencil != nil) [c->rtDepthStencil release];
+  if (c->msaaColor != nil) [c->msaaColor release];
+  if (c->msaaDepthStencil != nil) [c->msaaDepthStencil release];
   if (c->samplerLinear != nil) [c->samplerLinear release];
   if (c->samplerNearest != nil) [c->samplerNearest release];
   for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) for (int k = 0; k < 3; k++)
@@ -826,6 +923,8 @@ int s3d_resize(void* ctx, int width, int height) {
   if (c->depthStencil != nil) [c->depthStencil release];
   c->depthStencil = s3d_make_depth_stencil(c->device, c->width, c->height);
 #endif
+  // The multisample pair is size-coupled to the target, so it is rebuilt too.
+  s3d_alloc_msaa(c, c->width, c->height);
   return c->target != nil ? 1 : 0;
 }
 
@@ -1104,10 +1203,15 @@ static void s3d_factor_key(char* dst, const char* name) {
 // so this is the single place a pipeline state is created. Returns nil on
 // failure; *err receives the Metal error.
 static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendSource,
-                                              const char* blendDest, unsigned int writeMask, NSError** err) {
+                                              const char* blendDest, unsigned int writeMask,
+                                              int samples, NSError** err) {
   MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
   pd.vertexFunction = c->vfn;
   pd.fragmentFunction = c->ffn;
+  // The engine declares MSAA only for the pipelines it draws on-screen with,
+  // so the count is part of the pipeline identity (see S3DBlendVariant.samples).
+  if (samples < 1) samples = 1;
+  pd.rasterSampleCount = (NSUInteger)samples;
   pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
   // Color write mask (setColorMask). Metal bakes it into the pipeline, so the
   // caller passes the mask recorded by the last setColorMask -- MTLClearMaskAll
@@ -1167,6 +1271,7 @@ static void s3d_clear_variants(S3DContext* c) {
     c->bvars[i].sf[0] = '\0';
     c->bvars[i].df[0] = '\0';
     c->bvars[i].writeMask = 0;
+    c->bvars[i].samples = 0;
   }
   c->nbvars = 0;
   c->pso = nil;
@@ -1193,8 +1298,10 @@ static void s3d_select_pso(S3DContext* c) {
   s3d_factor_key(sf, c->blendSource);
   s3d_factor_key(df, c->blendDest);
   unsigned int wm = s3d_color_mask_bits(c);
+  int samples = s3d_pass_samples(c);
   for (int i = 0; i < c->nbvars; i++) {
-    if (strcmp(c->bvars[i].sf, sf) == 0 && strcmp(c->bvars[i].df, df) == 0 && c->bvars[i].writeMask == wm) {
+    if (strcmp(c->bvars[i].sf, sf) == 0 && strcmp(c->bvars[i].df, df) == 0 &&
+        c->bvars[i].writeMask == wm && c->bvars[i].samples == samples) {
       c->bvars[i].stamp = ++c->bstamp;
       c->pso = c->bvars[i].pso;
       return;
@@ -1202,7 +1309,7 @@ static void s3d_select_pso(S3DContext* c) {
   }
   asc_tr_psomiss++;
   NSError* err = nil;
-  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, wm, &err);
+  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, wm, samples, &err);
   if (pso == nil) {
     fprintf(stderr, "stage3d_glue: blend variant pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
     return;  // keep the previous pipeline: a wrong blend beats no draw at all
@@ -1221,6 +1328,7 @@ static void s3d_select_pso(S3DContext* c) {
   s3d_factor_key(c->bvars[idx].sf, c->blendSource);
   s3d_factor_key(c->bvars[idx].df, c->blendDest);
   c->bvars[idx].writeMask = wm;
+  c->bvars[idx].samples = samples;
   c->bvars[idx].pso = pso;
   c->bvars[idx].stamp = ++c->bstamp;
   c->pso = pso;
@@ -1238,6 +1346,7 @@ static void s3d_prog_release(S3DProgramCache* e) {
     e->bvars[i].sf[0] = '\0';
     e->bvars[i].df[0] = '\0';
     e->bvars[i].writeMask = 0;
+    e->bvars[i].samples = 0;
   }
   e->nbvars = 0;
 }
@@ -1392,7 +1501,8 @@ int s3d_compile(void* ctx, void* key, const char* vs_msl, const char* fs_msl, ch
   [flib release];
 
   NSError* perr = nil;
-  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, s3d_color_mask_bits(c), &perr);
+  const int seedSamples = s3d_pass_samples(c);
+  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, s3d_color_mask_bits(c), seedSamples, &perr);
   if (pso == nil) {
     fprintf(stderr, "stage3d_glue: pipeline create failed: %s\n", [[perr localizedDescription] UTF8String]);
     if (errbuf && errbuf_size > 0) snprintf(errbuf, errbuf_size, "pipeline: %s", [[perr localizedDescription] UTF8String]);
@@ -1402,6 +1512,7 @@ int s3d_compile(void* ctx, void* key, const char* vs_msl, const char* fs_msl, ch
   s3d_factor_key(c->bvars[0].sf, c->blendSource);
   s3d_factor_key(c->bvars[0].df, c->blendDest);
   c->bvars[0].writeMask = s3d_color_mask_bits(c);
+  c->bvars[0].samples = seedSamples;
   c->bvars[0].pso = pso;
   c->bvars[0].stamp = ++c->bstamp;
   c->nbvars = 1;
@@ -1598,11 +1709,21 @@ int s3d_draw(void* ctx, int numTriangles) {
         @autoreleasepool {
           if (c->batch == nil) c->batch = [[c->queue commandBuffer] retain];
           if (c->batch != nil) {
+            const int msaaClear = s3d_pass_samples(c);
             MTLRenderPassDescriptor* drp = [MTLRenderPassDescriptor renderPassDescriptor];
-            drp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+            if (msaaClear > 1) {
+              // Clear the multisample buffer (the real surface these draws land
+              // in) and resolve it down so the frame keeps the clear colour.
+              drp.colorAttachments[0].texture = c->msaaColor;
+              drp.colorAttachments[0].resolveTexture = c->target;
+              drp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+              c->msaaResolvePending = 0;
+            } else {
+              drp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+              drp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            }
             drp.colorAttachments[0].loadAction = MTLLoadActionClear;
             drp.colorAttachments[0].clearColor = MTLClearColorMake((double)c->clearR, (double)c->clearG, (double)c->clearB, (double)c->clearA);
-            drp.colorAttachments[0].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> e = [c->batch renderCommandEncoderWithDescriptor:drp];
             if (e != nil) [e endEncoding];
             c->clearPending = 0;
@@ -1642,12 +1763,24 @@ int s3d_draw(void* ctx, int numTriangles) {
   if (c->batch == nil) return 0;
   id<MTLCommandBuffer> cb = c->batch;
   MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-  rp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+  // MSAA (ASC_S3D_MSAA): an ON-SCREEN pass renders into the multisample colour
+  // buffer. It is NOT resolved here: one encoder per draw means a per-draw
+  // resolve would blit the whole target hundreds of times a frame. The resolve
+  // happens once, in a zero-draw pass at s3d_flush, so the multisample texture
+  // simply accumulates like the single-sample target does.
+  const int msaa = s3d_pass_samples(c);
+  if (msaa > 1) {
+    rp.colorAttachments[0].texture = c->msaaColor;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    c->msaaResolvePending = 1;
+  } else {
+    rp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+  }
   // Only the first draw after a clear() clears; subsequent draws accumulate onto
   // the same render target (Starling's clear-then-many-drawTriangles model).
   rp.colorAttachments[0].loadAction = (c->clearPending && c->clearColor) ? MTLLoadActionClear : MTLLoadActionLoad;
   rp.colorAttachments[0].clearColor = MTLClearColorMake((double)c->clearR, (double)c->clearG, (double)c->clearB, (double)c->clearA);
-  rp.colorAttachments[0].storeAction = MTLStoreActionStore;
 
   // Depth/stencil are only attached when the draw actually needs them. The
   // attachment is a 1280x2160 D32S8 texture (~22 MB): a per-draw Load+Store of it
@@ -1659,10 +1792,22 @@ int s3d_draw(void* ctx, int numTriangles) {
   int dsNeeded = (c->depthCompare != NULL && strcmp(c->depthCompare, "always") != 0)
               || (c->stencilCompare != NULL && strcmp(c->stencilCompare, "always") != 0)
               || (c->stencilBothPass != NULL && strcmp(c->stencilBothPass, "keep") != 0);
+  // ...but a pending DEPTH/STENCIL clear is itself a reason to attach: the load
+  // action below is what performs that clear, and clearPending is consumed by
+  // this pass whether or not the attachment exists. Without this, a first draw
+  // that does not test depth (depthCompare == "always": a full-screen background
+  // quad, a blit) silently dropped the frame's depth clear -- the buffer then
+  // kept the previous frame's depth, so a farther opaque surface drawn later in
+  // the frame was rejected by depth from a frame it was not part of (asaot3d M20:
+  // a translucent panel's depth hid the backdrop it was supposed to blend with,
+  // and only appeared to work once the panel stopped writing depth).
+  if (c->clearPending && (c->clearDepth || c->clearStencil)) dsNeeded = 1;
   // Depth/stencil comes from the back-buffer surface for on-screen passes and
   // from the render target's own same-size surface for offscreen passes (Metal
-  // requires matching attachment sizes).
-  id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil : c->depthStencil;
+  // requires matching attachment sizes). With MSAA the depth buffer must be
+  // multisampled as well, so it swaps to the companion texture.
+  id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil
+                    : (msaa > 1 ? c->msaaDepthStencil : c->depthStencil);
   if (ds != nil && dsNeeded) {
     rp.depthAttachment.texture = ds;
     rp.depthAttachment.loadAction = (c->clearPending && c->clearDepth) ? MTLLoadActionClear : MTLLoadActionLoad;

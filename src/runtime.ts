@@ -15140,19 +15140,31 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
     if (bytes[0] != 0xA0) { as_agal_errmsg = "AGAL: bad magic (expected 0xA0)"; return NULL; }
     if (bytes[5] != 0xA1) { as_agal_errmsg = "AGAL: bad program type marker (expected 0xA1)"; return NULL; }
     unsigned version = as_agal_u32(bytes + 1);
-    if (version < 1 || version > 3) { as_agal_errmsg = "AGAL: unsupported version"; return NULL; }
+    // AGAL4 is accepted: the AIR 51 runtime validates the version against the
+    // Context3D profile (measured on adl 51.4.1: baseline/baselineExtended accept
+    // nothing above 1, standard accepts 2, standardExtended accepts 3, and only
+    // "enhanced" accepts 4 -- asaot3d requests "enhanced" and assembles 4). The
+    // 0xA0/0xA1 encoding and the instruction slots are identical across 1..4, and
+    // this translator never gates register limits on the version, so decoding a v4
+    // program needs no other change. asaot3d emits no v4-only opcode.
+    if (version < 1 || version > 4) { as_agal_errmsg = "AGAL: unsupported version"; return NULL; }
     int isFragment = bytes[6] & 1;
     agal_is_frag = isFragment;
     memset(agal_used, 0, sizeof(agal_used));
     memset(agal_cube, 0, sizeof(agal_cube));
-    agal_instr ins[200];
+    // Instruction budget. AGAL1/2 caps a program well below this; the number
+    // here is the decode buffer size, not a language limit. It was 200 (the
+    // AGAL1 baseline) and capped the asaot3d PBR program at 168/200 -- one more
+    // feature (tone mapping) would have pushed it over. 400 keeps a wide margin
+    // while staying far from any Metal/GLSL source-size concern.
+    agal_instr ins[400];
     int n = 0, pos = 7;
     // The official AGALMiniAssembler emits each instruction as a fixed 192-bit
     // (24-byte) slot: 32-bit opcode + up to 160 bits of operands, zero-padded.
     // Operand counts are NOT encoded in the opcode token (see agal_op_nreg), so
     // the trailing zero-padding must be skipped to reach the next instruction.
     while (pos + 24 <= len) {
-        if (n >= 200) { as_agal_errmsg = "AGAL: too many instructions (limit 200)"; return NULL; }
+        if (n >= 400) { as_agal_errmsg = "AGAL: too many instructions (limit 400)"; return NULL; }
         int inst_start = pos;
         unsigned op_tok = as_agal_u32(bytes + pos); pos += 4;
         int op = op_tok & 0xFF;
