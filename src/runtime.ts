@@ -14625,12 +14625,20 @@ static char* as_cap_server_string(void) {
 }
 
 // ===== AGAL translator (stage 80) =====
-// Parses AGAL1/2/3 bytecode (7-byte header + variable-length instruction
-// tokens) and emits readable MSL (Metal) or GLSL ES (WebGL) source. Pure C
-// string processing, no GPU framework — the MSL *compile* (newLibraryWithSource)
-// is wired separately in stage 82. Validation errors return NULL and set
-// as_agal_errmsg. Bytecode is little-endian per the AGAL spec.
+// Parses AGAL1/2/3/4 bytecode (7-byte header + variable-length instruction
+// tokens) and emits readable MSL (Metal), GLSL ES (WebGL) or HLSL (D3D12)
+// source. Pure C string processing, no GPU framework — the MSL *compile*
+// (newLibraryWithSource) is wired separately in stage 82. Validation errors
+// return NULL and set as_agal_errmsg. Bytecode is little-endian per the AGAL
+// spec.
 static const char* as_agal_errmsg = NULL;
+// Stage3D reports AGAL validation failures as a numbered Error whose message is
+// "AGAL validation failed: <reason> at token N of <stage> program." Measured on
+// adl 51.4.1 (temp/vtfprobe/vtf-adl.txt), a vertex program that samples with
+// 'tex' throws Error #3622 from Program3D.upload -- i.e. at UPLOAD time, not at
+// the first draw. The id travels next to the message so the throw site can
+// build the same Error AIR does instead of a bare id-0 Error.
+static int as_agal_errid = 0;
 
 static unsigned as_agal_u32(const unsigned char* p) {
     return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
@@ -14663,7 +14671,22 @@ static const char* const agal_op_name[0x2f] = {
 // fails loudly (the caller throws) instead of emitting a shader that silently
 // drops the instruction -- a missing instruction renders as wrong pixels, which
 // is far harder to trace back than a failed compile.
-static char agal_err_buf[128];
+static char agal_err_buf[160];
+// Report an AIR-numbered AGAL validation failure. The token index is 1-based,
+// matching AIR's own counter ('at token 1' is the first instruction).
+static void agal_validation_fail_plain(int errid, const char* reason) {
+    if (as_agal_errmsg != NULL) return;
+    snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL validation failed: %s", reason);
+    as_agal_errmsg = agal_err_buf;
+    as_agal_errid = errid;
+}
+static void agal_validation_fail(int errid, const char* reason, int token) {
+    if (as_agal_errmsg != NULL) return;  // keep the first diagnostic
+    snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL validation failed: %s at token %d of %s program.",
+             reason, token, agal_is_frag ? "fragment" : "vertex");
+    as_agal_errmsg = agal_err_buf;
+    as_agal_errid = errid;
+}
 static void agal_unsupported(unsigned op) {
     if (as_agal_errmsg != NULL) return;  // keep the first diagnostic
     if (op < 0x2f && agal_op_name[op] != NULL)
@@ -14671,6 +14694,7 @@ static void agal_unsupported(unsigned op) {
     else
         snprintf(agal_err_buf, sizeof(agal_err_buf), "AGAL: opcode 0x%02x is not translated to MSL/GLSL/HLSL yet", op);
     as_agal_errmsg = agal_err_buf;
+    as_agal_errid = 0;
 }
 
 // Operand counts and no-destination flags for the OFFICIAL AGALMiniAssembler
@@ -15010,6 +15034,18 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 // separate sprintf calls (a ternary format string would mis-read the
                 // tail, see the compare-op note below).
                 else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else sprintf(rhs, "%s(%s, %s%s).%c", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3, c1); }
+                // tld (AGAL4, VERTEX only): the same fetch with an EXPLICIT level of
+                // detail, because a vertex shader has no derivatives to derive one
+                // from. LOD is byte 2 of the sampler operand; the register number is
+                // the low 16 bits, exactly as for 'tex'.
+                //
+                // Measured on adl 51.4.1 (temp/vtfprobe): everything else about the
+                // fetch is shared with 'tex' -- coordinates are normalised the same
+                // way (uv 0.25/0.75 land on the four texels of a 2x2), row 0 is the
+                // top row, and the <filter>/<wrap> bits of the SAME sampler word
+                // apply (nearest vs linear at a texel corner: white vs 0x808080;
+                // wrap repeat at u=2.4: 0xff0000 vs the clamped edge texel).
+                else if (op == 0x2e) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; int lod = (int)((s2lo >> 16) & 0xFFu); if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s, level(%d.0)).%c", s2b, n2, s1, c3, lod, c1); else if (target == 2) sprintf(rhs, "%s.SampleLevel(smp%d, %s%s, %d.0).%c", s2b, n2, s1, c3, lod, c1); else sprintf(rhs, "%s(%s, %s%s, %d.0).%c", agal_is_cube(n2) ? "textureCubeLod" : "texture2DLod", s2b, s1, c3, lod, c1); }
                 else if (op == 0x29) sprintf(rhs, "(%s.%c >= %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2a) sprintf(rhs, "(%s.%c < %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2c) sprintf(rhs, "(%s.%c == %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
@@ -15052,6 +15088,8 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         else if (op == 0x1a) sprintf(rhs, "%s(%s)", f_ddx, s1);
         else if (op == 0x1b) sprintf(rhs, "%s(%s)", f_ddy, s1);
         else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s)", s2b, n2, s1, c3); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s)", s2b, n2, s1, c3); else sprintf(rhs, "%s(%s, %s%s)", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3); }
+        // tld: explicit-LOD fetch, vertex only (see the masked arm above).
+        else if (op == 0x2e) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; int lod = (int)((s2lo >> 16) & 0xFFu); if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s, level(%d.0))", s2b, n2, s1, c3, lod); else if (target == 2) sprintf(rhs, "%s.SampleLevel(smp%d, %s%s, %d.0)", s2b, n2, s1, c3, lod); else sprintf(rhs, "%s(%s, %s%s, %d.0)", agal_is_cube(n2) ? "textureCubeLod" : "texture2DLod", s2b, s1, c3, lod); }
         // Compare instructions: sge/slt/seq/sne produce a per-component 0.0/1.0
         // mask. The operands are float4 (or 4-component swizzles), so the natural
         // 'cond ? v4(1.0) : v4(0.0)' is invalid in BOTH targets -- MSL needs a
@@ -15219,6 +15257,7 @@ static const char* agal_check_temp_writes(const agal_instr* ins, int n) {
 
 static char* as_agal_translate(const unsigned char* bytes, int len, int target) {
     as_agal_errmsg = NULL;
+    as_agal_errid = 0;
     if (len < 7) { as_agal_errmsg = "AGAL: bytecode too short for header"; return NULL; }
     if (bytes[0] != 0xA0) { as_agal_errmsg = "AGAL: bad magic (expected 0xA0)"; return NULL; }
     if (bytes[5] != 0xA1) { as_agal_errmsg = "AGAL: bad program type marker (expected 0xA1)"; return NULL; }
@@ -15227,9 +15266,9 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
     // Context3D profile (measured on adl 51.4.1: baseline/baselineExtended accept
     // nothing above 1, standard accepts 2, standardExtended accepts 3, and only
     // "enhanced" accepts 4 -- asaot3d requests "enhanced" and assembles 4). The
-    // 0xA0/0xA1 encoding and the instruction slots are identical across 1..4, and
-    // this translator never gates register limits on the version, so decoding a v4
-    // program needs no other change. asaot3d emits no v4-only opcode.
+    // 0xA0/0xA1 encoding and the instruction slots are identical across 1..4.
+    // AGAL4's own addition is vertex texture fetch ('tld' in a VERTEX program,
+    // see the stage rules in the decode loop).
     if (version < 1 || version > 4) { as_agal_errmsg = "AGAL: unsupported version"; return NULL; }
     int isFragment = bytes[6] & 1;
     agal_is_frag = isFragment;
@@ -15252,6 +15291,34 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         unsigned op_tok = as_agal_u32(bytes + pos); pos += 4;
         int op = op_tok & 0xFF;
         if (op > 0x2e || agal_op_name[op] == NULL) { as_agal_errmsg = "AGAL: invalid opcode"; return NULL; }
+        // ---- Stage rules (measured on adl 51.4.1, temp/vtfprobe) ----
+        // AIR's AGAL validator keeps two opcode families apart by stage:
+        //   * 'tex', 'kil', 'ddx', 'ddy' are fragment-only. A vertex program using
+        //     any of them is rejected at upload with #3622 "Opcode <name> only
+        //     allowed in fragment programs" -- there is NO implicit vertex texture
+        //     fetch through 'tex' in any AGAL version or profile.
+        //   * 'tld' is the reverse: vertex-only (#3803 "Opcode tld only allowed in
+        //     vertex programs") and it IS AGAL4's vertex texture fetch, gated on the
+        //     version (#3805 "Vertex Texture Fetch is supported in Agal version 4
+        //     and above").
+        // Both are AIR-defined behavior, so they are refused here with AIR's own
+        // numbering and wording rather than being translated into shader source
+        // the driver would reject with a much less useful message.
+        if (!isFragment && (op == 0x28 || op == 0x27 || op == 0x1a || op == 0x1b)) {
+            char reason[96];
+            snprintf(reason, sizeof(reason), "Opcode %s only allowed in fragment programs", agal_op_name[op]);
+            agal_validation_fail(3622, reason, n + 1);
+            return NULL;
+        }
+        if (isFragment && op == 0x2e) {
+            agal_validation_fail(3803, "Opcode tld only allowed in vertex programs", n + 1);
+            return NULL;
+        }
+        if (!isFragment && op == 0x2e && version < 4) {
+            // AIR's wording carries no "at token N" suffix for this one.
+            agal_validation_fail_plain(3805, "Vertex Texture Fetch is supported in Agal version 4 and above.");
+            return NULL;
+        }
         int nreg = agal_op_nreg[op];
         int hasDst = (nreg >= 1) && !agal_op_nodest[op];
         int hasSrc1 = nreg >= (hasDst ? 2 : 1);
@@ -15330,6 +15397,18 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
                 needComma = 1;
             }
             as_json_buf_append_cstr(&b, needComma ? ",\\n  constant float4* vc [[buffer(0)]]" : "  constant float4* vc [[buffer(0)]]");
+            // AGAL4 vertex texture fetch ('tld' in this program): the vertex entry
+            // point needs the same texture + sampler pairs the fragment one takes.
+            // Metal indexes textures and samplers per STAGE, so binding them to the
+            // fragment encoder only would fail the draw with "missing Texture
+            // binding at index N for fsN", and smpN must exist too because Metal
+            // requires state for every [[sampler(N)]] a function declares. Unit N is
+            // the AGAL sampler register number and it is SHARED with the fragment
+            // stage -- measured on adl 51.4.1: setTextureAt(1, t) feeds
+            // 'tld ..., vs1', and AIR's unused-sampler check (#3697) then names
+            // unit 2 rather than 1, i.e. it counted unit 1 as used.
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[64]; sprintf(t, ",\\n  %s fs%d [[texture(%d)]]", agal_is_cube(i) ? "texturecube<float>" : "texture2d<float>", i, i); as_json_buf_append_cstr(&b, t); }
+            for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[48]; sprintf(t, ",\\n  sampler smp%d [[sampler(%d)]]", i, i); as_json_buf_append_cstr(&b, t); }
             as_json_buf_append_cstr(&b, "\\n) {\\n  VSOut out;\\n  float4 op;\\n");
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  float4 vt%d;\\n", i); as_json_buf_append_cstr(&b, t); }
             for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[32]; sprintf(t, "  float4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
@@ -15402,7 +15481,17 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         // undefined.
         for (int i = 0; i < 256; i++) if (agal_is_used(isFragment ? AGAL_V : AGAL_VA, i)) { char t[48]; sprintf(t, "%s vec4 %s%d;\\n", isFragment ? "varying" : "attribute", isFragment ? "v" : "va", i); as_json_buf_append_cstr(&b, t); }
         if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[40]; sprintf(t, "varying vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
-        if (isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[40]; sprintf(t, "uniform %s fs%d;\\n", agal_is_cube(i) ? "samplerCube" : "sampler2D", i); as_json_buf_append_cstr(&b, t); }
+        // Sampler uniforms are declared for BOTH stages: ES 1.00 has no stage
+        // split for uniforms, and AGAL4's vertex texture fetch ('tld' in this
+        // program) reads the same 'uniform sampler2D fsN'. The fragment stage's
+        // declaration was gated on isFragment before, so a vertex sampler was
+        // simply undeclared and the shader failed to compile.
+        //
+        // The LOD-explicit fetch in ES 1.00 is texture2DLod/textureCubeLod, which
+        // is a VERTEX-stage built-in (§8.7) -- exactly where 'tld' is legal. It is
+        // core, not the GL_EXT_shader_texture_lod extension (that one only adds the
+        // *fragment* spellings).
+        for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[40]; sprintf(t, "uniform %s fs%d;\\n", agal_is_cube(i) ? "samplerCube" : "sampler2D", i); as_json_buf_append_cstr(&b, t); }
         as_json_buf_append_cstr(&b, "void main() {\\n");
         // Same four-component local as the other two targets (see the AGAL_OD arm
         // in agal_reg_name): the depth builtin itself is a scalar.
@@ -15532,6 +15621,37 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
     memcpy(out, b.buf, b.len + 1);
     free(b.buf);
     return out;
+}
+
+// Validate a VERTEX/FRAGMENT pair the way adl does at Program3D.upload, without
+// building any shader text. Returns 1 when the pair is legal, 0 otherwise with
+// as_agal_errmsg/as_agal_errid set to AIR's message and number.
+//
+// Two rules live here because they need BOTH programs:
+//   * #3757 -- the two stages must agree on the AGAL version (measured: a v4
+//     vertex program with a v1 fragment one throws
+//     "AGAL validation failed: Vertex and fragment program need to have the same
+//     version.").
+//   * everything else is per-program (stage rules, nrm mask, read-before-write),
+//     and runs through the real translator so the two can never drift.
+//
+// The translated text is dropped on the floor rather than freed: as_agal_translate
+// returns an as_str_alloc string, which lives on the GC heap (freeing it aborts
+// with "pointer being freed was not allocated"). Upload happens once per program
+// and the draw path re-translates and caches on the Program3D, so this is one
+// extra pass at upload time only.
+static int as_agal_validate_pair(const unsigned char* vb, int vlen, const unsigned char* fb, int flen, int target) {
+    if (as_agal_translate(vb, vlen, target) == NULL) return 0;
+    if (as_agal_translate(fb, flen, target) == NULL) return 0;
+    if (vlen >= 7 && flen >= 7 && vb[0] == 0xA0 && fb[0] == 0xA0) {
+        unsigned vv = as_agal_u32(vb + 1), fv = as_agal_u32(fb + 1);
+        if (vv != fv) {
+            as_agal_errmsg = "AGAL validation failed: Vertex and fragment program need to have the same version.";
+            as_agal_errid = 3757;
+            return 0;
+        }
+    }
+    return 1;
 }
 
 // Shader language handed to the AGAL translator must match the linked Stage3D

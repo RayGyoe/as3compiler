@@ -674,11 +674,18 @@ static int s3d_make_root_sig(S3DContext* c) {
   p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   p[2].DescriptorTable.NumDescriptorRanges = 1;
   p[2].DescriptorTable.pDescriptorRanges = &ranges[0];
-  p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  // SRV and sampler tables must be visible to BOTH stages: AGAL4's vertex
+  // texture fetch ('tld' in a vertex program) samples register(tN)/sN from the
+  // vertex shader, and a PIXEL-only table makes that read undefined (the table
+  // is bound but the VS cannot see it, so tld returns garbage/zero). The
+  // translator emits one cbuffer per stage on b0 and keeps those two VISIBILITY-
+  // specific (p[0]/p[1]); textures and samplers use one index space for both
+  // stages, exactly like Stage3D's shared texture units.
+  p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   p[3].DescriptorTable.NumDescriptorRanges = 1;
   p[3].DescriptorTable.pDescriptorRanges = &ranges[1];
-  p[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  p[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
   D3D12_ROOT_SIGNATURE_DESC d = {};
   d.NumParameters = 4;

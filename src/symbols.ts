@@ -7665,6 +7665,13 @@ export class SymbolTable {
           // sampler state away3d and Starling ever set.
           ['samplerUsed', prf({ kind: 'int' })],
           ['samplerFlags', prf({ kind: 'int' })],
+          // Bumped by every upload(). Context3D_submit caches the compiled GPU
+          // program on the Context3D keyed by the Program3D POINTER, so uploading
+          // new bytecode into a Program3D that has already been drawn has to
+          // invalidate that cache -- AIR recompiles the new pair, and without the
+          // counter a re-upload kept drawing with the previous shader (which is
+          // how a vertex-texture program silently rendered as its predecessor).
+          ['uploadSerial', prf({ kind: 'int' })],
         ]),
         methods: new Map([
           ['upload', prm({ kind: 'void' }, [
@@ -7875,8 +7882,11 @@ export class SymbolTable {
         // dereferences it — it is passed back verbatim to every as_s3d_* call.
         ['gpu', c3f({ kind: 'null' })],
         // Last Program3D compiled to a Metal pipeline (drawTriangles caches on
-        // the pointer so the MSL compile runs once per program, not per frame).
+        // the pointer so the MSL compile runs once per program, not per frame),
+        // plus the upload serial that program had when it was compiled -- a
+        // re-upload of the same Program3D bumps the serial and forces a recompile.
         ['gpuProgram', c3f({ kind: 'object', className: 'Program3D' })],
+        ['programGpuSerial', c3f({ kind: 'int' })],
         ['clearR', c3f({ kind: 'number' })],
         ['clearG', c3f({ kind: 'number' })],
         ['clearB', c3f({ kind: 'number' })],

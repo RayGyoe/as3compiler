@@ -25750,7 +25750,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('int t = (target != NULL && strcmp(target, "glsl") == 0) ? 1 : ((target != NULL && strcmp(target, "hlsl") == 0) ? 2 : 0);');
     this.line('char* r = as_agal_translate((const unsigned char*)bytes->data, bytes->length, t);');
-    this.line('if (r == NULL) { as_throw(Error_new((char*)as_agal_errmsg, 0)); return NULL; }');
+    this.line('if (r == NULL) { as_throw(Error_new((char*)as_agal_errmsg, as_agal_errid)); return NULL; }');
     this.line('return r;');
     this.indent--;
     this.line('}');
@@ -25947,22 +25947,40 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
-    this.line('void Program3D_ctor(Program3D* o) { Object_ctor((Object*)o); o->vertexProgram = NULL; o->fragmentProgram = NULL; o->samplerUsed = 0; o->samplerFlags = 0; }');
+    this.line('void Program3D_ctor(Program3D* o) { Object_ctor((Object*)o); o->vertexProgram = NULL; o->fragmentProgram = NULL; o->samplerUsed = 0; o->samplerFlags = 0; o->uploadSerial = 0; }');
     this.line('Program3D* Program3D_new(void) { Program3D* o = (Program3D*)gc_alloc(GCT_CLASS, sizeof(Program3D)); o->vtable = &Program3D_vt; Program3D_ctor(o); return o; }');
     this.line('void Program3D_upload(void* _this, ByteArray* vertexProgram, ByteArray* fragmentProgram) {');
     this.indent++;
     this.line('Program3D* o = (Program3D*)_this;');
     this.line('o->vertexProgram = vertexProgram; gc_write_barrier((void*)vertexProgram);');
     this.line('o->fragmentProgram = fragmentProgram; gc_write_barrier((void*)fragmentProgram);');
-    // Decode the sampler state the fragment program's `tex`/`tld` flags ask for,
-    // once, here (the ByteArray is retained and must not be mutated after
-    // upload). Context3D_setProgram applies it to the GPU unit state, so the
-    // state lands in call order relative to setSamplerStateAt. See
-    // as_agal_sampler_flags for why the AGAL flags are the real sampler state
-    // under Stage3D.
-    this.line('o->samplerUsed = 0; o->samplerFlags = 0;');
+    // Decode the sampler state the programs' `tex`/`tld` flags ask for, once,
+    // here (the ByteArray is retained and must not be mutated after upload).
+    // Context3D_setProgram applies it to the GPU unit state, so the state lands
+    // in call order relative to setSamplerStateAt. See as_agal_sampler_flags for
+    // why the AGAL flags are the real sampler state under Stage3D.
+    //
+    // The VERTEX program is decoded first because AGAL4's vertex texture fetch
+    // ('tld') samples the same unit space: a unit the vertex stage samples needs
+    // its filter/wrap bits as much as a fragment one. The fragment program runs
+    // second, so on a unit both stages touch the fragment flags win -- the same
+    // "last writer wins in call order" rule setSamplerStateAt follows.
+    this.line('o->samplerUsed = 0; o->samplerFlags = 0; o->uploadSerial++;');
+    this.line('if (o->vertexProgram != NULL && o->vertexProgram->data != NULL)');
+    this.line('  as_agal_sampler_flags((const unsigned char*)o->vertexProgram->data, o->vertexProgram->length, (unsigned int*)&o->samplerUsed, (unsigned int*)&o->samplerFlags);');
     this.line('if (o->fragmentProgram != NULL && o->fragmentProgram->data != NULL)');
     this.line('  as_agal_sampler_flags((const unsigned char*)o->fragmentProgram->data, o->fragmentProgram->length, (unsigned int*)&o->samplerUsed, (unsigned int*)&o->samplerFlags);');
+    // Validate the pair NOW, which is where adl validates it: measured on
+    // 51.4.1 (temp/vtfprobe), Program3D.upload throws Error #3622/#3803/#3805/
+    // #3757 itself and the first draw never happens. Translating here would
+    // build a second copy of the source, so this runs the translator's own
+    // checks through a validation-only entry point that discards the text.
+    this.line('if (o->vertexProgram != NULL && o->vertexProgram->data != NULL && o->fragmentProgram != NULL && o->fragmentProgram->data != NULL) {');
+    this.indent++;
+    this.line('if (!as_agal_validate_pair((const unsigned char*)o->vertexProgram->data, o->vertexProgram->length, (const unsigned char*)o->fragmentProgram->data, o->fragmentProgram->length, ASC_AGAL_TARGET))');
+    this.line('  as_throw(Error_new((char*)as_agal_errmsg, as_agal_errid));');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('void Program3D_dispose(void* _this) { Program3D* o = (Program3D*)_this; o->vertexProgram = NULL; o->fragmentProgram = NULL; }');
@@ -26576,7 +26594,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->blendSource = NULL; o->blendDest = NULL;');
     this.line('o->depthTestOn = false; o->depthCompare = NULL; o->cullMode = NULL;');
     this.line('o->program = NULL; o->indexBuffer = NULL; o->vc = NULL; o->fc = NULL;');
-    this.line('o->gpu = NULL;');
+    this.line('o->gpu = NULL; o->gpuProgram = NULL; o->programGpuSerial = 0;');
     this.line('o->stencilFace = NULL; o->stencilCompare = NULL; o->stencilBothPass = NULL; o->stencilDepthFail = NULL; o->stencilDepthPassStencilFail = NULL; o->stencilRefValue = 0;');
     this.line('o->scissorOn = false; o->scissorX = 0.0; o->scissorY = 0.0; o->scissorW = 0.0; o->scissorH = 0.0;');
     this.line('o->maxBackBufferWidth = 16384; o->maxBackBufferHeight = 16384;');
@@ -26786,7 +26804,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // caches compiled programs, so a scene that alternates programs between draws
     // (away3d's SkyBox renders its torus and its skybox with two programs, one per
     // draw) binds the cached program instead of recompiling MSL/GLSL every draw.
-    this.line('if (o->program != NULL && o->program != o->gpuProgram) {');
+    // The cache key is the Program3D pointer PLUS its upload serial: re-uploading
+    // new bytecode into a program that has already drawn must recompile, the way
+    // AIR does, instead of silently reusing the previous pair's shaders.
+    this.line('if (o->program != NULL && (o->program != o->gpuProgram || o->programGpuSerial != o->program->uploadSerial)) {');
     this.indent++;
     this.line('ByteArray* vp = o->program->vertexProgram;');
     this.line('ByteArray* fp = o->program->fragmentProgram;');
@@ -26794,10 +26815,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('char* vs = as_agal_translate((const unsigned char*)vp->data, vp->length, ASC_AGAL_TARGET);');
     this.line('char* fs = as_agal_translate((const unsigned char*)fp->data, fp->length, ASC_AGAL_TARGET);');
-    this.line('if (vs == NULL || fs == NULL) { as_throw(Error_new((char*)as_agal_errmsg, 0)); return; }');
+    this.line('if (vs == NULL || fs == NULL) { as_throw(Error_new((char*)as_agal_errmsg, as_agal_errid)); return; }');
     this.line('char errbuf[512];');
     this.line('if (!as_s3d_compile(o->gpu, (void*)o->program, vs, fs, errbuf, (int)sizeof(errbuf))) { as_throw(Error_new(errbuf, 0)); return; }');
-    this.line('o->gpuProgram = o->program;');
+    this.line('o->gpuProgram = o->program; o->programGpuSerial = o->program->uploadSerial;');
     this.indent--;
     this.line('}');
     this.indent--;

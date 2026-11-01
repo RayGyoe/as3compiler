@@ -808,6 +808,80 @@ texture) and only needs `s3d_readback_half`. All three backends export the same 
 **Acceptance**: `examples/tex-format.as` (40 assertions) and `stage3d/texture-formats` (17 source-level
 nails, including "the `profile` read-back and the `#3759` gate use the same switch").
 
+### 9.17 AGAL4 vertex texture fetch: `tld` stage/version gates and the three backend bindings (stage three-hundred-fifty-two)
+
+#### AIR has exactly one legal VTF path
+
+Measured (`temp/vtfprobe/`, adl 51.4.1, `enhanced` profile, OpenGL (Enhanced)):
+
+| Form | AIR |
+|---|---|
+| vertex `tex`, AGAL v1/v3/v4 | `Error #3622: AGAL validation failed: Opcode tex only allowed in fragment programs at token 1 of vertex program.` |
+| vertex `tld`, AGAL3 | `Error #3805: AGAL validation failed: Vertex Texture Fetch is supported in Agal version 4 and above.` |
+| fragment `tld`, AGAL4 | `Error #3803: AGAL validation failed: Opcode tld only allowed in vertex programs at token 1 of fragment program.` |
+| VS v4 + FS v1 | `Error #3757: AGAL validation failed: Vertex and fragment program need to have the same version.` |
+
+All four are thrown by **`Program3D.upload`**, not by the first draw. `kil`/`ddx`/`ddy` are fragment-only
+like `tex` (same #3622). Note that `#3805`/`#3757` carry **no** ` at token N` suffix while `#3622`/`#3803`
+do -- we copy both wordings verbatim instead of forcing one template onto four messages.
+
+#### Vertex sampler encoding and the shared unit space
+
+The second operand of a vertex `tld` is **register type 5** (`vs`, the same number as the fragment `fs`),
+the low 16 bits are the sampler number and byte 2 is the LOD. Vertex and fragment **share one 0..7 unit
+space** (measured: binding only `unit0` while the program references `vs1` gives
+`#3663 Sampler 1 binds an undefined texture`, and AIR's unused-sampler check `#3697` names bound-but-unused
+units -- i.e. "unit 1 is used" is one table). So `setTextureAt(1, t)` + `setSamplerStateAt(1, ...)` feed both stages.
+
+#### Sampling semantics (the part we replicate)
+
+- **uv -> texel mapping is the same as the fragment `tex`**: under NEAREST on a 2x2, uv
+  (0.25,0.25)/(0.75,0.25)/(0.25,0.75)/(0.75,0.75) fetch red/green/blue/white, row 0 being the top row.
+- **Sampling happens per vertex and the result is interpolated** (what VTF means): per-vertex uv produces
+  a four-corner gradient; the fragment stage sees interpolated colours.
+- **The filter / wrap bits apply**: at uv(0.5,0.5) NEAREST=`ffffff` and LINEAR=`808080`; at uv(2.4,0.4)
+  CLAMP=`00ff00` and REPEAT=`ff0000`.
+- **LOD byte**: AIR was measured to **ignore** it (on a three-level mip chain, lod=0/1/2/5/16/32 all sample
+  mip0). We use the value as the instruction means it (`level(lod)` / `SampleLevel` / `texture2DLod`) --
+  more faithful to the bytecode, and programs that ran correctly on AIR wrote lod=0 anyway.
+
+#### The three translators
+
+| Target | Declaration in the vertex entry point | Fetch |
+|---|---|---|
+| MSL | `texture2d<float> fsN [[texture(N)]]` + `sampler smpN [[sampler(N)]]` | `fsN.sample(smpN, uv, level(lod))` |
+| HLSL | `Texture2D<float4> fsN : register(tN)` + `SamplerState smpN : register(sN)` | `fsN.SampleLevel(smpN, uv, lod)` |
+| GLSL | `uniform sampler2D fsN;` (**no longer fragment-only**) | `texture2DLod` / `textureCubeLod` |
+
+MSL emitted its texture/sampler parameters for the **fragment** entry point only; a vertex entry point
+without `[[texture(N)]]` makes Metal reject the draw (`missing Texture binding at index N`), and every
+`[[sampler(N)]]` a function declares needs bound state -- hence `fsN` and `smpN` are emitted as a pair and
+the **vertex stage is bound too** (below). GLSL ES 1.00's `texture2DLod` is a **vertex** built-in
+(`GL_EXT_shader_texture_lod` only adds the fragment spellings), so no extension and no GLSL 3.00 upgrade.
+
+#### The three backends
+
+| Backend | Change |
+|---|---|
+| Metal (`vendor/stage3d_glue.mm`) | Metal keeps texture/sampler tables **per stage**, so `s3d_draw` adds `setVertexTexture:atIndex:` / `setVertexSamplerState:atIndex:` alongside the existing fragment calls (same per-unit state, all 8 bound unconditionally; binding an index the entry point does not declare is legal) |
+| D3D12 (`vendor/stage3d_d3d.cc`) | Root signature p[2] (SRV table) / p[3] (sampler table) move from `D3D12_SHADER_VISIBILITY_PIXEL` to `ALL` (**p[0]/p[1] stay per stage**, since both use `b0`) |
+| WebGL (`vendor/stage3d_webgl.cc`) | No change: the unit space is shared and `glUniform1i(fsN -> N)` addresses one uniform for both stages |
+
+#### A cache hole fixed along the way
+
+`Context3D_submit` compiles lazily keyed on the **`Program3D` pointer** (a program drawn repeatedly
+compiles once). Re-`upload`ing new bytecode into the same `Program3D` does not change the pointer, so the
+new shaders **never took effect** and the previous pair kept drawing -- which is exactly how a vertex
+texture program rendered its predecessor's output. Fixed with `Program3D.uploadSerial` (bumped on every
+upload) plus `Context3D.programGpuSerial`: the cache key is now "same pointer **and** same serial".
+
+**Acceptance**: `examples/vertex-texture.as` (26 checks on a real Metal device: three-target text, four
+error numbers, texel mapping, NEAREST/LINEAR, CLAMP/REPEAT, per-vertex interpolation; 20 checks in the
+pure-C state machine); `stage3d/vertex-texture` in `test/unit/stage3d.ts` (16 source-level pins: stage
+rules, three-target declarations, three backend bindings, upload-time validation, cache invalidation).
+Like `stage83.as` the example carries a `vertex-texture.build.json` and is **verified by hand** (Metal
+builds are not part of the automated suite).
+
 ## 10. The Windows / Direct3D 12 Backend (landed, stage one-hundred-thirty-two)
 
 The third backend, `vendor/stage3d_d3d.cc` (~2,290 lines), is **structurally isomorphic** to

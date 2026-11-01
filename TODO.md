@@ -18835,7 +18835,60 @@ path 补齐，并用单元钉把四条路径（方法/自由函数/构造函数/
 按新语义改写；真机三例：`stage83`（Metal `passed`）、`temp/halfrt/Sample.as`（`half 0.25` →
 `0x404040`）、`temp/halfrt/Bmp.as`（四角与 `Bmp.as` 的 adl 读数逐字节相同）。
 
+### 阶段三百五十二：AGAL4 顶点纹理取值（VTF）（v0.4.312 → v0.4.313）
+
+**起点**：阶段三百五十一 只把 AGAL4 的**版本**放行（`f9a2292`：版本上限 3 → 4、指令预算 200 → 400），
+真正的顶点取样零实现 —— 三个翻译器的 sampler 声明段都只对 `isFragment` 发，MSL 顶点入口没有
+`[[texture(N)]]`、D3D12 根签名把 SRV/sampler 表钉在 `VISIBILITY_PIXEL`。且此前**没有人量过 AIR 到底
+怎么支持 VTF**，方向本身就是猜的。
+
+**先量再改**（`temp/vtfprobe/`，adl 51.4.1、`enhanced`、OpenGL (Enhanced)；记录见该目录 `README.md`）：
+
+- **顶点 `tex` 在任何 AGAL 版本/档位都被拒**：v1/v3/v4 全是
+  `#3622 Opcode tex only allowed in fragment programs at token 1 of vertex program`，**上传统就抛**
+  （不是等 draw）。`kil`/`ddx`/`ddy` 同属片元专用、同一条号。⇒ AIR 没有「顶点 `tex` = VTF」这条路。
+- **VTF 只能走 `tld`，且只能 AGAL4**：`tld` 在顶点 v3 → `#3805 Vertex Texture Fetch is supported in
+  Agal version 4 and above.`（**无 token 后缀**）；`tld` 在片元 → `#3803 Opcode tld only allowed in
+  vertex programs at token 1 of fragment program`；VS v4 + FS v1 → `#3757 Vertex and fragment program
+  need to have the same version.`（**无 token 后缀**）。
+- **顶点 sampler 是 register type 5**，低 16 位 = 采样器号、byte2 = LOD；用错 type → `#3693`/`#3637`。
+- **顶点/片元共用同一个 0..7 单元空间**（只绑 unit0 而引用 `vs1` → `#3663`；未使用的绑定 →
+  `#3697`/`#3607`）。
+- **采样语义**：uv→纹素映射与片元 `tex` 相同（2x2 NEAREST 下四角取红/绿/蓝/白）；**取样逐顶点、
+  结果插值**（per-vertex uv 得到四角渐变）；filter 位（`uv(0.5,0.5)`：nearest `ffffff` / linear
+  `808080`）与 wrap 位（`uv(2.4,0.4)`：clamp `00ff00` / repeat `ff0000`）都生效；**LOD 字节被忽略**
+  （三级 mip 链上 lod=0/1/2/5/16/32 一律采 mip0）。
+
+**改动**（`src/runtime.ts` / `src/emit.ts` / `src/symbols.ts` + 两个后端 glue）：
+
+1. `as_agal_translate` 加 **stage 规则**：顶点 `tex`/`kil`/`ddx`/`ddy` → `#3622`、片元 `tld` → `#3803`、
+   顶点 `tld` 且 `version < 4` → `#3805`；新增 `as_agal_errid` 把错误号一路带到 `Error`（此前一律 0），
+   `agal_validation_fail`/`_plain` 两个模板对应「有/无 token 后缀」的两种 AIR 文案。
+2. 三目标顶点声明：MSL `texture2d<float> fsN [[texture(N)]]` + `sampler smpN [[sampler(N)]]`（**成对**，
+   Metal 要求声明的每个 sampler 索引都有状态）、HLSL `register(tN)`/`register(sN)`、GLSL
+   `uniform sampler2D fsN`（去掉 `isFragment` 门）+ `texture2DLod`/`textureCubeLod`（ES 1.00 的
+   顶点内建，不需要扩展）。
+3. **`tld` 的取值臂**：`level(lod)` / `SampleLevel` / `texture2DLod`，cube 走 `textureCubeLod`。
+4. 三后端：Metal 补 `setVertexTexture:atIndex:`/`setVertexSamplerState:atIndex:`（Metal 的
+   texture/sampler 表按阶段分开）；D3D12 根签名 p[2]/p[3] 改 `D3D12_SHADER_VISIBILITY_ALL`
+   （p[0]/p[1] 的两个 cbuffer 仍按阶段分开，因为都占 `b0`）；WebGL 无需改（单元空间本就共享）。
+5. **上传期成对校验** `as_agal_validate_pair`：两阶段都跑一遍真翻译器（不复制校验逻辑），再比版本
+   （`#3757`）。`Program3D.upload` 就抛 —— 与 AIR 同时机。顶点程序的 AGAL sampler 旗标也一并解码
+   （片元在后，同一单元片元优先，与 `setSamplerStateAt` 的「后者生效」同序）。
+6. **顺手修掉一个缓存缺口**：`Context3D_submit` 的惰性编译按 `Program3D` 指针缓存，于是**往同一个
+   `Program3D` 重新 upload 新字节码永远不生效**、继续用上一份着色器 —— 这正是本轮第一次真机跑时
+   「顶点纹理程序渲染出前一个程序结果」的真根因。`Program3D.uploadSerial`（每次 upload 自增）+
+   `Context3D.programGpuSerial` 把缓存键改成「指针同 **且** 序号同」。
+
+**验收**：`examples/vertex-texture.as` —— Metal 真机 26 条（三目标文本、四个错误号、纹素映射、
+NEAREST/LINEAR、CLAMP/REPEAT、逐顶点插值）、纯 C 状态机 20 条；`test/unit/stage3d.ts` 新增
+`stage3d/vertex-texture` 16 条源级钉子；`docs/{zh-cn,en}/display3d.md` §9.17 新章 + 两份 README 的
+示例条目同步。该示例带 `vertex-texture.build.json`，与 `stage83.as` 一样是**手工**验收（链 Metal 的
+构建不进自动回归）。
+
+
 ### 遗留待开发
+> **2026-11-02 追加（阶段三百五十二：AGAL4 顶点纹理取值）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **91 → 90 行**（`未开始` **71 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1）。**移出 1 行**：「顶点纹理取值（VTF）」——三翻译器的顶点 sampler 声明 + 三后端绑定 + stage/version 门控（`#3622`/`#3803`/`#3805`/`#3757`）全部落地，Metal 真机 26 条断言。**同阶段修净、不占表**：① `Program3D` 重 upload 不重新编译着色器（缓存键是指针，改成「指针 + `uploadSerial`」）；② `as_agal_errid` 让 AGAL 校验错误的 `errorID` 与 AIR 一致（此前恒 0）。**一处刻意的实现分歧**：AIR 的顶点 `tld` **忽略 LOD 字节**（恒采 mip0），我们按指令本意用该值 —— 在 AIR 上跑对的程序都写 lod=0，故行为等价。
 > **2026-11-02 追加（阶段三百五十一：`Context3DTextureFormat` 六常量 · 半浮点纹理 · `ignoreResourceLimits` 真实语义）**：**新登记 0 行 / 改写 1 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **93 → 91 行**（`未开始` **73 → 71** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 2 行**：① 「`Context3DTextureFormat` 与 AIR 官方全集有 4 处偏差」（六常量对齐、`RGBA` 删除、`#2008`/`#3745`/`#3759` 按实测顺序接入、六种格式的上传解码与字节数全部落地）；③ 「旗标打开后的显存预检与分配失败上报」（`as_tex_check_budget` 单次分配估算 + `as_tex_alloc_failed` 在 create 与三个上传入口翻译后端失败，守卫无后端构建）。**改写 1 行**：② 收窄成「顶点纹理取值（VTF）」——AGAL4 版本与指令预算已放行（`f9a2292`），剩下的只有三翻译器的顶点 sampler 声明与三后端绑定，属独立立项。**一处旧口径被推翻并同阶段修净（不占表）**：阶段二百二十七 把 `ignoreResourceLimits=true` 实现成「上限放到设备上限 16384」，实测（三档一致）是「上限不动、只把 `#3683` 换成 `#3684`」——旧实现比 AIR 更宽松，正是文档警告的那个输入；该分歧连同 `test/unit/stage3d.ts` 的 8 号钉一起按新口径改写，`docs/{zh-cn,en}/display3d.md` §9.14 正文同步。**另记一条 AIR 自身行为**：present 之后读回半浮点渲染目标恒为 `ff000000`（`Half3.as`），我们连续返回 `ff8040bf`（更正确），**不复制**。
 > **2026-11-01 追加（撤表：`walk-m26` 的光照点积差是取样口径，不是渲染分歧）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 主表数据行 **94 → 93 行**（`未开始` **74 → 73** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 1 行**是阶段三百四十八 登记的「`AGALRenderer` 的 PBR 主体在 AOT 与 `adl` 上 `dotNL`/`dotNV`/`dotNH` 系统性偏大」—— 它在 `asaot3d` 侧已由 `three-api-design.md` §29.8 证伪并撤回，**结论是取样口径**：`adl` 的 stage 一直是 **1000×768**（描述符含 32px 标题栏），AOT 的 stage 是 **1000×800**，NDC 差 4% 就足以把同一个分数框挪到球面别处，而 GGX 尾部对位置极敏感（当时「中位数几乎相同、差在尾部」正是这个特征）。把 `adl` 描述符高度临时改 **832** 后两端逐项相同（雾关本体 `38.69` 对 `37.80`、地面 `27.22` 对 `27.28`）。⇒ **不是 `adl` 跑得对我们跑不对**，按 §1.5 不属遗留缺陷，整行撤表；**判「谁对」必须对着参考实现**（`asaot3d/tools/refscene/` 的 three.js 真值 + 同口径 `boxstats.mjs`），不再用「我们的第二个后端」当 oracle。**真正还欠的两条已改挂在 `asaot3d` 侧**（`M26-R1` 直接光镜面项比 three.js 亮 3.4×、`M26-R2` 雾抬升 +5.50 对参考 +9.30，见 `three-api-design.md` §29.8 / §30.7），**编译器侧不留占位**。**口径提醒**：跨端像素比对前先读两端 `Stage3DApp ready: WxH` 对齐 **stage** 尺寸（D142/R56 的既有教训），否则量到的是透视投影差，不是渲染差。
 > **2026-11-01 追加（阶段三百五十：构造函数里的兄弟嵌套函数）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 主表数据行 **94 → 94 行**（项数按表内实际行数复数为准）。**改写 1 行**是 `toFixed` 那行：本阶段为它写的探针顺带撞出了上面那个编译缺陷，同时把它的证据从「27 例、规则不可命名」升级成「84 格双端矩阵、**分歧全部落在 `|v|<1`**、`|v|≥1` 的 60 格完全一致」，并把「为什么仍不能动手」写成了可复用的否定清单（半上入/半偶/单精度/最短十进制四类假设各自的死因），避免下一轮重做。**本阶段修净的不占表**：构造函数/类体静态块漏发共享 cell 的 `_cellN* cellN = _cellN_alloc();`（`cellN` 未声明 ⇒ 生成的 C 编不过）是本轮**新量到并同阶段修掉**的，按「已完成项落地即移出 / 修净不占表」不登记。**口径提醒**：这类「产物根本编不过」的缺陷不会被任何像素/数值回归发现（示例套件里的示例一旦编不过就是红的，但**没人写过的形状**永远不会出现在套件里），所以修它必须同时补一条**覆盖函数体种类**的单元钉（方法 / 自由函数 / 构造函数 / 类体静态块四条 path 各一钉 + 「每个 `_cellN` 都必须在某处被分配」的全域不变量），只补行为示例不够。
@@ -19119,7 +19172,6 @@ path 补齐，并用单元钉把四条路径（方法/自由函数/构造函数/
 | **窗口几何的 Windows 端残余**（Windows 端 `<transparent>` 仍未实现 / 四类未测面剩下的两项） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：原来列的四处里，① 最大化尺寸口径 **已定** —— 那是 `WS_MAXIMIZEBOX` 这一位（在 ⇒ 可用区 `2576x1675`，不在 ⇒ 整块显示器 `2576x1723`，adl 与我们在两档描述符下**逐字相同**），② 横向边框 **已修**（`b_left` 四处同源），③ 描述符成员 **已接线**（`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>`），只剩下面两处；**2026-10-23 阶段二百五十七 再收窄**：① 的**生成侧与 macOS 侧已接线**，剩下的只是 Windows 的原生实现） | **① `<transparent>` 的 Windows 端**：描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions.transparent` → `sk_window_set_transparent`、合成步清 alpha 0、macOS 的 `NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明，**全部已在阶段二百五十七 落地**；Windows 侧仍要 `WS_EX_LAYERED` + 逐帧 alpha（当前**报明一次**，不给假透明窗）；**② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没接线/没量」：① Windows 端需要一张分层窗（`WS_EX_LAYERED` + 逐帧 alpha）并把同样的「清 alpha 0」口径搬过去；② `closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
 | **初始窗的框/客户区单位**（描述符 `<width>/<height>` 是**框**，我们当**客户区** ⇒ 窗大一圈、舞台也大一圈） | 未开始（2026-10-19 阶段二百零五 实测登记；**两端同源，非 Windows 专属**） | Windows 实机孪生探针（`temp/nwwin/wprobe/`，`<width>366</width><height>630</height>`）：adl `bounds=366x630` + `stage=350x591`；我们 `bounds=382x669` + `stage=366x630`，**恰好差 16x39 = 左右边框 8+8 与标题栏 31 + 下边框 8**。根因在生成侧：引导代码把描述符的 `width`/`height` 当**客户区**交给 `Stage_showWindow`（它拿同一对数去置 `design_w/h`、`lw/lh`、`pw/ph`），窗口又按同一对数开 ⇒ **两道都大一圈**（AIR 的 `stage` 才是客户区，`NativeWindow.bounds` 是框）。macOS 走同一条生成路径 ⇒ 同一缺陷在 macOS 上应表现为差一个 `32pt` 标题栏，**本机不可实测** | 需与之俱动：① 窗口按**框**尺寸建（或建完读回客户区再定尺寸）；② 舞台/表面用**真实客户区**；③ `Stage.stageWidth/Height` 与 `design_*` 的口径一次对齐；④ 全 GUI 示例 + 像素 harness 同批回归（改的是**每扇窗的初始几何**）。半修（只改窗口不改舞台）会得到**被缩放**的画面，比现状更糟 ⇒ 必须成批做，先立项再动手。 |
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
-| **顶点纹理取值（VTF，AGAL3 的 `tex` 出现在顶点阶段 / AGAL4）** | 未开始（阶段二百二十六 分档实测登记；**阶段三百五十一 收窄**：AGAL4 版本与指令预算已放行，剩下的只有 VTF 本身） | `runtime.ts` 的 `as_agal_translate` 现在接受 `version <= 4`（原 `> 3` 显式拒绝）、指令预算 200 → 400，**AGAL4 本身就差最后一环**：三个翻译器的 MSL/HLSL/GLSL 声明段都只对 `isFragment` 发 sampler ⇒ GLSL 的顶点阶段没有 `sampler2D` 声明（WebGL2 上顶点取样直接编译失败）、MSL 的顶点入口没有 `[[texture(N)]]` 参数、HLSL 的根签名把 SRV/sampler 表钉在 `D3D12_SHADER_VISIBILITY_PIXEL`；`vendor/stage3d_webgl.cc` 的 `fsN → unit N` 映射同样只覆盖片元。完工判据：三翻译器的顶点 sampler 声明 + 三后端绑定（Metal `setVertexTexture:atIndex:`、D3D12 根签名 `VISIBILITY_ALL` 或 vertex、WebGL 顶点纹理单元）+ 一个双端取样实例 | **先实测 AIR 的顶点取样口径**（`enhanced` 档、`tex v0, v1, fs0 <2d,linear,nomip>` 是否真能在 VS 里读、取样坐标的纹理单元与采样器状态是否与片元共用），再动三个后端；探针脚手架可复用 `temp/agalprobe/` 与 `temp/halfrt/`。**成本中高** |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |

@@ -891,6 +891,74 @@ pipeline 会被直接拒绘（黑屏、无报错）。因此：
 `test/unit/stage3d.ts` 的 `stage3d/texture-formats` 17 条源级钉子（含「`as_s3d_profile_standard()`
 同时被 profile 回读和 #3759 门控使用」这条不漂移的承诺）。
 
+### 9.17 AGAL4 顶点纹理取值（VTF）：`tld` 的 stage/version 门控与三后端接线（阶段三百五十二）
+
+#### AIR 里只有一条合法的 VTF 路径
+
+实测（`temp/vtfprobe/`，adl 51.4.1、`enhanced` 档、OpenGL (Enhanced)）：
+
+| 写法 | AIR |
+|---|---|
+| 顶点 `tex`，AGAL v1/v3/v4 | `Error #3622: AGAL validation failed: Opcode tex only allowed in fragment programs at token 1 of vertex program.` |
+| 顶点 `tld`，AGAL3 | `Error #3805: AGAL validation failed: Vertex Texture Fetch is supported in Agal version 4 and above.` |
+| 片元 `tld`，AGAL4 | `Error #3803: AGAL validation failed: Opcode tld only allowed in vertex programs at token 1 of fragment program.` |
+| VS v4 + FS v1 | `Error #3757: AGAL validation failed: Vertex and fragment program need to have the same version.` |
+
+四条都在 **`Program3D.upload` 就抛**，不是等第一次 draw。`kil`/`ddx`/`ddy` 与 `tex` 同属片元专用（同一条 #3622）。
+注意 `#3805`/`#3757` 的文案**没有** ` at token N` 后缀，`#3622`/`#3803` 有——我们逐字照抄，不用一条模板套四种。
+
+#### 顶点 sampler 的编码与单元空间
+
+顶点 `tld` 的第二个操作数是 **register type 5**（`vs`，与片元 `fs` 同号），低 16 位 = 采样器号，
+byte2 = LOD。顶点与片元**共用同一个 0..7 单元空间**（实测：只绑 `unit0` 而程序引用 `vs1` →
+`#3663 Sampler 1 binds an undefined texture`；AIR 的未使用检查 `#3697` 会把「绑了但没用」的单元点名，
+说明「用了 unit1」与否是同一张表）。因此 `setTextureAt(1, t)` + `setSamplerStateAt(1, …)` 同时服务两个阶段。
+
+#### 采样语义（我们照做的那部分）
+
+- **uv→纹素映射与片元 `tex` 相同**：NEAREST 下 2x2 的 uv(0.25,0.25)/(0.75,0.25)/(0.25,0.75)/(0.75,0.75)
+  分别取红/绿/蓝/白，行 0 是纹理上边。
+- **取样是逐顶点、结果插值**（VTF 的本义）：per-vertex uv 得到四角渐变，片元拿到的是插值后的颜色。
+- **filter / wrap 位生效**：uv(0.5,0.5) 处 NEAREST=`ffffff`、LINEAR=`808080`；uv(2.4,0.4) 处
+  CLAMP=`00ff00`、REPEAT=`ff0000`。
+- **LOD 字节**：AIR 实测**忽略**它（三级 mip 链上 lod=0/1/2/5/16/32 一律采 mip0）。我们按指令本意
+  使用该值（`level(lod)` / `SampleLevel` / `texture2DLod`）—— 语义更正确，且在 AIR 恒采 mip0 的那些
+  程序里 lod 本来就被调用方写成 0。
+
+#### 三翻译器
+
+| 目标 | 顶点入口的声明 | 取值 |
+|---|---|---|
+| MSL | `texture2d<float> fsN [[texture(N)]]` + `sampler smpN [[sampler(N)]]` | `fsN.sample(smpN, uv, level(lod))` |
+| HLSL | `Texture2D<float4> fsN : register(tN)` + `SamplerState smpN : register(sN)` | `fsN.SampleLevel(smpN, uv, lod)` |
+| GLSL | `uniform sampler2D fsN;`（**不再只对片元发**） | `texture2DLod` / `textureCubeLod` |
+
+MSL 的纹理/采样器参数原先只在**片元**入口发；顶点入口缺 `[[texture(N)]]` 会让 Metal 直接拒绘
+（`missing Texture binding at index N`），而 `[[sampler(N)]]` 声明的每个索引都必须有状态绑定 ——
+故 `sampler smpN` 与 `texture fsN` 成对发出，且**顶点阶段也要绑**（见下）。
+GLSL ES 1.00 的 `texture2DLod` 本来就是**顶点**内建（`GL_EXT_shader_texture_lod` 只补片元的拼写），
+不需要扩展声明，也不需要把 GLSL 升到 3.00。
+
+#### 三后端
+
+| 后端 | 改动 |
+|---|---|
+| Metal（`vendor/stage3d_glue.mm`） | Metal 的 texture/sampler 表**按阶段分开**，`s3d_draw` 在原有 `setFragmentTexture:`/`setFragmentSamplerState:` 之外补 `setVertexTexture:atIndex:`/`setVertexSamplerState:atIndex:`（同一份单元状态，无条件绑 8 个；绑一个入口点没声明的索引是合法的） |
+| D3D12（`vendor/stage3d_d3d.cc`） | 根签名 p[2]（SRV 表）/p[3]（sampler 表）由 `D3D12_SHADER_VISIBILITY_PIXEL` 改为 `ALL`（**p[0]/p[1] 的两个 cbuffer 仍按阶段分开**，因为它们都占 `b0`） |
+| WebGL（`vendor/stage3d_webgl.cc`） | 无需改动：单元空间本就共享，`glUniform1i(fsN → N)` 对两个阶段是同一个 uniform |
+
+#### 顺带修掉的一个缓存缺口
+
+`Context3D_submit` 的惰性编译按 **`Program3D` 指针**缓存（同一个程序反复 draw 只编译一次）。
+但「往同一个 `Program3D` 里重新 `upload` 一份新字节码」不会换指针，于是新的着色器**永远不生效**，
+继续用上一份 —— 这正是「顶点纹理程序渲染出前一个程序的结果」的真根因。修法是 `Program3D.uploadSerial`
+（每次 upload 自增）+ `Context3D.programGpuSerial`，缓存键从「指针相同」改成「指针相同 **且** 序号相同」。
+
+**验收**：`examples/vertex-texture.as`（Metal 真机 26 条：三目标文本、四类错误号、纹素映射、
+NEAREST/LINEAR、CLAMP/REPEAT、逐顶点插值；纯 C 状态机 20 条）；`test/unit/stage3d.ts` 的
+`stage3d/vertex-texture` 16 条源级钉子（stage 规则、三目标声明、三后端绑定、upload 期校验与缓存失效）。
+该示例带 `vertex-texture.build.json`，与 `stage83.as` 一样是**手工**验收（链 Metal 的构建不进自动回归）。
+
 ## 10. Windows / Direct3D 12 后端（阶段一百三十二 落地）
 
 第三份后端 `vendor/stage3d_d3d.cc`（~2,290 行）与 `stage3d_glue.mm`（Metal）/**结构同形**：同一套 `s3d_*` ABI、

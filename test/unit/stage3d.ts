@@ -1791,3 +1791,83 @@ function checkStage3dTextureFormats(): string[] {
 }
 
 registerGroup('stage3d/texture-formats', checkStage3dTextureFormats);
+
+// AGAL4 vertex texture fetch ('tld' in a vertex program). Every expectation here
+// is measured on adl 51.4.1 (temp/vtfprobe): the stage/version gates and their
+// AIR numbers, the shared sampler unit space, and the three backend bindings that
+// have to follow the vertex stage rather than the fragment one.
+function checkStage3dVertexTexture(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const emitted = emittedLines();
+  const metal = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+  const d3d = readFileSync(join(root, 'vendor', 'stage3d_d3d.cc'), 'utf8');
+  const gl = readFileSync(join(root, 'vendor', 'stage3d_webgl.cc'), 'utf8');
+
+  // 1. Stage rules. AIR keeps two families apart: tex/kil/ddx/ddy are fragment
+  //    only (#3622), tld is vertex only (#3803) and needs AGAL4 (#3805).
+  check('a vertex program using tex/kil/ddx/ddy is refused with #3622',
+    /if \(!isFragment && \(op == 0x28 \|\| op == 0x27 \|\| op == 0x1a \|\| op == 0x1b\)\)/.test(runtime)
+    && /agal_validation_fail\(3622, reason, n \+ 1\)/.test(runtime));
+  check('the #3622 reason names the opcode the way AIR does',
+    /"Opcode %s only allowed in fragment programs"/.test(runtime));
+  check('tld in a fragment program is refused with #3803',
+    /if \(isFragment && op == 0x2e\) \{[\s\S]{0,200}?agal_validation_fail\(3803,/.test(runtime));
+  check('tld below AGAL4 is refused with #3805 and AIR\u2019s wording (no token suffix)',
+    /agal_validation_fail_plain\(3805, "Vertex Texture Fetch is supported in Agal version 4 and above\."\)/.test(runtime)
+    && !/agal_validation_fail\(3805,/.test(runtime));
+
+  // 2. Translation: the vertex entry point of every target has to declare the
+  //    texture AND the sampler (Metal requires state for every [[sampler(N)]]).
+  check('MSL vertex entry declares the texture for a vertex tld',
+    /%s fs%d \[\[texture\(%d\)\]\]/.test(runtime));
+  check('MSL vertex entry declares the sampler state for a vertex tld',
+    /sampler smp%d \[\[sampler\(%d\)\]\]/.test(runtime));
+  check('the MSL sampler/texture parameters are emitted for the vertex stage',
+    /agal_is_used\(AGAL_FS, i\)\).*\[\[texture\(%d\)\]\]/.test(runtime));
+  check('GLSL declares sampler uniforms for the vertex stage too (no isFragment gate)',
+    !/if \(isFragment\) for \(int i = 0; i < 256; i\+\+\) if \(agal_is_used\(AGAL_FS/.test(runtime)
+    && /uniform %s fs%d;/.test(runtime));
+  check('the tld arm samples with an explicit LOD on all three targets',
+    /sample\(smp%d, %s%s, level\(%d\.0\)\)/.test(runtime)
+    && /SampleLevel\(smp%d, %s%s, %d\.0\)/.test(runtime)
+    && /texture2DLod|textureCubeLod/.test(runtime));
+
+  // 3. Backends. Metal keeps texture/sampler tables per STAGE, D3D12 gates them
+  //    by root-parameter visibility, WebGL shares one unit space (nothing to do).
+  check('Metal binds the vertex texture and sampler stages as well',
+    /setVertexTexture:c->textures\[i\] atIndex:i/.test(metal)
+    && /setVertexSamplerState:smp atIndex:i/.test(metal));
+  check('D3D12 shows the SRV and sampler tables to both stages',
+    /p\[2\]\.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;/.test(d3d)
+    && /p\[3\]\.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;/.test(d3d));
+  check('D3D12 keeps the two per-stage cbuffers stage-specific',
+    /p\[0\]\.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;/.test(d3d)
+    && /p\[1\]\.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;/.test(d3d));
+  check('WebGL keeps one shared unit space for both stages',
+    /snprintf\(name, sizeof\(name\), "fs%d", i\);/.test(gl));
+
+  // 4. Upload-time validation and the program cache. AIR throws from upload, and
+  //    a re-upload into an already drawn Program3D must recompile.
+  const upload = emitted.slice(emitted.indexOf('void Program3D_upload('));
+  check('Program3D.upload validates the pair and throws AIR\u2019s numbered error',
+    /as_agal_validate_pair\(/.test(upload) && /as_throw\(Error_new\(\(char\*\)as_agal_errmsg, as_agal_errid\)\);/.test(upload));
+  check('a mismatched stage version is #3757 with AIR\u2019s wording',
+    /Vertex and fragment program need to have the same version\./.test(runtime) && /as_agal_errid = 3757;/.test(runtime));
+  check('the vertex program\u2019s sampler flags are decoded too (shared unit space)',
+    /as_agal_sampler_flags\(\(const unsigned char\*\)o->vertexProgram->data/.test(upload));
+  check('a re-upload invalidates the cached GPU program',
+    /o->uploadSerial\+\+;/.test(upload)
+    && /o->programGpuSerial != o->program->uploadSerial/.test(emitted));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/vertex-texture', checkStage3dVertexTexture);

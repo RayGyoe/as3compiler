@@ -2001,6 +2001,17 @@ int s3d_draw(void* ctx, int numTriangles) {
     if (c->samplerStateSet[i]) smp = s3d_sampler_for(c, c->samplerFilter[i], c->samplerWrap[i], c->samplerMip[i]);
     if (smp == nil) smp = (c->samplerLinear != nil ? c->samplerLinear : c->samplerNearest);
     [enc setFragmentSamplerState:smp atIndex:i];
+    // AGAL4 vertex texture fetch: 'tld' in a VERTEX program reads the same unit
+    // index, but Metal keeps texture/sampler tables PER STAGE, so the vertex
+    // encoder needs its own binding or the draw dies with "missing Texture
+    // binding at index N for fsN". The same values are used verbatim: Stage3D
+    // has one sampler state per unit, shared by both stages (measured on
+    // adl 51.4.1 -- setTextureAt(1, t) feeds 'tld ..., vs1' and the unused-sampler
+    // check counts that unit as used). Binding an index the vertex entry point
+    // does not declare is legal in Metal, so this is unconditional; the cost is
+    // 8+8 ObjC calls per draw against a per-frame command buffer.
+    if (c->textures[i] != nil) [enc setVertexTexture:c->textures[i] atIndex:i];
+    [enc setVertexSamplerState:smp atIndex:i];
   }
 
   if (c->indexBuffer != nil) {
