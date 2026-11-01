@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
@@ -127,7 +127,7 @@ const KNOWN_FLAGS: readonly string[] = [
   '-o', '--run', '--dry', '--cc', '--target', '--package', '--manifest', '--air-app',
   '--main-class', '--all-sources', '--include-third-party', '--extdir', '--as-class-path', '--gpu-backend', '--json', '--fix',
   '--check-update', '--verbose', '-v', '--opt', '--debug-info', '--lto', '--pgo', '--pgo-dir',
-  '-I', '-L', '-l', '-D', '--features', '--framework', '--source', '--swc', '--ane',
+  '-I', '-L', '-l', '-D', '--features', '--extra-roots', '--framework', '--source', '--swc', '--ane',
   '--ane-platform', '--export', '--cflag', '-w', '--version', '-V', '--help', '-h',
 ];
 
@@ -252,6 +252,17 @@ function parseArgs(argv: string[], doctorMode = false): Options {
       // which the missing-value error points at, so it is not repeated here.
       const v = value('--features');
       for (const f of v.split(',').map((s) => s.trim()).filter((s) => s !== '')) push('features', f);
+    }
+    // --extra-roots <a.b.C,d.E>: classes that only a STRING names (a
+    // getDefinitionByName lookup, a config file) have no reference edge, so the
+    // --air-app reachability closure cannot see them. This is that list. It is a
+    // CLI flag as well as a manifest field because `--air-app` REGENERATES
+    // <Main>.build.json on every run: a hand-edited field would be wiped, which
+    // would leave the only way to keep such a class alive unusable from the
+    // command line.
+    else if (a === '--extra-roots') {
+      const v = value('--extra-roots');
+      for (const r of v.split(',').map((s) => s.trim()).filter((s) => s !== '')) push('extraRoots', r);
     }
     else if (a === '--framework') push('frameworks', value('--framework'));
     else if (a === '--source') push('sources', value('--source'));
@@ -720,7 +731,16 @@ async function main(): Promise<void> {
           if (base.baseName.length > 0 && !base.baseName.startsWith('flash.')) swcBaseRoots.push(base.baseName);
         }
       }
-      const reach = computeReachable(parsedFiles, air.mainClass, swcBaseRoots);
+      // E6 §6.7: classes named only through `getDefinitionByName` have no reference
+      // edge, so the closure cannot see them -- `extra-roots` in the manifest is how
+      // the user keeps one alive (e.g. a native-shader renderer, which must NOT be
+      // reachable as a static reference or a default build would fail to compile it).
+      // --extra-roots has to be merged HERE, not in the generic override loop below:
+      // this is the call that decides what gets compiled, and that loop runs after.
+      for (const r of opts.overrides.extraRoots ?? []) {
+        if (!cfg.extraRoots.includes(r)) cfg.extraRoots.push(r);
+      }
+      const reach = computeReachable(parsedFiles, air.mainClass, [...swcBaseRoots, ...cfg.extraRoots]);
       const keep = new Set(reach.kept);
       keptFiles = parsedFiles.filter((f) => keep.has(f.path));
       reachNote = reach.dropped.length > 0
@@ -868,6 +888,13 @@ async function main(): Promise<void> {
   // A feature the backend cannot link must fail here, in the project's own words,
   // not as an unresolved-symbol dump from the linker.
   validateFeatures(cfg.features, cfg.target);
+  // A feature carries its own build inputs: native-shader must link the vendored
+  // cross-compiler shim + archives, and buildCompileSteps has to know that before
+  // it decides between the one-shot link and the per-object C++ path. Doing it here
+  // (after the manifest AND the --features overlay have settled) keeps a manifest
+  // from having to restate the vendor paths -- and keeps a project that merely
+  // repeats them from linking the same archive twice.
+  Object.assign(cfg, applyFeatureDeps(cfg));
   if (!VALID_PACKAGES.includes(cfg.package)) {
     throw new Error(`unknown --package '${cfg.package}' (expected: raw | app | dmg | exe | xcode-project | android-project | web)`);
   }

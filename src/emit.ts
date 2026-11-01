@@ -26059,6 +26059,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('bool Context3DNative_isAvailable_static(void) { return true; }');
+    // The factory the AS3 side calls (`Context3DNative.fromContext(context)`). A
+    // thin wrapper over the struct's real C constructor, so there is exactly one
+    // place that binds a native context to an object; `Context3DNative_new` also
+    // runs the write barrier that keeps the context alive across a GC.
+    this.line('Context3DNative* Context3DNative_fromContext_static(Context3D* context) { return Context3DNative_new(context); }');
     this.line('void Context3DNative_ctor(Context3DNative* o, Context3D* ctx) { Object_ctor((Object*)o); o->context = ctx; gc_write_barrier((void*)ctx); }');
     this.line('Context3DNative* Context3DNative_new(Context3D* ctx) { Context3DNative* o = (Context3DNative*)gc_alloc(GCT_CLASS, sizeof(Context3DNative)); o->vtable = &Context3DNative_vt; Context3DNative_ctor(o, ctx); return o; }');
     this.line('NativeProgram3D* NativeProgram3D_new(void) { NativeProgram3D* o = (NativeProgram3D*)gc_alloc(GCT_CLASS, sizeof(NativeProgram3D)); o->vtable = &NativeProgram3D_vt; NativeProgram3D_ctor(o); return o; }');
@@ -26229,6 +26234,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
+    // Context3D_submit is defined further down (it is the AGAL draw's sync point) and
+    // the native draw deliberately shares it, so it needs a prototype here.
+    this.line('void Context3D_submit(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances);');
     this.line('void Context3DNative_drawTriangles(void* _this, NativeProgram3D* p, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles) {');
     this.indent++;
     this.line('Context3DNative* self = (Context3DNative*)_this;');
@@ -26246,13 +26254,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('int avail = indexBuffer->numIndices - firstIndex;');
     this.line('if (numTriangles * 3 > avail) as_throw(ArgumentError_new((char*)"Context3DNative.drawTriangles: not enough indices", 2004));');
-    // The AGAL path re-uploads the index range per draw (s3d_upload_index), so the
-    // native path does the same rather than inventing a second caching scheme: the
-    // offset already folds in the IndexBuffer3D's own startIndex.
-    this.line('as_s3d_upload_index(self->context->gpu, indexBuffer->data->data + indexBuffer->startIndex + firstIndex, numTriangles * 3);');
     this.indent--;
     this.line('}');
-    this.line('as_s3d_draw(self->context->gpu, numTriangles);');
+    this.line('(void)firstIndex;');
+    // The SAME submit path an AGAL draw takes, deliberately: Context3D_submit is the
+    // one place that uploads the bound vertex streams (de-interleaving them for
+    // s3d_upload_vertex), the index buffer, the texture units and the constants, then
+    // draws. Calling as_s3d_draw directly skipped ALL of that -- the vertex streams
+    // never existed, so s3d_draw returned on `numStreams == 0` without a word
+    // (apps/shader-m30: the native draw was encoded and produced nothing). In native
+    // mode the constant/texture uploads are inert on the glue side (uniforms arrive
+    // through setUniform*, and vc/fc binding is suppressed), so sharing the function
+    // costs nothing and removes the chance of the two paths diverging again.
+    this.line('Context3D_submit(self->context, indexBuffer, numTriangles, 1);');
     this.indent--;
     this.line('}');
     this.line('Texture* Context3DNative_createTexture(void* _this, int width, int height, char* format, bool renderable) {');

@@ -63,6 +63,14 @@ export interface BuildConfig {
   // and embedded into the generated C (阶段九十五). Paths are resolved relative
   // to the manifest that declares them.
   swcPaths: string[];
+  // Fully-qualified class names a `--air-app` build must keep even though no AS3
+  // code names them (阶段三百五十四, E6 §6.7). The reachability closure is an
+  // over-approximation of what `mxmlc` keeps, but it works by finding REFERENCES,
+  // and a class reached only through `getDefinitionByName("...")` has none -- so
+  // the very driver that would use a native shader renderer is exactly the class
+  // the closure would drop. Naming it here is the explicit, one-purpose fix;
+  // `--all-sources` remains the blunt one.
+  extraRoots: string[];
   // .ane native-extension packages whose extension.xml is resolved at compile
   // time into the descriptor table the generated executable carries (阶段一百七十二).
   // Paths are resolved relative to the manifest that declares them.
@@ -185,6 +193,7 @@ export function defaultBuildConfig(): BuildConfig {
     pgoDir: '',
     sources: [],
     swcPaths: [],
+    extraRoots: [],
     anePaths: [],
     anePlatform: '',
     includePaths: [],
@@ -230,6 +239,7 @@ interface ManifestFields {
   'pgo-dir'?: string;
   sources?: string[];
   'swc-paths'?: string[];
+  'extra-roots'?: string[];
   'ane-paths'?: string[];
   'ane-platform'?: string;
   'include-paths'?: string[];
@@ -309,6 +319,7 @@ const MANIFEST_FIELD_NAMES: Record<keyof ManifestFields | 'targets', true> = {
   'pgo-dir': true,
   sources: true,
   'swc-paths': true,
+  'extra-roots': true,
   'ane-paths': true,
   'ane-platform': true,
   'include-paths': true,
@@ -475,6 +486,10 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['pgo-dir']) next.pgoDir = resolveFromManifest(manifestPath, m['pgo-dir']);
   if (m.sources) next.sources = [...cfg.sources, ...T(m.sources).map((p) => resolveFromManifest(manifestPath, p))];
   if (m['swc-paths']) next.swcPaths = [...cfg.swcPaths, ...T(m['swc-paths']).map((p) => resolveFromManifest(manifestPath, p))];
+  // Class names, not paths: never resolved, never templated. Duplicates are
+  // dropped rather than reported -- two halves of a project naming the same root
+  // is not an error, and the set semantics downstream already collapse them.
+  if (m['extra-roots']) next.extraRoots = [...cfg.extraRoots, ...T(m['extra-roots'])].filter((v, i, a) => a.indexOf(v) === i);
   if (m['ane-paths']) {
     // Appended to the CLI's --ane list (a manifest adds packages), but never the
     // same package twice. An --air-app build now DERIVES ane-paths from the
@@ -1242,6 +1257,86 @@ export function hostVendorKey(target: Target, platform: string, hostArch: string
 // manifest 可选项；--air-app 的 manifest 已在 linkLibs 列 z（去重跳过），无
 // manifest 的直接编译（--package exe/raw、--run）此前漏了，在 `#include
 // <zlib.h>` 处报 fatal error——CI windows-exe smoke 的真因。
+// ---- feature: native-shader => the linked cross-compiler -------------------
+//
+// `--features native-shader` is not a macro alone: the generated C calls
+// asc_shader_translate / asc_shader_program_free, which live in the vendored C++
+// shim vendor/shader_compiler.cc. Leaving that to each app's manifest means the
+// feature compiles and then dies at LINK (undefined _asc_shader_translate) -- the
+// exact first failure of apps/shader-m30. The feature owns its dependency, so the
+// paths are injected here, in the one place every target goes through, and a
+// manifest that also lists them only gets de-duplicated.
+//
+// The archive order is read from vendor/shader/lib/<host>/link-order.txt rather
+// than hard-coded: static archives resolve left to right, and that file is the
+// same list build-tools/shader/build.sh validate against. A missing file is a
+// loud error, never a silently shorter link line.
+const SHADER_FEATURE = 'native-shader';
+
+// The shim sits at vendor/shader_compiler.cc (a sibling of skia_glue.cc, so every
+// vendored glue source is findable in one listing); only its headers and archives
+// live under vendor/shader/.
+function shaderVendorRoot(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'vendor', 'shader');
+}
+
+function shaderVendorParent(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), '..', 'vendor');
+}
+
+// null when the feature is off; throws when it is on but the vendored build for
+// this host is absent (a build machine that never ran build-tools/shader/build.sh).
+export function shaderFeatureLibs(cfg: BuildConfig): string[] | null {
+  if (!cfg.features.includes(SHADER_FEATURE)) return null;
+  const root = shaderVendorRoot();
+  const dir = resolve(root, 'lib', hostVendorKey('native', process.platform, process.arch, cfg.architecture));
+  const order = resolve(dir, 'link-order.txt');
+  if (!existsSync(order)) {
+    throw new Error(
+      `--features native-shader needs the vendored shader cross-compiler, but ${order} is missing. ` +
+      `Run build-tools/shader/build.sh first (see docs/zh-cn/native-shader-plan.md §5.1).`);
+  }
+  return readFileSync(order, 'utf8')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith('#'))
+    // libglslang.a -> glslang: the linker wants the bare name.
+    .map((l) => l.replace(/^lib/, '').replace(/\.a$/, ''));
+}
+
+export function shaderFeatureArgs(cfg: BuildConfig): string[] {
+  const libs = shaderFeatureLibs(cfg);
+  if (libs === null) return [];
+  const root = shaderVendorRoot();
+  const dir = resolve(root, 'lib', hostVendorKey('native', process.platform, process.arch, cfg.architecture));
+  const out = ['-I', resolve(root, 'include'), '-L', dir];
+  for (const l of libs) out.push('-l', l);
+  return out;
+}
+
+// The shim itself plus the include/link paths, applied to the config before the
+// compile steps are planned (buildCompileSteps classifies .cc sources, so this
+// must happen earlier than any flag assembly).
+export function applyFeatureDeps(cfg: BuildConfig): BuildConfig {
+  if (!cfg.features.includes(SHADER_FEATURE)) return cfg;
+  if (cfg.target === 'wasm') {
+    throw new Error(
+      '--features native-shader is a native-only enhancement: the web backend feeds the ' +
+      'author GLSL to WebGL2 as-is, so it needs no cross-compiler.');
+  }
+  const root = shaderVendorRoot();
+  const shim = resolve(shaderVendorParent(), 'shader_compiler.cc');
+  const sources = cfg.sources.includes(shim) ? cfg.sources : [shim, ...cfg.sources];
+  const includePaths = cfg.includePaths.includes(resolve(root, 'include'))
+    ? cfg.includePaths : [resolve(root, 'include'), ...cfg.includePaths];
+  const libDir = resolve(root, 'lib', hostVendorKey('native', process.platform, process.arch, cfg.architecture));
+  const linkPaths = cfg.linkPaths.includes(libDir) ? cfg.linkPaths : [libDir, ...cfg.linkPaths];
+  const libs = shaderFeatureLibs(cfg) ?? [];
+  const linkLibs = [...cfg.linkLibs];
+  for (const l of libs) if (!linkLibs.includes(l)) linkLibs.push(l);
+  return { ...cfg, sources, includePaths, linkPaths, linkLibs };
+}
+
 export function windowsZlibArgs(cfg: BuildConfig): string[] {
   if (process.platform !== 'win32' || cfg.target !== 'native') return [];
   if (cfg.linkLibs.includes('z')) return [];

@@ -2095,8 +2095,11 @@ function checkSwcBaseClass(): string[] {
 
   ck(/\[\.\.\.cfg\.swcPaths, \.\.\.\(opts\.overrides\.swcPaths \?\? \[\]\)\]/.test(index),
     '--air-app seeds the closure with those bases, including a CLI-only --swc');
-  ck(/computeReachable\(parsedFiles, air\.mainClass, swcBaseRoots\)/.test(index),
-    '...and passes them to the closure computation');
+  // The roots are the SWC bases PLUS the manifest/`--extra-roots` list: a class
+  // that only a getDefinitionByName string names has no reference edge, so the
+  // closure cannot see it and would drop it from the compile face.
+  ck(/computeReachable\(parsedFiles, air\.mainClass, \[\.\.\.swcBaseRoots, \.\.\.cfg\.extraRoots\]\)/.test(index),
+    '...and passes them (plus extra-roots) to the closure computation');
   ck(/extraRoots: readonly string\[\] = \[\]/.test(reach) && /for \(const r of extraRoots\)/.test(reach),
     'reach.ts keeps the extra roots in the kept set');
   ck(/const swcLibs = new Map<string, SwcLibrary>\(\)/.test(index) && /const lib = swcLib\(libPath\);/.test(index),

@@ -62,10 +62,10 @@
 | **M0 立项** | 本文 + `enhancements.md` E6 状态 + `TODO.md` 阶段条目 | 文档落库，`node test.ts` 不变 |
 | **M1 交叉编译链** | `build-tools/shader/` 建 glslang + SPIRV-Cross；`vendor/shader_compiler.cc` 的 C 接口；独立 C 测试程序 | `./temp/shc-test` 打印出正确 MSL（含反射表） |
 | **M2 编译器侧** ✅ | `--features native-shader` 注册；`Context3DNative` 内建类 + 格式常量 + `uploadProgram`/绑定/draw；`ASC_HAS_NATIVE_SHADER` 门控 | `examples/native-shader-probe.as` 绿：MRT=2、反射 5 条、ES1.00/legacy 双双带行号拒绝 |
-| **M3 Metal 后端** 🟡 | 浮点 RT 格式面、原生程序绑定（uniform/纹理/属性）、MRT、深度纹理 | 代码已落（`s3d_native_*` 一族 + MRT 管线），**尚缺真机数值验收**（需窗口探针，见 §6） |
+| **M3 Metal 后端** ✅ | 浮点 RT 格式面、原生程序绑定（uniform/纹理/属性）、MRT、深度纹理 | `apps/shader-m30` 真机像素验收：中心 `#804020` / 3-8 处 `#361b0e`，与 `uColor.rgb * vUV.x` 逐位相符（M6 落地时一并修掉顶点描述符与 draw 提交两处缺陷，见 §5.6） |
 | **M4 Web 免费点** | `stage3d_webgl.cc` 直通 + `EXT_color_buffer_float` | `--target wasm` 同一份 `.as` 出同一画面，零交叉编译 |
 | **M5 D3D12** | `stage3d_d3d.cc` 浮点 `DXGI_FORMAT` + 原生 HLSL | Windows 出图（CI/实机） |
-| **M6 引擎侧** | `ShaderMaterial` + `NativeShaderRenderer` + `RendererFactory` | `asaot3d` probe 绿 |
+| **M6 引擎侧** ✅ | `ShaderMaterial` + `NativeShaderRenderer` + `RendererFactory` + `extra-roots` 清单字段 | `apps/shader-m30` 13 项全 PASS；`adl`/默认构建打印 NO-CHANNEL 并如实拒画（§8 红线） |
 | **M7 Ultra-Water 对齐** | FFT 海洋 → caustics → 大气 → 水下 | 与 three.js 参考逐项对拍 |
 
 ---
@@ -308,14 +308,38 @@ void asc_shader_program_free(AscShaderProgram* p);
 | uniform 按名 | `gl.getUniformLocation(prog, name)` —— WebGL 天然按名，反射表只用来自动枚举 |
 | MRT | `gl.drawBuffers([COLOR_ATTACHMENT0, …])` |
 
-### 5.5 M6 · 引擎侧（`asaot3d`）
+### 5.5 M6 · 引擎侧（`asaot3d`）✅
 
 | 文件 | 动作 |
 |---|---|
-| `seam/asaot/three/ShaderMaterial.as`（新增） | `vertexShader`/`fragmentShader`/`uniforms`/`defines`，继承 `Material`，**双后端共享**（设计 §7.3） |
-| `seam/asaot/three/NativeShaderRenderer.as`（新增） | 第二个 `IRenderer` 实现；标 `[WasmExport]` 保证进编译面（设计 §6.7 方案 1） |
+| `kit/asaot/three/materials/ShaderMaterial.as`（新增） | `vertexShader`/`fragmentShader`/`uniforms`/`defines`/`lights`，继承 `Material`，**双后端共享**（设计 §7.3）；`setValues()` 拒绝未知键 |
+| `seam/asaot/three/NativeShaderRenderer.as`（新增） | `extends AGALRenderer`，只覆写 `_drawShaderMaterial`；`getDefinitionByName(Context3DNative).fromContext(ctx)`（**不** `import`，见下） |
 | `seam/asaot/three/RendererFactory.as`（新增） | `getDefinitionByName` + `try/catch` + `as Class` 探测，缺失回退 `AGALRenderer`（设计 §7.4） |
-| `seam/asaot/three/AGALRenderer.as` | 遇到 `ShaderMaterial` **如实报错**（设计 §7.6），不降级成错误语义 |
+| `seam/asaot/three/AGALRenderer.as` | `_renderMesh` 分派到 `_drawShaderMaterial`；基类实现**如实报错**（设计 §7.6），不降级成错误语义 |
+| `seam/asaot/three/app/Stage3DApp.as` | `_renderer = RendererFactory.create(_context)`（运行期选后端，编译期常量做不到） |
+
+**as-built 修正（与上表原计划的三处偏差）**
+
+1. 可达性钩子用 **`extra-roots` 清单字段**（设计 §6.7 用户选定），不是 `[WasmExport]`；demo 的
+   `ShaderM30.build.json` 写 `"extra-roots": ["asaot.three.NativeShaderRenderer"]`，闭包路径
+   （65/123 sources）下该类仍被编译，已验证。
+2. `NativeShaderRenderer` **不得**在类型位置写 `Context3DNative`：那份源码要能被 mxmlc 编译、
+   被 `adl` 运行（缺类时走「无通道」分支），类型位置引用是 `#1046`。全部改走
+   `Class(getDefinitionByName(...))` + 方括号调用。
+3. `Context3DNative` **不能** `new (cls)(ctx)`：本运行时里内建类经 Class 值构造是**故意的
+   #1063**（注册表不给内建类统一 ctor）。因此有静态工厂 `Context3DNative.fromContext(ctx)`。
+
+### 5.6 M6 落地时暴露的四个真缺陷（都在「编译过、结果错/空」那一类）
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 链接报 `_asc_shader_translate` 未定义 | feature 只加宏，不加 shim/档案；依赖写在 demo manifest 里等于没写 | `build.ts::applyFeatureDeps` —— feature 自带 sources/include/link/`link-order.txt` 里的 14 个 .a，`index.ts` 在 feature 定稿后应用 |
+| 2 | `getDefinitionByName("flash.display3D.Context3DNative")` 落空 → 静默退化成默认构建 | 注册表按 `reflectFqn` 建键，新类没给 | `symbols.ts` 补 `reflectFqn: 'flash.display3D::Context3DNative'`（与 `NativeProgram3D`） |
+| 3 | 管线创建失败 `Vertex attribute aPos(0) is missing from the vertex descriptor` | `s3d_native_use` 立刻建 pipeline，而顶点流要到 draw 才绑定 → 描述符 0 属性 | `nativePsoPending`：管线延到首次 draw（AGAL 一直是这么做的） |
+| 4 | draw 编码了但**什么都没画**，无任何报错 | `Context3DNative_drawTriangles` 直接 `as_s3d_draw`，跳过 `Context3D_submit` 的顶点上传 → `numStreams == 0` 静默 return | 改走 `Context3D_submit(context, ibo, n, 1)`（AGAL 同一个同步点） |
+
+验收：`apps/shader-m30`（`ShaderMaterial` + 640×480 四边形，`drawToBitmapData` 读回）
+13 项全 PASS，中心像素 `#804020` = `uColor.rgb * 0.5` 精确命中，3/8 处 `#361b0e` 证明 `vUV` 梯度。
 
 ---
 
@@ -338,6 +362,18 @@ node --test --test-name-pattern='native-shader/' test/unit/*.ts
 
 # M3（Metal 真机）
 node as3compiler/index.ts examples/native-shader-fft.as --features native-shader --run
+
+# M6（引擎侧，真机像素）
+cd asaot3d && ./apps/shader-m30/build.sh aot && ./apps/shader-m30/ShaderM30
+#   → 13 项 PASS + "pixel at 1/4 #361b0e, centre #804020"
+# 「无通道」那半（等价于 adl / 默认构建）：同一份 .as，关掉 feature
+./apps/shader-m30/build.sh aot --features none   # 或临时停用 apps/shader-m30/features
+./apps/shader-m30/ShaderM30
+#   → "shader-m30 NO-CHANNEL: native channel=false ..." 并退出 0
+#     （§8 红线：AIR 侧如实报明，不画近似图。基类 AGALRenderer._drawShaderMaterial
+#      会每帧抛错拒绝——demo 因此在无通道时不把网格加进场景，避免变成报错洪水）
+# 注：`./build.sh air` + adl 只验证「同一份源码能被 mxmlc 编译」，adl 的 ENTER_FRAME
+#     在窗口未被激活(前台)时会停摆，脚本化验收请用上面那条。
 
 # M4（Web）
 node as3compiler/index.ts examples/native-shader-fft.as --features native-shader --target wasm --package web

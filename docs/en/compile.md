@@ -144,6 +144,10 @@ Options:
                  runs; `auto` clears it (see §3.4.6)
   --features <list> enable an AIR-superset enhancement (comma-separated, repeatable;
                  `none` clears). Default builds stay AIR-identical (see §3.4.2)
+  --extra-roots <fqns> --air-app: keep classes that only a STRING names (a
+                 getDefinitionByName lookup) out of the reachability pruning
+                 (comma-separated; same as the manifest field, and needed because
+                 --air-app rewrites <Main>.build.json on every run)
   --export <name> export a C symbol into the .wasm export table (repeatable)
   --opt <flags>  optimization flags (default: -O2)
   --cflag <f>    extra C compiler flag for every compile AND link step (repeatable;

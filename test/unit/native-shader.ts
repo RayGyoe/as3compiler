@@ -9,11 +9,12 @@
 //   node --test --test-name-pattern='native-shader/' test/unit/*.ts
 
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { knownFeatures, validateFeatures } from '../../src/build.ts';
-import { registerGroup, dir, readNorm } from '../harness.ts';
+import { registerGroup, dir, root, readNorm } from '../harness.ts';
 
 // A program that names the gated class in TYPE position. AS3 answers that at compile
 // time (#1046), which is why the default build must refuse it rather than emit a
@@ -77,7 +78,68 @@ export function checkNativeShader(): string[] {
   const decl = RUNTIME_PREAMBLE.indexOf('extern int asc_shader_translate');
   ok(gate >= 0 && decl > gate, 'asc_shader_translate must be declared only inside the ASC_HAS_NATIVE_SHADER gate');
 
+  // M6: the wiring that only breaks at link or run time (see the block below).
+  fails.push(...checkNativeShaderBuildInputs());
+
   return fails;
 }
 
 registerGroup('native-shader/', checkNativeShader);
+// ---- M6: the engine side (asaot3d) and the build inputs a feature owns ----
+//
+// These pin the four links that only fail at RUN or LINK time, i.e. exactly the
+// ones a compile-only test cannot see. Each was found by apps/shader-m30 and each
+// failed silently or with a message that named the wrong component:
+//
+//   1. `--features native-shader` must add the vendored shim + archives itself.
+//      Without it the C compiles and the LINK dies on `_asc_shader_translate`.
+//   2. Context3DNative/NativeProgram3D must carry a reflectFqn, or
+//      getDefinitionByName misses and a native build quietly behaves like a
+//      default one (the "silent downgrade" §0 forbids).
+//   3. The five s3d_native_* entry points must be DECLARED in the preamble.
+//      Undeclared is not benign in C99: it is `call to undeclared function`.
+//   4. A native draw goes through Context3D_submit, the same sync point an AGAL
+//      draw uses; calling s3d_draw directly skips the vertex-upload step and the
+//      glue returns on `numStreams == 0` without drawing anything.
+const INDEX_SRC = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+
+export function checkNativeShaderBuildInputs(): string[] {
+  const bad: string[] = [];
+  const build = readFileSync(join(root, 'src', 'build.ts'), 'utf8');
+  if (!build.includes('export function applyFeatureDeps')) bad.push('build.ts: no applyFeatureDeps');
+  if (!build.includes("SHADER_FEATURE = 'native-shader'")) bad.push("build.ts: the feature id is not named once");
+  if (!build.includes("link-order.txt")) bad.push('build.ts: archive order must come from link-order.txt');
+  if (!INDEX_SRC.includes('applyFeatureDeps(cfg)')) bad.push('index.ts: applyFeatureDeps is never applied');
+  // The shim is a sibling of skia_glue.cc, not under vendor/shader/.
+  if (!build.includes("resolve(shaderVendorParent(), 'shader_compiler.cc')")) {
+    bad.push('build.ts: the shim path must be vendor/shader_compiler.cc');
+  }
+
+  const symbols = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  for (const fqn of ['flash.display3D::Context3DNative', 'flash.display3D::NativeProgram3D']) {
+    if (!symbols.includes(`reflectFqn: '${fqn}'`)) {
+      bad.push(`symbols.ts: ${fqn} has no reflectFqn (getDefinitionByName cannot find it)`);
+    }
+  }
+
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  for (const fn of ['s3d_native_use', 's3d_native_uniform', 's3d_native_bind_texture',
+                    's3d_native_set_targets', 's3d_create_texture_fmt']) {
+    if (!runtime.includes(`extern `) || !new RegExp(`extern [a-z]+\\*? ?${fn}\\(`).test(runtime)) {
+      bad.push(`runtime.ts: ${fn} is called but not declared (C99 rejects implicit declarations)`);
+    }
+  }
+
+  const emit = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  if (!emit.includes('Context3D_submit(self->context, indexBuffer, numTriangles, 1)')) {
+    bad.push('emit.ts: the native draw must go through Context3D_submit (vertex uploads live there)');
+  }
+  if (!emit.includes('Context3DNative_fromContext_static')) {
+    bad.push('emit.ts: Context3DNative needs the fromContext factory (a Class value is not constructible)');
+  }
+  // The deferred pipeline: a native program's vertex descriptor comes from the
+  // streams bound at draw time, so s3d_native_use must NOT build one.
+  const glue = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+  if (!glue.includes('nativePsoPending')) bad.push('stage3d_glue.mm: the native pipeline must be built at draw time');
+  return bad;
+}

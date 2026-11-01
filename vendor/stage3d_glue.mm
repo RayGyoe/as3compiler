@@ -299,6 +299,14 @@ struct S3DContext {
   // have more than one colour attachment.
   int nativeMode;
   int nativeNColor;                // colour attachments the live native program writes
+  // A native program's pipeline can only be built once its vertex streams are
+  // known, and a program is USED (s3d_native_use) long before the first draw binds
+  // them: the engine sets the program, then setVertexBufferAt, then draws. Building
+  // the pipeline at use time therefore described ZERO attributes and Metal rejected
+  // it with "Vertex attribute aPos(0) is missing from the vertex descriptor"
+  // (apps/shader-m30). AGAL never hit this because its pipeline is built lazily on
+  // the first draw; native mode now defers the same way.
+  int nativePsoPending;
   int nativeColorFmt[4];           // MTLPixelFormat of each (0 = BGRA8Unorm)
   id<MTLTexture> nativeColor[4];   // explicit attachments; [0] nil = normal target
   id<MTLTexture> nativeDepth;      // explicit depth attachment, nil = the usual one
@@ -1656,31 +1664,17 @@ int s3d_compile(void* ctx, void* key, const char* vs_msl, const char* fs_msl, ch
   [vlib release];
   [flib release];
 
-  NSError* perr = nil;
-  const int seedSamples = s3d_pass_samples(c);
-  const int seedHalf = s3d_target_is_half(c);
-  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, s3d_color_mask_bits(c), seedSamples, seedHalf, &perr);
-  if (pso == nil) {
-    fprintf(stderr, "stage3d_glue: pipeline create failed: %s\n", [[perr localizedDescription] UTF8String]);
-    if (errbuf && errbuf_size > 0) snprintf(errbuf, errbuf_size, "pipeline: %s", [[perr localizedDescription] UTF8String]);
-    return 0;
-  }
-  // Seed the cache with this variant so a re-selection never rebuilds it.
-  s3d_factor_key(c->bvars[0].sf, c->blendSource);
-  s3d_factor_key(c->bvars[0].df, c->blendDest);
-  c->bvars[0].writeMask = s3d_color_mask_bits(c);
-  c->bvars[0].samples = seedSamples;
-  c->bvars[0].isHalf = seedHalf;
-  // Same identity s3d_select_pso computes, so the seeded variant is a hit rather
-  // than a one-off rebuild.
-  c->bvars[0].fmtKey = c->nativeMode
-      ? 1000u + (unsigned int)(c->nativeColorFmt[0] != 0 ? c->nativeColorFmt[0] : (int)MTLPixelFormatBGRA8Unorm)
-      : (seedHalf ? 4u : 0u);
-  c->bvars[0].ncolor = c->nativeMode ? (c->nativeNColor > 0 ? (c->nativeNColor > 4 ? 4 : c->nativeNColor) : 1) : 1;
-  c->bvars[0].pso = pso;
-  c->bvars[0].stamp = ++c->bstamp;
-  c->nbvars = 1;
-  c->pso = pso;
+  // The functions are live; the PIPELINE deliberately is not. A native program's
+  // vertex descriptor comes from the streams bound at draw time (the engine does
+  // setProgram -> setVertexBufferAt -> draw), so building it here described zero
+  // attributes and Metal rejected a perfectly good program with "Vertex attribute
+  // aPos(0) is missing from the vertex descriptor" (apps/shader-m30). Deferring is
+  // what AGAL has always done; native mode now matches. nativePsoPending is cleared
+  // by s3d_draw, which is also where a build failure is reported with the program's
+  // own error text instead of a bare pipeline error.
+  s3d_clear_variants(c);
+  c->pso = nil;
+  c->nativePsoPending = 1;
   // Record the live program's identity + source hash, so the next switch away
   // stashes it under the right slot and a re-upload is detected.
   c->progKey = key;
@@ -1852,6 +1846,38 @@ int s3d_draw(void* ctx, int numTriangles) {
   const double t_dbg0 = dbg ? asc_dbg_now_ms() : 0.0;
   // The program's functions must exist (compile ran) and geometry must be bound.
   if (c->vfn == nil || c->numStreams == 0) return 0;
+  // Deferred native pipeline (see S3DContext.nativePsoPending): NOW the streams are
+  // bound, so the descriptor describes the author's attributes. A failure here is
+  // the program's problem, stated once and then never retried -- a per-frame rebuild
+  // of a doomed pipeline would flood stderr at 120 Hz.
+  if (c->nativePsoPending) {
+    c->nativePsoPending = 0;
+    NSError* perr = nil;
+    const int pendSamples = s3d_pass_samples(c);
+    id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest,
+                                                  s3d_color_mask_bits(c), pendSamples,
+                                                  s3d_target_is_half(c), &perr);
+    if (pso == nil) {
+      fprintf(stderr, "stage3d_glue: native pipeline create failed: %s\n",
+              perr != nil ? [[perr localizedDescription] UTF8String] : "(no error)");
+      c->vfn = nil;
+      c->ffn = nil;
+      return 0;
+    }
+    // Seed the one variant that matches the current state, so the selection below
+    // is a hit and the seeded object is the one that gets used.
+    s3d_factor_key(c->bvars[0].sf, c->blendSource);
+    s3d_factor_key(c->bvars[0].df, c->blendDest);
+    c->bvars[0].writeMask = s3d_color_mask_bits(c);
+    c->bvars[0].samples = pendSamples;
+    c->bvars[0].isHalf = s3d_target_is_half(c);
+    c->bvars[0].fmtKey = 1000u + (unsigned int)(c->nativeColorFmt[0] != 0 ? c->nativeColorFmt[0] : (int)MTLPixelFormatBGRA8Unorm);
+    c->bvars[0].ncolor = c->nativeNColor > 0 ? (c->nativeNColor > 4 ? 4 : c->nativeNColor) : 1;
+    c->bvars[0].pso = pso;
+    c->bvars[0].stamp = ++c->bstamp;
+    c->nbvars = 1;
+    c->pso = pso;
+  }
   // AIR fidelity: a mip-filtered sampler (miplinear/mipnearest) on a texture
   // that has NO mip chain makes AIR drop the entire draw -- the target keeps
   // whatever was there (measured in temp/sampprobe A6: a 2x2 level-0-only

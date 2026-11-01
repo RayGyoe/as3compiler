@@ -237,6 +237,22 @@ function checkClosure(): string[] {
     JSON.stringify(r.kept) === JSON.stringify(EXPECTED_KEPT));
   c.check('everything unreachable is dropped',
     JSON.stringify(r.dropped) === JSON.stringify(EXPECTED_DROPPED));
+  // E6 §6.7: the closure works on REFERENCE edges, so a class only ever named by a
+  // string (`getDefinitionByName`) is dropped -- which would silently drop the very
+  // renderer a `--features native-shader` build exists to provide. `extra-roots` is
+  // the escape hatch, and it must move exactly the named class (plus its own
+  // closure), not everything.
+  {
+    const rooted = computeReachable(r.files, 'app.Main', ['other.Dead']);
+    const rootedNames = rooted.kept.map(short).sort();
+    c.check('an extra root revives a class no reference reaches',
+      rootedNames.includes('Dead') && !r.kept.includes('Dead'));
+    c.check('...and revives nothing it did not name',
+      JSON.stringify(rootedNames.filter((n) => !r.kept.includes(n))) === JSON.stringify(['Dead']));
+    const unknown = computeReachable(r.files, 'app.Main', ['no.such.Class']);
+    c.check('an extra root the project does not declare is ignored, not fatal',
+      JSON.stringify(unknown.kept.map(short).sort()) === JSON.stringify(r.kept));
+  }
   c.check('kept + dropped accounts for every input file',
     r.kept.length + r.dropped.length === FIXTURE.length);
   c.check('an unused `import` alone does not keep a class (matches mxmlc)',
@@ -392,7 +408,19 @@ function checkWiring(): string[] {
       readFileSync(join(root, 'src', 'air-app.ts'), 'utf8'))
     && /--as-class-path/.test(index));
   c.check('...and compiles the closure the adapter computed',
-    /computeReachable\(parsedFiles, air\.mainClass, swcBaseRoots\)/.test(index));
+    /computeReachable\(parsedFiles, air\.mainClass, \[\.\.\.swcBaseRoots, \.\.\.cfg\.extraRoots\]\)/.test(index));
+  // E6 §6.7: a class reached only through `getDefinitionByName("...")` has no
+  // reference edge at all, so the closure drops exactly the driver that would have
+  // used it. `extra-roots` is the explicit, one-purpose root list; the manifest
+  // field is pinned in the manifest group, the wiring here.
+  c.check('...plus the manifest\'s extra-roots (classes no AS3 code names)',
+    /cfg\.extraRoots/.test(index) && /'extra-roots'/.test(readFileSync(join(root, 'src', 'build.ts'), 'utf8')));
+  // `--air-app` REWRITES <Main>.build.json on every run, so a manifest-only field
+  // is unusable from a build script: the flag has to exist too, and the merge has
+  // to happen BEFORE the closure runs (the generic override loop runs after it).
+  c.check('...which also comes from --extra-roots, merged before the closure',
+    /'--extra-roots'/.test(index) &&
+    index.indexOf('opts.overrides.extraRoots') < index.indexOf('const reach = computeReachable'));
   // The closure's extra roots: a symbol class whose SWC-declared base is a project
   // class must keep that class's source, or the binding (swc.ts) has nothing to bind
   // to and AIR would have linked the class while we dropped it.

@@ -7640,6 +7640,12 @@ export class SymbolTable {
         // map would be emitted as an instance method and called with a bogus `this`.
         staticMethods: new Map([
           ['isAvailable', stm({ kind: 'bool' }, [])],
+          // The ONLY way to obtain one. A built-in stays non-constructible through a
+          // Class value on purpose (`new (cls)(ctx)` is a loud #1063 -- see the
+          // registry loop in emit.ts), so the honest entry point is a named factory:
+          // it also states in the signature that a Context3DNative is bound to ONE
+          // context, which is the invariant every method body relies on.
+          ['fromContext', stm({ kind: 'object', className: 'Context3DNative' }, [p('context', 'Context3D')])],
         ]),
         methods: new Map([
           ['uploadProgram', im({ kind: 'object', className: 'NativeProgram3D' }, [p('vertexSource', 'String'), p('fragmentSource', 'String')])],
@@ -7662,6 +7668,14 @@ export class SymbolTable {
         setters: new Map(),
         constructor: { params: [p('context', 'Context3D')] },
         superClass: 'Object', isFinal: false, implements: [],
+        // REQUIRED, not cosmetic: the flash.utils.getDefinitionByName registry keys
+        // on this string, so without it `getDefinitionByName("flash.display3D.
+        // Context3DNative")` misses, `RendererFactory` answers "no native channel"
+        // and a --features native-shader build silently behaves like a default one.
+        // That is exactly the failure this class exists to make impossible; found by
+        // apps/shader-m30 (the probe printed NO-CHANNEL while the C carried all 163
+        // Context3DNative references).
+        reflectFqn: 'flash.display3D::Context3DNative',
       });
       // A compiled GLSL ES 3.00 pair plus its reflection table. Not a Texture and not
       // a Program3D: it is not AGAL, and Context3D.setProgram would reject it.
@@ -7696,6 +7710,7 @@ export class SymbolTable {
         getters: new Map(), setters: new Map(),
         constructor: { params: [] },
         superClass: 'Object', isFinal: false, implements: [],
+        reflectFqn: 'flash.display3D::NativeProgram3D',
       });
     }
 

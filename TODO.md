@@ -18947,7 +18947,31 @@ M5 D3D12 → M6 引擎侧（`ShaderMaterial`/`NativeShaderRenderer`）→ M7 Ult
   只有「用这个程序」才抛；`setUniform`/`bindTexture` 的未知名字抛 `ArgumentError #2008`
   ——拼错 uniform 是这条通道最常见的 bug，静默保留旧值会看起来像「着色器不理我的光照」。
 
-**M3（Metal）代码已落，缺真机数值验收**（需要窗口探针，见施工图 §6）：
+**M6（引擎侧）+ M3（Metal 真机）已验收**（`asaot3d/apps/shader-m30`）：
+
+- 新 `apps/shader-m30`：`ShaderMaterial`（GLSL ES 3.00 一对）画一张 2×2 四边形，
+  `drawToBitmapData` 读回像素断言。13 项全 PASS，中心 **`#804020`** = `uColor.rgb * 0.5`
+  逐位相符，3/8 处 `#361b0e` 证明 `vUV` 真的进了插值；`adl`/默认构建同一份源码打印
+  **`NO-CHANNEL`** 并以 0 退出（§8 红线：AIR 侧如实报明，不画近似图）。
+- 引擎侧四处新增：`kit/.../materials/ShaderMaterial.as`、`seam/.../NativeShaderRenderer.as`
+  （`extends AGALRenderer`，只覆写 `_drawShaderMaterial`）、`seam/.../RendererFactory.as`、
+  `AGALRenderer._renderMesh` 的 `ShaderMaterial` 分派 + `Stage3DApp` 改走 `RendererFactory.create`。
+- `extra-roots` 清单字段（`src/build.ts` + `src/index.ts`）：给「只被 `getDefinitionByName` 字符串
+  命名、无引用边」的类留一条活路；demo manifest 写 `["asaot.three.NativeShaderRenderer"]`，闭包路径
+  （65/123 sources）下该类确实被编译——这是 §6.7 选定方案的真机验证。
+- **落地过程暴露四个「编译过、结果错/空」的真缺陷**（施工图 §5.6 有完整表）：
+  feature 不带 shim/档案（链接期 `_asc_shader_translate` 未定义）→ `build.ts::applyFeatureDeps`；
+  新类缺 `reflectFqn`（`getDefinitionByName` 落空 → 静默退化成默认构建）→ 补 FQN；
+  `s3d_native_use` 立刻建管线而顶点流尚未绑定（Metal 拒「aPos(0) 不在顶点描述符里」）→ 延到首绘；
+  `Context3DNative_drawTriangles` 绕过 `Context3D_submit`（顶点不上传 → `numStreams == 0` 静默 return，
+  **draw 编码了但什么都没画**）→ 改走同一个同步点。
+- 另修一处**已入库的断链**：`symbols.ts` 里 `NativeWindow.systemMinSize/systemMaxSize` 静态 getter
+  曾只有声明没有方法体（window-gestures WIP 只落了半边），任何 Stage3D AIR app 链接都会
+  `_NativeWindow_get_systemMaxSize_static` 未定义。当时按「两半必须同时落」原则先把声明撤掉并注明；
+  **该断链已由阶段三百五十四（v0.4.315）补齐 emit/runtime/glue 三半后真正修好**——静态 getter 现在
+  两处都在，`NativeWindow_get_systemMinSize_static`/`_systemMaxSize_static` 各有方法体。
+
+**M3（Metal）代码已落，真机数值验收见上（shader-m30 像素）**：
 
 - `s3d_create_texture_fmt(ctx,w,h,fmtId,renderable)`：11 个格式 id（RGBA32F/R32F/RG32F/R16F/RG16F/
   RGB11B10F/R8/Depth32F/Depth16 + 默认 BGRA8）。

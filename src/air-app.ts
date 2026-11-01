@@ -1346,7 +1346,9 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // Read the previous file back and carry its set forward unless this invocation
   // said otherwise. Only `features` is carried: every other field is a function of
   // the descriptor and sources, and resurrecting a stale generated value (a
-  // dropped define, an old link lib) would be a silent wrong build.
+  // dropped define, an old link lib) would be a silent wrong build. (`extra-roots`
+  // is NOT carried -- it has a `--extra-roots` flag of its own; pass it every run,
+  // which is what apps/shader-m30/build.sh does.)
   let persistedFeatures: string[] = [];
   // `gpu-backend` is the second carried field, and for the same reason: the
   // manifest is regenerated in full every run, so the only memory of a

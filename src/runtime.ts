@@ -16295,6 +16295,19 @@ static inline int as_s3d_bind_texture(void* ctx, int unit, void* tex, int hasCha
 // caller can appear, and the default build must not name s3d_native_* symbols at
 // all (they live in the same glue file but would pull the shim in on link).
 #if ASC_HAS_NATIVE_SHADER
+// The glue-side entry points, declared here rather than in the glue header for the
+// same reason every other s3d_* seam is: this preamble is the ONE place a bare
+// s3d_* name appears, so the ABI-coverage pins can walk it (unit: stage3d/*).
+// Missing these five is not a soft failure -- it is exactly the "call to
+// undeclared function" wall an --air-app Stage3D build hit the first time the
+// native channel was enabled (temp: apps/shader-m30), because every other s3d_*
+// name in this file had its declaration and these were assumed to come along.
+extern int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap);
+extern void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats);
+extern void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex);
+extern void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth);
+extern void* s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable);
+
 static inline int as_s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
 #ifdef ASC_RENDER_STAGE3D
     return s3d_native_use(ctx, vs, fs, ncolor, err, errcap);
