@@ -328,6 +328,9 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // (`--features tray`, stage 二百六十): without that manifest the same AS3 must
   // fail exactly like AIR (#2012), which is the unit pin's job, not this example's.
   'status-item.as': ['--manifest', join(dir, 'status-item.build.json')],
+  // E6 native shader passthrough: the feature switch plus the manifest that links
+  // vendor/shader_compiler.cc and the two cross-compilers.
+  'native-shader-probe.as': ['--features', 'native-shader', '--manifest', join(dir, 'native-shader-probe.build.json')],
   // [Embed]: an embedded image is decoded through Skia and an embedded mp3 through
   // the audio seam, so the example links both backends. It is about the AS3
   // contract of the generated classes (Kind, Class-value identity, decoded
@@ -484,6 +487,11 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
   'swc-mc-button.as': join(dir, 'embed-assets', 'skin.swc'),
   'swc-morph.as': join(dir, 'embed-assets', 'skin.swc'),
   'swc-mask-frames.as': join(dir, 'embed-assets', 'skin.swc'),
+  // E6: the glslang / SPIRV-Cross archives are BUILT, not vendored (they are 14
+  // static libraries, ~30 MB, and `build-tools/shader/build.sh` produces them for
+  // THIS host). A fresh clone has no such directory, so the unit skips loudly with
+  // the command that creates it rather than failing at the linker.
+  'native-shader-probe.as': join(dir, '..', 'vendor', 'shader', 'lib'),
 };
 
 // Why the extension-bearing example units (`ane/`, `ane-app/`) are skipped instead

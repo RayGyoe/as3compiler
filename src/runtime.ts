@@ -15751,6 +15751,70 @@ extern void s3d_destroy_texture(void* tex);
 extern void* s3d_get_render_target(void* ctx);
 #endif
 
+// ---- E6 native shader passthrough (--features native-shader) ----
+//
+// An ENHANCEMENT, not a debt: AIR's Context3D has never had float render targets,
+// MRT, texelFetch or a way to submit a shader at all (only AGAL bytecode). See
+// docs/zh-cn/native-shader.md §3 for the five-criteria proof and §8 for the
+// AOT-only red line -- adl cannot run this channel, and says so by not having
+// the class (a reference from author code fails #1065, exactly like the class that
+// really is absent).
+//
+// Because it is opt-in, a default build links none of glslang/SPIRV-Cross and
+// carries none of these symbols (enhancements.md §1.2(d): the default artifact's
+// size must not move).
+#if defined(ASC_USE_NATIVE_SHADER)
+#define ASC_HAS_NATIVE_SHADER 1
+#else
+#define ASC_HAS_NATIVE_SHADER 0
+#endif
+
+#if ASC_HAS_NATIVE_SHADER
+// The pure-C face of vendor/shader_compiler.cc: GLSL ES 3.00 in, the backend's own
+// language out, plus a reflection table. Target ids mirror ASC_SHADER_TARGET_*.
+#define ASC_SHADER_TARGET_MSL 0
+#define ASC_SHADER_TARGET_GLSL_ES3 1
+#define ASC_SHADER_TARGET_HLSL 2
+#define ASC_SHADER_KIND_UNIFORM 1
+#define ASC_SHADER_KIND_TEXTURE 2
+#define ASC_SHADER_KIND_ATTRIBUTE 3
+typedef struct {
+  char* name;
+  int kind;
+  int binding;
+  int stage;
+  int size;
+} asc_shader_binding;
+typedef struct {
+  char* vertex_source;
+  char* fragment_source;
+  asc_shader_binding* bindings;
+  int binding_count;
+  int color_attachments;
+  char error[1024];
+} asc_shader_program;
+extern int asc_shader_translate(const char* vs, const char* fs, int target, asc_shader_program* out);
+extern void asc_shader_program_free(asc_shader_program* p);
+extern const char* asc_shader_backend_info(void);
+
+// Which language the linked Stage3D backend actually consumes. Mirrors
+// ASC_AGAL_TARGET's three-way split (runtime.ts above): MSL for Metal, GLSL ES for
+// WebGL2, HLSL for D3D12. WebGL2 takes the author's ES 3.00 text verbatim, which is
+// why the web target needs no cross-compiler at all.
+#if defined(ASC_S3D_GLSL)
+#define AS_SHADER_BACKEND_TARGET ASC_SHADER_TARGET_GLSL_ES3
+#elif defined(ASC_S3D_HLSL)
+#define AS_SHADER_BACKEND_TARGET ASC_SHADER_TARGET_HLSL
+#else
+#define AS_SHADER_BACKEND_TARGET ASC_SHADER_TARGET_MSL
+#endif
+
+// getInfoLog on a program that compiled cleanly answers the empty string (AIR's
+// Program3D has no such method, so there is no behaviour to mirror -- but three.js
+// authors expect this one, and a null would read as "no program").
+static inline char* as_shader_or_empty(const char* s) { return (char*)(s != NULL ? s : ""); }
+#endif
+
 // ---- ATF (Adobe Texture Format) ----
 // AIR's uploadCompressedTextureFromByteArray hands the container straight to the
 // GPU, which decodes the block-compressed payload (S3TC) in hardware. Our
@@ -16173,6 +16237,54 @@ static inline int as_s3d_bind_texture(void* ctx, int unit, void* tex, int hasCha
     (void)ctx; (void)unit; (void)tex; (void)hasChain; return 0;
 #endif
 }
+// ---- E6 native shader: the GPU half ----
+//
+// These are #if-gated on ASC_HAS_NATIVE_SHADER, unlike their AGAL neighbours
+// above: with the feature off the generated class family does not exist, so no
+// caller can appear, and the default build must not name s3d_native_* symbols at
+// all (they live in the same glue file but would pull the shim in on link).
+#if ASC_HAS_NATIVE_SHADER
+static inline int as_s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_native_use(ctx, vs, fs, ncolor, err, errcap);
+#else
+    // No GPU backend in this build (pure C, or a target without Stage3D). Report,
+    // never pretend: a silent success would render nothing and look like a bug in
+    // the shader (AGENTS.md §0 / §1.5).
+    (void)ctx; (void)vs; (void)fs; (void)ncolor;
+    if (err != NULL && errcap > 0) snprintf(err, (size_t)errcap, "this build has no Stage3D backend (ASC_RENDER_STAGE3D is off)");
+    return 0;
+#endif
+}
+static inline void as_s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_native_uniform(ctx, stage, slot, f, nfloats);
+#else
+    (void)ctx; (void)stage; (void)slot; (void)f; (void)nfloats;
+#endif
+}
+static inline void as_s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_native_bind_texture(ctx, stage, slot, tex);
+#else
+    (void)ctx; (void)stage; (void)slot; (void)tex;
+#endif
+}
+static inline void as_s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_native_set_targets(ctx, colors, ncolors, depth);
+#else
+    (void)ctx; (void)colors; (void)ncolors; (void)depth;
+#endif
+}
+static inline void* as_s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_create_texture_fmt(ctx, w, h, fmtId, renderable);
+#else
+    (void)ctx; (void)w; (void)h; (void)fmtId; (void)renderable; return NULL;
+#endif
+}
+#endif  // ASC_HAS_NATIVE_SHADER
 static inline int as_s3d_readback_render(void* ctx, uint8_t* out) {
 #ifdef ASC_RENDER_STAGE3D
     return s3d_readback_render(ctx, out);

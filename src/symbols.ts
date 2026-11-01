@@ -653,6 +653,13 @@ export class SymbolTable {
 
   get classes(): ReadonlyMap<string, ClassInfo> { return this.classMap; }
   get funcs(): ReadonlyMap<string, FuncInfo> { return this.funcMap; }
+
+  // The `--features` names in effect for THIS compilation (E6 gating). Populated by
+  // generateC before collect() runs. Empty means a default build, whose symbol
+  // surface must stay byte-for-byte AIR's -- so anything gated here simply does not
+  // exist, and `getDefinitionByName` throws #1065 the way adl does.
+  features: readonly string[] = [];
+  private hasFeature(name: string): boolean { return this.features.includes(name); }
   get interfaces(): ReadonlyMap<string, InterfaceInfo> { return this.interfaceMap; }
   get exports(): ReadonlyArray<ExportedSymbol> { return this.exportList; }
 
@@ -1985,6 +1992,7 @@ export class SymbolTable {
       const nwField = (owner: string, t: CType, init: Expr | null): FieldInfo => ({ type: t, init, visibility: 'public', owner, isStatic: false, isConst: false });
       const nwMethod = (owner: string, ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
       const nwGet = (owner: string, ret: CType): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      const nwGetStatic = (owner: string, ret: CType): MethodInfo => ({ returnType: ret, params: [], owner, visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false });
       const nwSet = (owner: string, pt: ASType): MethodInfo => ({ returnType: { kind: 'void' }, params: [{ name: 'value', type: pt, defaultValue: null, isRest: false }], owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
 
       // NativeWindowInitOptions: a plain data bag whose defaults are the adl ones.
@@ -2072,6 +2080,17 @@ export class SymbolTable {
           ['supportsNotification', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
         ]),
         staticMethods: new Map(),
+        // systemMinSize/systemMaxSize are STATIC getters in AIR, not instance
+        // properties (measured on adl 51.4.1: `NativeWindow.systemMinSize` answers
+        // (2,2), while `w.systemMinSize` is both an mxmlc error -- "possibly
+        // undefined" -- and a runtime #1069). They report the OS's own window-size
+        // limits, a different pair from the instance-level minSize/maxSize below
+        // (which are the app's limits, seeded from AIR's per-platform defaults).
+        // Assigning either one is a compile error in AIR (read-only getter).
+        staticGetters: new Map<string, MethodInfo>([
+          ['systemMinSize', nwGetStatic('NativeWindow', { kind: 'object', className: 'Point' })],
+          ['systemMaxSize', nwGetStatic('NativeWindow', { kind: 'object', className: 'Point' })],
+        ]),
         getters: new Map<string, MethodInfo>([
           ['stage', nwGet('NativeWindow', { kind: 'object', className: 'Stage' })],
           ['bounds', nwGet('NativeWindow', { kind: 'object', className: 'Rectangle' })],
@@ -7569,6 +7588,116 @@ export class SymbolTable {
     constClass('Context3DVertexBufferFormat', { BYTES_4: 'bytes4', FLOAT_1: 'float1', FLOAT_2: 'float2', FLOAT_3: 'float3', FLOAT_4: 'float4' });
     constClass('Context3DWrapMode', { CLAMP: 'clamp', REPEAT: 'repeat' });
     intConstClass('Context3DCubeMapFace', { POSITIVE_X: 0, NEGATIVE_X: 1, POSITIVE_Y: 2, NEGATIVE_Y: 3, POSITIVE_Z: 4, NEGATIVE_Z: 5 });
+
+    // ---- flash.display3D.Context3DNative (E6, --features native-shader) ----
+    //
+    // WHY A SEPARATE CLASS INSTEAD OF EXTENDING Context3D: the float formats, MRT
+    // and native-program submission this needs are things AIR's Context3D has never
+    // had, so adding them to Context3D would make a DEFAULT build's symbol table a
+    // superset of AIR's -- the exact "default must stay AIR-identical" rule
+    // (AGENTS.md §1.5, enhancements.md §1.4). A separate class can be absent from
+    // the default build entirely, which is what makes the author-side probe
+    // (`getDefinitionByName`) answer truthfully: absent => #1065, same as adl.
+    //
+    // It is likewise NOT registered under Context3DTextureFormat: `Context3DTextureFormat
+    // .RGBA32F` would be a *constant reference*, and AS3 has no "does this constant
+    // exist" runtime probe, so that shape cannot degrade gracefully (see
+    // docs/zh-cn/native-shader.md §6.1 层 2 方案 A).
+    if (this.hasFeature('native-shader')) {
+      const stm = (ret: CType, params: Param[]): MethodInfo => ({
+        returnType: ret, params, owner: 'Context3DNative', visibility: 'public',
+        isStatic: true, isFinal: true, isGetter: false, isSetter: false,
+      });
+      const im = (ret: CType, params: Param[]): MethodInfo => ({
+        returnType: ret, params, owner: 'Context3DNative', visibility: 'public',
+        isStatic: false, isFinal: false, isGetter: false, isSetter: false,
+      });
+      const p = (name: string, type: string, def: Expr | null = null): Param => ({
+        name, type, defaultValue: def, isRest: false,
+      });
+      const num: CType = { kind: 'number' };
+      // Render-target formats. Strings, exactly like Context3DTextureFormat's values
+      // -- one idiom for "a format is a token", so a reader who knows one knows both.
+      // RGBA_HALF_FLOAT is deliberately absent: AIR 14 already has it, so it lives on
+      // Context3DTextureFormat (the layer-1 debt that was paid in 阶段三百五十一).
+      const consts: Record<string, string> = {
+        RGBA_FLOAT: 'rgba32f', R32_FLOAT: 'r32f', RG32_FLOAT: 'rg32f',
+        R16_FLOAT: 'r16f', RG16_FLOAT: 'rg16f', R11G11B10_FLOAT: 'r11g11b10f', R8: 'r8',
+        DEPTH_32F: 'depth32f', DEPTH_16: 'depth16',
+      };
+      const nativeFields = new Map<string, FieldInfo>([
+        ['context', { type: { kind: 'object', className: 'Context3D' }, init: null, visibility: 'private', owner: 'Context3DNative', isStatic: false, isConst: false }],
+      ]);
+      const staticFields = new Map<string, FieldInfo>();
+      for (const [k, v] of Object.entries(consts)) {
+        staticFields.set(k, { type: { kind: 'string' }, init: { kind: 'Str', value: v }, visibility: 'public', owner: 'Context3DNative', isStatic: true, isConst: true });
+      }
+      this.classMap.set('Context3DNative', {
+        fields: nativeFields,
+        staticFields,
+        // Answers whether this build really carries the channel. It lives in
+        // staticMethods, not methods: a static method reached through the instance
+        // map would be emitted as an instance method and called with a bogus `this`.
+        staticMethods: new Map([
+          ['isAvailable', stm({ kind: 'bool' }, [])],
+        ]),
+        methods: new Map([
+          ['uploadProgram', im({ kind: 'object', className: 'NativeProgram3D' }, [p('vertexSource', 'String'), p('fragmentSource', 'String')])],
+          ['getInfoLog', im({ kind: 'string' }, [p('program', 'NativeProgram3D')])],
+          ['getTranslatedSource', im({ kind: 'string' }, [p('program', 'NativeProgram3D'), p('vertex', 'Boolean', { kind: 'Bool', value: false })])],
+          ['useProgram', im({ kind: 'void' }, [p('program', 'NativeProgram3D')])],
+          ['setUniform1f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number')])],
+          ['setUniform2f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number'), p('v2', 'Number')])],
+          ['setUniform3f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number'), p('v2', 'Number'), p('v3', 'Number')])],
+          ['setUniform4f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number'), p('v2', 'Number'), p('v3', 'Number'), p('v4', 'Number')])],
+          ['setUniformMatrix4', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('m', 'Vector.<Number>')])],
+          ['bindTexture', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('texture', 'TextureBase')])],
+          ['drawTriangles', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('indexBuffer', 'IndexBuffer3D'), p('firstIndex', 'int', { kind: 'Num', value: 0, isInt: true }), p('numTriangles', 'int', { kind: 'Num', value: -1, isInt: true })])],
+          ['createTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String'), p('renderable', 'Boolean', { kind: 'Bool', value: true })])],
+          ['createDepthTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String')])],
+          ['setRenderTargets', im({ kind: 'void' }, [p('colors', 'Array'), p('depth', 'TextureBase', { kind: 'Null' })])],
+          ['setBackBuffer', im({ kind: 'void' }, [])],
+        ]),
+        getters: new Map(),
+        setters: new Map(),
+        constructor: { params: [p('context', 'Context3D')] },
+        superClass: 'Object', isFinal: false, implements: [],
+      });
+      // A compiled GLSL ES 3.00 pair plus its reflection table. Not a Texture and not
+      // a Program3D: it is not AGAL, and Context3D.setProgram would reject it.
+      const pm = (ret: CType, params: Param[]): MethodInfo => ({
+        returnType: ret, params, owner: 'NativeProgram3D', visibility: 'public',
+        isStatic: false, isFinal: false, isGetter: false, isSetter: false,
+      });
+      this.classMap.set('NativeProgram3D', {
+        fields: new Map<string, FieldInfo>([
+          ['vertexSource', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['fragmentSource', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['translatedVertex', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['translatedFragment', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['infoLog', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['ok', { type: { kind: 'bool' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['colorAttachments', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          // Reflection, as parallel arrays rather than a vector of records: the
+          // generated C looks these up by name in a tight loop, and four flat
+          // arrays need no per-entry allocation.
+          ['bindingNames', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['bindingKinds', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['bindingSlots', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['bindingStages', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['disposed', { type: { kind: 'bool' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+        ]),
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        methods: new Map([
+          ['dispose', pm({ kind: 'void' }, [])],
+          ['findSlot', pm({ kind: 'int' }, [p('name', 'String'), p('kind', 'int'), p('stage', 'int')])],
+        ]),
+        getters: new Map(), setters: new Map(),
+        constructor: { params: [] },
+        superClass: 'Object', isFinal: false, implements: [],
+      });
+    }
 
     // --- resource classes: CPU copies of uploaded data; GPU objects in stage 82. ---
     {

@@ -1040,6 +1040,22 @@ const FEATURES: Readonly<Record<string, {
     targets: ['native'],
     why: 'the wasm Skia has no piex/dng_sdk archive (zero SkRawDecoder symbols), so camera RAW/DNG cannot be linked there',
   },
+  // `native-shader` (E6): GLSL ES 3.00 submitted directly, cross-compiled to the
+  // backend's own language by the LINKED glslang + SPIRV-Cross pair
+  // (vendor/shader_compiler.cc). It also opens float render targets, MRT and depth
+  // textures, which AIR's Context3D has never had -- so with the macro off the
+  // classes (Context3DNative / NativeProgram3D) do not exist at all and nothing is
+  // linked, keeping a default build both AIR-identical and the same size.
+  //
+  // Native only for now: `build-tools/shader/build.sh` produces host archives, and
+  // the web target's shim is a separate step (docs/zh-cn/native-shader.md §5, M4)
+  // because a WebGL2 build submits the author's GLSL verbatim and needs no
+  // cross-compiler at all.
+  'native-shader': {
+    macro: 'ASC_USE_NATIVE_SHADER=1',
+    targets: ['native'],
+    why: 'glslang/SPIRV-Cross are built as host archives under vendor/shader/<host>; the web (WebGL2) side of the channel is a separate milestone',
+  },
 };
 
 // Resolve feature names to their macros, failing loudly on anything unknown.

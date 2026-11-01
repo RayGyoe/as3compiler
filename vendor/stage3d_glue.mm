@@ -170,6 +170,12 @@ typedef struct {
   unsigned int writeMask;   // MTLColorWriteMask bits baked into this pipeline
   int samples;              // MTLRenderPipelineDescriptor.rasterSampleCount
   int isHalf;               // color attachment is RGBA16F instead of BGRA8
+  // Colour-attachment-0 pixel format, as a comparable key. The AGAL path only
+  // ever had two possibilities (BGRA8 / RGBA16F), which isHalf already encoded; a
+  // native program can name RGBA32F, R32F, R16F... so the format has to join the
+  // key on its own (MTLPixelFormat is small, +1000 keeps it clear of the AGAL ids).
+  unsigned int fmtKey;
+  int ncolor;               // number of colour attachments the pipeline declares
   id<MTLRenderPipelineState> pso;
   unsigned long stamp;
 } S3DBlendVariant;
@@ -285,6 +291,19 @@ struct S3DContext {
   const char* blendSource;   // AS3 blend-factor name (e.g. "one"), NULL = off
   const char* blendDest;     // AS3 blend-factor name (e.g. "oneMinusSourceAlpha")
   int instanceCount;               // 1 unless drawTrianglesInstanced set it
+  // ---- E6 native shader (Context3DNative; see docs/zh-cn/native-shader.md) ----
+  // `nativeMode` says the LIVE program came from Context3DNative rather than from
+  // AGAL. It changes three things in s3d_draw: the vc/fc constant arrays are not
+  // bound (a native program's uniforms have their own [[buffer(N)]] slots and
+  // buffer(0) would collide), uniforms come from nativeUniform, and the pass may
+  // have more than one colour attachment.
+  int nativeMode;
+  int nativeNColor;                // colour attachments the live native program writes
+  int nativeColorFmt[4];           // MTLPixelFormat of each (0 = BGRA8Unorm)
+  id<MTLTexture> nativeColor[4];   // explicit attachments; [0] nil = normal target
+  id<MTLTexture> nativeDepth;      // explicit depth attachment, nil = the usual one
+  unsigned char nativeUniform[2][16][64];   // by stage, by binding slot
+  unsigned char nativeUniformSet[2][16];
   int clearPending;                // set by s3d_clear, consumed by the next s3d_draw
   // Per-attachment clear flags for the next draw (Stage3D's clear() takes a
   // Context3DClearMask: COLOR=1/DEPTH=2/STENCIL=4). Each applies to exactly one
@@ -1310,33 +1329,52 @@ static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendS
   // into a Context3DTextureFormat.RGBA_HALF_FLOAT render target needs a pipeline
   // built for RGBA16F (see s3d_target_is_half). Metal rejects a pass whose
   // attachment format does not match the pipeline's.
-  pd.colorAttachments[0].pixelFormat = isHalf ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+  // A native program declares its own colour-attachment formats (float targets, MRT),
+  // so the pipeline is built from the context in that case instead of from isHalf.
+  int nc = 1;
+  MTLPixelFormat fmt0 = isHalf ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+  if (c->nativeMode) {
+    nc = c->nativeNColor > 0 ? c->nativeNColor : 1;
+    if (nc > 4) nc = 4;
+    if (c->nativeColorFmt[0] != 0) fmt0 = (MTLPixelFormat)c->nativeColorFmt[0];
+  }
+  for (int ai = 0; ai < nc; ai++) {
+    pd.colorAttachments[ai].pixelFormat = ai == 0 ? fmt0 : (MTLPixelFormat)c->nativeColorFmt[ai];
+    pd.colorAttachments[ai].writeMask = writeMask;
+    pd.colorAttachments[ai].blendingEnabled = NO;
+  }
   // Color write mask (setColorMask). Metal bakes it into the pipeline, so the
   // caller passes the mask recorded by the last setColorMask -- MTLClearMaskAll
   // when all four channels are writable, which is also the descriptor default.
-  pd.colorAttachments[0].writeMask = writeMask;
+  // (writeMask is applied per attachment in the loop above.)
   // Depth/stencil: only when the manifest allocated the attachment
   // (ASC_RENDER_DEPTH_STENCIL). The pipeline must declare the depth/stencil pixel
   // format or the render pass's depth attachment would be ignored; depth test /
   // stencil ops themselves are driven by Context3D_setDepthTest/setStencilActions
   // (stage 87) and land on the encoder in s3d_draw below.
-  if (c->depthStencil != nil) {
-    pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+  if (c->nativeMode ? (c->nativeDepth != nil) : (c->depthStencil != nil)) {
+    // A native pass may bring its own depth texture (a sampled depth attachment is
+    // the whole point of createdDepthTexture), so its format wins over the fixed
+    // back-buffer D32S8.
+    MTLPixelFormat dfmt = MTLPixelFormatDepth32Float_Stencil8;
+    if (c->nativeMode && c->nativeDepth != nil) dfmt = c->nativeDepth.pixelFormat;
+    pd.depthAttachmentPixelFormat = dfmt;
+    pd.stencilAttachmentPixelFormat = dfmt;
   }
   // Blending defaults to off; setBlendFactors turns it on. Stage3D's initial
   // state is (ONE, ZERO), which is exactly "no blending".
-  pd.colorAttachments[0].blendingEnabled = NO;
   if (blendSource != NULL || blendDest != NULL) {
     MTLBlendFactor sf = s3d_blend_factor(blendSource);
     MTLBlendFactor df = s3d_blend_factor(blendDest);
-    pd.colorAttachments[0].blendingEnabled = YES;
-    pd.colorAttachments[0].sourceRGBBlendFactor = sf;
-    pd.colorAttachments[0].destinationRGBBlendFactor = df;
-    pd.colorAttachments[0].sourceAlphaBlendFactor = sf;
-    pd.colorAttachments[0].destinationAlphaBlendFactor = df;
-    pd.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-    pd.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+    for (int ai = 0; ai < nc; ai++) {
+      pd.colorAttachments[ai].blendingEnabled = YES;
+      pd.colorAttachments[ai].sourceRGBBlendFactor = sf;
+      pd.colorAttachments[ai].destinationRGBBlendFactor = df;
+      pd.colorAttachments[ai].sourceAlphaBlendFactor = sf;
+      pd.colorAttachments[ai].destinationAlphaBlendFactor = df;
+      pd.colorAttachments[ai].rgbBlendOperation = MTLBlendOperationAdd;
+      pd.colorAttachments[ai].alphaBlendOperation = MTLBlendOperationAdd;
+    }
   }
 
   // Vertex descriptor: one layout per stream, stride = components * 4 bytes.
@@ -1405,10 +1443,19 @@ static void s3d_select_pso(S3DContext* c) {
   unsigned int wm = s3d_color_mask_bits(c);
   int samples = s3d_pass_samples(c);
   int isHalf = s3d_target_is_half(c);
+  // A native program's attachment formats are part of the pipeline identity for the
+  // same reason isHalf is: Metal rejects a pass whose attachment format differs from
+  // the pipeline's. AGAL only ever had two formats, so it keeps the cheap key.
+  unsigned int fmtKey = isHalf ? 4u : 0u;
+  int ncolor = 1;
+  if (c->nativeMode) {
+    fmtKey = 1000u + (unsigned int)(c->nativeColorFmt[0] != 0 ? c->nativeColorFmt[0] : (int)MTLPixelFormatBGRA8Unorm);
+    ncolor = c->nativeNColor > 0 ? (c->nativeNColor > 4 ? 4 : c->nativeNColor) : 1;
+  }
   for (int i = 0; i < c->nbvars; i++) {
     if (strcmp(c->bvars[i].sf, sf) == 0 && strcmp(c->bvars[i].df, df) == 0 &&
         c->bvars[i].writeMask == wm && c->bvars[i].samples == samples &&
-        c->bvars[i].isHalf == isHalf) {
+        c->bvars[i].fmtKey == fmtKey && c->bvars[i].ncolor == ncolor) {
       c->bvars[i].stamp = ++c->bstamp;
       c->pso = c->bvars[i].pso;
       return;
@@ -1436,7 +1483,8 @@ static void s3d_select_pso(S3DContext* c) {
   s3d_factor_key(c->bvars[idx].df, c->blendDest);
   c->bvars[idx].writeMask = wm;
   c->bvars[idx].samples = samples;
-  c->bvars[idx].isHalf = isHalf;
+  c->bvars[idx].fmtKey = fmtKey;
+  c->bvars[idx].ncolor = ncolor;
   c->bvars[idx].pso = pso;
   c->bvars[idx].stamp = ++c->bstamp;
   c->pso = pso;
@@ -1623,6 +1671,12 @@ int s3d_compile(void* ctx, void* key, const char* vs_msl, const char* fs_msl, ch
   c->bvars[0].writeMask = s3d_color_mask_bits(c);
   c->bvars[0].samples = seedSamples;
   c->bvars[0].isHalf = seedHalf;
+  // Same identity s3d_select_pso computes, so the seeded variant is a hit rather
+  // than a one-off rebuild.
+  c->bvars[0].fmtKey = c->nativeMode
+      ? 1000u + (unsigned int)(c->nativeColorFmt[0] != 0 ? c->nativeColorFmt[0] : (int)MTLPixelFormatBGRA8Unorm)
+      : (seedHalf ? 4u : 0u);
+  c->bvars[0].ncolor = c->nativeMode ? (c->nativeNColor > 0 ? (c->nativeNColor > 4 ? 4 : c->nativeNColor) : 1) : 1;
   c->bvars[0].pso = pso;
   c->bvars[0].stamp = ++c->bstamp;
   c->nbvars = 1;
@@ -1884,13 +1938,31 @@ int s3d_draw(void* ctx, int numTriangles) {
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     c->msaaResolvePending = 1;
   } else {
-    rp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+    // A native pass's first attachment is whatever setRenderTargets landed in
+    // nativeColor[0]; without one the draw goes to the Context3D render target or
+    // the drawable, exactly like the AGAL path.
+    id<MTLTexture> a0 = (c->nativeMode && c->nativeColor[0] != nil) ? c->nativeColor[0]
+                     : (c->renderOverride != nil ? c->renderOverride : c->target);
+    rp.colorAttachments[0].texture = a0;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
   }
   // Only the first draw after a clear() clears; subsequent draws accumulate onto
   // the same render target (Starling's clear-then-many-drawTriangles model).
   rp.colorAttachments[0].loadAction = (c->clearPending && c->clearColor) ? MTLLoadActionClear : MTLLoadActionLoad;
   rp.colorAttachments[0].clearColor = MTLClearColorMake((double)c->clearR, (double)c->clearG, (double)c->clearB, (double)c->clearA);
+  // MRT (E6 only): a native program can write several colour attachments, which is
+  // exactly what an FFT ocean needs (displacement + derivatives in one pass).
+  // Attachment 0 is the pass target set above (setRenderTargets puts its first
+  // texture there); 1..n-1 come from nativeColor and are LOADED, never cleared --
+  // Stage3D has one clear colour and it belongs to attachment 0.
+  if (c->nativeMode && c->nativeNColor > 1) {
+    int nn = c->nativeNColor > 4 ? 4 : c->nativeNColor;
+    for (int ai = 1; ai < nn; ai++) {
+      rp.colorAttachments[ai].texture = c->nativeColor[ai];
+      rp.colorAttachments[ai].loadAction = MTLLoadActionLoad;
+      rp.colorAttachments[ai].storeAction = MTLStoreActionStore;
+    }
+  }
 
   // Depth/stencil are only attached when the draw actually needs them. The
   // attachment is a 1280x2160 D32S8 texture (~22 MB): a per-draw Load+Store of it
@@ -1912,12 +1984,17 @@ int s3d_draw(void* ctx, int numTriangles) {
   // a translucent panel's depth hid the backdrop it was supposed to blend with,
   // and only appeared to work once the panel stopped writing depth).
   if (c->clearPending && (c->clearDepth || c->clearStencil)) dsNeeded = 1;
+  // A native pass that brought its own depth texture always attaches it: the whole
+  // reason to create one is to sample it afterwards, so a LOAD/STORE of it is the
+  // point, not an optimization target.
+  if (c->nativeMode && c->nativeDepth != nil) dsNeeded = 1;
   // Depth/stencil comes from the back-buffer surface for on-screen passes and
   // from the render target's own same-size surface for offscreen passes (Metal
   // requires matching attachment sizes). With MSAA the depth buffer must be
   // multisampled as well, so it swaps to the companion texture.
   id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil
                     : (msaa > 1 ? c->msaaDepthStencil : c->depthStencil);
+  if (c->nativeMode && c->nativeDepth != nil) ds = c->nativeDepth;
   if (ds != nil && dsNeeded) {
     rp.depthAttachment.texture = ds;
     rp.depthAttachment.loadAction = (c->clearPending && c->clearDepth) ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -1971,8 +2048,20 @@ int s3d_draw(void* ctx, int numTriangles) {
     MTLScissorRect sr; sr.x = x; sr.y = y; sr.width = (NSUInteger)w; sr.height = (NSUInteger)h;
     [enc setScissorRect:sr];
   }
-  if (c->vc != nil) [enc setVertexBuffer:c->vc offset:0 atIndex:0];
-  if (c->fc != nil) [enc setFragmentBuffer:c->fc offset:0 atIndex:0];
+  // Constant arrays vs native uniform buffers. They occupy the SAME index space in
+  // Metal ([[buffer(0)]]) but are two different models: AGAL packs every vertex
+  // constant into one array at buffer(0), while a native program gets one buffer per
+  // uniform at its own reflected index. Binding both would silently overwrite the
+  // native program's first uniform, so exactly one of the two runs.
+  if (c->nativeMode) {
+    for (int i = 0; i < 16; i++) {
+      if (c->nativeUniformSet[0][i]) [enc setVertexBytes:&c->nativeUniform[0][i][0] length:64 atIndex:i];
+      if (c->nativeUniformSet[1][i]) [enc setFragmentBytes:&c->nativeUniform[1][i][0] length:64 atIndex:i];
+    }
+  } else {
+    if (c->vc != nil) [enc setVertexBuffer:c->vc offset:0 atIndex:0];
+    if (c->fc != nil) [enc setFragmentBuffer:c->fc offset:0 atIndex:0];
+  }
   // Vertex streams: attribute i reads MTLBuffer S3D_STREAM_BASE+i (buffer 0 is
   // the vertex-constant array vc).
   for (int i = 0; i < c->numStreams && i < 8; i++) {
@@ -2233,6 +2322,129 @@ int s3d_readback_render(void* ctx, uint8_t* out) {
       fromRegion:MTLRegionMake2D(0, 0, src.width, src.height) mipmapLevel:0];
   }
   return 1;
+}
+
+// ============================ E6 native shader ============================
+// A Context3DNative program is compiled from text the caller already cross-compiled
+// (vendor/shader_compiler.cc turned GLSL ES 3.00 into this backend's language), so
+// this file only has to make the resulting functions drawable. It reuses s3d_compile
+// for the MTLLibrary creation and the program cache: the only new state is the
+// attachment formats/pointers and the per-uniform byte buffers.
+
+// Format id -> MTLPixelFormat. The ids are the C face of the AS3 constants on
+// Context3DNative (see as_shader_format_id in emit.ts); 0 is the AIR default.
+static MTLPixelFormat s3d_fmt_from_id(int id) {
+  switch (id) {
+    case 0:  return MTLPixelFormatBGRA8Unorm;
+    case 1:  return MTLPixelFormatRGBA32Float;
+    case 2:  return MTLPixelFormatR32Float;
+    case 3:  return MTLPixelFormatRG32Float;
+    case 4:  return MTLPixelFormatRGBA16Float;
+    case 5:  return MTLPixelFormatR16Float;
+    case 6:  return MTLPixelFormatRG16Float;
+    case 7:  return MTLPixelFormatRG11B10Float;
+    case 8:  return MTLPixelFormatR8Unorm;
+    case 9:  return MTLPixelFormatDepth32Float;
+    case 10: return MTLPixelFormatDepth16Unorm;
+    default: return MTLPixelFormatInvalid;
+  }
+}
+
+void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId, int renderable) {
+  if (ctx == NULL || width <= 0 || height <= 0) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  MTLPixelFormat fmt = s3d_fmt_from_id(fmtId);
+  if (fmt == MTLPixelFormatInvalid) return NULL;
+  MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+      width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+  if (d == nil) return NULL;
+  const int isDepth = (fmtId == 9 || fmtId == 10);
+  if (renderable) {
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+  } else {
+    d.usage = MTLTextureUsageShaderRead;
+  }
+  // Depth formats are never sampled as colour; `renderable` already selected the RT
+  // usage above, so nothing extra is needed here -- the branch documents that the
+  // same id space covers both and keeps the intent readable.
+  (void)isDepth;
+  id<MTLTexture> t = [c->device newTextureWithDescriptor:d];
+  if (t == nil) return NULL;
+  return (void*)t;
+}
+
+int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
+  if (ctx == NULL || vs == NULL || fs == NULL) return 0;
+  S3DContext* c = (S3DContext*)ctx;
+  if (ncolor < 1) ncolor = 1;
+  if (ncolor > 4) ncolor = 4;
+  // The uniform slots belong to the program that was current, not to this one.
+  memset(c->nativeUniformSet, 0, sizeof(c->nativeUniformSet));
+  c->nativeMode = 1;
+  c->nativeNColor = ncolor;
+  // The program's identity for the compile cache is the translated vertex text the
+  // caller owns: GC never moves it and one NativeProgram3D has exactly one.
+  if (!s3d_compile(ctx, (void*)vs, vs, fs, err, errcap)) {
+    // Leave nativeMode set: the caller throws on the 0 return, and a half-configured
+    // context that then falls back to AGAL would draw with the wrong uniform model.
+    return 0;
+  }
+  return 1;
+}
+
+void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats) {
+  if (ctx == NULL || f == NULL || nfloats <= 0) return;
+  S3DContext* c = (S3DContext*)ctx;
+  if (stage < 0 || stage > 1 || slot < 0 || slot > 15) return;
+  // 64 bytes is the payload ceiling of the whole channel (vec4, mat4). A uniform
+  // that needs more is not expressible through Context3DNative, so this clamps
+  // instead of writing out of bounds -- the reflected `size` is what a future
+  // buffer-object API would need.
+  int n = nfloats * 4;
+  if (n > 64) n = 64;
+  memcpy(c->nativeUniform[stage][slot], f, (size_t)n);
+  c->nativeUniformSet[stage][slot] = 1;
+}
+
+void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  if (slot < 0 || slot > 7) {
+    // Beyond the 8 units the draw path binds. Report instead of dropping the bind:
+    // a shader sampling unit 8 would otherwise read black forever.
+    if (asc_s3d_dump())
+      fprintf(stderr, "stage3d_glue: native texture unit %d is outside 0..7 (not bound)\n", slot);
+    return;
+  }
+  c->textures[slot] = (id<MTLTexture>)tex;
+  // A native sampler's filter/wrap comes from the Metal sampler state bound at the
+  // same index. The AGAL path derives that from the program's `tex` flags; a native
+  // program has none, so give the unit the linear default unless setSamplerStateAt
+  // already configured it (the draw path then keeps that state).
+  if (!c->samplerStateSet[slot]) {
+    c->samplerFilter[slot] = 2;   // linear
+    c->samplerWrap[slot] = 0;     // clamp
+    c->samplerMip[slot] = 0;
+    c->samplerStateSet[slot] = 1;
+  }
+  (void)stage;
+}
+
+void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  for (int i = 0; i < 4; i++) {
+    c->nativeColor[i] = (colors != NULL && i < ncolors) ? (id<MTLTexture>)colors[i] : nil;
+    c->nativeColorFmt[i] = 0;
+  }
+  c->nativeDepth = (id<MTLTexture>)depth;
+  int n = colors != NULL ? ncolors : 0;
+  if (n > 4) n = 4;
+  c->nativeNColor = n > 0 ? n : 1;
+  for (int i = 0; i < n; i++) {
+    if (c->nativeColor[i] != nil) c->nativeColorFmt[i] = (int)c->nativeColor[i].pixelFormat;
+  }
 }
 
 void s3d_destroy_texture(void* tex) {

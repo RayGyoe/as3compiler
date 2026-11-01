@@ -433,7 +433,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 编到 native/WASI/web，故可在 AIR **未定义 / 不支持 / 没有对应物**的地方做增强（增强必须 opt-in、
 绝不静默）。判据：同一输入 `adl` 能跑对我们跑不出 ⇒ 遗留缺陷；`adl` 本来就报错或 API 不存在 ⇒ 才是增强。
 
-**已实现（8 / 19）**：
+**已实现（9 / 19）**：
 
 - **显示器刷新率查询** — `VsyncStateChangeAvailabilityEvent` 增加只读 `refreshRate:Number`（AIR 无任何刷新率 API，只读 `available` 实测恒 `false`）
 - **多格式图片解码** — WebP / BMP / ICO（`--features formats`；默认与 AIR 同报 `#2124`）
@@ -443,8 +443,9 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - **LTO / PGO 构建开关** — 清单 `lto`/`pgo`、CLI `--lto`/`--pgo`
 - **带状态码的退出** — `System.exit(code)`（AIR 运行时抛 `#2018`）
 - **macOS 菜单栏状态项** — `SystemTrayIcon` 背后是真 `NSStatusItem`（`--features tray`；AIR 在 macOS 上 `supportsSystemTrayIcon=false`、构造抛 `#2012`）
+- **原生着色器直通** — `Context3DNative` 吃 GLSL ES 3.00 源码，经 glslang + SPIRV-Cross 出 MSL/HLSL/GLSL，并拿到浮点渲染目标、MRT、整数纹理、深度纹理（`--features native-shader`，仅 native；AIR 只有 AGAL 寄存器语言。默认构建里这个类**不存在**，`getDefinitionByName` 与 `adl` 同形抛 `#1065`）
 
-完整 19 项清单（余 Lottie、原生着色器、FFI、服务端出图…）与五条判定标准见
+完整 19 项清单（余 Lottie、FFI、服务端出图…）与五条判定标准见
 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md)。
 
 ## 示例

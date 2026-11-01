@@ -41,6 +41,7 @@ import './unit/audio-example.ts';
 import './unit/reach.ts';
 import './unit/doctor.ts';
 import './unit/vsync.ts';
+import './unit/native-shader.ts';
 import './unit/npm-package.ts';
 import './unit/cli.ts';
 import './unit/fre.ts';

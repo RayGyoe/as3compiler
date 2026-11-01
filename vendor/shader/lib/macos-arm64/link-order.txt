@@ -1,0 +1,17 @@
+# Link order (static archives resolve left to right). Consumed by src/build.ts.
+# vendor/shader_compiler.cc is compiled into the app as a SOURCE (like skia_glue.cc),
+# so it is not listed here.
+libspirv-cross-msl.a
+libspirv-cross-hlsl.a
+libspirv-cross-glsl.a
+libspirv-cross-cpp.a
+libspirv-cross-reflect.a
+libspirv-cross-util.a
+libspirv-cross-c.a
+libspirv-cross-core.a
+libglslang.a
+libSPIRV.a
+libMachineIndependent.a
+libGenericCodeGen.a
+libOSDependent.a
+libglslang-default-resource-limits.a

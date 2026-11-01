@@ -18,6 +18,30 @@ import { registerGroup, root, readNorm } from '../harness.ts';
 // The emitter builds the generated C from `this.line('...')` string literals.
 // Assert on the emitted statements, not on the raw source: comments in emit.ts
 // quote both the broken and the fixed forms (the same trap render.ts documents).
+// E6 (阶段三百五十三): `--features native-shader` is a NATIVE-ONLY channel, and the
+// runtime declares its `s3d_native_*` seam inside `#if ASC_HAS_NATIVE_SHADER`. Those
+// five symbols are therefore not part of the shared s3d_* ABI that every glue must
+// define -- asking the WebGL/D3D glues for them would demand dead stubs for a backend
+// they never serve. Dropping the gated region is the honest reading of the seam rule.
+//
+// Nesting-aware on purpose: those blocks contain ordinary `#ifdef ASC_RENDER_STAGE3D`
+// bodies, so a non-greedy first-`#endif` regex stops at an inner branch and leaks the
+// remainder back into the ABI set.
+function stripNativeGate(s: string): string {
+  const out: string[] = [];
+  let depth = 0;
+  for (const line of s.split('\n')) {
+    if (depth === 0) {
+      if (/^#if\s+ASC_HAS_NATIVE_SHADER\b/.test(line)) { depth = 1; continue; }
+      out.push(line);
+      continue;
+    }
+    if (/^#\s*if/.test(line)) depth++;
+    else if (/^#\s*endif/.test(line)) depth--;
+  }
+  return out.join('\n');
+}
+
 function emittedLines(): string {
   const src = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   return [...src.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
@@ -679,7 +703,7 @@ function checkStage3dWebglAbiCoverage(): string[] {
   // stale-artifact page then reported it as "stuck at the loading screen".
   const stripComments = (s: string): string =>
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
-  const referenced = new Set([...stripComments(runtime).matchAll(/\b(s3d_\w+)\s*\(/g)].map((m) => m[1]));
+  const referenced = new Set([...stripNativeGate(stripComments(runtime)).matchAll(/\b(s3d_\w+)\s*\(/g)].map((m) => m[1]));
   const definedWeb = new Set([...webgl.matchAll(/^[A-Za-z_][\w \t\*]*\b(s3d_\w+)\s*\(/gm)].map((m) => m[1]));
   const missing = [...referenced].filter((n) => !definedWeb.has(n)).sort();
   check(`every s3d_* symbol the runtime calls is defined in the WebGL glue (missing: ${missing.join(', ') || 'none'})`,
@@ -1000,7 +1024,7 @@ function checkStage3dD3dGlue(): string[] {
   const stripComments = (s: string): string =>
     s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '');
 
-  const referenced = new Set([...stripComments(runtime).matchAll(/\b(s3d_\w+)\s*\(/g)].map((m) => m[1]));
+  const referenced = new Set([...stripNativeGate(stripComments(runtime)).matchAll(/\b(s3d_\w+)\s*\(/g)].map((m) => m[1]));
   const definedD3d = new Set([...d3d.matchAll(/^[A-Za-z_][\w \t\*]*\b(s3d_\w+)\s*\(/gm)].map((m) => m[1]));
   const missing = [...referenced].filter((n) => !definedD3d.has(n)).sort();
   check(`every s3d_* symbol the runtime calls is defined in the D3D glue (missing: ${missing.join(', ') || 'none'})`,
@@ -1397,7 +1421,11 @@ function checkStage3dTextureLimits(): string[] {
   const iCreate = emitted.indexOf('Texture* Context3D_createTexture');
   check('all three factories validate before allocating',
     iCreate > 0
-    && emitted.indexOf('as_tex_check_2d(ctx, width, height);') < emitted.indexOf('Texture* t = Texture_new();')
+    // Scoped to iCreate on purpose: Context3DNative_createTexture (E6) also allocates a
+    // Texture* and appears earlier in emit.ts, so a bare indexOf would compare across
+    // two different factories.
+    && emitted.indexOf('as_tex_check_2d(ctx, width, height);') > iCreate
+    && emitted.indexOf('as_tex_check_2d(ctx, width, height);') < emitted.indexOf('Texture* t = Texture_new();', iCreate)
     && emitted.indexOf('as_tex_check_cube(ctx->ignoreResourceLimits, size);') < emitted.indexOf('CubeTexture* t = CubeTexture_new();')
     && emitted.indexOf('as_tex_check_rect(ctx, width, height);') < emitted.indexOf('RectangleTexture* t = RectangleTexture_new();'));
 
@@ -1765,9 +1793,15 @@ function checkStage3dTextureFormats(): string[] {
   // 5. Each backend keeps a half-float surface AND selects its pipeline on it:
   //    Metal/D3D12 bake the attachment format into the pipeline object, so a
   //    draw into RGBA16F on a pipeline built for BGRA8 is rejected outright.
-  check('Metal creates RGBA16F surfaces and keys the pipeline on it',
-    /MTLPixelFormatRGBA16Float/.test(metal) && /c->bvars\[i\]\.isHalf == isHalf/.test(metal)
-    && /c->bvars\[idx\]\.isHalf = isHalf;/.test(metal));
+  // (E6 阶段三百五十三) The key widened from `isHalf` to `fmtKey` + `ncolor` when float
+  // render targets grew past RGBA16F: an RGBA32F draw used to hit the RGBA16F pipeline
+  // (Metal then rejects the pass outright), and MRT needs the count in the key because
+  // one BGRA8 attachment and two of them are different pipeline objects.
+  check('Metal creates RGBA16F surfaces and keys the pipeline on the attachment format',
+    /MTLPixelFormatRGBA16Float/.test(metal)
+    && /c->bvars\[i\]\.fmtKey == fmtKey && c->bvars\[i\]\.ncolor == ncolor/.test(metal)
+    && /c->bvars\[idx\]\.fmtKey = fmtKey;/.test(metal)
+    && /c->bvars\[idx\]\.ncolor = ncolor;/.test(metal));
   check('D3D12 uses R16G16B16A16_FLOAT and keys the PSO on the target format',
     /DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d) && /RTVFormats\[0\] = rtfHalf \? DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d));
   check('WebGL creates GL_RGBA16F and narrows the readback',

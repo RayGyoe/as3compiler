@@ -1,0 +1,29 @@
+{
+  "target": "native",
+  "opt": "-O2",
+  "sources": [
+    "../vendor/shader_compiler.cc"
+  ],
+  "include-paths": [
+    "../vendor/shader/include"
+  ],
+  "link-paths": [
+    "../vendor/shader/lib/macos-arm64"
+  ],
+  "link-libs": [
+    "spirv-cross-msl",
+    "spirv-cross-hlsl",
+    "spirv-cross-glsl",
+    "spirv-cross-cpp",
+    "spirv-cross-reflect",
+    "spirv-cross-util",
+    "spirv-cross-c",
+    "spirv-cross-core",
+    "glslang",
+    "SPIRV",
+    "MachineIndependent",
+    "GenericCodeGen",
+    "OSDependent",
+    "glslang-default-resource-limits"
+  ]
+}

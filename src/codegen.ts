@@ -29,9 +29,14 @@ export function generateC(
   embedResources: readonly EmbedResourceSpec[] = [],
   embedFieldInits?: ReadonlyMap<string, string>,
   appDescriptorXml?: string,
-  aneDescriptors: readonly AneDescriptor[] = []
+  aneDescriptors: readonly AneDescriptor[] = [],
+  // `--features` names in effect. Only the symbol surface consults them today:
+  // a gated class must not EXIST in a default build, because its absence is what
+  // makes getDefinitionByName answer #1065 like adl (see symbols.ts §E6 gate).
+  features: readonly string[] = []
 ): CodegenResult {
   const symbols = new SymbolTable();
+  symbols.features = features;
   symbols.collect(program, embedFieldInits);
   const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml, aneDescriptors);
   const c = emitter.run();

@@ -992,7 +992,7 @@ async function main(): Promise<void> {
   if (opts.airApp) {
     try { appDescriptorXml = readFileSync(opts.airApp, 'utf8'); } catch { appDescriptorXml = undefined; }
   }
-  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? []);
+  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? [], cfg.features);
   mkdirSync(dirname(cPath), { recursive: true });
   writeFileSync(cPath, c);
 

@@ -18887,6 +18887,83 @@ NEAREST/LINEAR、CLAMP/REPEAT、逐顶点插值）、纯 C 状态机 20 条；`t
 构建不进自动回归）。
 
 
+### 阶段三百五十三：E6 原生着色器直通 · 立项与交叉编译链（v0.4.313 → v0.4.314）
+
+**范围**：`### 增强待做` 的 **E6**（原生着色器直通）。本阶段只做两件事：**立项**（施工图）与**交叉编译链**
+（M1）——把「GLSL ES 3.00 → 各后端」这条链变成可独立验证的 C 组件，先于任何 AS3 面动工。
+
+**为什么先做 M1**：E6 的全部后续工作（`Context3DNative`、三端胶水、`NativeShaderRenderer`）都建立在
+「源码字符串真的能变成合法 MSL/HLSL」之上。这一条若假，其余全是空转。所以先用一个**不涉及 GPU、不涉及
+编译器前端**的 C 程序把它单独证伪/证实。
+
+**今天实测到的三件事（都改了原设计里的假设）**：
+
+1. **`#version 300 es` 不能直接进 SPIR-V**：glslang 报 `ES shaders for SPIR-V require version 310 or higher`
+   ⇒ 送 SPIR-V 前必须把版本指令**内部升级**成 `310 es`（作者仍写 3.00，Web 直通那端保持 300 不变）。
+2. **Vulkan 环境不接受裸 uniform**：`-V --target-env vulkan1.0` 报
+   `'non-opaque uniforms outside a block' : not allowed when using GLSL for Vulkan` ⇒ 必须走
+   **`-G --target-env opengl`**，否则 three.js 风格的 `uniform float uT;` 一律编不过。这是设计文档 §5.3
+   「glslang → SPIR-V → SPIRV-Cross」没写的一步。
+3. **本机的 Metal 离线编译器不可用**：`xcrun -sdk macosx metal` 报 `missing Metal Toolchain`
+   ⇒ 设计文档 §9 写的「`xcrun metal` 真编译」验收方式**作废**，改走运行期 `newLibraryWithSource:`
+   （`s3d_compile` 本来就走这条，用的是系统 Metal 框架，与离线工具链无关）。
+
+**产物形状反过来定了绑定 API**：SPIRV-Cross 给每个 uniform 一个**独立** `[[buffer(N)]]`、给纹理与采样器
+**成对**的 `[[texture(N)]]`/`[[sampler(N)]]`、把 MRT 直接落成 `[[color(0)]]`/`[[color(1)]]`。
+⇒ uniform 走**按名字**绑定（不需要算 `std140` 偏移），顶点属性位置 = 顶点流号（`va0` = `[[attribute(0)]]`），
+这两条与现有 AGAL 路径的顶点布局**零冲突**。入口名 `main0` 与 `s3d_compile` 期待的 `vs_main`/`fs_main`
+不一致，用 SPIRV-Cross 的 `rename_entry_point` API 改，**不做**文本替换（会误伤注释里的同名串）。
+
+**交付**：`docs/zh-cn/native-shader-plan.md`（施工图：M0–M7 里程碑、文件级 WBS、接口契约、GLSL 子集与
+拒绝面、错误面、验收命令）；`build-tools/shader/build.sh`（一条命令从零建 glslang + SPIRV-Cross）；
+`vendor/shader_compiler.{h,cc}`（纯 C 接口的 C++ 垫片）；`temp/shc-test/`（独立 C 验收程序）。
+
+**里程碑与后续**：M2 编译器侧（`--features native-shader` + `Context3DNative`）→ M3 Metal → M4 Web →
+M5 D3D12 → M6 引擎侧（`ShaderMaterial`/`NativeShaderRenderer`）→ M7 Ultra-Water 对齐。
+每步的验收命令写在施工图 §6。
+
+**红线**：AOT-only（AIR 侧 `#1065`，与 AIR 逐字同形）；默认构建**零增长**（`--features native-shader`
+才链 glslang/SPIRV-Cross）；`Context3DTextureFormat` 保持 AIR 六常量不变（浮点增强走独立新类）。
+
+#### M2 完成 + M3 代码落地（同日推进）
+
+**M2（编译器侧）全部落地**，验收 `examples/native-shader-probe.as` 绿：MRT 附件数 = 2、反射 5 条
+（`aPos`/`uMVP`/`uTime`×2 阶段/`uSpectrum`）、`#version 100` 与 `attribute` 双双被拒且带 `0:2` 行号。
+
+- `src/build.ts`：`FEATURES['native-shader']`（macro `ASC_USE_NATIVE_SHADER=1`，**targets 只有 `native`**）。
+  收窄的理由：wasm 那条路是「作者 GLSL 原样喂 WebGL2」，它不需要 `asc_shader_translate`，需要的是 M4 的
+  直通胶水；在那之前打开 `wasm` 只会让 web 构建连到不存在的 shim。
+- `src/codegen.ts` / `src/index.ts`：新增 `generateC(..., features)` 形参，把 `cfg.features` 透传下去
+  （**features 第一次影响符号表**，此前只影响 C 编译宏）。
+- `src/symbols.ts`：`SymbolTable.features` + `hasFeature()`；`native-shader` 时注册
+  `flash.display3D.Context3DNative`（9 个格式常量 + 14 个方法 + 静态 `isAvailable`）与
+  `flash.display3D.NativeProgram3D`（反射用四条平行数组，避免每条一次分配）。**默认不注册**。
+- `src/runtime.ts`：`ASC_HAS_NATIVE_SHADER` 派生宏；`asc_shader_program`/`asc_shader_binding` 的 C 结构
+  与 `asc_shader_translate` 等 extern（整块在 `#if ASC_HAS_NATIVE_SHADER` 内）；`as_s3d_native_*` 一族
+  包装（无 Stage3D 后端时**如实返回错误串**而不是假装成功）。
+- `src/emit.ts`：两个类的全部方法体，整块既要 `this.symbols.features` 含 `native-shader` **且**包在
+  `#if ASC_HAS_NATIVE_SHADER` 里——前者保证默认构建的 C 逐字不变，后者保证发射出来的 C 自身自洽。
+- AS3 面的两个决定：`uploadProgram` **编译失败不抛**（返回 `ok=false` + `infoLog` 带 glslang 原文），
+  只有「用这个程序」才抛；`setUniform`/`bindTexture` 的未知名字抛 `ArgumentError #2008`
+  ——拼错 uniform 是这条通道最常见的 bug，静默保留旧值会看起来像「着色器不理我的光照」。
+
+**M3（Metal）代码已落，缺真机数值验收**（需要窗口探针，见施工图 §6）：
+
+- `s3d_create_texture_fmt(ctx,w,h,fmtId,renderable)`：11 个格式 id（RGBA32F/R32F/RG32F/R16F/RG16F/
+  RGB11B10F/R8/Depth32F/Depth16 + 默认 BGRA8）。
+- `s3d_native_use` / `s3d_native_uniform` / `s3d_native_bind_texture` / `s3d_native_set_targets`。
+  uniform 走 `setVertexBytes`/`setFragmentBytes`，索引 = 反射出的 `[[buffer(N)]]`，**payload 上限 64 字节**。
+- `S3DBlendVariant` 的键加了 `fmtKey` + `ncolor`：只按 `isHalf` 做键会让 RGBA32F 命中 RGBA16F 的旧管线，
+  Metal 直接拒绝该 pass。`s3d_make_pso` 现在逐附件配格式与 blend。
+- `s3d_draw`：`nativeMode` 时**不绑** `vc`/`fc`（AGAL 的 `buffer(0)` 与原生第一条 uniform 同槽，后写的
+  会静默覆盖前者）；MRT 附件 1..n-1 走 `Load`（Stage3D 只有一个清屏色，属于附件 0）；`nativeDepth`
+  非空时强制挂附件并让管线深度格式跟随它。
+
+**未做（明确登记，不静默）**：真机出图与 `readPixels` 容差验收；M4 WebGL2 直通；M5 D3D12/HLSL；
+深度纹理的 `sampler2DShadow` 比较采样（SPIRV-Cross 目前发普通 sampler，比较由 shader 侧做）。
+
+---
+
 ### 遗留待开发
 > **2026-11-02 追加（阶段三百五十二：AGAL4 顶点纹理取值）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **91 → 90 行**（`未开始` **71 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1）。**移出 1 行**：「顶点纹理取值（VTF）」——三翻译器的顶点 sampler 声明 + 三后端绑定 + stage/version 门控（`#3622`/`#3803`/`#3805`/`#3757`）全部落地，Metal 真机 26 条断言。**同阶段修净、不占表**：① `Program3D` 重 upload 不重新编译着色器（缓存键是指针，改成「指针 + `uploadSerial`」）；② `as_agal_errid` 让 AGAL 校验错误的 `errorID` 与 AIR 一致（此前恒 0）。**一处刻意的实现分歧**：AIR 的顶点 `tld` **忽略 LOD 字节**（恒采 mip0），我们按指令本意用该值 —— 在 AIR 上跑对的程序都写 lod=0，故行为等价。
 > **2026-11-02 追加（阶段三百五十一：`Context3DTextureFormat` 六常量 · 半浮点纹理 · `ignoreResourceLimits` 真实语义）**：**新登记 0 行 / 改写 1 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **93 → 91 行**（`未开始` **73 → 71** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 2 行**：① 「`Context3DTextureFormat` 与 AIR 官方全集有 4 处偏差」（六常量对齐、`RGBA` 删除、`#2008`/`#3745`/`#3759` 按实测顺序接入、六种格式的上传解码与字节数全部落地）；③ 「旗标打开后的显存预检与分配失败上报」（`as_tex_check_budget` 单次分配估算 + `as_tex_alloc_failed` 在 create 与三个上传入口翻译后端失败，守卫无后端构建）。**改写 1 行**：② 收窄成「顶点纹理取值（VTF）」——AGAL4 版本与指令预算已放行（`f9a2292`），剩下的只有三翻译器的顶点 sampler 声明与三后端绑定，属独立立项。**一处旧口径被推翻并同阶段修净（不占表）**：阶段二百二十七 把 `ignoreResourceLimits=true` 实现成「上限放到设备上限 16384」，实测（三档一致）是「上限不动、只把 `#3683` 换成 `#3684`」——旧实现比 AIR 更宽松，正是文档警告的那个输入；该分歧连同 `test/unit/stage3d.ts` 的 8 号钉一起按新口径改写，`docs/{zh-cn,en}/display3d.md` §9.14 正文同步。**另记一条 AIR 自身行为**：present 之后读回半浮点渲染目标恒为 `ff000000`（`Half3.as`），我们连续返回 `ff8040bf`（更正确），**不复制**。

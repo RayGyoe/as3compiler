@@ -524,7 +524,22 @@ function checkFeatures(): string[] {
     catch (e) { return String(e).includes("unknown feature 'lottie'") && String(e).includes(knownFeatures().join(', ')); }
   })());
   check('only implemented channels are offered as features',
-    knownFeatures().join(',') === 'formats,raw,svg,tray');
+    knownFeatures().join(',') === 'formats,native-shader,raw,svg,tray');
+
+  // (3b-bis) E6 / 阶段三百五十三: `native-shader`. Two claims, both about the DEFAULT
+  // direction -- the switch is opt-in, and it is native-only because the archives it
+  // links are host-specific (vendor/shader/lib/<vendor>, built by
+  // build-tools/shader/build.sh). Web is a separate milestone: it feeds the author's
+  // GLSL straight to WebGL2 and needs none of this.
+  const withNativeShader: BuildConfig = { ...dflt, features: ['native-shader'] };
+  check('feature native-shader resolves to its macro',
+    effectiveDefines(withNativeShader).includes('ASC_USE_NATIVE_SHADER=1'));
+  check('a default build defines no native-shader macro',
+    !effectiveDefines(dflt).some((d) => d.startsWith('ASC_USE_NATIVE_SHADER')));
+  check('native-shader is native-only, and says why', (() => {
+    try { validateFeatures(['native-shader'], 'wasm'); return false; }
+    catch (e) { return String(e).includes('native'); }
+  })());
 
   // (3c) E6 / 阶段二百六十: `tray` -- a REAL macOS menu-bar status item. The one
   // claim that has to hold on every machine is the DEFAULT: without the switch the

@@ -25984,6 +25984,323 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('void Program3D_dispose(void* _this) { Program3D* o = (Program3D*)_this; o->vertexProgram = NULL; o->fragmentProgram = NULL; }');
+    // ---- flash.display3D.Context3DNative (E6 native shader passthrough) ----
+    //
+    // Emitted inside `#if ASC_HAS_NATIVE_SHADER` so a default build (`--features`
+    // without `native-shader`) drops this whole block in the preprocessor: it must
+    // not reference vendor/shader_compiler.h, must not link glslang, and must not
+    // move the artifact's size (enhancements.md §1.2(d)). The symbol-table half of
+    // the gate is in symbols.ts -- with the feature off the classes do not exist at
+    // all, so the vtables/prototypes the emitter derives from classMap are absent
+    // too, and the block below would not even have types to name.
+    // The whole block is emitted only when the feature was asked for, so a DEFAULT
+    // build's C is byte-identical to before (enhancements.md §1.2(d)). The C-level
+    // `#if` below stays as well: the emitted source must be self-consistent if
+    // someone compiles it with the macro off, and it names the boundary for a reader.
+    if (this.symbols.features.includes('native-shader')) {
+    this.line('#if ASC_HAS_NATIVE_SHADER');
+    this.line('// Format token -> backend format id. 0 is the default BGRA8 so a caller that passes');
+    this.line('// null keeps AIR behaviour; every other id is the enhancement layer of');
+    this.line('// docs/zh-cn/native-shader.md §6.1. `rgbaHalfFloat` is accepted here even though it');
+    this.line('// is spelled on Context3DTextureFormat: it is AIR 14 behaviour, and this channel must');
+    this.line('// be able to name it without the caller juggling two constant classes.');
+    this.line('static int as_shader_format_id(const char* fmt) {');
+    this.indent++;
+    this.line('if (fmt == NULL || fmt[0] == 0) return 0;');
+    this.line('if (strcmp(fmt, "bgra") == 0) return 0;');
+    this.line('if (strcmp(fmt, "rgba32f") == 0) return 1;');
+    this.line('if (strcmp(fmt, "r32f") == 0) return 2;');
+    this.line('if (strcmp(fmt, "rg32f") == 0) return 3;');
+    this.line('if (strcmp(fmt, "rgbaHalfFloat") == 0) return 4;');
+    this.line('if (strcmp(fmt, "r16f") == 0) return 5;');
+    this.line('if (strcmp(fmt, "rg16f") == 0) return 6;');
+    this.line('if (strcmp(fmt, "r11g11b10f") == 0) return 7;');
+    this.line('if (strcmp(fmt, "r8") == 0) return 8;');
+    this.line('if (strcmp(fmt, "depth32f") == 0) return 9;');
+    this.line('if (strcmp(fmt, "depth16") == 0) return 10;');
+    this.line('return -1;');
+    this.indent--;
+    this.line('}');
+    this.line('bool Context3DNative_isAvailable_static(void) { return true; }');
+    this.line('void Context3DNative_ctor(Context3DNative* o, Context3D* ctx) { Object_ctor((Object*)o); o->context = ctx; gc_write_barrier((void*)ctx); }');
+    this.line('Context3DNative* Context3DNative_new(Context3D* ctx) { Context3DNative* o = (Context3DNative*)gc_alloc(GCT_CLASS, sizeof(Context3DNative)); o->vtable = &Context3DNative_vt; Context3DNative_ctor(o, ctx); return o; }');
+    this.line('NativeProgram3D* NativeProgram3D_new(void) { NativeProgram3D* o = (NativeProgram3D*)gc_alloc(GCT_CLASS, sizeof(NativeProgram3D)); o->vtable = &NativeProgram3D_vt; NativeProgram3D_ctor(o); return o; }');
+    this.line('void NativeProgram3D_ctor(NativeProgram3D* o) {');
+    this.indent++;
+    this.line('Object_ctor((Object*)o);');
+    this.line('o->vertexSource = NULL; o->fragmentSource = NULL;');
+    this.line('o->translatedVertex = NULL; o->translatedFragment = NULL;');
+    this.line('o->infoLog = NULL; o->ok = false; o->colorAttachments = 1; o->disposed = false;');
+    this.line('o->bindingNames = as_array_new(); gc_write_barrier((void*)o->bindingNames);');
+    this.line('o->bindingKinds = as_array_new(); gc_write_barrier((void*)o->bindingKinds);');
+    this.line('o->bindingSlots = as_array_new(); gc_write_barrier((void*)o->bindingSlots);');
+    this.line('o->bindingStages = as_array_new(); gc_write_barrier((void*)o->bindingStages);');
+    this.indent--;
+    this.line('}');
+    // Reflection lookup: -1 (not an error) when the name is absent, so callers can
+    // report a precise message. `stage` is 0=vertex / 1=fragment; a uniform declared
+    // in both stages has one entry per stage, which is why the stage is part of the
+    // key rather than being folded away.
+    this.line('int NativeProgram3D_findSlot(void* _this, char* name, int kind, int stage) {');
+    this.indent++;
+    this.line('NativeProgram3D* o = (NativeProgram3D*)_this;');
+    this.line('if (name == NULL) return -1;');
+    this.line('int n = o->bindingNames->length;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('const char* bn = as_v_str_val(o->bindingNames->data[i]);');
+    this.line('if (bn == NULL || strcmp(bn, name) != 0) continue;');
+    this.line('if (as_v_int_val(o->bindingKinds->data[i]) != kind) continue;');
+    this.line('if (stage >= 0 && as_v_int_val(o->bindingStages->data[i]) != stage) continue;');
+    this.line('return as_v_int_val(o->bindingSlots->data[i]);');
+    this.indent--;
+    this.line('}');
+    this.line('return -1;');
+    this.indent--;
+    this.line('}');
+    this.line('void NativeProgram3D_dispose(void* _this) { NativeProgram3D* o = (NativeProgram3D*)_this; o->disposed = true; o->ok = false; }');
+    // uploadProgram: translate + reflect. A FAILED compile is NOT an exception: the
+    // caller gets a program whose `ok` is false and whose `infoLog` carries the
+    // driver's own text, which is the shape three.js authors expect and the only one
+    // that lets a caller print why before deciding. Using the program anyway throws.
+    this.line('NativeProgram3D* Context3DNative_uploadProgram(void* _this, char* vs, char* fs) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('NativeProgram3D* p = NativeProgram3D_new();');
+    this.line('p->vertexSource = vs; gc_write_barrier((void*)vs);');
+    this.line('p->fragmentSource = fs; gc_write_barrier((void*)fs);');
+    this.line('asc_shader_program sp;');
+    this.line('memset(&sp, 0, sizeof(sp));');
+    this.line('int ok = asc_shader_translate(vs, fs, AS_SHADER_BACKEND_TARGET, &sp);');
+    this.line('p->ok = ok != 0;');
+    this.line('if (!ok) {');
+    this.indent++;
+    this.line('p->infoLog = as_str_dup(sp.error[0] != 0 ? sp.error : "native shader: translation failed"); gc_write_barrier((void*)p->infoLog);');
+    this.line('asc_shader_program_free(&sp);');
+    this.line('return p;');
+    this.indent--;
+    this.line('}');
+    this.line('p->translatedVertex = as_str_dup(sp.vertex_source != NULL ? sp.vertex_source : ""); gc_write_barrier((void*)p->translatedVertex);');
+    this.line('p->translatedFragment = as_str_dup(sp.fragment_source != NULL ? sp.fragment_source : ""); gc_write_barrier((void*)p->translatedFragment);');
+    this.line('p->colorAttachments = sp.color_attachments > 0 ? sp.color_attachments : 1;');
+    this.line('p->infoLog = as_str_dup(""); gc_write_barrier((void*)p->infoLog);');
+    this.line('for (int i = 0; i < sp.binding_count; i++) {');
+    this.indent++;
+    this.line('as_array_push(p->bindingNames, as_v_str(as_str_dup(sp.bindings[i].name != NULL ? sp.bindings[i].name : "")));');
+    this.line('as_array_push(p->bindingKinds, as_v_num((double)sp.bindings[i].kind));');
+    this.line('as_array_push(p->bindingSlots, as_v_num((double)sp.bindings[i].binding));');
+    this.line('as_array_push(p->bindingStages, as_v_num((double)sp.bindings[i].stage));');
+    this.indent--;
+    this.line('}');
+    this.line('asc_shader_program_free(&sp);');
+    this.line('(void)self;');
+    this.line('return p;');
+    this.indent--;
+    this.line('}');
+    this.line('char* Context3DNative_getInfoLog(void* _this, NativeProgram3D* p) { (void)_this; return p != NULL ? as_shader_or_empty(p->infoLog) : (char*)""; }');
+    this.line('char* Context3DNative_getTranslatedSource(void* _this, NativeProgram3D* p, bool vertex) { (void)_this; if (p == NULL) return (char*)""; return vertex ? as_shader_or_empty(p->translatedVertex) : as_shader_or_empty(p->translatedFragment); }');
+    // Every consumer of a failed program reports instead of drawing nothing. AIR has no
+    // counterpart so there is no code to copy; id 0 with a named message is this
+    // codebase's convention for engine-level errors (see the AMF3 throws above).
+    this.line('static void as_shader_require_ok(NativeProgram3D* p, const char* what) {');
+    this.indent++;
+    this.line('if (p == NULL) as_throw(Error_new((char*)"Context3DNative: null NativeProgram3D", 0));');
+    this.line('if (!p->ok || p->disposed) {');
+    this.indent++;
+    this.line('char msg[512];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative: %s on a program that did not compile: %s", what, as_shader_or_empty(p->infoLog));');
+    this.line('as_throw(Error_new(msg, 0));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_useProgram(void* _this, NativeProgram3D* p) {');
+    this.indent++;
+    this.line('as_shader_require_ok(p, "useProgram");');
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('char err[512]; err[0] = 0;');
+    this.line('if (!as_s3d_native_use(self->context->gpu, p->translatedVertex, p->translatedFragment, p->colorAttachments, err, (int)sizeof(err))) {');
+    this.indent++;
+    this.line('char msg[512];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative: backend rejected the program: %s", err[0] != 0 ? err : "(no message)");');
+    this.line('p->ok = false; p->infoLog = as_str_dup(msg); gc_write_barrier((void*)p->infoLog);');
+    this.line('as_throw(Error_new(msg, 0));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // setUniform*f: a name that the reflection table does not carry is an
+    // ArgumentError, never a silent no-op -- a typo'd uniform is the single most
+    // common native-shader bug, and silently keeping the old value would look like
+    // "the shader ignores my light".
+    this.line('static void as_shader_set_uniform_vec(Context3DNative* self, NativeProgram3D* p, char* name, const float* f, int nf) {');
+    this.indent++;
+    this.line('as_shader_require_ok(p, "setUniform");');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('int found = 0;');
+    this.line('for (int stage = 0; stage < 2; stage++) {');
+    this.indent++;
+    this.line('int slot = NativeProgram3D_findSlot(p, name, ASC_SHADER_KIND_UNIFORM, stage);');
+    this.line('if (slot < 0) continue;');
+    this.line('found = 1;');
+    this.line('as_s3d_native_uniform(self->context->gpu, stage, slot, f, nf);');
+    this.indent--;
+    this.line('}');
+    this.line('if (!found) {');
+    this.indent++;
+    this.line('char msg[512];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative.setUniform: no uniform named \'%s\' (it is unused, or the compiler removed it)", name != NULL ? name : "null");');
+    this.line('as_throw(ArgumentError_new(msg, 2008));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_setUniform1f(void* _this, NativeProgram3D* p, char* name, double v1) { float f[4] = { (float)v1, 0.0f, 0.0f, 0.0f }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 1); }');
+    this.line('void Context3DNative_setUniform2f(void* _this, NativeProgram3D* p, char* name, double v1, double v2) { float f[4] = { (float)v1, (float)v2, 0.0f, 0.0f }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 2); }');
+    this.line('void Context3DNative_setUniform3f(void* _this, NativeProgram3D* p, char* name, double v1, double v2, double v3) { float f[4] = { (float)v1, (float)v2, (float)v3, 0.0f }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 3); }');
+    this.line('void Context3DNative_setUniform4f(void* _this, NativeProgram3D* p, char* name, double v1, double v2, double v3, double v4) { float f[4] = { (float)v1, (float)v2, (float)v3, (float)v4 }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 4); }');
+    this.line('void Context3DNative_setUniformMatrix4(void* _this, NativeProgram3D* p, char* name, as_vector_number* m) {');
+    this.indent++;
+    this.line('if (m == NULL || m->length < 16) as_throw(ArgumentError_new((char*)"Context3DNative.setUniformMatrix4: matrix must hold 16 numbers", 2004));');
+    this.line('float f[16];');
+    this.line('for (int i = 0; i < 16; i++) f[i] = (float)m->data[i];');
+    this.line('as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 16);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_bindTexture(void* _this, NativeProgram3D* p, char* name, TextureBase* tex) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('as_shader_require_ok(p, "bindTexture");');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('void* gpu = (tex != NULL && tex->vtable == (void*)&Texture_vt) ? ((Texture*)tex)->gpu : NULL;');
+    this.line('int found = 0;');
+    this.line('for (int stage = 0; stage < 2; stage++) {');
+    this.indent++;
+    this.line('int slot = NativeProgram3D_findSlot(p, name, ASC_SHADER_KIND_TEXTURE, stage);');
+    this.line('if (slot < 0) continue;');
+    this.line('found = 1;');
+    this.line('as_s3d_native_bind_texture(self->context->gpu, stage, slot, gpu);');
+    this.indent--;
+    this.line('}');
+    this.line('if (!found) {');
+    this.indent++;
+    this.line('char msg[512];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative.bindTexture: no sampler named \'%s\'", name != NULL ? name : "null");');
+    this.line('as_throw(ArgumentError_new(msg, 2008));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_drawTriangles(void* _this, NativeProgram3D* p, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('as_shader_require_ok(p, "drawTriangles");');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('if (numTriangles < 0) {');
+    this.indent++;
+    this.line('if (indexBuffer == NULL || indexBuffer->data == NULL) as_throw(ArgumentError_new((char*)"Context3DNative.drawTriangles: no index buffer and no triangle count", 2004));');
+    this.line('numTriangles = (int)((indexBuffer->numIndices - firstIndex) / 3);');
+    this.indent--;
+    this.line('}');
+    this.line('if (numTriangles <= 0) return;');
+    this.line('if (firstIndex < 0) as_throw(ArgumentError_new((char*)"Context3DNative.drawTriangles: firstIndex must be >= 0", 2004));');
+    this.line('if (indexBuffer != NULL && indexBuffer->data != NULL) {');
+    this.indent++;
+    this.line('int avail = indexBuffer->numIndices - firstIndex;');
+    this.line('if (numTriangles * 3 > avail) as_throw(ArgumentError_new((char*)"Context3DNative.drawTriangles: not enough indices", 2004));');
+    // The AGAL path re-uploads the index range per draw (s3d_upload_index), so the
+    // native path does the same rather than inventing a second caching scheme: the
+    // offset already folds in the IndexBuffer3D's own startIndex.
+    this.line('as_s3d_upload_index(self->context->gpu, indexBuffer->data->data + indexBuffer->startIndex + firstIndex, numTriangles * 3);');
+    this.indent--;
+    this.line('}');
+    this.line('as_s3d_draw(self->context->gpu, numTriangles);');
+    this.indent--;
+    this.line('}');
+    this.line('Texture* Context3DNative_createTexture(void* _this, int width, int height, char* format, bool renderable) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('int fid = as_shader_format_id(format);');
+    this.line('if (fid < 0 || fid > 8) {');
+    this.indent++;
+    this.line('char msg[512];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative.createTexture: unsupported format \'%s\'", format != NULL ? format : "null");');
+    this.line('as_throw(ArgumentError_new(msg, 2008));');
+    this.indent--;
+    this.line('}');
+    this.line('if (width <= 0 || height <= 0) as_throw(ArgumentError_new((char*)"Context3DNative.createTexture: width and height must be > 0", 2004));');
+    this.line('int cap = as_s3d_max_texture_size();');
+    this.line('if (width > cap || height > cap) as_throw(Error_new((char*)"Error #3683: Texture too large.", 3683));');
+    this.line('void* gpu = as_s3d_create_texture_fmt(self->context->gpu, width, height, fid, renderable ? 1 : 0);');
+    this.line('if (gpu == NULL) as_throw(Error_new((char*)"Error #3684: Texture size too large or out of memory.", 3684));');
+    this.line('Texture* t = Texture_new();');
+    this.line('t->width = width; t->height = height; t->format = format; gc_write_barrier((void*)format);');
+    this.line('t->gpu = gpu; t->ctx = self->context->gpu; t->mips = 1;');
+    this.line('return t;');
+    this.indent--;
+    this.line('}');
+    this.line('Texture* Context3DNative_createDepthTexture(void* _this, int width, int height, char* format) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('int fid = as_shader_format_id(format);');
+    this.line('if (fid != 9 && fid != 10) {');
+    this.indent++;
+    this.line('char msg[512];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative.createDepthTexture: format \'%s\' is not DEPTH_32F or DEPTH_16", format != NULL ? format : "null");');
+    this.line('as_throw(ArgumentError_new(msg, 2008));');
+    this.indent--;
+    this.line('}');
+    this.line('if (width <= 0 || height <= 0) as_throw(ArgumentError_new((char*)"Context3DNative.createDepthTexture: width and height must be > 0", 2004));');
+    this.line('void* gpu = as_s3d_create_texture_fmt(self->context->gpu, width, height, fid, 1);');
+    this.line('if (gpu == NULL) as_throw(Error_new((char*)"Error #3684: Texture size too large or out of memory.", 3684));');
+    this.line('Texture* t = Texture_new();');
+    this.line('t->width = width; t->height = height; t->format = format; gc_write_barrier((void*)format);');
+    this.line('t->gpu = gpu; t->ctx = self->context->gpu; t->mips = 1;');
+    this.line('return t;');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_setRenderTargets(void* _this, as_array* colors, TextureBase* depth) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('if (colors == NULL) { as_s3d_native_set_targets(self->context->gpu, NULL, 0, NULL); return; }');
+    this.line('int n = colors->length;');
+    this.line('if (n > 4) as_throw(ArgumentError_new((char*)"Context3DNative.setRenderTargets: at most 4 colour attachments", 2004));');
+    this.line('void* gpu[4];');
+    this.line('int w = 0, h = 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('as_value cv = colors->data[i];');
+    this.line('Texture* t = (cv.tag == 4 && cv.ptr != NULL && ((void**)cv.ptr)[0] == (void*)&Texture_vt) ? (Texture*)cv.ptr : NULL;');
+    this.line('if (t == NULL || t->gpu == NULL) {');
+    this.indent++;
+    this.line('char msg[256];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative.setRenderTargets: attachment %d is not a renderable Texture", i);');
+    this.line('as_throw(ArgumentError_new(msg, 2004));');
+    this.indent--;
+    this.line('}');
+    this.line('if (i == 0) { w = t->width; h = t->height; }');
+    this.line('else if (t->width != w || t->height != h) as_throw(ArgumentError_new((char*)"Context3DNative.setRenderTargets: all attachments must share one size", 2004));');
+    this.line('gpu[i] = t->gpu;');
+    this.indent--;
+    this.line('}');
+    this.line('void* dgpu = NULL;');
+    this.line('if (depth != NULL && depth->vtable == (void*)&Texture_vt) dgpu = ((Texture*)depth)->gpu;');
+    this.line('as_s3d_native_set_targets(self->context->gpu, gpu, n, dgpu);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_setBackBuffer(void* _this) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('as_s3d_native_set_targets(self->context->gpu, NULL, 0, NULL);');
+    this.indent--;
+    this.line('}');
+    this.line('#endif  // ASC_HAS_NATIVE_SHADER');
+    }
     this.line('void TextureBase_ctor(TextureBase* o) { Object_ctor((Object*)o); }');
     this.line('TextureBase* TextureBase_new(void) { TextureBase* o = (TextureBase*)gc_alloc(GCT_CLASS, sizeof(TextureBase)); o->vtable = &TextureBase_vt; TextureBase_ctor(o); return o; }');
     this.line('void TextureBase_dispose(void* _this) { (void)_this; }');
