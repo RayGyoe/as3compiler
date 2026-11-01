@@ -343,6 +343,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // scrollrect-clip.as 断言的也是**像素**（scrollRect 窗口的着色包围盒与窗口左上角
   // 色条），纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
   'scrollrect-clip.as': ['--manifest', join(dir, 'scrollrect-clip.build.json')],
+  // scrollrect-round.as（阶段三百四十九）断言的是窗口**尺寸取整**（四舍六入五成双、对象坐标）
+  // 与小数位置上边列的**部分覆盖**——两者都只能看着像素判断，纯 C 构建下 `draw` 是空桩，
+  // 示例会自行 skip。故与 scrollrect-clip.as 共用同一份 Skia 清单。
+  'scrollrect-round.as': ['--manifest', join(dir, 'scrollrect-clip.build.json')],
   // overflow-clip.as（阶段三百四十三 · G29）断言的是「把子树裁到盒子里」这条编译器能力：
   // 120 宽父盒里的 200 宽子件在 scrollRect/mask 下都只画到第 120 像素，且**整棵子树**
   // （孙件）、跨界描边、BlurFilter 外溢、cacheAsBitmap、嵌套裁剪、TextField 子件一并被裁，

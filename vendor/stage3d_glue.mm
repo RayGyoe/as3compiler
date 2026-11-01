@@ -17,6 +17,7 @@
 #import <Metal/Metal.h>
 #include <cstdio>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -168,6 +169,7 @@ typedef struct {
   char df[32];
   unsigned int writeMask;   // MTLColorWriteMask bits baked into this pipeline
   int samples;              // MTLRenderPipelineDescriptor.rasterSampleCount
+  int isHalf;               // color attachment is RGBA16F instead of BGRA8
   id<MTLRenderPipelineState> pso;
   unsigned long stamp;
 } S3DBlendVariant;
@@ -366,7 +368,7 @@ struct S3DContext {
 // bakes the blend state into an MTLRenderPipelineState, since Metal has no
 // per-draw blend-factor call.
 static void s3d_factor_key(char* dst, const char* name);
-static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendSource, const char* blendDest, unsigned int writeMask, NSError** err);
+static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendSource, const char* blendDest, unsigned int writeMask, int samples, int isHalf, NSError** err);
 static void s3d_clear_variants(S3DContext* c);
 static void s3d_prog_release(S3DProgramCache* e);
 static void s3d_prog_stash(S3DContext* c);
@@ -443,6 +445,72 @@ static int s3d_pass_samples(S3DContext* c) {
   if (c->msaaColor == nil || c->msaaDepthStencil == nil) return 1;
   return c->msaaCount;
 }
+
+// Apply a still-pending clear to the CURRENT target with a zero-draw render pass.
+//
+// Stage3D's clear() is not immediate: s3d_clear only records the values, and the
+// pass that performs the clear is the NEXT draw's (loadAction = Clear) so that
+// Starling's "one clear, thousands of draws" model does not re-clear per draw.
+// That is fine as long as something is drawn -- but a clear followed by ZERO
+// draws never gets a pass at all, and the target then keeps whatever the driver
+// left in a freshly allocated private texture (all zeros). AIR applies clear() to
+// the bound target regardless of what follows, so the two diverge exactly on the
+// empty pass. Measured consequence (asaot3d apps/shadow-m13, identical sources):
+// a shadow-casting directional light with NO shadow caster in the scene leaves
+// the shadow map at zeros, the packed [0,1] depth decodes as 0.0 = "nearer than
+// any fragment", and the whole shadow frustum is judged occluded -- ground
+// 11.8/255 on AOT vs 31.8/255 on AIR for the same frame. Clearing the map to 1
+// (farthest) is what makes "nothing cast" mean "no shadow".
+//
+// The pass is emitted in-order into the frame's batch, so it lands before any
+// draw that samples the target (the submission order of one command buffer).
+static void s3d_apply_pending_clear(S3DContext* c) {
+  if (!c->clearPending) return;
+  const int wantColor = c->clearColor;
+  const int wantDepth = c->clearDepth;
+  const int wantStencil = c->clearStencil;
+  // Consume the flags first: everything below may return early, and a stale
+  // pending clear would then leak into an unrelated later pass.
+  c->clearPending = 0; c->clearColor = 0; c->clearDepth = 0; c->clearStencil = 0;
+  if (c->queue == nil) return;
+  if (!wantColor && !wantDepth && !wantStencil) return;
+  @autoreleasepool {
+    if (c->batch == nil) c->batch = [[c->queue commandBuffer] retain];
+    if (c->batch == nil) return;
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    // An offscreen pass is single-sample (s3d_pass_samples); an on-screen one may
+    // be multisampled, in which case the clear has to land in the multisample
+    // buffer AND resolve down so the visible surface keeps the colour (the same
+    // shape as the mip-drop path in s3d_draw).
+    const int msaa = s3d_pass_samples(c);
+    if (msaa > 1) {
+      rp.colorAttachments[0].texture = c->msaaColor;
+      rp.colorAttachments[0].resolveTexture = c->target;
+      rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+      c->msaaResolvePending = 0;
+    } else {
+      rp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+      rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    rp.colorAttachments[0].loadAction = wantColor ? MTLLoadActionClear : MTLLoadActionLoad;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake((double)c->clearR, (double)c->clearG, (double)c->clearB, (double)c->clearA);
+    id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil
+                        : (msaa > 1 ? c->msaaDepthStencil : c->depthStencil);
+    if (ds != nil && (wantDepth || wantStencil)) {
+      rp.depthAttachment.texture = ds;
+      rp.depthAttachment.loadAction = wantDepth ? MTLLoadActionClear : MTLLoadActionLoad;
+      rp.depthAttachment.clearDepth = (double)c->clearDepthValue;
+      rp.depthAttachment.storeAction = MTLStoreActionStore;
+      rp.stencilAttachment.texture = ds;
+      rp.stencilAttachment.loadAction = wantStencil ? MTLLoadActionClear : MTLLoadActionLoad;
+      rp.stencilAttachment.clearStencil = (uint32_t)c->clearStencilValue;
+      rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
+    id<MTLRenderCommandEncoder> e = [c->batch renderCommandEncoderWithDescriptor:rp];
+    if (e != nil) [e endEncoding];
+  }
+}
+
 
 // Create a fragment sampler state (linear or nearest); clamp-to-edge addressing
 // and a full 0..maxLod range (a texture uploaded without mipmaps clamps to
@@ -672,6 +740,12 @@ static void s3d_unbind_texture_everywhere(id<MTLTexture> t) {
 static void s3d_flush_impl(void* ctx, int wait) {
   if (ctx == NULL) return;
   S3DContext* c = (S3DContext*)ctx;
+  // An offscreen target still bound at the frame boundary has to be settled here
+  // too: an app may clear a render-to-texture target, issue no draw into it and
+  // never call setRenderToBackBuffer before the frame ends. (The on-screen case
+  // is left alone deliberately -- the back buffer is presented from a draw, and
+  // injecting a clear pass into a draw-less frame is a separate question.)
+  if (c->renderOverride != nil) s3d_apply_pending_clear(c);
   id<MTLCommandBuffer> cb = c->batch;
   if (cb == nil) return;
   c->batch = nil;
@@ -1024,6 +1098,26 @@ void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* 
   return (void*)tex;  // caller owns the +1
 }
 
+// Upload an rgbaHalfFloat texture. `rgba` is width*height texels of four 16-bit
+// half floats (R,G,B,A) in host byte order -- the ByteArray's own bytes, because
+// narrowing to 8 bits here would destroy the values above 1.0 that are the format's
+// only reason to exist. Same ownership contract as s3d_texture_from_pixels: the
+// caller owns the +1 and releases it with s3d_destroy_texture.
+void* s3d_texture_from_pixels_half(void* ctx, int width, int height, const void* rgba) {
+  if (ctx == NULL || width <= 0 || height <= 0 || rgba == NULL) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+      width:width height:height mipmapped:NO];
+  td.usage = MTLTextureUsageShaderRead;
+  id<MTLTexture> tex = [c->device newTextureWithDescriptor:td];
+  if (tex == nil) return NULL;
+  // RGBA16Float is 8 bytes per texel and has the SAME channel order as the payload
+  // (no BGRA equivalent exists for float formats), so this is a straight copy.
+  [tex replaceRegion:MTLRegionMake2D(0, 0, width, height) mipmapLevel:0
+      withBytes:rgba bytesPerRow:(NSUInteger)width * 8];
+  return (void*)tex;  // caller owns the +1
+}
+
 // Upload pixels AND bind them as fragment sampler fs{unit} in one step. Only
 // correct when the draw that samples fs{unit} is the very next thing that
 // happens; the sequential-upload-then-draw path in Context3D_submit uses it.
@@ -1204,7 +1298,7 @@ static void s3d_factor_key(char* dst, const char* name) {
 // failure; *err receives the Metal error.
 static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendSource,
                                               const char* blendDest, unsigned int writeMask,
-                                              int samples, NSError** err) {
+                                              int samples, int isHalf, NSError** err) {
   MTLRenderPipelineDescriptor* pd = [[MTLRenderPipelineDescriptor alloc] init];
   pd.vertexFunction = c->vfn;
   pd.fragmentFunction = c->ffn;
@@ -1212,7 +1306,11 @@ static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendS
   // so the count is part of the pipeline identity (see S3DBlendVariant.samples).
   if (samples < 1) samples = 1;
   pd.rasterSampleCount = (NSUInteger)samples;
-  pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+  // The color-attachment pixel format is part of the pipeline object, so a draw
+  // into a Context3DTextureFormat.RGBA_HALF_FLOAT render target needs a pipeline
+  // built for RGBA16F (see s3d_target_is_half). Metal rejects a pass whose
+  // attachment format does not match the pipeline's.
+  pd.colorAttachments[0].pixelFormat = isHalf ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
   // Color write mask (setColorMask). Metal bakes it into the pipeline, so the
   // caller passes the mask recorded by the last setColorMask -- MTLClearMaskAll
   // when all four channels are writable, which is also the descriptor default.
@@ -1288,6 +1386,13 @@ static unsigned int s3d_color_mask_bits(const S3DContext* c) {
   return m;
 }
 
+// Whether the NEXT encoded draw lands on a half-float (RGBA16F) color attachment.
+// Only a render-to-texture target can be one: the back buffer is always BGRA8.
+static int s3d_target_is_half(S3DContext* c) {
+  if (c->renderOverride == nil) return 0;
+  return c->renderOverride.pixelFormat == MTLPixelFormatRGBA16Float ? 1 : 0;
+}
+
 // Select the pipeline whose baked blend + color-write state matches what is
 // currently recorded on the context, building and caching it on first use. Called
 // once per encoded draw: a setBlendFactors or setColorMask between two draws
@@ -1299,9 +1404,11 @@ static void s3d_select_pso(S3DContext* c) {
   s3d_factor_key(df, c->blendDest);
   unsigned int wm = s3d_color_mask_bits(c);
   int samples = s3d_pass_samples(c);
+  int isHalf = s3d_target_is_half(c);
   for (int i = 0; i < c->nbvars; i++) {
     if (strcmp(c->bvars[i].sf, sf) == 0 && strcmp(c->bvars[i].df, df) == 0 &&
-        c->bvars[i].writeMask == wm && c->bvars[i].samples == samples) {
+        c->bvars[i].writeMask == wm && c->bvars[i].samples == samples &&
+        c->bvars[i].isHalf == isHalf) {
       c->bvars[i].stamp = ++c->bstamp;
       c->pso = c->bvars[i].pso;
       return;
@@ -1309,7 +1416,7 @@ static void s3d_select_pso(S3DContext* c) {
   }
   asc_tr_psomiss++;
   NSError* err = nil;
-  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, wm, samples, &err);
+  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, wm, samples, isHalf, &err);
   if (pso == nil) {
     fprintf(stderr, "stage3d_glue: blend variant pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
     return;  // keep the previous pipeline: a wrong blend beats no draw at all
@@ -1329,6 +1436,7 @@ static void s3d_select_pso(S3DContext* c) {
   s3d_factor_key(c->bvars[idx].df, c->blendDest);
   c->bvars[idx].writeMask = wm;
   c->bvars[idx].samples = samples;
+  c->bvars[idx].isHalf = isHalf;
   c->bvars[idx].pso = pso;
   c->bvars[idx].stamp = ++c->bstamp;
   c->pso = pso;
@@ -1502,7 +1610,8 @@ int s3d_compile(void* ctx, void* key, const char* vs_msl, const char* fs_msl, ch
 
   NSError* perr = nil;
   const int seedSamples = s3d_pass_samples(c);
-  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, s3d_color_mask_bits(c), seedSamples, &perr);
+  const int seedHalf = s3d_target_is_half(c);
+  id<MTLRenderPipelineState> pso = s3d_make_pso(c, c->blendSource, c->blendDest, s3d_color_mask_bits(c), seedSamples, seedHalf, &perr);
   if (pso == nil) {
     fprintf(stderr, "stage3d_glue: pipeline create failed: %s\n", [[perr localizedDescription] UTF8String]);
     if (errbuf && errbuf_size > 0) snprintf(errbuf, errbuf_size, "pipeline: %s", [[perr localizedDescription] UTF8String]);
@@ -1513,6 +1622,7 @@ int s3d_compile(void* ctx, void* key, const char* vs_msl, const char* fs_msl, ch
   s3d_factor_key(c->bvars[0].df, c->blendDest);
   c->bvars[0].writeMask = s3d_color_mask_bits(c);
   c->bvars[0].samples = seedSamples;
+  c->bvars[0].isHalf = seedHalf;
   c->bvars[0].pso = pso;
   c->bvars[0].stamp = ++c->bstamp;
   c->nbvars = 1;
@@ -1946,14 +2056,40 @@ int s3d_height(void* ctx) { return ctx ? ((S3DContext*)ctx)->height : 0; }
 // profile claim and the enforced limit must never disagree.
 int s3d_max_texture_size(void) { return 16384; }
 
+// Bytes of texture this backend will attempt in ONE allocation: the device's
+// recommended working set (how much the OS lets this process keep resident), read
+// from the live device so a small integrated GPU answers less than a discrete one.
+// The generated C uses it only as a pre-check for a single texture; a device with
+// an unknown budget falls back to 2 GiB, which is above every realistic texture and
+// still stops a 16384x16384x8 B = 2 GiB half-float request from being attempted.
+double s3d_max_texture_memory(void) {
+  // Any live context will do: every context of one process shares the device.
+  if (s3d_live_n > 0 && s3d_live[0]->device != nil) {
+    NSUInteger ws = s3d_live[0]->device.recommendedMaxWorkingSetSize;
+    if (ws > 0) return (double)ws;
+  }
+  return 2147483648.0;
+}
+
 // ---- render-to-texture (stage 83) ----
 // A render-target texture (optimizeForRenderToTexture=true) is an MTLTexture with
 // both RenderTarget and ShaderRead usage: drawTriangles renders into it when it is
 // the current render override, and setTextureAt can later sample it as fsN.
+void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf);
+
 void* s3d_create_render_texture(void* ctx, int width, int height) {
+  return s3d_create_render_texture_fmt(ctx, width, height, 0);
+}
+
+// isHalf != 0 allocates RGBA16F for Context3DTextureFormat.RGBA_HALF_FLOAT. The
+// sampling side needs no change (AGAL's texture2d<float> reads any float format);
+// the DRAWING side does, and it is handled by the pipeline cache: a Metal pipeline
+// object carries the color-attachment pixel format, so s3d_select_pso keys on it
+// (see s3d_target_is_half).
+void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf) {
   if (ctx == NULL || width <= 0 || height <= 0) return NULL;
   S3DContext* c = (S3DContext*)ctx;
-  MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+  MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(isHalf ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm)
       width:width height:height mipmapped:NO];
   td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
   id<MTLTexture> tex = [c->device newTextureWithDescriptor:td];
@@ -1968,6 +2104,11 @@ void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
   asc_tr_rt++;
   if (ctx == NULL) return;
   S3DContext* c = (S3DContext*)ctx;
+  // A clear() that no draw consumed belongs to the target that was bound when it
+  // was issued, not to the one being bound now, so settle it before switching
+  // away (no-op when the target is unchanged: same-texture re-binds must not
+  // punch a clear pass into the middle of a draw sequence).
+  if ((id<MTLTexture>)tex != c->renderOverride) s3d_apply_pending_clear(c);
   if (tex != NULL) {
     id<MTLTexture> t = (id<MTLTexture>)tex;
     if ((t.usage & MTLTextureUsageRenderTarget) == 0) {
@@ -2029,6 +2170,19 @@ void* s3d_get_render_target(void* ctx) {
 }
 
 // Read back the current render target (render override if set, else back buffer).
+// IEEE 754 binary16 -> double. Written out instead of using a library call so the
+// conversion is identical on every SDK, including denormals and Inf/NaN.
+static double s3d_half_to_float(uint16_t h) {
+  const int sign = (h >> 15) & 1;
+  const int exp = (h >> 10) & 0x1F;
+  const int man = h & 0x3FF;
+  double v;
+  if (exp == 0) v = (double)man / 1024.0 * ldexp(1.0, -14);
+  else if (exp == 31) v = (man == 0) ? INFINITY : NAN;
+  else v = (1.0 + (double)man / 1024.0) * ldexp(1.0, exp - 15);
+  return sign ? -v : v;
+}
+
 int s3d_readback_render(void* ctx, uint8_t* out) {
   if (ctx == NULL || out == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
@@ -2037,6 +2191,33 @@ int s3d_readback_render(void* ctx, uint8_t* out) {
   // Same autorelease-pool wrap as s3d_readback: getBytes may allocate an
   // autoreleased blit command buffer each frame (see the shmup residual leak).
   @autoreleasepool {
+  if (src.pixelFormat == MTLPixelFormatRGBA16Float) {
+    // A half-float render target is 8 bytes per texel; the caller's buffer is
+    // BGRA8 (Context3D.drawToBitmapData's contract), so the samples are narrowed
+    // here -- clamping to [0,1] like AIR does, since an 8-bit surface cannot hold
+    // an HDR value.
+    const NSUInteger n = src.width * src.height;
+    uint16_t* tmp = (uint16_t*)malloc(n * 4 * sizeof(uint16_t));
+    if (tmp == NULL) return 0;
+    [src getBytes:tmp bytesPerRow:(NSUInteger)src.width * 8
+        fromRegion:MTLRegionMake2D(0, 0, src.width, src.height) mipmapLevel:0];
+    for (NSUInteger i = 0; i < n; i++) {
+      double r = s3d_half_to_float(tmp[i * 4 + 0]);
+      double g = s3d_half_to_float(tmp[i * 4 + 1]);
+      double b = s3d_half_to_float(tmp[i * 4 + 2]);
+      double a = s3d_half_to_float(tmp[i * 4 + 3]);
+      if (r < 0.0) r = 0.0; if (r > 1.0) r = 1.0;
+      if (g < 0.0) g = 0.0; if (g > 1.0) g = 1.0;
+      if (b < 0.0) b = 0.0; if (b > 1.0) b = 1.0;
+      if (a < 0.0) a = 0.0; if (a > 1.0) a = 1.0;
+      out[i * 4 + 0] = (uint8_t)(b * 255.0 + 0.5);  // BGRA8 byte order
+      out[i * 4 + 1] = (uint8_t)(g * 255.0 + 0.5);
+      out[i * 4 + 2] = (uint8_t)(r * 255.0 + 0.5);
+      out[i * 4 + 3] = (uint8_t)(a * 255.0 + 0.5);
+    }
+    free(tmp);
+    return 1;
+  }
   [src getBytes:out bytesPerRow:(NSUInteger)src.width * 4
       fromRegion:MTLRegionMake2D(0, 0, src.width, src.height) mipmapLevel:0];
   }

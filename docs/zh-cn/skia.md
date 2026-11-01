@@ -209,7 +209,7 @@ skia::textlayout::StrutStyle::StrutStyle()`），只给最终二进制加 `-dead
 | `filters.DropShadowFilter` | `SkImageFilters::DropShadow` / `DropShadowOnly`（`saveLayer` + `SkImageFilter`） | 已落地（阶段六十一），外投影。阶段九十五·七补 `strength`（模糊**之后**乘，`min(1, 剪影 × alpha × strength)`，对齐 adl 实测）与 `hideObject`；注意 `DropShadow` 工厂本身已把**源**合成进去，`strength` 绝不能套在它的输出上（会把整个对象打薄 —— 见 `swc.md` §9.2 F4 的 137/255 事故） |
 | `filters.GlowFilter` | `SkColorFilters::Matrix`（alpha 轮廓着色）+ 模糊 + 叠本体 | 已落地（阶段六十一），外发光。阶段九十五·七补 `strength`（同 DropShadow，且在模糊后乘：前置 alpha 因子因剪影不透明会饱和，实测 `strength 1` 与 `2` 会一模一样）|
 | `DisplayObject.mask` | `canvas->saveLayer` + mask 绘制 + `SkBlendMode::kSrcIn` | AS3 遮罩语义 |
-| `scrollRect` | `canvas->clipRect(0,0,w,h)` **再** `translate(-x,-y)` | 窗口钉在对象自己的盒上、只有**内容**平移（阶段一百六十二实测，见下方「坐标变换」与 D29）|
+| `scrollRect` | `clipRect`（窗口尺寸按 `rint` 量化、非整像素位置开 AA，阶段三百四十九）**再** `translate(-x,-y)` | 窗口钉在对象自己的盒上、只有**内容**平移（阶段一百六十二实测，见下方「坐标变换」与 D29）|
 
 **坐标变换的正确姿势**（对应 Skia `SkCanvas` 的矩阵栈）：
 
@@ -899,23 +899,39 @@ asaotui 的 `compiler-gaps.md` G29 是「样式字段 `overflow` 被接受、被
 
 **实现口径**（`src/emit.ts`）：
 
-- `scrollRect`：`save` → `clipRect(0,0,w,h)` → `translate(-x,-y)`（顺序见 D29），并且这层
-  `save`/`restore` **夹住 `as_render_object_content`** —— 也就是自身几何**和递归下去的子件**都在
-  裁剪里。这是「子树裁剪」成立的全部秘密，`unit: render/OverflowClip` 就钉这一条作用域：只夹自身
-  绘制、把子件留在外面的写法，像素测试会红，但重构时最容易悄悄退回去。
+- `scrollRect`：`save` → `clipRect`（阶段三百四十九 起走 `as_skia_canvas_clip_rect_window`）→
+  `translate(-x,-y)`（顺序见 D29），并且这层 `save`/`restore` **夹住 `as_render_object_content`**
+  —— 也就是自身几何**和递归下去的子件**都在裁剪里。这是「子树裁剪」成立的全部秘密，
+  `unit: render/OverflowClip` 就钉这一条作用域：只夹自身绘制、把子件留在外面的写法，像素测试会红，
+  但重构时最容易悄悄退回去。
 - `mask`：二值 `clipPath`（不是 alpha 合成，§6.15），在对象的 `translate/rotate/scale` **之前**
   裁（遮罩是兄弟，落在两者共同的父空间）；同样夹住整个子树。
 - 两者可叠加（既遮罩又裁的容器），各自一对 `save`/`restore`。
 - 滤镜层在裁剪**之内**，所以模糊/阴影的外溢会被切掉（上表第 5 行）。
 
-**已登记的小数残差**（`TODO.md` `### 遗留待开发`）：裁剪边落在 `.5` 时 AIR 用**银行家舍入**
-（`100.5→100`、`120.5→120`、`122.5→122`、`121.5→122`、`123.5→124`），我们的裁剪半上入
+**小数边的取整与抗锯齿（阶段三百四十九，已修）**：裁剪边落在 `.5` 时 AIR 用**四舍六入五成双**
+（`100.5→100`、`119.5→120`、`120.5→120`、`121.5→122`、`122.5→122`、`123.5→124`），我们此前半上入
 （`100.5→101`、`120.5→121`、`122.5→123`）⇒ 整数部分为偶数的那一半 `.5` 场合**多画 1 设备像素**。
-整数几何逐位相同（`examples/overflow-clip.as` 只用整数，故稳定）。
+本轮把整条口径量全（`temp/clipround`，24 格双端逐像素）后收口：**取整发生在对象坐标系、对
+`width`/`height` 各做一次（`rint`），随后窗口自己的边按对象当前的小数设备位置做抗锯齿**
+（`x=20.25/20.5/20.75` 的首列覆盖率 25/50/25%）。两条用同一个反例分开：父件 `scaleX=2` 时
+`w=100.5` 仍只占 **200** 设备像素（= 2×100）⇒ 量化不在设备空间；而 `x=20.5` 的窗口首列覆盖率
+是 50% 且**不从 21 开始** ⇒ 边不是被吸附到整像素。
 
-验收：`examples/overflow-clip.as`（上表十格，纯 C 构建自跳过——没有光栅后端）＋
-`unit: render/OverflowClip`（6 条作用域钉子：裁剪夹住内容调用、遮罩在对象变换之前、遮罩是二值
-`clipPath`、外层 `save` 与遮罩之间不得有 `restore`、`scrollRect` 自开 `save`）。
+落地方式：`scrollRect` 的裁剪改走 `as_skia_canvas_clip_rect_window`（`rint(w)`/`rint(h)` + AA），
+**整数对齐时仍走原来那条零开销的非 AA 矩形 clip**（Skia 的 AA clip 要走覆盖率掩码，热路径上
+给每个滚动列表白白加价，而整数几何下两者逐像素相同）；其余裁剪入口（`TextField` 框、烘焙
+`ShapeBounds`、文本行窗口）**不动** —— 它们的取整口径本轮没有量过，不臆造。
+
+**仍存的小残差（新登记）**：对象自己的边与窗口边**重合**且落在小数设备位置时（内容恰好铺满
+窗口，最常见），AIR 那列覆盖率是 `c`（0.25/0.5/0.75），我们是 `c²`——Skia 的 AA clip 把裁剪
+覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按整数尺寸烘焙、再按小数原点合成一次」
+（`c`）。结构与列数已逐格相同，差的是**一个边界列的 alpha**；这需要按窗口烘焙才能消掉，
+故按残差登记而不是默默近似。
+
+验收：`examples/scrollrect-round.as`（宽度 14 格 + 高度 3 格 + `scaleX=2` 3 格 + 小数原点 2 格；
+纯 C 构建自跳过）＋`unit: render/ScrollRectWindowRounding`（12 条：发射点、`rint`、AA 开关、
+整像素快路、seam 三态、以及示例里的实测表）。
 
 ## 7. 多目标：native 与 wasm
 

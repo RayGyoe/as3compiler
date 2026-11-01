@@ -131,7 +131,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 | E3 | **多格式图片解码**（WebP / BMP / ICO） | 部分：仅 JPG / PNG / GIF（实测 `adl 51.4.1` 对 BMP/WebP/ICO 报 `#2124`） | ✅ **已实现、opt-in 具名开关 `--features formats`**：默认构建**与 AIR 同报 `#2124`**，开关打开后两端实测**全部解码正确**（见 §4.3）；`QOI` **不在内**（未编入 `SkQoiCodec`） | 两端 | **已完成（默认拒绝 + 开关）** |
 | E4 | **相机 RAW / DNG 解码** | ✗（实测 `adl 51.4.1` 对 `.dng` 报 `#2124`；`BitmapData.loadFile` 更是**不存在**，`#1069`） | ✅ **已实现、opt-in 具名开关 `--features raw`**：默认构建与 AIR 同报 `#2124`；开关打开后 native 四条解码入口全部解出 DNG 600×338（见 §4.5）；web 侧 wasm Skia **无** piex/dng_sdk 归档（`nm` 实测 0 个 `SkRawDecoder` 符号）⇒ 开关在 wasm 上被**前置拒绝**并点名缺哪个归档 | native 已完成 / web 与 AIR 同形 | **已完成（默认拒绝 + 开关）** |
 | E5 | **矢量图形直接上屏**（`Shape` 走 `SkPath`，无限分辨率） | ✗（`BitmapData` 只有位图） | Skia 已在，缺 AS3 面 | 两端 | 中 |
-| E6 | **原生着色器直通**（MSL / GLSL ES） | ✗（只有 AGAL 寄存器语言） | AGAL→MSL/GLSL 翻译器已在（`ASC_AGAL_TARGET`），缺「提交原生 shader」的扩展 API | 两端 | 中 |
+| E6 | **原生着色器直通**（MSL / GLSL ES） | ✗（只有 AGAL 寄存器语言） | AGAL→MSL/GLSL 翻译器已在（`ASC_AGAL_TARGET`），缺「提交原生 shader」的扩展 API。**立项设计见 [`native-shader.md`](native-shader.md)**（源语言定 GLSL ES 3.00，glslang+SPIRV-Cross 交叉编译，AOT-only） | 两端 | 中 |
 | E7 | **GPU 通用计算**（Metal compute / WebGL2 transform feedback） | ✗ | 需新胶水层 | 两端 | 高 |
 | E8 | **无窗口 / 服务端出图** | 半（可离屏，但绑死 AIR 运行时） | **已具备**：headless 可跑，`stage.render()` 直接出 PNG | 两端 | 已有 |
 | E9 | **64 位整数**（`int64` / `uint64`） | ✗（`int` / `uint` 都是 32 位） | ✅ **已实现（opt-in，纯 C，两端同形）**：类型 + `L`/`UL` 字面量 + `int64()`/`uint64()` 转换 + 64 位算术/位运算/比较 + 独立装箱 tag（见 §4.7） | 两端（native / web / WASI 同一份 C） | **已完成** |

@@ -10098,6 +10098,12 @@ extern void sk_canvas_draw_rect(void* canvas, double x, double y, double w, doub
 extern void sk_canvas_draw_circle(void* canvas, double cx, double cy, double r, void* paint);
 extern void sk_canvas_draw_path(void* canvas, void* path, void* paint);
 extern void sk_canvas_clip_rect(void* canvas, double x, double y, double w, double h);
+// DisplayObject.scrollRect's window (stage 349): same rect clip, but with AIR's
+// sizing rule -- width/height quantized ties-to-even in OBJECT units -- and with
+// antialiasing on, so a fractional object position gives fractional coverage.
+// SkCanvas' rect-clip default is doAntiAlias=FALSE with half-UP snapping, which is
+// what the plain sk_canvas_clip_rect above keeps for its other callers.
+extern void sk_canvas_clip_rect_window(void* canvas, double x, double y, double w, double h);
 // clipDepth masks (swc.md §9 E-4): a mask shape's outline becomes a clip path.
 extern void sk_canvas_clip_path(void* canvas, void* path, int antialias);
 extern void sk_canvas_draw_image_src_rect(void* canvas, void* image, double sx, double sy, double sw, double sh, double dx, double dy, double dw, double dh);
@@ -10280,6 +10286,7 @@ static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) {
     sk_canvas_draw_path(c, path, paint);
 }
 static inline void as_skia_canvas_clip_rect(void* c, double x, double y, double w, double h) { sk_canvas_clip_rect(c, x, y, w, h); }
+static inline void as_skia_canvas_clip_rect_window(void* c, double x, double y, double w, double h) { sk_canvas_clip_rect_window(c, x, y, w, h); }
 static inline void as_skia_canvas_clip_path(void* c, void* path, int aa) { sk_canvas_clip_path(c, path, aa); }
 static inline void as_skia_canvas_draw_image_src_rect(void* c, void* img, double sx, double sy, double sw, double sh, double dx, double dy, double dw, double dh) { sk_canvas_draw_image_src_rect(c, img, sx, sy, sw, sh, dx, dy, dw, dh); }
 // Device units per logical unit of the current canvas transform (see
@@ -11090,6 +11097,7 @@ static inline void as_skia_canvas_total_translate(void* c, double* tx, double* t
 static inline void as_skia_canvas_draw_circle(void* c, double cx, double cy, double r, void* p) { (void)c; (void)cx; (void)cy; (void)r; (void)p; }
 static inline void as_skia_canvas_draw_path(void* c, void* path, void* paint) { (void)c; (void)path; (void)paint; }
 static inline void as_skia_canvas_clip_rect(void* c, double x, double y, double w, double h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
+static inline void as_skia_canvas_clip_rect_window(void* c, double x, double y, double w, double h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
 static inline void as_skia_canvas_clip_path(void* c, void* path, int aa) { (void)c; (void)path; (void)aa; }
 static inline void as_skia_canvas_draw_image_src_rect(void* c, void* img, double sx, double sy, double sw, double sh, double dx, double dy, double dw, double dh) { (void)c; (void)img; (void)sx; (void)sy; (void)sw; (void)sh; (void)dx; (void)dy; (void)dw; (void)dh; }
 static inline void as_skia_canvas_translate(void* c, double x, double y) { (void)c; (void)x; (void)y; }
@@ -14776,6 +14784,48 @@ static void agal_src_expr(char* out, int type, int num, unsigned swz, int target
     else sprintf(out, "%s.%s", reg, sw);
 }
 
+// Source expression from an explicit register NAME instead of (type, num).
+//
+// Only the write-mask emitter needs it: when a source operand is the same
+// register as the destination, the operand is snapshotted into a temporary and
+// every later reference must keep using that temporary (see agal_snap_src).
+static void agal_src_expr_named(char* out, const char* reg, unsigned swz) {
+    char sw[5]; agal_swizzle(swz, sw); sw[4] = 0;
+    if (strcmp(sw, "xyzw") == 0) strcpy(out, reg);
+    else sprintf(out, "%s.%s", reg, sw);
+}
+
+// Does writing the destination components one at a time clobber a component a
+// LATER component still has to read?
+//
+// AGAL reads every source operand before it writes the destination, which is what
+// a single vector instruction means. The emitter expands a write-mask into one
+// statement per component (x before y before z before w), so a source that
+// aliases the destination is only wrong when its swizzle reads a component that
+// has ALREADY been overwritten: read index r < written component c, and r is
+// itself written by this instruction. 'mul ft0.xyz, ft0.xyz, ft1.x' reads each
+// component from itself (r == c) and is safe; 'mul ft8.xyz, ft0.xyz, ft8.xxxx'
+// reads x for all three and is not.
+static int agal_mask_clobber(unsigned swz, int dmask) {
+    for (int c = 0; c < 4; c++) {
+        if (!(dmask & (1u << c))) continue;
+        unsigned r = (swz >> (2 * c)) & 3u;
+        if (r < (unsigned)c && (dmask & (1u << r))) return 1;
+    }
+    return 0;
+}
+
+// Snapshot one aliased source operand into a temporary and append the copy.
+//
+// MUST be called (and appended) before the instruction's own statements, so the
+// temporary holds the pre-instruction register value.
+static void agal_snap_src(as_json_buf* b, const char* v4, char* tmp, int* seq, const char* name) {
+    sprintf(tmp, "as_agal_s%d", (*seq)++);
+    char t[96];
+    sprintf(t, "    %s %s = %s;\\n", v4, tmp, name);
+    as_json_buf_append_cstr(b, t);
+}
+
 // Destination expression: register name (write-mask applied by the emitter).
 static void agal_dst_name(char* out, int type, int num, int target) {
     agal_reg_name(out, type, num, target);
@@ -14795,6 +14845,9 @@ static int agal_is_cube(int num) { return (num >= 0 && num < 256) ? ((agal_cube[
 // component (so write-masks are fully expanded).
 static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int target) {
     const char* v4 = target == 1 ? "vec4" : "float4";
+    // Names of the aliasing snapshots (see agal_snap_src). Reset per body so the
+    // emitted text is deterministic -- the unit tests pin it.
+    int snap_seq = 0;
     // 3-component constructor, needed by nrm (see its arm below).
     const char* v3 = target == 1 ? "vec3" : "float3";
     // Builtins whose spelling differs between targets but whose call SHAPE is
@@ -14872,6 +14925,14 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 as_json_buf_append_cstr(b, t);
                 continue;
             }
+            // Same alias rule as the write-mask path below: the rows are emitted
+            // as one statement each while every row reads s1, so an s1 that IS the
+            // destination would be re-read after the first row overwrote it.
+            if (dname[0] && hasSrc1 && strcmp(s1b, dname) == 0) {
+                char snap[40];
+                agal_snap_src(b, v4, snap, &snap_seq, s1b);
+                strcpy(s1b, snap); agal_src_expr_named(s1, snap, w1);
+            }
             for (int r = 0; r < rows; r++) { char t[200]; sprintf(t, "    %s.%c = dot(%s, %s(%s.x, %s.y, %s.z, %s.w));\\n", dname, agal_swz[r], s1, v4, mrow[r], mrow[r], mrow[r], mrow[r]); as_json_buf_append_cstr(b, t); }
             continue;
         }
@@ -14879,6 +14940,28 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         // component, so 'mov vt0.xy, va1.zw' emits 'vt0.x = va[1].z; vt0.y = va[1].w;'
         // rather than an opaque '.zwzw.x' re-swizzle.
         if (dmask != 0xF && dmask != 0) {
+            // AGAL reads every source operand before the destination is written,
+            // but this expansion writes components one at a time (x, then y, ...).
+            // A source that IS the destination register therefore has to survive
+            // the earlier component writes: snapshot it first. Without this,
+            // 'mul ft8.xyz, ft0.xyz, ft8.xxxx' emitted
+            //   ft8.x = ft0.x * ft8.x;  ft8.y = ft0.y * ft8.x(NEW!);  ...
+            // i.e. the whole result scaled by the destination's own x -- measured
+            // on the mirror-metal env sphere (asaot3d apps/cubeface-m25), where
+            // it turned every cube texel whose red channel was 0 (green/blue
+            // faces) into black and made the environment disagree with adl.
+            if (dname[0] && hasSrc1 && strcmp(s1b, dname) == 0 && agal_mask_clobber(w1, dmask)) {
+                char snap[40];
+                agal_snap_src(b, v4, snap, &snap_seq, s1b);
+                strcpy(s1b, snap); agal_src_expr_named(s1, snap, w1);
+            }
+            // The sampler operand of tex/tld (s2) is a sampler register, never
+            // the destination, so only the value operand can alias.
+            if (dname[0] && hasSrc2 && !isTexOp && strcmp(s2b, dname) == 0 && agal_mask_clobber(w2, dmask)) {
+                char snap[40];
+                agal_snap_src(b, v4, snap, &snap_seq, s2b);
+                strcpy(s2b, snap); agal_src_expr_named(s2, snap, w2);
+            }
             for (int c = 0; c < 4; c++) {
                 if (!(dmask & (1 << c))) continue;
                 char ch = agal_swz[c], c1 = sw1[c], c2 = sw2[c];
@@ -15488,6 +15571,11 @@ extern int s3d_upload_constants(void* ctx, int isFragment, const double* data, i
 extern void* s3d_upload_texture(void* ctx, int unit, int width, int height, const uint32_t* argb);
 extern void* s3d_upload_cube_texture(void* ctx, int unit, int size, const uint32_t* const* argb);
 extern void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* argb);
+// RGBA16F upload for Context3DTextureFormat.RGBA_HALF_FLOAT. The payload (rgba) is
+// width*height texels of four 16-bit half floats (R,G,B,A) in host byte order --
+// the ByteArray payload as-is, because the format's whole purpose (values outside
+// [0,1]) is lost the moment it is narrowed to 8 bits.
+extern void* s3d_texture_from_pixels_half(void* ctx, int width, int height, const void* rgba);
 // Upload ONE mip level (level > 0) from the top-left lw x lh rectangle of a
 // source bitmap whose row stride is srcW pixels. Called when the app passes a
 // mip level to uploadFromBitmapData; AIR's region semantics were measured in
@@ -15527,7 +15615,15 @@ extern int s3d_height(void* ctx);
 // both to report Context3D.profile and to enforce the #3683 ceiling, so the claim and
 // the limit are always derived from the same number.
 extern int s3d_max_texture_size(void);
+// Bytes of texture this backend will attempt in ONE allocation. The generated C
+// pre-checks w*h*bpp*4/3 against it so an impossible create fails at the create
+// (AIR's Error #3684) rather than at the first lazy upload.
+extern double s3d_max_texture_memory(void);
 extern void* s3d_create_render_texture(void* ctx, int width, int height);
+// Same, choosing the color attachment format: isHalf != 0 allocates RGBA16F
+// instead of BGRA8. The format is baked into the pipeline objects on Metal and
+// D3D12, so it must be known before the first draw into the target.
+extern void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf);
 extern void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil);
 extern int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain);
 extern int s3d_readback_render(void* ctx, uint8_t* out);
@@ -15892,11 +15988,55 @@ static inline int as_s3d_max_texture_size(void) {
     return 4096;
 #endif
 }
+// Whether this build links a GPU backend at all. The as_s3d_* wrappers answer NULL
+// for "no backend" and for "allocation failed" alike, and the two must not be
+// confused: an allocation failure is AIR's Error #3684, a backend-less build is a
+// supported configuration whose textures simply never leave the CPU state machine.
+static inline int as_s3d_has_backend(void) {
+#ifdef ASC_RENDER_STAGE3D
+    return 1;
+#else
+    return 0;
+#endif
+}
+// How many bytes of texture a single allocation may take. Used as a pre-check at
+// create time so an impossible request fails THERE, like AIR's Error #3684, instead
+// of lazily at the first upload (our sampler-only textures allocate on upload).
+// The number is the backend's own working-set budget, not a convenience constant:
+// the check must never reject a texture the device could actually hold. A CPU-only
+// build allocates nothing, hence the huge answer.
+static inline double as_s3d_max_texture_memory(void) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_max_texture_memory();
+#else
+    return 1e12;
+#endif
+}
 static inline void* as_s3d_create_render_texture(void* ctx, int w, int h) {
 #ifdef ASC_RENDER_STAGE3D
     return s3d_create_render_texture(ctx, w, h);
 #else
     (void)ctx; (void)w; (void)h; return NULL;
+#endif
+}
+// Same, for the half-float (RGBA16F) target of a Context3DTextureFormat.RGBA_HALF_FLOAT
+// render texture. Their pipelines differ (the color attachment format is baked into a
+// Metal/D3D12 pipeline object), which is why the format is an argument and not a
+// property of the context.
+static inline void* as_s3d_create_render_texture_fmt(void* ctx, int w, int h, int isHalf) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_create_render_texture_fmt(ctx, w, h, isHalf);
+#else
+    (void)ctx; (void)w; (void)h; (void)isHalf; return NULL;
+#endif
+}
+// Upload an rgbaHalfFloat texture: the payload is width*height texels of four 16-bit
+// half floats (R,G,B,A) in host byte order, straight out of the app's ByteArray.
+static inline void* as_s3d_texture_from_pixels_half(void* ctx, int w, int h, const void* rgba) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_texture_from_pixels_half(ctx, w, h, rgba);
+#else
+    (void)ctx; (void)w; (void)h; (void)rgba; return NULL;
 #endif
 }
 static inline void as_s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {

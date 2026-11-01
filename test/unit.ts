@@ -20,6 +20,7 @@ import './unit/vector.ts';
 import './unit/object-array.ts';
 import './unit/ternary-null.ts';
 import './unit/closure-statics.ts';
+import './unit/closure-cells.ts';
 import './unit/context-menu.ts';
 import './unit/clipboard.ts';
 import './unit/gettextformat.ts';

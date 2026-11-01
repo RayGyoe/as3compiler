@@ -18587,7 +18587,261 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 `undefined` 替身）。全量 `node test.ts` **586/586**。
 
 
+### 阶段三百四十六：写掩码逐分量展开的**读后写别名**（AGAL 翻译器，v0.4.306 → v0.4.307）
+
+**起点**：asaot3d 的 `env-m9` / `walk-m26` 在 AOT 与 `adl` 上**观感不同**——同一张立方体环境贴图，
+AOT 那一半偏黑、高光发白，而 `adl` 见得到夜空。两轮取证（`temp/env-m9-aot-new.png` vs
+`temp/env-m9-air-new.png`、逐像素统计）确认不是色调/曝光问题，而是**采样结果本身不同**。
+
+**先量后改**：新写诊断台 `asaot3d/apps/cubeface-m25` —— 六面纯色立方体（`+X` 红 / `-X` 绿 / `+Y` 蓝 /
+`-Y` 黄 / `+Z` 品红 / `-Z` 青）+ 镜面金属球（`metalness=1`、`roughness=0.02`、无直射光、无色调映射），
+判据是「六面是否**全部**上屏」。结论：`adl` 六面齐全；AOT 只有红/黄/品红/蓝在，**绿 `-X` 与青 `-Z`
+几乎为零**。把六面逐一换成受控灰度/纯色后规律更清楚：**红通道为 0 的贴图一律变黑**（绿/蓝/黑），
+红/白正常，128 灰出来是 (119,67,66) 这种偏红的值 —— 即「结果 ≈ 贴图 × 自己的红通道」。
+
+**定位**：把实际发射的 MSL 打出来（`AGALTranslator.translate(fragment.agalcode, "msl")`，探针里临时开
+`AGALRenderer.dumpFragSource`）后一眼可见：
+
+```c
+ft8.x = ft0.x * ft8.x;      // mul ft8.xyz, ft0.xyz, ft8.xxxx
+ft8.y = ft0.y * ft8.x;      // ← 读到的是刚被覆盖的新 ft8.x
+ft8.z = ft0.z * ft8.x;
+```
+
+**根因**：AGAL 的一条指令是「**先读全部源操作数，再写目的**」，但发射器把写掩码展开成**逐分量**语句
+（x 在 y 之前、y 在 z 之前）。当某个源操作数**就是目的寄存器**、且它的 swizzle 会读到「本次已经写过的
+分量」时，后续分量读到的是新值。PBR 的 `mul ft8.xyz, ft7.xyz, ft8.xxxx`（`radiance * (1-r4)`）正是这个
+形态，于是环境反射被乘上自己的红通道。`adl` 执行真 AGAL，**从来不经过这个发射器**，所以只有 AOT/web 错。
+
+**实现**（`src/runtime.ts`，三档共用 `agal_emit_body`）：
+- `agal_mask_clobber(swz, dmask)`：只在「读下标 `r < c` 且 `r` 落在写掩码内」时判为危险 ——
+  `mul ft0.xyz, ft0.xyz, ft1.x` 这类自读自写的常见形态因此**文本不变**（不给既有快照钉制造噪音）。
+- `agal_snap_src()`：先发一条**整寄存器**拷贝 `float4 as_agal_s0 = <reg>;`（GLSL 档是 `vec4`），
+  序号每 body 重置，保证生成文本确定。
+- `agal_src_expr_named()`：把该操作数在**所有**使用点重绑到快照。只改逐分量那份会漏掉
+  `crs`/`dp3`/`dp4`/`nrm` 这些用**整向量**的分支。
+- 矩阵指令（`m33/m34/m44`）按行发语句、每行都读 `s1`，命中同一规则一并快照。
+
+**影响面**：MSL / GLSL ES / HLSL 三档同一个发射器 ⇒ **web 端同错**；`adl` 侧不受影响。这也解释了
+「AIR 对、AOT 错」的差异为什么最早在环境反射上显形。
+
+**验收**：`examples/stage346.as`（翻译文本 8 条断言：快照出现在写掩码展开之前、三个分量都读快照、
+不得读回被写过的分量、GLSL 档同样成立；外加一条 Metal 像素 = `0x00FF00`，读回不可用时**如实 SKIP**
+而不是静默通过）+ 单元钉 `unit: stage3d/agal-write-mask-alias`（7 钉：clobber 判据、整寄存器快照、
+`vec4`/`float4` 分档、两个源都覆盖且在循环之前、整向量分支的重绑、矩阵路径、序号每 body 重置）。
+端到端证据：`asaot3d/apps/cubeface-m25` 六面全部上屏（修前三面黑），`env-m9` 与 `adl` 观感一致，
+`walk-m26` 的城堡反射恢复。全量 `node test.ts` 见下条 note。
+
+### 阶段三百四十七：`clear()` 之后**一个 draw 都没有**的离屏目标也必须真的被清（v0.4.307 → v0.4.308）
+
+**起点**：asaot3d 的 `walk-m26` 在 AOT 与 `adl` 上地面对不上。剥离到最小复现后是同源、单盏
+`castShadow = true` 的平行光、而场景里**一个 `castShadow` 网格都没有**：AOT 地面 `11.8/255`、
+`adl` `31.8/255` —— 整片阴影视锥被压黑。
+
+**根因**：Metal 后端的 `clear()` 是**延迟**的 —— 它只记下颜色/深度/模板值与「待清」标志，
+真正的清屏动作挂在**下一次 `drawTriangles`** 的渲染通道 `loadAction` 上。这对「清完就画」的常规
+形态没有差别，却漏掉了 AIR 会正确处理的一种情形：**清完一个 draw 都没有**。于是阴影 prepass
+既没清也没画，阴影贴图停在 Metal 新分配私有不透明纹理的**未定义内容**（驱动给全 0）；8bit 打包
+的深度解出来是 `0.0` = 「比任何片元都近」⇒ 整个视锥判为遮挡。`adl` 那边 `clear()` 与 draw 无关，
+空 pass 照样落到贴图上（深度 `1.0` = 最远）⇒ 同样是「零投形体」，它不产生任何阴影。
+
+**实现**（`vendor/stage3d_glue.mm`）：
+- `s3d_apply_pending_clear(S3DContext*)` —— 先**消费**三个 clear 标志（下面任何一处提前返回都不能
+  让待清状态泄漏进后续无关的 pass），再发一条**零 draw** 的渲染通道：颜色/深度/模板各自按自己的
+  标志决定 `Clear`/`Load`；离屏走 `renderOverride` + `rtDepthStencil`，屏上 MSAA 走 multisample +
+  `resolveTexture` 并清 `msaaResolvePending`（与既有的 mip-drop 路径同形）。
+- 两个调用点：`s3d_set_render_target()` 在**目标切换**时（必须在新 target 的任何 pass 之前落地）、
+  `s3d_flush_impl()` 在**帧末离屏目标仍绑定**时。两者都写进本帧的同一 command buffer，靠提交顺序
+  保证「先清、后采样」。
+- **屏上目标刻意不在 flush 注入**：那是既有行为，没有观测到差异，不在本阶段扩大改动面。
+
+**验收**：`examples/stage347.as`（16x16 可渲染纹理 → `setRenderToTexture` → `clear(白, depth=1, 三面全清)`
+→ **零 `drawTriangles`** → 切回后台缓冲用全屏三角采样 → 中心像素必须 `0xFFFFFF`；修前为 `0x000000`）
++ 单元钉 `unit: stage3d/pending-clear-no-draw`（7 钉：零 draw pass 存在、标志先消费、三面各按自己
+的标志、离屏用 `renderOverride`/`rtDepthStencil`、MSAA 必须 resolve、two 调用点各一条）。
+端到端证据：`walk-m26` 同源同帧地面 AOT `34.6` 对 `adl` `32.1`（修前 `11.8` 对 `31.8`）。
+注：示例套件在**纯 C 模式**下跑（无 GPU 上下文），那时 `drawToBitmapData` 是状态机空操作、读回清黑，
+示例里如实走「状态机」分支断言黑；Metal 像素断言只在有 GPU 上下文时生效，接线的正确性由上述单元钉覆盖。
+
+### 阶段三百四十八：AGAL 的 `exp` / `log` 是**以 2 为底**（v0.4.308 → v0.4.309）
+
+**起点**：`walk-m26` 的金属身体在 AOT 上比 `adl` 明显偏亮、高光核外扩，排查里一度怀疑 `exp` 的底数。
+
+**实测**（`temp/agalprobe/Exp.as`，同一份源码分别编译到 `adl` 与 AOT）：`exp(-1)` 读回 `0x7F` =
+`0.498` = `2^-1`（自然指数是 `0.368`），`log(2)` 读回 `0xFF` = `1.0` = `log2(2)`（自然对数是 `0.693`）；
+**两端完全一致**。也就是说翻译器（`src/runtime.ts` 的 op `0x0d → exp2()`、`0x0c → log2()`）本来就对，
+错的是**消费方**。
+
+**结论**：`asaot3d/seam/asaot3d/three/AGALRenderer.as` 有两处按「AGAL 只有 e^x」写的折算是错的：
+1. **EnvBRDFApprox**：把 `-9.28` 折成 `-9.28 * ln2 = -6.4324` 写进 `fc13.x`，于是
+   `a004 = min(r², 2^(-6.43*NoV))` 偏大 ⇒ 环境光照下的高光比 three.js 亮，`r.x = 1 - roughness`
+   一乘，**粗糙度越低偏得越多**。改为直接用 `-9.28`。
+2. **FogExp2**：`exp` 是 `2^x` 而 three.js 是 `e^{-(density*d)²}`，少了一个 `log2(e)`。把 `log2(e)`
+   放进 `fc37.w`（线性雾用它存 `1/(far-near)`，exp2 模式本来就空着），片元只多一条 `mul`。
+
+两处都是**两端同错** —— 所以 AOT/AIR 对比永远看不出来，只有对着 three.js 参考值才显形，这也是它
+活了这么久的原因。本阶段同时把这条语义钉进编译器回归，防止再有人假设 `exp` 是自然指数。
+
+**顺带**：`AGALRenderer.dumpFragSource` 在 `adl` 上会抛 `#1065`（`flash.display3D.AGALTranslator`
+不在 `airglobal.swc` 里），即一个诊断开关能把 AIR 端整帧打死。改为先用 try/catch 包住 MSL 转译并
+**先打 AGAL 文本**（那份两端都拿得到），转译不可用时只打一行 `MSL-FRAGMENT-UNAVAILABLE`。
+
+**验收**：`examples/stage348.as`（四档判别值 `127 / 16 / 255 / 149`，即 `exp(-1)`、`exp(-4)`、`log(2)`、
+`log2(1.5)`；自然指数的答案是 `94 / 4 / 177 / 103`）+ 单元钉 `unit: stage3d/agal-exp-log-base2`
+（5 钉：opcode 表、整向量两条臂、swizzle 两条臂、不得落回自然 `exp(`/`log(`、示例判别值）+
+`asaot3d/probes/scene-smoke-m20` 的 C25 改写（`fc37.w` 对 exp2 从「期望 0」改为「期望 `log2(e)`」）。
+
+**未收口（已登记入遗留表）**：同一轮定位时量到 AOT 与 `adl` 的**光照点积**系统性不同（`dotNL`/`dotNV`/
+`dotNH` 在 AOT 上偏大约 0.05–0.08），GGX 分母 `1 + dotNH²(a2-1)` 在 `dotNH → 1` 处把这几个 LSB 放大成
+高光核面积差。见遗留表新登记行。
+
+### 阶段三百四十九：`scrollRect` 窗口的**尺寸取整**与小数位置（v0.4.309 → v0.4.310）
+
+**起点**：阶段三百四十三 登记过一条窄残差（`scrollRect` 的裁剪边落在 `.5` 时我们多画 1 设备像素，
+AIR 像银行家舍入）。本轮把它当独立阶段做完 —— 量全之后发现**不是一个取整规则的小偏差**，而是
+「窗口尺寸在哪个坐标系里取整」+「窗口自己的边要不要抗锯齿」两件事都没对上。
+
+**实测**（`temp/clipround/`，同一份源码 `probe.as` 分别喂 `mxmlc + adl 51.4.1` 与我们，
+`BitmapData.draw` 后逐列取样，共 24 格：宽度 15 格 + 高度 3 格 + `scaleX=2` 3 格 + 小数原点 3 格）：
+
+| 问的 | `adl` 的答案 | 修前我们 |
+|---|---|---|
+| `w=100.5`（`x=20` 整数） | 画 `20..119`（100 列） | `20..120`（**多 1 列**） |
+| `w=120.5` / `w=123.5` | 120 列 / 124 列 | 121 列 / 124 列 |
+| `w=101.5` / `w=121.5` / `w=122.5` | 102 / 122 / 122 列 | 同（这半边两边巧合一致） |
+| 父件 `scaleX=2`、`w=100.5` | 跨 **200** 设备像素（= 2×100） | **201**（量化落到了设备空间） |
+| 父件 `scaleX=2`、`w=101.5` | **204** | 203 |
+| 对象 `x=20.5`、`w=100` | 画 `20..120`，首列覆盖率 **50%** | 画 `21..120`（**整窗右移 1 列**，覆盖率丢失） |
+| 对象 `x=20.25` / `x=20.75` | 首列 25% / 25%（末列 25% / 75%） | 首列 0%（吸附到 21） |
+
+**口径**（两条反例分别定住）：
+1. **尺寸在对象坐标系里取整，规则是四舍六入五成双** —— `rint()` 就是它（`FE_TONEAREST`）。不是
+   `(int)` 截断（那会 `120.5→121`），也不是 Skia 的 `SkScalarRoundToInt`（半上入）。判据就是
+   `scaleX=2` 那两格：若在设备空间取整，`w=100.5` 会得到 201 而不是 200。
+2. **窗口自己的边按对象的小数设备位置抗锯齿** —— `x=20.25/20.5/20.75` 的首列覆盖率 25/50/25%，
+   且窗口**不从 21 开始**。这与 1 是两个独立的量：1 决定「窗口多宽」，2 决定「窗口边落在哪」。
+
+**根因**：我们走 `sk_canvas_clip_rect`，而 **`SkCanvas` 的矩形 clip 重载默认 `doAntiAlias=false`**
+（`clipPath` 默认 true，`clipRect` 默认 false —— 这个不对称是坑的来源），于是 Skia 把矩形吸附到整
+像素（`SkScalarRoundToInt`，半上入）并丢掉小数覆盖率。两条症状（多一列、整窗右移一列）都是它的
+直接后果。
+
+**修法**：新增 `as_skia_canvas_clip_rect_window`（胶水 `sk_canvas_clip_rect_window`）—— 先
+`rint(w)`/`rint(h)`，再开 AA 裁剪。**整数对齐时仍走原来那条非 AA 矩形 clip**：Skia 的 AA clip 要走
+覆盖率掩码，热路径上给每个滚动列表白白加价，而整数几何下两者逐像素相同（缺陷本来就只在整数布局
+上不显形）。其余裁剪入口（`TextField` 框、烘焙 `ShapeBounds`、文本行窗口）**一字不动** —— 它们的
+取整口径本轮没量过，不臆造。
+
+**顺带**：`test/examples.ts` 的 Skia 清单里补了 `scrollrect-round.as`（像素断言在纯 C 构建下会自
+跳过，加进清单才能在回归里真的看见）。
+
+**验收**：`examples/scrollrect-round.as`（19 格）+ `unit: render/ScrollRectWindowRounding`（12 钉：
+发射点、`rint`、AA 开关、整像素快路、seam 三态、示例里的实测表、`evenRound` 必须是「五成双」而
+不是 `Math.round`）。**变异**：① 发射点退回 `clip_rect` → 示例首格即红（`w=100.5` 多一列）；② 胶水
+去掉 `rint` → 单元钉红 + 示例 `w=100.25` 红；③ 胶水关掉 AA → 单元钉红 + 示例 `x=20.5` 红（从 21
+开始）；④ 去掉整像素快路 → 单元钉红（行为不变，纯性能守卫，如实标注）。
+
+**未收口（已登记入遗留表）**：对象自己的边与窗口边**重合**且落在小数设备位置时（内容恰好铺满
+窗口），AIR 那列覆盖率是 `c`（0.25/0.5/0.75），我们是 `c²` —— Skia 的 AA clip 把裁剪覆盖率与图元
+覆盖率**相乘**，而 AIR 等效于「按整数尺寸烘焙、再按小数原点合成一次」。列数与结构已逐格相同，
+差的只是**一个边界列的 alpha**；消掉它要给窗口做烘焙，按残差登记而不是默默近似。
+
+### 阶段三百五十：构造函数里的**兄弟嵌套函数**（v0.4.310 → v0.4.311）
+
+**起点**：本轮为了量 `toFixed` 写了一支探针（`temp/tofixed2/src/Ours.as`），里面用三个嵌套函数
+（`pad` / `h1` / `h2`）拼诊断字符串 —— **编译器直接产出了编不过的 C**：
+`error: use of undeclared identifier 'cell3'`。
+
+**复现**（`temp/tofixed2/min/`，五份最小化源码）：一个函数体里声明**两个**嵌套函数、且其中一个
+**调用**另一个，就必然触发：
+
+| 源码形状 | 修前 |
+|---|---|
+| 构造函数里两个嵌套函数互不调用（`v1`/`v4`） | ✅ 编译通过 |
+| 构造函数里 `g()` 调兄弟 `pad()`（`v5`，最小复现） | ❌ `use of undeclared identifier 'cell2'` |
+| 三层（`v3`：三个兄弟、`g` 调 `pad`） | ❌ 同上 |
+| 方法体里的同形状（`v1` 改造） | ✅（方法路径本来就对） |
+
+**根因**：兄弟嵌套函数互相调用时，发射器会为一个**共享激活 cell**（`_cellN`，每个同胞一个 `as_fn`
+槽）建结构体和 `_cellN_alloc()`，然后由 `emitClosureCellLocals()` 在被调用方所在函数体的**开头**
+声明并分配 `_cellN* cellN = _cellN_alloc();`。这个方法被方法/取值器/自由函数路径调用了（7 处），
+**构造函数路径（`Xxx_ctor`）和类体静态块路径（`Xxx_cinit`）都没调** —— 于是 cell 结构体和它的 `_alloc()` 都在，
+但没有任何一处声明 `cellN`，所有兄弟调用点读到未声明的标识符。也就是说：**构造函数里写的互递归
+嵌套函数（含最常见的「加载完成后回调里再定义两个互引的小函数」）在这个版本里是彻底不可用的**，
+不是运行期偏差，而是编译失败。
+
+**修法**：在两条漏掉的路径上各补一次 `emitClosureCellLocals()`（构造函数体 `hoistFunctionLocals`
+之后、类体静态块 `hoistFunctionLocals` 之后），位置与已有 7 处一致（在任何语句之前）。**没有**把它
+塞进 `hoistFunctionLocals` 内部：闭包体那条路径也用同一个 hoist，塞进去会让「外层方法的 cell」在
+闭包体里被**重复分配**（同名遮蔽，两个 cell 各自持有自己的槽 ⇒ 兄弟身份分裂），所以保持显式、逐
+path 补齐，并用单元钉把四条路径（方法/自由函数/构造函数/类体静态块）的「恰好一次分配」全部钉住。
+
+**验收**：`examples/nested-sibling-fn.as`（构造函数的互递归 `isEven`/`isOdd`、单向调用 `doPad`+
+`bumpBy`、三层 `inner`→`step1`→`step2`、方法体同形状；四行输出 `007/9` / `even` / `v8` / `o5`
+与 `adl 51.4.1` **逐字符相同**，证据台 `temp/nsfair/`）+ 单元组 `unit: closure/sibling-cells`
+（11 钉：构造函数体内声明+分配且在使用点之前、静态块同理、方法/自由函数恰好各一次、闭包体内
+直接调用的兄弟对**不**需要 cell（反向守卫）、以及「每个 `_cellN` 都必须在某处被分配」这条覆盖
+整类缺陷的不变量）。**变异**：① 撤掉构造函数那一次调用 ⇒ 4 钉红 + 示例编不过（`cellN` 未声明，
+与修前症状一致）；② 撤掉静态块那一次 ⇒ 1 钉红（示例不含静态块，故只有单元钉能抓）。
+
+### 阶段三百五十一：`Context3DTextureFormat` 六常量 · 半浮点纹理 · `ignoreResourceLimits` 的真实语义（v0.4.311 → v0.4.312）
+
+**起点**：遗留表里的三项 Stage3D 欠账 —— ① `Context3DTextureFormat` 与 AIR 官方全集有 4 处偏差；
+② AGAL4 与顶点纹理取值（VTF）；③ 旗标打开后的显存预检与分配失败上报。本阶段做 ①③，② 只做到
+「AGAL4 版本放行」，VTF 留表。
+
+**先量再改**（`temp/texfmt/`，adl 51.4.1）：
+
+- 六常量字面值：`bgra` / `bgrPacked565` / `bgraPacked4444` / `compressed` / `compressedAlpha` /
+  `rgbaHalfFloat`；`"rgba"` → `ArgumentError #2008`（**`RGBA` 这个常量在 AIR 里不存在**）。
+- 档位门控：`rgbaHalfFloat` 在 `baseline`/`baselineExtended` → `#3759`，`standard` 起接受。
+- **检查顺序**（`Gate.as`）：格式 → 尺寸 → 每格式规则，即 `#2008` → `#3681` → `#3682` → `#3683`
+  → `#3745` → `#3759`。`#3759` 排在尺寸三兄弟**之后**：`half 0x0` 报 `#3681`、`half 3x3` 报
+  `#3682`、`half 8192` 报 `#3683`，只有尺寸合法的 `half 2x2` 才问到档位。
+- 上传字节数 = `n × 每纹素字节`（bgra 4 / 565 2 / 4444 2 / half 8 / DXT 8·16 每块），不足抛
+  `RangeError #3669`；565 用 **四舍五入** 展开（`B=24` → `197`，不是位复制的 `198`）、4444 用 ×17。
+- 读回**不量化**：565/4444 渲染目标 `clear(0.5)` 读回 `808080` 而不是 `848484` —— GPU 上根本不
+  保留 565/4444，格式只影响上传解码。
+- `ignoreResourceLimits=true` **不抬高上限**：`enhanced` 下 `8192` 仍拒，只是错误从 `#3683`
+  （`ArgumentError`）变成 `#3684`（`Error`）。且惰性贴图不占预算（4096 张 1024² 全成功）。
+- `uploadFromBitmapData` 进 half 纹理：AIR 接受（`Texture` 与 `RectangleTexture` 都收），采样值与
+  BGRA 逐字节相同、`0x808080` 不漂（`Bmp.as`）。
+- 半浮点渲染目标：`clear(0.5,0.25,0.75)` 读回 `ff8040bf`，与 8 位目标逐字节相同（无 gamma）。
+
+**改动**（`src/symbols.ts` / `src/emit.ts` / `src/runtime.ts` + 三个后端 glue）：
+
+1. 常量表对齐六值（删 `RGBA`、补 `RGBA_HALF_FLOAT`、修两个 packed 值）；`as_tex_fmt_*` 家族
+   （known/half/compressed/bpp/block_bytes）成为唯一的格式知识表。
+2. `#2008`/`#3745`/`#3759`/`#3746` 四个错误号按实测顺序接入（`as_tex_check_known_format` /
+   `as_tex_check_format_rules`），文案逐字取自 adl。
+3. `rgbaHalfFloat` 走**16 位专用通道**：`as_tex_half_from_byte_array` + `as_s3d_texture_from_pixels_half`
+   → Metal/D3D12 `RGBA16Float`、WebGL2 `RGBA16F`；收窄到 8 位会毁掉 HDR 值。`uploadFromBitmapData`
+   同样保持 16 位（`as_tex_half_from_argb`）。
+4. 档位门控与 `profile` 回读**共用** `as_s3d_profile_standard()`（编译开关 `ASC_S3D_HALF_TEXTURES`），
+   承诺与限制不漂。
+5. **半浮点渲染目标必须按格式分 PSO**：Metal/D3D12 把 attachment 格式烘进 pipeline，`RGBA16F` 目标
+   配 `BGRA8` pipeline 会被静默拒绘 ⇒ `S3DBlendVariant.isHalf` + `s3d_target_is_half()` 进 PSO 缓存键，
+   D3D12 加 `rtfHalf` / `RTVFormats[0]`；WebGL 无此约束，只需读回时解 half。
+6. `#3684` 的两条来源：创建点预检 `as_tex_check_budget`（`w*h*bpp*4/3` 对
+   `as_s3d_max_texture_memory()`：Metal `recommendedMaxWorkingSetSize`、D3D12
+   `QueryVideoMemoryInfo(LOCAL)` 的 budget−usage、WebGL 1 GiB、纯 CPU 1e12）+ 分配点翻译
+   `as_tex_alloc_failed`（create 与三个上传入口，守卫 `as_s3d_has_backend()`）。
+7. **推翻一条旧口径**（阶段二百二十七 的「旗标打开 → 上限放到设备上限」）：实测是「上限不动、
+   只换错误号」，故 `as_tex_check_2d` 的旗标臂改为比较 `as_tex_ceiling()`。旧口径是**误读文档**，
+   它会让 `createTexture(16384,16384)` 比 AIR 更宽松 —— 正是文档警告的那个输入。
+
+**验收**：`examples/tex-format.as`（40 条断言：六常量、四个错误号、门控、字节数、旗标）；
+`test/unit/stage3d.ts` 新增 `stage3d/texture-formats`（17 钉）+ `stage3d/texture-size-limits` 的 8 号钉
+按新语义改写；真机三例：`stage83`（Metal `passed`）、`temp/halfrt/Sample.as`（`half 0.25` →
+`0x404040`）、`temp/halfrt/Bmp.as`（四角与 `Bmp.as` 的 adl 读数逐字节相同）。
+
 ### 遗留待开发
+> **2026-11-02 追加（阶段三百五十一：`Context3DTextureFormat` 六常量 · 半浮点纹理 · `ignoreResourceLimits` 真实语义）**：**新登记 0 行 / 改写 1 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **93 → 91 行**（`未开始` **73 → 71** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 2 行**：① 「`Context3DTextureFormat` 与 AIR 官方全集有 4 处偏差」（六常量对齐、`RGBA` 删除、`#2008`/`#3745`/`#3759` 按实测顺序接入、六种格式的上传解码与字节数全部落地）；③ 「旗标打开后的显存预检与分配失败上报」（`as_tex_check_budget` 单次分配估算 + `as_tex_alloc_failed` 在 create 与三个上传入口翻译后端失败，守卫无后端构建）。**改写 1 行**：② 收窄成「顶点纹理取值（VTF）」——AGAL4 版本与指令预算已放行（`f9a2292`），剩下的只有三翻译器的顶点 sampler 声明与三后端绑定，属独立立项。**一处旧口径被推翻并同阶段修净（不占表）**：阶段二百二十七 把 `ignoreResourceLimits=true` 实现成「上限放到设备上限 16384」，实测（三档一致）是「上限不动、只把 `#3683` 换成 `#3684`」——旧实现比 AIR 更宽松，正是文档警告的那个输入；该分歧连同 `test/unit/stage3d.ts` 的 8 号钉一起按新口径改写，`docs/{zh-cn,en}/display3d.md` §9.14 正文同步。**另记一条 AIR 自身行为**：present 之后读回半浮点渲染目标恒为 `ff000000`（`Half3.as`），我们连续返回 `ff8040bf`（更正确），**不复制**。
+> **2026-11-01 追加（撤表：`walk-m26` 的光照点积差是取样口径，不是渲染分歧）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 主表数据行 **94 → 93 行**（`未开始` **74 → 73** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 1 行**是阶段三百四十八 登记的「`AGALRenderer` 的 PBR 主体在 AOT 与 `adl` 上 `dotNL`/`dotNV`/`dotNH` 系统性偏大」—— 它在 `asaot3d` 侧已由 `three-api-design.md` §29.8 证伪并撤回，**结论是取样口径**：`adl` 的 stage 一直是 **1000×768**（描述符含 32px 标题栏），AOT 的 stage 是 **1000×800**，NDC 差 4% 就足以把同一个分数框挪到球面别处，而 GGX 尾部对位置极敏感（当时「中位数几乎相同、差在尾部」正是这个特征）。把 `adl` 描述符高度临时改 **832** 后两端逐项相同（雾关本体 `38.69` 对 `37.80`、地面 `27.22` 对 `27.28`）。⇒ **不是 `adl` 跑得对我们跑不对**，按 §1.5 不属遗留缺陷，整行撤表；**判「谁对」必须对着参考实现**（`asaot3d/tools/refscene/` 的 three.js 真值 + 同口径 `boxstats.mjs`），不再用「我们的第二个后端」当 oracle。**真正还欠的两条已改挂在 `asaot3d` 侧**（`M26-R1` 直接光镜面项比 three.js 亮 3.4×、`M26-R2` 雾抬升 +5.50 对参考 +9.30，见 `three-api-design.md` §29.8 / §30.7），**编译器侧不留占位**。**口径提醒**：跨端像素比对前先读两端 `Stage3DApp ready: WxH` 对齐 **stage** 尺寸（D142/R56 的既有教训），否则量到的是透视投影差，不是渲染差。
+> **2026-11-01 追加（阶段三百五十：构造函数里的兄弟嵌套函数）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 主表数据行 **94 → 94 行**（项数按表内实际行数复数为准）。**改写 1 行**是 `toFixed` 那行：本阶段为它写的探针顺带撞出了上面那个编译缺陷，同时把它的证据从「27 例、规则不可命名」升级成「84 格双端矩阵、**分歧全部落在 `|v|<1`**、`|v|≥1` 的 60 格完全一致」，并把「为什么仍不能动手」写成了可复用的否定清单（半上入/半偶/单精度/最短十进制四类假设各自的死因），避免下一轮重做。**本阶段修净的不占表**：构造函数/类体静态块漏发共享 cell 的 `_cellN* cellN = _cellN_alloc();`（`cellN` 未声明 ⇒ 生成的 C 编不过）是本轮**新量到并同阶段修掉**的，按「已完成项落地即移出 / 修净不占表」不登记。**口径提醒**：这类「产物根本编不过」的缺陷不会被任何像素/数值回归发现（示例套件里的示例一旦编不过就是红的，但**没人写过的形状**永远不会出现在套件里），所以修它必须同时补一条**覆盖函数体种类**的单元钉（方法 / 自由函数 / 构造函数 / 类体静态块四条 path 各一钉 + 「每个 `_cellN` 都必须在某处被分配」的全域不变量），只补行为示例不够。
+> **2026-11-01 追加（阶段三百四十九：`scrollRect` 窗口的尺寸取整与小数位置）**：**新登记 1 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数（逐行数百），主表数据行 **94 → 94 行**（`未开始` **74 → 74** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 1 行**是 2026-10-30 阶段三百四十三 登记的「`scrollRect` 的裁剪边落在 `.5` 时多画 1 设备像素」—— 它按 §1.5 硬判据是遗留缺陷（`adl` 跑得对我们跑不出），本阶段已修净（19 格示例 + 12 钉 + 4 个变异），按「已完成项一经落地即移出」移除。**新登记 1 行**是本轮**量出但没修**的更窄一条：窗口边与内容边重合时覆盖率是 `c²` 对 AIR 的 `c`（同一个量的两个不同组合口径，不是取整错），行内写明了消掉它的代价与两条必须先量的情形。**口径提醒**：这个缺陷只在**整数布局以外**现形 —— 整数位置、整数尺寸的窗口把「AA vs 吸附」「对象空间 vs 设备空间」「五成双 vs 半上入」三种错法全部藏起来，所以历轮整数探针（含`examples/overflow-clip.as` 的十格）一直是绿的；今后量裁剪/几何类口径一律要带 **`.5`、`.25`、`scale≠1`** 三类格子，否则等于没量。
+> **2026-11-01 追加（阶段三百四十七/三百四十八：`clear()` 零 draw 必须落地 · AGAL `exp`/`log` 以 2 为底）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数（逐行数百，不看上一轮 note 的自述），主表（`遗留项|状态|说明|建议`）数据行 **93 → 94 行**（`未开始` **73 → 74** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**新登记的 1 行**：AOT 与 `adl` 的 PBR 光照点积系统性不同（`dotNL`/`dotNV`/`dotNH` 在 AOT 上偏大 0.05–0.08，被 GGX 分母在 `dotNH → 1` 处放大成高光核面积差）—— 这是 `adl` 跑得对我们跑不对，按 §1.5 属遗留缺陷，本轮只登记不改。**两个阶段修净的都不占表**：① 阶段三百四十七 的 `clear()` 零 draw 不落地（Metal 后端延迟清屏的缝隙，`adl` 空 pass 照清 ⇒ 阴影 prepass 在「有 castShadow 灯、无 castShadow 网格」时整片压黑）是**本轮新量到并同阶段修掉**的；② 阶段三百四十八 的两处底数折算错在 `asaot3d` 侧（`AGALRenderer` 的 EnvBRDF 系数与 FogExp2 的 `log2(e)`），编译器翻译器本来就是 `exp2`/`log2`，故编译器侧只产出钉子（`examples/stage348.as` + `unit: stage3d/agal-exp-log-base2`）。**口径提醒**：`exp`/`log` 的底数只能靠 `adl` 实测确定（`temp/agalprobe/Exp.as`），两端一致所以 AOT/AIR 对比**看不见**这类错，本轮的取证靠的是对着 three.js 参考值反推。
+> **2026-11-01 追加（阶段三百四十六：AGAL 写掩码的读后写别名）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑错的实错（翻译器把写掩码逐分量展开，源操作数与目的同寄存器时读到刚写入的分量），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。影响面是 **MSL/GLSL/HLSL 三档共用**的发射器，`adl` 不受影响；判据与实测见 [`docs/zh-cn/display3d.md`](docs/zh-cn/display3d.md) §3 ④，钉子 `examples/stage346.as` + `unit: stage3d/agal-write-mask-alias`。
 > **2026-10-31 追加（阶段三百四十五：`with` 三种接收者成员面 + `is`/`as` 动态 Class 右操作数 + with 体内隐式全局）**：**新登记 0 行 / 改写 1 行 / 移出 3 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**96 → 93 行**（`未开始` **74**（含 `未开始 / D43b` 1 行）/ `部分完成` **22 → 19** / `已完成` 0；`调研完成 · 实现暂缓` 1 行照旧不计）。**移出 3 行**：①「`is`/`as` 右操作数是内建类 / 接口 / `Vector.<T>` 的 Class 值」——行内三条剩余全部清偿：内建接口与 `Vector.<T>` 的 Class 值在阶段三百三十三已随类注册表落地（`as_class_is_val` 的 iface/vecfqn 路径），真正剩下的 `*` 型右操作数本轮落地（`as_class_req_any`：undefined → `#1010`、null/数字/字符串等非 Class 值一律 `#1009`、左操作数先求值再校验——`adl 51.4.1` 实测，`temp/isany/` 双端逐字节相同；`Object` 型右操作数在 `mxmlc` 是编译期隐式强制转换错，我们同样编译期拒绝）；②「`with` 体内给『对象与词法作用域都没有』的名字赋值仍是编译期错误」——函数体（含函数体内 `with`）残留本轮清偿：`collectImplicitGlobals` 加 `fnDepth`/`withDepth` 双深度扫描（脚本层恒收、闭包内仅 `with` 体内收），实测语义是**模块级共享全局**（`temp/with3n`：闭包 A 写、闭包 B 的 with 体读得到）；③「`Stage.fullScreenWidth/Height` 取『完整显示模式』而非 AIR 的『可用区』」——macOS 一端清偿：新 seam `sk_window_get_stage_full_size`（`window_glue.cc`，主窗口所在显示器的 `SDL_GetDisplayUsableBounds`，`__APPLE__` 臂；Windows/web 保持整块——AIR 实测同值），`Stage` 两 getter 改走新包装 `as_window_get_stage_full_size`，`Capabilities.screenResolution*` **刻意不换**（实测是另一个量）；真窗探针（`temp/fullscrprobe.as` + `examples/window.build.example.json`）：开窗期 Stage 读 **1753×1130**（= 本机 dock-left 的可用区，与 `Screen.visibleBounds` 同源量）、Capabilities 仍 **1800×1169**；`unit: platform/DisplayMetrics` 钉新契约（Stage/Capabilities 各走各的 seam）。**改写 1 行**＝「`with` 的接收者仍有三种只到『响亮拒绝』」——Function/类/RegExp 三类的成员面本轮全部落地（行内只留 String/`Vector` 接体内写形态）：Function 接收者 `length`/`call`/`apply`（绑定方法、arity 1、缺参按接收者 `#1063`）/`toString()`/`valueOf()`/`hasOwnProperty`/`propertyIsEnumerable`/`prototype`（每函数独立空 Object、按 (fn,env) 身份缓存）/`"call" in f2` 八成员集；类接收者静态字段/方法/getter/setter/const 全通、实例字段不可见（`#1065`）、`toString()`=`"[class KC]"`、`valueOf()` 是类本身、`hasOwnProperty('toString')`=true、PIE=false、const 写 `#1074`（"on class <fqn>."）、方法写 `#1037`、getter-only 写 `#1074`、`delete` 静态成员=false、未知写→隐式全局、null Class→`#1009`；RegExp 六只读成员改 getter（写 `#1074`、`flags` 从来不是成员→`#1065`、内部槽 `_flags`/`_compiled`）、`toString()`=`"/ab/gi"`（无 flag 保留 `/`）、`lastIndex` 可写、exec/test 共享状态；Function 相等改 (fn,env,arity) 身份比较（原来对 as_fn 指针直接 `==`）、`Function.apply` 第二参非数组且非 null/undefined→`#1116`、`* → Function` 隐式强制转换不检查（X13：值形态 toString 存入 Function 槽、调用时 `#1006`）、密封实体的 `valueOf()` 静态路径返接收者本身（Object 槽仍走 `as_dyn_call` 保阶段三百四十四 的盒装原始值契约）。**本阶段修净、不占表**：`f2.call`/`f2.apply` 作为**值**的绑定语义（`temp/with3i` V1–V11：`c(1,2,3)`=接收者的 `(2,3)` 调用、`c.length`=1、`f2.toString.length`=0、`f2.call == f2.call`=true、`apply` 值第二参非数组 `#1116`）、`KC.prototype`/`f2.prototype` 是每类/每函数独立的空动态 Object（`temp/with3k`：跨函数/跨类不相等、同函数两次相等、hasOwnProperty 全 false、Object 实例的 `constructor` 不是 Class）。证据台 `temp/with3/`（Main1..14 探针 + `ourall.as` 镜像，`diffcheck.py` 口径 diff=**IDENTICAL**），钉子 `examples/with-fn-class-regexp.as`（46 断言）+ `examples/is-as-any-class.as`（阶段三百四十四 已入）。**已接受残差**（mxmlc 自身非确定，均记在 `temp/with3/README.md`）：F14/P28（同形不同文件一抛一答）、裸 `length` 恒 1 的全局作用域产物、P29、闭包内 `arguments`（独立挂表）、toString/valueOf 动态自建属性写（响亮报错）、错误消息短形态（全库既有）。
 > **2026-10-31 追加（阶段三百四十四：动态接收者上的内建方法面）**：**新登记 0 行 / 改写 1 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表（`遗留项|状态|说明|建议`）**97 → 96 行**（`未开始` **74**，含 `未开始 / **D43b**` 1 行 / `部分完成` **22** / `已完成` 0）。**移出 1 行**＝「动态接收者的 `Number.toString()` / `toFixed()` 返 `null`」⇒ 转**已完成**：根因是**同一个值有两套表示各走各的门**（裸 box tag 从 `as_any_call` 出门，tag 1/2/7 的 `ptr` 不是对象头 ⇒ 一律 `null`；`Object` 槽的堆盒从 `as_dyn_call` 出门，成员表只有 `Object` 四件套 ⇒ 一律 `#1069`），现在两条门都开在同一个 `as_prim_call` 上。**改写 1 行**＝`toFixed` 的 `.5` 舍入：补齐 27 例双端读数后确认 AIR 既非银行家也非半上入（`0.5`/`0.05` 向下、`2.5`/`0.25` 向上），**只补证据不定口径**（盲目改会弄红现在正确的 5 例）。**本阶段修净、不占表**（全是 `adl` 跑得对我们跑不出）：盒化 `String`/`Function` 的方法面（`#1069`）、静态 `Function` 类型上的 `toString`/`hasOwnProperty`/`propertyIsEnumerable`（曾是 `CodegenError`）、字符串方法**缺参数**返 `null`、`var u:*;` 是 `null` 而非 `undefined`（连同类字段/静态字段/`new Array(n)` 的洞）、`Number.toString(radix)` 的 radix 10 走了整数转换与大数丢高位、radix/位数越界或缺失的静默夹取（应为 `#1003`/`#1002`）、`toPrecision` 走 `%g` 吃掉尾零与无参退化、负零的画法。证据台 `temp/dynnum/`（`body.inc` 90 条断言双端 `diff` = IDENTICAL），钉子 `examples/dyn-prim-methods.as` + `unit: prim/PrimMethods`。
 
@@ -18788,7 +19042,7 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 >
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
-| **`toFixed` 对 `.5` 的舍入方向与 AIR 不同** | 未开始（2026-10-28 阶段三百一十四 量到；2026-10-31 阶段三百四十四 补齐 27 例双端实测，口径仍未定） | AIR 的 `toFixed` 既不是银行家也不是半上入：`2.5/4.5/6.5/8.5/10.5 → 3/5/7/9/11`（整数部分 ≥1 的 `.5` **一律远离零**），但 `0.5 → "0"`、`0.05 → "0.0"`、`0.5000000000000001 → "0"`（恰好落在 / 刚刚跨过阈值的那几档反而**向下**），而 `0.25 → "0.3"`、`0.75 → "0.8"` 又向上；非 `.5` 的值两侧都按**真实二进制值**舍（`2.675 → "2.67"`、`1.005 → "1.00"`、`8.345 → "8.35"`、`1.255 → "1.25"`、`0.15 → "0.1"`、`0.35 → "0.3"`、`0.45 → "0.5"`、`0.85 → "0.8"`、`0.95 → "0.9"`）。我们走 `printf` 的 half-to-even（正确 IEEE 舍入），27 例里 9 例不同，且 `0.5000000000000001 → "1"` 按 ECMA 是对的、AIR 答 `"0"` | **先别动**：没有一条单一规则能同时解释上面 27 个读数（半上入解释不了 `0.5`/`0.05`，银行家解释不了 `2.5`/`0.25`），盲目改成半上入会让现在**正确**的 5 例（`1.5`/`3.5`/`5.5`/`7.5`/`9.5`）翻红。证据台 `temp/dynnum/body5.inc`（AIR）、`ours5b.as`（我方）与 `dynfix2-{air,ours}.txt`；下一轮先补 `sprintf` 以外的假设（例如「先转成有限位十进制、再在十进制上舍」）逐条对照，能一次解释 ≥26/27 再动手 |
+| **`toFixed` 对 `.5` 的舍入方向与 AIR 不同** | 未开始（2026-10-28 阶段三百一十四 量到；2026-10-31 阶段三百四十四 27 例；2026-11-01 阶段三百五十 补 84 格双端矩阵，**残差已收窄到 `|v|<1`**，规则仍不可命名） | AIR 的 `toFixed` 既不是银行家也不是半上入。**84 格矩阵**（`temp/tofixed2/`：28 个值 × `f=0/1/2`，`adl` 落 `out.txt`、我们落 `our.txt`）读出 13 格不同，**全部落在 `|v| < 1`**：`|v| ≥ 1` 的 60 格（含 `2.5→3`、`10.5→11`、`2.675→2.67`、`1.255→1.25`、`1234.5678→1235`）**与我们完全一致**。`|v| < 1` 的分歧只有两类：① `f=0` 且小数 ≥ 0.5 时 AIR **一律给 0**（`0.5/0.55/0.75/0.85/0.95/0.5000000000000001` 全为 `0`，即截断），而 `f≥1` 时同样落在十进制平局的 `0.25→0.3`、`0.75→0.8` 反而**进位**；② 真值只是**刚刚越过**平局一位的（`0.05` 真值 `0.05000000000000000277`、`0.85` 真值 `0.85000000000000008882`、`0.125` 在 `f=1`）AIR **不进位**，而 `0.125` 在 `f=2` 又进位成 `0.13`。**任何单一十进制规则都解释不了**：`0.05` 与 `0.25` 在 15/16 位十进制视图下形状完全相同（都是「cut 后面恰好是 5、再无尾数」）却一个向下一个向上；`0.125` 在 `f=1` 向下、`f=2` 向上；`0.5.toFixed(0)` 向下而 `2.5.toFixed(0)` 向上（同一平局、仅剩「`|v|<1`」这一条共同点）。已排除：`printf` 半偶（那是我们现在的实现，60 格 `|v|≥1` 全靠它撑住）、单精度中转（`0.05f*10+0.5` → 1，与 AIR 的 0 相反）、「先转 15 位最短十进制再按十进制舍」（解释不了 `0.05` vs `0.25`）、十进制串层半偶（解释不了 `0.25→0.3`） | **仍然别动**，但下一轮不必重做本轮：矩阵与两端读数已在 `temp/tofixed2/`（`probe.as` 是同一份源码；`out.txt`=adl、`our.txt`=我们），13 格分歧清单直接用 `diff out.txt our.txt` 取。动手的前置条件是拿到**avmplus 的 `toFixed` 实现源码**（AIR SDK 不带源，仓库里也没有）：本轮的读数证明它不是「某条十进制规则」，而是带着 `|v|<1` 专用分支/精度损失的实现细节，凭读数反推已到极限。若拿不到源码，另一条可行路线是**只改 `|v|<1` 的 `f=0` 分支**（13 格分歧里 5 格是这一类，且规则明确：截断），收益有限但零风险；**禁止**为了对齐 `2.5→3` 而把整体改成半上入——那会让现在正确的 `0.5→0`/`0.05→0.0`/`0.85→0.8` 与 60 格 `|v|≥1` 一起翻红 |
 | **`gc_find_block()` 的首次适配是线性扫描：空闲块越多、每次分配越贵**（**我方性能缺口**，不是 `adl` 保真差） | 未开始（2026-10-28 阶段三百一十四 量到并用三段因果实验定案） | 真应用一帧 **4642 ms**，而同一行遥测给出 `gcshare=0.1%` / `worstgc=1.00 ms` / `freeblk=300026` ⇒ **不是 GC**。`temp/perf-b3/src/GeomPerf.as`：干净堆 **0.037 µs/次** → 只造 10 万个空闲块后全部丢弃（存活集几乎不变）**0.548 µs/次**（×15），另驻留 6 万对象 0.667 µs/次（×18）；同相位读路径 `read_cast_frag` **0.000 µs/次** ⇒ 不是「堆变慢」，是「分配变慢」。`gc_find_block()`（`src/runtime.ts:556`）从自己的尺寸类起沿**单向链表**逐节点找第一个够大的块，找不到还要向上爬所有更高的类。**这就是「打开/刷新列表就卡」的直接形状**：一次刷新几千次分配 × 几百 µs = 秒级冻结 | 把「挑一块」做成 **O(1)**（精确尺寸类分箱 / 每链「上次成功位置」游标 / 链内按大小有序），**不要动 GC 预算与切片**（`gcshare=0.1%` 已排除），也别用 `ASC_GC_THRESHOLD` 拖回收（只会让链更长）。口径与读数：`docs/zh-cn/gc.md` §6.17。**2026-10-29 复算（合并到新 base 后）**：AOT 臂在 `pt_4000` 就被外部看门狗判 3 次不响应杀掉（`per=338 µs/次`、`stalls=7`、`gapmax=1675 ms`），**合并前与合并后的 exe 同点位同形状**；同一时刻 adl 臂跑完整轮、同一相位 `per=0.271 µs/次`、0 hang ⇒ 「AOT 连基准都跑不完」本身就是这条的现形，与本轮三处修复无关（读数 `temp/perf-b3/bench3-aot-merged-report.txt` vs `bench3-air-report-1029.txt`）。**验收判据**：Bench3 的 `pt_8000` 相位从 4.6 s 降到 <50 ms 且 `ASC_FRAME_STATS` 的 `p99` 同跌 |
 | **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
 | **`DisplayObject.stage` 对「已不在显示列表上」的对象返回主窗 Stage 而非 `null`**（`DisplayObject_get_stage` 末尾 `return ASC_root_stage;` 对所有孤立对象兜底；`adl 51.4.1` 实测 `after stage=null`，我们答 `stage`，见 `temp/dispabort/`） | 未开始（2026-10-27 阶段二百九十五 做出 A/B 探针时量到；本阶段只修派发时机，未动兜底） | 兜底本身是为 document class **构造期**的 `stage` 非 null（Flash 语义），但它区分不了「document class 实例」与「任意孤立 Sprite」⇒ `if (obj.stage == null)` 这类守卫在对象被摘除后判错，`stage.removeChild(...)` 会打到**另一个窗口**的 Stage 上（找不到子件 ⇒ 返回 null，多数场景无害但语义错）。 | 加 `static void* ASC_doc_root`（窗口创建时指向 document class 实例），只在 `o == ASC_doc_root` 时兜底、其余返回 NULL；改后必须全量回归（`examples/` 里若有孤立对象读 `stage` 的会变红） |
@@ -18865,9 +19119,7 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 | **窗口几何的 Windows 端残余**（Windows 端 `<transparent>` 仍未实现 / 四类未测面剩下的两项） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：原来列的四处里，① 最大化尺寸口径 **已定** —— 那是 `WS_MAXIMIZEBOX` 这一位（在 ⇒ 可用区 `2576x1675`，不在 ⇒ 整块显示器 `2576x1723`，adl 与我们在两档描述符下**逐字相同**），② 横向边框 **已修**（`b_left` 四处同源），③ 描述符成员 **已接线**（`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>`），只剩下面两处；**2026-10-23 阶段二百五十七 再收窄**：① 的**生成侧与 macOS 侧已接线**，剩下的只是 Windows 的原生实现） | **① `<transparent>` 的 Windows 端**：描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions.transparent` → `sk_window_set_transparent`、合成步清 alpha 0、macOS 的 `NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明，**全部已在阶段二百五十七 落地**；Windows 侧仍要 `WS_EX_LAYERED` + 逐帧 alpha（当前**报明一次**，不给假透明窗）；**② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没接线/没量」：① Windows 端需要一张分层窗（`WS_EX_LAYERED` + 逐帧 alpha）并把同样的「清 alpha 0」口径搬过去；② `closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
 | **初始窗的框/客户区单位**（描述符 `<width>/<height>` 是**框**，我们当**客户区** ⇒ 窗大一圈、舞台也大一圈） | 未开始（2026-10-19 阶段二百零五 实测登记；**两端同源，非 Windows 专属**） | Windows 实机孪生探针（`temp/nwwin/wprobe/`，`<width>366</width><height>630</height>`）：adl `bounds=366x630` + `stage=350x591`；我们 `bounds=382x669` + `stage=366x630`，**恰好差 16x39 = 左右边框 8+8 与标题栏 31 + 下边框 8**。根因在生成侧：引导代码把描述符的 `width`/`height` 当**客户区**交给 `Stage_showWindow`（它拿同一对数去置 `design_w/h`、`lw/lh`、`pw/ph`），窗口又按同一对数开 ⇒ **两道都大一圈**（AIR 的 `stage` 才是客户区，`NativeWindow.bounds` 是框）。macOS 走同一条生成路径 ⇒ 同一缺陷在 macOS 上应表现为差一个 `32pt` 标题栏，**本机不可实测** | 需与之俱动：① 窗口按**框**尺寸建（或建完读回客户区再定尺寸）；② 舞台/表面用**真实客户区**；③ `Stage.stageWidth/Height` 与 `design_*` 的口径一次对齐；④ 全 GUI 示例 + 像素 harness 同批回归（改的是**每扇窗的初始几何**）。半修（只改窗口不改舞台）会得到**被缩放**的画面，比现状更糟 ⇒ 必须成批做，先立项再动手。 |
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
-| **浮点纹理 `Context3DTextureFormat.RGBA_HALF_FLOAT`** | 未开始（阶段二百二十六 分档实测登记：`baselineExtended` 抛 `#3759`，`standard` 起接受） | 我方 `Context3DTextureFormat` **无该常量**（编译期即报 undefined），三后端只建 `BGRA8`（`stage3d_d3d.cc` 的 `DXGI_FORMAT` 选择、`stage3d_glue.mm` 的 `MTLPixelFormat` 选择、WebGL 的 `internalformat`）。Starling 不用它，但 `RenderTexture` 的 HDR 路径会 |
-| **AGAL4 与顶点纹理取值（VTF）** | 未开始（阶段二百二十六 分档实测登记：这是 `enhanced` 相对 `standard` 唯一新增的东西） | `runtime.ts` 的 AGAL 前置对 `version > 3` **显式拒绝**、指令数上限硬编码 200；GLSL 翻译器**只在片元阶段声明 sampler**（`isFragment` 分支）⇒ WebGL2 上顶点取样会编译失败；MSL/HLSL 的顶点入口也没有对应的 `texture` 绑定槽。完工判据：AGAL4 解析 + 顶点 sampler 声明 + 三后端绑定与取样 |
-| **旗标打开后的显存预检与分配失败上报**（`Context3D.ignoreResourceLimits = true`） | 未开始（2026-10-22 阶段二百二十七 实测登记：`adl` 在 `#3684` 处**同步**失败，我们的惰性分配会把失败推到上传之后） | 旗标打开后我们只按**设备上限**（`as_s3d_max_texture_size()`，D3D12/Metal 16384）放行尺寸，**不预检像素总量**；而 2D/`RectangleTexture` 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `t->gpu` 留空，等 `uploadFromBitmapData`/`uploadFromByteArray` 才建），所以「设备上限允许、实际建不出来」这一档现在**不会**冒成 `#3684`——它会在上传时静默变成一张空贴图。`adl 51.4.1` 实测（`temp/adlprof/`，`PROBE_MODE=ign`）：旗标打开后 `baseline` 的 `createTexture(4096,1)`、`enhanced` 的 `createTexture(8192,1)` 都在**创建时**同步抛 `Error #3684: Texture creation failed. Internal error.`，即 AIR 在创建点就把分配做完了 | ① 给 `Texture`/`RectangleTexture` 的创建补一次**总量估算**（`w*h*bpp`，带 mip 时再乘 4/3，累加到 context 上），超过一个可配置的显存预算就抛 `#3684`（文案照 AIR）；② 或把 `as_s3d_create_render_texture` 的返回 `NULL` 立刻变成 `#3684`（目前只对 `optimizeForRenderToTexture=true` 有这条路径，且未检查返回值）。**成本中**，且要与「`ignoreResourceLimits=false` 时 AIR 的对象数量/显存预算」一起量（本阶段实测：`adl` 关旗标时 4300 个 1×1 贴图仍可建，即计数上限实际未生效，约束在显存） |
+| **顶点纹理取值（VTF，AGAL3 的 `tex` 出现在顶点阶段 / AGAL4）** | 未开始（阶段二百二十六 分档实测登记；**阶段三百五十一 收窄**：AGAL4 版本与指令预算已放行，剩下的只有 VTF 本身） | `runtime.ts` 的 `as_agal_translate` 现在接受 `version <= 4`（原 `> 3` 显式拒绝）、指令预算 200 → 400，**AGAL4 本身就差最后一环**：三个翻译器的 MSL/HLSL/GLSL 声明段都只对 `isFragment` 发 sampler ⇒ GLSL 的顶点阶段没有 `sampler2D` 声明（WebGL2 上顶点取样直接编译失败）、MSL 的顶点入口没有 `[[texture(N)]]` 参数、HLSL 的根签名把 SRV/sampler 表钉在 `D3D12_SHADER_VISIBILITY_PIXEL`；`vendor/stage3d_webgl.cc` 的 `fsN → unit N` 映射同样只覆盖片元。完工判据：三翻译器的顶点 sampler 声明 + 三后端绑定（Metal `setVertexTexture:atIndex:`、D3D12 根签名 `VISIBILITY_ALL` 或 vertex、WebGL 顶点纹理单元）+ 一个双端取样实例 | **先实测 AIR 的顶点取样口径**（`enhanced` 档、`tex v0, v1, fs0 <2d,linear,nomip>` 是否真能在 VS 里读、取样坐标的纹理单元与采样器状态是否与片元共用），再动三个后端；探针脚手架可复用 `temp/agalprobe/` 与 `temp/halfrt/`。**成本中高** |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
@@ -18880,7 +19132,7 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 | **AOT 的每帧固定成本高于 AIR 10×**（`static` 场景 0.579 vs 0.058 ms/帧） | 未开始（2026-10-29 阶段三百一十五 量到；本阶段修的是「每项成本」，没有动固定成本） | 夹具 `static`（一个 FPS 文本 + 一张位图，**没有列表**）：AOT **0.579**、AIR **0.058 ms/帧**（3 reps，进程 CPU/帧）。同一份数据里 AOT 的**列表斜率已经反超**（2.56 vs 1.85 µs/项），所以固定成本是现在唯一还落后的量：384 项时的总差 0.5 ms 里，固定成本与斜率各占约一半。候选来源（**未拆**）：`as_render_fp` 整树哈希、窗口 pass 的若干 per-frame 准备、`ASC_pass`/`ASC_frame` 探针的残留检查 | 先给固定成本加分段探针（把 `as_render_fp` 单独关掉一次、把窗口 pass 的每帧准备工作分段计时），定位到具体语句后再改；`ASC_RPROF` 现有绝对值不可信（与进程 CPU 比值 ≈4×，原因未定位），只能做相对比较
 | **`DisplayObject.mask` 的非矢量遮罩只有包围盒精度**（`Bitmap`/`TextField` 当遮罩时 AIR 按**像素**模板裁剪，我们退回它的包围盒并 `as_shell_unsupported` 报一次；纯描边遮罩的描边带、遮罩自带 `filters`/`blendMode` 的呈现同样只取几何） | 未开始（2026-10-29 阶段三百一十八 落地二值模板时登记；本阶段把矢量遮罩（含子件并集、离屏遮罩、别的容器）逐条对齐了 adl，这三档 adl 侧未实测、实现上也还没接） | `docs/zh-cn/skia.md` §6.15 的实测表是已对齐的九条；缺的三档分别是「遮罩是 `Bitmap`/`TextField`」「遮罩只有描边」「遮罩自身带滤镜/混合」 | 先按 §6.15 的探针套路（`temp/mask/MaskProbe*.as`）补测这三档的 adl 口径，再把 `as_mask_ink` 的路径收集扩到像素模板（`SkImage` → `SkShader` 裁剪或 `saveLayer` + `kDstIn`），并把报明换成真实现 |
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
-| `scrollRect` 的裁剪边落在 `.5` 时多画 1 设备像素（AIR **银行家舍入**，我们**半上入**） | 未开始（2026-10-30 阶段三百四十三 实测登记，G29 顺带量到） | **判据（§1.5）**：同一输入 `adl` 的输出正确、我们的错 1 px ⇒ **遗留缺陷**。`adl 51.4.1` 逐像素（`temp/g29/src3/Main.as`，父盒 `x=20`、子件 200 宽、`BitmapData.draw` 扫行）：裁剪宽 `100.5→` 只画到第 `100` 列、`119.5→120`、`120.5→120`、`121.5→122`、`122.5→122`、`123.5→124` ⇒ 规则是**四舍六入五成双**（恰为 `.5` 时取偶）；我们走 Skia 的 `clipRect`，`SkScalarRoundToInt` 是**半上入** （`100.5→101`、`120.5→121`、`122.5→123`）⇒ 只在「`.5` 且整数部分为**偶**」的那一半场合差 1 列（奇数的那半两边一致，纯属巧合）。整数几何、`.25/.75/.9` 等非 `.5` 小数**逐位相同**；`scrollRect` 的 `x` 偏移为 `.5` 时内容平移两边也相同（`x0.5` 格） | 修法两条，都只动渲染侧、不碰布局：① 在 `as_skia_canvas_clip_rect` 里按**设备空间**把矩形四条边做「四舍六入五成双」再裁（须换 CTM 后算，否则父层缩放会二次取整）；② 或在 `as_render_object` 的 `scrollRect` 分支里先把 `w/h` 量化再交给 glue。**验收**：`temp/g29/src3` 那 9 格双端逐位相同（现仅 3 格不同）＋现有 `examples/scrollrect-clip.as` / `examples/overflow-clip.as` 零回归。**风险**：`clip_rect`/`clip_path` 是全渲染器共用的裁剪入口，改取整口径要连带回归 `mask`/`clipDepth`/`cacheAsBitmap` 全部像素示例 |
+| `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | 未开始（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
 
 
 
@@ -18900,7 +19152,7 @@ AOT 镜像 + `scan.cjs` 像素扫描），**先量后改**：
 | **WebP / BMP / ICO 解码** | 部分：仅 JPG/PNG/GIF（`adl` 对三者报 `#2124`） | ✅ **已实现、opt-in**（默认与 AIR **同报 `#2124`**，`--features formats` 打开后两端实测全部解码正确；`QOI` 未编入 `SkQoiCodec`，不含在内） | 两端 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **相机 RAW / DNG 解码** | ✗（`adl` 对 `.dng` 报 `#2124`；`BitmapData.loadFile` 不存在 → `#1069`） | ✅ **已实现、opt-in**（默认与 AIR 同报 `#2124`，`--features raw` 打开后 native 四条解码入口全部解出 600×338）；web 无 piex/dng_sdk 归档 ⇒ 该开关在 wasm 上被前置拒绝 | native / web 与 AIR 同形 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **矢量图形直接上屏**（`Shape` 走 `SkPath`） | ✗（`BitmapData` 只有位图） | 两端 | 中 | 未排期 |
-| **原生着色器直通**（MSL / GLSL ES） | ✗（只有 AGAL） | 两端 | 中 | 未排期 |
+| **原生着色器直通**（MSL / GLSL ES） | ✗（只有 AGAL） | 两端 | 中 | 未排期（立项设计见 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md)） |
 | **GPU 通用计算**（Metal compute / transform feedback） | ✗ | 两端 | 高 | 未排期 |
 | **无窗口 / 服务端出图** | 半（可离屏，但绑死 AIR 运行时） | 两端 | 已有（headless + `stage.render()` 出 PNG） | 已有 |
 | **64 位整数**（`int64`/`uint64`） | ✗（`int`/`uint` 均 32 位） | ✅ **已实现、opt-in**：类型 + `L`/`UL` 字面量 + `int64()`/`uint64()` 转换 + 64 位算术/位运算/比较 + 独立装箱 tag；纯 C ⇒ **native/web/WASI 同一份代码同一行为**（无胶水依赖） | — | **已完成（阶段九十四·二十四）** |

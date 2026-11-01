@@ -7553,7 +7553,18 @@ export class SymbolTable {
     constClass('Context3DRenderMode', { AUTO: 'auto', SOFTWARE: 'software' });
     constClass('Context3DStencilAction', { KEEP: 'keep', DECREMENT_SATURATE: 'decrementSaturate', DECREMENT_WRAP: 'decrementWrap', INCREMENT_SATURATE: 'incrementSaturate', INCREMENT_WRAP: 'incrementWrap', INVERT: 'invert', REPLACE: 'replace', SET: 'set', ZERO: 'zero' });
     constClass('Context3DTextureFilter', { NEAREST: 'nearest', LINEAR: 'linear' });
-    constClass('Context3DTextureFormat', { BGRA: 'bgra', RGBA: 'rgba', COMPRESSED: 'compressed', COMPRESSED_ALPHA: 'compressedAlpha', BGR_PACKED: 'bgrPacked', BGRA_PACKED: 'bgraPacked' });
+    // AIR's Context3DTextureFormat is exactly these six constants, with these exact
+    // string values (measured on adl 51.4.1, temp/texfmt/README.md §1). Three things
+    // this table used to get wrong, all of them observable:
+    //   * there is NO `RGBA` constant, and "rgba" is not an accepted format string --
+    //     passing it throws ArgumentError #2008 "Parameter textureFormat must be one
+    //     of the accepted values";
+    //   * BGR_PACKED is "bgrPacked565", BGRA_PACKED is "bgraPacked4444" (the trailing
+    //     565/4444 is part of the value);
+    //   * RGBA_HALF_FLOAT exists (AIR 14+) with the value "rgbaHalfFloat" -- it is a
+    //     `standard`-rung format, so at the profiles this build reports it throws
+    //     ArgumentError #3759 (see as_tex_check_format in emit.ts).
+    constClass('Context3DTextureFormat', { BGRA: 'bgra', BGR_PACKED: 'bgrPacked565', BGRA_PACKED: 'bgraPacked4444', COMPRESSED: 'compressed', COMPRESSED_ALPHA: 'compressedAlpha', RGBA_HALF_FLOAT: 'rgbaHalfFloat' });
     constClass('Context3DTriangleFace', { BACK: 'back', FRONT: 'front', FRONT_AND_BACK: 'frontAndBack', NONE: 'none' });
     constClass('Context3DVertexBufferFormat', { BYTES_4: 'bytes4', FLOAT_1: 'float1', FLOAT_2: 'float2', FLOAT_3: 'float3', FLOAT_4: 'float4' });
     constClass('Context3DWrapMode', { CLAMP: 'clamp', REPEAT: 'repeat' });

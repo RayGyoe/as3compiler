@@ -1305,7 +1305,10 @@ function checkScrollRectWindow(): string[] {
   check('the renderer has a scrollRect branch', start >= 0);
   const end = start < 0 ? -1 : c.indexOf('if (scroll_on) as_skia_canvas_restore(canvas);', start);
   const block = start < 0 || end < 0 ? '' : c.slice(start, end);
-  const clip = block.indexOf('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+  // Stage 349 moved the window clip to the rounding-aware entry point; the ORDER is
+  // what this group pins, so accept either name (rounding itself is pinned by
+  // unit: render/ScrollRectWindowRounding).
+  const clip = /as_skia_canvas_clip_rect(?:_window)?\(canvas, 0\.0, 0\.0, o->_scroll_rect->width, o->_scroll_rect->height\);/.exec(block)?.index ?? -1;
   const move = block.indexOf('as_skia_canvas_translate(canvas, -o->_scroll_rect->x, -o->_scroll_rect->y);');
   check('the window is clipped at the object\'s own box (0,0,w,h)', clip >= 0);
   check('the content is shifted by -x/-y', move >= 0);
@@ -1740,7 +1743,9 @@ function checkOverflowClip(): string[] {
 
   // The scrollRect clip must enclose as_render_object_content (own geometry AND the
   // children it recurses into), not just the object's own draws.
-  const clipAt = c.indexOf('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+  // Stage 349 renamed the entry point (see ScrollRectWindowRounding); the SCOPE is what
+  // this group pins, so either name is acceptable here.
+  const clipAt = /as_skia_canvas_clip_rect(?:_window)?\(canvas, 0\.0, 0\.0, o->_scroll_rect->width, o->_scroll_rect->height\);/.exec(c)?.index ?? -1;
   const contentAt = c.indexOf('as_render_object_content(canvas, o);', clipAt < 0 ? 0 : clipAt);
   const restoreAt = c.indexOf('if (scroll_on) as_skia_canvas_restore(canvas);', clipAt < 0 ? 0 : clipAt);
   check('the scrollRect clip is entered before the content call', clipAt >= 0 && contentAt > clipAt);
@@ -2343,3 +2348,78 @@ function checkSwcClipMaskPerFrame(): string[] {
   return bad;
 }
 registerGroup('unit: render/SwcClipMaskPerFrame', checkSwcClipMaskPerFrame);
+// ---------------------------------------------------------------------------
+// unit: render/ScrollRectWindowRoundsToEven -- the scrolling window's SIZE rule.
+//
+// Measured on adl 51.4.1 (temp/clipround, 24 cases): AIR quantizes
+// scrollRect.width/height with ties-to-EVEN **in object units** (100.5 -> 100,
+// 101.5 -> 102, 119.5/120.5 -> 120, 121.5/122.5 -> 122, 123.5 -> 124; a scale-2
+// parent still spans 100.5*2 = 200 device px) and antialiases the window's own
+// edges at the object's fractional device position (x=20.25/20.5/20.75 give
+// 25/50/25% first-column coverage). We snapped half-UP in DEVICE space with
+// antialiasing off (SkCanvas' *rect* clip overload defaults doAntiAlias=false),
+// i.e. one column too many and a whole-pixel shift of the window at fractional
+// origins. The behavioral half of this pin is examples/scrollrect-round.as; the
+// structural half is here, because a pure-C build has no raster backend and the
+// example self-skips.
+function checkScrollRectWindowRounding(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [srwin] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [srwin] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.display.*;\nimport flash.geom.*;\n' +
+    'var s:Sprite = new Sprite();\nvar b:Shape = new Shape();\ns.addChild(b);\n' +
+    's.scrollRect = new Rectangle(0, 0, 100.5, 20.5);\n')).c;
+
+  // ---- emit: the scrollRect branch uses the window entry point ----
+  check('the scrollRect clip goes through as_skia_canvas_clip_rect_window',
+    c.includes('as_skia_canvas_clip_rect_window(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);'));
+  // The window must not be pre-quantized in the generated C: the rounding lives in
+  // the glue, where the OBJECT-space rect is still existent before the CTM applies.
+  check('the emitted width/height are the live scrollRect fields (no (int) cast at the call site)',
+    !/as_skia_canvas_clip_rect_window\(canvas, 0\.0, 0\.0, \(double\)\(int\)/.test(c));
+  // ...and the object-space rounding is what the scale-2 row proved: a device-space
+  // rint would give 201 there.
+  const glue = readGlue();
+  check('the window clip rounds with rint (ties-to-even, FE_TONEAREST)',
+    /void sk_canvas_clip_rect_window\(void\* canvas, double x, double y, double w, double h\) \{[\s\S]{0,400}?\(SkScalar\)rint\(w\), \(SkScalar\)rint\(h\)/.test(glue));
+  check('the window clip antialiases (SkCanvas rect clip defaults to no AA)',
+    /void sk_canvas_clip_rect_window\(void\* canvas[\s\S]{0,2000}?c->clipRect\(r, SkClipOp::kIntersect, true\);\n\}/.test(glue));
+  // Whole-pixel windows must keep the cheap non-AA rect clip: an AA clip on every
+  // scrolled list would be a silent per-frame regression for zero visual change.
+  check('whole-device-pixel windows take the fast non-AA path',
+    /axis_aligned[\s\S]{0,600}?d\.left\(\) == rintf\(d\.left\(\)\)/.test(glue) &&
+    /d\.right\(\) == rintf\(d\.right\(\)\)[\s\S]{0,200}?c->clipRect\(r\);\n      return;/.test(glue));
+  check('<cmath> is included for rint/rintf',
+    glue.includes('#include <cmath>'));
+
+  // ---- runtime seam: both the Skia build and the pure-C stub ----
+  const pre = RUNTIME_PREAMBLE;
+  check('the seam declares the glue entry point', pre.includes('extern void sk_canvas_clip_rect_window('));
+  check('the Skia build forwards to it', pre.includes('static inline void as_skia_canvas_clip_rect_window(void* c, double x, double y, double w, double h) { sk_canvas_clip_rect_window(c, x, y, w, h); }'));
+  check('the no-Skia build has a stub (the example then self-skips)',
+    pre.includes('static inline void as_skia_canvas_clip_rect_window(void* c, double x, double y, double w, double h) { (void)c; (void)x; (void)y; (void)w; (void)h; }'));
+  // The plain entry point keeps its (half-UP, no-AA) behavior for its other callers
+  // -- TextField boxes, baked ShapeBounds, text-line windows.
+  check('plain clip_rect is untouched (still the non-AA rect overload)',
+    /void sk_canvas_clip_rect\(void\* canvas, double x, double y, double w, double h\) \{\n  \(\(SkCanvas\*\)canvas\)->clipRect\(\n      SkRect::MakeXYWH\(\(SkScalar\)x, \(SkScalar\)y, \(SkScalar\)w, \(SkScalar\)h\)\);/.test(glue));
+
+  // ---- the example carries the measured table ----
+  const ex = readFileSync(join(root, 'examples', 'scrollrect-round.as'), 'utf8');
+  check('the example pins the measured width table',
+    ex.includes('var WS:Array = [100, 100.1, 100.25, 100.5, 100.9, 101, 101.5, 119.5, 120, 120.5, 121, 121.5, 122.5, 123.5];'));
+  check('the example pins the object-space rounding under scale 2',
+    ex.includes('scaledCase(100.5, 2, 200);') && ex.includes('scaledCase(101.5, 2, 204);'));
+  check('the example pins the fractional-origin coverage',
+    ex.includes('fracCase(20.5, 20, 120);') && ex.includes('fracCase(20.75, 20, 120);'));
+  // The expectation must be computed by the measured rule, not by Math.round.
+  check('evenRound implements ties-to-even rather than reusing Math.round',
+    ex.includes('if (v - f == 0.5) {') && ex.includes('return (fi % 2 == 0) ? fi : fi + 1;'));
+
+  return bad;
+}
+registerGroup('unit: render/ScrollRectWindowRounding', checkScrollRectWindowRounding);

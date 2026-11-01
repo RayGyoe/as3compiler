@@ -179,6 +179,58 @@ generations (MRT, instancing, the `iid` register, `fragment output index`).
 > vs `out-aot.txt`, all five lines including `nrm-xyz-masked = 0xFF99CC00`); and each of the three targets really
 > compiles — Metal 2/2 (`temp/metalshader/nrm*.msl` through `xcrun metal`), WebGL 2/2 (`glslcheck3.html` doing a
 > real `compileShader`), HLSL pinned by text only (no `fxc` on this machine).
+>
+> ④ **A source operand that IS the destination must be snapshotted before a write-mask is expanded per component**
+> (stage 346). One AGAL instruction **reads every source operand before it writes the destination**, but the
+> emitter expands a write mask into one statement per component (x before y before z). So
+> `mul ft1.xyz, ft0.xyz, ft1.xxxx` used to become `ft1.x = ft0.x * ft1.x; ft1.y = ft0.y * ft1.x(the NEW x); ...`
+> — the whole vector scaled by its own x. The fix emits a **whole-register** snapshot first
+> (`float4 as_agal_s0 = ft1;`, `agal_snap_src`) and rebinds that operand at **every** use site
+> (`agal_src_expr_named` — the whole-vector arms `crs`/`dp3`/`dp4`/`nrm` need rebinding too, not just the
+> per-component ones). `m33/m34/m44` emit one statement per row and every row reads `s1`, so they take the same
+> snapshot. `agal_mask_clobber` narrows the condition to "same register as the destination **and** the swizzle
+> reads a component this instruction has already written" (read index `r < c` with `r` inside the write mask),
+> so the common self-read form `mul ft0.xyz, ft0.xyz, ft1.x` emits unchanged text. The snapshot counter resets per
+> body, keeping the emitted shader text deterministic (the unit pin relies on it).
+>
+> **The bug was exposed by asaot3d's environment-map look**: a mirror-metal sphere sampling a cube environment
+> rendered every texel whose red channel was 0 (the green/blue faces) black under AOT while `adl` was correct —
+> `adl` executes **real AGAL** and never goes through this emitter. All three targets (MSL/GLSL/HLSL) share
+> `agal_emit_body`, so the web target was affected as well; `adl` never was, which is why the "AIR right, AOT
+> wrong" divergence showed up first in environment reflections (the PBR `radiance * (1-r4)` term is exactly this
+> `mul ft8.xyz, ft7.xyz, ft8.xxxx` shape). The diagnostic is `asaot3d/apps/cubeface-m25` (six flat-colour cube
+> faces plus a mirror sphere: `+X` grey, `-X` green, `+Y` blue, `-Y` white, `+Z` red, `-Z` black); the criterion
+> is whether **all six** reach the screen.
+> Acceptance: `examples/stage346.as` (8 translation-text assertions plus a Metal pixel of 0x00FF00, honestly
+> skipped when the readback is unavailable) + the `unit: stage3d/agal-write-mask-alias` group (7 pins).
+>
+> (5) **An offscreen target cleared with no draw at all must still be cleared** (stage 347). The Metal backend
+> defers `clear()`: it only records the colour/depth/stencil values plus a "pending" flag, and the actual clear
+> rides on the `loadAction` of the **next `drawTriangles`** pass. That is fine for "clear then draw", and wrong
+> for the shape AIR handles correctly -- **clear then zero draws** (which is exactly the shadow prepass when a
+> `castShadow` light has no `castShadow` mesh): the texture keeps the undefined contents of a fresh private
+> opaque texture (zeros on this driver), the packed 8-bit depth decodes as `0.0` = "nearer than any fragment",
+> and the whole shadow frustum is judged occluded. adl's clear is independent of draws, so an empty pass still
+> lands (depth `1.0` = farthest) and nothing is shadowed. The fix is `s3d_apply_pending_clear()`: **consume**
+> the three clear flags first (no early return may leak a pending clear into an unrelated later pass), then emit
+> a zero-draw render pass (each face driven by its own flag; offscreen uses `renderOverride` + `rtDepthStencil`,
+> an MSAA on-screen pass goes through multisample + `resolveTexture` and clears `msaaResolvePending`). Two call
+> sites: `s3d_set_render_target()` when the target changes and `s3d_flush_impl()` when an offscreen target is
+> still bound at frame end, both in the same command buffer so submission order gives "clear, then sample".
+> The on-screen target is deliberately NOT injected at flush: that is existing behaviour with no measured
+> difference, so the change stays narrow. Acceptance: `examples/stage347.as` (clear white + zero draws + the
+> sample must read back `0xFFFFFF`, `0x000000` before the fix) + the `unit: stage3d/pending-clear-no-draw`
+> group (7 pins); end to end, `asaot3d/apps/walk-m26` ground `34.6` on AOT against `32.1` on adl (`11.8` vs
+> `31.8` before the fix).
+>
+> (6) **AGAL's `exp` / `log` are base 2** (stage 348). Measured on `adl 51.4.1`: `exp(-1)` = `0.498` = `2^-1`
+> and `log(2)` = `1.0` = `log2(2)`, value for value identical on AOT -- the translator already emits
+> `exp2`/`log2`, and what this rule protects is the **consumer**: nothing may assume a natural exponent.
+> asaot3d's `AGALRenderer` did, folding EnvBRDFApprox's `-9.28` into `-9.28 * ln2 = -6.4324` and leaving a
+> `log2(e)` factor out of FogExp2. **Both runtimes were wrong the same way**, so AOT/AIR comparison could never
+> show it -- only the three.js reference value could. Acceptance: `examples/stage348.as` (discriminators
+> `127/16/255/149` where a natural exponent gives `94/4/177/103`) + the `unit: stage3d/agal-exp-log-base2`
+> group (5 pins).
 
 ---
 
@@ -655,6 +707,106 @@ numbers were taken while both sides were in one TU / on one queue, which hid it)
 `-Wl,-exported_symbol,_sk_mtl_shared_queue` (`-Wl,--export-dynamic` for ELF) for every build that links the Metal
 glue, and the `build/ExportDynamic` pins hold both halves: that the switch appears *only* there (a headless Stage3D
 build has no symbol to export, and naming it fails the link), and that both link paths carry it.
+
+### 9.14 Texture size ceilings and `Context3D.ignoreResourceLimits` (stage two-hundred-twenty-seven, flag semantics corrected in stage three-hundred-fifty-one)
+
+AIR's size validation is **three rules, in an observable order**: `#3681` zero → `#3682` not a power of
+two → `#3683`/`#3705`/`#3766` over the ceiling. All `ArgumentError`, all before allocation. Ceilings
+(measured with adl 51.4.1): `createTexture` 2048 / 4096 depending on profile; `createCubeTexture` **1024 at
+every rung**; `createRectangleTexture` 2048 / 4096 **and never below the backbuffer**, with no
+power-of-two rule (4097 answers `#3766`, not `#3682`). The ceiling and the `profile` read-back come from
+the same `as_s3d_max_texture_size()` query, so the promise and the enforcement cannot drift.
+
+One deliberate cross-target difference: **our no-backend path is not AIR's `software` mode.** AIR's
+`requestContext3D("software", p)` only hands out a context when `p == "baseline"` and that context is
+locked to baseline (4096 answers `#3683`, `rgbaHalfFloat` answers `#3759`); our pure-C state machine
+reports `baselineExtended` and validates against 4096, because a texture there is CPU state that costs
+no VRAM. It is not silent (`driverInfo` says `"Software (state machine)"`) and is registered as
+enhancement E17.
+
+**What the flag actually does (measured at baseline / baselineExtended / enhanced, all identical):**
+zero size and power-of-two are unaffected; the ceiling itself is **not lifted** — after the bypass AIR
+still enforces 2048/4096 and merely changes the error from `#3683` (`ArgumentError`) to `#3684` (`Error`),
+because the app now sees a real, failed allocation. Only `RectangleTexture` goes further, because there
+the ceiling was derived from the backbuffer rather than the profile. Early versions of this project read
+"ignore the profile's soft limits" as "raise the ceiling to the device maximum (16384)" and allowed
+`createTexture(16384, 16384)`; **that was a misreading** and it has been removed: `as_tex_check_2d`'s
+flag-on arm compares against `as_tex_ceiling()`, exactly like the flag-off arm. Cube maps stay at 1024
+(only `#3705` → `#3684`).
+
+**VRAM pre-check.** `#3684` on AIR is a genuine allocation failure, not a computable total (measured: with
+the flag on, 4096 lazy 1024x1024 textures — 16 GiB in total — all succeed). So we do not accumulate a
+total; we do two things per single allocation: `as_tex_check_budget` estimates `w*h*bpp*4/3` (blocks for
+compressed formats) against `as_s3d_max_texture_memory()` — Metal answers with
+`recommendedMaxWorkingSetSize`, D3D12 with `QueryVideoMemoryInfo(LOCAL).Budget - CurrentUsage`, WebGL2
+falls back to a conservative 1 GiB and the CPU-only build reports 1e12 (i.e. never refuses); and
+`as_tex_alloc_failed` translates a `NULL` from the backend into `#3684` at the create site and at the three
+upload entry points, guarded by `as_s3d_has_backend()`.
+
+**Acceptance**: `examples/tex-format.as` (40 assertions) and the `stage3d/texture-size-limits` /
+`stage3d/texture-formats` unit groups.
+
+### 9.15 Upload bounds: **throw when short**, never "copy what fits" (stage three-hundred-twenty)
+
+`VertexBuffer3D`/`IndexBuffer3D`/`Texture`/`RectangleTexture` uploads validate `start + count` against the
+destination capacity and the source length *before* touching memory, and answer AIR's `RangeError` /
+`ArgumentError` numbers rather than silently truncating (the old behaviour also wrote **before** the buffer
+for a negative `startVertex`, i.e. an out-of-bounds write). Pinned by `examples/s3d-upload-bounds.as` and
+`stage3d/upload-bounds` (24 structural nails, because the same rule is implemented six times in `emit.ts`
+and the example cannot reach every one). Twelve mutations were used to prove the nails bite.
+
+**Not done, stated loudly**: `CubeTexture.uploadFromByteArray` is still `as_shell_unsupported` (all six
+faces must arrive at once and `createCubeTexture` hands out no `ctx` handle); a `level > 0` upload that
+arrives before the lazy GPU handle exists is skipped — AIR has no such state because its texture exists
+from creation, so this is an internal property of our lazy handle and is commented as such.
+
+### 9.16 The six `Context3DTextureFormat` values: constants, profile gating, byte layout, upload decoding (stage three-hundred-fifty-one)
+
+**Four constant values were wrong.** `BGR_PACKED` must be `"bgrPacked565"` (was `"bgrPacked"`),
+`BGRA_PACKED` must be `"bgraPacked4444"` (was `"bgraPacked"`), `RGBA_HALF_FLOAT` must exist as
+`"rgbaHalfFloat"` (was missing), and **`RGBA` does not exist at all** in AIR — `"rgba"` answers
+`ArgumentError #2008`. `RGBA` is the dangerous one: under mxmlc it is a compile error, while here it used
+to compile and fail later at `createTexture` with an unrelated message.
+
+**Profile gating.** `rgbaHalfFloat` is accepted from `standard` up (`baseline`/`baselineExtended` answer `#3759`).
+The order is **format → size → per-format rules**, so `#3759` comes *after* the size rules — measured
+one by one on baseline (`temp/texfmt/Gate.as`): `half 0x0` → `#3681`, `half 3x3` → `#3682`,
+`half 8192` → `#3683`, and only a legal-size `half 2x2` reaches `#3759`. "This profile does not
+support that format" is not asked until the size is legal. We gate it behind the compile switch
+`ASC_S3D_HALF_TEXTURES` (off by default) and **share that switch with the `profile` read-back**: when it
+is on, `profile` reports `"standard"`. The advertised rung and the accepted formats therefore cannot
+disagree.
+
+**Create-time order (all measured)**: invalid format `#2008` (so `0x0` + `"rgba"` is `#2008`, not `#3681`)
+→ zero size `#3681` → not a power of two `#3682` (2D and half; not rect; not when the flag is on) →
+over ceiling `#3683` → compressed smaller than 4x4 `#3745` (but `#3682` wins if it is also not a power of
+two: 3x3 compressed is `#3682`) → `#3746` when a compressed texture is made a render target.
+
+**Upload length is `texels × bytes-per-texel`** (blocks for compressed), short is `RangeError #3669`,
+extra bytes are ignored: `bgra` 4 / `bgrPacked565` 2 / `bgraPacked4444` 2 / `rgbaHalfFloat` 8 /
+`compressed` 8 per block / `compressedAlpha` 16 per block. 565 expands with **rounding**
+(`(v*255+15)/31`, so `B=24` → 197, not the bit-replication 198); 4444 expands with `×17`; half is four
+little-endian halves. Compressed payloads are decoded to BGRA8 with the ATF block decoder, because this
+backend only binds BGRA8 surfaces. Half takes a dedicated 16-bit seam
+(`as_tex_half_from_byte_array` + `as_s3d_texture_from_pixels_half`, `RGBA16Float`/`RGBA16F`) — narrowing
+to 8 bits would destroy the range that is the format's reason to exist — and `uploadFromBitmapData` keeps
+it: the 8-bit source is converted with `as_tex_half_from_argb` (AIR accepts that call and samples it
+byte-identically to BGRA, measured).
+
+**Read-back is not quantised.** Clearing `0.5` into a `bgrPacked565`/`bgraPacked4444` render target reads
+back as `808080`, not `848484`/`888888`: the GPU never holds 565/4444, the format only drives upload
+decoding, so we never try to reproduce quantisation on the way out.
+
+**A half-float render target needs its own PSO.** Metal and D3D12 bake the color-attachment format into
+the pipeline object, so an `RGBA16F` target with a `BGRA8` pipeline is dropped without an error (black
+frame). `stage3d_glue.mm` gained `S3DBlendVariant.isHalf` and `s3d_make_pso(..., isHalf)` plus
+`s3d_target_is_half()` in the cache key; `stage3d_d3d.cc` keys on `rtfHalf` and sets
+`RTVFormats[0] = R16G16B16A16_FLOAT`; WebGL2 has no such constraint (the FBO attachment follows the
+texture) and only needs `s3d_readback_half`. All three backends export the same three seams:
+`s3d_create_render_texture_fmt`, `s3d_texture_from_pixels_half`, `s3d_max_texture_memory`.
+
+**Acceptance**: `examples/tex-format.as` (40 assertions) and `stage3d/texture-formats` (17 source-level
+nails, including "the `profile` read-back and the `#3759` gate use the same switch").
 
 ## 10. The Windows / Direct3D 12 Backend (landed, stage one-hundred-thirty-two)
 

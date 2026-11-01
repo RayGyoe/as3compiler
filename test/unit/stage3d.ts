@@ -531,6 +531,57 @@ function checkStage3dAgalTempWrites(): string[] {
 
 registerGroup('stage3d/agal-temp-writes', checkStage3dAgalTempWrites);
 
+// Writing the destination one component at a time is only safe when no source
+// operand aliases it. AGAL reads ALL sources before writing the destination, so
+// 'mul ft1.xyz, ft0.xyz, ft1.xxxx' must scale by the OLD ft1.x; the per-component
+// expansion would otherwise feed the freshly written ft1.x into y and z.
+//
+// This was not a theoretical hole: the mirror-metal environment sphere in
+// asaot3d (apps/cubeface-m25) rendered every cube texel as (r*r, g*r, b*r) under
+// AOT -- green/blue faces came out black -- while adl was correct, because adl
+// executes real AGAL and never goes through this emitter. It reaches MSL, GLSL
+// and HLSL alike, since all three share agal_emit_body.
+function checkStage3dAgalWriteMaskAlias(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const bodyOf = (sig: string): string => {
+    const i = runtime.indexOf(sig);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(runtime.slice(i));
+    return m == null ? '' : runtime.slice(i, i + m.index);
+  };
+  const body = bodyOf('static void agal_emit_body(');
+
+  check('a clobber test decides when a source alias actually matters',
+    /static int agal_mask_clobber\(unsigned swz, int dmask\)/.test(runtime)
+    && /if \(r < \(unsigned\)c && \(dmask & \(1u << r\)\)\) return 1;/.test(runtime));
+  check('the snapshot copies the whole register before the write-mask expansion',
+    /static void agal_snap_src\(as_json_buf\* b, const char\* v4, char\* tmp, int\* seq, const char\* name\)/.test(runtime)
+    && /sprintf\(tmp, "as_agal_s%d", \(\*seq\)\+\+\)/.test(runtime));
+  check('the copy uses the target-specific vec4 spelling (GLSL target 1)',
+    /const char\* v4 = target == 1 \? "vec4" : "float4";/.test(body)
+    && /agal_snap_src\(b, v4, snap, &snap_seq, s1b\)/.test(body));
+  check('both source operands are snapshotted, before the per-component loop',
+    /strcpy\(s1b, snap\); agal_src_expr_named\(s1, snap, w1\);/.test(body)
+    && /strcpy\(s2b, snap\); agal_src_expr_named\(s2, snap, w2\);/.test(body)
+    && body.indexOf('agal_snap_src(b, v4, snap, &snap_seq, s2b)') < body.indexOf('for (int c = 0; c < 4; c++) {'));
+  check('the full-vector arms (crs/dp3/dp4/nrm) are rebound too, not just the swizzled ones',
+    /static void agal_src_expr_named\(char\* out, const char\* reg, unsigned swz\)/.test(runtime));
+  check('the matrix path snapshots its vector operand (rows are written one per statement)',
+    /if \(dname\[0\] && hasSrc1 && strcmp\(s1b, dname\) == 0\) \{\s*char snap\[40\];\s*agal_snap_src/.test(body));
+  check('snapshot names reset per body so the emitted text stays deterministic',
+    /int snap_seq = 0;/.test(body) && /snap_seq/.test(runtime));
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/agal-write-mask-alias', checkStage3dAgalWriteMaskAlias);
+
 // Flush policy: the frame boundary commits WITHOUT waiting, the CPU-readback
 // paths wait.
 //
@@ -1105,7 +1156,10 @@ function checkStage3dD3dGlue(): string[] {
   const pso = bodyOfIn(d3d, 'static ID3D12PipelineState* s3d_select_pso(');
   check('the PSO key carries the blend FACTOR PAIR, not just "is blending on"',
     pso !== ''
-    && /\|\%d\|\%s\|\%s\|\%x"/.test(pso)
+    // ... and the target's pixel format, which a later stage added as another field:
+    // Metal/D3D12 bake the color-attachment format into the pipeline object, so it
+    // belongs in the key exactly like the blend pair does.
+    && /\|\%d\|\%s\|\%s\|\%x\|\%d"/.test(pso)
     && /\(int\)\(c->blendSource != NULL \|\| c->blendDest != NULL\),/.test(pso)
     && /c->blendSource \? c->blendSource : ""/.test(pso)
     && /c->blendDest \? c->blendDest : ""/.test(pso));
@@ -1355,13 +1409,18 @@ function checkStage3dTextureLimits(): string[] {
     && body2d.indexOf('ctx->ignoreResourceLimits') > iPow
     && bodyRect.indexOf('ctx->ignoreResourceLimits') > 0);
 
-  // 8. With the flag set, the ceiling comes from the DEVICE query, not the profile
-  //    ceiling: AIR's own post-bypass limit is still the profile ceiling, which is the
-  //    one documented divergence and the reason the switch exists at all.
-  const ignore2d = body2d.slice(body2d.indexOf('if (ctx != NULL && ctx->ignoreResourceLimits)'),
-    body2d.indexOf('int m = as_tex_ceiling();'));
-  check('flag-on 2D ceiling uses the device maximum',
-    ignore2d.includes('int d = as_s3d_max_texture_size();') && ignore2d.includes('as_tex_alloc_failed();'));
+  // 8. With the flag set the CEILING does not move: AIR keeps enforcing the profile's
+  //    2048/4096 after the bypass and only changes the error (#3683 -> #3684), measured
+  //    at both rungs (temp/adlprof PROBE_MODE=ign). So the flag-on arm must compare
+  //    against as_tex_ceiling(), NOT against as_s3d_max_texture_size(): allocating a
+  //    16384x16384 "because the limit was lifted" would be more permissive than AIR on
+  //    exactly the input its documentation warns about.
+  const iFlag = body2d.indexOf('if (ctx != NULL && ctx->ignoreResourceLimits)');
+  const ignore2d = body2d.slice(iFlag, body2d.indexOf('return;', iFlag));
+  check('flag-on 2D ceiling stays the profile ceiling, only the error type changes',
+    iFlag > 0 && ignore2d.includes('int m = as_tex_ceiling();')
+    && ignore2d.includes('as_tex_alloc_failed();')
+    && !ignore2d.includes('as_s3d_max_texture_size()'));
 
   // 9. #3684 is an Error (not an ArgumentError) with AIR's verbatim text, and it is
   //    the answer from all three validators once the flag is on.
@@ -1521,9 +1580,13 @@ function checkStage3dUploadBounds(): string[] {
     && !texHelper.includes('Error #2004'));
   // 目标字指针必须能安全解引用：非 4 字节对齐的偏移走逐字节装配（IB 实测接受 off=1，
   // 纹理同理），否则 uint32_t* 解引用是 UB。
+  // 阶段三百五十一 把这一支拆成了 per-format 解码（565 四舍五入、4444 ×17、DXT），
+  // 但 bgra 的原地快路径仍在，且仍带同样的两条守卫。
   check('the in-place texel fast path is guarded by alignment and host byte order',
-    texHelper.includes('if ((off & 3u) == 0u && as_host_little() && strcmp(format, "bgra") == 0) return (const uint32_t*)src;')
-    && texHelper.includes('unsigned r = isbgra ? b2 : b0, b = isbgra ? b0 : b2;'));
+    texHelper.includes('if (strcmp(format, "bgra") == 0) {')
+    && texHelper.includes('if ((off & 3u) == 0u && as_host_little()) return (const uint32_t*)src;')
+    && texHelper.includes('unsigned b0 = src[i*4], b1 = src[i*4+1], b2 = src[i*4+2], b3 = src[i*4+3];')
+    && texHelper.includes('out[i] = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;'));
 
   // 7. data.endian 被刻意忽略：参考文档要求小端 ByteArray，adl 却接受 bigEndian 且
   //    按小端读 —— 尊重该标志会字节翻转 AIR 原样透传的数据。
@@ -1537,3 +1600,194 @@ function checkStage3dUploadBounds(): string[] {
 
 registerGroup('stage3d/upload-bounds', checkStage3dUploadBounds);
 
+
+// clear() is not immediate in the Metal backend: it is recorded and attached as
+// the loadAction of the NEXT draw's render pass. That is invisible for the
+// ordinary "clear then draw" shape, but AIR also honours a clear that no draw
+// follows -- and the shadow prepass is exactly that shape whenever the scene has
+// a castShadow light and no castShadow mesh.
+//
+// Measured on asaot3d/apps/shadow-m13 (identical sources): the shadow map stayed
+// at a fresh private texture's zeros, the packed [0,1] depth decoded as 0.0 =
+// "nearer than any fragment", and the whole shadow frustum was judged occluded.
+// Ground 11.8/255 on AOT against 31.8/255 on AIR for the same frame. Clearing to
+// depth 1 (farthest) is what makes "nothing cast" mean "no shadow"; examples/
+// stage347.as pins the behaviour end to end on a GPU, this pins the seam.
+function checkStage3dPendingClear(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const glue = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+  const bodyOf = (sig: string): string => {
+    const i = glue.indexOf(sig);
+    if (i < 0) return '';
+    const m = /\r?\n\}\r?\n/.exec(glue.slice(i));
+    return m == null ? '' : glue.slice(i, i + m.index);
+  };
+  const body = bodyOf('static void s3d_apply_pending_clear(S3DContext* c) {');
+
+  check('a zero-draw pass exists for a clear that no draw consumes', body !== '');
+  check('the flags are consumed before any early return (no leak into a later pass)',
+    /c->clearPending = 0; c->clearColor = 0; c->clearDepth = 0; c->clearStencil = 0;/.test(body)
+    && body.indexOf('c->clearPending = 0;') < body.indexOf('if (c->queue == nil) return;'));
+  check('all three faces are driven by their own flag',
+    /loadAction = wantColor \? MTLLoadActionClear : MTLLoadActionLoad/.test(body)
+    && /loadAction = wantDepth \? MTLLoadActionClear : MTLLoadActionLoad/.test(body)
+    && /loadAction = wantStencil \? MTLLoadActionClear : MTLLoadActionLoad/.test(body));
+  check('an offscreen target and its own depth/stencil are the ones cleared',
+    /c->renderOverride != nil \? c->renderOverride : c->target/.test(body)
+    && /\(c->renderOverride != nil\) \? c->rtDepthStencil/.test(body));
+  check('a multisampled on-screen pass resolves, or the visible surface keeps nothing',
+    /MTLStoreActionMultisampleResolve/.test(body) && /c->msaaResolvePending = 0;/.test(body));
+  check('it is flushed when the render target changes (before the next pass binds it)',
+    /if \(\(id<MTLTexture>\)tex != c->renderOverride\) s3d_apply_pending_clear\(c\);/.test(glue));
+  check('it is flushed at frame end for an offscreen target still bound',
+    /if \(c->renderOverride != nil\) s3d_apply_pending_clear\(c\);/.test(glue));
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/pending-clear-no-draw', checkStage3dPendingClear);
+
+// AGAL's `exp` and `log` are BASE 2, i.e. 2^x and log2(x) -- not the natural
+// pair. Measured on adl 51.4.1 (temp/agalprobe/Exp.as, same source on adl and on
+// the AOT build): exp(-1) reads back 0x7F = 0.498 = 2^-1 and log(2) reads back
+// 0xFF = 1.0 = log2(2), on BOTH runtimes.
+//
+// That equality is why the mistake could hide: asaot3d's AGALRenderer folded a
+// base change into its EnvBRDF constant (-9.28 * ln2 = -6.4324) and left a
+// log2(e) factor out of FogExp2, and because both backends run the same AGAL the
+// error was invisible in AOT/AIR comparison -- it only showed against three.js.
+// The translator already emits exp2/log2; this group keeps it that way.
+function checkStage3dAgalExpLogBase2(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+
+  check('the opcode table still puts log at 0x0c and exp at 0x0d',
+    /"mov","add","sub","mul","div","rcp","min","max","frc","sqt","rsq","pow","log","exp"/.test(runtime));
+  check('the full-vector arm emits log2/exp2',
+    /else if \(op == 0x0c\) sprintf\(rhs, "log2\(%s\)"/.test(runtime)
+    && /else if \(op == 0x0d\) sprintf\(rhs, "exp2\(%s\)"/.test(runtime));
+  check('the swizzled arm emits log2/exp2',
+    /else if \(op == 0x0c\) sprintf\(rhs, "log2\(%s\.%c\)"/.test(runtime)
+    && /else if \(op == 0x0d\) sprintf\(rhs, "exp2\(%s\.%c\)"/.test(runtime));
+  check('neither opcode falls through to a natural exp/log spelling',
+    !/sprintf\(rhs, "exp\(/.test(runtime) && !/sprintf\(rhs, "log\(/.test(runtime));
+
+  // The example is the end-to-end half: 0.5, 0.0625, 1.0 and log2(1.5)=0.585
+  // land on 127, 16, 255 and 149 of 255, far from the natural-exp answers
+  // (94, 4, 177, 103).
+  const ex = join(root, 'examples', 'stage348.as');
+  let src = '';
+  try { src = readFileSync(ex, 'utf8'); } catch { /* reported by the check below */ }
+  check('examples/stage348.as pins the four discriminator values',
+    src !== '' && /near8\(e1, 127\)/.test(src) && /near8\(e4, 16\)/.test(src)
+    && /near8\(l2, 255\)/.test(src) && /near8\(l15, 149\)/.test(src));
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/agal-exp-log-base2', checkStage3dAgalExpLogBase2);
+
+// The six Context3DTextureFormat constants and the per-format rules (stage 348).
+//
+// A constant TABLE is the kind of thing no example can catch on its own: an app
+// reads `Context3DTextureFormat.BGR_PACKED`, hands the string to createTexture and
+// the resulting byte-per-texel stride silently changes. Ours had four deviations
+// from AIR 51.4.1 -- a missing RGBA_HALF_FLOAT, an invented RGBA ("rgba", which
+// AIR rejects with #2008), and BGR_PACKED/BGRA_PACKED missing their trailing
+// 565/4444 -- all measured in temp/texfmt/README.md §1.
+function checkStage3dTextureFormats(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const symbols = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const emitted = emittedLines();
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const metal = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+  const d3d = readFileSync(join(root, 'vendor', 'stage3d_d3d.cc'), 'utf8');
+  const gl = readFileSync(join(root, 'vendor', 'stage3d_webgl.cc'), 'utf8');
+
+  // 1. The table itself: exactly six constants, AIR's exact string values.
+  const table = /constClass\('Context3DTextureFormat', \{([^}]*)\}\)/.exec(symbols)?.[1] ?? '';
+  check('Context3DTextureFormat is the six AIR constants with AIR values',
+    table.includes("BGRA: 'bgra'") && table.includes("BGR_PACKED: 'bgrPacked565'")
+    && table.includes("BGRA_PACKED: 'bgraPacked4444'") && table.includes("COMPRESSED: 'compressed'")
+    && table.includes("COMPRESSED_ALPHA: 'compressedAlpha'") && table.includes("RGBA_HALF_FLOAT: 'rgbaHalfFloat'"));
+  check('there is no RGBA constant (AIR rejects the format string "rgba" with #2008)',
+    !/\bRGBA:/.test(table));
+  check('the known-format table rejects a bare "rgba"',
+    /strcmp\(f, "bgra"\) == 0/.test(emitted) && !/strcmp\(f, "rgba"\) == 0/.test(emitted));
+
+  // 2. Check ORDER, which is observable: format -> size -> per-format rules. A
+  //    0x0 request with an unknown format reports #2008, not #3681, and a gated
+  //    format (rgbaHalfFloat on baseline) is not asked about until the SIZE is legal
+  //    -- measured, temp/texfmt/Gate.as: half 0x0 -> #3681, half 3x3 -> #3682,
+  //    half 8192 -> #3683, only half 2x2 -> #3759.
+  const create = emitted.slice(emitted.indexOf('Texture* Context3D_createTexture('));
+  check('createTexture validates the format before the size',
+    create.indexOf('as_tex_check_known_format(format);') >= 0
+    && create.indexOf('as_tex_check_known_format(format);') < create.indexOf('as_tex_check_2d(ctx, width, height);'));
+  check('createTexture runs the per-format rules after the size checks',
+    create.indexOf('as_tex_check_2d(ctx, width, height);') < create.indexOf('as_tex_check_format_rules(format, width, height);'));
+  check('the compressed minimum is #3745 with AIR\'s text',
+    /Error #3745: Compressed texture size is too small\. The minimum size for compressed textures is 4x4\./.test(emitted));
+  check('a profile-rejected format is #3759 with AIR\'s text',
+    /Error #3759: The selected texture format is not valid in this profile\./.test(emitted));
+
+  // 3. The profile claim and the #3759 gate must read ONE switch, or the app can
+  //    create a format the profile it was told about does not allow.
+  check('the profile getter and the half-float gate share as_s3d_profile_standard',
+    /if \(as_s3d_profile_standard\(\)\) return \(char\*\)"standard";/.test(emitted)
+    && /as_tex_fmt_half\(format\) && !as_s3d_profile_standard\(\)/.test(emitted));
+
+  // 4. Half float is a 16-bit channel everywhere, never narrowed on upload.
+  check('rgbaHalfFloat uploads through the 16-bit seam',
+    /as_s3d_texture_from_pixels_half\(o->ctx, o->width, o->height, hp\)/.test(emitted));
+  check('render textures pass the format to the backend',
+    /as_s3d_create_render_texture_fmt\(ctx->gpu, width, height, as_tex_fmt_half\(format\) \? 1 : 0\)/.test(emitted));
+  check('the runtime declares the half upload and render-target seams',
+    /extern void\* s3d_texture_from_pixels_half\(void\* ctx, int width, int height, const void\* rgba\)/.test(runtime)
+    && /extern void\* s3d_create_render_texture_fmt\(void\* ctx, int width, int height, int isHalf\)/.test(runtime));
+
+  // 5. Each backend keeps a half-float surface AND selects its pipeline on it:
+  //    Metal/D3D12 bake the attachment format into the pipeline object, so a
+  //    draw into RGBA16F on a pipeline built for BGRA8 is rejected outright.
+  check('Metal creates RGBA16F surfaces and keys the pipeline on it',
+    /MTLPixelFormatRGBA16Float/.test(metal) && /c->bvars\[i\]\.isHalf == isHalf/.test(metal)
+    && /c->bvars\[idx\]\.isHalf = isHalf;/.test(metal));
+  check('D3D12 uses R16G16B16A16_FLOAT and keys the PSO on the target format',
+    /DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d) && /RTVFormats\[0\] = rtfHalf \? DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d));
+  check('WebGL creates GL_RGBA16F and narrows the readback',
+    /GL_RGBA16F/.test(gl) && /s3d_readback_half/.test(gl));
+  check('every backend exports the same three new entry points',
+    [metal, d3d, gl].every((s) => s.includes('s3d_texture_from_pixels_half')
+      && s.includes('s3d_create_render_texture_fmt') && s.includes('s3d_max_texture_memory')));
+
+  // 6. ignoreResourceLimits does NOT raise a ceiling: AIR keeps enforcing the
+  //    profile's after the bypass and only changes the error (#3683 -> #3684).
+  const check2d = emitted.slice(emitted.indexOf('static void as_tex_check_2d'));
+  const flagArm = check2d.slice(check2d.indexOf('ignoreResourceLimits'), check2d.indexOf('ignoreResourceLimits') + 200);
+  check('the bypass arm still compares against as_tex_ceiling()',
+    /int m = as_tex_ceiling\(\);/.test(flagArm) && /as_tex_alloc_failed\(\);/.test(flagArm));
+  check('a single-allocation byte budget pre-check runs on every create path',
+    (emitted.match(/as_tex_check_budget\(format, (width|size), (height|size)\);/g) ?? []).length >= 2
+    && /if \(need > as_s3d_max_texture_memory\(\)\) as_tex_alloc_failed\(\);/.test(emitted));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/texture-formats', checkStage3dTextureFormats);

@@ -57,6 +57,7 @@
 #include <map>
 #include <string>
 #include <cstring> // strcmp: the AS3 BlendMode name -> SkBlendMode table
+#include <cmath>   // rint: the scrollRect window's ties-to-even quantization
 // E1 (opt-in, native-only): the SVG rasterizer needs the stream adapter and the
 // svg module. Both are guarded by ASC_USE_SVG -- see the forward declarations in
 // the bitmap/image section for why this is an opt-in enhancement.
@@ -763,9 +764,62 @@ void sk_canvas_total_translate(void* canvas, double* tx, double* ty) {
 
 // Intersect the current clip with a rectangle — used by TextField to keep
 // wrapped lines inside the field box when the text is scrolled (stage 44).
+//
+// NOTE the antialias flag: SkCanvas' *rect* clip overload defaults doAntiAlias to
+// FALSE (unlike clipPath), so this snaps the rect to whole device pixels with
+// SkScalarRoundToInt -- round-half-UP. Where a caller needs AIR's scrolling
+// window instead, use sk_canvas_clip_rect_window below.
 void sk_canvas_clip_rect(void* canvas, double x, double y, double w, double h) {
   ((SkCanvas*)canvas)->clipRect(
       SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h));
+}
+
+// The scrolling window of DisplayObject.scrollRect (stage 349).
+//
+// AIR's window is two things at once, both measured pixel-for-pixel on adl 51.4.1
+// (temp/clipround, 24 cases):
+//   1. its WIDTH/HEIGHT are quantized with round-half-to-EVEN, in OBJECT units --
+//      `w` 100.5 -> 100 columns, 101.5 -> 102, 119.5 -> 120, 120.5 -> 120,
+//      121.5 -> 122, 122.5 -> 122, 123.5 -> 124 -- and under a scale-2 parent the
+//      100.5 window still spans exactly 200 device px, i.e. the 100 is an object
+//      coordinate, not a device one. rint() is exactly that rounding (it obeys the
+//      current mode, FE_TONEAREST = ties-to-even), so no hand-written rule here.
+//      Note this is NOT `(int)` truncation (120.5 -> 121 would be half-up) and NOT
+//      the SkScalarRoundToInt half-up that sk_canvas_clip_rect above gets.
+//   2. the window's own edges are ANTIALIASED at the object's (possibly
+//      fractional) device position: an object at x=20.25 paints its first column
+//      at 25% and its last window column at 25%, x=20.5 gives 50%/50%, x=20.75
+//      gives 25%/75%. Whole-pixel objects are unaffected (integer edges need no
+//      coverage), which is why the defect only ever showed up on fractional
+//      layout.
+//
+// Both halves together are indistinguishable from "AIR bakes the window at an
+// integer size and blits it at the object's fractional origin". We implement it as
+// an AA clip of the rounded rect, which is the same picture for opaque content; a
+// translucent subtree straddling a fractional window edge is the one case where
+// per-primitive coverage and a single baked blit differ -- unmeasured, hence
+// noted rather than guessed at.
+void sk_canvas_clip_rect_window(void* canvas, double x, double y, double w, double h) {
+  SkCanvas* c = (SkCanvas*)canvas;
+  SkRect r = SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)rint(w), (SkScalar)rint(h));
+  // Fast path: when the window lands on whole DEVICE pixels, an AA clip buys nothing
+  // -- every edge pixel is 100% or 0% -- and AA clips are markedly more expensive in
+  // Skia (coverage masks instead of a clip rect), which would hit every scrolled list
+  // in an app for no visual change. That is also the shape of the bug's absence:
+  // integer layout never showed the defect. Rotation/skew is not modelled here, so it
+  // takes the AA path (a rotated window's edges are not axis-aligned anyway).
+  const SkMatrix& m = c->getTotalMatrix();
+  bool axis_aligned = m.getSkewX() == 0.0f && m.getSkewY() == 0.0f;
+  if (axis_aligned) {
+    SkRect d;
+    m.mapRect(&d, r);
+    if (d.left() == rintf(d.left()) && d.top() == rintf(d.top()) &&
+        d.right() == rintf(d.right()) && d.bottom() == rintf(d.bottom())) {
+      c->clipRect(r);
+      return;
+    }
+  }
+  c->clipRect(r, SkClipOp::kIntersect, true);
 }
 
 // Clip the canvas to an arbitrary path -- the clipDepth mask of a DefineSprite

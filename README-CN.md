@@ -507,6 +507,8 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/autosize-metrics.as` — `TextField.autoSize` 的大小口径（`wordWrap=true` 只改高度、宽度保持用户值；
   `wordWrap=false` 才 `width = textWidth + 4` 且两向收放；几何读取即刷新）与**未安装字族**回落到平台默认脸的行盒
 - `examples/overflow-clip.as` — **子树裁剪**的编译器契约（阶段三百四十三，G29）：120 宽父盒里的 200 宽子件在 `scrollRect` 与 `mask` 下都只画到第 120 像素，且**整棵子树**（孙件）、跨界描边、`BlurFilter` 外溢、`cacheAsBitmap`、嵌套裁剪、`TextField` 子件一并被裁，50% alpha 的遮罩不削弱内容 —— 十格与 `adl 51.4.1` 逐像素相同（这就是库侧 `overflow: hidden` 的落点）
+- `examples/scrollrect-round.as` — `scrollRect` **窗口尺寸的取整口径**（阶段三百四十九）：`width`/`height` 在**对象坐标**里四舍六入五成双（`100.5→100`、`101.5→102`、`120.5→120`、`123.5→124`，`scaleX=2` 时仍只占 200 设备像素），窗口自己的边按对象的小数设备位置抗锯齿（`x=20.25/20.5/20.75` → 首列 25/50/25%），19 格双端对照
+- `examples/nested-sibling-fn.as` — 同一函数体内**互相调用**的嵌套函数（阶段三百五十）：构造函数里的互递归 `isEven`/`isOdd`、单向调用、三层 `inner→step1→step2` 与方法体同形状，四行输出与 `adl 51.4.1` 逐字符相同（修前构造函数路径的共享 cell 只建结构体不分配 ⇒ 生成的 C 里 `cellN` 未声明，**根本编不过**）
 - `examples/text-underline.as` — `TextFormat.underline` / `htmlText` 的 `<u>` **真的被画出来**（阶段三百四十二，G28）：一条 1 设备像素的横线落在 `floor(2 + ascent + descent/2)`（12px `_typewriter` 即 y=15）、覆盖该范围的整个前进宽度（含行尾空格）、取 run 自己的颜色、**每个视觉行**一条、`leading` 不移动它、`underline=false` 的 run 把线断开、混排行按**行盒**落；且 `textWidth`/`textHeight`/`getLineMetrics` **逐位不受影响**
 - `examples/gettextformat.as` — `TextField.getTextFormat()` 读回该区间**生效的**格式（阶段二百七十，G21）：单 run / gap 用默认格式 / 跨边界与反序答**全 null 空格式** / `#2006` 越界 / `-1` 表示未提供 / 返回**副本**
 - `examples/tf-scale-metrics.as` — 被缩放的 `TextField` 口径：`textWidth`/`textHeight` = 名义 extents 乘**累积 `scaleY / scaleX`**
@@ -563,8 +565,14 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   常量（含 `ENHANCED`）；非法 `renderMode`/`profile` 是**同步** `#2008`（AIR 文案逐字，且 `renderMode` 先于 `profile`
   校验）；回读 `profile` 报本构建真正能兑现的最高档（现为 `"baselineExtended"`），外加 `createTexture`/
   `createCubeTexture`/`createRectangleTexture` 的尺寸校验（`#3681` 零尺寸 → `#3682` 非 2 的幂 → `#3683`/`#3705`/`#3766` 超上限，
-  AIR 文案逐字；对 `adl` 51.4.1 实测）；`Context3D.ignoreResourceLimits`（AIR 50.0+）关时与 AIR 逐字一致、
-  开时放开到**设备上限**（D3D12/Metal 16384），超限改报 `Error #3684`，而 `#3681`/`#3682` 仍照旧。
+  AIR 文案逐字；对 `adl` 51.4.1 实测）；`Context3D.ignoreResourceLimits`（AIR 50.0+）关时与 AIR 逐字一致；**开时上限不动**（`adl` 实测：
+  上限仍是 profile 的 2048/4096，只是超限改报 `Error #3684`，`#3681`/`#3682` 照旧），`#3684` 另有创建点
+  显存预检（`as_tex_check_budget`）与分配失败翻译两条来源。`Context3DTextureFormat` 是 AIR 的**六个**
+  常量（`bgra`/`bgrPacked565`/`bgraPacked4444`/`compressed`/`compressedAlpha`/`rgbaHalfFloat`，**没有** `RGBA`：
+  `"rgba"` 抛 `#2008`），六种格式的上传字节数、565 四舍五入与 4444 ×17 解码、DXT 解码、以及 `rgbaHalfFloat`
+  的 16 位通道（`RGBA16Float` 渲染目标 + 按格式分 PSO）全部落地；`rgbaHalfFloat` 属 `standard` 档（编译开关
+  `ASC_S3D_HALF_TEXTURES`，与 `profile` 回读共用同一开关），默认构建对它报 `#3759`。见
+  `docs/zh-cn/display3d.md` §9.16。
   **未链接 Stage3D 后端的构建**（纯 C 状态机）也报 `"baselineExtended"`：AIR 的 `software` 渲染模式在这里会直接
   异步抛 `#3702`（它锁死在 `baseline`），这是我们刻意保留的差异，登记为增强 E17，见 `docs/zh-cn/display3d.md` §9.14
 - `examples/stage86.as` — `flash.utils` 反射（`getQualifiedClassName`/`getDefinitionByName`/动态实例化）
@@ -574,6 +582,9 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/shmup-stage3d/` — Stage3D 射击 demo（`test/examples.ts` 的 `SKIP_DIRS` 列出，需整层 Stage3D/Context3D 与 `package {}` 支持），macOS（Metal）与 **Windows（Direct3D 12，阶段一百三十二）** 均实机跑通：与 2D 显示列表合成到同一窗口
 - `examples/system-exit.as` — `flash.system.System.exit(code:uint)`（调用点之后的语句仍执行到帧边界、进程状态码即 `code`）；状态码那一半在 `examples/system-exit-status.as`（位于 `SKIP_FILES`，因为示例池要求每个示例 exit 0）+ `test/examples.ts` 的串行用例里断言**真的以 7 退出**（阶段二百四十五）
 - `examples/stage82.as` — Metal 端到端彩色三角形（AGAL→MSL 翻译 + `Context3D` 全链路 + 像素读回）
+- `examples/stage346.as` — AGAL 写掩码展开的**读后写别名**：与目的同寄存器的源操作数必须先快照（`mul ft1.xyz, ft0.xyz, ft1.xxxx` 曾把整个向量乘上自己的 x 分量，环境反射因此「红通道为 0 的贴图全黑」；断言翻译文本含 `as_agal_s0` 快照且三档一致，另有 Metal 像素 `0x00FF00`，阶段三百四十六）
+- `examples/stage347.as` — `clear()` 之后**一个 draw 都没有**的离屏目标也必须真的被清（Metal 后端的 clear 是延迟的，挂在下一次 draw 的渲染通道 `loadAction` 上；零 draw 就永远不清 ⇒ 阴影 prepass 在「有 `castShadow` 灯、无 `castShadow` 网格」时把整片视锥判成遮挡，地面 11.8/255 对 `adl` 31.8/255；断言 16×16 离屏目标清白后零 draw 采样回来仍是 `0xFFFFFF`，阶段三百四十七）
+- `examples/stage348.as` — AGAL 的 `exp`/`log` 是**以 2 为底**（`exp(-1)` = 0.5、`log(2)` = 1.0，`adl` 与 AOT 一致；断言四档判别值 127/16/255/149，自然指数会给出 94/4/177/103 —— 这条钉子存在的理由是「两端同样算错时 AOT/AIR 对比看不见」，阶段三百四十八）
 - `examples/stage81.as` — `Stage3D` + `Context3D` 骨架（`stage3Ds`/`requestContext3D`/状态机 + 常量断言）
 - `examples/stage80.as` — AGAL 字节码内核（MSL/GLSL/**HLSL** 三档翻译、寄存器映射、swizzle/write-mask、比较指令、三档各自的寄存器与内建名断言、非法 opcode 与 `tld` 的响亮拒绝）
 - `examples/stage79.as` — Stage3D 前置几何类（`Vector3D` + `Matrix3D` 运算与 `decompose`/`recompose`）

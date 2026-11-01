@@ -801,7 +801,8 @@ consumed the field). The compiler's job is to measure that contract and nail it 
 
 **How it is implemented** (`src/emit.ts`):
 
-- `scrollRect`: `save` -> `clipRect(0,0,w,h)` -> `translate(-x,-y)` (that order is D29), and that
+- `scrollRect`: `save` -> clip (a window clip from stage 349 on: see the next paragraph) ->
+  `translate(-x,-y)` (that order is D29), and that
   `save`/`restore` pair **brackets `as_render_object_content`** -- so the object's own geometry **and the
   children it recurses into** are inside the clip. That scope is the whole secret of "subtree clipping", and
   `unit: render/OverflowClip` pins exactly it: a version that clipped only the object's own drawing would
@@ -813,11 +814,35 @@ consumed the field). The compiler's job is to measure that contract and nail it 
 - The two compose (a container that is both masked and clipped), each with its own `save`/`restore`.
 - The filter layer sits **inside** the clip, which is why blur/shadow spill is cut (row 5 above).
 
-**A registered sub-pixel residual** (`TODO.md`, `### 遗留待开发`): when a clip edge lands on `.5`, AIR
-rounds **half to even** (`100.5->100`, `120.5->120`, `122.5->122`, `121.5->122`, `123.5->124`) while our
-clip rounds half up (`100.5->101`, `120.5->121`, `122.5->123`) -- so on the half of the `.5` cases whose
-integer part is even we paint **one extra device pixel**. Integer geometry is bit-identical
-(`examples/overflow-clip.as` only uses integers, so it is stable).
+**Sub-pixel window edges: rounding and antialiasing (stage 349, fixed)**. When a window edge lands on `.5`,
+AIR rounds **half to even** (`100.5->100`, `119.5->120`, `120.5->120`, `121.5->122`, `122.5->122`,
+`123.5->124`) while our clip rounded half up (`100.5->101`, `120.5->121`, `122.5->123`) -- so on the half
+of the `.5` cases whose integer part is even we painted **one extra device pixel**. Stage 349 measured the
+whole rule (temp/clipround, 24 pixel-exact cases on both arms) and closed it: **the rounding happens in
+OBJECT space, on `width`/`height` separately (`rint`), and the window's own edges are then antialiased at
+the object's fractional device position** (`x=20.25 / 20.5 / 20.75` give 25 / 50 / 25% first-column
+coverage). Two counter-examples separate the two halves: under a `scaleX=2` parent a `w=100.5` window still
+spans **200** device px (= 2x100), so the quantization is not in device space; and at `x=20.5` the first
+covered column has 50% coverage and does **not** move to 21, so the edge is not snapped to a whole pixel.
+
+Implementation: the `scrollRect` clip now calls `as_skia_canvas_clip_rect_window` (`rint(w)`/`rint(h)` plus
+AA), and **integer-aligned windows keep the original zero-cost non-AA rect clip** (Skia's AA clip goes
+through a coverage mask, which would be a silent per-frame surcharge on every scrolled list for zero visual
+change at integer geometry). The other clip call sites (the `TextField` box, baked `ShapeBounds`, text line
+windows) are **untouched** -- their rounding was not measured here and is not invented.
+
+**Remaining residual (newly registered)**: when the object's own edge **coincides** with the window edge and
+lands on a fractional device position (content exactly filling the window -- the common case), AIR gives
+that column coverage `c` (0.25 / 0.5 / 0.75) while we give `c^2`: Skia's AA clip **multiplies** clip
+coverage by primitive coverage, whereas AIR's window is equivalent to "bake at the integer size, then
+composite once at the fractional origin" (`c`). Column counts and structure are now identical in every
+case; what differs is **one boundary column's alpha**. Removing it needs a per-window bake, so it is
+registered rather than silently approximated.
+
+Nails: `examples/scrollrect-round.as` (14 width cases + 3 height cases + 3 `scaleX=2` cases + 2 fractional
+origin cases; self-skips on pure-C builds) plus `unit: render/ScrollRectWindowRounding` (12 checks: the emit
+site, `rint`, the AA flag, the whole-pixel fast path, the three seam states and the measured table in the
+example).
 
 Nails: `examples/overflow-clip.as` (the ten rows above; skipped on pure-C builds, which have no raster
 backend) plus `unit: render/OverflowClip` (6 scope checks: the clip brackets the content call, the mask

@@ -707,8 +707,8 @@ static int s3d_make_root_sig(S3DContext* c) {
 
 // ---- textures --------------------------------------------------------------
 
-static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int faces,
-                                    int isRT, int isDepth) {
+static S3DTexture* s3d_make_texture_fmt(S3DContext* c, int w, int h, int mips, int faces,
+                                        int isRT, int isDepth, int fmtHalf) {
   if (w <= 0 || h <= 0) return NULL;
   if (mips < 1) mips = 1;
   if (faces != 6) faces = 1;
@@ -721,7 +721,12 @@ static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int f
   t->owner = c;
   t->rtvSlot = -1;
   t->dsvSlot = -1;
-  t->format = isDepth ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM;
+  // fmtHalf selects the RGBA16F surface used by Context3DTextureFormat.RGBA_HALF_FLOAT
+  // (sampler-only and render-target alike). The format is part of the RESOURCE
+  // descriptor -- immutable -- so it cannot be changed after creation; the drawing
+  // side picks it up through the PSO key (s3d_select_pso).
+  t->format = isDepth ? DXGI_FORMAT_D24_UNORM_S8_UINT
+                      : (fmtHalf ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM);
 
   D3D12_RESOURCE_DESC d = {};
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -790,6 +795,13 @@ static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int f
   return t;
 }
 
+// Historic 7-argument form: an 8-bit BGRA surface, which is what every caller
+// except the rgbaHalfFloat paths wants.
+static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int faces,
+                                    int isRT, int isDepth) {
+  return s3d_make_texture_fmt(c, w, h, mips, faces, isRT, isDepth, 0);
+}
+
 // A texture object outlives a shared-device rebuild at the AS3 level. Revive its
 // GPU resource lazily on the next bind/upload; the CPU-side contents are gone, as
 // they are after AIR's context loss, but no call may submit the old resource.
@@ -799,8 +811,9 @@ static int s3d_revive_texture(S3DContext* c, S3DTexture* t) {
   const HRESULT hr = t->res != NULL ? t->res->GetDevice(__uuidof(ID3D12Device), (void**)&owner) : E_FAIL;
   if (owner != NULL) owner->Release();
   if (SUCCEEDED(hr) && owner == c->device) return 1;
-  S3DTexture* fresh = s3d_make_texture(c, t->width, t->height, t->mips, t->faces,
-                                      t->isRT, t->isDepth);
+  S3DTexture* fresh = s3d_make_texture_fmt(c, t->width, t->height, t->mips, t->faces,
+                                          t->isRT, t->isDepth,
+                                          t->format == DXGI_FORMAT_R16G16B16A16_FLOAT);
   if (fresh == NULL) return 0;
   t->res = fresh->res;
   t->owner = c;
@@ -1061,9 +1074,15 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   for (int i = 0; i < S3D_MAX_STREAMS; i++)
     streamSig |= (unsigned)((c->streams[i].components & 7) << (i * 3));
 
+  // The render target's pixel format is baked into the PSO (RTVFormats[0]), so a
+  // draw into an RGBA16F (Context3DTextureFormat.RGBA_HALF_FLOAT) target needs its
+  // own pipeline; D3D12 fails the draw outright on a mismatch.
+  const S3DTexture* tgt = s3d_cur_target(c);
+  const int rtfHalf = (tgt != NULL && tgt->format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 1 : 0;
+
   char sk[S3D_KEY_CAP];
   snprintf(sk, sizeof sk,
-           "%016llx|%x|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s|%d|%s|%s|%x",
+           "%016llx|%x|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s|%d|%s|%s|%x|%d",
            (unsigned long long)(pr ? pr->srcHash : 0),
            s3d_write_mask_bits(c),
            c->depthWrite ? 1 : 0,
@@ -1081,7 +1100,8 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
            (int)(c->blendSource != NULL || c->blendDest != NULL),
            c->blendSource ? c->blendSource : "",
            c->blendDest ? c->blendDest : "",
-           streamSig);
+           streamSig,
+           rtfHalf);
 
   for (int i = 0; i < pr->npso; i++) {
     if (strcmp(pr->pso[i].key, sk) == 0) {
@@ -1199,7 +1219,7 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1;
-  pd.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.RTVFormats[0] = rtfHalf ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
   pd.DSVFormat = dsNeeded ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
   pd.SampleDesc.Count = 1;
   pd.NodeMask = 0;
@@ -1231,6 +1251,8 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
 }
 
 // ---- render target binding -------------------------------------------------
+
+static S3DTexture* s3d_cur_target(S3DContext* c);  // used by s3d_select_pso above
 
 static S3DTexture* s3d_cur_target(S3DContext* c) {
   return c->renderOverride != NULL ? c->renderOverride : c->target;
@@ -1818,6 +1840,97 @@ int s3d_upload_constants(void* ctx, int isFragment, const double* data, int coun
 
 // ---- textures --------------------------------------------------------------
 
+// Same as s3d_upload_region, for an RGBA16F surface: `src` is w*h texels of four
+// half floats (8 bytes per texel) with the SAME channel order as the surface -- no
+// swizzle, unlike the ARGB word the 8-bit path receives.
+static int s3d_upload_region_half(S3DContext* c, S3DTexture* t, int w, int h, const void* src) {
+  if (c == NULL || t == NULL || src == NULL || w <= 0 || h <= 0) return 0;
+  if (!s3d_revive_texture(c, t)) return 0;
+  const UINT rowPitch = s3d_align256((UINT)w * 8u);
+  const UINT bytes = rowPitch * (UINT)h;
+
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC bd = {};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = bytes;
+  bd.Height = 1;
+  bd.DepthOrArraySize = 1;
+  bd.MipLevels = 1;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ID3D12Resource* up = NULL;
+  if (FAILED(c->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                                                __uuidof(ID3D12Resource), (void**)&up)))
+    return 0;
+  void* map = NULL;
+  D3D12_RANGE rr = { 0, 0 };
+  if (FAILED(up->Map(0, &rr, &map)) || map == NULL) { up->Release(); return 0; }
+  for (int j = 0; j < h; j++) {
+    memcpy((uint8_t*)map + (size_t)j * rowPitch,
+           (const uint8_t*)src + (size_t)j * (size_t)w * 8u,
+           (size_t)w * 8u);
+  }
+  up->Unmap(0, NULL);
+
+  if (FAILED(c->upAlloc->Reset())) { up->Release(); return 0; }
+  if (FAILED(c->upList->Reset(c->upAlloc, NULL))) { up->Release(); return 0; }
+  s3d_wait_idle(c);
+  if (t->state != D3D12_RESOURCE_STATE_COPY_DEST) {
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = t->res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = t->state;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    c->upList->ResourceBarrier(1, &b);
+    t->state = D3D12_RESOURCE_STATE_COPY_DEST;
+  }
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = t->res;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+  srcLoc.pResource = up;
+  srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  srcLoc.PlacedFootprint.Footprint.Format = t->format;
+  srcLoc.PlacedFootprint.Offset = 0;
+  srcLoc.PlacedFootprint.Footprint.Width = (UINT)w;
+  srcLoc.PlacedFootprint.Footprint.Height = (UINT)h;
+  srcLoc.PlacedFootprint.Footprint.Depth = 1;
+  srcLoc.PlacedFootprint.Footprint.RowPitch = rowPitch;
+  c->upList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, NULL);
+  {
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = t->res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    c->upList->ResourceBarrier(1, &b);
+    t->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  }
+  const int ok = s3d_run_immediate(c);
+  up->Release();
+  return ok;
+}
+
+// Upload an rgbaHalfFloat texture (Context3DTextureFormat.RGBA_HALF_FLOAT).
+void* s3d_texture_from_pixels_half(void* ctx, int width, int height, const void* rgba) {
+  if (ctx == NULL || width <= 0 || height <= 0 || rgba == NULL) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  S3DTexture* t = s3d_make_texture_fmt(c, width, height, 1, 1, 0, 0, 1);
+  if (t == NULL) return NULL;
+  if (!s3d_upload_region_half(c, t, width, height, rgba)) {
+    s3d_free_texture(c, t);
+    return NULL;
+  }
+  t->hasChain = 0;
+  return (void*)t;
+}
+
+// Upload pixels into a new texture and return its handle
 void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* argb) {
   if (ctx == NULL || width <= 0 || height <= 0 || argb == NULL) return NULL;
   S3DContext* c = (S3DContext*)ctx;
@@ -2530,12 +2643,35 @@ int s3d_max_texture_size(void) { return 16384; }
 // ---- render-to-texture -----------------------------------------------------
 
 void* s3d_create_render_texture(void* ctx, int width, int height) {
+  return s3d_create_render_texture_fmt(ctx, width, height, 0);
+}
+
+// isHalf != 0 allocates an R16G16B16A16_FLOAT render target for
+// Context3DTextureFormat.RGBA_HALF_FLOAT (see s3d_select_pso for the pipeline side).
+void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf) {
   if (ctx == NULL || width <= 0 || height <= 0) return NULL;
   S3DContext* c = (S3DContext*)ctx;
   // A render-target texture is created with ALLOW_RENDER_TARGET and an RTV slot:
   // drawTriangles renders into it while it is the render override, and setTextureAt
   // can later sample it as fsN.
-  return (void*)s3d_make_texture(c, width, height, 1, 1, 1, 0);
+  return (void*)s3d_make_texture_fmt(c, width, height, 1, 1, 1, 0, isHalf ? 1 : 0);
+}
+
+// Bytes of texture this backend will attempt in ONE allocation. D3D12 exposes the
+// real budget through QueryVideoMemoryInfo; the segment for LOCAL (VRAM) memory
+// carries both the budget and the current usage. Falls back to 2 GiB when the query
+// is unavailable, which is above every realistic single texture and still stops a
+// 16384x16384x8 B = 2 GiB half-float request from being attempted.
+double s3d_max_texture_memory(void) {
+  if (s3d_live_n > 0 && s3d_live[0]->device != NULL) {
+    D3D12_QUERY_VIDEO_MEMORY_INFO info = {};
+    s3d_live[0]->device->QueryVideoMemoryInfo(0, D3D12_MEMORY_SEGMENT_GROUP_LOCAL, &info);
+    if (info.Budget > 0) {
+      const UINT64 free = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+      return (double)free;
+    }
+  }
+  return 2147483648.0;
 }
 
 // Bind the render override. tex == NULL restores the back-buffer target.

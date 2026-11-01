@@ -146,6 +146,48 @@ Stage3D 的着色器是 **AGAL（Adobe 图形汇编语言）二进制字节码**
 > 验收：`temp/agalprobe/` 的 **adl 真值与 AOT 输出逐字节相同**（`out.txt` 与 `out-aot.txt` 五行一致，含
 > `nrm-xyz-masked = 0xFF99CC00`）；三档文本各自真编译 —— Metal 2/2 过（`temp/metalshader/nrm*.msl` 走
 > `xcrun metal`）、WebGL 2/2 过（`glslcheck3.html` 真 `compileShader`）、HLSL 只做文本钉（本机无 `fxc`）。
+>
+> ④ **写掩码逐分量展开时，与目的寄存器同名的源操作数必须先快照**（阶段三百四十六）。AGAL 的一条指令是
+> 「**先读全部源操作数，再写目的**」，而翻译器把写掩码展开成逐分量语句（x 在 y 之前、y 在 z 之前）——
+> 于是 `mul ft1.xyz, ft0.xyz, ft1.xxxx` 会发成
+> `ft1.x = ft0.x * ft1.x; ft1.y = ft0.y * ft1.x(刚写进去的新值); ...`，整个向量被乘上自己的 x 分量。
+> 修法是先发一条**整寄存器**快照 `float4 as_agal_s0 = ft1;`（`agal_snap_src`），再把该操作数在**所有**
+> 使用点重绑到快照（`agal_src_expr_named`：`crs`/`dp3`/`dp4`/`nrm` 这些用**整向量**的分支同样要重绑，
+> 只改逐分量那份会漏）；矩阵指令的 `m33/m34/m44` 按行发语句、每行都读 `s1`，命中同一规则一并快照。
+> 判定由 `agal_mask_clobber` 收窄，只在与目的同寄存器**且**该源的 swizzle 读到了「本次已写过的分量」
+> （读下标 `r < c` 且 `r` 在写掩码内）时才快照，故 `mul ft0.xyz, ft0.xyz, ft1.x` 这类自读自写的常见形态
+> 文本不变。快照序号每 body 重置，保证生成的着色器文本确定（单元钉依赖它）。
+>
+> **这条 bug 由 asaot3d 的环境贴图观感差暴露**：镜面金属球采样立方体环境时，红通道为 0 的贴图（绿/蓝面）
+> 在 AOT 上全黑，而 `adl` 正确 —— 因为 `adl` 执行**真 AGAL**，根本不经过这个发射器。三档（MSL/GLSL/HLSL）
+> 共用 `agal_emit_body`，故 web 侧同样受影响；`adl` 侧从来不受影响，这也解释了「AIR 对、AOT 错」的
+> 观感差异为何只在环境反射上最先显形（PBR 的 `radiance * (1-r4)` 正是 `mul ft8.xyz, ft7.xyz, ft8.xxxx`
+> 这个形态）。诊断台是 `asaot3d/apps/cubeface-m25`（六面纯色立方体 + 镜面球，`+X` 灰/`-X` 绿/`+Y` 蓝/
+> `-Y` 白/`+Z` 红/`-Z` 黑），判据是六面是否**全部**上屏。
+> 验收：`examples/stage346.as`（翻译文本 8 条断言 + Metal 像素 0x00FF00，读回不可用时如实 SKIP）+ 单元钉
+> `unit: stage3d/agal-write-mask-alias`（7 条）。
+>
+> ⑤ **`clear()` 之后一个 draw 都没有的离屏目标也必须真的被清**（阶段三百四十七）。Metal 后端的 `clear()`
+> 是**延迟**的：它只记下颜色/深度/模板值与「待清」标志，真正的清屏动作挂在**下一次 `drawTriangles`** 的
+> 渲染通道 `loadAction` 上。这对「清完就画」没有问题，漏掉的是 AIR 会正确处理的那种情形 —— **清完零 draw**
+> （阴影 prepass 在「有 `castShadow` 灯、场景里没有 `castShadow` 网格」时正是这个形状）：贴图停在新分配私有
+> 不透明纹理的**未定义内容**（驱动给全 0），8bit 打包深度解出 `0.0` = 「比任何片元都近」⇒ 整个阴影视锥判为
+> 遮挡。`adl` 的 clear 与 draw 无关，空 pass 照样落到贴图上（深度 `1.0` = 最远）⇒ 它不产生阴影。
+> 修法是 `s3d_apply_pending_clear()`：**先消费**三个 clear 标志（任何提前返回都不能让待清状态泄漏进后续
+> 无关 pass），再发一条零 draw 的渲染通道（三面各按自己的标志决定 `Clear`/`Load`；离屏用 `renderOverride`
+> + `rtDepthStencil`；屏上 MSAA 走 multisample + `resolveTexture` 并清 `msaaResolvePending`），调用点两处：
+> `s3d_set_render_target()` 目标切换时、`s3d_flush_impl()` 帧末离屏目标仍绑定时（同一 command buffer，
+> 靠提交顺序保证「先清、后采样」）。**屏上目标刻意不在 flush 注入** —— 那是既有行为，没量到差异，不扩大改动面。
+> 验收：`examples/stage347.as`（清白 + 零 draw + 采样回来必须是 `0xFFFFFF`，修前 `0x000000`）+ 单元钉
+> `unit: stage3d/pending-clear-no-draw`（7 条）；端到端 `asaot3d/apps/walk-m26` 地面 AOT `34.6` 对 `adl` `32.1`
+> （修前 `11.8` 对 `31.8`）。
+>
+> ⑥ **AGAL 的 `exp` / `log` 是以 2 为底**（阶段三百四十八）。实测 `adl 51.4.1`：`exp(-1)` = `0.498` = `2^-1`、
+> `log(2)` = `1.0` = `log2(2)`，AOT 端逐值相同 —— 翻译器本来就是 `exp2`/`log2`，这条口径的作用是**防止消费方
+> 假设自然指数**。asaot3d 的 `AGALRenderer` 曾据此把 EnvBRDFApprox 的 `-9.28` 折成 `-9.28 * ln2 = -6.4324`
+> 并让 FogExp2 少乘一个 `log2(e)`：**两个后端同样算错**，所以 AOT/AIR 对比永远看不出来，只有对着 three.js
+> 参考值才显形。验收：`examples/stage348.as`（判别值 `127/16/255/149`，自然指数会是 `94/4/177/103`）+ 单元钉
+> `unit: stage3d/agal-exp-log-base2`（5 条）。
 
 ---
 
@@ -586,7 +628,7 @@ Stage3D 构建（链 `stage3d_glue` 而不链 `metal_glue`）会链接失败；�
 可见，钉子 `build/ExportDynamic` 同时钉住"开关只出现在链接了 `metal_glue.mm` 的构建里"（headless
 Stage3D 构建导出未定义符号会**链接失败**）与"两条链接路径都带它"。
 
-### 9.14 纹理尺寸上限与 `Context3D.ignoreResourceLimits`（阶段二百二十七）
+### 9.14 纹理尺寸上限与 `Context3D.ignoreResourceLimits`（阶段二百二十七 落地，**阶段三百五十一 修正旗标语义**）
 
 AIR 的纹理尺寸校验**不是一条规则，而是三条**，顺序也是可观测的：`#3681` 零尺寸 →
 `#3682` 非 2 的幂 → `#3683` / `#3705` / `#3766` 超上限。全部是 `ArgumentError`，全部在
@@ -633,25 +675,40 @@ AGENTS.md §1.5 登记为增强（`TODO.md`「增强待做」与该文件的 E17
 `createTexture(4096,1)` 也报 `#3684`，`enhanced` 下 `8192` 同样报 `#3684`。也就是说这个开关
 在 AIR 上**并没有真正把 2D 纹理放大**，只是把错误从参数错误换成了分配失败。
 
-#### 我们的取舍：默认与 AIR 逐字一致，打开旗标后放到设备上限
+#### 我们的取舍：旗标不抬高上限，只换错误号（与 AIR 逐字一致）
 
-`ignoreResourceLimits = false`（默认）：与 AIR 完全一致，包括三个错误号、文案与判定顺序。
-`= true`：`#3681`/`#3682` 照旧，`#3683`/`#3766` 跳过，**上限改为设备上限**
-（`as_s3d_max_texture_size()`，D3D12/Metal 为 16384）而不是 AIR 的 profile 上限，超出时报
-`Error #3684: Texture creation failed. Internal error.`。这是**唯一的刻意分歧**，且是
-**双重 opt-in**（AIR 合法属性 + 默认关），默认产物仍与 AIR 同构。
+早期实现把旗标当成「上限放到设备上限（16384）」，理由是「AIR 软上限被绕过」的文档措辞。**那是
+误读**：实测（`PROBE_MODE=ign`，baseline / baselineExtended / enhanced 三档一致）显示 AIR 在旁路
+之后**仍然**按 profile 上限（2048 / 4096）判定，只是把报错从 `#3683`（`ArgumentError`）换成
+`#3684`（`Error`）——因为应用现在看到的是一次失败的真实分配。所以：
 
-**cube 刻意不放大**：保持 1024，旗标打开时只把错误号换成 `#3684`（与 AIR 同）。理由是
-16384 的立方体贴图 = 6 GB 纹理内存，现实中零需求，而放大它只会把「明确报错」变成「后端分配失败」。
-若将来真要放开，改 `as_tex_check_cube` 一处即可。
+- `ignoreResourceLimits = false`（默认）：`#3681` → `#3682` → `#3683`/`#3705`/`#3766`，与 AIR 完全一致。
+- `= true`：`#3681`/`#3682` 照旧（一个字都没少），`#3683` 换成 `#3684`，**上限仍是 profile 上限**。
+  `as_tex_check_2d` 的旗标分支比较的就是 `as_tex_ceiling()`，不是 `as_s3d_max_texture_size()`。
+  这样「放行了 16384x16384」这种比 AIR 更宽松的行为不会出现——恰好是文档警告的那个输入。
+- cube 恒 1024（旗标打开只换 `#3705` → `#3684`）；rect 的上限本是「profile 上限与 backbuffer 取大」，
+  旗标打开后跳过该检查，与 AIR 的「rect 一路放到设备上限」一致。
 
-**未闭合（不静默）**：旗标打开后，我们只按**设备上限**放行，并不预检像素总量；
-2D/rect 的 GPU 分配是**惰性**的（`optimizeForRenderToTexture=false` 时 `gpu` 留空，等上传时再建），
-后端分配失败目前不会立刻变成 `#3684`。该缺口已在 `TODO.md` 遗留表登记。
+**不再存在「唯一刻意分歧」**：旗标打开的语义现在是 AIR 实测口径本身。
 
-**验收**：`examples/stage3d-profile.as` 67 条断言（含旗标默认值、`#3681`/`#3682` 不受影响、
-`#3683` → `#3684` 的类型变化、复位后恢复）；`test/unit/stage3d.ts` 的
-`stage3d/texture-size-limits` 10 条源级钉子（含「零/幂次检查必须在旗标分支之前」）。
+#### 显存预检：`#3684` 的两种来源（阶段三百五十一）
+
+`#3684` 在 AIR 上是**真分配失败**，不是一个可计算的超限判据（实测：`ignoreResourceLimits=true`
+之后 4096 张 1024x1024 惰性贴图——合计 16 GiB——全部创建成功）。所以我们不去「累计总量」，
+只在**单次分配**上做两件事：
+
+1. **创建点预检**（`as_tex_check_budget`）：按格式算这次要多少字节
+   （`w*h*bpp*4/3`，压缩格式按 8/16 B 每 4x4 块），超过 `as_s3d_max_texture_memory()`
+   就直接抛 `#3684`。后端回答这个预算：Metal 用 `recommendedMaxWorkingSetSize`，
+   D3D12 用 `QueryVideoMemoryInfo(LOCAL).Budget - CurrentUsage`，WebGL 2 无查询则保守取 1 GiB，
+   纯 C 状态机给 1e12（等于不拦）。
+2. **分配点翻译**（`as_tex_alloc_failed`）：create（`optimizeForRenderToTexture=true`）与
+   三个上传入口在 `gpu == NULL` 时把后端失败翻成 `#3684`，而不是留一张空贴图。
+   守卫 `as_s3d_has_backend()`：无后端构建根本没有分配器，`NULL` 不是失败。
+
+**验收**：`examples/tex-format.as` 40 条断言（含旗标默认值、`#3681`/`#3682` 不受影响、`#3683` →
+`#3684` 的类型变化、上限处仍可创建、复位后恢复）；`test/unit/stage3d.ts` 的
+`stage3d/texture-size-limits` 11 条 + `stage3d/texture-formats` 17 条源级钉子。
 
 ### 9.15 上传入口的边界契约：**不够长就抛错**，不是「能拷多少拷多少」（阶段三百二十）
 
@@ -725,9 +782,114 @@ VB、IB 的长度改成按 `start + count` 校验。**其中一条曾被误判**
 
 **未做（如实报明）**：`CubeTexture.uploadFromByteArray` 仍是**响亮**的
 `as_shell_unsupported`（立方体六面必须一次性齐备，`createCubeTexture` 不给 `ctx` 句柄）；
-非 8 位纹理格式（`compressed`/float）报明「本构建不支持」而不是按错的步长读；
 `level > 0` 的上传在**惰性 GPU 句柄还没建**时（先传 level 1 再传 level 0）会被静默跳过——
 AIR 上不存在这个状态（它创建时就有 GPU 纹理），这是本后端惰性句柄的内部差别，已写进注释。
+六种纹理格式（含 `compressed`/`compressedAlpha`/`rgbaHalfFloat`）的字节数与解码口径见
+§9.16——**不再**有「非 8 位格式报不支持」这回事。
+
+### 9.16 六种 `Context3DTextureFormat`：常量表、档位门控、字节布局与上传解码（阶段三百五十一）
+
+#### 常量表曾是错的 4 处
+
+`Context3DTextureFormat` 的字符串值不是随便起的名：`createTexture` 收的**就是这个值**，
+它是 AS3 侧唯一可见的格式标识（`Texture.format` 回读同一字符串）。旧表有 4 处偏差：
+
+| 常量 | AIR 权威值 | 旧值 | 后果 |
+|---|---|---|---|
+| `BGR_PACKED` | `"bgrPacked565"` | `"bgrPacked"` | `createTexture(.., BGR_PACKED, ..)` 被我们按**未知格式**处理 |
+| `BGRA_PACKED` | `"bgraPacked4444"` | `"bgraPacked"` | 同上 |
+| `RGBA_HALF_FLOAT` | `"rgbaHalfFloat"` | （缺） | 编译期就找不到该常量 |
+| `RGBA` | 不存在 | `"rgba"` | AIR 对 `"rgba"` 抛 `ArgumentError #2008 {0} is not a valid format` |
+
+`RGBA` 在 AIR 里**从来不存在**（`BGRA` 才是"普通 8 位"）。这一条尤其危险：写
+`Context3DTextureFormat.RGBA` 在 mxmlc 下是编译错误，在我们这里却编译通过、跑到 create 时
+才报别的错。现在两者都是「该常量不存在 / 该字符串无效」。
+
+#### 档位门控：`rgbaHalfFloat` 要 `standard` 起
+
+实测（baseline / baselineExtended / standard / enhanced 四档）：
+
+```
+baseline        createTexture(2,2,"rgbaHalfFloat") -> ArgumentError #3759 Texture format is not supported.
+baselineExtended                                    -> #3759
+standard                                            -> ok
+enhanced                                            -> ok
+```
+
+**顺序是「格式 → 尺寸 → 每格式规则」**，`#3759` 排在尺寸规则**之后**（`temp/texfmt/Gate.as`，
+baseline 档逐条实测：`half 0x0` → `#3681`、`half 3x3` → `#3682`、`half 8192` → `#3683`、
+只有 `half 2x2` 才到 `#3759`）。这与「先判格式再有尺寸」的直觉相反，但 AIR 就是这么判的：
+格式在档位上「不被支持」这件事，要等尺寸合法之后才会被问到。我们把它做成**编译开关**
+`ASC_S3D_HALF_TEXTURES`（默认关），且与 `Context3D.profile` 的回读**共用同一个开关**：
+开关打开时 `profile` 报 `"standard"`，否则报 `baselineEnabled`/`baselineExtended`。这样
+「承诺的档位」和「实际接受的格式」不会漂——不存在「报 enhanced 却拒 half」。
+
+#### create 的检查顺序（全部实测）
+
+```
+格式无效            -> #2008   （0x0 + "rgba" 也先报 #2008，不是 #3681）
+尺寸为 0            -> #3681
+非 2 的幂           -> #3682   （只在 ignoreResourceLimits=false 且非 rect 时）
+超 profile 上限      -> #3683
+压缩格式 < 4x4       -> #3745   （3x3 compressed -> #3745；2x2 compressed -> #3745；
+                                但 3x3 又非 2 幂时先报 #3682 -- 即 #3682 早于 #3745）
+half 3x3            -> #3682   （half 也吃 2 的幂规则）
+setRenderToTexture  -> #3746    （纹理本身是压缩格式时）
+```
+
+`#3745` 与 `#3759` 都是 `ArgumentError`，文案逐字取自 adl：
+`Error #3745: Compressed texture size is too small. The minimum size for compressed textures is 4x4.`
+/ `Error #3759: The selected texture format is not valid in this profile.`
+
+#### 上传字节数与字节布局
+
+`uploadFromByteArray` 的长度规则是 **`n × 每纹素字节数`**，不足即 `RangeError #3669`；
+多余字节被忽略：
+
+| 格式 | 每纹素 | 2x2 最小 | 布局 |
+|---|---|---|---|
+| `bgra` | 4 | 16 | `B,G,R,A` 顺序的直接拷贝，小端下可原地采样 |
+| `bgrPacked565` | 2 | 8 | LE 16 位字，`R` 15-11 / `G` 10-5 / `B` 4-0，**四舍五入**展开（`round(v*255/31)`） |
+| `bgraPacked4444` | 2 | 8 | LE 16 位字，`A` 15-12 / `R` 11-8 / `G` 7-4 / `B` 3-0，`×17` 展开 |
+| `rgbaHalfFloat` | 8 | 32 | 4 个 LE half（R,G,B,A） |
+| `compressed` | 8/块 | 4x4 块 | 原始 DXT1 块 |
+| `compressedAlpha` | 16/块 | 4x4 块 | 原始 DXT5 块 |
+
+**565 必须四舍五入**：`B=24` 读回 `197 = round(24*255/31)`，不是位复制的 `198`。这一位之差
+在整幅图上就是可见的偏色，所以展开用的是 `(v*255+15)/31`。
+
+**压缩格式不进 GPU**：本后端只绑 BGRA8 表面，DXT 块在上传时用与 ATF 路径同一个解码器
+（`as_atf_decode_dxt`）展开成 ARGB。AIR 是把块原样交给驱动的，读回时也不量化（见下），
+所以「解码后上传」与 AIR 的采样结果一致。
+
+**half 走 16 位专用通道**：`as_tex_half_from_byte_array` + `as_s3d_texture_from_pixels_half`，
+把 8 字节/纹素的负载原样交给 `RGBA16Float`（Metal/D3D12）/`RGBA16F`（WebGL2）。收窄到 8 位
+会毁掉 HDR 值，而这正是 `rgbaHalfFloat` 存在的理由。`uploadFromBitmapData` 也保持 16 位：
+8 位源经 `as_tex_half_from_argb` 转 half 后再上传（实测 AIR 接受该调用且采样值与 BGRA 逐字节相同）。
+
+#### 读回不量化（AIR 的一个反直觉行为）
+
+`clear(0.5, 0.5, 0.5, 1)` 到一个 `bgrPacked565` 或 `bgraPacked4444` 渲染目标，`drawToBitmapData`
+读回是 **`808080`**，不是量化后的 `848484`/`888888`：GPU 上根本不保留 565/4444，格式只影响
+上传时的解码。所以我们从不试图在读回路径复现量化。
+
+#### 半浮点渲染目标要按格式分 PSO
+
+Metal 与 D3D12 把 color attachment 的像素格式烘进 pipeline state，`RGBA16F` 目标配 `BGRA8`
+pipeline 会被直接拒绘（黑屏、无报错）。因此：
+
+- `vendor/stage3d_glue.mm`：`S3DBlendVariant.isHalf` + `s3d_make_pso(..., isHalf)` 选
+  `MTLPixelFormatRGBA16Float`，PSO 缓存键加 `s3d_target_is_half(c)`。
+- `vendor/stage3d_d3d.cc`：PSO 键加 `rtfHalf`，`RTVFormats[0] = R16G16B16A16_FLOAT`。
+- `vendor/stage3d_webgl.cc`：无此约束（FBO 的 attachment 格式随纹理走），只需读回时把
+  half 解成 8 位（`s3d_readback_half`）。
+
+三个后端各补一组 seam：`s3d_create_render_texture_fmt`、`s3d_texture_from_pixels_half`、
+`s3d_max_texture_memory`。
+
+**验收**：`examples/tex-format.as` 40 条断言（六常量、四个错误号、门控、字节数、旗标）；
+`test/unit/stage3d.ts` 的 `stage3d/texture-formats` 17 条源级钉子（含「`as_s3d_profile_standard()`
+同时被 profile 回读和 #3759 门控使用」这条不漂移的承诺）。
 
 ## 10. Windows / Direct3D 12 后端（阶段一百三十二 落地）
 

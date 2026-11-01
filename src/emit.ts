@@ -25976,60 +25976,294 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void VideoTexture_attachNetStream(void* _this, Object* netStream) { (void)_this; (void)netStream; }');
     this.line('void Texture_ctor(Texture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; o->ctx = NULL; o->mips = 0; }');
     this.line('Texture* Texture_new(void) { Texture* o = (Texture*)gc_alloc(GCT_CLASS, sizeof(Texture)); o->vtable = &Texture_vt; Texture_ctor(o); return o; }');
+    this.line('static bool as_tex_is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }');
+    this.line('static int as_tex_ceiling(void) { return as_s3d_max_texture_size() >= 4096 ? 4096 : 2048; }');
+    // #3684 is an Error, not an ArgumentError, and its text is AIR's verbatim.
+    this.line('static void as_tex_alloc_failed(void) {');
+    this.line('  as_throw(Error_new((char*)"Error #3684: Texture creation failed. Internal error.", 3684));');
+    this.line('}');
+    // ---- texture FORMAT table (measured on adl 51.4.1, temp/texfmt/) ----
+    //
+    // AIR's Context3DTextureFormat is six constants (symbols.ts). The backend only
+    // has two GPU pixel formats behind them -- 8-bit BGRA and half float -- so the
+    // table below is what maps a format NAME to a storage/upload rule:
+    //
+    //   bgra             4 B/texel  B,G,R,A                     -> BGRA8
+    //   bgrPacked565     2 B/texel  16-bit LE, R15-11 G10-5 B4-0 -> BGRA8 (CPU unpack)
+    //   bgraPacked4444   2 B/texel  16-bit LE, A15-12 R11-8 G7-4 B3-0 -> BGRA8 (CPU unpack)
+    //   rgbaHalfFloat    8 B/texel  4 half floats R,G,B,A (LE)  -> RGBA16F
+    //   compressed       8 B/block  DXT1                        -> BGRA8 (CPU decode)
+    //   compressedAlpha 16 B/block  DXT5                        -> BGRA8 (CPU decode)
+    //
+    // The packed formats are NOT kept 565/4444 in the GPU texture, because AIR does
+    // not keep them either: a 565 render target read back through drawToBitmapData
+    // returns the full 8-bit value (measured: clear(0.5) -> 0x808080, not the 565
+    // quantization 0x848484). Decoding on upload and re-encoding on read would put
+    // error where AIR has none.
+    this.line('static bool as_tex_fmt_known(const char* f) {');
+    this.line('  if (f == NULL) return false;');
+    this.line('  return strcmp(f, "bgra") == 0 || strcmp(f, "bgrPacked565") == 0 || strcmp(f, "bgraPacked4444") == 0');
+    this.line('      || strcmp(f, "compressed") == 0 || strcmp(f, "compressedAlpha") == 0 || strcmp(f, "rgbaHalfFloat") == 0;');
+    this.line('}');
+    this.line('static bool as_tex_fmt_half(const char* f) { return f != NULL && strcmp(f, "rgbaHalfFloat") == 0; }');
+    this.line('static bool as_tex_fmt_compressed(const char* f) {');
+    this.line('  return f != NULL && (strcmp(f, "compressed") == 0 || strcmp(f, "compressedAlpha") == 0);');
+    this.line('}');
+    // Bytes per texel for the pixel formats; 0 for the block-compressed ones (their
+    // stride is per 4x4 block, see as_tex_fmt_block_bytes).
+    this.line('static int as_tex_fmt_bpp(const char* f) {');
+    this.line('  if (f == NULL) return 0;');
+    this.line('  if (strcmp(f, "bgra") == 0) return 4;');
+    this.line('  if (strcmp(f, "rgbaHalfFloat") == 0) return 8;');
+    this.line('  if (strcmp(f, "bgrPacked565") == 0 || strcmp(f, "bgraPacked4444") == 0) return 2;');
+    this.line('  return 0;');
+    this.line('}');
+    this.line('static int as_tex_fmt_block_bytes(const char* f) {');
+    this.line('  return (f != NULL && strcmp(f, "compressedAlpha") == 0) ? 16 : 8;');
+    this.line('}');
+    // ---- the `standard` rung ----
+    //
+    // RGBA_HALF_FLOAT is a standard-rung format: at baseline/baselineExtended AIR
+    // answers ArgumentError #3759 "The selected texture format is not valid in this
+    // profile." and only accepts it from `standard` up (measured, temp/texfmt/
+    // prof-adl.txt). This build still REPORTS baselineExtended -- float textures
+    // are ready, but MRT (the other standard-only feature) is not, and a profile
+    // claim is all-or-nothing.
+    //
+    // This predicate is the single switch, read by BOTH the #3759 gate below and
+    // (indirectly) by what this build is allowed to claim. ASC_S3D_HALF_TEXTURES
+    // forces it on: that is a diagnostics/verification switch for exercising the
+    // RGBA16F path on real hardware before the profile claim can move, not a
+    // compatibility mode (an app that needs half float needs `standard` anyway).
+    this.line('static bool as_s3d_profile_standard(void) {');
+    this.line('#ifdef ASC_S3D_HALF_TEXTURES');
+    this.line('  return true;');
+    this.line('#else');
+    this.line('  return false;');
+    this.line('#endif');
+    this.line('}');
+    // #2008 unknown format string. Not an ArgumentError by accident: measured, AIR
+    // rejects "rgba" (a value this runtime used to accept) with exactly this.
+    this.line('static void as_tex_check_known_format(char* format) {');
+    this.line('  if (!as_tex_fmt_known(format))');
+    this.line('    as_throw(ArgumentError_new((char*)"Error #2008: Parameter textureFormat must be one of the accepted values.", 2008));');
+    this.line('}');
+    // The per-format structural rules, in AIR's order (measured): the compressed
+    // minimum is checked AFTER the size/power-of-two rules (3x3 compressed answers
+    // #3682, 2x2 answers #3745, 0x0 answers #3681), and the profile rule is checked
+    // last of all (baseline: 0x0 half float answers #3681, 3x3 answers #3682).
+    this.line('static void as_tex_check_format_rules(char* format, int w, int h) {');
+    this.line('  if (as_tex_fmt_compressed(format) && (w < 4 || h < 4))');
+    this.line('    as_throw(ArgumentError_new((char*)"Error #3745: Compressed texture size is too small. The minimum size for compressed textures is 4x4.", 3745));');
+    this.line('  if (as_tex_fmt_half(format) && !as_s3d_profile_standard())');
+    this.line('    as_throw(ArgumentError_new((char*)"Error #3759: The selected texture format is not valid in this profile.", 3759));');
+    this.line('}');
+    // Total-byte pre-check for a single allocation. The backend allocates lazily for
+    // a sampler-only texture, so without this a 16384x16384 request would be created
+    // and only die at upload -- AIR fails the create. A mip chain is 4/3 of level 0
+    // on the Metal backend (its descriptor is always mipmapped).
+    this.line('static double as_tex_estimate_bytes(const char* format, int w, int h) {');
+    this.line('  double bpp;');
+    this.line('  if (as_tex_fmt_compressed(format)) bpp = (double)as_tex_fmt_block_bytes(format) / 16.0;');
+    this.line('  else bpp = (double)as_tex_fmt_bpp(format);');
+    this.line('  return (double)w * (double)h * bpp * (4.0 / 3.0);');
+    this.line('}');
+    this.line('static void as_tex_check_budget(const char* format, int w, int h) {');
+    this.line('  double need = as_tex_estimate_bytes(format, w, h);');
+    this.line('  if (need > as_s3d_max_texture_memory()) as_tex_alloc_failed();');
+    this.line('}');
+
     // uploadFromByteArray (Texture / RectangleTexture): the texels are read straight
     // out of the ByteArray at byteArrayOffset, in the texture's INTERNAL format.
-    // For the 8-bit formats that is 4 bytes per texel -- bgra is the byte order
-    // B,G,R,A, which is precisely an ARGB uint32 in little-endian, i.e. our
-    // canonical pixel word (rgba is the same word with R and B swapped). AIR
+    // The function below turns every 8-bit-per-channel format (bgra, the two packed
+    // ones, and the DXT block formats) into the canonical ARGB word this runtime
+    // feeds the GPU; rgbaHalfFloat has its own 16-bit entry point below. AIR
     // validates the available byte count BEFORE copying, so the same check runs
     // here: uploading a partially-filled texture would sample stale/garbage texels
     // instead of raising, which is worse than not rendering at all.
     // This is the video path (StarlingView frame upload / OpenGLVideo.update), so it
     // must be real -- a stub would leave every video texture empty.
-    this.line('static const uint32_t* as_tex_argb_from_byte_array(ByteArray* data, unsigned int off, int w, int h, char* format, int* out_swizzled) {');
+    this.line('static const uint32_t* as_tex_argb_from_byte_array(ByteArray* data, unsigned int off, int w, int h, char* format, int* out_owned) {');
     this.indent++;
-    this.line('if (out_swizzled != NULL) *out_swizzled = 0;');
+    this.line('if (out_owned != NULL) *out_owned = 0;');
     // AIR throws TypeError #2007 for a null ByteArray.
     this.line('if (data == NULL) { as_s3d_null_data(); return NULL; }');
-    // Only 8-bit RGBA/BGRA is consumed. The packed (2 bytes/texel) and float
-    // (4 bytes/component) formats would need a different stride, so they are
-    // reported loudly rather than read at the wrong stride.
-    this.line('if (format == NULL || (strcmp(format, "bgra") != 0 && strcmp(format, "rgba") != 0)) {');
-    this.indent++;
-    this.line('as_shell_unsupported("Texture.uploadFromByteArray (non-8-bit texture format)");');
-    this.line('return NULL;');
-    this.indent--;
-    this.line('}');
-    // The size check is the shared contract (as_s3d_bad_input -> RangeError
-    // #3669). It used to raise #2004 "One of the parameters is invalid", which is
-    // a RangeError carrying the WRONG error id AND the wrong text: adl 51.4.1
-    // answers every short-byte-array case with "Error #3669: Bad input size."
-    // (measured, temp/s3dupload).
     this.line('long long n = (long long)w * (long long)h;');
     this.line('if (n <= 0) return NULL;');
+    // Byte-count rule per format (measured, temp/texfmt/upl-adl.txt): n * bytes per
+    // texel for the pixel formats, ceil(w/4)*ceil(h/4)*block bytes for the
+    // compressed ones. Extra bytes are ignored by AIR and by us.
+    this.line('int comp = as_tex_fmt_compressed(format) ? 1 : 0;');
+    this.line('long long need;');
+    this.line('if (comp) {');
+    this.indent++;
+    this.line('long long bw = (long long)((w + 3) / 4), bh = (long long)((h + 3) / 4);');
+    this.line('need = bw * bh * (long long)as_tex_fmt_block_bytes(format);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('int bpp = as_tex_fmt_bpp(format);');
+    this.line('if (bpp <= 0) return NULL;  // unknown format: rejected at create time');
+    this.line('need = n * (long long)bpp;');
+    this.indent--;
+    this.line('}');
     this.line('if (data->data == NULL || (long long)off >= (long long)data->length) { as_s3d_bad_input(); return NULL; }');
-    this.line('if ((long long)data->length - (long long)off < n * 4LL) { as_s3d_bad_input(); return NULL; }');
+    this.line('if ((long long)data->length - (long long)off < need) { as_s3d_bad_input(); return NULL; }');
     this.line('const unsigned char* src = (const unsigned char*)data->data + off;');
-    // Byte-order-free fast path: 0xAARRGGBB in memory reads B,G,R,A on a
+    // bgra: byte-order-free fast path. 0xAARRGGBB in memory reads B,G,R,A on a
     // little-endian host, i.e. exactly the "bgra" texel layout, so the words can
     // be sampled in place -- provided the offset is word aligned (a misaligned
     // uint32_t* would be UB to dereference, and adl accepts off=1 for the index
     // buffer, so odd offsets are legal input).
-    this.line('if ((off & 3u) == 0u && as_host_little() && strcmp(format, "bgra") == 0) return (const uint32_t*)src;');
-    this.line('int isbgra = strcmp(format, "bgra") == 0;');
+    this.line('if (strcmp(format, "bgra") == 0) {');
+    this.indent++;
+    this.line('if ((off & 3u) == 0u && as_host_little()) return (const uint32_t*)src;');
     this.line('uint32_t* out = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)n);');
     this.line('if (out == NULL) return NULL;');
-    // Assemble each texel from its BYTES so the copy is correct on either host
-    // byte order and at any alignment: bgra is B,G,R,A and rgba is R,G,B,A, both
-    // landing in the canonical ARGB word.
     this.line('for (long long i = 0; i < n; i++) {');
     this.indent++;
     this.line('unsigned b0 = src[i*4], b1 = src[i*4+1], b2 = src[i*4+2], b3 = src[i*4+3];');
-    this.line('unsigned r = isbgra ? b2 : b0, b = isbgra ? b0 : b2;');
-    this.line('out[i] = (b3 << 24) | (r << 16) | (b1 << 8) | b;');
+    this.line('out[i] = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0;');
     this.indent--;
     this.line('}');
-    this.line('if (out_swizzled != NULL) *out_swizzled = 1;');
+    this.line('if (out_owned != NULL) *out_owned = 1;');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // bgrPacked565: one 16-bit LITTLE-ENDIAN word per texel, R in bits 15-11,
+    // G 10-5, B 4-0. AIR expands with a ROUNDED scale (measured: B=24 reads back
+    // 197 = round(24*255/31), not the bit-replication form's 198), so the same
+    // rounding is used here -- the value that reaches the GPU must be what an
+    // AIR-readback comparison would see.
+    this.line('if (strcmp(format, "bgrPacked565") == 0) {');
+    this.indent++;
+    this.line('uint32_t* out = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)n);');
+    this.line('if (out == NULL) return NULL;');
+    this.line('for (long long i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('unsigned v = (unsigned)src[i*2] | ((unsigned)src[i*2+1] << 8);');
+    this.line('unsigned r = (v >> 11) & 0x1Fu, g = (v >> 5) & 0x3Fu, b = v & 0x1Fu;');
+    this.line('r = (r * 255u + 15u) / 31u; g = (g * 255u + 31u) / 63u; b = (b * 255u + 15u) / 31u;');
+    this.line('out[i] = 0xFF000000u | (r << 16) | (g << 8) | b;');
+    this.indent--;
+    this.line('}');
+    this.line('if (out_owned != NULL) *out_owned = 1;');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // bgraPacked4444: one 16-bit little-endian word per texel, A in bits 15-12,
+    // R 11-8, G 7-4, B 3-0 (measured with all four nibbles distinct).
+    this.line('if (strcmp(format, "bgraPacked4444") == 0) {');
+    this.indent++;
+    this.line('uint32_t* out = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)n);');
+    this.line('if (out == NULL) return NULL;');
+    this.line('for (long long i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('unsigned v = (unsigned)src[i*2] | ((unsigned)src[i*2+1] << 8);');
+    this.line('unsigned a = (v >> 12) & 0xFu, r = (v >> 8) & 0xFu, g = (v >> 4) & 0xFu, b = v & 0xFu;');
+    this.line('out[i] = ((a * 17u) << 24) | ((r * 17u) << 16) | ((g * 17u) << 8) | (b * 17u);');
+    this.indent--;
+    this.line('}');
+    this.line('if (out_owned != NULL) *out_owned = 1;');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    // compressed / compressedAlpha: the array holds RAW DXT blocks (8 bytes for
+    // DXT1, 16 for DXT5 per 4x4 block). AIR hands them to the driver as-is; this
+    // backend only binds BGRA8, so they are decoded with the same block decoder the
+    // ATF path uses. A block outside the image (a non-multiple-of-4 edge) is decoded
+    // and discarded, exactly like the ATF path does.
+    this.line('if (comp) {');
+    this.indent++;
+    this.line('int dxt5 = strcmp(format, "compressedAlpha") == 0;');
+    this.line('int bb = as_tex_fmt_block_bytes(format);');
+    this.line('int bw = (w + 3) / 4, bh = (h + 3) / 4;');
+    this.line('uint32_t* out = (uint32_t*)malloc(sizeof(uint32_t) * (size_t)n);');
+    this.line('if (out == NULL) return NULL;');
+    this.line('for (int by = 0; by < bh; by++) {');
+    this.indent++;
+    this.line('for (int bx = 0; bx < bw; bx++) {');
+    this.indent++;
+    this.line('unsigned blk[16];');
+    this.line('as_dxt_block(src + ((size_t)by * (size_t)bw + (size_t)bx) * (size_t)bb, dxt5, blk);');
+    this.line('for (int y = 0; y < 4; y++) {');
+    this.indent++;
+    this.line('int py = by * 4 + y;');
+    this.line('if (py >= h) break;');
+    this.line('for (int x = 0; x < 4; x++) { int pxx = bx * 4 + x; if (pxx < w) out[(size_t)py * (size_t)w + (size_t)pxx] = blk[y * 4 + x]; }');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('if (out_owned != NULL) *out_owned = 1;');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    // rgbaHalfFloat keeps its 16-bit payload: converting it to 8 bits here would
+    // defeat the only reason the format exists (HDR values beyond [0,1]). The
+    // caller hands the raw pointer straight to the RGBA16F upload; only the byte
+    // count is validated, with AIR's n*8 rule.
+    this.line('static const void* as_tex_half_from_byte_array(ByteArray* data, unsigned int off, int w, int h) {');
+    this.indent++;
+    this.line('if (data == NULL) { as_s3d_null_data(); return NULL; }');
+    this.line('long long n = (long long)w * (long long)h;');
+    this.line('if (n <= 0) return NULL;');
+    this.line('if (data->data == NULL || (long long)off >= (long long)data->length) { as_s3d_bad_input(); return NULL; }');
+    this.line('if ((long long)data->length - (long long)off < n * 8LL) { as_s3d_bad_input(); return NULL; }');
+    this.line('return (const void*)((const unsigned char*)data->data + off);');
+    this.indent--;
+    this.line('}');
+    // uint32 ARGB pixels -> RGBA half floats, for uploadFromBitmapData on an
+    // rgbaHalfFloat texture. AIR accepts that call (measured: temp/texfmt/Bmp.as,
+    // both Texture and RectangleTexture, sampled values identical to BGRA), and it
+    // really does keep a 16-bit surface -- so the conversion has to happen here
+    // rather than silently reusing the 8-bit path: a texture the app declared
+    // RGBA_HALF_FLOAT must not become BGRA8, or a later HDR draw into it
+    // (setRenderToTexture) would be clamped at 8 bits on our side and not on AIR's.
+    this.line('static uint16_t as_float_to_half(float v) {');
+    this.indent++;
+    this.line('union { float f; uint32_t u; } c; c.f = v;');
+    this.line('uint32_t x = c.u;');
+    this.line('uint32_t sign = (x >> 16) & 0x8000u;');
+    this.line('int exp = (int)((x >> 23) & 0xFFu) - 127 + 15;');
+    this.line('uint32_t man = x & 0x7FFFFFu;');
+    this.line('if (((x >> 23) & 0xFFu) == 0xFFu) return (uint16_t)(sign | 0x7C00u | (man ? 0x200u : 0u));  // Inf/NaN');
+    this.line('if (exp <= 0) {  // subnormal or underflow: 0 is close enough, like any RT conversion');
+    this.line('  if (exp < -10) return (uint16_t)sign;');
+    this.line('  man |= 0x800000u;');
+    this.line('  uint32_t sh = (uint32_t)(14 - exp);');
+    this.line('  uint32_t m = man >> sh;');
+    this.line('  if ((man >> (sh - 1)) & 1u) m++;');
+    this.line('  return (uint16_t)(sign | m);');
+    this.line('}');
+    this.line('if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);  // overflow -> clamp to max half');
+    this.line('uint32_t m = man >> 13;');
+    this.line('if (man & 0x1000u) {  // round half up');
+    this.line('  m++;');
+    this.line('  if (m == 0x400u) { m = 0; exp++; if (exp >= 31) return (uint16_t)(sign | 0x7BFFu); }');
+    this.line('}');
+    this.line('return (uint16_t)(sign | ((uint32_t)exp << 10) | m);');
+    this.indent--;
+    this.line('}');
+    this.line('static void* as_tex_half_from_argb(const uint32_t* argb, int n) {');
+    this.indent++;
+    this.line('if (argb == NULL || n <= 0) return NULL;');
+    this.line('uint16_t* out = (uint16_t*)malloc((size_t)n * 8u);');
+    this.line('if (out == NULL) return NULL;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('uint32_t p = argb[i];');
+    this.line('out[i*4+0] = as_float_to_half((float)((p >> 16) & 0xFFu) / 255.0f);');
+    this.line('out[i*4+1] = as_float_to_half((float)((p >> 8) & 0xFFu) / 255.0f);');
+    this.line('out[i*4+2] = as_float_to_half((float)(p & 0xFFu) / 255.0f);');
+    this.line('out[i*4+3] = as_float_to_half((float)((p >> 24) & 0xFFu) / 255.0f);');
+    this.indent--;
+    this.line('}');
     this.line('return out;');
     this.indent--;
     this.line('}');
@@ -26097,7 +26331,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     // previous draw had left on that unit, so button labels rendered as garbage
     // slices of the sprite atlas). The bitmapData reference above is kept only for
     // the pre-upload fallback below and for onRestore-style re-uploads.
-    this.line('if (o->ctx != NULL && bitmapData != NULL && bitmapData->pixels != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, (const uint32_t*)bitmapData->pixels);');
+    this.line('if (o->ctx != NULL && bitmapData != NULL && bitmapData->pixels != NULL) {');
+    this.indent++;
+    this.line('if (as_tex_fmt_half(o->format)) {');
+    this.indent++;
+    this.line('void* hp = as_tex_half_from_argb((const uint32_t*)bitmapData->pixels, o->width * o->height);');
+    this.line('if (hp != NULL) { o->gpu = as_s3d_texture_from_pixels_half(o->ctx, o->width, o->height, hp); free(hp); }');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, (const uint32_t*)bitmapData->pixels);');
+    this.indent--;
+    this.line('}');
+    this.line('if (o->gpu == NULL && as_s3d_has_backend()) as_tex_alloc_failed();');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('void Texture_dispose(void* _this) { Texture* o = (Texture*)_this; o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; o->ctx = NULL; }');
@@ -26124,6 +26372,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     // The level's own dimensions drive both the byte-count check and the decode:
     // level l needs max(w>>l,1) * max(h>>l,1) texels (measured: 8x8 level 1 wants
     // 64 bytes, level 2 wants 16, level 3 wants 4).
+    //
+    // rgbaHalfFloat takes a 16-bit path of its own (as_tex_half_from_byte_array):
+    // its payload cannot be squeezed into the ARGB word without losing exactly the
+    // range that is the format's reason to exist.
+    this.line('if (as_tex_fmt_half(o->format)) {');
+    this.indent++;
+    this.line('const void* hp = as_tex_half_from_byte_array(data, byteArrayOffset, lw, lh);');
+    this.line('if (hp == NULL) return;');
+    // A mip level of a half-float texture would need a 16-bit upload seam; that
+    // combination is outside what this build does, and saying so beats writing
+    // 8-bit texels into a float surface.
+    this.line('if (lv != 0) { as_shell_unsupported("Texture.uploadFromByteArray (rgbaHalfFloat at miplevel > 0)"); return; }');
+    this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
+    this.line('o->mips = 0;');
+    this.line('o->bitmapData = NULL;');
+    this.line('if (o->ctx != NULL) { o->gpu = as_s3d_texture_from_pixels_half(o->ctx, o->width, o->height, hp); if (o->gpu == NULL && as_s3d_has_backend()) as_tex_alloc_failed(); }');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
     this.line('const uint32_t* px = as_tex_argb_from_byte_array(data, byteArrayOffset, lw, lh, o->format, &sw);');
     this.line('if (px == NULL) return;');
     this.line('if (lv != 0) {');
@@ -26142,7 +26409,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Context3D_submit's deferred-upload fallback (which runs when gpu == NULL)
     // would upload that stale bitmap's pixels in place of this byte array.
     this.line('o->bitmapData = NULL;');
-    this.line('if (o->ctx != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, px);');
+    this.line('if (o->ctx != NULL) { o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, px); if (o->gpu == NULL && as_s3d_has_backend()) as_tex_alloc_failed(); }');
     this.line('if (sw) free((void*)px);');
     this.indent--;
     this.line('}');
@@ -26186,7 +26453,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->width = aw; o->height = ah;');
     // Upload eagerly, like Texture_uploadFromBitmapData: mip level 0 only, the
     // upload is synchronous and the GPU handle is cached on the texture.
-    this.line('if (o->ctx != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, aw, ah, (const uint32_t*)bd->pixels);');
+    this.line('if (o->ctx != NULL) { o->gpu = as_s3d_texture_from_pixels(o->ctx, aw, ah, (const uint32_t*)bd->pixels); if (o->gpu == NULL && as_s3d_has_backend()) as_tex_alloc_failed(); }');
     this.indent--;
     this.line('}');
     this.line('free(px);');
@@ -26281,7 +26548,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
     this.line('o->bitmapData = bitmapData; gc_write_barrier((void*)bitmapData);');
     this.line('if (bitmapData != NULL) { o->width = bitmapData->width; o->height = bitmapData->height; }');
-    this.line('if (o->ctx != NULL && bitmapData != NULL && bitmapData->pixels != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, (const uint32_t*)bitmapData->pixels);');
+    this.line('if (o->ctx != NULL && bitmapData != NULL && bitmapData->pixels != NULL) { o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, (const uint32_t*)bitmapData->pixels); if (o->gpu == NULL && as_s3d_has_backend()) as_tex_alloc_failed(); }');
     this.indent--;
     this.line('}');
     this.line('void RectangleTexture_dispose(void* _this) { RectangleTexture* o = (RectangleTexture*)_this; o->bitmapData = NULL; as_s3d_destroy_texture(o->gpu); o->gpu = NULL; o->ctx = NULL; }');
@@ -26296,7 +26563,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // decoder reuses/clears its ByteArray right after this call returns).
     this.line('if (o->gpu != NULL) { as_s3d_destroy_texture(o->gpu); o->gpu = NULL; }');
     this.line('o->bitmapData = NULL;');
-    this.line('if (o->ctx != NULL) o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, px);');
+    this.line('if (o->ctx != NULL) { o->gpu = as_s3d_texture_from_pixels(o->ctx, o->width, o->height, px); if (o->gpu == NULL && as_s3d_has_backend()) as_tex_alloc_failed(); }');
     this.line('if (sw) free((void*)px);');
     this.indent--;
     this.line('}');
@@ -26702,17 +26969,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     //     even createTexture(4096,1) fails with #3684, and at enhanced 8192 does. The
     //     documented text says only that the "resource limits" table stops applying.
     //
-    // We therefore bypass to the DEVICE maximum (as_s3d_max_texture_size(), 16384 on
-    // D3D12/Metal) rather than to AIR's profile ceiling. That is the one intentional
-    // divergence and it is opt-in twice over (AIR-legal property, default false), so
-    // default builds stay byte-compatible with AIR. Cube stays at 1024 even with the
-    // flag: a 16384 cube is 6 GB of texture and AIR does not lift it either.
-    this.line('static bool as_tex_is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }');
-    this.line('static int as_tex_ceiling(void) { return as_s3d_max_texture_size() >= 4096 ? 4096 : 2048; }');
-    // #3684 is an Error, not an ArgumentError, and its text is AIR's verbatim.
-    this.line('static void as_tex_alloc_failed(void) {');
-    this.line('  as_throw(Error_new((char*)"Error #3684: Texture creation failed. Internal error.", 3684));');
-    this.line('}');
+    // So the flag does NOT raise a ceiling here: it changes the CEILING ERROR from
+    // #3683 (ArgumentError, "Texture too big") to #3684 (Error, "creation failed"),
+    // because a rejected *allocation* is what the app now sees. The ceiling itself
+    // stays the profile's (2048/4096) -- AIR keeps enforcing it after the bypass,
+    // measured at both rungs -- so a build that allocated 16384x16384 "because the
+    // limit was lifted" would be MORE permissive than AIR on exactly the input the
+    // docs warn about. Cube (`<= 1024`) and RectangleTexture follow the same
+    // measured shape; the rect ceiling is the one that the flag genuinely lifts,
+    // because for a rect it is derived from the backbuffer rather than the profile.
     this.line('static void as_tex_check_2d(Context3D* ctx, int w, int h) {');
     this.indent++;
     this.line('if (w <= 0 || h <= 0)');
@@ -26720,8 +26985,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (!as_tex_is_pow2(w) || !as_tex_is_pow2(h))');
     this.line('  as_throw(ArgumentError_new((char*)"Error #3682: Texture size not a power of two.", 3682));');
     this.line('if (ctx != NULL && ctx->ignoreResourceLimits) {');
-    this.line('  int d = as_s3d_max_texture_size();');
-    this.line('  if (w > d || h > d) as_tex_alloc_failed();');
+    this.line('  int m = as_tex_ceiling();');
+    this.line('  if (w > m || h > m) as_tex_alloc_failed();');
     this.line('  return;');
     this.line('}');
     this.line('int m = as_tex_ceiling();');
@@ -26767,13 +27032,29 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('Texture* Context3D_createTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
     this.line('Context3D* ctx = (Context3D*)_this;');
+    this.line('as_tex_check_known_format(format);');
     this.line('as_tex_check_2d(ctx, width, height);');
+    this.line('as_tex_check_format_rules(format, width, height);');
+    this.line('as_tex_check_budget(format, width, height);');
     this.line('Texture* t = Texture_new();');
     this.line('t->width = width; t->height = height; t->format = format;');
     // optimizeForRenderToTexture=true allocates a render-target MTLTexture up
     // front (setRenderToTexture binds it); false leaves gpu=NULL (sampler-only,
     // uploaded later via uploadFromBitmapData).
-    this.line('if (optimizeForRenderToTexture) t->gpu = as_s3d_create_render_texture(ctx->gpu, width, height);');
+    //
+    // A FAILED allocation here is AIR's Error #3684, not a silently empty texture:
+    // adl fails the CREATE synchronously (measured, temp/texfmt/README.md §6), and a
+    // texture whose gpu handle never materialised would sample as garbage for the
+    // rest of the app's life. Guarded by ASC_RENDER_STAGE3D because a CPU-only build
+    // has no allocator at all and always answers NULL.
+    this.line('if (optimizeForRenderToTexture) {');
+    this.indent++;
+    this.line('t->gpu = as_s3d_create_render_texture_fmt(ctx->gpu, width, height, as_tex_fmt_half(format) ? 1 : 0);');
+    this.line('#ifdef ASC_RENDER_STAGE3D');
+    this.line('if (t->gpu == NULL) as_tex_alloc_failed();');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     // Hand the texture its context so uploadFromBitmapData can upload eagerly.
     this.line('t->ctx = ctx->gpu;');
     this.line('return t;');
@@ -26783,7 +27064,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('Context3D* ctx = (Context3D*)_this;');
     this.line('(void)optimizeForRenderToTexture;');
+    this.line('as_tex_check_known_format(format);');
     this.line('as_tex_check_cube(ctx->ignoreResourceLimits, size);');
+    this.line('as_tex_check_format_rules(format, size, size);');
     this.line('CubeTexture* t = CubeTexture_new();');
     this.line('t->width = size; t->height = size; t->format = format;');
     this.line('return t;');
@@ -26792,14 +27075,24 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('RectangleTexture* Context3D_createRectangleTexture(void* _this, int width, int height, char* format, bool optimizeForRenderToTexture) {');
     this.indent++;
     this.line('Context3D* ctx = (Context3D*)_this;');
+    this.line('as_tex_check_known_format(format);');
     this.line('as_tex_check_rect(ctx, width, height);');
+    this.line('as_tex_check_format_rules(format, width, height);');
+    this.line('as_tex_check_budget(format, width, height);');
     // Same contract as createTexture: optimizeForRenderToTexture=true allocates a
     // render-target MTLTexture up front (Starling's FragmentFilter renders its
     // offscreen passes into such a texture through setRenderToTexture); false
     // leaves gpu=NULL for a later uploadFromBitmapData.
     this.line('RectangleTexture* t = RectangleTexture_new();');
     this.line('t->width = width; t->height = height; t->format = format;');
-    this.line('if (optimizeForRenderToTexture) t->gpu = as_s3d_create_render_texture(ctx->gpu, width, height);');
+    this.line('if (optimizeForRenderToTexture) {');
+    this.indent++;
+    this.line('t->gpu = as_s3d_create_render_texture_fmt(ctx->gpu, width, height, as_tex_fmt_half(format) ? 1 : 0);');
+    this.line('#ifdef ASC_RENDER_STAGE3D');
+    this.line('if (t->gpu == NULL) as_tex_alloc_failed();');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
     this.line('t->ctx = ctx->gpu;');
     this.line('return t;');
     this.indent--;
@@ -26916,6 +27209,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
     this.line('(void)antiAlias; (void)surfaceSelector;');
+    // Compressed textures cannot be render targets on any backend; AIR raises this
+    // at setRenderToTexture time (not at createTexture: the create accepts the flag
+    // for every format -- measured, temp/texfmt/README.md §4).
+    this.line('if (texture != NULL && as_tex_fmt_compressed(texture->format))');
+    this.line('  as_throw(Error_new((char*)"Error #3746: Rendering to compressed textures is not allowed.", 3746));');
     // enableDepthAndStencil asks for a depth/stencil surface matching the render
     // target (Metal rejects a pass whose depth attachment has a different size).
     this.line('as_s3d_set_render_target(o->gpu, (texture != NULL) ? texture->gpu : NULL, enableDepthAndStencil ? 1 : 0);');
@@ -26980,9 +27278,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     // GL_MAX_TEXTURE_SIZE is 2048 answers baseline, a D3D12 one answers
     // baselineExtended. Echoing the requested value instead would put Starling on
     // its 4096-texture path on hardware that cannot allocate one.
+    // ONE switch decides both halves of the promise: as_s3d_profile_standard()
+    // (above) is what accepts RGBA_HALF_FLOAT, and it is what moves the claim to
+    // `standard` here. Reporting baselineExtended while accepting half float would
+    // be a claim and a limit that disagree, the exact drift the derivation below
+    // exists to prevent. `standard` is still not the DEFAULT because it also
+    // promises MRT (#3779), which this build does not have.
     this.line('char* Context3D_get_profile(void* _this) {');
     this.indent++;
     this.line('(void)_this;');
+    this.line('if (as_s3d_profile_standard()) return (char*)"standard";');
     this.line('return (char*)(as_s3d_max_texture_size() >= 4096 ? "baselineExtended" : "baseline");');
     this.indent--;
     this.line('}');
@@ -28606,7 +28911,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (scroll_on) {');
     this.indent++;
     this.line('as_skia_canvas_save(canvas);');
-    this.line('as_skia_canvas_clip_rect(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
+    // The window's SIZE is quantized the way AIR does it (round-half-to-EVEN in
+    // object units), and its edges are antialiased at the object's fractional
+    // device position -- see sk_canvas_clip_rect_window. Measured on adl 51.4.1
+    // (temp/clipround, 24 cases): w 100.5 -> 100 columns, 101.5 -> 102, 119.5/120.5
+    // -> 120, 121.5/122.5 -> 122, 123.5 -> 124, and a scale-2 parent still spans
+    // 100.5*2 = 200 device px, so the rounding is in object space. Both halves
+    // matter: plain clip_rect snapped half-UP (100.5 -> 101) and snapping to
+    // whole device pixels also lost AIR's 25%/50%/75% edge coverage at x=20.25 /
+    // 20.5 / 20.75.
+    this.line('as_skia_canvas_clip_rect_window(canvas, 0.0, 0.0, o->_scroll_rect->width, o->_scroll_rect->height);');
     this.line('as_skia_canvas_translate(canvas, -o->_scroll_rect->x, -o->_scroll_rect->y);');
     this.indent--;
     this.line('}');
@@ -31295,6 +31609,13 @@ void FileStream_writeObject(void* _this, as_value v) {
         for (const p of ctor.params) this.declareVar(p.name, this.ann(p.type));
         this.line(`${name}* this = o;`);
         this.hoistFunctionLocals(ctorBody);
+        // A mutually-recursive sibling group declared in a CONSTRUCTOR needs the
+        // same shared cell the method paths allocate: without it the cell's
+        // `_cellN_alloc()` exists but nobody calls it, and every sibling call site
+        // reads an undeclared `cellN` (measured: `g()` calling sibling `pad()`
+        // inside `Main()` emitted `cell2->_nf0` with no declaration, so the
+        // generated C did not compile).
+        this.emitClosureCellLocals();
       }
       // gc_alloc zeroes the instance, so every non-`Number` field already holds
       // its AS3 default (null/0/false/0.0). The exceptions that are NOT the zero
@@ -31693,6 +32014,10 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.pushScope();
         this.functionScope = this.scopes[this.scopes.length - 1];
         this.hoistFunctionLocals(b.stmt.body.body);
+        // Same reason as the constructor path: a class-body static block can hold
+        // a sibling nested-function group, and its shared cell must be allocated
+        // before the first statement that names it.
+        this.emitClosureCellLocals();
         this.emitBlockBody(b.stmt.body);
         this.functionScope = null;
         this.hoistedLocals = new Set();

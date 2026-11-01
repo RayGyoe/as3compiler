@@ -68,6 +68,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <cstdint>
 
 // Ganesh state invalidation (skia_glue.cc). Declared here rather than in a shared
@@ -123,6 +124,7 @@ struct S3DTexState {
 struct S3DRtTex {
   GLuint id;
   int width, height;
+  int isHalf;     // GL_RGBA16F instead of GL_RGBA8 (readback must narrow it)
 };
 
 // Registry entry for a texture object's GL target. A cube map can only ever be
@@ -165,6 +167,7 @@ struct S3DRt {
   GLuint color;   // GL texture name
   GLuint depthStencil;
   int width, height;
+  int isHalf;     // color attachment is RGBA16F (readback must narrow it)
 };
 
 struct S3DContext {
@@ -609,6 +612,33 @@ void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* 
   return (void*)(uintptr_t)tex;
 }
 
+// Bytes of texture this backend will attempt in ONE allocation. WebGL exposes no
+// budget query, so a conservative 1 GiB is used: above every realistic game texture
+// and still below what any WebGL2 implementation would fail to allocate. The value
+// only backs the create-time pre-check (AIR's Error #3684); the drive itself
+// reports a real failure through the upload path.
+double s3d_max_texture_memory(void) { return 1073741824.0; }
+
+// Upload an rgbaHalfFloat texture: width*height texels of four half floats
+// (R,G,B,A), handed to GL as GL_HALF_FLOAT -- no narrowing, which is the point of
+// the format. WebGL2 core has RGBA16F as a colour-renderable+filterable internal
+// format, so filtering and setRenderToTexture need no extension.
+void* s3d_texture_from_pixels_half(void* ctx, int width, int height, const void* rgba) {
+  if (ctx == NULL || width <= 0 || height <= 0 || rgba == NULL) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  (void)c;
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_HALF_FLOAT, rgba);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  sk_gr_reset_context();
+  return (void*)(uintptr_t)tex;
+}
+
 // Upload pixels AND bind them as fragment sampler fs{unit} in one step (the
 // sequential upload-then-draw path in Context3D_submit).
 void* s3d_upload_texture(void* ctx, int unit, int width, int height, const uint32_t* argb) {
@@ -730,13 +760,25 @@ void s3d_sampler_cache_invalidate(void) {
 
 // A render-target texture (optimizeForRenderToTexture=true): sampled like any
 // other texture, and legal as the render override while a filter draws into it.
+void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf);
+
 void* s3d_create_render_texture(void* ctx, int width, int height) {
+  return s3d_create_render_texture_fmt(ctx, width, height, 0);
+}
+
+// isHalf != 0 allocates an RGBA16F target (Context3DTextureFormat.RGBA_HALF_FLOAT).
+// Unlike Metal/D3D12, GL bakes no attachment format into its program objects, so
+// the only extra state is the texture format itself and the readback conversion.
+void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf) {
   if (ctx == NULL || width <= 0 || height <= 0) return NULL;
   S3DContext* c = (S3DContext*)ctx;
   GLuint tex = 0;
   glGenTextures(1, &tex);
   glBindTexture(GL_TEXTURE_2D, tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  if (isHalf)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_HALF_FLOAT, NULL);
+  else
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -745,6 +787,7 @@ void* s3d_create_render_texture(void* ctx, int width, int height) {
     c->rtTex[c->rtTexN].id = tex;
     c->rtTex[c->rtTexN].width = width;
     c->rtTex[c->rtTexN].height = height;
+    c->rtTex[c->rtTexN].isHalf = isHalf ? 1 : 0;
     c->rtTexN++;
   }
   sk_gr_reset_context();
@@ -758,6 +801,7 @@ static S3DRt* s3d_rt_for(S3DContext* c, GLuint color, int width, int height) {
   S3DRt* rt = new S3DRt();
   rt->color = color;
   rt->width = width; rt->height = height;
+  rt->isHalf = 0;   // s3d_set_render_target records the real format below
   glGenFramebuffers(1, &rt->fbo);
   glGenRenderbuffers(1, &rt->depthStencil);
   glBindRenderbuffer(GL_RENDERBUFFER, rt->depthStencil);
@@ -795,12 +839,16 @@ void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
     delete old;
     c->overrideRt = NULL;
   }
-  int w = 0, h = 0;
+  int w = 0, h = 0, isHalf = 0;
   for (int i = 0; i < c->rtTexN; i++) {
-    if (c->rtTex[i].id == t) { w = c->rtTex[i].width; h = c->rtTex[i].height; break; }
+    if (c->rtTex[i].id == t) {
+      w = c->rtTex[i].width; h = c->rtTex[i].height; isHalf = c->rtTex[i].isHalf; break;
+    }
   }
   if (w <= 0 || h <= 0) return;
   c->overrideRt = s3d_rt_for(c, t, w, h);
+  // The format is what makes drawToBitmapData narrow instead of memcpy.
+  if (c->overrideRt != NULL) c->overrideRt->isHalf = isHalf;
   sk_gr_reset_context();
 }
 
@@ -1342,6 +1390,19 @@ int s3d_draw(void* ctx, int numTriangles) {
 // as_skia_canvas_draw_bgra. GL returns RGBA rows bottom-up, but because the GLSL
 // vertex stage negates clip-space Y the stored image is already top-down, so only
 // the channel order needs a swap.
+// IEEE 754 binary16 -> float. Spelled out so the conversion is identical across
+// toolchains (denormals, Inf, NaN included).
+static float s3d_half_to_float(uint16_t h) {
+  const int sign = (h >> 15) & 1;
+  const int exp = (h >> 10) & 0x1F;
+  const int man = h & 0x3FF;
+  float v;
+  if (exp == 0) v = (float)man / 1024.0f * ldexpf(1.0f, -14);
+  else if (exp == 31) v = (man == 0) ? INFINITY : NAN;
+  else v = (1.0f + (float)man / 1024.0f) * ldexpf(1.0f, exp - 15);
+  return sign ? -v : v;
+}
+
 static int s3d_readback_target(S3DContext* c, GLuint fbo, int w, int h, uint8_t* out) {
   if (out == NULL || w <= 0 || h <= 0) return 0;
   int n = w * h;
@@ -1361,11 +1422,42 @@ int s3d_readback(void* ctx, uint8_t* out) {
   return s3d_readback_target(c, c->fbo, c->width, c->height, out);
 }
 
+// Narrow an RGBA16F framebuffer to the caller's BGRA8 contract
+// (Context3D.drawToBitmapData), clamping to [0,1]: an 8-bit surface cannot hold an
+// HDR value, and AIR clamps on the same path.
+static int s3d_readback_half(S3DContext* c, S3DRt* rt, uint8_t* out) {
+  const int n = rt->width * rt->height;
+  uint16_t* tmp = (uint16_t*)malloc((size_t)n * 4 * sizeof(uint16_t));
+  if (tmp == NULL) return 0;
+  glBindFramebuffer(GL_FRAMEBUFFER, rt->fbo);
+  glReadPixels(0, 0, rt->width, rt->height, GL_RGBA, GL_HALF_FLOAT, tmp);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  for (int i = 0; i < n; i++) {
+    float ch[4];
+    for (int k = 0; k < 4; k++) {
+      float v = s3d_half_to_float(tmp[i * 4 + k]);
+      if (!(v == v)) v = 0.0f;              // NaN
+      if (v < 0.0f) v = 0.0f;
+      if (v > 1.0f) v = 1.0f;
+      ch[k] = v;
+    }
+    out[i * 4 + 0] = (uint8_t)(ch[2] * 255.0f + 0.5f);  // B
+    out[i * 4 + 1] = (uint8_t)(ch[1] * 255.0f + 0.5f);  // G
+    out[i * 4 + 2] = (uint8_t)(ch[0] * 255.0f + 0.5f);  // R
+    out[i * 4 + 3] = (uint8_t)(ch[3] * 255.0f + 0.5f);  // A
+  }
+  free(tmp);
+  sk_gr_reset_context();
+  return 1;
+}
+
 int s3d_readback_render(void* ctx, uint8_t* out) {
   if (ctx == NULL || out == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
-  if (c->overrideRt != NULL)
+  if (c->overrideRt != NULL) {
+    if (c->overrideRt->isHalf) return s3d_readback_half(c, c->overrideRt, out);
     return s3d_readback_target(c, c->overrideRt->fbo, c->overrideRt->width, c->overrideRt->height, out);
+  }
   return s3d_readback_target(c, c->fbo, c->width, c->height, out);
 }
 
