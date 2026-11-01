@@ -340,6 +340,25 @@ if (nat != null) {
 }
 ```
 
+**as-built 的 `Context3DNative` 方法面**（阶段三百五十三 + 三百五十五，`src/symbols.ts`）：
+
+| 方法 | 用途 | 来源 |
+|---|---|---|
+| `uploadProgram(vs, fs)` / `dispose` | 交叉编译 + 链接（运行期，`newLibraryWithSource:`） | M2 |
+| `setUniform1f` … `setUniform4f` | ≤4 个 float 分量 | M2 |
+| `setUniformFloats(prog, name, Vector.<Number>)` | **>4** 个 float 字（`vec4 uSpecA[2]` 是 8 个字） | M3 |
+| `setUniformInts(prog, name, Vector.<int>)` | `int`/`uint`/`bool`（**不能**用 float 入口，见 §6.9 #3） | M3 |
+| `setUniformMatrix4` | 16 字矩阵 | M2 |
+| `createTexture(w, h, format, renderable, mipmapped = false)` | 11 个格式 id；`renderable` = 可做渲染目标 | M2 / M3（`mipmapped`） |
+| `createDepthTexture(w, h, format)` | `DEPTH_32F` / `DEPTH_16`（只作附件，见 §6.4f） | M3 |
+| `generateMipmaps(tex)` | Metal blit 编码器生成 mip 链 | M3 |
+| `setRenderTargets(colors, depth)` / `setBackBuffer()` | MRT；**空目标集非法**（§6.9 #4） | M2 |
+| `bindTexture(prog, name, tex)` / `bindAttribute(...)` / `drawTriangles(...)` | 绑定与绘制 | M2 |
+
+`NativeProgram3D` 暴露反射结果：`uniformNames` / `bindingNames` +（M3 新增）`bindingComponents`、
+`bindingBaseTypes`、`bindingSizes`。引擎侧按这三张表决定走哪个上传入口——这是 #3 那条缺陷的修法，
+不是可选的便利。
+
 ### 6.4 深度纹理
 
 `OceanSurface.js` 的 depth-validated 折射（`main.js:117` 的 `uSceneDepth`）要采样场景深度纹理。Stage3D 无
@@ -365,6 +384,22 @@ UnderwaterPass.js:17 声明 `precision highp sampler2DShadow`，配合 `uShadowM
 **e. 深度纹理的采样器区分**：深度纹理必须用 `sampler2D`（浮点读）或 `sampler2DShadow`（比较读）采样，
 WebGL2 里深度纹理的 `texture-filterable` 有限制、Metal/D3D 也有对应约束，不能用普通颜色纹理的采样方式
 直接对待。
+
+**f. 真机结论（M3 补验，2026-11-02）——深度只当附件，别当采样器**：SPIRV-Cross 把 GLSL 的 `sampler2D`
+静态映射成 `texture2d<float>`，它**不知道**绑定的是深度资源；Metal 里深度纹理是 `depth2d<float>`，
+两个类型对不上，于是采样恒读 0（不报错，只是全黑）。所以：
+
+- 现阶段的契约是**深度纹理 = 渲染附件**（遮挡/消隐正确），`sampler2D` 读深度**不支持**；
+- 要读线性深度就把深度写进一张彩色浮点 RT（`oDepth = vec4(viewZ)`），这条在 M3 已验；
+- 真要做比较采样（阴影）必须让作者显式写 `sampler2DShadow`，并在绑定时把 sampler 配上
+  `CompareFunction`——那是后续阶段的事，不在当前通道里。
+
+**g. 深度附件与模板槽必须同时清空**：金属校验会直接拒掉「`depthAttachmentPixelFormat` 是
+`Depth32Float`、`stencilAttachmentPixelFormat` 还是默认值」的管线描述子
+（`stencilAttachmentPixelFormat MTLPixelFormatDepth32Float is not stencil renderable`）。反之，
+管线过了但 render pass 仍给 `stencilAttachment.texture` 赋值，Metal 会把**整条深度附件**静默忽略：
+几何遮挡失效、画面看起来「深度没起作用」。`s3d_pass` 现在按「深度纹理的像素格式是不是打包的
+`Depth32Float_Stencil8`」双向对齐，只在打包格式时才挂 stencil。
 
 ### 6.5 构建层（build.ts + build-tools）
 
@@ -430,6 +465,23 @@ Metal/D3D 的顶点阶段采样无此限制，但 WebGL2 有 `MAX_VERTEX_TEXTURE
 
 **结论**：E6 的价值不只是「换掉 AGAL」，而是**解锁这 7 类 AGAL 表达不了的语言特性**。它们不需要新的
 后端 API（底层 GPU 都有），只需要 E6 的「GLSL ES 3.00 直通」把它们从「AGAL 死规范」里放出来。
+
+### 6.9 通道约束清单（M3 + FFT 海洋实测倒推，2026-11-02）
+
+这五条都不是「没实现」而是「这么写就错」——都由 `apps/shader-m31` / `apps/ocean-m32` 的实际崩溃或
+静默黑屏逼出来，写进契约，别再踩：
+
+| # | 约束 | 症状（看到的） | 正确写法 |
+|---|---|---|---|
+| 1 | **顶点属性必须给 `layout(location = N)`** | `MSL(vertex) compile failed: invalid type 'vs_main_in' of input declaration with attribute 'stage_in'` / `field with missing attribute 'attribute'` | `layout(location = 0) in vec3 aPos;`，按 0..n 连续编号 |
+| 2 | **读 `uniform` 的 GLSL 辅助函数不翻译** | `cannot bind reference in address space 'constant' to object in default address space` | 内联；或先把 uniform 抄进局部 `vec3 w = uFoo;` 再传给函数（局部量在 `thread` 地址空间） |
+| 3 | **整数 uniform 不能走 `setUniform1f`** | 值 2 传进去，shader 里读到 `1073741824`（`2.0` 的 IEEE 位模式） | `Context3DNative.setUniformInts(program, name, values)`；绑定反射里 `base_type` 决定派发，`components`/`size` 决定是 `setUniform1f..4f` / `setUniformFloats` / `setUniformMatrix4` |
+| 4 | **不能给「空」渲染目标集提交绘制** | Metal 绘制中止、进程崩在 `MTLResourceListAddResource` 附近 | 读后台缓冲用 `setBackBuffer()`（或 `setRenderToBackBuffer()`），不要 `setRenderTargets([], null)` |
+| 5 | **`drawToBitmapData` 的目标位图可以比后台缓冲小**（本次修的编译器缺陷） | 读回结果对，但**下一帧**崩在 Metal 内部（method cache corrupted），像「Metal 的 bug」 | 拷贝按**目标位图**尺寸裁剪（`min(bb, dest)`）；以前按后台缓冲全量写，64×64 探针写穿 256 KB 堆缓冲 |
+
+第 5 条是 `Context3D.drawToBitmapData` 的**语义缺陷**而不是通道问题：AIR 的 `drawToBitmapData` 要求目标位图
+不小于后台缓冲，我们放宽成「重叠区拷、其余保持原值」，但**绝不越界写**。这条缺陷从第一个读回探针起就在，
+只是探针紧接着退出、堆损坏没来得及显形——被 34 pass/帧的海洋抓住。
 
 ---
 
@@ -633,7 +685,7 @@ E6 落地后，**FFT 的归属从「被迫 CPU」翻转为「可以 GPU」**：
 | **P1 · Metal 单后端起步** | glslang+SPIRV-Cross 入 `build-tools/`；`--features native-shader` 注册；`stage3d_glue.mm` 增 float RT + MRT + 原生 MSL 编译；`NativeShaderRenderer` + `ShaderMaterial` | AOT-macOS 出画面，float RT 可渲可读，MSL **真编译** | Metal | ✅ **M3 + M6 已验收**：`shader-m30` 15 项 PASS、像素 `#804020`/`#361b0e`。验收方式从 `xcrun metal` 改运行期 `newLibraryWithSource:`（§3.4：本机无离线工具链） |
 | **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一画面，零交叉编译 | WebGL2 | ❌ 未做（现在 `--features native-shader` 只声明 `native` 目标） |
 | **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 | ❌ 未做（SPIRV-Cross 的 HLSL 半边库已链好） |
-| **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | ❌ 未做（本轮只证明了通路，**没有证明海洋**） |
+| **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | 🟡 **第一阶段已落**：`asaot3d/apps/ocean-m32` = Tessendorf FFT 海洋（256²×2 cascade、34 pass/帧、顶点纹理取值位移、MRT 位移+法线、高度读回 ±1.6 m）。**未做**：caustics / 水下 pass / 喷雾 / 4 cascade / 平面反射 / 天空梯度 |
 
 **第一批只落 Metal** 的理由成立：本机 macOS + Metal，MSL 与 GLSL ES 3.00 语法接近，先把
 「E6 + float RT + MRT + texelFetch」的最小闭环钉死，再铺开。

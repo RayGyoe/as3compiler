@@ -19040,6 +19040,65 @@ Retina 门）；真手势自测（`temp/gui11/temp/dragtest/`，Quartz 合成 + 
 = `RESIZING` + `RESIZE`（**这一条只有把窗口 `activate()` 之后才成立**——后台窗口的首次边框点击只激活不缩放）。
 两份 README 与 `docs/{zh-cn,en}/compile.md` 的 `requestedDisplayResolution` 段同步。
 
+### 阶段三百五十五：E6 M3 能力面补验 · FFT 海洋跑通后倒推的三个真缺陷（v0.4.316 → v0.4.317）
+
+**起点**：阶段三百五十三把 `--features native-shader` 的通路钉死了，但验收只用一张 2×2 四边形画到**后台缓冲**
+——浮点渲染目标、MRT 两附件、`texelFetch`、整数哈希、深度纹理这些「M7 开工前必须先证」的能力面**一项没验**。
+本轮先把能力面逐项补齐（`asaot3d/apps/shader-m31`），再拿它跑一个真的 Tessendorf FFT 海洋
+（`asaot3d/apps/ocean-m32`，256² × 2 cascade、34 pass/帧），用「能不能跑出第二帧」当判据。
+
+**能力面验收（13 项 PASS，每项配一条能把对/错分开的可观测差值）**：
+
+| 能力 | 断言 | 为什么这条差值能分辨 |
+|---|---|---|
+| 32F/16F 目标可渲染 | 写 100.0，读回绿通道 100 | 8 位目标会把 100.0 与 1.0 都压成 1 |
+| **fp16 真的丢位** | `1+1/4096`：32F 读回 255、16F 读回 0 | fp16 在 1.0 处 ulp=1/1024，这条正好跨过它；若 16F 被当 32F 用，两者会一样 |
+| MRT 两附件 | 附件0 红 / 附件1 绿，分别读回 | 绑成一张图会读到同一个颜色 |
+| `texelFetch` | 读**非中心** texel（+5,+5）得 100 | 归一化 `texture()` 会读到邻近 texel 平均值=0 |
+| `uvec2` PCG 哈希 | 种子 1337/1338 → 255/177 | 走浮点上传会读到位模式，两个种子给同一条输出 |
+| 深度纹理**作附件** | z=-0.5 红先画；z=0.9 绿必须被拒；z=-0.9 蓝必须通过 | 只测「被拒」区分不了「深度没工作」与「根本没画」，第三条是正对照 |
+
+**深度纹理的真相**：GLSL `sampler2D` 读深度在这条链上**恒读 0**——SPIRV-Cross 把 `sampler2D` 静态映射成
+`texture2d<float>`，它不知道绑定的是 `depth2d`。所以契约定为「深度纹理 = 渲染附件」，要线性深度就渲染进
+彩色浮点图；比较采样（阴影）必须作者显式写 `sampler2DShadow`，留给后续阶段。
+
+**跑海洋时暴露并修掉的三个真缺陷**：
+
+1. **`Context3D.drawToBitmapData` 堆溢出**（`src/emit.ts`）：拷贝循环按**后台缓冲**尺寸走
+   （960×600），索引却写进**目标位图**大小的缓冲（256×256），写穿约 1.1 MB。读回值本身是**对的**，
+   崩溃落在下一帧 Metal 内部（`MTLResourceListAddResource` + `method cache corrupted`），看着像驱动的锅。
+   这条从**第一个读回探针**起就存在，只是探针读回后立刻退出，堆损坏没来得及显形——被 34 pass/帧的海洋抓出来。
+   改成按 `min(后台缓冲, 目标位图)` 裁剪只填重叠左上区（AIR 要求目标不小于后台缓冲，我们放宽但**绝不越界写**）。
+2. **深度仅格式纹理挂到 stencil 槽会静默丢掉整条深度附件**（`vendor/stage3d_glue.mm`）：管线侧
+   `stencilAttachmentPixelFormat` 留在默认值会让 Metal 直接拒（`stencilAttachmentPixelFormat
+   MTLPixelFormatDepth32Float is not stencil renderable`）；更隐蔽的是管线通过、render pass 仍给
+   `stencilAttachment.texture` 赋值时，Metal **整条忽略深度附件**（几何不分前后、零报错）。PSO 与**两处**
+   render-pass 构造改为一律以「是否 `MTLPixelFormatDepth32Float_Stencil8`」为准。
+3. **整数 uniform 必须走 `setUniformInts`**：`setUniform1f` 写的是**位模式**，float 2.0 当 int 读是
+   `1073741824`。反射表补 `components`/`base_type`/`size`，派发按 `base_type` 分 int/uint/bool 与 float，
+   按 `size` 分 `setUniform1f..4f` / `setUniformFloats` / `setUniformMatrix4`。
+
+**顺带补齐的通道能力**：`createTexture(w,h,format,renderable,mipmapped)` 的 `mipmapped` 形参真正生效 +
+`generateMipmaps(tex)`（Metal blit 编码器）；`s3d_pass_samples` 对带 `nativeColor[0]` 的 native pass 强制
+单采样，避免 MSAA 抢走 MRT 附件 0。
+
+**新登记的运行期约束**（`native-shader.md` §6.9）：顶点属性必须 `layout(location = N)`；读 uniform 的 GLSL
+辅助函数不翻译（`constant` 地址空间的引用绑不到 `thread` 参数），要么内联要么先抄进局部变量；
+不能给空渲染目标集提交绘制（读后台缓冲用 `setBackBuffer()`）。
+
+**验收**：`asaot3d/apps/shader-m31` 13 项 PASS；`asaot3d/apps/ocean-m32` 打印
+`height readback: -1.9..1.6 m (spread ~200/255)` 并跑满 25 s（平面会读成 0）；AIR 侧两个 demo 都打印
+`NO-CHANNEL` 后**以 0 退出**（`logLine` = `System.output`，`trace()` 在 macOS 的 `adl` 下什么也不输出——
+这是本轮才发现的口径错误，`shader-m30`/`shader-m31` 的 NO-CHANNEL 一并改成 `logLine`）。
+单元：`test/unit/stage3d.ts` 新增 `unit: stage3d/draw-to-bitmap-bounds`（4 钉，含反向变异：改回
+后台缓冲尺寸即 2 钉红）与 `unit: stage3d/depth-only-stencil`（2 钉）。全量 `node test.ts` 606/606；
+`asaot3d` 29 组探针 1295 PASS、27 个 app 构建 + 运行全绿。
+
+**未做（明确登记）**：M4 WebGL2 直通、M5 D3D12/HLSL；深度纹理的 `sampler2DShadow` 比较采样；
+海洋侧的 sky/大气 LUT、caustics、水下 pass、喷雾、4 cascade、平面反射（`asaot3d` §38.2 已列）。
+
+---
+
 ### 遗留待开发
 > **2026-11-02 追加（阶段三百五十四：`NativeWindow.systemMinSize`/`systemMaxSize` 与拖拽进行中的 `moving`/`resizing`）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **90 → 90 行**（`未开始` 70 / `部分完成` 19 / `调研完成·实现暂缓` 1）。**改写 1 行**是 `NativeWindow` 家族那行——②③ 两条（静态系统极限、拖拽中的 `moving`/`resizing`）落地，剩下的只有 `NativeMenu` **整个子系统**（依赖面最大，仍最低优先）。**同阶段修净、不占表**：`requestedDisplayResolution=standard` 的窗口在 Retina 屏上被**减半**（`sk_client_size_live`/`sk_window_device_scale` 无条件折 backing scale ⇒ 400x300 读回 `200x166`、stage 只有一半大）——它先于本轮改动存在，是示例里那三条失败的真正原因；现在两处都以 `SDL_WINDOW_ALLOW_HIGHDPI` 为门。**口径提醒**：这类「尺寸口径」缺陷只在**Retina + 1x 渲染**的组合里现形，非 Retina 机器上怎么量都是绿的，故 `docs/{zh-cn,en}/compile.md` 的 `requestedDisplayResolution` 段已写明门控条件。
 > **2026-11-02 追加（阶段三百五十二：AGAL4 顶点纹理取值）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **91 → 90 行**（`未开始` **71 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1）。**移出 1 行**：「顶点纹理取值（VTF）」——三翻译器的顶点 sampler 声明 + 三后端绑定 + stage/version 门控（`#3622`/`#3803`/`#3805`/`#3757`）全部落地，Metal 真机 26 条断言。**同阶段修净、不占表**：① `Program3D` 重 upload 不重新编译着色器（缓存键是指针，改成「指针 + `uploadSerial`」）；② `as_agal_errid` 让 AGAL 校验错误的 `errorID` 与 AIR 一致（此前恒 0）。**一处刻意的实现分歧**：AIR 的顶点 `tld` **忽略 LOD 字节**（恒采 mip0），我们按指令本意用该值 —— 在 AIR 上跑对的程序都写 lod=0，故行为等价。
@@ -19349,7 +19408,7 @@ Retina 门）；真手势自测（`temp/gui11/temp/dragtest/`，Quartz 合成 + 
 > **2026-10-30 追加（阶段三百三十三：`extends Array`/`Dictionary`/`Date` 在 AIR 侧的限制）**：**新登记 1 行**。`temp/gprobe7` 双端实测（同一份 `.as` 同时喂 `mxmlc`+`adl` 与我们的 AOT）：`class X extends Array` 里任何动态写抛 `ReferenceError #1056: Cannot create property 0 on MyArr`、`class X extends Dictionary` 同样（`Cannot create property k on MyDict`）、`class X extends Date` 带参 `super(y, m, d)` 抛 `#1107 The ABC data is corrupt, attempt to read out of bounds` —— 即 **AIR 自己的子类化是坏的**，这属于「`adl` 本来就报错」⇒ 按 §1.5 是**增强**，不是欠账。我们这边三种子类都照常工作（已量：`arr` 长度/下标、`dict` 键读写、`date.getFullYear()` 全部正确），按增强规矩默认产物**不比 AIR 更宽松**这一条不适用（我们只是不主动复制 AIR 的 bug），故**记为已具备、不引入开关**，示例 `examples/builtin-class.as` 第 14 节刻意不对这三类作运行期断言（只在注释里点名），避免把「AIR 跑不通」写成「我们的契约」。
 >
 > **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
-> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224；2026-11-02 原生着色器直通转「进行中」，v0.4.316）**：下表 **18 项**，已完成 **8 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64、显示器刷新率查询、带状态码退出、macOS 菜单栏状态项——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**进行中** 1 项（原生着色器直通：通路已真机验收，M4/M5/M7 与浮点目标读回未做，见阶段三百五十三）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **5 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`/`tray`/`native-shader`），登记未实现的开关等于「看着开了、实际没编进去」——`formats`/`native-shader` 还能改变符号表（类是否存在），其余只加宏。
+> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224；2026-11-02 原生着色器直通转「进行中」，v0.4.316）**：下表 **18 项**，已完成 **8 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64、显示器刷新率查询、带状态码退出、macOS 菜单栏状态项——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**进行中** 1 项（原生着色器直通：通路与 M3 能力面均已真机验收并跑通 FFT 海洋，M4/M5/M7 余项未做，见阶段三百五十三/三百五十五）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **5 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`/`tray`/`native-shader`），登记未实现的开关等于「看着开了、实际没编进去」——`formats`/`native-shader` 还能改变符号表（类是否存在），其余只加宏。
 
 | 增强项 | AIR 现状 | 目标端 | 成本 | 状态 |
 |--------|---------|--------|------|------|
@@ -19358,7 +19417,7 @@ Retina 门）；真手势自测（`temp/gui11/temp/dragtest/`，Quartz 合成 + 
 | **WebP / BMP / ICO 解码** | 部分：仅 JPG/PNG/GIF（`adl` 对三者报 `#2124`） | ✅ **已实现、opt-in**（默认与 AIR **同报 `#2124`**，`--features formats` 打开后两端实测全部解码正确；`QOI` 未编入 `SkQoiCodec`，不含在内） | 两端 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **相机 RAW / DNG 解码** | ✗（`adl` 对 `.dng` 报 `#2124`；`BitmapData.loadFile` 不存在 → `#1069`） | ✅ **已实现、opt-in**（默认与 AIR 同报 `#2124`，`--features raw` 打开后 native 四条解码入口全部解出 600×338）；web 无 piex/dng_sdk 归档 ⇒ 该开关在 wasm 上被前置拒绝 | native / web 与 AIR 同形 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **矢量图形直接上屏**（`Shape` 走 `SkPath`） | ✗（`BitmapData` 只有位图） | 两端 | 中 | 未排期 |
-| **原生着色器直通**（GLSL ES 3.00 源 → MSL/HLSL） | ✗（只有 AGAL 寄存器语言） | **进行中（阶段三百五十三）**：源语言 GLSL ES 3.00 → glslang + SPIR-V + SPIRV-Cross → MSL；`--features native-shader`（仅 native）注册 `Context3DNative`/`NativeProgram3D`。**已真机验收**：`asaot3d/apps/shader-m30` 用作者的一对 GLSL 画四边形，`drawToBitmapData` 读回中心 `#804020` 与 `uColor.rgb * vUV.x` 逐位相符；同一份 `.as` 在默认构建/`adl` 下打印 `NO-CHANNEL` 并退出 0。**未做**：M4 WebGL2 直通、M5 D3D12/HLSL、M7 Ultra-Water 对齐，以及浮点 RT / MRT 两附件 / 深度纹理的**读回数值**验收（设计 §11 表）。设计 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md)、施工图 [`docs/zh-cn/native-shader-plan.md`](docs/zh-cn/native-shader-plan.md) | native（web 待 M4） | 中 | **进行中** |
+| **原生着色器直通**（GLSL ES 3.00 源 → MSL/HLSL） | ✗（只有 AGAL 寄存器语言） | **进行中（阶段三百五十三）**：源语言 GLSL ES 3.00 → glslang + SPIR-V + SPIRV-Cross → MSL；`--features native-shader`（仅 native）注册 `Context3DNative`/`NativeProgram3D`。**已真机验收**：`asaot3d/apps/shader-m30` 用作者的一对 GLSL 画四边形，`drawToBitmapData` 读回中心 `#804020` 与 `uColor.rgb * vUV.x` 逐位相符；同一份 `.as` 在默认构建/`adl` 下打印 `NO-CHANNEL` 并退出 0。**M3 能力面已补验**（阶段三百五十五，`asaot3d/apps/shader-m31` 13 项 PASS）：32F/16F 目标可渲可读且 fp16 确实丢位、MRT 两附件分别读回、`texelFetch` 精确、`uvec2` 整数哈希、深度纹理**作附件**的遮挡判定；`asaot3d/apps/ocean-m32` 已用它跑通 Tessendorf FFT 海洋。**未做**：M4 WebGL2 直通、M5 D3D12/HLSL、M7 余项（天空/大气、caustics、水下、喷雾、平面反射），以及深度纹理的 `sampler2DShadow` 比较采样（`sampler2D` 读深度在 Metal 上恒 0，契约定为「深度=渲染附件」）。设计 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md)、施工图 [`docs/zh-cn/native-shader-plan.md`](docs/zh-cn/native-shader-plan.md) | native（web 待 M4） | 中 | **进行中** |
 | **GPU 通用计算**（Metal compute / transform feedback） | ✗ | 两端 | 高 | 未排期 |
 | **无窗口 / 服务端出图** | 半（可离屏，但绑死 AIR 运行时） | 两端 | 已有（headless + `stage.render()` 出 PNG） | 已有 |
 | **64 位整数**（`int64`/`uint64`） | ✗（`int`/`uint` 均 32 位） | ✅ **已实现、opt-in**：类型 + `L`/`UL` 字面量 + `int64()`/`uint64()` 转换 + 64 位算术/位运算/比较 + 独立装箱 tag；纯 C ⇒ **native/web/WASI 同一份代码同一行为**（无胶水依赖） | — | **已完成（阶段九十四·二十四）** |

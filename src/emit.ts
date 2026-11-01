@@ -26077,6 +26077,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->bindingKinds = as_array_new(); gc_write_barrier((void*)o->bindingKinds);');
     this.line('o->bindingSlots = as_array_new(); gc_write_barrier((void*)o->bindingSlots);');
     this.line('o->bindingStages = as_array_new(); gc_write_barrier((void*)o->bindingStages);');
+    this.line('o->bindingComponents = as_array_new(); gc_write_barrier((void*)o->bindingComponents);');
+    this.line('o->bindingBaseTypes = as_array_new(); gc_write_barrier((void*)o->bindingBaseTypes);');
+    this.line('o->bindingSizes = as_array_new(); gc_write_barrier((void*)o->bindingSizes);');
     this.indent--;
     this.line('}');
     // Reflection lookup: -1 (not an error) when the name is absent, so callers can
@@ -26132,6 +26135,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_array_push(p->bindingKinds, as_v_num((double)sp.bindings[i].kind));');
     this.line('as_array_push(p->bindingSlots, as_v_num((double)sp.bindings[i].binding));');
     this.line('as_array_push(p->bindingStages, as_v_num((double)sp.bindings[i].stage));');
+    this.line('as_array_push(p->bindingComponents, as_v_num((double)sp.bindings[i].components));');
+    this.line('as_array_push(p->bindingBaseTypes, as_v_num((double)sp.bindings[i].base_type));');
+    this.line('as_array_push(p->bindingSizes, as_v_num((double)sp.bindings[i].size));');
     this.indent--;
     this.line('}');
     this.line('asc_shader_program_free(&sp);');
@@ -26210,6 +26216,34 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 16);');
     this.indent--;
     this.line('}');
+    // Arrays and integer uniforms. The backend stores a 64-byte payload per
+    // [[buffer(N)]], so 16 words is the ceiling; a longer vector is truncated HERE
+    // with an exception rather than silently half-uploaded, because a partially
+    // written uniform array is a wrong picture with no symptom.
+    this.line('void Context3DNative_setUniformFloats(void* _this, NativeProgram3D* p, char* name, as_vector_number* v) {');
+    this.indent++;
+    this.line('if (v == NULL) as_throw(ArgumentError_new((char*)"Context3DNative.setUniformFloats: values is null", 2004));');
+    this.line('if (v->length > 16) as_throw(ArgumentError_new((char*)"Context3DNative.setUniformFloats: at most 16 floats (the backend uniform payload is 64 bytes)", 2004));');
+    this.line('float f[16];');
+    this.line('int n = v->length;');
+    this.line('for (int i = 0; i < n; i++) f[i] = (float)v->data[i];');
+    this.line('as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, n > 0 ? n : 1);');
+    this.indent--;
+    this.line('}');
+    // Integers MUST NOT go through the float path: `setUniform4f` memcpy's 2.0f
+    // (0x40000000) into a `uniform int` slot, which the shader reads as 1073741824.
+    // Metal accepts it, so the only symptom is a wrong result -- see the comment on
+    // asc_shader_binding.base_type.
+    this.line('void Context3DNative_setUniformInts(void* _this, NativeProgram3D* p, char* name, as_vector_int* v) {');
+    this.indent++;
+    this.line('if (v == NULL) as_throw(ArgumentError_new((char*)"Context3DNative.setUniformInts: values is null", 2004));');
+    this.line('if (v->length > 16) as_throw(ArgumentError_new((char*)"Context3DNative.setUniformInts: at most 16 integers", 2004));');
+    this.line('float f[16];');
+    this.line('int n = v->length;');
+    this.line('for (int i = 0; i < n; i++) { int32_t bits = (int32_t)v->data[i]; memcpy(&f[i], &bits, 4); }');
+    this.line('as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, n > 0 ? n : 1);');
+    this.indent--;
+    this.line('}');
     this.line('void Context3DNative_bindTexture(void* _this, NativeProgram3D* p, char* name, TextureBase* tex) {');
     this.indent++;
     this.line('Context3DNative* self = (Context3DNative*)_this;');
@@ -26269,7 +26303,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('Context3D_submit(self->context, indexBuffer, numTriangles, 1);');
     this.indent--;
     this.line('}');
-    this.line('Texture* Context3DNative_createTexture(void* _this, int width, int height, char* format, bool renderable) {');
+    this.line('Texture* Context3DNative_createTexture(void* _this, int width, int height, char* format, bool renderable, bool mipmapped) {');
     this.indent++;
     this.line('Context3DNative* self = (Context3DNative*)_this;');
     this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
@@ -26284,12 +26318,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (width <= 0 || height <= 0) as_throw(ArgumentError_new((char*)"Context3DNative.createTexture: width and height must be > 0", 2004));');
     this.line('int cap = as_s3d_max_texture_size();');
     this.line('if (width > cap || height > cap) as_throw(Error_new((char*)"Error #3683: Texture too large.", 3683));');
-    this.line('void* gpu = as_s3d_create_texture_fmt(self->context->gpu, width, height, fid, renderable ? 1 : 0);');
+    this.line('void* gpu = as_s3d_create_texture_fmt(self->context->gpu, width, height, fid, renderable ? 1 : 0, mipmapped ? 1 : 0);');
     this.line('if (gpu == NULL) as_throw(Error_new((char*)"Error #3684: Texture size too large or out of memory.", 3684));');
     this.line('Texture* t = Texture_new();');
     this.line('t->width = width; t->height = height; t->format = format; gc_write_barrier((void*)format);');
-    this.line('t->gpu = gpu; t->ctx = self->context->gpu; t->mips = 1;');
+    this.line('t->gpu = gpu; t->ctx = self->context->gpu; t->mips = mipmapped ? 2 : 1;');
     this.line('return t;');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3DNative_generateMipmaps(void* _this, TextureBase* tex) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    // A texture created WITHOUT `mipmapped: true` has no chain to fill; silently
+    // returning would leave `textureLod` sampling level 0 forever, so this reports.
+    this.line('if (tex == NULL || tex->vtable != (void*)&Texture_vt) as_throw(ArgumentError_new((char*)"Context3DNative.generateMipmaps: not a Texture", 2004));');
+    this.line('Texture* t = (Texture*)tex;');
+    this.line('if (t->gpu == NULL) as_throw(ArgumentError_new((char*)"Context3DNative.generateMipmaps: texture has no GPU storage", 2004));');
+    this.line('if (t->mips < 2) as_throw(ArgumentError_new((char*)"Context3DNative.generateMipmaps: the texture was created without mipmaps (pass mipmapped: true)", 2004));');
+    this.line('as_s3d_generate_mips(self->context->gpu, t->gpu);');
     this.indent--;
     this.line('}');
     this.line('Texture* Context3DNative_createDepthTexture(void* _this, int width, int height, char* format) {');
@@ -26305,7 +26352,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('if (width <= 0 || height <= 0) as_throw(ArgumentError_new((char*)"Context3DNative.createDepthTexture: width and height must be > 0", 2004));');
-    this.line('void* gpu = as_s3d_create_texture_fmt(self->context->gpu, width, height, fid, 1);');
+    this.line('void* gpu = as_s3d_create_texture_fmt(self->context->gpu, width, height, fid, 1, 0);');
     this.line('if (gpu == NULL) as_throw(Error_new((char*)"Error #3684: Texture size too large or out of memory.", 3684));');
     this.line('Texture* t = Texture_new();');
     this.line('t->width = width; t->height = height; t->format = format; gc_write_barrier((void*)format);');
@@ -27563,16 +27610,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('if (as_s3d_readback_render(o->gpu, rgba)) {');
     this.indent++;
-    this.line('for (int y = 0; y < o->backBufferHeight; y++) {');
+    // The copy is bounded by the DESTINATION, not by the back buffer. The two are
+    // routinely different sizes: every readback probe reads a 64x64 or 256x256
+    // window out of a much larger back buffer, and the loop below used to walk the
+    // whole back buffer while indexing a bitmap-sized buffer -- a heap overflow
+    // whose first symptom was Metal answering "method cache corrupted /
+    // MTLResourceListAddResource" on the NEXT frame, nowhere near the write (the
+    // m32 FFT ocean found it; a 64x64 readback had been corrupting the heap since
+    // the first probe and only survived because the probe exits immediately).
+    // Only the overlapping top-left region is filled.
+    this.line('int cw = o->backBufferWidth < destination->width ? o->backBufferWidth : destination->width;');
+    this.line('int ch = o->backBufferHeight < destination->height ? o->backBufferHeight : destination->height;');
+    this.line('for (int y = 0; y < ch; y++) {');
     this.indent++;
-    this.line('for (int x = 0; x < o->backBufferWidth; x++) {');
+    this.line('for (int x = 0; x < cw; x++) {');
     this.indent++;
     this.line('int idx = y * o->backBufferWidth + x;');
     this.line('uint8_t b = rgba[idx * 4 + 0];');
     this.line('uint8_t g = rgba[idx * 4 + 1];');
     this.line('uint8_t r = rgba[idx * 4 + 2];');
     this.line('uint8_t a = rgba[idx * 4 + 3];');
-    this.line('((uint32_t*)destination->pixels)[idx] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;');
+    this.line('((uint32_t*)destination->pixels)[y * destination->width + x] = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;');
     this.indent--;
     this.line('}');
     this.indent--;

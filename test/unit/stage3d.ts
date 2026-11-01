@@ -1680,6 +1680,90 @@ function checkStage3dPendingClear(): string[] {
 
 registerGroup('stage3d/pending-clear-no-draw', checkStage3dPendingClear);
 
+// `Context3D.drawToBitmapData` must never write outside the destination bitmap.
+//
+// This is the one defect in this file that cost a heap corruption rather than a
+// wrong pixel: the loop walked the whole BACK BUFFER (960x600 in the m32 ocean)
+// while indexing a destination-sized buffer (256x256), writing ~1.1 MB past the
+// end. Nothing showed up at the readback itself -- the pixels that were read back
+// were correct -- and the crash landed in Metal (`MTLResourceListAddResource`,
+// "method cache corrupted") ONE FRAME LATER, which reads as a driver bug. It had
+// been latent since the first readback probe, because every probe read back and
+// then exited before the heap damage could be used.
+function checkStage3dDrawToBitmapBounds(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const emitted = emittedLines();
+  const i = emitted.indexOf('void Context3D_drawToBitmapData(');
+  const body = i < 0 ? '' : emitted.slice(i, i + 2000);
+  check('drawToBitmapData is emitted', body !== '');
+
+  // 1. The copy dimensions are the intersection, measured against the bitmap.
+  check('the copy width/height are clamped to the destination bitmap',
+    /int cw = o->backBufferWidth < destination->width \? o->backBufferWidth : destination->width;/.test(body)
+    && /int ch = o->backBufferHeight < destination->height \? o->backBufferHeight : destination->height;/.test(body));
+
+  // 2. The destination index is destination-strided. The bug was exactly this:
+  //    a back-buffer-strided `idx` reused as the destination offset.
+  check('the destination is written with its own stride',
+    /\[y \* destination->width \+ x\] =/.test(body));
+
+  // 3. Both loops must walk the clamped counts -- a `y < o->backBufferHeight`
+  //    loop with a clamped body would still leave the last rows unwritten, and a
+  //    `y < o->backBufferHeight` loop with a destination index is the overflow.
+  check('both loops walk the clamped counts, not the back buffer size',
+    /for \(int y = 0; y < ch; y\+\+\)/.test(body) && /for \(int x = 0; x < cw; x\+\+\)/.test(body)
+    && !/for \(int y = 0; y < o->backBufferHeight/.test(body));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/draw-to-bitmap-bounds', checkStage3dDrawToBitmapBounds);
+
+// A depth-only texture must never reach Metal's stencil slot.
+//
+// Two independent failures came out of this, and both are silent:
+//   * pipeline validation aborts the whole PSO with
+//     "stencilAttachmentPixelFormat MTLPixelFormatDepth32Float is not stencil
+//      renderable" (loud, but it kills the draw);
+//   * worse, a pipeline that validates will still drop the DEPTH ATTACHMENT when
+//     the pass puts a depth-only texture on the stencil slot too -- geometry then
+//     renders with no depth testing at all and nothing reports anything.
+// Both the PSO and every render pass therefore key the stencil slot off
+// `MTLPixelFormatDepth32Float_Stencil8` (the one packed format the context uses
+// for its own depth/stencil).
+function checkStage3dDepthOnlyStencil(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean) => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+  const glue = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
+
+  check('the pipeline descriptor nulls the stencil format for a depth-only format',
+    /pd\.stencilAttachmentPixelFormat = \(dfmt == MTLPixelFormatDepth32Float_Stencil8\)/.test(glue)
+    && /MTLPixelFormatInvalid/.test(glue));
+
+  // Exactly two render-pass builders assign the stencil slot (s3d_apply_pending_clear
+  // and the main s3d_pass); both must be guarded.
+  const assigns = [...glue.matchAll(/rp\.stencilAttachment\.texture = ds;/g)];
+  const guards = [...glue.matchAll(/if \(ds\.pixelFormat == MTLPixelFormatDepth32Float_Stencil8\) \{/g)];
+  check('every stencil-attachment assignment is guarded by the packed-format test',
+    assigns.length > 0 && guards.length >= assigns.length);
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/depth-only-stencil', checkStage3dDepthOnlyStencil);
+
 // AGAL's `exp` and `log` are BASE 2, i.e. 2^x and log2(x) -- not the natural
 // pair. Measured on adl 51.4.1 (temp/agalprobe/Exp.as, same source on adl and on
 // the AOT build): exp(-1) reads back 0x7F = 0.498 = 2^-1 and log(2) reads back

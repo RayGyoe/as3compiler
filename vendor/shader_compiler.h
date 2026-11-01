@@ -30,12 +30,28 @@ extern "C" {
 #define ASC_SHADER_KIND_TEXTURE 2
 #define ASC_SHADER_KIND_ATTRIBUTE 3
 
+/* Scalar category of a uniform, so the host can upload the right BIT PATTERN.
+ *
+ * Why this is not cosmetic: `setUniform4f` memcpy's four 32-bit FLOATS. Feeding
+ * that to `uniform int uSub` stores 2.0f (0x40000000) where the shader reads the
+ * integer 1073741824 -- and MSL does not complain, so the only symptom is a wrong
+ * picture. The FFT's `uSub`, `uVertical`, `uCascade` and PCG's `uSeed` are all
+ * integers, which is why the table carries this at all. */
+#define ASC_SHADER_BASE_FLOAT 0
+#define ASC_SHADER_BASE_INT 1
+#define ASC_SHADER_BASE_UINT 2
+#define ASC_SHADER_BASE_BOOL 3
+
 typedef struct {
   char* name;    /* owned by the program; freed by asc_shader_program_free */
   int kind;      /* ASC_SHADER_KIND_* */
   int binding;   /* MSL/HLSL slot index. For attributes: the vertex location. */
   int stage;     /* 0 = vertex, 1 = fragment (uniforms/attributes differ) */
   int size;      /* array element count; 1 when not an array */
+  /* Scalars in ONE element: 1 for a scalar, 2..4 for a vector, 4/9/16 for a
+   * mat2/mat3/mat4. `size * components` is the number of words to upload. */
+  int components;
+  int base_type; /* ASC_SHADER_BASE_* */
 } asc_shader_binding;
 
 typedef struct {

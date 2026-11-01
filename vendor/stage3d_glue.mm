@@ -469,6 +469,13 @@ static void s3d_alloc_msaa(S3DContext* c, int w, int h) {
 // on-screen passes only, so a render-to-texture draw forces 1.
 static int s3d_pass_samples(S3DContext* c) {
   if (c->renderOverride != nil) return 1;
+  // A NATIVE pass is offscreen by definition: its first attachment comes from
+  // setRenderTargets, and the MSAA branch below rewrites colorAttachments[0] to the
+  // multisample buffer. Leaving MSAA on would therefore send attachment 0 to the
+  // back buffer while attachments 1..n-1 went to the caller's textures -- an MRT
+  // pass that silently loses its first target. Measured cause of this guard: the
+  // E6 capability probe (apps/shader-m31) with ASC_S3D_MSAA=4.
+  if (c->nativeMode && c->nativeColor[0] != nil) return 1;
   if (c->msaaColor == nil || c->msaaDepthStencil == nil) return 1;
   return c->msaaCount;
 }
@@ -528,10 +535,17 @@ static void s3d_apply_pending_clear(S3DContext* c) {
       rp.depthAttachment.loadAction = wantDepth ? MTLLoadActionClear : MTLLoadActionLoad;
       rp.depthAttachment.clearDepth = (double)c->clearDepthValue;
       rp.depthAttachment.storeAction = MTLStoreActionStore;
-      rp.stencilAttachment.texture = ds;
-      rp.stencilAttachment.loadAction = wantStencil ? MTLLoadActionClear : MTLLoadActionLoad;
-      rp.stencilAttachment.clearStencil = (uint32_t)c->clearStencilValue;
-      rp.stencilAttachment.storeAction = MTLStoreActionStore;
+      // The stencil slot mirrors the pipeline (see s3d_make_pso): a depth-only
+      // texture -- which an offscreen render target may well carry -- declared on
+      // both slots makes Metal drop the depth attachment entirely. The context's
+      // own depth/stencil is packed, so this only ever skips a foreign depth-only
+      // target; it is the same guard the native pass uses.
+      if (ds.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+        rp.stencilAttachment.texture = ds;
+        rp.stencilAttachment.loadAction = wantStencil ? MTLLoadActionClear : MTLLoadActionLoad;
+        rp.stencilAttachment.clearStencil = (uint32_t)c->clearStencilValue;
+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
+      }
     }
     id<MTLRenderCommandEncoder> e = [c->batch renderCommandEncoderWithDescriptor:rp];
     if (e != nil) [e endEncoding];
@@ -1362,12 +1376,20 @@ static id<MTLRenderPipelineState> s3d_make_pso(S3DContext* c, const char* blendS
   // (stage 87) and land on the encoder in s3d_draw below.
   if (c->nativeMode ? (c->nativeDepth != nil) : (c->depthStencil != nil)) {
     // A native pass may bring its own depth texture (a sampled depth attachment is
-    // the whole point of createdDepthTexture), so its format wins over the fixed
+    // the whole point of createDepthTexture), so its format wins over the fixed
     // back-buffer D32S8.
+    //
+    // The stencil slot must follow the DEPTH format's own capability, not copy it:
+    // Metal aborts the pipeline with "stencilAttachmentPixelFormat
+    // MTLPixelFormatDepth32Float is not stencil renderable" when a depth-only
+    // texture (DEPTH_32F / DEPTH_16, no stencil channel) is declared as both.
+    // Leaving the stencil format Invalid is what makes a depth-only attachment
+    // legal; a packed D32S8 texture keeps both.
     MTLPixelFormat dfmt = MTLPixelFormatDepth32Float_Stencil8;
     if (c->nativeMode && c->nativeDepth != nil) dfmt = c->nativeDepth.pixelFormat;
     pd.depthAttachmentPixelFormat = dfmt;
-    pd.stencilAttachmentPixelFormat = dfmt;
+    pd.stencilAttachmentPixelFormat = (dfmt == MTLPixelFormatDepth32Float_Stencil8)
+        ? MTLPixelFormatDepth32Float_Stencil8 : MTLPixelFormatInvalid;
   }
   // Blending defaults to off; setBlendFactors turns it on. Stage3D's initial
   // state is (ONE, ZERO), which is exactly "no blending".
@@ -2026,10 +2048,16 @@ int s3d_draw(void* ctx, int numTriangles) {
     rp.depthAttachment.loadAction = (c->clearPending && c->clearDepth) ? MTLLoadActionClear : MTLLoadActionLoad;
     rp.depthAttachment.clearDepth = (double)c->clearDepthValue;
     rp.depthAttachment.storeAction = MTLStoreActionStore;
-    rp.stencilAttachment.texture = ds;
-    rp.stencilAttachment.loadAction = (c->clearPending && c->clearStencil) ? MTLLoadActionClear : MTLLoadActionLoad;
-    rp.stencilAttachment.clearStencil = (uint32_t)c->clearStencilValue;
-    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    // The stencil slot mirrors the pipeline: it is only filled when the texture
+    // actually has a stencil channel. A depth-only texture (DEPTH_32F/DEPTH_16)
+    // declared on both slots makes Metal drop the depth attachment -- the render
+    // came out with no depth testing at all, which cost a debugging round here.
+    if (ds.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+      rp.stencilAttachment.texture = ds;
+      rp.stencilAttachment.loadAction = (c->clearPending && c->clearStencil) ? MTLLoadActionClear : MTLLoadActionLoad;
+      rp.stencilAttachment.clearStencil = (uint32_t)c->clearStencilValue;
+      rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    }
   }
   c->clearPending = 0;
   c->clearColor = 0; c->clearDepth = 0; c->clearStencil = 0;
@@ -2376,13 +2404,13 @@ static MTLPixelFormat s3d_fmt_from_id(int id) {
   }
 }
 
-void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId, int renderable) {
+void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId, int renderable, int mipmapped) {
   if (ctx == NULL || width <= 0 || height <= 0) return NULL;
   S3DContext* c = (S3DContext*)ctx;
   MTLPixelFormat fmt = s3d_fmt_from_id(fmtId);
   if (fmt == MTLPixelFormatInvalid) return NULL;
   MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
-      width:(NSUInteger)width height:(NSUInteger)height mipmapped:NO];
+      width:(NSUInteger)width height:(NSUInteger)height mipmapped:(mipmapped ? YES : NO)];
   if (d == nil) return NULL;
   const int isDepth = (fmtId == 9 || fmtId == 10);
   if (renderable) {
@@ -2398,6 +2426,26 @@ void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId, int re
   id<MTLTexture> t = [c->device newTextureWithDescriptor:d];
   if (t == nil) return NULL;
   return (void*)t;
+}
+
+// Build the mip chain of a GPU-written target.
+//
+// WHY THIS CANNOT BE DONE AT UPLOAD TIME: an environment map is uploaded, so its
+// chain can be built once (s3d_generate_cube_mips). A RENDER TARGET's level 0 does
+// not exist until the pass that writes it, and the ocean re-derives it every frame;
+// the chain therefore has to be built on the GPU, after the draw, on the same
+// queue. Order is guaranteed by FIFO on that queue, so no explicit sync is needed
+// beyond the one wait the caller's own frame boundary already implies.
+void s3d_generate_mips(void* ctx, void* tex) {
+  if (ctx == NULL || tex == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  id<MTLTexture> t = (id<MTLTexture>)tex;
+  if (t.mipmapLevelCount <= 1) return;
+  id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+  id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+  [blit generateMipmapsForTexture:t];
+  [blit endEncoding];
+  [cb commit];
 }
 
 int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {

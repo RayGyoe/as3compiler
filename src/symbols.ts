@@ -7656,11 +7656,25 @@ export class SymbolTable {
           ['setUniform2f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number'), p('v2', 'Number')])],
           ['setUniform3f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number'), p('v2', 'Number'), p('v3', 'Number')])],
           ['setUniform4f', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('v1', 'Number'), p('v2', 'Number'), p('v3', 'Number'), p('v4', 'Number')])],
+          // Arrays and integer uniforms. `setUniform4f` memcpy's four FLOATS, so an
+          // `int`/`uint` uniform fed through it reads a bit pattern, not a number;
+          // and a `vec4 uSpecA[2]` is 8 words, which no *f form can express.
+          // `...Floats` / `...Ints` take the whole run and upload it verbatim, so
+          // the caller can bind a GLSL array from one Vector. Both cap at 16 words
+          // (the backend's 64-byte uniform payload).
+          ['setUniformFloats', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('values', 'Vector.<Number>')])],
+          ['setUniformInts', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('values', 'Vector.<int>')])],
           ['setUniformMatrix4', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('m', 'Vector.<Number>')])],
           ['bindTexture', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('name', 'String'), p('texture', 'TextureBase')])],
           ['drawTriangles', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('indexBuffer', 'IndexBuffer3D'), p('firstIndex', 'int', { kind: 'Num', value: 0, isInt: true }), p('numTriangles', 'int', { kind: 'Num', value: -1, isInt: true })])],
-          ['createTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String'), p('renderable', 'Boolean', { kind: 'Bool', value: true })])],
+          ['createTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String'), p('renderable', 'Boolean', { kind: 'Bool', value: true }), p('mipmapped', 'Boolean', { kind: 'Bool', value: false })])],
           ['createDepthTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String')])],
+          // Build the mip chain of a render target. A CPU-baked environment can hand
+          // its levels to uploadFromBitmapData; a GPU-written target cannot -- the
+          // levels do not exist until the pass that wrote level 0 is done, which is
+          // exactly when this is called. Without it `textureLod` in a vertex shader
+          // (the ocean's LOD selection) has nothing above level 0 to choose.
+          ['generateMipmaps', im({ kind: 'void' }, [p('texture', 'TextureBase')])],
           ['setRenderTargets', im({ kind: 'void' }, [p('colors', 'Array'), p('depth', 'TextureBase', { kind: 'Null' })])],
           ['setBackBuffer', im({ kind: 'void' }, [])],
         ]),
@@ -7699,6 +7713,13 @@ export class SymbolTable {
           ['bindingKinds', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
           ['bindingSlots', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
           ['bindingStages', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          // Parallel to the four arrays above: how many words one element holds and
+          // which bit pattern they carry (ASC_SHADER_BASE_*). The engine needs both
+          // to decide between setUniformFloats and setUniformInts, and to know that a
+          // `vec4[2]` wants eight words rather than four.
+          ['bindingComponents', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['bindingBaseTypes', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
+          ['bindingSizes', { type: { kind: 'array' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
           ['disposed', { type: { kind: 'bool' }, init: null, visibility: 'public', owner: 'NativeProgram3D', isStatic: false, isConst: false }],
         ]),
         staticFields: new Map(),

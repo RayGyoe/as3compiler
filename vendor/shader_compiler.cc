@@ -190,7 +190,7 @@ bool parse_pair(const std::string& vs, const std::string& fs,
 }
 
 void add_binding(asc_shader_program* out, int* cap, const char* name, int kind, int binding,
-                 int stage, int size) {
+                 int stage, int size, int components = 1, int base_type = ASC_SHADER_BASE_FLOAT) {
   if (name == nullptr || name[0] == '\0') return;
   if (out->binding_count == *cap) {
     int next = *cap == 0 ? 16 : *cap * 2;
@@ -203,6 +203,43 @@ void add_binding(asc_shader_program* out, int* cap, const char* name, int kind, 
   b->binding = binding;
   b->stage = stage;
   b->size = size > 0 ? size : 1;
+  b->components = components > 0 ? components : 1;
+  b->base_type = base_type;
+}
+
+// Scalar count and scalar category of a uniform type, looking THROUGH an array to
+// its element type (`uniform vec4 uSpecA[2]` -> components 4, size 2).
+void type_info(spvc_compiler comp, spvc_type_id type_id, int* size_out, int* components_out,
+               int* base_type_out) {
+  spvc_type t = spvc_compiler_get_type_handle(comp, type_id);
+  int size = 1;
+  unsigned dims = spvc_type_get_num_array_dimensions(t);
+  if (dims > 0) {
+    size = 1;
+    for (unsigned d = 0; d < dims; d++) {
+      unsigned n = spvc_type_get_array_dimension(t, d);
+      if (n > 0) size *= (int)n;
+    }
+    t = spvc_compiler_get_type_handle(comp, spvc_type_get_base_type_id(t));
+  }
+  int vec = (int)spvc_type_get_vector_size(t);
+  if (vec <= 0) vec = 1;
+  int cols = (int)spvc_type_get_columns(t);
+  if (cols <= 0) cols = 1;
+  int base = ASC_SHADER_BASE_FLOAT;
+  switch (spvc_type_get_basetype(t)) {
+    case SPVC_BASETYPE_INT8: case SPVC_BASETYPE_INT16: case SPVC_BASETYPE_INT32: case SPVC_BASETYPE_INT64:
+      base = ASC_SHADER_BASE_INT; break;
+    case SPVC_BASETYPE_UINT8: case SPVC_BASETYPE_UINT16: case SPVC_BASETYPE_UINT32: case SPVC_BASETYPE_UINT64:
+      base = ASC_SHADER_BASE_UINT; break;
+    case SPVC_BASETYPE_BOOLEAN:
+      base = ASC_SHADER_BASE_BOOL; break;
+    default:
+      base = ASC_SHADER_BASE_FLOAT; break;
+  }
+  *size_out = size;
+  *components_out = vec * cols;
+  *base_type_out = base;
 }
 
 int resource_array_size(spvc_compiler comp, spvc_type_id type_id) {
@@ -234,7 +271,9 @@ void reflect_msl(spvc_compiler comp, int stage, asc_shader_program* out, int* ca
     for (size_t i = 0; i < count; i++) {
       unsigned idx = spvc_compiler_msl_get_automatic_resource_binding(comp, list[i].id);
       if (idx == (unsigned)-1) continue;
-      add_binding(out, cap, list[i].name, ASC_SHADER_KIND_UNIFORM, (int)idx, stage, 1);
+      int usize = 1, ucomp = 1, ubase = ASC_SHADER_BASE_FLOAT;
+      type_info(comp, list[i].type_id, &usize, &ucomp, &ubase);
+      add_binding(out, cap, list[i].name, ASC_SHADER_KIND_UNIFORM, (int)idx, stage, usize, ucomp, ubase);
     }
   }
   if (spvc_resources_get_resource_list_for_type(res, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, &list, &count) == SPVC_SUCCESS) {

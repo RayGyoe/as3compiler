@@ -15829,12 +15829,23 @@ extern void* s3d_get_render_target(void* ctx);
 #define ASC_SHADER_KIND_UNIFORM 1
 #define ASC_SHADER_KIND_TEXTURE 2
 #define ASC_SHADER_KIND_ATTRIBUTE 3
+// Scalar category of a uniform. A float uploaded into an int slot is read as a
+// BIT PATTERN (2.0f == 1073741824), so the host must know which one it has.
+#define ASC_SHADER_BASE_FLOAT 0
+#define ASC_SHADER_BASE_INT 1
+#define ASC_SHADER_BASE_UINT 2
 typedef struct {
   char* name;
   int kind;
   int binding;
   int stage;
   int size;
+  // Scalars in ONE element: 1 for a scalar, 2..4 for a vector, 4/9/16 for a matrix.
+  // size * components words is the payload. Kept in sync with
+  // vendor/shader_compiler.h by hand -- the two must never disagree, which is why
+  // the fields are listed in the same order.
+  int components;
+  int base_type;
 } asc_shader_binding;
 typedef struct {
   char* vertex_source;
@@ -16306,7 +16317,8 @@ extern int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor,
 extern void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats);
 extern void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex);
 extern void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth);
-extern void* s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable);
+extern void* s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable, int mipmapped);
+extern void s3d_generate_mips(void* ctx, void* tex);
 
 static inline int as_s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
 #ifdef ASC_RENDER_STAGE3D
@@ -16341,11 +16353,18 @@ static inline void as_s3d_native_set_targets(void* ctx, void** colors, int ncolo
     (void)ctx; (void)colors; (void)ncolors; (void)depth;
 #endif
 }
-static inline void* as_s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable) {
+static inline void* as_s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable, int mipmapped) {
 #ifdef ASC_RENDER_STAGE3D
-    return s3d_create_texture_fmt(ctx, w, h, fmtId, renderable);
+    return s3d_create_texture_fmt(ctx, w, h, fmtId, renderable, mipmapped);
 #else
-    (void)ctx; (void)w; (void)h; (void)fmtId; (void)renderable; return NULL;
+    (void)ctx; (void)w; (void)h; (void)fmtId; (void)renderable; (void)mipmapped; return NULL;
+#endif
+}
+static inline void as_s3d_generate_mips(void* ctx, void* tex) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_generate_mips(ctx, tex);
+#else
+    (void)ctx; (void)tex;
 #endif
 }
 #endif  // ASC_HAS_NATIVE_SHADER
