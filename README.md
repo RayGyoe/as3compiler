@@ -367,7 +367,7 @@ Our product is a readable C file handed to `clang -O2`, able to link Skia/libcur
 and compile to native/WASI/web — so we can add enhancements where AIR **does not define / does not support / has no counterpart** (enhancements must be opt-in
 and never silent). The criterion: the same input that `adl` runs correctly but we cannot ⇒ a legacy defect; something `adl` already errors on or an API that does not exist ⇒ an enhancement.
 
-**Implemented (9 / 19)**:
+**Implemented (8 / 19)**:
 
 - **Display refresh-rate query** — `VsyncStateChangeAvailabilityEvent` gains a read-only `refreshRate:Number` (AIR has no refresh-rate API at all; the read-only `available` is measured to be constantly `false`)
 - **Multi-format image decoding** — WebP / BMP / ICO (`--features formats`; default reports `#2124` just like AIR)
@@ -377,7 +377,9 @@ and never silent). The criterion: the same input that `adl` runs correctly but w
 - **LTO / PGO build switches** — manifest `lto`/`pgo`, CLI `--lto`/`--pgo`
 - **Exit with a status code** — `System.exit(code)` (AIR's runtime throws `#2018`)
 - **macOS menu-bar status item** — `SystemTrayIcon` behind a real `NSStatusItem` (`--features tray`; AIR on macOS has `supportsSystemTrayIcon=false` and throws `#2012` on construction)
-- **Native shader passthrough** — `Context3DNative` takes GLSL ES 3.00 source, runs it through glslang + SPIRV-Cross to MSL/HLSL/GLSL, and unlocks float render targets, MRT, integer textures and depth textures (`--features native-shader`, native only; AIR has only the AGAL register language. In a default build the class **does not exist** at all, so `getDefinitionByName` throws `#1065` exactly as `adl` does)
+**In progress (1 / 19)**:
+
+- **Native shader passthrough** (E6) — `Context3DNative` takes GLSL ES 3.00 source and runs it through glslang + SPIR-V + SPIRV-Cross to MSL (`--features native-shader`, native only; AIR has only the AGAL register language, and in a default build these classes **do not exist** at all, so `getDefinitionByName` throws `#1065` exactly as `adl` does). **The path is verified on device** (`asaot3d/apps/shader-m30`: an author GLSL pair draws a quad and the readback centre `#804020` matches the expression bit for bit; a default build / `adl` prints `NO-CHANNEL` and refuses). **Not finished**: web passthrough, D3D12, the readback values of float targets and MRT, and depth-texture sampling (checklist in [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md) §11)
 
 The full 19-item list (the rest being Lottie, FFI, server-side rendering…) and the five criteria are in
 [`docs/en/enhancements.md`](docs/en/enhancements.md).

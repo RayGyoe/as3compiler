@@ -369,6 +369,7 @@ as-aot app.as --air-app app.xml --features none     # clear (see below: this cle
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | extra image formats WebP / BMP / ICO (AIR reports `#2124` for them, hence **denied by default** — see §3.4.3.1) |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | `native` only | camera RAW / DNG (denied by default — see §3.4.3.1; the web-side Skia has no piex/dng_sdk archive, so it errors when the target is unsupported) |
 | `tray` | `ASC_USE_TRAY=1` | `native` only, **and the host must be macOS** | `SystemTrayIcon` behind a real `NSStatusItem` (see §3.4.5). AIR on macOS has no system tray at all (`supportsSystemTrayIcon=false`, `#2012`), hence off by default |
+| `native-shader` | `ASC_USE_NATIVE_SHADER=1` | `native` only | Registers `flash.display3D.Context3DNative` / `NativeProgram3D` (author GLSL ES 3.00 → glslang + SPIRV-Cross → MSL) and links the 14 static archives under `vendor/shader`. AIR only has the AGAL register language, hence off by default — **those two classes do not exist in a default build**, and `getDefinitionByName` throws `#1065` exactly as `adl` does. See [`native-shader.md`](native-shader.md) |
 
 This table is the **complete** list of named enhancement switches: `--features` only registers "AIR-superset
 capabilities" — off by default, and turning one on changes what the artifact means. The window GPU backend is
@@ -389,7 +390,7 @@ Rules (all three exist to **not be silent**, AGENTS.md §1.5):
   isomorphic with `adl`. When enabled it prints a line
   `== enhancements: svg (-D ASC_USE_SVG=1) ==` and states in the hint that it is an AIR superset.
 - **An unknown name errors**, not silently ignored: `--features lottie` reports
-  `unknown feature 'lottie' (known: formats, raw, svg, tray)` and exits **before generating any code** (only
+  `unknown feature 'lottie' (known: formats, native-shader, raw, svg, tray)` and exits **before generating any code** (only
   capabilities already implemented in the manifest are registered; a registered-but-unimplemented switch
   would give the user something that "looks enabled but was never compiled in"). `--features none` cannot be
   combined with other names.
@@ -750,7 +751,13 @@ carrying **non-class top-level statements** (module statements / free functions)
 for the whole program and cannot be pruned per class.
 
 Classes referenced **only by a `getDefinitionByName("…")` string** are not kept, matching AIR (mxmlc
-cannot resolve the string either). The class registry `as_class_registry[]` stays eager (it also
+cannot resolve the string either). To keep one, name it explicitly: the manifest field
+`extra-roots: ["a.b.C", ...]` or CLI `--extra-roots a.b.C,d.E` (see the §4 `extra-roots` row) — it only
+seeds the root set, **does not widen the closure and does not resolve paths**, deduplicates, and silently
+ignores a class name that does not exist. Typical case: `asaot3d`'s `NativeShaderRenderer` is referenced
+only by `RendererFactory`'s string probe, and forgetting to list it degrades **silently** (the probe misses
+and the factory falls back to the default backend) instead of failing. The class registry
+`as_class_registry[]` stays eager (it also
 serves `is Class`, `new x()`, `getDefinitionByName` and the GC roots) — what shrinks is the
 **emission** face, not the runtime table.
 
@@ -1015,6 +1022,7 @@ kebab-case.
 | `defines` | string[] | Preprocessor macros (→ `-D`) |
 | `c-flags` | string[] | Flags forwarded **verbatim** to the C/C++ compiler (the manifest form of `--cflag <f>` / `-w`). They land on **every** compile step and the link step (C source, C++ glue, link), positioned **before** the objects and `-l` libraries (link flags such as `-Wl,--as-needed` are order sensitive). There is **no allow-list**: a flag the compiler does not understand must fail the build loudly — that is the only proof the flag really reached the compiler. Empty by default, so a build that names none is byte-for-byte what it was. Top level appends (so CLI and manifest can coexist); a `targets.<target>` block replaces (§4.1's rule) |
 | `features` | string[] | **Named enhancement switches** (§3.4.2), e.g. `["svg"]`. Empty by default. An unknown name is an error; when on, the build banner names it, and when off the artifact matches `adl`. On the CLI `--features` **replaces** the whole set (`-D` is the one that appends) |
+| `extra-roots` | string[] | **Extra closure roots** (§3.5.1): fully-qualified names of classes that only a **string** names (`getDefinitionByName("…")`) and that therefore have no AST reference edge (e.g. `["asaot.three.NativeShaderRenderer"]`). Only seeds the root set — no path resolution, no semantic widening; deduplicated; a name that does not exist is **ignored, not an error**. Written by `--air-app --extra-roots <fqns>`, **top level only**. Builds without the field are **byte-for-byte unchanged** |
 | `gpu-backend` | `"auto" \| "d3d12" \| "gl"` | Windows' **window GPU backend** (§3.4.6); absent = `auto` (D3D12). Written by `--air-app --gpu-backend`, and **top level only** (inside a `targets.<target>` block it is an error: the backend is decided by the descriptor plus the host, not a per-target quantity). Builds without the field are **byte-for-byte unchanged**. It is **cross-checked** against `defines`: `gl` must carry `ASC_RENDER_GL=1`, `d3d12` must carry `ASC_RENDER_D3D=1`, and both macros at once is a hard error |
 | `objects` | string[] | Precompiled `.o` added directly to the link |
 | `frameworks` | string[] | macOS frameworks (→ `-framework X`, needed for Skia's CoreText/CoreGraphics backend) |

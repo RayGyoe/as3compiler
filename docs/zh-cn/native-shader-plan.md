@@ -62,10 +62,10 @@
 | **M0 立项** | 本文 + `enhancements.md` E6 状态 + `TODO.md` 阶段条目 | 文档落库，`node test.ts` 不变 |
 | **M1 交叉编译链** | `build-tools/shader/` 建 glslang + SPIRV-Cross；`vendor/shader_compiler.cc` 的 C 接口；独立 C 测试程序 | `./temp/shc-test` 打印出正确 MSL（含反射表） |
 | **M2 编译器侧** ✅ | `--features native-shader` 注册；`Context3DNative` 内建类 + 格式常量 + `uploadProgram`/绑定/draw；`ASC_HAS_NATIVE_SHADER` 门控 | `examples/native-shader-probe.as` 绿：MRT=2、反射 5 条、ES1.00/legacy 双双带行号拒绝 |
-| **M3 Metal 后端** ✅ | 浮点 RT 格式面、原生程序绑定（uniform/纹理/属性）、MRT、深度纹理 | `apps/shader-m30` 真机像素验收：中心 `#804020` / 3-8 处 `#361b0e`，与 `uColor.rgb * vUV.x` 逐位相符（M6 落地时一并修掉顶点描述符与 draw 提交两处缺陷，见 §5.6） |
+| **M3 Metal 后端** 🟡 | 浮点 RT 格式面、原生程序绑定（uniform/纹理/属性）、MRT、深度纹理 | **通路已真机验收，三项能力面未验**：`apps/shader-m30` 中心 `#804020` / 3-8 处 `#361b0e`，与 `uColor.rgb * vUV.x` 逐位相符（但它画的是**后台缓冲**）；**浮点 RT 读回、MRT 两附件分别读回、深度纹理采样均未验收**（格式创建面与 11 个 id 已落）。M7 开工前先补这三项（设计 §11 表） |
 | **M4 Web 免费点** | `stage3d_webgl.cc` 直通 + `EXT_color_buffer_float` | `--target wasm` 同一份 `.as` 出同一画面，零交叉编译 |
 | **M5 D3D12** | `stage3d_d3d.cc` 浮点 `DXGI_FORMAT` + 原生 HLSL | Windows 出图（CI/实机） |
-| **M6 引擎侧** ✅ | `ShaderMaterial` + `NativeShaderRenderer` + `RendererFactory` + `extra-roots` 清单字段 | `apps/shader-m30` 13 项全 PASS；`adl`/默认构建打印 NO-CHANNEL 并如实拒画（§8 红线） |
+| **M6 引擎侧** ✅ | `ShaderMaterial` + `NativeShaderRenderer` + `RendererFactory` + `extra-roots` 清单字段 | `apps/shader-m30` **15 项全 PASS**；`adl`/默认构建打印 NO-CHANNEL 并如实拒画（§8 红线）；引擎侧决策见 `asaot3d/three-api-design.md` §37 |
 | **M7 Ultra-Water 对齐** | FFT 海洋 → caustics → 大气 → 水下 | 与 three.js 参考逐项对拍 |
 
 ---
@@ -400,13 +400,15 @@ node test.ts > temp/node-test-full.log 2>&1
 
 ## 8. 待定项
 
-| # | 问题 | 现状 | 建议 |
+| # | 问题 | 现状 | 结论 |
 |---|---|---|---|
-| 1 | `Context3DNative` 的包路径 | 暂定 `flash.display3D.Context3DNative` | 放 `flash.display3D` 与 `Context3D` 同包，作者少一个 import |
-| 2 | 浮点格式在 AS3 侧的表达 | 用 `String` 常量（`"rgba32f"`） | 与 `Context3DTextureFormat` 同形（那也是 String） |
-| 3 | 是否提供 `RawShaderMaterial`（不注入任何前导） | 未定 | M6 再评估；先做 `ShaderMaterial` |
-| 4 | UBO（`layout(std140) uniform`） | 未做 | M5 后评估，Ultra-Water 不需要 |
-| 5 | 是否为 AOT 二进制预编译 shader（build-time） | 未做 | 运行时为主（设计 §5.4）；等有「启动耗时」数据再评估 |
+| 1 | `Context3DNative` 的包路径 | **已定** `flash.display3D.Context3DNative` | 与 `Context3D` 同包，作者少一个 import |
+| 2 | 浮点格式在 AS3 侧的表达 | **已定** `String` 常量（`"rgba32f"`…共 9 个） | 与 `Context3DTextureFormat` 同形（那也是 String） |
+| 3 | 是否提供 `RawShaderMaterial`（不注入任何前导） | **未做** | M6 评估过：`ShaderMaterial` 已足够覆盖 three.js 的 `ShaderMaterial` 用法，暂不做 |
+| 4 | UBO（`layout(std140) uniform`） | **未做** | M5 后评估，Ultra-Water 不需要；现在的绑定是**逐条 `[[buffer(N)]]` 名字绑定**，压根不算 `std140` 偏移 |
+| 5 | 是否为 AOT 二进制预编译 shader（build-time） | **未做** | 运行时为主（设计 §5.4）；等有「启动耗时」数据再评估 |
+| 6 | 浮点目标/深度纹理的真机验证口径（容差怎么定） | **待定** | M3 余项第一件事；建议：格式往返用**相对误差 1e-5**（32F）与 **1e-3**（16F），形状/附件数用逐位 |
+| 7 | FFT 归属（GPU 还是 CPU） | **待定** | 直接决定 M7 形状，开工前定（设计 §12） |
 
 ---
 
@@ -414,5 +416,6 @@ node test.ts > temp/node-test-full.log 2>&1
 
 | 日期 | 内容 |
 |---|---|
+| 2026-11-02 | **M6 引擎侧验收 + M3 通路验收**：`asaot3d/apps/shader-m30` 15 项 PASS（中心 `#804020`、3/8 `#361b0e`），默认构建/`adl` 打印 `NO-CHANNEL` 并退出 0；修掉四个「编译过、结果错/空」缺陷（§5.6）；`extra-roots` 清单字段 + `--extra-roots` CLI 落地；**同时修正文档口径**：M3 降为 🟡（浮点 RT / MRT 读回 / 深度纹理**未验收**）、M6 项数 13 → 15、§8 待定项 1/2/3/4/5 结案 |
 | 2026-11-02 | **M2 完成 + M3 代码落地**：`--features native-shader`（仅 native）、`Context3DNative`/`NativeProgram3D` 金标内建、`asc_shader_translate` 接线、Metal 侧 `s3d_native_*` 与 MRT 管线；`examples/native-shader-probe.as` 绿；`test/unit/native-shader.ts` 钉门控 |
 | 2026-11-02 | 立项；M1 交叉编译链在真机跑通（glslang@e7917c4 + SPIRV-Cross@65d7393，GLSL 300es→MSL 20100 全链路）；钉下 §4 契约 |

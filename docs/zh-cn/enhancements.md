@@ -59,7 +59,7 @@ as-aot app.as --air-app app.xml --features svg     # 等于 -D ASC_USE_SVG=1
 | | `-D ASC_USE_SVG=1` | `--features svg` |
 |---|---|---|
 | 可发现性 | 宏名只出现在文档正文里 | `--help` 列名字，报错也列出已知名字 |
-| 打错字 | 静默无效（clang 不管未使用的宏）——**正是 (b) 禁止的** | `unknown feature 'sgg' (known: formats, raw, svg)` 并在生成代码前退出 |
+| 打错字 | 静默无效（clang 不管未使用的宏）——**正是 (b) 禁止的** | `unknown feature 'sgg' (known: formats, native-shader, raw, svg, tray)` 并在生成代码前退出 |
 | 跨端能力 | 要用户自己知道 web 编不出来 | `feature 'svg' is not available with --target wasm` 直报（标准 c） |
 | 开了之后 | 不声不响 | 构建横幅点名 `== enhancements: svg (-D ASC_USE_SVG=1) ==`，再明说这是 AIR 超集 |
 | 集合语义 | 只能追加 | `--features` **替换**整个集合（`-D` 才是追加），故「只留 X」可表达；`--features none` 清空 |
@@ -77,7 +77,7 @@ as-aot app.as --air-app app.xml --features svg     # 等于 -D ASC_USE_SVG=1
 
 **窗口 GPU 后端不是增强，也不在这张表里**：`--gpu-backend`（[`compile.md`](compile.md) §3.4.6）换的是
 「同一套语义画在哪套原生 API 上」，不改变任何 API 行为、不解锁任何 AIR 拒绝的能力，因此不落在 §1.2 的
-判定范围内。它是**独立开关**：`--features gl` 会报 `unknown feature 'gl' (known: formats, raw, svg, tray)`。
+判定范围内。它是**独立开关**：`--features gl` 会报 `unknown feature 'gl' (known: formats, native-shader, raw, svg, tray)`。
 
 **默认拒绝（阶段九十四·二十五）**：E3/E4 的通道此前是「零代码可用」——我们的 Skia 本来就带这些
 codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `#2124`，我们却解出来了。这违反
@@ -111,6 +111,9 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 ## 3. 增强待做清单
 
 > **已完成 8 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）、E19 macOS 菜单栏状态项（`SystemTrayIcon`）。
+> **进行中 1 项**：**E6 原生着色器直通**——通路（作者 GLSL ES 3.00 → glslang → SPIR-V → MSL →
+> 管线 → draw → 像素）已真机验收，**但不算完成**：M4 Web 直通 / M5 D3D12 / M7 Ultra-Water 未做，
+> 且浮点 RT / MRT 读回 / 深度纹理三项**未验**（设计 §11 表）。所以它不在上面那 8 项里。
 > **另有 1 项现状即增强、无需开工**：E17（无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`）——
 > AIR 的 `software` 渲染模式在这里会直接 `#3702`，我们照常给上下文；详细实测见
 > [`display3d.md`](display3d.md) §9.14。

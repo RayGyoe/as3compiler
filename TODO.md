@@ -18887,7 +18887,7 @@ NEAREST/LINEAR、CLAMP/REPEAT、逐顶点插值）、纯 C 状态机 20 条；`t
 构建不进自动回归）。
 
 
-### 阶段三百五十三：E6 原生着色器直通 · 立项与交叉编译链（v0.4.313 → v0.4.314）
+### 阶段三百五十三：E6 原生着色器直通 · 立项、交叉编译链、编译器侧与引擎侧（v0.4.313 → v0.4.316）
 
 **范围**：`### 增强待做` 的 **E6**（原生着色器直通）。本阶段只做两件事：**立项**（施工图）与**交叉编译链**
 （M1）——把「GLSL ES 3.00 → 各后端」这条链变成可独立验证的 C 组件，先于任何 AS3 面动工。
@@ -18983,8 +18983,10 @@ M5 D3D12 → M6 引擎侧（`ShaderMaterial`/`NativeShaderRenderer`）→ M7 Ult
   会静默覆盖前者）；MRT 附件 1..n-1 走 `Load`（Stage3D 只有一个清屏色，属于附件 0）；`nativeDepth`
   非空时强制挂附件并让管线深度格式跟随它。
 
-**未做（明确登记，不静默）**：真机出图与 `readPixels` 容差验收；M4 WebGL2 直通；M5 D3D12/HLSL；
-深度纹理的 `sampler2DShadow` 比较采样（SPIRV-Cross 目前发普通 sampler，比较由 shader 侧做）。
+**未做（明确登记，不静默）**：M4 WebGL2 直通；M5 D3D12/HLSL；M7 Ultra-Water 对齐；深度纹理的
+`sampler2DShadow` 比较采样（SPIRV-Cross 目前发普通 sampler，比较由 shader 侧做）；以及 **M3 的三个能力面
+尚未真机验证**——浮点 RT 读回、MRT 两附件分别读回、深度纹理采样（`shader-m30` 画的是**后台缓冲**，
+它证明的是通路不是格式面）。这三项是 M7 开工前的第一件事，口径见 `native-shader.md` §11 表。
 
 ---
 
@@ -19347,7 +19349,7 @@ Retina 门）；真手势自测（`temp/gui11/temp/dragtest/`，Quartz 合成 + 
 > **2026-10-30 追加（阶段三百三十三：`extends Array`/`Dictionary`/`Date` 在 AIR 侧的限制）**：**新登记 1 行**。`temp/gprobe7` 双端实测（同一份 `.as` 同时喂 `mxmlc`+`adl` 与我们的 AOT）：`class X extends Array` 里任何动态写抛 `ReferenceError #1056: Cannot create property 0 on MyArr`、`class X extends Dictionary` 同样（`Cannot create property k on MyDict`）、`class X extends Date` 带参 `super(y, m, d)` 抛 `#1107 The ABC data is corrupt, attempt to read out of bounds` —— 即 **AIR 自己的子类化是坏的**，这属于「`adl` 本来就报错」⇒ 按 §1.5 是**增强**，不是欠账。我们这边三种子类都照常工作（已量：`arr` 长度/下标、`dict` 键读写、`date.getFullYear()` 全部正确），按增强规矩默认产物**不比 AIR 更宽松**这一条不适用（我们只是不主动复制 AIR 的 bug），故**记为已具备、不引入开关**，示例 `examples/builtin-class.as` 第 14 节刻意不对这三类作运行期断言（只在注释里点名），避免把「AIR 跑不通」写成「我们的契约」。
 >
 > **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
-> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224）**：下表 **18 项**，已完成 **7 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **7 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`），登记未实现的开关等于「看着开了、实际没编进去」。
+> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224；2026-11-02 原生着色器直通转「进行中」，v0.4.316）**：下表 **18 项**，已完成 **8 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64、显示器刷新率查询、带状态码退出、macOS 菜单栏状态项——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**进行中** 1 项（原生着色器直通：通路已真机验收，M4/M5/M7 与浮点目标读回未做，见阶段三百五十三）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **5 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`/`tray`/`native-shader`），登记未实现的开关等于「看着开了、实际没编进去」——`formats`/`native-shader` 还能改变符号表（类是否存在），其余只加宏。
 
 | 增强项 | AIR 现状 | 目标端 | 成本 | 状态 |
 |--------|---------|--------|------|------|
@@ -19356,7 +19358,7 @@ Retina 门）；真手势自测（`temp/gui11/temp/dragtest/`，Quartz 合成 + 
 | **WebP / BMP / ICO 解码** | 部分：仅 JPG/PNG/GIF（`adl` 对三者报 `#2124`） | ✅ **已实现、opt-in**（默认与 AIR **同报 `#2124`**，`--features formats` 打开后两端实测全部解码正确；`QOI` 未编入 `SkQoiCodec`，不含在内） | 两端 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **相机 RAW / DNG 解码** | ✗（`adl` 对 `.dng` 报 `#2124`；`BitmapData.loadFile` 不存在 → `#1069`） | ✅ **已实现、opt-in**（默认与 AIR 同报 `#2124`，`--features raw` 打开后 native 四条解码入口全部解出 600×338）；web 无 piex/dng_sdk 归档 ⇒ 该开关在 wasm 上被前置拒绝 | native / web 与 AIR 同形 | **已完成（九十四·二十五，默认拒绝 + 开关）** |
 | **矢量图形直接上屏**（`Shape` 走 `SkPath`） | ✗（`BitmapData` 只有位图） | 两端 | 中 | 未排期 |
-| **原生着色器直通**（MSL / GLSL ES） | ✗（只有 AGAL） | 两端 | 中 | 未排期（立项设计见 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md)） |
+| **原生着色器直通**（GLSL ES 3.00 源 → MSL/HLSL） | ✗（只有 AGAL 寄存器语言） | **进行中（阶段三百五十三）**：源语言 GLSL ES 3.00 → glslang + SPIR-V + SPIRV-Cross → MSL；`--features native-shader`（仅 native）注册 `Context3DNative`/`NativeProgram3D`。**已真机验收**：`asaot3d/apps/shader-m30` 用作者的一对 GLSL 画四边形，`drawToBitmapData` 读回中心 `#804020` 与 `uColor.rgb * vUV.x` 逐位相符；同一份 `.as` 在默认构建/`adl` 下打印 `NO-CHANNEL` 并退出 0。**未做**：M4 WebGL2 直通、M5 D3D12/HLSL、M7 Ultra-Water 对齐，以及浮点 RT / MRT 两附件 / 深度纹理的**读回数值**验收（设计 §11 表）。设计 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md)、施工图 [`docs/zh-cn/native-shader-plan.md`](docs/zh-cn/native-shader-plan.md) | native（web 待 M4） | 中 | **进行中** |
 | **GPU 通用计算**（Metal compute / transform feedback） | ✗ | 两端 | 高 | 未排期 |
 | **无窗口 / 服务端出图** | 半（可离屏，但绑死 AIR 运行时） | 两端 | 已有（headless + `stage.render()` 出 PNG） | 已有 |
 | **64 位整数**（`int64`/`uint64`） | ✗（`int`/`uint` 均 32 位） | ✅ **已实现、opt-in**：类型 + `L`/`UL` 字面量 + `int64()`/`uint64()` 转换 + 64 位算术/位运算/比较 + 独立装箱 tag；纯 C ⇒ **native/web/WASI 同一份代码同一行为**（无胶水依赖） | — | **已完成（阶段九十四·二十四）** |

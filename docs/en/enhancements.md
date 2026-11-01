@@ -71,7 +71,7 @@ macro directly:
 | | `-D ASC_USE_SVG=1` | `--features svg` |
 |---|---|---|
 | Discoverability | The macro name appears only in the docs body | `--help` lists the names; errors list the known names too |
-| Typos | Silently ineffective (clang ignores unused macros) — **exactly what (b) forbids** | `unknown feature 'sgg' (known: formats, raw, svg, tray)` and exits before generating code |
+| Typos | Silently ineffective (clang ignores unused macros) — **exactly what (b) forbids** | `unknown feature 'sgg' (known: formats, native-shader, raw, svg, tray)` and exits before generating code |
 | Cross-end capability | The user must know web cannot build it | `feature 'svg' is not available with --target wasm` stated directly (criterion c) |
 | Once enabled | Silent | A build banner names it `== enhancements: svg (-D ASC_USE_SVG=1) ==`, and states explicitly that this is an AIR superset |
 | Set semantics | Can only append | `--features` **replaces** the whole set (`-D` appends), so "keep only X" is expressible; `--features none` clears it |
@@ -92,7 +92,7 @@ error text both list them):
 **The window GPU backend is not an enhancement and is not in this table**: `--gpu-backend`
 ([`compile.md`](compile.md) §3.4.6) changes *which native API draws the same semantics*; it changes no API
 behavior and unlocks no capability AIR refuses, so it does not fall under §1.2. It is an **independent switch**:
-`--features gl` reports `unknown feature 'gl' (known: formats, raw, svg, tray)`.
+`--features gl` reports `unknown feature 'gl' (known: formats, native-shader, raw, svg, tray)`.
 
 **Default refusal (stage ninety-four · twenty-five)**: the E3/E4 channels were previously "usable with zero
 code" — our Skia already carries those codecs, so the **default output was wider than AIR**: AIR reports
@@ -130,8 +130,14 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 
 ## 3. Enhancement backlog
 
-> **6 items completed**: E1 SVG (native half), E3 multi-format decoding, E4 RAW/DNG (native half), E9 64-bit
-> integers, E13 LTO/PGO, E16 refresh-rate query.
+> **8 items completed**: E1 SVG (native half), E3 multi-format decoding, E4 RAW/DNG (native half), E9 64-bit
+> integers, E13 LTO/PGO, E16 refresh-rate query, E18 exit-with-status (`System.exit`), E19 the macOS menu-bar
+> status item (`SystemTrayIcon`).
+>
+> **One item is in progress**: **E6 raw shader passthrough** — the path (author GLSL ES 3.00 → glslang →
+> SPIR-V → MSL → pipeline → draw → pixels) is verified on device, **but it does not count as done**: M4 Web
+> passthrough / M5 D3D12 / M7 Ultra-Water are not started, and float RT / MRT readback / depth textures are
+> **unverified** (design §11 table). Hence it is not among the 8 above.
 >
 > **One more item is measured and explicitly not scheduled**: E10 (`Vector.<Number>` batch SIMD) — on arm64
 > AArch64 NEON has only **2** `f64` lanes while Apple-silicon scalar FP ports are already wide: hand-written
@@ -151,7 +157,7 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 | E3 | **Multi-format image decoding** (WebP / BMP / ICO) | partial: only JPG / PNG / GIF (measured: `adl 51.4.1` reports `#2124` for BMP/WebP/ICO) | ✅ **implemented, opt-in named switch `--features formats`**: the default build **reports `#2124` just like AIR**; once the switch is on, both ends measured to **decode correctly** (see §4.3); `QOI` is **not** included (no `SkQoiCodec` compiled in) | both ends | **done (default-refuse + switch)** |
 | E4 | **Camera RAW / DNG decoding** | ✗ (measured: `adl 51.4.1` reports `#2124` for `.dng`; `BitmapData.loadFile` **does not even exist**, `#1069`) | ✅ **implemented, opt-in named switch `--features raw`**: the default build reports `#2124` just like AIR; once the switch is on, all four native decode entry points decode DNG 600×338 (see §4.5); the web-side wasm Skia has **no** piex/dng_sdk archives (measured `nm`: 0 `SkRawDecoder` symbols) ⇒ the switch is **pre-rejected** on wasm, naming the missing archive | native done / web isomorphic to AIR | **done (default-refuse + switch)** |
 | E5 | **Vector graphics straight to screen** (`Shape` via `SkPath`, infinite resolution) | ✗ (`BitmapData` is bitmap-only) | Skia is already there, the AS3 surface is missing | both ends | medium |
-| E6 | **Raw shader passthrough** (MSL / GLSL ES) | ✗ (only the AGAL register language) | The AGAL→MSL/GLSL translator already exists (`ASC_AGAL_TARGET`), missing the extension API for "submitting a native shader" | both ends | medium |
+| E6 | **Raw shader passthrough** (GLSL ES 3.00 source → MSL / HLSL) | ✗ (only the AGAL register language) | Source language is **GLSL ES 3.00**; glslang + SPIRV-Cross (linked C libraries, Apache-2.0) cross-compile to MSL, HLSL and SPIR-V, and WebGL2 later consumes the source verbatim. **In progress (stage three-hundred-fifty-three)**: M1 toolchain, M2 compiler side, M3 Metal path and M6 engine side are **verified on device** (`asaot3d/apps/shader-m30`: `ShaderMaterial` draws a quad over the native channel and `drawToBitmapData` reads back centre `#804020`, matching `uColor.rgb * vUV.x` bit for bit; the same `.as` under `adl`/in a default build prints `NO-CHANNEL` and refuses). **Not done**: M4 Web passthrough, M5 D3D12, M7 Ultra-Water, plus the device verification of float RT / MRT readback / depth textures. Design: [`native-shader.md`](native-shader.md); plan: [`native-shader-plan.md`](native-shader-plan.md) | `native` today (web waits for M4's passthrough) | medium |
 | E7 | **General-purpose GPU compute** (Metal compute / WebGL2 transform feedback) | ✗ | Needs a new glue layer | both ends | high |
 | E8 | **Windowless / server-side rendering** | half (offscreen possible, but bound to the AIR runtime) | **already present**: headless runs, and `stage.render()` produces a PNG directly | both ends | already have |
 | E9 | **64-bit integers** (`int64` / `uint64`) | ✗ (`int` / `uint` are both 32-bit) | ✅ **implemented (opt-in, pure C, same shape both ends)**: types + `L`/`UL` literals + `int64()`/`uint64()` conversions + 64-bit arithmetic/bitwise/comparison + a dedicated box tag (see §4.7) | both ends (native / web / WASI, the same C) | **done** |

@@ -882,6 +882,37 @@ rules, three-target declarations, three backend bindings, upload-time validation
 Like `stage83.as` the example carries a `vertex-texture.build.json` and is **verified by hand** (Metal
 builds are not part of the automated suite).
 
+### 9.18 What AGAL cannot express: the E6 native shader channel (documented elsewhere)
+
+Everything above is about **aligning with AIR** — we translate whatever AGAL can write. But a whole class of
+capability **does not exist in AGAL at all**; no amount of translation invents it. That is a different
+mechanism (no AGAL is generated: the author's GLSL ES 3.00 is cross-compiled straight to MSL), documented in
+[`native-shader.md`](native-shader.md) with the work breakdown in
+[`native-shader-plan.md`](native-shader-plan.md). The table below only says **which document owns
+what**, so readers stop hunting for these items here:
+
+| Capability | AGAL path (this document) | E6 native channel (elsewhere) |
+|---|---|---|
+| Float render targets (`RGBA32F`/`R32F`/`RG16F`…) | ✗ none | ✅ `Context3DNative.createTexture` (11 format ids); **`rgbaHalfFloat` stays profile-gated in the default tier** (§9.16) |
+| MRT (one draw writing several targets) | ✗ `oc` is a single register | ✅ `layout(location=N) out`; the pipeline key carries `ncolor` |
+| `texelFetch` (integer-coordinate sampling) | ✗ only normalised `tex` | ✅ ES 3.00 core |
+| `uint` / bit ops / PCG hashing | ✗ no integers | ✅ ES 3.00 core |
+| `textureLod` (explicit LOD) | ✗ (`tld` is **vertex-only**, needs AGAL4 + `enhanced`, §9.17) | ✅ both stages |
+| Depth texture sampling (`sampler2DShadow`) | ✗ | 🟡 texture/attachment wired, **comparison sampling unverified** |
+| Instancing (`gl_InstanceID`) | ✗ | ✅ Metal `[[instance_id]]` |
+| Sampler slots | **hard cap of eight** (`fs0..fs7`; the shadow variant already fills them) | same eight (it reuses the AGAL unit space) |
+
+Three boundaries that are easy to misremember:
+
+1. **Those classes do not exist in a default build** — `Context3DNative` / `NativeProgram3D` are registered
+   only under `--features native-shader` (and only for the `native` target); `getDefinitionByName` throws
+   `#1065` exactly as `adl` does.
+2. **There is no AIR fallback** — not an "AGAL approximation" but an explicit refusal (`asaot3d`'s
+   `ShaderMaterial` throws).
+3. **Claim exactly what is asserted** — the path (source → MSL → pipeline → draw → pixels) is verified on
+   device, but the **readback values** of float targets and MRT are not (`native-shader.md` §11 table). Do not
+   cite "float RT works" here as an established fact.
+
 ## 10. The Windows / Direct3D 12 Backend (landed, stage one-hundred-thirty-two)
 
 The third backend, `vendor/stage3d_d3d.cc` (~2,290 lines), is **structurally isomorphic** to

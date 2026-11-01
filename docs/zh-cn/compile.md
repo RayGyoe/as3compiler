@@ -353,6 +353,7 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | 额外图片格式 WebP / BMP / ICO（AIR 对它们报 `#2124`，故**默认拒绝**——见 §3.4.3.1） |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | 仅 `native` | 相机 RAW / DNG（默认拒绝——见 §3.4.3.1；web 侧 Skia 无 piex/dng_sdk 归档，故目标不支持时就报错） |
 | `tray` | `ASC_USE_TRAY=1` | 仅 `native`，**且宿主须为 macOS** | `SystemTrayIcon` 背后是真 `NSStatusItem`（见 §3.4.5）。AIR 在 macOS 上根本没有托盘（`supportsSystemTrayIcon=false`、`#2012`），故默认关闭 |
+| `native-shader` | `ASC_USE_NATIVE_SHADER=1` | 仅 `native` | 注册 `flash.display3D.Context3DNative` / `NativeProgram3D`（作者 GLSL ES 3.00 → glslang + SPIRV-Cross → MSL），并链上 `vendor/shader` 的 14 个静态库。AIR 只有 AGAL 寄存器语言，故默认关闭——**默认构建里这两个类不存在**，`getDefinitionByName` 与 `adl` 同形抛 `#1065`。见 [`native-shader.md`](native-shader.md) |
 
 这张表是**全部**的具名增强开关：`--features` 只登记「AIR 超集能力」——默认关、开后改变产物语义。
 窗口 GPU 后端**不在**表里：`--features gl` 会按未知名字报错。后端是**独立开关** `--gpu-backend`
@@ -369,7 +370,7 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 
 - **默认全关**：不开时产物与以前**逐字节相同**，与 `adl` 同构。开了会打印一行
   `== enhancements: svg (-D ASC_USE_SVG=1) ==`，并在提示里写明它是 AIR 超集。
-- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: formats, raw, svg, tray)`
+- **未知名字报错**，不静默忽略：`--features lottie` 会报 `unknown feature 'lottie' (known: formats, native-shader, raw, svg, tray)`
   并在**生成任何代码之前**退出（清单里也已实现的能力才会被登记，登记了却没实现的开关
   等于给用户一个「看着开了、实际没编进去」的东西）。`--features none` 不能与其它名字同用。
 - **目标不支持就报错**：`--target wasm --features svg` 直接报
@@ -685,7 +686,11 @@ demo 触及。此前 `--air-app` 一律编译整包，是**过度近似**，代�
 函数）的文件——那些代码是整程序发射的，无法按类剪。
 
 **只被 `getDefinitionByName("…")` 字符串引用的类**不会被保留，这与 AIR 一致（`mxmlc` 同样解析不出
-字符串）。**类注册表 `as_class_registry[]` 保持 eager**（它同时服务 `is Class`、`new x()`、
+字符串）。要保留就显式登记：清单字段 `extra-roots: ["a.b.C", ...]` 或 CLI `--extra-roots a.b.C,d.E`
+（§4 `extra-roots` 行）——它只把名字塞进根集合，**不展开闭包语义、不解析路径**，去重，同名类不存在
+时忽略不报错。典型用例：`asaot3d` 的 `NativeShaderRenderer` 只被 `RendererFactory` 的字符串探测引用，
+漏登记的症状是**静默退化**（工厂探测落空 → 回到默认后端），不是报错。**类注册表 `as_class_registry[]`
+保持 eager**（它同时服务 `is Class`、`new x()`、
 `getDefinitionByName` 与 GC 根）——收的是**发射面**，不是运行时表。
 
 **强制文件的引用同样要展开**（阶段二百四十九）：上面「总是保留」的那类文件是**先种进队列、再排空**
@@ -919,6 +924,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `defines` | string[] | 预处理宏（→ `-D`） |
 | `c-flags` | string[] | **原样透传**给 C/C++ 编译器的旗标（`--cflag <f>` / `-w` 的清单写法）。落在**每一个**编译步骤与链接步骤上（C 源、C++ 胶水层、链接），位置在对象与 `-l` 库**之前**（`-Wl,--as-needed` 这类链接旗标对顺序敏感）。**不做白名单**：编译器不认的旗标必须让构建**响亮的失败**——那正是「旗标真的到了编译器」的唯一证据。默认空 ⇒ 不写就与以前的产物逐字节相同。顶层 append（CLI 与清单可并存）、`targets.<目标>` 块 replace（按 §4.1 的规则） |
 | `features` | string[] | **具名增强开关**（§3.4.2），如 `["svg"]`。默认空。未知名字报错；开了会在构建横幅里点名，不开则产物与 `adl` 同构。`--features` 在 CLI 侧是**替换**整个集合（`-D` 才是追加） |
+| `extra-roots` | string[] | **额外闭包根**（§3.5.1）：只被 `getDefinitionByName("…")` 等**字符串**命名、因而没有 AST 引用边的类 FQN（如 `["asaot.three.NativeShaderRenderer"]`）。只把名字塞进根集合，不解析路径、不展开语义；去重；同名类不存在时**忽略不报错**。由 `--air-app --extra-roots <fqns>` 写入，**只允许出现在顶层**。不写该字段的构建**逐字节不变** |
 | `gpu-backend` | `"auto" \| "d3d12" \| "gl"` | Windows 的**窗口 GPU 后端**（§3.4.6），缺省不写 = `auto`（D3D12）。由 `--air-app --gpu-backend` 写入，**只允许出现在顶层**（写进 `targets.<目标>` 块报错：后端由描述符与宿主共同决定，不是按目标分层的量）。不写该字段的构建**逐字节不变**。它与 `defines` **交叉校验**：`gl` 必须带 `ASC_RENDER_GL=1`、`d3d12` 必须带 `ASC_RENDER_D3D=1`，两个宏同时出现直接报错 |
 | `objects` | string[] | 预编译 `.o` 直接加入链接 |
 | `frameworks` | string[] | macOS 框架（→ `-framework X`，Skia 的 CoreText/CoreGraphics 后端需要）。**只在 `darwin` + `target=native` 上发射**：其他宿主静默丢弃（不报错），因此同一份清单可以同时写着 `Cocoa`/`Metal` 与 `gdi32`（后者走 `link-libs` 的 `${win:}`，见 §4.1.1）；以前在 Windows 上它们会被当成**输入文件**丢给链接器，报 `lld-link: could not open 'Cocoa'` |

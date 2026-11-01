@@ -491,7 +491,7 @@ AIR**：`mxmlc`/`adl` 本来就只链从文档类可达的传递闭包（`-link-
 | Lottie 矢量动画（Skottie） | ✗ 无对应物 | native：库已构建+已链接，缺播放器 API；web：需重编 | 中 |
 | WebP / BMP / ICO 等格式解码 | 部分（仅 JPG/PNG/GIF） | 两端（`SkCodec` 已编入，**待实测**） | 低 |
 | 相机 RAW / DNG 解码 | ✗ | native：`libpiex`/`libdng_sdk` 已构建；web：需重编 | 低-中 |
-| 原生着色器直通（MSL / GLSL ES） | ✗（只有 AGAL） | 两端 | 中 |
+| 原生着色器直通（GLSL ES 3.00 源 → MSL/HLSL） | ✗（只有 AGAL 寄存器语言） | **进行中**：native 通路已真机验收（`asaot3d/apps/shader-m30`）；web 待 M4 直通、D3D12 待 M5 | 中 |
 | FFI：直调宿主 C 函数 | ✗ | native（「直接转 C」的独有红利） | 中 |
 | LTO / PGO 构建开关 | — | 两端 | 低 |
 

@@ -12,6 +12,12 @@
 > 相邻文档：[`enhancements.md`](enhancements.md)（增强判定与 `--features` 开关）、
 > [`display3d.md`](display3d.md)（Stage3D 对齐与 AGAL 翻译）、[`compile.md`](compile.md)（构建清单与后端）、
 > `asaot3d/three-api-design.md` §9（渲染接缝与 `NativeShaderRenderer`）。
+>
+> **进展（2026-11-02）**：M1 交叉编译链 / M2 编译器侧 / M3 Metal 后端 / M6 引擎侧 **已落地并真机验收**
+> —— `asaot3d/apps/shader-m30` 用作者写的一对 GLSL ES 3.00 画四边形，`drawToBitmapData` 读回
+> 中心 `#804020`（= `uColor.rgb * vUV.x`）与 3/8 处 `#361b0e`，同一份 `.as` 在默认构建/`adl` 下
+> 打印 `NO-CHANNEL` 并退出 0（§8 红线）。**M4 Web 直通 / M5 D3D12 / M7 Ultra-Water 对齐未做**。
+> 施工图与逐条 as-built（含落地时暴露的四个真缺陷）见 [`native-shader-plan.md`](native-shader-plan.md)。
 
 ---
 
@@ -45,7 +51,7 @@ E6 的作用域**不只是 Ultra-Water**：任何 three.js `ShaderMaterial` 风�
 | **渲染接缝 `IRenderer`** | `asaot3d/seam/asaot/three/IRenderer.as`：`render(scene,camera)` + `setSize(w,h)` 两个窄接口 | E6 的引擎侧落点就是第二个实现：`NativeShaderRenderer` |
 | **`AGALRenderer`**（默认后端） | `asaot3d/seam/asaot/three/AGALRenderer.as`，机器生成 AGAL 的 PBR（GGX/IBL/阴影/tone map） | 保真对照物 + 复杂负载的兜底；E6 不与它抢默认，是 opt-in 的旁路 |
 | **E6 已在设计文档占位** | `three-api-design.md` §9 表格：`NativeShaderRenderer`，绕过 AGAL，E6 opt-in 后续 | 接口形状已定，缺实现 |
-| **E6 已在增强清单登记** | `enhancements.md` §3 表 / `TODO.md` `### 增强待做`：成本「中」、状态「未排期」 | 本文把「未排期」推进到「有排期」 |
+| **E6 已在增强清单登记** | `enhancements.md` §3 表 / `TODO.md` `### 增强待做`：成本「中」 | 本文把状态从「未排期」推进到「进行中」——**现为「进行中」**（阶段三百五十三，通路已真机验收，余项见 §9/§11） |
 
 ---
 
@@ -391,16 +397,14 @@ WebGL2 里深度纹理的 `texture-filterable` 有限制、Metal/D3D 也有对�
 **字符串字面量**，不在 `reach.ts` 的 AST 引用边里 ⇒ `--features native-shader` 开了，这个类也**进不了编译面**，
 注册表里没有，探测照样抛 `#1065`。这与 `AGALTranslator` 的先例**本质不同**——后者是 as-aot 内建类，常驻编译面。
 
-解法二选一（`reach.ts` 均已具备机制）：
+**已拍板（§12 ⑤）：选方案 2**——构建清单字段 `extra-roots: ["asaot.three.NativeShaderRenderer"]`
+（+ CLI `--extra-roots a.b.C,d.E`，因为 `--air-app` 每次重写 `<Main>.build.json`，只存在于清单里的字段
+在构建脚本里用不了）。不用 `[WasmExport]`：那个注解会被迫兼管两件事（JS 导出 / 闭包根），语义不单一。
 
-1. **`[WasmExport]` 标记**（推荐）：`NativeShaderRenderer` 等 AOT-only 类标 `[WasmExport]`，`reach.ts:516` 会
-   把它当「无 AS3 引用也保持可达」的入口点（注释原文：`[WasmExport] is how a class is deliberately reachable
-   from JS with no AS3 reference`）。零新增 CLI，源码内标记。
-2. **通用「额外根」入口**：`computeReachable(files, mainClass, extraRoots)` 的 `extraRoots` 参数目前只喂
-   SWC 符号类基类（`index.ts:723`）。为 E6 增一个构建清单字段（如 `keep-classes: [FQN…]`）透传进去，作者
-   显式点名要常驻编译面的类。
-
-无论哪种，都要**只在 `--features native-shader` 时生效**，默认构建不带。
+as-built：`computeReachable(parsedFiles, mainClass, [...swcBaseRoots, ...cfg.extraRoots])`；只把名字塞进
+根集合、**不解析路径**；去重；同名类不存在时**忽略不报错**（清单要能跨构建复用）。实测：`shader-m30` 的
+`extra-roots` 文件里那一行确实把 `NativeShaderRenderer` 拉进闭包（65/123 sources）；单元组 `unit: reach/*`
+三条断言（复活一个无引用类 / 只复活它自己 / 未声明类名被忽略）钉住。
 
 ### 6.8 着色器语言特性补齐（AGAL 表达不了、原生路径天然支持）
 
@@ -608,22 +612,35 @@ E6 落地后，**FFT 的归属从「被迫 CPU」翻转为「可以 GPU」**：
     `#1065`；作者走 §7.4 工厂探测时优雅回退 `AGALRenderer`（与现有 `AGALTranslator` 在 AIR 上缺失同形，
     `AGALRenderer.as` 头部注释已记录这个坑）。
 
-**这一条必须先跟用户拍板**（§12），因为它顶到 §1「双后端对齐」的红线——本文的立场是：E6 是**增强**，
-AOT-only 放行，文档报明「AIR 不支持浮点 RT / 原生 shader」，不当遗留缺陷去追。
+**这一条已拍板并落地**（§12）：E6 按**增强**放行、AOT-only，AIR 侧**抛错报明**而不是静默黑屏。
+落地的具体形态比本文原设想更硬：
+
+- **默认构建零字节变化**——`Context3DNative` / `NativeProgram3D` 在默认构建的符号表里**不存在**，
+  `getDefinitionByName` 与 `adl` 同形抛 `#1065`；`examples/native-shader-probe.as` 与
+  `test/unit/native-shader.ts` 双向钉住（含「默认构建的 C 里没有 native 方法体」与
+  `#define ASC_HAS_NATIVE_SHADER 0`）。
+- **引擎侧不画近似图**——`ShaderMaterial` 在拿不到 native 通道时
+  `AGALRenderer._drawShaderMaterial` **直接抛错**并报出材质名与开关（`asaot3d` §37.4）。
+  用 AGAL 冒充作者的 GLSL 会是「穿着合理外衣的错误答案」（AGENTS.md §0）。
+- 代价已写入 `enhancements.md` §3 的 E6 行：这是**增强**，不是遗留欠账，不入「遗留待开发」。
 
 ---
 
 ## 9. 分阶段路线
 
-| 阶段 | 内容 | 验收 | 后端 |
-|---|---|---|---|
-| **P1 · Metal 单后端起步** | glslang+SPIRV-Cross 入 `build-tools/`；`--features native-shader` 注册；`stage3d_glue.mm` 增 float RT + MRT + 原生 MSL 编译；`NativeShaderRenderer` + `ShaderMaterial` + 最小 FFT 海洋 | AOT-macOS 出 Tessendorf 位移水面，float RT 读回正确，MSL 真编译（`xcrun metal`） | Metal |
-| **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一水面，零交叉编译 | WebGL2 |
-| **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 |
-| **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 |
+| 阶段 | 内容 | 验收 | 后端 | 状态 |
+|---|---|---|---|---|
+| **P1 · Metal 单后端起步** | glslang+SPIRV-Cross 入 `build-tools/`；`--features native-shader` 注册；`stage3d_glue.mm` 增 float RT + MRT + 原生 MSL 编译；`NativeShaderRenderer` + `ShaderMaterial` | AOT-macOS 出画面，float RT 可渲可读，MSL **真编译** | Metal | ✅ **M3 + M6 已验收**：`shader-m30` 15 项 PASS、像素 `#804020`/`#361b0e`。验收方式从 `xcrun metal` 改运行期 `newLibraryWithSource:`（§3.4：本机无离线工具链） |
+| **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一画面，零交叉编译 | WebGL2 | ❌ 未做（现在 `--features native-shader` 只声明 `native` 目标） |
+| **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 | ❌ 未做（SPIRV-Cross 的 HLSL 半边库已链好） |
+| **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | ❌ 未做（本轮只证明了通路，**没有证明海洋**） |
 
-**建议第一批只落 Metal**：本机 macOS + Metal，MSL 与 GLSL ES 3.00 语法接近，手译/交叉编译成本都可控；
-E6 接口预留三向后端，但先跑通「E6 + float RT + MRT + texelFetch」的最小闭环验证路径正确，再谈铺开。
+**第一批只落 Metal** 的理由成立：本机 macOS + Metal，MSL 与 GLSL ES 3.00 语法接近，先把
+「E6 + float RT + MRT + texelFetch」的最小闭环钉死，再铺开。
+
+> 原 P1 验收写的是「出 Tessendorf 位移水面」——**实际第一版验收是一张 2×2 四边形**。
+> 这是故意的：海洋会把「通路错」和「FFT 算错」两种错缠在一起，而四边形的像素能逐位对上
+> `uColor.rgb * vUV.x`。FFT 归 M7。
 
 ---
 
@@ -642,38 +659,47 @@ E6 接口预留三向后端，但先跑通「E6 + float RT + MRT + texelFetch」
 
 ## 11. 验收标准（DoD）
 
-E6 一个阶段「做完」须同时满足（对齐 AGENTS.md §4）：
+E6 一个阶段「做完」须同时满足（对齐 AGENTS.md §4）。**下表按「已验收 / 未验收」分开**，
+避免把「代码落了」当成「验收过了」：
 
-1. `--features native-shader` 开启后，`Context3DNative`（§6.3）能提交 GLSL ES 3.00 源码并正确编译到
-   目标后端（Metal 先 `xcrun metal` 真编译过）；
-2. float RT（至少 `RGBA_HALF_FLOAT` / `RGBA_FLOAT` / `R32F`）读写正确，读回数值在容差内；
-3. MRT 至少两附件，`layout(location=0/1) out` 落对；
-4. `examples/*.as` 有最小 FFT 海洋示例，`as-aot --features native-shader examples/x.as --run` 跑通；
-5. 默认构建（不带 `--features native-shader`）**逐字节不变**，且 `Context3DTextureFormat` 与 AIR 六常量
-   逐字对齐（§6.1 层 1 的四处偏差已修，不多不少）；
-6. AIR 侧如实报明（不静默黑屏）；
-7. `test/unit/` 有源级钉子（新格式枚举、MRT、`--features` 注册、负例「AIR 不支持」）；
-8. `enhancements.md` §3 E6 状态更新、`README-CN.md`/`README.md` 同步、版本号递增。
+| # | 标准 | 状态 |
+|---|---|---|
+| 1 | `--features native-shader` 开启后，`Context3DNative`（§6.3）能提交 GLSL ES 3.00 源码并正确编译到目标后端 | ✅ **已验收**——但不是 `xcrun metal`（本机无离线工具链，§3.4），而是运行期 `newLibraryWithSource:`；`shader-m30` 的 15 项里前 12 项就是这个通路（含顶点译文里的 `[[buffer(n)]]` 与 `main0` 入口、ES1.00/legacy 拒绝带行号） |
+| 2 | float RT（至少 `RGBA_HALF_FLOAT` / `RGBA_FLOAT` / `R32F`）读写正确，读回数值在容差内 | ❌ **未验收**——`shader-m30` 画到**后台缓冲**再 `drawToBitmapData` 读回，没碰浮点目标；格式创建面（11 个 id）代码已落 |
+| 3 | MRT 至少两附件，`layout(location=0/1) out` 落对 | 🟡 **部分**——反射已验（`examples/native-shader-probe.as` 报 `colorAttachments == 2`）， **两张附件分别读回像素未验** |
+| 4 | `examples/*.as` 有最小示例，`as-aot --features native-shader examples/x.as --run` 跑通 | ✅ **已验收**——`examples/native-shader-probe.as`（编译器侧）+ `asaot3d/apps/shader-m30`（引擎侧）。**不是「FFT 海洋」**：原 DoD 写的是海洋，实际改成四边形，理由见 §9 |
+| 5 | 默认构建（不带 `--features native-shader`）**逐字节不变**，`Context3DTextureFormat` 与 AIR 六常量逐字对齐 | ✅ **已验收**——`test/unit/native-shader.ts` 双向钉（默认构建无 native 方法体 + `#define ASC_HAS_NATIVE_SHADER 0`） |
+| 6 | AIR 侧如实报明（不静默黑屏） | ✅ **已验收**——默认构建/`adl` 下 `shader-m30` 打印 `NO-CHANNEL` 并退出 0，`ShaderMaterial` 直接抛错 |
+| 7 | `test/unit/` 有源级钉子（新格式枚举、MRT、`--features` 注册、负例「AIR 不支持」） | ✅ `test/unit/native-shader.ts` |
+| 8 | `enhancements.md` §3 E6 状态更新、`README-CN.md`/`README.md` 同步、版本号递增 | ✅ v0.4.314 立项+M2、v0.4.316 M3 通路 + M6 |
+
+> **1/2/3 的区别很重要**：通路（源码 → MSL → 管线 → draw → 像素）已经端到端跑通，但**浮点目标与 MRT 的读回**没验。
+> 所以「浮点渲染目标可用」这句话今天只能说到「API 在、格式建得出来」，不能说到「数值对」。这正是 M7（FFT 需要两张浮点图）开工前必须补的第一件事。
 
 ---
 
-## 12. 待拍板问题（开工前必须定）
+## 12. 拍板记录
 
-**本轮已拍板**：
+**已拍板（本轮实现即结论）**：
 
-- **源语言**：GLSL ES 3.00（§4 结论，用户已认可）。
+- **源语言**：GLSL ES 3.00（§4）。
 - **`ShaderMaterial` 存在性**：双后端共享（§7.3）。
 - **AOT-only 能力隔离机制**：运行时探测（§7.4 / §7.5）。
 - **浮点格式 API 形状**：方案 B「新类 `Context3DNative`」（被「运行时探测」锁定，§7.5）。
+- **① AOT-only 红线**：按**增强**放行（§8），且落地比设想更硬：默认构建零字节变化 + 引擎侧抛错报明。
+- **② 编译时机**：**运行时**（three.js 同形）——`uploadProgram` 返回 `ok=false` + `infoLog`，不抛。
+  build-time 预编译维持 §8 的「未做」登记。
+- **④ 命名**：`flash.display3D.Context3DNative` / `flash.display3D.NativeProgram3D` /
+  `asaot.three.NativeShaderRenderer` / `asaot.three.RendererFactory` / `asaot.three.ShaderMaterial`；
+  格式常量是 `String`（`"rgba32f"` 等 9 个，与 `Context3DTextureFormat` 同形）。
+- **⑤ 可达性钩子**：选**清单字段 `extra-roots`**（+ CLI `--extra-roots`），不用 `[WasmExport]`——
+  那个注解会被迫兼管两件事（JS 导出 / 闭包根），语义不单一。
 
 **仍待拍板**：
 
-1. **AOT-only 红线**：按「增强」放行（本文立场，§8），还是另有约束？
-2. **编译时机**：运行时（three.js 同形，§5.4 推荐）还是 build-time 预编译？
-3. **FFT 归属**：E6 解锁后走 GPU FFT（§7.8 推荐，不绕行）还是保留 CPU FFT 兜底？
-4. **命名**：`Context3DNative` / `NativeShaderRenderer` / `ShaderMaterial` 的最终类名与包名，以及
-   `Context3DNative` 上浮点格式常量、`uploadProgram` 等方法的确切拼写。
-5. **编译面可达性钩子**：§6.7 的 `[WasmExport]` 标记 vs 通用「额外根」入口，选哪个。
+1. **FFT 归属**：E6 解锁后走 GPU FFT（§7.8 推荐，不绕行）还是保留 CPU FFT 兜底？——它直接决定 M7 的形状，
+   开工前定。
+2. **浮点目标的验证口径**：容差怎么定（逐位 / 相对误差 1e-5 / 只比形状）？M3 余项要拿它写断言。
 
 ---
 

@@ -431,7 +431,7 @@ target ends, and per-item description are in [`enhancements.md`](enhancements.md
 | Lottie vector animation (Skottie) | ✗ no counterpart | native: library already built + linked, missing player API; web: needs rebuild | medium |
 | WebP / BMP / ICO and other format decoding | partial (only JPG/PNG/GIF) | both ends (`SkCodec` already compiled in, **to be measured**) | low |
 | Camera RAW / DNG decoding | ✗ | native: `libpiex`/`libdng_sdk` already built; web: needs rebuild | low-medium |
-| Raw shader passthrough (MSL / GLSL ES) | ✗ (only AGAL) | both ends | medium |
+| Raw shader passthrough (GLSL ES 3.00 source → MSL/HLSL) | ✗ (only the AGAL register language) | **in progress**: the native path is verified on device (`asaot3d/apps/shader-m30`); web waits for M4's passthrough, D3D12 for M5 | medium |
 | FFI: directly calling host C functions | ✗ | native (the unique gain of "direct-to-C") | medium |
 | LTO / PGO build switches | — | both ends | low |
 

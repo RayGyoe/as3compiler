@@ -959,6 +959,33 @@ NEAREST/LINEAR、CLAMP/REPEAT、逐顶点插值；纯 C 状态机 20 条）；`t
 `stage3d/vertex-texture` 16 条源级钉子（stage 规则、三目标声明、三后端绑定、upload 期校验与缓存失效）。
 该示例带 `vertex-texture.build.json`，与 `stage83.as` 一样是**手工**验收（链 Metal 的构建不进自动回归）。
 
+### 9.18 AGAL 表达不了的那部分：E6 原生着色器通道（另册）
+
+本文全篇解决的是「**对齐 AIR**」——AGAL 能写什么，我们就翻译什么。但有一整类能力在 AGAL 里
+**语法上就不存在**，无论怎么翻译都变不出来。它们的实现是另一套机制（不生成 AGAL，直接把作者的
+GLSL ES 3.00 交叉编译到 MSL），细节见 [`native-shader.md`](native-shader.md) 与施工图
+[`native-shader-plan.md`](native-shader-plan.md)；此处只留一张「哪边管什么」的表，避免读者
+在本篇里找这些能力：
+
+| 能力 | AGAL 路径（本篇） | E6 原生通道（另册） |
+|---|---|---|
+| 浮点渲染目标（`RGBA32F`/`R32F`/`RG16F`…） | ✗ 没有 | ✅ `Context3DNative.createTexture`（11 个格式 id）；**默认档的 `rgbaHalfFloat` 受 profile 门控**（§9.16） |
+| MRT（一次 draw 写多张） | ✗ `oc` 只有一个 | ✅ `layout(location=N) out`，管线键含 `ncolor` |
+| `texelFetch` 整数坐标采样 | ✗ 只有归一化 `tex` | ✅ ES 3.00 核心 |
+| `uint` / 位运算 / PCG 哈希 | ✗ 无整数 | ✅ ES 3.00 核心 |
+| `textureLod` 显式 LOD | ✗（`tld` 只在**顶点**、需 AGAL4 + `enhanced`，§9.17） | ✅ 两个阶段都有 |
+| 深度纹理采样（`sampler2DShadow`） | ✗ | 🟡 纹理/附件已接，**比较采样未验收** |
+| 实例化（`gl_InstanceID`） | ✗ | ✅ Metal `[[instance_id]]` |
+| 采样器槽数 | **`fs0..fs7` 八槽硬上限**（阴影变体已满） | 同八槽（复用 AGAL 的单元空间） |
+
+三条容易记错的边界：
+
+1. **默认构建里这些类不存在**——`Context3DNative` / `NativeProgram3D` 只在 `--features native-shader`
+   （且只 `native` 目标）注册，`getDefinitionByName` 与 `adl` 同形抛 `#1065`。
+2. **AIR 侧没有降级版**——不是「AGAL 近似」，而是**报明**（`asaot3d` 的 `ShaderMaterial` 直接抛错）。
+3. **断言到哪一步就说到哪一步**——通路（源码 → MSL → 管线 → draw → 像素）已真机验收，但浮点目标
+   与 MRT 的**读回数值**未验（`native-shader.md` §11 表）。不要在本篇里引「浮点 RT 可用」当既成事实。
+
 ## 10. Windows / Direct3D 12 后端（阶段一百三十二 落地）
 
 第三份后端 `vendor/stage3d_d3d.cc`（~2,290 行）与 `stage3d_glue.mm`（Metal）/**结构同形**：同一套 `s3d_*` ABI、
