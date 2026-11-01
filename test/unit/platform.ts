@@ -2564,18 +2564,23 @@ function checkNativeWindowLimitsAndEvents(): string[] {
   check('both bounds events take their before from the FRAME-START snapshot',
     /int fx = w->snap_x, fy = w->snap_y, fw = w->snap_w, fh = w->snap_h;/.test(c)
     && (c.match(/Rectangle\* before = Rectangle_new\(\(double\)fx, \(double\)fy, \(double\)fw, \(double\)fh\);/g) || []).length === 2);
-  check('...and the dispatch order is deactivate, resize, displayStateChange, move, activate',
+  // The frame-boundary order is deactivate, then the geometry/state batch, then activate.
+  // Since 阶段三百五十三 the middle of that batch lives in ASC_win_settle (so the poll can
+  // hold it until the button comes up); its own internal order -- resizing, resize,
+  // displayStateChange, moving, move -- is pinned by unit: platform/WindowSystemLimitsAndGestures.
+  check('...and the dispatch order is deactivate, the settled batch, activate',
     (() => {
       const at = (needle: string): number => c.indexOf(needle);
       const ds = at('ASC_win_fire(id, (char*)"deactivate", false);');
-      const rs = at('ASC_win_fire_bounds(id, (char*)"resize", before, after);');
-      const st = at('ASC_win_fire_ds(id, before, after);');
-      const mv = at('ASC_win_fire_bounds(id, (char*)"move", before, after);');
+      const settleCall = at('ASC_win_settle(id, fx, fy, fw, fh, x, y, cw, ch, gesture, ds);');
       const ac = at('ASC_win_fire(id, (char*)"activate", false);');
-      return ds > 0 && ds < rs && rs < st && st < mv && mv < ac;
+      return ds > 0 && settleCall > ds && ac > settleCall;
     })());
+  // The cancelable argument is a parameter as of 阶段三百五十三: MOVING/RESIZING must be
+  // cancellable (preventDefault puts the frame back) while MOVE/RESIZE must not, so the
+  // flag travels with the call instead of being hardcoded false here.
   check('the two carrying events are AIR\'s own classes, not a bare Event',
-    /NativeWindowBoundsEvent_new\(\(char\*\)type, false, false, before, after\)/.test(c)
+    /NativeWindowBoundsEvent_new\(\(char\*\)type, false, cancelable, before, after\)/.test(c)
     && /NativeWindowDisplayStateEvent_new\(\(char\*\)"displayStateChange", false, false, before, after\)/.test(c));
   check('a minimize is reported as DEACTIVATE before the display-state change',
     /if \(ds == 1 && w->snap_ds != 1 && w->snap_active\) \{ w->snap_active = 0; ASC_win_fire\(id, \(char\*\)"deactivate", false\); \}/.test(c));
@@ -2631,6 +2636,140 @@ function checkNativeWindowLimitsAndEvents(): string[] {
 }
 
 registerGroup('unit: platform/WindowLimitsAndEvents', checkNativeWindowLimitsAndEvents);
+
+// ---- NativeWindow.systemMinSize/systemMaxSize + the INTERACTIVE moving/resizing
+// ---- pair (阶段三百五十三) ----
+// Three measured facts drive these pins, and each one had a way of looking right while
+// being wrong:
+//
+//  (1) systemMinSize/systemMaxSize are STATIC, read-only members of the CLASS --
+//      `NativeWindow.systemMinSize` (temp/nwsys/README.md: an instance access is an
+//      mxmlc "possibly undefined" warning and a runtime #1069, and assigning is
+//      "property is read-only"). They answer the WINDOW MANAGER's tracking limits,
+//      which is a different quantity from minSize/maxSize and from the content floor:
+//      macOS answers (2,2) while `minSize = (0,0)` reads back (2,32).
+//  (2) MOVING/RESIZING belong to INTERACTIVE gestures only, they are cancelable, and
+//      they are dispatched immediately BEFORE the MOVE/RESIZE they describe, both
+//      carrying the same before/after pair (adl: resizing t, resize t+1ms). Preventing
+//      one puts the geometry back and suppresses the plain event.
+//  (3) "Interactive" is decided by ACCOUNTING, not by the pointer: every geometry
+//      write this runtime makes on the app's behalf is counted, so an uncounted change
+//      is the user's. A macOS live resize can run from press to release without the
+//      app ever seeing a frame with the button down (measured), which is why sampling
+//      the button is not enough.
+function checkNativeWindowSystemLimitsAndGestures(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [win-gesture] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [win-gesture] ${label}`); }
+  };
+
+  const glueWin = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const glueWeb = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const exSrc = readFileSync(join(dir, 'native-window.as'), 'utf8');
+  const c = generateC(parse(exSrc)).c;
+  const preamble = RUNTIME_PREAMBLE;
+
+  // (1) Static members: one accessor pair keyed on the CALL, never on the instance.
+  check('systemMinSize/systemMaxSize are static getters, not instance properties',
+    /static Point\* NativeWindow_get_systemMinSize_static\(void\* _this\) \{\n  \(void\)_this;/.test(c)
+    && /static Point\* NativeWindow_get_systemMaxSize_static\(void\* _this\) \{\n  \(void\)_this;/.test(c)
+    // the instance-shaped names must NOT exist, or an instance access would resolve
+    // to them instead of failing the way adl does
+    && !/NativeWindow_get_systemMinSize\(void\* _this\)/.test(c)
+    && !/NativeWindow_get_systemMaxSize\(void\* _this\)/.test(c));
+  check('...and each read allocates a fresh Point (adl: identity is false)',
+    /static Point\* NativeWindow_get_systemMinSize_static[\s\S]{0,260}?return Point_new\(\(double\)mnw, \(double\)mnh\);/.test(c)
+    && /static Point\* NativeWindow_get_systemMaxSize_static[\s\S]{0,260}?return Point_new\(\(double\)mxw, \(double\)mxh\);/.test(c));
+  // The numbers are the OS's tracking limits, so Windows ASKS the OS and macOS uses the
+  // measured constant -- written down with the measurement next to it.
+  check('the system limits come from the OS (SM_CXMINTRACK on Windows, measured on macOS)',
+    /void sk_window_system_limits\(int\* mnw[\s\S]{0,420}?GetSystemMetrics\(SM_CXMINTRACK\)/.test(glueWin)
+    && /#else\n  if \(mnw\) \*mnw = 2;\n  if \(mnh\) \*mnh = 2;\n#endif/.test(glueWin)
+    && /Measured on adl 51\.4\.1 \/ macOS 14: \(2,2\)/.test(glueWin));
+
+  // (2a) The interactive pair is dispatched from the settle, in AIR's order, immediately
+  // before the event it qualifies, and with the SAME rectangles.
+  const settleAt = c.indexOf('static void ASC_win_settle(int id,');
+  check('one helper settles the whole frame-boundary batch', settleAt > 0);
+  check('resizing comes before resize, and moving before move, off one before/after pair',
+    (() => {
+      const sz = c.indexOf('(char*)"resizing"', settleAt);
+      const sr = c.indexOf('(char*)"resize"', settleAt);
+      const ds = c.indexOf('ASC_win_fire_ds(id, before, after);', settleAt);
+      const mv1 = c.indexOf('(char*)"moving"', settleAt);
+      const mv2 = c.indexOf('(char*)"move"', settleAt);
+      return sz > settleAt && sz < sr && sr < ds && ds < mv1 && mv1 < mv2;
+    })());
+  check('resizing/moving are cancelable, resize/move are not',
+    /ASC_win_fire_bounds\(id, \(char\*\)"resizing", rb, ra, true\)/.test(c)
+    && /ASC_win_fire_bounds\(id, \(char\*\)"moving", mb, ma, true\)/.test(c)
+    && /ASC_win_fire_bounds\(id, \(char\*\)"resize", before, after, false\)/.test(c)
+    && /ASC_win_fire_bounds\(id, \(char\*\)"move", before, after, false\)/.test(c));
+  check('a prevented resizing puts the geometry back and stops right there',
+    /if \(!ASC_win_fire_bounds\(id, \(char\*\)"resizing", rb, ra, true\)\) \{ ASC_win_revert\(id, fx, fy, fw, fh\); return; \}/.test(c)
+    && /if \(!ASC_win_fire_bounds\(id, \(char\*\)"moving", mb, ma, true\)\) \{ ASC_win_revert\(id, fx, fy, cw, ch\); return; \}/.test(c));
+  check('the revert writes the frame back and re-reads what the platform really applied',
+    /static void ASC_win_revert\(int id, int rx, int ry, int rw, int rh\) \{\n  ASCWin\* w = ASC_w\(id\);\n  if \(w == NULL\) return;\n  as_window_set_bounds\(id, rx, ry, rw, rh\);\n  int gx = 0, gy = 0, gw = 0, gh = 0;\n  as_window_get_bounds\(id, &gx, &gy, &gw, &gh\);\n  w->snap_x = gx;/.test(c));
+
+  // (2b) MOVING has exactly one source -- startMove() -- because a title-bar drag is not
+  // a MOVING in AIR (measured: no moving, one move at the release).
+  check('MOVING comes only from the glue latch of startMove(), never from a frame drag',
+    /else gesture \|= \(sg == 1\) \? 1 : 2;/.test(c)
+    && !/gesture \|= 1;/.test(c));
+
+  // (2c) Whoever asked for the change is accounted for, or "interactive" means nothing.
+  check('every app-caused geometry write is counted, and a counted one is not a gesture',
+    /if \(w->prog_writes > 0\) w->prog_writes--;/.test(c)
+    && (c.match(/w->prog_writes\+\+;/g) || []).length >= 7
+    // the two ATOMIC rectangles (bounds= and resizeToScreen) and the four state/limit
+    // writes that move the frame as a side effect
+    && /double nw = value->x, nh = value->y;[\s\S]{0,600}?w->prog_writes\+\+;\n  as_window_set_limits\(id/.test(c)
+    && /else as_window_restore\(\(\(NativeWindow\*\)_this\)->_win\);/.test(c)
+    // displayState is counted BEFORE the branch, so all three targets are covered
+    && /w->prog_writes\+\+;\n  if \(strcmp\(value, "minimized"\) == 0\) as_window_minimize/.test(c));
+  check('a change with no count left is the user\'s, and only the button keeps it pending',
+    /else gesture \|= \(sg == 1\) \? 1 : 2;\n  \} else if \(w->prog_writes > 0\) \{/.test(c)
+    && /if \(gesture == 0 \|\| !bdown\) \{\n    ASC_win_settle\(/.test(c));
+  check('the glue answers which drag is latched, and whether the button is down',
+    /int sk_window_gesture\(int id\) \{[\s\S]{0,140}?return c->sys_drag;/.test(glueWin)
+    && /int sk_window_pointer_down\(void\) \{\n  return \(SDL_GetGlobalMouseState\(NULL, NULL\) & SDL_BUTTON_LMASK\) \? 1 : 0;/.test(glueWin));
+
+  // (3) The three-way seam: real backend, headless fallback, web stub.
+  check('the runtime declares the three new glue externs',
+    /extern void sk_window_system_limits\(int\* mnw/.test(preamble)
+    && /extern int sk_window_gesture\(int id\);/.test(preamble)
+    && /extern int sk_window_pointer_down\(void\);/.test(preamble));
+  check('...and the headless branch stubs them (link cleanliness)',
+    /static inline void as_window_system_limits\(int\* mnw, int\* mnh, int\* mxw, int\* mxh\) \{\n    if \(mnw\) \*mnw = 0;/.test(preamble)
+    && /static inline int as_window_gesture\(int id\) \{ \(void\)id; return 0; \}/.test(preamble)
+    && /static inline int as_window_pointer_down\(void\) \{ return 0; \}/.test(preamble));
+  check('the web glue stubs the same three',
+    ['sk_window_system_limits', 'sk_window_gesture', 'sk_window_pointer_down']
+      .every((f) => new RegExp(`\\n(?:void|int) ${f}\\(`).test(glueWeb)));
+
+  // (4) The Retina gate this work uncovered: a window WITHOUT ALLOW_HIGHDPI renders at
+  // 1x, so dividing its logical size by the NSWindow backing scale halved every size on
+  // a Retina host (a 400x300 standard-resolution window answered 200x166, and the stage
+  // was half the window). Both the getter and the resize report have to be gated.
+  check('the logical size is only re-derived when the window is actually high-dpi',
+    /int highdpi = \(SDL_GetWindowFlags\(c->win\) & SDL_WINDOW_ALLOW_HIGHDPI\) \? 1 : 0;\n  if \(highdpi && pw > 0 && ph > 0\) \(void\)sk_window_device_scale/.test(glueWin)
+    && /if \(bs > 0\.0 && \(SDL_GetWindowFlags\(win\) & SDL_WINDOW_ALLOW_HIGHDPI\)\) \{/.test(glueWin));
+
+  // (5) The example is where the measured expectations live, and it is windowed (it never
+  // returns until nativeApplication.exit()), so it is not part of the run suite.
+  check('the example carries the measured static values and the "no moving for a write" pin',
+    /eq\("NativeWindow\.systemMinSize \(static\)"/.test(exSrc)
+    && /systemMinSize is unaffected by a minSize write/.test(exSrc)
+    && /RESIZING\(\" \+ rr\(e\.beforeBounds\)/.test(exSrc)
+    && c.includes('NativeWindow_get_systemMinSize_static(NULL)'));
+
+  console.log(`     [win-gesture] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/WindowSystemLimitsAndGestures', checkNativeWindowSystemLimitsAndGestures);
 
 // ---- the app's OWN initial window: the descriptor describes THAT window only ----
 //

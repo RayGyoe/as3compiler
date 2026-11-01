@@ -831,6 +831,12 @@ Four key behaviors aligned with adl:
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → build manifest adds `ASC_DISPLAY_HIGH=1`;
   the window opens `SDL_WINDOW_ALLOW_HIGHDPI` and the surface is created with physical pixels at device scale
   (Retina is not blurry); `standard` or omitted keeps 1x (consistent with adl, stretched by the compositor).
+  - **Only a window that opened `ALLOW_HIGHDPI` has "physical pixels != logical points"** (stage 353):
+    `sk_client_size_live` / `sk_window_device_scale` divide SDL's sizes by the NSWindow backing scale to
+    fold them back to logical points, and that divide is for high-dpi windows only; doing it to a 1x window
+    **halves** it — measured on this box, a `standard` `new NativeWindow(new Rectangle(220,220,400,300))`
+    read back `200x166` (a 200x150 client plus half a title bar) and the stage was half the window. Both
+    sites are now gated on `SDL_WINDOW_ALLOW_HIGHDPI`.
 - `<renderMode>` controls the GPU/CPU rendering split: `direct`/`gpu` → the build manifest adds a GPU define,
   and the backend switches the Skia surface from `SkSurfaces::Raster` to Ganesh `GrDirectContext`, compositing
   the whole frame on the GPU (efficiency-first, not aligning with AIR's official "direct = CPU compositing +

@@ -777,7 +777,11 @@ static double sk_window_backing_scale(SDL_Window* win) { (void)win; return 0.0; 
 // cross-display case is the one that matters.
 static double sk_window_device_scale(SDL_Window* win, int* lw, int* lh, int pw, int ph) {
   double bs = sk_window_backing_scale(win);
-  if (bs > 0.0) {
+  // Same gate as sk_client_size_live: a window without ALLOW_HIGHDPI renders at 1x, so
+  // its drawable IS its logical size and the backing scale must not be divided out.
+  // (This is also what do_resize reports to the AS3 side, so an ungated divide made the
+  // stage half the window on every Retina host in a standard-resolution build.)
+  if (bs > 0.0 && (SDL_GetWindowFlags(win) & SDL_WINDOW_ALLOW_HIGHDPI)) {
     const int dw = (int)((double)pw / bs + 0.5);
     const int dh = (int)((double)ph / bs + 0.5);
     // Both directions, and the stated logical size is REPLACED rather than only
@@ -811,7 +815,16 @@ static void sk_client_size_live(WinCtx* c, int* lw, int* lh) {
   int w = 0, h = 0, pw = 0, ph = 0;
   SDL_GetWindowSize(c->win, &w, &h);
   SDL_GetWindowSizeInPixels(c->win, &pw, &ph);
-  if (pw > 0 && ph > 0) (void)sk_window_device_scale(c->win, &w, &h, pw, ph);
+  // Only a window created with SDL_WINDOW_ALLOW_HIGHDPI owns a drawable that differs
+  // from its logical size -- that is what <requestedDisplayResolution>high buys
+  // (ASC_DISPLAY_HIGH). Without the flag SDL reports pixels == points even on a Retina
+  // panel, so re-deriving the logical size from the NSWindow's backing scale HALVED
+  // every window size on this machine: a 400x300 standard-resolution window answered
+  // bounds 200x166 (200x150 client + the 16pt title bar it had measured at half
+  // scale), and NativeWindow.set_minSize could then never widen it. AIR answers the
+  // point size it was asked for, which is precisely w x h here.
+  int highdpi = (SDL_GetWindowFlags(c->win) & SDL_WINDOW_ALLOW_HIGHDPI) ? 1 : 0;
+  if (highdpi && pw > 0 && ph > 0) (void)sk_window_device_scale(c->win, &w, &h, pw, ph);
   if (lw != NULL) *lw = w;
   if (lh != NULL) *lh = h;
 }
@@ -3322,6 +3335,48 @@ void sk_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
 
 void sk_window_limits_floor(int* fw, int* fh) {
   sk_window_size_floor(fw, fh);
+}
+
+// NativeWindow.systemMinSize/systemMaxSize: the tracking limits the window manager
+// itself imposes on ANY window, which is a different question from this window's own
+// minSize/maxSize (and from sk_window_size_floor, which is about CONTENT: macOS lets a
+// window track down to (2,2) but will not make the content smaller than (2,32)).
+// Measured on adl 51.4.1 / macOS 14: (2,2) and (107374182,107374182). The Windows
+// numbers come from the same quantity -- SM_CXMINTRACK/SM_CYMINTRACK, the size below
+// which the window manager refuses to shrink a frame -- which is why they are read
+// from the OS rather than written down here.
+void sk_window_system_limits(int* mnw, int* mnh, int* mxw, int* mxh) {
+#ifdef _WIN32
+  if (mnw) *mnw = (int)GetSystemMetrics(SM_CXMINTRACK);
+  if (mnh) *mnh = (int)GetSystemMetrics(SM_CYMINTRACK);
+#else
+  if (mnw) *mnw = 2;
+  if (mnh) *mnh = 2;
+#endif
+  if (mxw) *mxw = 107374182;
+  if (mxh) *mxh = 107374182;
+}
+
+// Which system drag is latched on this window: 0 none, 1 startMove(), 2 startResize().
+// sk_sys_drag_step clears it on button-up, so this reads 0 for every frame after the
+// gesture ends -- the poll latches the bit itself while the drag is running.
+int sk_window_gesture(int id) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return 0;
+  return c->sys_drag;
+}
+
+// 1 while the left pointer button is held anywhere on the desktop. The GLOBAL state is
+// used on purpose -- the pointer is routinely outside the window while dragging an
+// edge.
+//
+// Used by the AS3-side poll to keep ONE interactive change pending until the button
+// comes up: AIR reports a user's drag as a single settle at the release, never as a
+// stream of intermediate events. It is deliberately NOT used to decide whether a change
+// was interactive -- see ASC_win_poll for why (a macOS live resize can run from press
+// to release without this ever reading 1 at a frame the app gets to see).
+int sk_window_pointer_down(void) {
+  return (SDL_GetGlobalMouseState(NULL, NULL) & SDL_BUTTON_LMASK) ? 1 : 0;
 }
 
 // NativeWindow.minSize/maxSize. Stored here because they are a property of the OS

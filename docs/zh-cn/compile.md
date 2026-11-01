@@ -767,6 +767,11 @@ native 清单并定义 `ASC_HAVE_CURL=1`；web 目标则定义 `ASC_HAVE_FETCH=1
 - `<requestedDisplayResolution>high</requestedDisplayResolution>` → 构建清单加 `ASC_DISPLAY_HIGH=1`，
   窗口开 `SDL_WINDOW_ALLOW_HIGHDPI` 且 surface 按设备倍率创建物理像素（Retina 不模糊）；`standard`
   或缺省保持 1x（与 adl 一致，会被合成器拉伸）。
+  - **只有开了 `ALLOW_HIGHDPI` 的窗口才有「物理像素 ≠ 逻辑点」这回事**（阶段三百五十三）：
+    `sk_client_size_live` / `sk_window_device_scale` 会按 NSWindow 的 backing scale 把 SDL 的尺寸折回
+    逻辑点，这个折算是给 high-dpi 窗口的；对 1x 窗口再做一次就会**减半** —— 本机实测
+    `standard` 窗口 `new NativeWindow(new Rectangle(220,220,400,300))` 读回 `200x166`（客户区 200x150
+    加半个标题栏），stage 也只有窗口的一半大。现在两处都以 `SDL_WINDOW_ALLOW_HIGHDPI` 为门。
 - `<renderMode>` 控制 GPU/CPU 渲染分工：`direct`/`gpu` → 构建清单加 GPU define，后端把 Skia
   surface 从 `SkSurfaces::Raster` 换成 Ganesh `GrDirectContext`，整帧在 GPU 上合成（效率优先，不对齐
   AIR 官方「direct = CPU 合成 + GPU blit」的分割）。web 目标走 WebGL2，加 `ASC_RENDER_GPU=1`，present

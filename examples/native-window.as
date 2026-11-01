@@ -94,6 +94,14 @@ if (hasBackend) {
   w.addEventListener(NativeWindowBoundsEvent.MOVE, function(e:NativeWindowBoundsEvent):void {
     got.push("MOVE(" + rr(e.beforeBounds) + "->" + rr(e.afterBounds) + ")");
   });
+  // moving/resizing 只属于**交互**手势：程序化改 bounds 在 AIR 里只派发 RESIZE/MOVE
+  // （temp/nwsys/README.md 实测）。挂上监听就等于把「不该来」也钉进下面那条字符串。
+  w.addEventListener(NativeWindowBoundsEvent.RESIZING, function(e:NativeWindowBoundsEvent):void {
+    got.push("RESIZING(" + rr(e.beforeBounds) + "->" + rr(e.afterBounds) + ")");
+  });
+  w.addEventListener(NativeWindowBoundsEvent.MOVING, function(e:NativeWindowBoundsEvent):void {
+    got.push("MOVING(" + rr(e.beforeBounds) + "->" + rr(e.afterBounds) + ")");
+  });
   setTimeout(phase1, 600);
   setTimeout(phase2, 1200);
   setTimeout(phase3, 1800);
@@ -118,6 +126,13 @@ function phase1():void {
   eq("a minSize write resizes the live window", wSize.width, 1000);
   // getter 每次都是新对象（adl：`w.minSize === w.minSize` 为 false）。
   eq("minSize returns a fresh Point", wSize.minSize === wSize.minSize, false);
+  // systemMinSize/systemMaxSize 是**静态**只读成员，答的是「系统允许的极限」，与 minSize
+  // 的平台地板不同源（macOS 实测 (2,2)，而 minSize=(0,0) 读回 (2,32)——内容区地板另算）。
+  // 上面刚把 wSize 的 minSize 写到 (2,32)：静态值不受影响，这就是两者的分界。
+  eq("NativeWindow.systemMinSize (static)", pt(NativeWindow.systemMinSize), isMac ? "2,2" : "136,39");
+  eq("NativeWindow.systemMaxSize (static)", pt(NativeWindow.systemMaxSize), "107374182,107374182");
+  eq("systemMinSize is unaffected by a minSize write", pt(NativeWindow.systemMinSize), isMac ? "2,2" : "136,39");
+  eq("systemMinSize returns a fresh Point", NativeWindow.systemMinSize === NativeWindow.systemMinSize, false);
   wSize.minSize = new Point(2, 32);
   wSize.maxSize = new Point(107374182, 107374182);
 }

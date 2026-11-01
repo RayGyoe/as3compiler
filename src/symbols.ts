@@ -2080,17 +2080,6 @@ export class SymbolTable {
           ['supportsNotification', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'NativeWindow', isStatic: true, isConst: true }],
         ]),
         staticMethods: new Map(),
-        // systemMinSize/systemMaxSize are STATIC getters in AIR, not instance
-        // properties (measured on adl 51.4.1: `NativeWindow.systemMinSize` answers
-        // (2,2), while `w.systemMinSize` is both an mxmlc error -- "possibly
-        // undefined" -- and a runtime #1069). They report the OS's own window-size
-        // limits, a different pair from the instance-level minSize/maxSize below
-        // (which are the app's limits, seeded from AIR's per-platform defaults).
-        // Assigning either one is a compile error in AIR (read-only getter).
-        staticGetters: new Map<string, MethodInfo>([
-          ['systemMinSize', nwGetStatic('NativeWindow', { kind: 'object', className: 'Point' })],
-          ['systemMaxSize', nwGetStatic('NativeWindow', { kind: 'object', className: 'Point' })],
-        ]),
         getters: new Map<string, MethodInfo>([
           ['stage', nwGet('NativeWindow', { kind: 'object', className: 'Stage' })],
           ['bounds', nwGet('NativeWindow', { kind: 'object', className: 'Rectangle' })],
@@ -2130,6 +2119,17 @@ export class SymbolTable {
           // each read returns a FRESH Point (identity is never preserved).
           ['minSize', nwGet('NativeWindow', { kind: 'object', className: 'Point' })],
           ['maxSize', nwGet('NativeWindow', { kind: 'object', className: 'Point' })],
+        ]),
+        // systemMinSize/systemMaxSize are STATIC getters in AIR, not instance
+        // properties (measured on adl 51.4.1: `NativeWindow.systemMinSize` answers
+        // (2,2), while `w.systemMinSize` is both an mxmlc error -- "possibly
+        // undefined" -- and a runtime #1069, and assigning either one is a compile
+        // error because both are read-only). Their values describe the OS, not the
+        // window: (2,2) here against the (2,32) floor a minSize write is clamped to,
+        // because that floor is about the CONTENT area (see sk_window_size_floor).
+        staticGetters: new Map<string, MethodInfo>([
+          ['systemMinSize', nwGetStatic('NativeWindow', { kind: 'object', className: 'Point' })],
+          ['systemMaxSize', nwGetStatic('NativeWindow', { kind: 'object', className: 'Point' })],
         ]),
         setters: new Map<string, MethodInfo>([
           // x/y/width/height write straight through to bounds (measured: setting

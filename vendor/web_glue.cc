@@ -550,6 +550,16 @@ void sk_window_limits_floor(int* fw, int* fh) { if (fw) *fw = 0; if (fh) *fh = 0
 void sk_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
   if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
 }
+// systemMinSize/systemMaxSize belong to the browser's window too, so like the two
+// limits above there is no platform answer to give: a zero pair keeps the getter
+// honest rather than inventing a window manager's numbers.
+void sk_window_system_limits(int* mnw, int* mnh, int* mxw, int* mxh) {
+  if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+}
+// No drag latch and no desktop pointer to sample: the page never sees an interactive
+// geometry change, so both stay at their "nothing in progress" value.
+int sk_window_gesture(int id) { (void)id; return 0; }
+int sk_window_pointer_down(void) { return 0; }
 int sk_window_start_move(int id) { (void)id; return 0; }
 int sk_window_start_resize(int id, const char* edge) { (void)id; (void)edge; return 0; }
 // A browser tab's close button is the browser's to own: the page never sees it, so

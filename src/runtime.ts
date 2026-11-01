@@ -10554,6 +10554,21 @@ extern void sk_window_limits_floor(int* fw, int* fh);
 // The same two numbers, readable before any OS window exists (see the note on
 // as_window_limits_default).
 extern void sk_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh);
+// NativeWindow.systemMinSize/systemMaxSize: what the OS itself will allow ANY window
+// to be sized to, independent of this window's minSize/maxSize. Measured on adl
+// 51.4.1 / macOS: (2,2) and (107374182,107374182) -- note the minimum is NOT the
+// (2,32) floor a minSize write is clamped to, because that floor is about the
+// CONTENT area and this one is the window manager's tracking limit.
+extern void sk_window_system_limits(int* mnw, int* mnh, int* mxw, int* mxh);
+// Which system drag (if any) the glue currently has latched on this window:
+// 0 none, 1 NativeWindow.startMove(), 2 NativeWindow.startResize(). Only the
+// app-driven ones are reported here -- a user dragging the system chrome never
+// enters the glue at all, which is why the poll also needs the pointer state below.
+extern int sk_window_gesture(int id);
+// 1 while the left pointer button is held anywhere on the desktop. Needed to
+// recognise the OTHER kind of interactive geometry change (the user dragging an
+// edge of the window's own frame), which AIR reports as RESIZING too.
+extern int sk_window_pointer_down(void);
 // NativeWindow.startMove()/startResize(): begin a pointer-driven system drag.
 // Returns 1 when the drag was started (AIR's true), 0 when the window cannot be
 // dragged at all (closed/maximized/not resizable), which is also AIR's false.
@@ -10954,6 +10969,37 @@ static inline void as_window_limits_default(int* mnw, int* mnh, int* mxw, int* m
     if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
 #endif
 }
+// NativeWindow.systemMinSize/systemMaxSize. Answers the OS's own limits, which on
+// every platform we target are a single pair for all windows -- hence the two-argument
+// seam with no window id.
+static inline void as_window_system_limits(int* mnw, int* mnh, int* mxw, int* mxh) {
+#ifdef ASC_USE_WINDOW
+    sk_window_system_limits(mnw, mnh, mxw, mxh);
+#else
+    if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+#endif
+}
+// Which app-requested system drag is in progress (0 none, 1 startMove(), 2
+// startResize()) and whether the left pointer button is down at all.
+//
+// Neither of them decides whether a change was INTERACTIVE -- see the poll for that: everything this runtime writes is counted by the app instead, because a macOS
+// live resize can run press-to-release without the app ever getting a frame with the
+// button still down. They are what keep a running drag pending (one settle at the
+// release, as AIR does) and what makes startMove() the only source of MOVING.
+static inline int as_window_gesture(int id) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_gesture(id);
+#else
+    (void)id; return 0;
+#endif
+}
+static inline int as_window_pointer_down(void) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_pointer_down();
+#else
+    return 0;
+#endif
+}
 // NativeWindow.startMove()/startResize(): begin a pointer-driven system drag.
 // Returns 1 when the drag started, which is AIR's true; 0 (no window manager, or a
 // window that cannot be dragged) is AIR's false and is reported as such rather
@@ -11246,6 +11292,11 @@ static inline void as_window_limits_floor(int* fw, int* fh) { if (fw) *fw = 0; i
 static inline void as_window_limits_default(int* mnw, int* mnh, int* mxw, int* mxh) {
     if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
 }
+static inline void as_window_system_limits(int* mnw, int* mnh, int* mxw, int* mxh) {
+    if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
+}
+static inline int as_window_gesture(int id) { (void)id; return 0; }
+static inline int as_window_pointer_down(void) { return 0; }
 static inline int as_window_start_move(int id) { (void)id; return 0; }
 static inline int as_window_start_resize(int id, const char* edge) { (void)id; (void)edge; return 0; }
 static inline int as_window_main(void) { return -1; }

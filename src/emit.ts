@@ -6640,6 +6640,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('as_window_get_client_size(id, &lw, &lh);');
     this.line('if (lw > 0 && lh > 0) { ww->lw = lw; ww->lh = lh; }');
     this.line('ASC_window_apply_stage_size(id);');
+    // Counted for ASC_win_poll: a geometry change the app asked for is NOT an
+    // interactive gesture, so it must not be reported as moving/resizing. The counter
+    // is consumed by the first poll that sees its effect (see the note there).
+    this.line('ww->prog_writes++;');
     this.indent--;
     this.line('}');
     // x/y/width/height are bounds components (measured: setting x=100 moved
@@ -6918,6 +6922,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w == NULL || value == NULL) return;');
+    // Each of these changes the frame, so it is counted as an app-caused geometry
+    // change: maximize/restore must surface as a bare RESIZE, never as RESIZING.
+    this.line('w->prog_writes++;');
     this.line('if (strcmp(value, "minimized") == 0) as_window_minimize(((NativeWindow*)_this)->_win);');
     this.line('else if (strcmp(value, "maximized") == 0) as_window_maximize(((NativeWindow*)_this)->_win);');
     this.line('else as_window_restore(((NativeWindow*)_this)->_win);');
@@ -7042,6 +7049,8 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('Rectangle* vb = Screen_get_visibleBounds((void*)screen);');
     this.line('if (vb == NULL) return;');
     this.line('as_window_set_bounds(id, (int)vb->x, (int)vb->y, (int)vb->width, (int)vb->height);');
+    // Same accounting as write_bounds: resizeToScreen is the app moving the window.
+    this.line('{ ASCWin* rw = ASC_w(id); if (rw != NULL) rw->prog_writes++; }');
     this.indent--;
     this.line('}');
     // listOwnedWindows(): the windows this one owns, which in AIR is the set whose
@@ -7064,6 +7073,27 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.indent--;
       this.line('}');
     }
+    // systemMinSize/systemMaxSize (static, read-only): the OS's own tracking limits.
+    // Not read from the window record on purpose -- these describe the window manager,
+    // so they are the same for every window and exist before one is created. A fresh
+    // Point per read, like the two getters above (measured: `a === b` is false on adl
+    // and mutating the returned Point does not stick).
+    this.line('Point* NativeWindow_get_systemMinSize_static(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('int mnw = 0, mnh = 0, mxw = 0, mxh = 0;');
+    this.line('as_window_system_limits(&mnw, &mnh, &mxw, &mxh);');
+    this.line('return Point_new((double)mnw, (double)mnh);');
+    this.indent--;
+    this.line('}');
+    this.line('Point* NativeWindow_get_systemMaxSize_static(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('int mnw = 0, mnh = 0, mxw = 0, mxh = 0;');
+    this.line('as_window_system_limits(&mnw, &mnh, &mxw, &mxh);');
+    this.line('return Point_new((double)mxw, (double)mxh);');
+    this.indent--;
+    this.line('}');
     this.line('void NativeWindow_set_minSize(void* _this, Point* value) {');
     this.indent++;
     this.line('if (value == NULL) return;');
@@ -7078,6 +7108,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (nw > w->max_w) nw = w->max_w;');
     this.line('if (nh > w->max_h) nh = w->max_h;');
     this.line('w->min_w = nw; w->min_h = nh;');
+    // The platform applies the new floor immediately, so this write can resize the live
+    // window -- an app-caused change, hence counted, exactly like a bounds write.
+    this.line('w->prog_writes++;');
     this.line('as_window_set_limits(id, (int)w->min_w, (int)w->min_h, (int)w->max_w, (int)w->max_h);');
     this.indent--;
     this.line('}');
@@ -7091,6 +7124,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (nw < w->min_w) nw = w->min_w;');
     this.line('if (nh < w->min_h) nh = w->min_h;');
     this.line('w->max_w = nw; w->max_h = nh;');
+    this.line('w->prog_writes++;');
     this.line('as_window_set_limits(id, (int)w->min_w, (int)w->min_h, (int)w->max_w, (int)w->max_h);');
     this.indent--;
     this.line('}');
@@ -7138,6 +7172,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w != NULL) { w->display_state = (char*)"minimized"; gc_write_barrier((void*)w->display_state); }');
+    this.line('if (w != NULL) w->prog_writes++;');
     this.line('as_window_minimize(((NativeWindow*)_this)->_win);');
     this.indent--;
     this.line('}');
@@ -7145,6 +7180,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w != NULL) { w->display_state = (char*)"maximized"; gc_write_barrier((void*)w->display_state); }');
+    this.line('if (w != NULL) w->prog_writes++;');
     this.line('as_window_maximize(((NativeWindow*)_this)->_win);');
     this.indent--;
     this.line('}');
@@ -7152,6 +7188,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w != NULL) { w->display_state = (char*)"normal"; gc_write_barrier((void*)w->display_state); }');
+    this.line('if (w != NULL) w->prog_writes++;');
     this.line('as_window_restore(((NativeWindow*)_this)->_win);');
     this.indent--;
     this.line('}');
@@ -29850,6 +29887,18 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Display state as a code (0 normal, 1 minimized, 2 maximized, 3 fullScreen),
     // so the poll can compare it with a plain int; see ASC_win_ds_code.
     this.line('int snap_ds;');
+    // How many of the geometry writes in flight were the APP's own (a setter, or
+    // resizeToScreen). A write the app made is never an interactive gesture: AIR
+    // reports it as a bare MOVE/RESIZE, while the same change made by the user
+    // dragging the frame is preceded by MOVING/RESIZING. Each count is consumed by
+    // the first poll that sees the resulting geometry, so the two never mix.
+    this.line('int prog_writes;');
+    // The gesture bits latched while an interactive drag is still running: 1 =
+    // a move (only from an app-driven startMove() drag), 2 = a resize. They are
+    // collected ACROSS the frames of one drag -- the platform only reports the final
+    // geometry, so the settle pair is built from the rect the drag started at -- and
+    // consumed at button-up, which is when AIR dispatches the pair.
+    this.line('int gesture;');
     this.line('char* title;');
     this.line('char* system_chrome;');
     this.line('char* type;');
@@ -29913,6 +29962,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('w->snap_active = as_window_is_active(id);');
     this.line('w->snap_raw_active = w->snap_active;');
     this.line('w->snap_ds = ASC_win_ds_code(w);');
+    // The gesture bookkeeping is part of the same snapshot: whatever was pending is
+    // now the baseline, so it must not colour the next transition.
+    this.line('w->prog_writes = 0;');
+    this.line('w->gesture = 0;');
     this.indent--;
     this.line('}');
     // NativeWindow.minSize/maxSize as the window starts out, and the floor a later
@@ -29947,8 +30000,82 @@ void FileStream_writeObject(void* _this, as_value v) {
     // RESIZE,MOVE), and ACTIVATE last (coming back -> DISPLAY_STATE_CHANGE,
     // ACTIVATE). The two `before` values the events carry are the snapshot's, which
     // is exactly what AIR fills in.
-    this.line('static void ASC_win_fire_bounds(int id, const char* type, Rectangle* before, Rectangle* after);');
+    this.line('static bool ASC_win_fire_bounds(int id, const char* type, Rectangle* before, Rectangle* after, bool cancelable);');
     this.line('static void ASC_win_fire_ds(int id, char* before, char* after);');
+    // Put the frame back where a gesture started, and re-baseline the snapshot from what
+    // the window ACTUALLY reports afterwards. A cancelled moving/resizing must leave
+    // nothing behind: re-reading (rather than trusting the arguments) keeps the rollback
+    // itself from showing up as a fresh transition on the next poll, when the platform
+    // ends up a pixel off from what was asked for.
+    this.line('static void ASC_win_revert(int id, int rx, int ry, int rw, int rh) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('as_window_set_bounds(id, rx, ry, rw, rh);');
+    this.line('int gx = 0, gy = 0, gw = 0, gh = 0;');
+    this.line('as_window_get_bounds(id, &gx, &gy, &gw, &gh);');
+    this.line('w->snap_x = gx; w->snap_y = gy; w->snap_w = gw; w->snap_h = gh;');
+    this.line('w->prog_writes = 0;');
+    this.line('w->gesture = 0;');
+    this.indent--;
+    this.line('}');
+    // One frame of geometry settlement, in AIR's order: resizing, RESIZE,
+    // DISPLAY_STATE_CHANGE, moving, MOVE. A cancelled resizing/moving returns early --
+    // AIR then reports nothing else for that frame (measured: cancelling the RESIZING of
+    // a corner drag produced no RESIZE at all and left the window at its pre-gesture
+    // rect, temp/nwsys/README.md).
+    this.line('static void ASC_win_settle(int id, int fx, int fy, int fw, int fh, int x, int y, int cw, int ch, int gesture, int ds) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL) return;');
+    this.line('bool size_changed = (cw != fw || ch != fh);');
+    this.line('bool pos_changed = (x != fx || y != fy);');
+    this.line('if (size_changed && (gesture & 2) != 0) {');
+    this.indent++;
+    this.line('Rectangle* rb = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
+    this.line('Rectangle* ra = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
+    this.line('if (!ASC_win_fire_bounds(id, (char*)"resizing", rb, ra, true)) { ASC_win_revert(id, fx, fy, fw, fh); return; }');
+    this.indent--;
+    this.line('}');
+    this.line('if (size_changed) {');
+    this.indent++;
+    // Both events of a frame describe the SAME transition, so both take `before` from
+    // the rect the frame started in. Measured: for a change that moves and resizes at
+    // once, adl answers RESIZE(100,100 300x200 -> 200,200 500x400) then
+    // MOVE(100,100 300x200 -> 200,200 500x400) -- the move carries the pre-change rect
+    // too, not the new size at the old origin (temp/nwmac/ev-out-adl.txt t2).
+    this.line('Rectangle* before = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
+    this.line('Rectangle* after = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
+    this.line('w->snap_w = cw; w->snap_h = ch;');
+    this.line('ASC_win_fire_bounds(id, (char*)"resize", before, after, false);');
+    this.indent--;
+    this.line('}');
+    this.line('if (ds != w->snap_ds) {');
+    this.indent++;
+    this.line('char* before = (char*)(w->snap_ds == 1 ? "minimized" : w->snap_ds == 2 ? "maximized" : w->snap_ds == 3 ? "fullScreen" : "normal");');
+    this.line('char* after = (char*)(ds == 1 ? "minimized" : ds == 2 ? "maximized" : ds == 3 ? "fullScreen" : "normal");');
+    this.line('w->snap_ds = ds;');
+    this.line('ASC_win_fire_ds(id, before, after);');
+    this.indent--;
+    this.line('}');
+    this.line('if (pos_changed && (gesture & 1) != 0) {');
+    this.indent++;
+    this.line('Rectangle* mb = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
+    this.line('Rectangle* ma = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
+    // Position only: a move gesture keeps the size the resize settle just recorded.
+    this.line('if (!ASC_win_fire_bounds(id, (char*)"moving", mb, ma, true)) { ASC_win_revert(id, fx, fy, cw, ch); return; }');
+    this.indent--;
+    this.line('}');
+    this.line('if (pos_changed) {');
+    this.indent++;
+    this.line('Rectangle* before = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
+    this.line('Rectangle* after = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
+    this.line('w->snap_x = x; w->snap_y = y;');
+    this.line('ASC_win_fire_bounds(id, (char*)"move", before, after, false);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('static void ASC_win_poll(int id) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(id);');
@@ -30003,34 +30130,59 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('ASC_win_fire(id, (char*)"deactivate", false);');
     this.indent--;
     this.line('}');
-    // Both bounds events describe the SAME frame, so both take their `before` from the
-    // state this frame started in -- not from the half-updated snapshot. Measured: for a
-    // change that moves and resizes at once, adl answers
-    // RESIZE(100,100 300x200->200,200 500x400) | MOVE(100,100 300x200->200,200 500x400),
-    // i.e. the move's beforeBounds is the pre-change rect, NOT the new size at the old
-    // origin (temp/nwmac/ev-out-adl.txt t2).
-    this.line('if (cw != w->snap_w || ch != w->snap_h) {');
+    // moving/resizing (temp/nwsys/README.md, adl 51.4.1):
+    //  * AIR dispatches them ONCE per gesture, immediately before the settle event and
+    //    with the SAME before/after pair, and they are cancelable -- preventing one
+    //    rolls the geometry back and suppresses the settle event (measured: a corner
+    //    drag 400x300 -> 470x350 with RESIZING.preventDefault() left the window at
+    //    400x300 and delivered no RESIZE at all).
+    //  * They exist only for INTERACTIVE gestures. A programmatic `width = ...`,
+    //    `bounds = ...`, `maximize()` or `restore()` gets a bare RESIZE/MOVE, never a
+    //    RESIZING/MOVING. That is what prog_writes counts: every geometry write the app
+    //    itself issues, consumed by the next poll that sees its effect.
+    //  * MOVING exists ONLY for an app-driven `startMove()` drag: a user dragging the
+    //    title bar of a standard-chrome window gets no MOVING at all from AIR (three
+    //    independent probes), so gesture bit 1 is set from the backend's sys_drag == 1,
+    //    never from the bare button state.
+    //  * Everything the user does DURING a gesture is folded into that one pair: the
+    //    snapshot is left alone while the button is held, so the settle pair spans the
+    //    whole gesture (a whole title-bar drag produces exactly one MOVE, at button-up).
+    this.line('int sg = as_window_gesture(id);');
+    this.line('bool bdown = as_window_pointer_down();');
+    this.line('int gesture = w->gesture;');
+    this.line('if (cw != fw || ch != fh || x != fx || y != fy) {');
     this.indent++;
-    this.line('Rectangle* before = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
-    this.line('Rectangle* after = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
-    this.line('w->snap_w = cw; w->snap_h = ch;');
-    this.line('ASC_win_fire_bounds(id, (char*)"resize", before, after);');
+    this.line('if (w->prog_writes > 0) w->prog_writes--;');
+    // "The app did not ask for this" IS the definition of an interactive gesture: every
+    // geometry write this runtime makes on the app's behalf is counted in prog_writes
+    // (the setters, resizeToScreen, minimize/maximize/restore/displayState, and the
+    // minSize/maxSize writes that can resize the live window). So a change with no
+    // count left is the user's.
+    //
+    // It cannot be decided from the pointer alone: a macOS live resize runs entirely
+    // inside the window server, so the app learns the final size only when the drag
+    // ENDS -- the button is already up by then (measured: an interactive corner drag
+    // reached the poll as a bare size change, with the button state gone). The button
+    // is still what keeps a DRAG coalesced while it is running.
+    this.line('else gesture |= (sg == 1) ? 1 : 2;');
+    this.indent--;
+    this.line('} else if (w->prog_writes > 0) {');
+    this.indent++;
+    this.line('w->prog_writes = 0;');
     this.indent--;
     this.line('}');
-    this.line('if (ds != w->snap_ds) {');
+    // Hold everything back while the button is still down: the snapshot stays at the
+    // pre-gesture rect, which is exactly the `before` the one-shot pair will carry at
+    // button-up. Only the geometry/dispatch block is held -- focus and the close request
+    // above keep being served while the user drags.
+    this.line('if (gesture == 0 || !bdown) {');
     this.indent++;
-    this.line('char* before = (char*)(w->snap_ds == 1 ? "minimized" : w->snap_ds == 2 ? "maximized" : w->snap_ds == 3 ? "fullScreen" : "normal");');
-    this.line('char* after = (char*)(ds == 1 ? "minimized" : ds == 2 ? "maximized" : ds == 3 ? "fullScreen" : "normal");');
-    this.line('w->snap_ds = ds;');
-    this.line('ASC_win_fire_ds(id, before, after);');
+    this.line('ASC_win_settle(id, fx, fy, fw, fh, x, y, cw, ch, gesture, ds);');
+    this.line('w->gesture = 0;');
     this.indent--;
-    this.line('}');
-    this.line('if (x != w->snap_x || y != w->snap_y) {');
+    this.line('} else {');
     this.indent++;
-    this.line('Rectangle* before = Rectangle_new((double)fx, (double)fy, (double)fw, (double)fh);');
-    this.line('Rectangle* after = Rectangle_new((double)x, (double)y, (double)cw, (double)ch);');
-    this.line('w->snap_x = x; w->snap_y = y;');
-    this.line('ASC_win_fire_bounds(id, (char*)"move", before, after);');
+    this.line('w->gesture = gesture;');
     this.indent--;
     this.line('}');
     // ACTIVATE is the raw 0->1 focus transition, so the inferred deactivate above
@@ -30051,13 +30203,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     // bare Event: a listener declared `function(e:NativeWindowBoundsEvent)` would
     // otherwise be handed an object of the wrong class, and the before/after values
     // it reads are exactly what our snapshot already holds.
-    this.line('static void ASC_win_fire_bounds(int id, const char* type, Rectangle* before, Rectangle* after) {');
+    this.line('static bool ASC_win_fire_bounds(int id, const char* type, Rectangle* before, Rectangle* after, bool cancelable) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL || w->closed) return;');
+    this.line('if (w == NULL || w->closed) return true;');
     this.line('NativeWindow* nw = as_win_wrapper(id);');
-    this.line('if (nw == NULL) return;');
-    this.line('EventDispatcher_dispatchEvent((void*)nw, (Event*)NativeWindowBoundsEvent_new((char*)type, false, false, before, after));');
+    this.line('if (nw == NULL) return true;');
+    // true means "carry on": the event was not cancelable, or every listener let it
+    // through. Only moving/resizing are cancelable, and a listener that prevents one
+    // makes AIR refuse the pending change -- the caller answers by rolling the geometry
+    // back (see ASC_win_settle and temp/nwsys/README.md).
+    this.line('return EventDispatcher_dispatchEvent((void*)nw, (Event*)NativeWindowBoundsEvent_new((char*)type, false, cancelable, before, after));');
     this.indent--;
     this.line('}');
     this.line('static void ASC_win_fire_ds(int id, char* before, char* after) {');
