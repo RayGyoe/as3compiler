@@ -467,6 +467,32 @@ straight to the backend) — but they must be listed completely so nobody assume
 | **Shadow compare sampling** `sampler2DShadow` | OceanSurface.js:271, UnderwaterPass.js:17 | none (ES 1.00 manual `texture2DProj`) | §6.4(c) — today the comparison is done in the shader, not in hardware |
 | **Integer types + bit ops** `uint`/`uvec2`/`^`/`>>` | OceanSim.js:38/41/51 PCG hash | none (AGAL has no integers) | ES 3.00 core, native on all three |
 
+### 6.9 Render-target MSAA: `setRenderTargetSamples` (M34, enhancement)
+
+`ASC_S3D_MSAA` multisamples the **drawable** only; offscreen targets were pinned to one sample (D54/D55).
+The offscreen-chain apps need edge antialiasing there, so M34 adds a **per-target** knob:
+
+```as3
+var ok:Boolean = ctxNative.setRenderTargetSamples(waterTex, 4);   // 1 / 2 / 4 / 8
+```
+
+The channel allocates a same-size multisample companion for that target and tracks whether it still holds
+unresolved samples. A later pass renders into the companion **only if every attachment in that pass has the
+same sample count**; otherwise it silently falls back to one sample (no error, no slow path). Resolution is
+**lazy** — performed before sampling bind, `bindTexture`, `get_render_target`, `generateMipmaps` and the frame
+flush — so the app always reads the single-sample texture and never has to know the companion exists.
+
+Per target rather than global because the full-screen data passes (FFT atlases, metering grid, bloom
+pyramid) cover every sample identically: multisampling them costs memory and a resolve for a bit-identical
+result. Colour and depth must be attached together (Metal requires one sample count per pass).
+`renderOverride` passes (shadow prepass, `drawToBitmapData`) stay at one sample (D54), and `generateMipmaps`
+now encodes into the current frame's command batch — submitting an immediate command buffer would reorder it
+against the draws under MSAA.
+
+Measured (ocean-m34, frozen time, identical camera): off vs 4x differs on 1.58% of pixels (mean 0.185), and
+92.5% of that lands on strong edges; the Breakers view shows 1.12% with hard-step pixels down 1.8%. A
+difference covering flat surfaces means the wrong targets were multisampled.
+
 ---
 
 ## 7. AS side (asaot3d) work list
@@ -750,6 +776,8 @@ verified from unverified** so "the code landed" is never confused with "it was a
 - **⑤ UBO**: not implemented (nothing computes std140 offsets); `uniformsGroups` is not borrowed.
 - **⑥ `RawShaderMaterial`**: not implemented — `ShaderMaterial` already takes raw source, a separate class would
   have carried three.js's "no built-in uniforms/attributes" semantics that we inject anyway.
+- **⑦ Offscreen MSAA**: per-target `setRenderTargetSamples(tex, n)`, default 1 (§6.9). Not a `Context3D`-wide
+  switch: a global one would drag the full-screen data passes into multisampling for no gain.
 
 **Still open**:
 

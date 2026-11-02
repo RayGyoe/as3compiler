@@ -1673,9 +1673,13 @@ function checkStage3dPendingClear(): string[] {
     /loadAction = wantColor \? MTLLoadActionClear : MTLLoadActionLoad/.test(body)
     && /loadAction = wantDepth \? MTLLoadActionClear : MTLLoadActionLoad/.test(body)
     && /loadAction = wantStencil \? MTLLoadActionClear : MTLLoadActionLoad/.test(body));
+  // The depth pick grew a multisample rung (a native offscreen pass clears the
+  // companion, not the app-visible texture, see docs §6.10), so this asserts the
+  // FIRST branch rather than the whole expression: the override's own depth is still
+  // what an offscreen pass clears.
   check('an offscreen target and its own depth/stencil are the ones cleared',
     /c->renderOverride != nil \? c->renderOverride : c->target/.test(body)
-    && /\(c->renderOverride != nil\) \? c->rtDepthStencil/.test(body));
+    && /c->renderOverride != nil \? c->rtDepthStencil/.test(body));
   check('a multisampled on-screen pass resolves, or the visible surface keeps nothing',
     /MTLStoreActionMultisampleResolve/.test(body) && /c->msaaResolvePending = 0;/.test(body));
   check('it is flushed when the render target changes (before the next pass binds it)',

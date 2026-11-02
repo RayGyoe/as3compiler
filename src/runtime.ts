@@ -16319,6 +16319,11 @@ extern void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex);
 extern void s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip);
 extern void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth);
 extern void* s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable, int mipmapped);
+// Multisample level of ONE offscreen render target (Context3DNative.setRenderTargetSamples).
+// Per target, not per context: multisampling averages subpixel coverage, so a
+// full-screen GPU-data pass (FFT atlas, metering grid) has no edge to improve and
+// only pays memory -- the caller decides which target wants edges smoothed.
+extern int s3d_set_target_samples(void* ctx, void* tex, int samples);
 extern void s3d_generate_mips(void* ctx, void* tex);
 
 static inline int as_s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
@@ -16366,6 +16371,13 @@ static inline void* as_s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId
     return s3d_create_texture_fmt(ctx, w, h, fmtId, renderable, mipmapped);
 #else
     (void)ctx; (void)w; (void)h; (void)fmtId; (void)renderable; (void)mipmapped; return NULL;
+#endif
+}
+static inline int as_s3d_set_target_samples(void* ctx, void* tex, int samples) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_set_target_samples(ctx, tex, samples);
+#else
+    (void)ctx; (void)tex; (void)samples; return 0;
 #endif
 }
 static inline void as_s3d_generate_mips(void* ctx, void* tex) {

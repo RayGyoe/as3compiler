@@ -26374,6 +26374,35 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return t;');
     this.indent--;
     this.line('}');
+    // Multisample level of ONE offscreen target. Not a create-time flag: the app's
+    // texture keeps sampleCount 1 and stays the thing it samples, and the level only
+    // decides whether passes render into a companion surface and resolve back into
+    // it. That makes the level changeable on a live target (the demo's QUALITY menu
+    // does exactly that) and keeps one texture identity for every pass list that
+    // names it.
+    //
+    // Boolean, not void: a device that cannot honour the count must not look like it
+    // did -- the caller logs the refusal instead of showing a control that does
+    // nothing (see docs/zh-cn/native-shader.md §9).
+    this.line('bool Context3DNative_setRenderTargetSamples(void* _this, TextureBase* tex, int samples) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('if (tex == NULL || tex->vtable != (void*)&Texture_vt) as_throw(ArgumentError_new((char*)"Context3DNative.setRenderTargetSamples: not a Texture", 2004));');
+    this.line('Texture* t = (Texture*)tex;');
+    this.line('if (t->gpu == NULL) as_throw(ArgumentError_new((char*)"Context3DNative.setRenderTargetSamples: texture has no GPU storage", 2004));');
+    this.line('int n = samples;');
+    this.line('if (n < 1) n = 1;');
+    this.line('if (n != 1 && n != 2 && n != 4 && n != 8) {');
+    this.indent++;
+    this.line('char msg[256];');
+    this.line('snprintf(msg, sizeof(msg), "Context3DNative.setRenderTargetSamples: %d samples is not one of 1/2/4/8", samples);');
+    this.line('as_throw(ArgumentError_new(msg, 2008));');
+    this.indent--;
+    this.line('}');
+    this.line('return as_s3d_set_target_samples(self->context->gpu, t->gpu, n) ? true : false;');
+    this.indent--;
+    this.line('}');
     this.line('void Context3DNative_setRenderTargets(void* _this, as_array* colors, TextureBase* depth) {');
     this.indent++;
     this.line('Context3DNative* self = (Context3DNative*)_this;');

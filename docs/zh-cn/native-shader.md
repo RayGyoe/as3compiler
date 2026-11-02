@@ -353,6 +353,7 @@ if (nat != null) {
 | `createDepthTexture(w, h, format)` | `DEPTH_32F` / `DEPTH_16`（只作附件，见 §6.4f） | M3 |
 | `generateMipmaps(tex)` | Metal blit 编码器生成 mip 链 | M3 |
 | `setRenderTargets(colors, depth)` / `setBackBuffer()` | MRT；**空目标集非法**（§6.9 #4） | M2 |
+| `setRenderTargetSamples(tex, samples)` | 给**单个**离屏目标挂一张 multisample companion（`1/2/4/8`；返回是否真的生效，见 §6.10） | M34 |
 | `bindTexture(prog, name, tex)` / `bindAttribute(...)` / `drawTriangles(...)` | 绑定与绘制 | M2 |
 
 `NativeProgram3D` 暴露反射结果：`uniformNames` / `bindingNames` +（M3 新增）`bindingComponents`、
@@ -482,6 +483,31 @@ Metal/D3D 的顶点阶段采样无此限制，但 WebGL2 有 `MAX_VERTEX_TEXTURE
 第 5 条是 `Context3D.drawToBitmapData` 的**语义缺陷**而不是通道问题：AIR 的 `drawToBitmapData` 要求目标位图
 不小于后台缓冲，我们放宽成「重叠区拷、其余保持原值」，但**绝不越界写**。这条缺陷从第一个读回探针起就在，
 只是探针紧接着退出、堆损坏没来得及显形——被 34 pass/帧的海洋抓住。
+
+### 6.10 离屏 MSAA：`setRenderTargetSamples`（M34，enhancement）
+
+默认（`ASC_S3D_MSAA`）只多重采样**drawable**；离屏目标在 M10 被钉死 1 采样（D54/D55）。离屏链的
+应用（ocean-m34）确实需要边缘抗锯齿，所以 M34 补一个**逐目标**旋钮：
+
+```as3
+var ok:Boolean = ctxNative.setRenderTargetSamples(waterTex, 4);   // 1/2/4/8
+```
+
+**语义**：为这个目标分配一张同尺寸、同格式的 multisample companion（`dirty` 标记是否还有未解析的
+样本）；之后的 pass 如果**所有附件采样数一致**就画进 companion，否则退回 1 采样（不报错、不退性能）；
+resolve 是**惰性**的，在「采样绑定 / `bindTexture` / `get_render_target` / `generateMipmaps` / 帧 flush」
+五处入口之前做，所以应用读到的永远是单样本目标，不需要知道 companion 存在。
+
+**为什么逐目标而不是全局**：全屏数据 pass（FFT 图集、测光网格、bloom 金字塔）由全屏 quad 覆盖，
+每个样本拿到 bit-identical 的值，多采样只多花显存与一次 resolve。**为什么必须连深度一起挂**：
+Metal 要求一次 pass 的所有附件采样数相同。**为什么 `generateMipmaps` 要改成编进当前批次**：
+以前它自己提交一个 immediate command buffer，MSAA 下会与前面的绘制**乱序**（mip 链从空目标生成）。
+
+**实测判据**（ocean-m34，冻结时间 + 同一相机）：off vs 4x 差 1.58% 像素、均值 0.185，
+92.5% 的差异落在强边缘；Breakers 视图 1.12%、硬台阶像素 -1.8%。差异落在平面上就说明挂错了东西。
+
+**边界**：`setRenderTargetSamples` 不改 drawable（那个仍归 `ASC_S3D_MSAA`）；`renderOverride` 的 pass
+（阴影 prepass、`drawToBitmapData`）永远 1 采样（D54）；目标重建后 companion 会丢，调用方要重推一次。
 
 ---
 
@@ -746,6 +772,8 @@ E6 一个阶段「做完」须同时满足（对齐 AGENTS.md §4）。**下表�
   格式常量是 `String`（`"rgba32f"` 等 9 个，与 `Context3DTextureFormat` 同形）。
 - **⑤ 可达性钩子**：选**清单字段 `extra-roots`**（+ CLI `--extra-roots`），不用 `[WasmExport]`——
   那个注解会被迫兼管两件事（JS 导出 / 闭包根），语义不单一。
+- **⑥ 离屏 MSAA**：逐目标 `setRenderTargetSamples(tex, n)`，默认 1（§6.10）。不把它做成 `Context3D`
+  的全局开关：全局开关会逼全屏数据 pass 一起多采样，纯浪费。
 
 **仍待拍板**：
 

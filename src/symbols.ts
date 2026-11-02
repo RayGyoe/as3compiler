@@ -7669,6 +7669,12 @@ export class SymbolTable {
           ['drawTriangles', im({ kind: 'void' }, [p('program', 'NativeProgram3D'), p('indexBuffer', 'IndexBuffer3D'), p('firstIndex', 'int', { kind: 'Num', value: 0, isInt: true }), p('numTriangles', 'int', { kind: 'Num', value: -1, isInt: true })])],
           ['createTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String'), p('renderable', 'Boolean', { kind: 'Bool', value: true }), p('mipmapped', 'Boolean', { kind: 'Bool', value: false })])],
           ['createDepthTexture', im({ kind: 'object', className: 'Texture' }, [p('width', 'int'), p('height', 'int'), p('format', 'String')])],
+          // Multisample level of ONE offscreen render target (1 = off). Per target
+          // rather than per context because multisampling only pays where geometry
+          // has edges: a full-screen GPU-data pass would cost 4x the memory for a
+          // bit-identical result. Boolean: false means the device refused the count,
+          // so a control backed by this call can report instead of lying.
+          ['setRenderTargetSamples', im({ kind: 'bool' }, [p('texture', 'TextureBase'), p('samples', 'int')])],
           // Build the mip chain of a render target. A CPU-baked environment can hand
           // its levels to uploadFromBitmapData; a GPU-written target cannot -- the
           // levels do not exist until the pass that wrote level 0 is done, which is

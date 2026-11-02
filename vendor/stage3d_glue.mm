@@ -248,6 +248,36 @@ typedef struct {
 #define S3D_STAGE_VS 0
 #define S3D_STAGE_FS 1
 
+// Multisample companions for OFFSCREEN targets (see s3d_set_target_samples).
+//
+// Two different MSAA stories live in this backend and they must not be confused:
+//
+//  * ON-SCREEN (M10, ASC_S3D_MSAA): the drawable has no resolve target the app can
+//    name, so the context owns one multisample pair (msaaColor/msaaDepthStencil) and
+//    resolves it into c->target once per frame in s3d_flush. Default 1 = the exact
+//    AIR path.
+//  * OFFSCREEN (this table): a render target is a texture the app SAMPLES, so the
+//    multisample surface has to be a separate texture that resolves back into the
+//    app's own texture. The app names the level per target through
+//    Context3DNative.setRenderTargetSamples, because "anti-alias this scene colour"
+//    and "do not touch my FFT atlas" are both expressible and only the caller knows
+//    which is which. A companion is allocated on request and released when the level
+//    goes back to 1 or the target is disposed.
+//
+// `dirty` means "the multisample texture holds samples that are not in dest yet".
+// Draws into the target only mark it; the resolve is encoded lazily -- right before
+// something reads dest (a sampler bind, a mip build, a readback, the Skia composite)
+// or once at the frame boundary -- because a resolve is a full target's worth of
+// bandwidth and doing it per draw would multiply it by the pass count.
+#define S3D_MAX_MSAA_TARGETS 32
+
+typedef struct {
+  id<MTLTexture> dest;      // the app-visible texture (sampleCount 1, CPU/sampler side)
+  id<MTLTexture> msaa;      // the multisample surface passes actually render into
+  int samples;
+  int dirty;
+} S3DRttMsaa;
+
 struct S3DContext {
   id<MTLDevice> device;
   id<MTLCommandQueue> queue;
@@ -269,6 +299,11 @@ struct S3DContext {
   id<MTLTexture> msaaDepthStencil;
   int msaaCount;
   int msaaResolvePending;   // an on-screen multisample pass was encoded this frame
+  // Offscreen multisample companions (see S3DRttMsaa). Keyed by the app's own
+  // texture, so depth and colour share one table: the rule "this target resolves
+  // into itself" is the same for both, only the attachment slot differs.
+  S3DRttMsaa mst[S3D_MAX_MSAA_TARGETS];
+  int nmst;
   int width, height;
   // current pipeline (one of the cached blend variants below)
   id<MTLRenderPipelineState> pso;
@@ -457,8 +492,7 @@ static id<MTLTexture> s3d_make_depth_stencil(id<MTLDevice> device, int width, in
   return [device newTextureWithDescriptor:td];
 }
 
-// ---- MSAA (M10 of asaot3d) ------------------------------------------------
-//
+// ---- MSAA (M10 of asaot3d) ------------------------------------------------//
 // AIR's Stage3D has no anti-aliasing knob at all, so this is an OPT-IN
 // divergence: ASC_S3D_MSAA=2|4 turns on multisampling for ON-SCREEN passes, and
 // the default (unset or 1) keeps the exact single-sample path AIR renders.
@@ -505,17 +539,142 @@ static void s3d_alloc_msaa(S3DContext* c, int w, int h) {
 #endif
 }
 
-// The sample count the NEXT encoded pass will use: multisampling applies to
-// on-screen passes only, so a render-to-texture draw forces 1.
+// ---- offscreen multisample companions (see S3DRttMsaa) --------------------
+
+static int s3d_is_depth_format(MTLPixelFormat f) {
+  return f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8
+      || f == MTLPixelFormatDepth16Unorm;
+}
+
+static S3DRttMsaa* s3d_msaa_find(S3DContext* c, id<MTLTexture> dest) {
+  if (dest == nil) return NULL;
+  for (int i = 0; i < c->nmst; i++) if (c->mst[i].dest == dest) return &c->mst[i];
+  return NULL;
+}
+
+// Drop a slot's multisample surface (never the app's texture: that one is owned by
+// Texture->gpu and freed by s3d_destroy_texture).
+static void s3d_msaa_clear_slot(S3DRttMsaa* s) {
+  if (s->msaa != nil) [s->msaa release];
+  s->msaa = nil;
+  s->dest = nil;
+  s->samples = 0;
+  s->dirty = 0;
+}
+
+// Give `dest` a multisample surface of `samples` samples. Returns the slot, or NULL
+// when the device refuses that sample count / format (reported: a level the device
+// cannot honour must never look like it was applied).
+static S3DRttMsaa* s3d_msaa_attach(S3DContext* c, id<MTLTexture> dest, int samples) {
+  if (dest == nil || samples <= 1) return NULL;
+  if (![c->device supportsTextureSampleCount:(NSUInteger)samples]) {
+    fprintf(stderr, "stage3d_glue: %d samples is not supported by this Metal device; "
+            "the render target stays single-sample\n", samples);
+    return NULL;
+  }
+  S3DRttMsaa* s = s3d_msaa_find(c, dest);
+  if (s == NULL) {
+    if (c->nmst >= S3D_MAX_MSAA_TARGETS) {
+      fprintf(stderr, "stage3d_glue: at most %d multisampled render targets are tracked; "
+              "this target stays single-sample\n", S3D_MAX_MSAA_TARGETS);
+      return NULL;
+    }
+    s = &c->mst[c->nmst++];
+    s->dest = dest;
+    s->msaa = nil;
+    s->samples = 0;
+    s->dirty = 0;
+  }
+  if (s->msaa != nil && s->samples == samples) return s;
+  if (s->msaa != nil) { [s->msaa release]; s->msaa = nil; }
+  s->samples = 0;
+  s->dirty = 0;
+  // A multisample texture is never mipmapped and never CPU-visible: only the resolve
+  // destination is sampled, and the samples live in tile/device memory.
+  MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dest.pixelFormat
+      width:dest.width height:dest.height mipmapped:NO];
+  d.textureType = MTLTextureType2DMultisample;
+  d.sampleCount = (NSUInteger)samples;
+  d.usage = MTLTextureUsageRenderTarget;
+  d.storageMode = MTLStorageModePrivate;
+  id<MTLTexture> m = [c->device newTextureWithDescriptor:d];
+  if (m == nil) {
+    fprintf(stderr, "stage3d_glue: could not allocate a %dx%d %d-sample companion "
+            "(format %lu); the target stays single-sample\n",
+            (int)dest.width, (int)dest.height, samples, (unsigned long)dest.pixelFormat);
+    return NULL;
+  }
+  s->msaa = m;
+  s->samples = samples;
+  return s;
+}
+
+// Encode the resolve of one target into the frame's batch. Metal has no blit
+// resolve: the only way to express one is a render pass whose attachment is the
+// multisample texture and whose store action resolves it. The pass draws nothing,
+// so loadAction=Load is required -- the resolve reads what earlier passes stored.
+static void s3d_msaa_resolve_slot(S3DContext* c, S3DRttMsaa* s) {
+  if (s == NULL || s->msaa == nil || !s->dirty) return;
+  if (c->batch == nil) c->batch = [[c->queue commandBuffer] retain];
+  if (c->batch == nil) return;
+  @autoreleasepool {
+    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (s3d_is_depth_format(s->dest.pixelFormat)) {
+      rp.depthAttachment.texture = s->msaa;
+      rp.depthAttachment.loadAction = MTLLoadActionLoad;
+      rp.depthAttachment.storeAction = MTLStoreActionMultisampleResolve;
+      rp.depthAttachment.resolveTexture = s->dest;
+    } else {
+      rp.colorAttachments[0].texture = s->msaa;
+      rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+      rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+      rp.colorAttachments[0].resolveTexture = s->dest;
+    }
+    id<MTLRenderCommandEncoder> e = [c->batch renderCommandEncoderWithDescriptor:rp];
+    if (e != nil) [e endEncoding];
+  }
+  s->dirty = 0;
+}
+
+// Resolve one texture if it has uncommitted samples. Called right before anything
+// READS the texture, so the reader sees resolved pixels in the same command buffer.
+static void s3d_msaa_resolve_texture(S3DContext* c, id<MTLTexture> tex) {
+  if (tex == nil) return;
+  s3d_msaa_resolve_slot(c, s3d_msaa_find(c, tex));
+}
+
+// Settle every target at a frame boundary, so the next frame's first read (and any
+// CPU readback / Skia composite) sees the last frame's samples.
+static void s3d_msaa_resolve_all(S3DContext* c) {
+  for (int i = 0; i < c->nmst; i++) s3d_msaa_resolve_slot(c, &c->mst[i]);
+}
+
+// The sample count the NEXT encoded pass will use.
+//
+// Three cases, in this order: an offscreen target the app asked to multisample
+// (per-target companions), an on-screen pass (the context's own pair), everything
+// else single-sample. A per-target pass is only multisampled when EVERY attachment
+// it writes can be: Metal requires one sample count for the whole pass, so a
+// mismatched depth or MRT slot would make the pass invalid rather than partly
+// resolved. The validation is repeated from s3d_draw's descriptor builder by
+// construction -- both call THIS function -- so the pipeline's rasterSampleCount
+// can never disagree with the attachments it is about to be used with.
 static int s3d_pass_samples(S3DContext* c) {
+  if (c->nativeMode && c->nativeColor[0] != nil) {
+    S3DRttMsaa* s0 = s3d_msaa_find(c, c->nativeColor[0]);
+    if (s0 == NULL) return 1;
+    const int n = s0->samples;
+    for (int i = 1; i < c->nativeNColor && i < 4; i++) {
+      S3DRttMsaa* si = s3d_msaa_find(c, c->nativeColor[i]);
+      if (si == NULL || si->samples != n) return 1;
+    }
+    if (c->nativeDepth != nil) {
+      S3DRttMsaa* sd = s3d_msaa_find(c, c->nativeDepth);
+      if (sd == NULL || sd->samples != n) return 1;
+    }
+    return n;
+  }
   if (c->renderOverride != nil) return 1;
-  // A NATIVE pass is offscreen by definition: its first attachment comes from
-  // setRenderTargets, and the MSAA branch below rewrites colorAttachments[0] to the
-  // multisample buffer. Leaving MSAA on would therefore send attachment 0 to the
-  // back buffer while attachments 1..n-1 went to the caller's textures -- an MRT
-  // pass that silently loses its first target. Measured cause of this guard: the
-  // E6 capability probe (apps/shader-m31) with ASC_S3D_MSAA=4.
-  if (c->nativeMode && c->nativeColor[0] != nil) return 1;
   if (c->msaaColor == nil || c->msaaDepthStencil == nil) return 1;
   return c->msaaCount;
 }
@@ -552,24 +711,40 @@ static void s3d_apply_pending_clear(S3DContext* c) {
     if (c->batch == nil) c->batch = [[c->queue commandBuffer] retain];
     if (c->batch == nil) return;
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-    // An offscreen pass is single-sample (s3d_pass_samples); an on-screen one may
-    // be multisampled, in which case the clear has to land in the multisample
-    // buffer AND resolve down so the visible surface keeps the colour (the same
-    // shape as the mip-drop path in s3d_draw).
+    // An offscreen pass is single-sample unless its target asked otherwise; an
+    // on-screen one may be multisampled, in which case the clear has to land in the
+    // multisample buffer AND resolve down so the visible surface keeps the colour
+    // (the same shape as the mip-drop path in s3d_draw).
     const int msaa = s3d_pass_samples(c);
-    if (msaa > 1) {
+    id<MTLTexture> a0 = (c->nativeMode && c->nativeColor[0] != nil) ? c->nativeColor[0]
+                     : (c->renderOverride != nil ? c->renderOverride : c->target);
+    S3DRttMsaa* slot = (msaa > 1 && c->nativeMode) ? s3d_msaa_find(c, a0) : NULL;
+    if (slot != NULL) {
+      // The clear lands in the companion and resolves into the app's texture in the
+      // same pass: a cleared target with no draw after it must still be cleared, and
+      // that is exactly the case this function exists for (see its header).
+      rp.colorAttachments[0].texture = slot->msaa;
+      rp.colorAttachments[0].resolveTexture = a0;
+      rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+      slot->dirty = 0;
+    } else if (msaa > 1) {
       rp.colorAttachments[0].texture = c->msaaColor;
       rp.colorAttachments[0].resolveTexture = c->target;
       rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
       c->msaaResolvePending = 0;
     } else {
-      rp.colorAttachments[0].texture = c->renderOverride != nil ? c->renderOverride : c->target;
+      rp.colorAttachments[0].texture = a0;
       rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     }
     rp.colorAttachments[0].loadAction = wantColor ? MTLLoadActionClear : MTLLoadActionLoad;
     rp.colorAttachments[0].clearColor = MTLClearColorMake((double)c->clearR, (double)c->clearG, (double)c->clearB, (double)c->clearA);
-    id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil
+    id<MTLTexture> ds = c->renderOverride != nil ? c->rtDepthStencil
                         : (msaa > 1 ? c->msaaDepthStencil : c->depthStencil);
+    if (c->nativeMode && c->nativeDepth != nil) {
+      ds = c->nativeDepth;
+      S3DRttMsaa* dslot = slot != NULL ? s3d_msaa_find(c, c->nativeDepth) : NULL;
+      if (dslot != NULL) { ds = dslot->msaa; dslot->dirty = 1; }
+    }
     if (ds != nil && (wantDepth || wantStencil)) {
       rp.depthAttachment.texture = ds;
       rp.depthAttachment.loadAction = wantDepth ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -829,6 +1004,10 @@ static void s3d_flush_impl(void* ctx, int wait) {
   // is left alone deliberately -- the back buffer is presented from a draw, and
   // injecting a clear pass into a draw-less frame is a separate question.)
   if (c->renderOverride != nil) s3d_apply_pending_clear(c);
+  // Settle every offscreen target that took samples this frame. Deferring past this
+  // point would leave the resolve owed to the NEXT frame, and a target that is only
+  // written once (a bake, a reflection probe) would then be sampled stale.
+  s3d_msaa_resolve_all(c);
   id<MTLCommandBuffer> cb = c->batch;
   if (cb == nil) return;
   c->batch = nil;
@@ -1051,6 +1230,8 @@ void s3d_destroy(void* ctx) {
   if (c->rtDepthStencil != nil) [c->rtDepthStencil release];
   if (c->msaaColor != nil) [c->msaaColor release];
   if (c->msaaDepthStencil != nil) [c->msaaDepthStencil release];
+  for (int i = 0; i < c->nmst; i++) s3d_msaa_clear_slot(&c->mst[i]);
+  c->nmst = 0;
   if (c->samplerLinear != nil) [c->samplerLinear release];
   if (c->samplerNearest != nil) [c->samplerNearest release];
   for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) for (int k = 0; k < 3; k++)
@@ -2054,11 +2235,16 @@ int s3d_draw(void* ctx, int numTriangles) {
   // happens once, in a zero-draw pass at s3d_flush, so the multisample texture
   // simply accumulates like the single-sample target does.
   const int msaa = s3d_pass_samples(c);
-  if (msaa > 1) {
+  // Which mechanism is in play: a per-target companion (native offscreen pass), the
+  // context's on-screen pair, or neither. s3d_pass_samples has already validated that
+  // every attachment of the pass has a companion with this sample count, so the
+  // descriptor below can use them unconditionally.
+  const int msaaRtt = (msaa > 1 && c->nativeMode && c->nativeColor[0] != nil);
+  if (msaa > 1 && !msaaRtt) {
     rp.colorAttachments[0].texture = c->msaaColor;
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     c->msaaResolvePending = 1;
-  } else {
+  } else if (!msaaRtt) {
     // A native pass's first attachment is whatever setRenderTargets landed in
     // nativeColor[0]; without one the draw goes to the Context3D render target or
     // the drawable, exactly like the AGAL path.
@@ -2076,7 +2262,18 @@ int s3d_draw(void* ctx, int numTriangles) {
   // Attachment 0 is the pass target set above (setRenderTargets puts its first
   // texture there); 1..n-1 come from nativeColor and are LOADED, never cleared --
   // Stage3D has one clear colour and it belongs to attachment 0.
-  if (c->nativeMode && c->nativeNColor > 1) {
+  if (msaaRtt) {
+    // Every attachment renders into its own companion and accumulates there; the
+    // resolve into the app's texture happens on first read (s3d_msaa_resolve_texture)
+    // or at the frame boundary, never per draw.
+    for (int ai = 0; ai < c->nativeNColor && ai < 4; ai++) {
+      S3DRttMsaa* s = s3d_msaa_find(c, c->nativeColor[ai]);
+      rp.colorAttachments[ai].texture = s->msaa;
+      rp.colorAttachments[ai].storeAction = MTLStoreActionStore;
+      if (ai > 0) rp.colorAttachments[ai].loadAction = MTLLoadActionLoad;
+      s->dirty = 1;
+    }
+  } else if (c->nativeMode && c->nativeNColor > 1) {
     int nn = c->nativeNColor > 4 ? 4 : c->nativeNColor;
     for (int ai = 1; ai < nn; ai++) {
       rp.colorAttachments[ai].texture = c->nativeColor[ai];
@@ -2115,7 +2312,16 @@ int s3d_draw(void* ctx, int numTriangles) {
   // multisampled as well, so it swaps to the companion texture.
   id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil
                     : (msaa > 1 ? c->msaaDepthStencil : c->depthStencil);
-  if (c->nativeMode && c->nativeDepth != nil) ds = c->nativeDepth;
+  if (c->nativeMode && c->nativeDepth != nil) {
+    ds = c->nativeDepth;
+    // A multisampled pass needs a multisampled depth attachment (one sample count per
+    // pass), and the resolve is only owed to an app that samples the depth texture --
+    // which is a different question from writing it, so it is tracked per slot.
+    if (msaaRtt) {
+      S3DRttMsaa* dslot = s3d_msaa_find(c, c->nativeDepth);
+      if (dslot != nil) { ds = dslot->msaa; dslot->dirty = 1; }
+    }
+  }
   // A native pass that brought its OWN colour attachment but no depth texture must
   // not inherit the window's depth buffer. Metal requires every attachment in a
   // pass to be the same size, so pairing a 64x64 (or 256x1024) render target with
@@ -2385,6 +2591,10 @@ int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   asc_tr_bindtex++;
   if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || tex == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
+  // The texture may be a target a previous pass rendered into with multisampling.
+  // Settle it HERE, before the draw that samples it is encoded: same command buffer,
+  // so the resolve is guaranteed to run first.
+  s3d_msaa_resolve_texture(c, (id<MTLTexture>)tex);
   for (int st = 0; st < 2; st++) {
     c->textures[st][unit] = (id<MTLTexture>)tex;
     c->texHasMips[st][unit] = hasChain ? 1 : 0;
@@ -2400,7 +2610,11 @@ int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
 void* s3d_get_render_target(void* ctx) {
   if (ctx == NULL) return NULL;
   S3DContext* c = (S3DContext*)ctx;
+  // The compositor reads the texture directly, so any pending multisample samples
+  // must be resolved first. (The frame boundary usually did it; this covers a caller
+  // that composites without flushing.)
   id<MTLTexture> src = c->renderOverride != nil ? c->renderOverride : c->target;
+  s3d_msaa_resolve_texture(c, src);
   // Debug probe (ASC_S3D_TRACE=1): which texture the compositor is handed, and
   // whether the back buffer actually holds drawn pixels (the render-to-texture
   // override, if set, is a DIFFERENT texture and may be untouched).
@@ -2523,6 +2737,45 @@ void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId, int re
   return (void*)t;
 }
 
+// Context3DNative.setRenderTargetSamples: choose the multisample level of ONE
+// offscreen target, in place.
+//
+// WHY PER TARGET AND NOT A CONTEXT KNOB. The ocean needs anti-aliased scene colour
+// and exactly one sample on its FFT atlases, its 32x32 metering grid and its 1x1
+// exposure state: multisampling averages SUBPIXEL COVERAGE, so a full-screen quad
+// (every GPU-data pass) has no edges to average and would pay 4x the memory and a
+// resolve per pass for a bit-identical result. The caller knows which target is
+// which; a global level would have to be re-litigated by hand in every pass list.
+//
+// The app's texture keeps sampleCount 1 and stays the thing it samples; the level
+// only decides whether passes render into a companion and resolve into it. Level 1
+// releases the companion. Returns 1 when the level is in force, 0 when the device
+// refused it (reported: a level that silently did nothing would be a fake control).
+int s3d_set_target_samples(void* ctx, void* tex, int samples) {
+  if (ctx == NULL || tex == NULL) return 0;
+  S3DContext* c = (S3DContext*)ctx;
+  id<MTLTexture> t = (id<MTLTexture>)tex;
+  if ((t.usage & MTLTextureUsageRenderTarget) == 0) {
+    fprintf(stderr, "stage3d_glue: setRenderTargetSamples: texture %lux%lu has no "
+            "render-target usage, so it can never be drawn into (level ignored)\n",
+            (unsigned long)t.width, (unsigned long)t.height);
+    return 0;
+  }
+  S3DRttMsaa* cur = s3d_msaa_find(c, t);
+  if (samples <= 1) {
+    if (cur != NULL) {
+      // Settle what the companion still holds before it is thrown away, so the last
+      // frame drawn at the old level survives the change.
+      s3d_msaa_resolve_slot(c, cur);
+      s3d_msaa_clear_slot(cur);
+    }
+    return 1;
+  }
+  if (cur != NULL && cur->samples == samples) return 1;
+  if (cur != NULL) s3d_msaa_resolve_slot(c, cur);
+  return s3d_msaa_attach(c, t, samples) != NULL ? 1 : 0;
+}
+
 // Build the mip chain of a GPU-written target.
 //
 // WHY THIS CANNOT BE DONE AT UPLOAD TIME: an environment map is uploaded, so its
@@ -2536,11 +2789,19 @@ void s3d_generate_mips(void* ctx, void* tex) {
   S3DContext* c = (S3DContext*)ctx;
   id<MTLTexture> t = (id<MTLTexture>)tex;
   if (t.mipmapLevelCount <= 1) return;
-  id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+  // The chain is built from level 0, so a target that still owes a multisample
+  // resolve has to settle first -- and both go into the frame's batch, in order.
+  // (A separate command buffer here used to run BEFORE the draws that filled the
+  // texture, because the frame's batch is only committed at the boundary: the mip
+  // chain then described the previous frame. Encoding into the batch is both
+  // correct and free.)
+  s3d_msaa_resolve_texture(c, t);
+  if (c->batch == nil) c->batch = [[c->queue commandBuffer] retain];
+  id<MTLCommandBuffer> cb = c->batch;
+  if (cb == nil) return;
   id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
   [blit generateMipmapsForTexture:t];
   [blit endEncoding];
-  [cb commit];
 }
 
 int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
@@ -2588,6 +2849,7 @@ void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
   }
   // `stage` is the compiler's: 0 = vertex, 1 = fragment.
   if (stage < 0 || stage > 1) stage = S3D_STAGE_FS;
+  s3d_msaa_resolve_texture(c, (id<MTLTexture>)tex);
   c->textures[stage][slot] = (id<MTLTexture>)tex;
   // Ask the texture, do not track it: a native target may be created mipmapped and
   // its chain generated after the pass that fills level 0, so a flag set at bind time
@@ -2625,6 +2887,13 @@ void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) 
 
 void s3d_destroy_texture(void* tex) {
   if (tex == NULL) return;
+  // A multisample companion is only meaningful while its app texture exists. The
+  // registry is per-context, so every live context is asked to forget the pair.
+  for (int ci = 0; ci < s3d_live_n; ci++) {
+    S3DContext* lc = s3d_live[ci];
+    S3DRttMsaa* slot = s3d_msaa_find(lc, (id<MTLTexture>)tex);
+    if (slot != NULL) s3d_msaa_clear_slot(slot);
+  }
   // Drop every borrowed binding first: a released texture left in a sampler slot
   // or as the render override would crash the next draw (see the live-context
   // registry above).

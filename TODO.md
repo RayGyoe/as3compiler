@@ -19097,6 +19097,47 @@ Retina 门）；真手势自测（`temp/gui11/temp/dragtest/`，Quartz 合成 + 
 **未做（明确登记）**：M4 WebGL2 直通、M5 D3D12/HLSL；深度纹理的 `sampler2DShadow` 比较采样；
 海洋侧的 sky/大气 LUT、caustics、水下 pass、喷雾、4 cascade、平面反射（`asaot3d` §38.2 已列）。
 
+### 阶段三百五十六：离屏目标的逐目标 MSAA（v0.4.318 → v0.4.319）
+
+**起点**：M34 的 QUALITY 段此前只有「渲染缩放」一把旋钮，面板上那句「MSAA 在离屏链里没有插入点」是实话
+——D54/D55 把**所有**离屏 pass 钉死 1 采样（`s3d_pass_samples()` 对 `renderOverride` 一律返回 1）。这句话
+被当成结论写进了三份文档和一次提交说明，而它其实只是**能力缺口**：离屏链的应用（`asaot3d/apps/ocean-m34`）
+恰恰只需要这一个旋钮，缺的是 API 面，不是做不到。
+
+**做了什么**（引擎侧，不是 demo 侧）：
+
+| 层 | 落点 | 语义 |
+|---|---|---|
+| Metal 胶水 | `vendor/stage3d_glue.mm`：`S3DRttMsaa` 槽表（32 项）+ `s3d_msaa_attach/find/clear_slot/resolve_slot/resolve_texture/resolve_all` | 每个被点名的目标一张同尺寸 companion，绘制进 companion、**惰性 resolve** 回目标本体 |
+| 采样数判定 | `s3d_pass_samples()` | 逐目标优先；**同一次 pass 的所有附件采样数必须一致**（Metal 规则），少一张就退回 1 采样（不报错、不退性能） |
+| resolve 入口 | 采样绑定 / `bindTexture` / `get_render_target` / `generateMipmaps` / 帧 flush | 应用永远只读单样本目标，companion 对它不可见 |
+| C API | `int s3d_set_target_samples(void* ctx, void* tex, int samples)` | 1/2/4/8；`<=1` 释放 companion 前先把未解析样本落盘 |
+| AS3 API | `Context3DNative.setRenderTargetSamples(texture: TextureBase, samples: int): Boolean` | 非 Texture / 无 GPU 存储 / 非法采样数分别抛 `#2004`/`#2004`/`#2008` |
+
+**顺带修掉的真缺陷**：`s3d_generate_mips` 原本自己提交一个 immediate command buffer。非 MSAA 时看不出问题；
+一旦目标有未解析的 companion，那个 command buffer 会**排在产生内容的绘制之前**（帧批次只在边界提交），
+mip 链描述的是上一帧甚至空目标。改成编进帧内现有批次——同一队列 FIFO 保证顺序，而且省一次提交。
+
+**验收**（`ocean-m34`，冻结时间 + 同一相机，逐像素比 PPM）：
+
+| 视图 | off vs 4x 差异 | 均值 | 边缘占比 | 其它 |
+|---|---|---|---|---|
+| Golden hour | 9118/576000 = **1.58%** | 0.185 | **92.5%** 落在强边缘 | 差异若落在大块平面上说明挂错了目标 |
+| Breakers | 6480/576000 = **1.12%** | 0.137 | — | 硬台阶像素 **10861 → 10668**（-1.8%） |
+
+**钉子**：`test/unit/native-shader.ts` 新增 6 条（symbol 面、`extern`、wrapper、emit 体、采样数校验、
+胶水的惰性 resolve 与槽表）；`asaot3d/probes/panel-params-m35/` 88 → **99 项**（样本菜单档位/夹取/reset 11 条）。
+全量 `node --test test/unit/*.ts` **312/312**、`test/examples.ts` **296/296**；`asaot3d`
+`tools/check-all-demos.sh` **58 个 demo 全 OK、0 失败**，`apphost-smoke-m16` 30 项、`stats-smoke-m15`
+81 项均 ALL PASS。
+
+**为什么不做全局开关**：全屏数据 pass（FFT 图集、测光网格、1×1 曝光状态、bloom 金字塔）在每个样本上拿到
+bit-identical 的值，多采样只多花显存与一次 resolve。**为什么默认 1**：Stage3D 没有这个 API，默认打开就等于
+「同一份代码在 `adl` 与我们后端画得不一样」，违反 §1.5。
+
+**未做（明确登记）**：屏上路径仍只由 `ASC_S3D_MSAA` 环境变量控制（没有运行时 API 面）；MSAA 目标的
+`drawToBitmapData` 读回走的是 resolve 后的单样本纹理（正确，但没做逐样本断言）。
+
 ---
 
 ### 遗留待开发

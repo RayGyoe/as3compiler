@@ -137,9 +137,37 @@ export function checkNativeShaderBuildInputs(): string[] {
   if (!emit.includes('Context3DNative_fromContext_static')) {
     bad.push('emit.ts: Context3DNative needs the fromContext factory (a Class value is not constructible)');
   }
+
+  // ---- M34: offscreen MSAA is a per-target API, and it has to survive the same
+  // three-link chain the other native entry points do (symbol -> emit -> extern).
+  // A missing extern is a C99 hard error; a missing symbol entry means the AS3 side
+  // cannot name the method at all, which shows up as a compile error in the demo,
+  // not here. Both are cheap to pin by name.
+  if (!/\['setRenderTargetSamples',[^\]]*TextureBase[^\]]*'samples', 'int'/.test(symbols)) {
+    bad.push('symbols.ts: Context3DNative.setRenderTargetSamples is missing from the method surface');
+  }
+  if (!runtime.includes('extern int s3d_set_target_samples(')) {
+    bad.push('runtime.ts: s3d_set_target_samples is not declared');
+  }
+  if (!runtime.includes('as_s3d_set_target_samples')) {
+    bad.push('runtime.ts: the AS wrapper as_s3d_set_target_samples is missing');
+  }
+  if (!emit.includes('Context3DNative_setRenderTargetSamples')) {
+    bad.push('emit.ts: the setRenderTargetSamples body is not emitted');
+  }
+  // 8x is accepted by the channel but must still be a listed level: the check is what
+  // makes an unsupported request fail loudly instead of silently staying at 1 sample.
+  if (!/n != 1 && n != 2 && n != 4 && n != 8/.test(emit)) {
+    bad.push('emit.ts: setRenderTargetSamples must validate the level (1/2/4/8)');
+  }
   // The deferred pipeline: a native program's vertex descriptor comes from the
   // streams bound at draw time, so s3d_native_use must NOT build one.
   const glue = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
   if (!glue.includes('nativePsoPending')) bad.push('stage3d_glue.mm: the native pipeline must be built at draw time');
+  // The lazy resolve is what keeps a multisample companion invisible to the app: drop
+  // it and every read samples the stale single-sample destination.
+  for (const site of ['s3d_msaa_resolve_texture', 's3d_msaa_resolve_all', 'S3D_MAX_MSAA_TARGETS']) {
+    if (!glue.includes(site)) bad.push(`stage3d_glue.mm: ${site} is missing (per-target MSAA, docs/zh-cn/native-shader.md §6.10)`);
+  }
   return bad;
 }
