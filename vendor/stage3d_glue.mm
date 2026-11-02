@@ -230,6 +230,24 @@ typedef struct {
   unsigned long stamp;      // LRU stamp (updated on stash/load/compile)
 } S3DProgramCache;
 
+// Fragment sampler units. AGAL programs declare fs0..fs7 (Stage3D's eight texture
+// registers) and the draw path binds all eight unconditionally, because a program may
+// sample fs3 without ever touching fs0. The NATIVE channel has no such register file --
+// its samplers are named, and the reflection hands each one an index -- so it is not
+// limited to eight: an FFT ocean surface reads three displacement atlases, four slope
+// atlases, the opaque scene and the planar reflection in one pass. 16 is what the
+// hardware comfortably provides (Metal allows 31) and what our binding loops are written
+// for; the AGAL path keeps using only the first eight.
+#define S3D_MAX_TEX 16
+// The stage numbers used by `asc_shader_program` reflection and therefore by
+// Context3DNative_bindTexture: 0 = vertex, 1 = fragment (shader_compiler.cc
+// `stage == 0 ? SpvExecutionModelVertex : ...`). The per-stage texture rows below are
+// indexed by THIS enum, not by "the order the draw happens to bind them", because the
+// bind arrives from the C side with the compiler's number and translating in two
+// places is how a fragment sampler ends up on the vertex stage and reads black.
+#define S3D_STAGE_VS 0
+#define S3D_STAGE_FS 1
+
 struct S3DContext {
   id<MTLDevice> device;
   id<MTLCommandQueue> queue;
@@ -277,7 +295,13 @@ struct S3DContext {
   int numIndices;
   id<MTLBuffer> vc;               // vertex constants (float4 array)
   id<MTLBuffer> fc;               // fragment constants (float4 array)
-  id<MTLTexture> textures[8];     // fragment samplers fs0..fs7
+  // Textures are indexed PER STAGE. Stage3D has one texture register file shared by
+  // both stages (fs0..fs7 with 'tld' reaching them from a vertex program), which is
+  // what the AGAL path binds -- s3d_bind_texture writes both rows. A NATIVE program's
+  // samplers are named and SPIRV-Cross numbers them per stage, so a vertex-only
+  // sampler and a fragment-only sampler can both be unit 0 legitimately; sharing one
+  // row made whichever bound last win and the other stage sample the wrong texture.
+  id<MTLTexture> textures[2][S3D_MAX_TEX];  // [S3D_STAGE_*] -> units (0 = vertex, 1 = fragment)
   // clear color / blend
   float clearR, clearG, clearB, clearA;
   // Stage3D clear(red,green,blue,alpha,depth,stencil,mask) also carries the
@@ -345,15 +369,31 @@ struct S3DContext {
   // generated MSL declares one sampler per sampled texture register
   // (smpN [[sampler(N)]]), so each unit's state is bound at its own index (see
   // s3d_draw).
-  int samplerFilter[8];            // 0 = linear, 1 = nearest
-  int samplerWrap[8];              // 0 = clamp, 1 = repeat
-  int samplerMip[8];               // 0 = none, 1 = nearest, 2 = linear
-  int samplerStateSet[8];          // whether setSamplerStateAt ran for this unit
+  // Sampler STATE is per (stage, unit) even though Stage3D's register file is not.
+  // Metal keeps sampler tables per stage, and SPIRV-Cross numbers native samplers per
+  // stage, so a fragment program's sampler 0 and a vertex program's sampler 0 are two
+  // different samplers that happen to share a number: an FFT ocean surface reads
+  // repeat-wrapped displacement atlases in the vertex program and a clamp-wrapped
+  // screen texture at sampler 0 in the fragment program. One row for both silently
+  // gave one of them the other's wrap mode. AGAL's setSamplerStateAt still writes
+  // BOTH rows (one register file, per Stage3D semantics); only native programs, which
+  // know their stage, can differ.
+  int samplerFilter[2][S3D_MAX_TEX];  // 0 = linear, 1 = nearest
+  int samplerWrap[2][S3D_MAX_TEX];    // 0 = clamp, 1 = repeat
+  int samplerMip[2][S3D_MAX_TEX];     // 0 = none, 1 = nearest, 2 = linear
+  int samplerStateSet[2][S3D_MAX_TEX];// whether a state was set for this stage+unit
+  // Highest unit touched since the last reset, +1. s3d_draw binds at least 8
+  // units (every AGAL program's fs0..fs7) and no more than needed: a native
+  // program may legitimately declare more samplers than AGAL's eight registers
+  // (an FFT ocean surface reads 3 displacement atlases, 4 slope atlases, the
+  // opaque scene and the reflection), and binding 16 sampler states per draw
+  // for the AGAL path would be pure waste.
+  int texUnitsUsed[2];
   // Whether the texture bound at each unit actually owns a mip chain. Reported
   // by s3d_bind_texture (the AS texture knows: it built the chain when the app
   // supplied a mip level > 0), and consulted by s3d_draw to reproduce AIR's
   // "mip-filtered sample on a chainless texture drops the draw" rule.
-  int texHasMips[8];
+  int texHasMips[2][S3D_MAX_TEX];
   id<MTLSamplerState> samplerCache[2][2][3];  // [filter][wrap][mip]
   id<MTLDepthStencilState> dss;    // BORROWED from a dssv[] slot (see below)
   int dssDirty;                    // (re)select before the next draw
@@ -752,7 +792,9 @@ static void s3d_unbind_texture_everywhere(id<MTLTexture> t) {
   if (t == nil) return;
   for (int k = 0; k < s3d_live_n; k++) {
     S3DContext* c = s3d_live[k];
-    for (int i = 0; i < 8; i++) if (c->textures[i] == t) { c->textures[i] = nil; c->texHasMips[i] = 0; }
+    for (int st = 0; st < 2; st++)
+      for (int i = 0; i < S3D_MAX_TEX; i++)
+        if (c->textures[st][i] == t) { c->textures[st][i] = nil; c->texHasMips[st][i] = 0; }
     if (c->renderOverride == t) c->renderOverride = nil;
   }
 }
@@ -906,7 +948,10 @@ void* s3d_create(int width, int height) {
   c->numIndices = 0;
   c->vc = nil;
   c->fc = nil;
-  for (int i = 0; i < 8; i++) { c->streams[i].buffer = nil; c->streams[i].components = 0; c->streams[i].numVertices = 0; c->textures[i] = nil; }
+  for (int i = 0; i < 8; i++) { c->streams[i].buffer = nil; c->streams[i].components = 0; c->streams[i].numVertices = 0; }
+  for (int st = 0; st < 2; st++)
+    for (int i = 0; i < S3D_MAX_TEX; i++) { c->textures[st][i] = nil; c->texHasMips[st][i] = 0; }
+  c->texUnitsUsed[0] = 0; c->texUnitsUsed[1] = 0;
   c->clearR = c->clearG = c->clearB = 0.0f; c->clearA = 1.0f;
   c->blendSource = NULL;
   c->blendDest = NULL;
@@ -928,7 +973,9 @@ void* s3d_create(int width, int height) {
   c->stencilReadMask = 0xFF;
   c->stencilWriteMask = 0xFF;
   c->scissorOn = 0; c->scissorX = c->scissorY = c->scissorW = c->scissorH = 0;
-  for (int i = 0; i < 8; i++) { c->samplerFilter[i] = 0; c->samplerWrap[i] = 0; c->samplerMip[i] = 0; c->samplerStateSet[i] = 0; c->texHasMips[i] = 0; }
+  for (int st = 0; st < 2; st++) for (int i = 0; i < S3D_MAX_TEX; i++) {
+    c->samplerFilter[st][i] = 0; c->samplerWrap[st][i] = 0; c->samplerMip[st][i] = 0; c->samplerStateSet[st][i] = 0;
+  }
   for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) for (int k = 0; k < 3; k++) c->samplerCache[i][j][k] = nil;
   c->dss = nil;
   c->dssDirty = 1;
@@ -1164,14 +1211,16 @@ void* s3d_texture_from_pixels_half(void* ctx, int width, int height, const void*
 // happens; the sequential-upload-then-draw path in Context3D_submit uses it.
 void* s3d_upload_texture(void* ctx, int unit, int width, int height, const uint32_t* argb) {
   asc_tr_uptex++;
-  if (ctx == NULL || unit < 0 || unit > 7) return NULL;
+  if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX) return NULL;
   void* tex = s3d_texture_from_pixels(ctx, width, height, argb);
   if (tex != NULL) {
     S3DContext* c = (S3DContext*)ctx;
-    c->textures[unit] = (id<MTLTexture>)tex;  // borrowed; caller owns the +1
-    // Freshly uploaded level 0 only: no chain yet, so a mip-filtered sample on
-    // it must drop the draw like AIR does (s3d_draw).
-    c->texHasMips[unit] = 0;
+    for (int st = 0; st < 2; st++) {
+      c->textures[st][unit] = (id<MTLTexture>)tex;  // borrowed; caller owns the +1
+      // Freshly uploaded level 0 only: no chain yet, so a mip-filtered sample on
+      // it must drop the draw like AIR does (s3d_draw).
+      c->texHasMips[st][unit] = 0;
+    }
   }
   return tex;
 }
@@ -1260,7 +1309,7 @@ static void s3d_generate_cube_mips(S3DContext* c, id<MTLTexture> tex) {
 
 void* s3d_upload_cube_texture(void* ctx, int unit, int size, const uint32_t* const* argb) {
   asc_tr_cube++;
-  if (ctx == NULL || unit < 0 || unit > 7 || size <= 0 || argb == NULL) return NULL;
+  if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || size <= 0 || argb == NULL) return NULL;
   S3DContext* c = (S3DContext*)ctx;
   MTLTextureDescriptor* td = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
       size:(NSUInteger)size mipmapped:YES];
@@ -1279,8 +1328,10 @@ void* s3d_upload_cube_texture(void* ctx, int unit, int size, const uint32_t* con
         withBytes:argb[face] bytesPerRow:(NSUInteger)size * 4 bytesPerImage:(NSUInteger)size * 4 * (NSUInteger)size];
   }
   s3d_generate_cube_mips(c, tex);
-  c->textures[unit] = tex;  // borrowed; caller owns the +1
-  c->texHasMips[unit] = 1;  // cube maps always carry a chain (built just above)
+  for (int st = 0; st < 2; st++) {
+    c->textures[st][unit] = tex;  // borrowed; caller owns the +1
+    c->texHasMips[st][unit] = 1;  // cube maps always carry a chain (built just above)
+  }
   return (void*)tex;
 }
 
@@ -1801,15 +1852,36 @@ void s3d_set_stencil_ref(void* ctx, unsigned int ref, unsigned int readMask, uns
 void s3d_set_sampler_state_i(void* ctx, int unit, int filter, int wrap, int mip) {
   asc_tr_smpseti++;
   if (ctx == NULL) return;
-  if (unit < 0 || unit > 7) return;
+  if (unit < 0 || unit >= S3D_MAX_TEX) return;
+  { S3DContext* tc = (S3DContext*)ctx;
+    if (unit + 1 > tc->texUnitsUsed[0]) tc->texUnitsUsed[0] = unit + 1;
+    if (unit + 1 > tc->texUnitsUsed[1]) tc->texUnitsUsed[1] = unit + 1; }
   S3DContext* c = (S3DContext*)ctx;
   if (filter < 0 || filter > 1) filter = 0;
   if (wrap < 0 || wrap > 1) wrap = 0;
   if (mip < 0 || mip > 2) mip = 0;
-  c->samplerFilter[unit] = filter;
-  c->samplerWrap[unit] = wrap;
-  c->samplerMip[unit] = mip;
-  c->samplerStateSet[unit] = 1;
+  for (int st = 0; st < 2; st++) {
+    c->samplerFilter[st][unit] = filter;
+    c->samplerWrap[st][unit] = wrap;
+    c->samplerMip[st][unit] = mip;
+    c->samplerStateSet[st][unit] = 1;
+  }
+}
+
+// Native programs name a stage with their sampler, so their state is written to one
+// row only (see the field comment). `stage` is the compiler's: 0 = vertex, 1 = fragment.
+void s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip) {
+  if (ctx == NULL) return;
+  if (stage < 0 || stage > 1) stage = S3D_STAGE_FS;
+  if (unit < 0 || unit >= S3D_MAX_TEX) return;
+  if (filter < 0 || filter > 1) filter = 0;
+  if (wrap < 0 || wrap > 1) wrap = 0;
+  if (mip < 0 || mip > 2) mip = 0;
+  S3DContext* c = (S3DContext*)ctx;
+  c->samplerFilter[stage][unit] = filter;
+  c->samplerWrap[stage][unit] = wrap;
+  c->samplerMip[stage][unit] = mip;
+  c->samplerStateSet[stage][unit] = 1;
 }
 
 // setSamplerStateAt(unit, wrap, filter, mipfilter): the AS3 side passes enum
@@ -1907,8 +1979,8 @@ int s3d_draw(void* ctx, int numTriangles) {
   // <2d,linear,nomip> drew normally). Sampling level 0 with a clamped
   // derivative instead would be a silent divergence in the opposite direction:
   // it renders an aliased image where AIR renders nothing.
-  for (int i = 0; i < 8; i++) {
-    if (c->samplerStateSet[i] && c->samplerMip[i] != 0 && c->texHasMips[i] == 0 && c->textures[i] != nil) {
+  for (int i = 0; i < S3D_MAX_TEX; i++) {
+    if (c->samplerStateSet[S3D_STAGE_FS][i] && c->samplerMip[S3D_STAGE_FS][i] != 0 && c->texHasMips[S3D_STAGE_FS][i] == 0 && c->textures[S3D_STAGE_FS][i] != nil) {
       asc_tr_mipdrop++;
       if (asc_s3d_dump())
         fprintf(stderr, "S3D mip-drop: unit %d asks for mipmaps but the bound texture has no chain (AIR drops the draw)\n", i);
@@ -1950,7 +2022,7 @@ int s3d_draw(void* ctx, int numTriangles) {
   s3d_select_pso(c);
   if (c->pso == nil) return 0;
   if (asc_s3d_dump()) {
-    int ntex = 0; for (int i = 0; i < 8; i++) if (c->samplerStateSet[i]) ntex++;
+    int ntex = 0; for (int i = 0; i < S3D_MAX_TEX; i++) if (c->samplerStateSet[S3D_STAGE_FS][i]) ntex++;
     fprintf(stderr, "S3DDRAW tris=%d streams=%d depth=(%s,w=%d) cull=%s blend=(%s,%s) cmask=%d%d%d%d samplers=%d\n",
       numTriangles, c->numStreams,
       c->depthCompare ? c->depthCompare : "null", c->depthWrite,
@@ -1960,8 +2032,9 @@ int s3d_draw(void* ctx, int numTriangles) {
     for (int i = 0; i < 8; i++) {
       if (c->streams[i].buffer != nil)
         fprintf(stderr, "   stream[%d] comp=%d nv=%d\n", i, c->streams[i].components, c->streams[i].numVertices);
-      if (c->samplerStateSet[i])
-        fprintf(stderr, "   sampler[%d] filter=%d wrap=%d mip=%d\n", i, c->samplerFilter[i], c->samplerWrap[i], c->samplerMip[i]);
+      if (c->samplerStateSet[S3D_STAGE_FS][i])
+        fprintf(stderr, "   sampler[%d] filter=%d wrap=%d mip=%d\n", i,
+                c->samplerFilter[S3D_STAGE_FS][i], c->samplerWrap[S3D_STAGE_FS][i], c->samplerMip[S3D_STAGE_FS][i]);
     }
   }
   // The command buffer / render pass descriptor / render encoder returned by
@@ -2043,6 +2116,18 @@ int s3d_draw(void* ctx, int numTriangles) {
   id<MTLTexture> ds = (c->renderOverride != nil) ? c->rtDepthStencil
                     : (msaa > 1 ? c->msaaDepthStencil : c->depthStencil);
   if (c->nativeMode && c->nativeDepth != nil) ds = c->nativeDepth;
+  // A native pass that brought its OWN colour attachment but no depth texture must
+  // not inherit the window's depth buffer. Metal requires every attachment in a
+  // pass to be the same size, so pairing a 64x64 (or 256x1024) render target with
+  // the 640x480 back-buffer depth makes the pass invalid: measured here, the draw
+  // then only lands inside the intersection of the two -- the top rows of a tall
+  // atlas came back as zeros and an offscreen scene walk produced nothing at all,
+  // with no Metal error because validation was off. A pass that needs depth
+  // passes its own createDepthTexture(...) through setRenderTargets.
+  if (c->nativeMode && c->nativeColor[0] != nil && c->nativeDepth == nil) {
+    ds = nil;
+    dsNeeded = 0;
+  }
   if (ds != nil && dsNeeded) {
     rp.depthAttachment.texture = ds;
     rp.depthAttachment.loadAction = (c->clearPending && c->clearDepth) ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -2124,8 +2209,10 @@ int s3d_draw(void* ctx, int numTriangles) {
   // Fragment textures fs0..fs7 -> texture(0..7). Without this binding Metal fails
   // the draw ("missing Texture binding at index 0 for fs0[0]") and nothing is
   // rasterized — the Sprite 3D cube rendered as an empty scene because of it.
-  for (int i = 0; i < 8; i++) {
-    if (c->textures[i] != nil) [enc setFragmentTexture:c->textures[i] atIndex:i];
+  int nfrag = c->texUnitsUsed[S3D_STAGE_FS] > 8 ? c->texUnitsUsed[S3D_STAGE_FS] : 8;
+  int nvert = c->texUnitsUsed[S3D_STAGE_VS] > 8 ? c->texUnitsUsed[S3D_STAGE_VS] : 8;
+  for (int i = 0; i < nfrag; i++) {
+    if (c->textures[S3D_STAGE_FS][i] != nil) [enc setFragmentTexture:c->textures[S3D_STAGE_FS][i] atIndex:i];
   }
   // One sampler state per unit: the fragment program declares smpN [[sampler(N)]]
   // for each fsN it samples (the AGAL translator emits one per register), and
@@ -2139,11 +2226,12 @@ int s3d_draw(void* ctx, int numTriangles) {
   // observed, so per-unit REPEAT/NEAREST was silently ignored in multi-texture
   // programs. The linear default below is unreachable for any program that
   // samples at all.
-  for (int i = 0; i < 8; i++) {
-    id<MTLSamplerState> smp = nil;
-    if (c->samplerStateSet[i]) smp = s3d_sampler_for(c, c->samplerFilter[i], c->samplerWrap[i], c->samplerMip[i]);
-    if (smp == nil) smp = (c->samplerLinear != nil ? c->samplerLinear : c->samplerNearest);
-    [enc setFragmentSamplerState:smp atIndex:i];
+  for (int i = 0; i < (nfrag > nvert ? nfrag : nvert); i++) {
+    id<MTLSamplerState> smpF = nil;
+    if (c->samplerStateSet[S3D_STAGE_FS][i])
+      smpF = s3d_sampler_for(c, c->samplerFilter[S3D_STAGE_FS][i], c->samplerWrap[S3D_STAGE_FS][i], c->samplerMip[S3D_STAGE_FS][i]);
+    if (smpF == nil) smpF = (c->samplerLinear != nil ? c->samplerLinear : c->samplerNearest);
+    [enc setFragmentSamplerState:smpF atIndex:i];
     // AGAL4 vertex texture fetch: 'tld' in a VERTEX program reads the same unit
     // index, but Metal keeps texture/sampler tables PER STAGE, so the vertex
     // encoder needs its own binding or the draw dies with "missing Texture
@@ -2153,8 +2241,12 @@ int s3d_draw(void* ctx, int numTriangles) {
     // check counts that unit as used). Binding an index the vertex entry point
     // does not declare is legal in Metal, so this is unconditional; the cost is
     // 8+8 ObjC calls per draw against a per-frame command buffer.
-    if (c->textures[i] != nil) [enc setVertexTexture:c->textures[i] atIndex:i];
-    [enc setVertexSamplerState:smp atIndex:i];
+    if (i < nvert && c->textures[S3D_STAGE_VS][i] != nil) [enc setVertexTexture:c->textures[S3D_STAGE_VS][i] atIndex:i];
+    id<MTLSamplerState> smpV = nil;
+    if (c->samplerStateSet[S3D_STAGE_VS][i])
+      smpV = s3d_sampler_for(c, c->samplerFilter[S3D_STAGE_VS][i], c->samplerWrap[S3D_STAGE_VS][i], c->samplerMip[S3D_STAGE_VS][i]);
+    if (smpV == nil) smpV = (c->samplerNearest != nil ? c->samplerNearest : c->samplerLinear);
+    [enc setVertexSamplerState:smpV atIndex:i];
   }
 
   if (c->indexBuffer != nil) {
@@ -2291,10 +2383,13 @@ void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
 // ARGB pixel upload — the texture already holds rendered content).
 int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   asc_tr_bindtex++;
-  if (ctx == NULL || unit < 0 || unit > 7 || tex == NULL) return 0;
+  if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || tex == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
-  c->textures[unit] = (id<MTLTexture>)tex;
-  c->texHasMips[unit] = hasChain ? 1 : 0;
+  for (int st = 0; st < 2; st++) {
+    c->textures[st][unit] = (id<MTLTexture>)tex;
+    c->texHasMips[st][unit] = hasChain ? 1 : 0;
+    if (unit + 1 > c->texUnitsUsed[st]) c->texUnitsUsed[st] = unit + 1;
+  }
   return 1;
 }
 
@@ -2484,25 +2579,32 @@ void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nflo
 void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
   if (ctx == NULL) return;
   S3DContext* c = (S3DContext*)ctx;
-  if (slot < 0 || slot > 7) {
-    // Beyond the 8 units the draw path binds. Report instead of dropping the bind:
-    // a shader sampling unit 8 would otherwise read black forever.
+  if (slot < 0 || slot >= S3D_MAX_TEX) {
+    // Beyond the units the draw path binds. Report instead of dropping the bind:
+    // a shader sampling an out-of-range unit would otherwise read black forever.
     if (asc_s3d_dump())
       fprintf(stderr, "stage3d_glue: native texture unit %d is outside 0..7 (not bound)\n", slot);
     return;
   }
-  c->textures[slot] = (id<MTLTexture>)tex;
+  // `stage` is the compiler's: 0 = vertex, 1 = fragment.
+  if (stage < 0 || stage > 1) stage = S3D_STAGE_FS;
+  c->textures[stage][slot] = (id<MTLTexture>)tex;
+  // Ask the texture, do not track it: a native target may be created mipmapped and
+  // its chain generated after the pass that fills level 0, so a flag set at bind time
+  // would be wrong either way. mipmapLevelCount is the authority s3d_draw's AIR-faithful
+  // "mip filter on a texture without a chain drops the draw" gate needs.
+  c->texHasMips[stage][slot] = (((id<MTLTexture>)tex).mipmapLevelCount > 1) ? 1 : 0;
+  if (slot + 1 > c->texUnitsUsed[stage]) c->texUnitsUsed[stage] = slot + 1;
   // A native sampler's filter/wrap comes from the Metal sampler state bound at the
   // same index. The AGAL path derives that from the program's `tex` flags; a native
   // program has none, so give the unit the linear default unless setSamplerStateAt
   // already configured it (the draw path then keeps that state).
-  if (!c->samplerStateSet[slot]) {
-    c->samplerFilter[slot] = 2;   // linear
-    c->samplerWrap[slot] = 0;     // clamp
-    c->samplerMip[slot] = 0;
-    c->samplerStateSet[slot] = 1;
+  if (!c->samplerStateSet[stage][slot]) {
+    c->samplerFilter[stage][slot] = 0;   // 0 == linear in the backend filter encoding
+    c->samplerWrap[stage][slot] = 0;     // clamp
+    c->samplerMip[stage][slot] = 0;
+    c->samplerStateSet[stage][slot] = 1;
   }
-  (void)stage;
 }
 
 void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {

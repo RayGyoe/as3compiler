@@ -16316,6 +16316,7 @@ static inline int as_s3d_bind_texture(void* ctx, int unit, void* tex, int hasCha
 extern int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap);
 extern void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats);
 extern void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex);
+extern void s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip);
 extern void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth);
 extern void* s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable, int mipmapped);
 extern void s3d_generate_mips(void* ctx, void* tex);
@@ -16344,6 +16345,13 @@ static inline void as_s3d_native_bind_texture(void* ctx, int stage, int slot, vo
     s3d_native_bind_texture(ctx, stage, slot, tex);
 #else
     (void)ctx; (void)stage; (void)slot; (void)tex;
+#endif
+}
+static inline void as_s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_native_set_sampler_state(ctx, stage, unit, filter, wrap, mip);
+#else
+    (void)ctx; (void)stage; (void)unit; (void)filter; (void)wrap; (void)mip;
 #endif
 }
 static inline void as_s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {

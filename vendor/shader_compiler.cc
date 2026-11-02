@@ -242,6 +242,78 @@ void type_info(spvc_compiler comp, spvc_type_id type_id, int* size_out, int* com
   *base_type_out = base;
 }
 
+// ---------------------------------------------------------------------------
+// MSL: read-only REFERENCE parameters become by-value parameters.
+//
+// WHAT GOES WRONG WITHOUT THIS. SPIRV-Cross promotes a plain (non-block) uniform
+// into an entry-point parameter in the `constant` address space --
+//
+//   fs_main(constant float& uGain [[buffer(0)]], ...)
+//
+// and when a HELPER function reads that uniform it appends the uniform as one more
+// parameter of the helper, but in the `thread` address space:
+//
+//   Med medium(thread const float& h, thread const float& uGain)
+//   ...  Med m = medium(param, uGain);
+//   // error: cannot bind reference in address space 'constant' to object in
+//   //        default address space in 2nd argument
+//
+// Metal rejects that, so EVERY shader written as helpers-that-read-uniforms fails
+// to compile: the Hillaire atmosphere (medium / transmittance / integrate), the FFT
+// slopes, the underwater scattering loop. The alternative is inlining every helper
+// by hand, i.e. encoding "write shaders the awkward way" into the engine -- which is
+// exactly what this project refuses to do.
+//
+// WHY BY-VALUE IS SEMANTICS-PRESERVING. SPIRV-Cross only emits `thread const T&`
+// for objects that are never written (a written one loses the `const`). A copy of a
+// read-only scalar/vector/matrix/small struct is therefore observably identical.
+//
+// SCOPE. Only FUNCTION PARAMETER LISTS are rewritten: the same qualifier also
+// appears on local aliases, and while copying those would usually be fine too, the
+// parameter list is the shape we have measured Metal rejecting. MSL only -- HLSL
+// and GLSL have no address spaces.
+static void normalize_msl_param_refs(std::string& src) {
+  static const char* kQualifier = "thread const ";
+  static const size_t kThread = 7;   // strlen("thread ")
+  const size_t qlen = strlen(kQualifier);
+  std::string out;
+  out.reserve(src.size());
+  size_t pos = 0;      // first source byte not yet copied
+  size_t search = 0;
+  while (true) {
+    size_t i = src.find(kQualifier, search);
+    if (i == std::string::npos) break;
+    search = i + qlen;
+    // Only a parameter list: the previous non-space character must be '(' (first
+    // parameter) or ',' (any later one). A local alias declaration cannot follow a
+    // comma -- SPIRV-Cross emits one statement per alias -- so this is precise for
+    // the shapes it produces.
+    size_t k = i;
+    while (k > 0 && (src[k - 1] == ' ' || src[k - 1] == '\t')) k--;
+    if (k == 0 || (src[k - 1] != '(' && src[k - 1] != ',')) continue;
+    // Find the '&' that closes the declarator, skipping template arguments so
+    // `spvUnsafeArray<float, 4>&` keeps its comma.
+    size_t j = i + qlen;
+    int depth = 0;
+    bool found = false;
+    while (j < src.size()) {
+      char c = src[j];
+      if (c == '<') depth++;
+      else if (c == '>') { if (depth > 0) depth--; }
+      else if (c == '&' && depth == 0) { found = true; break; }
+      else if (c == ';' || c == '{' || c == '}' || c == ')' || c == '\n') break;
+      j++;
+    }
+    if (!found) continue;
+    out.append(src, pos, i - pos);          // up to the qualifier
+    out.append(src, i + kThread, j - (i + kThread));   // "const T" without the '&'
+    pos = j + 1;                            // skip the '&'
+    search = pos;
+  }
+  out.append(src, pos, src.size() - pos);
+  src.swap(out);
+}
+
 int resource_array_size(spvc_compiler comp, spvc_type_id type_id) {
   spvc_type t = spvc_compiler_get_type_handle(comp, type_id);
   if (spvc_type_get_num_array_dimensions(t) == 0) return 1;
@@ -301,6 +373,20 @@ void reflect_msl(spvc_compiler comp, int stage, asc_shader_program* out, int* ca
       add_binding(out, cap, list[i].name, ASC_SHADER_KIND_TEXTURE, (int)idx, stage,
                   resource_array_size(comp, list[i].type_id));
     }
+  }
+}
+
+// Opt-in dump of the reflection table. The native channel binds by reflected name,
+// so "my uniform is always 0" is either "the program never declared it" or "the
+// reflection stopped early"; both are invisible from AS3 and this is the only place
+// that can distinguish them.
+static void dump_bindings(const char* stage_name, const asc_shader_program* out) {
+  if (getenv("ASC_NATIVE_DUMP_BINDINGS") == NULL) return;
+  fprintf(stderr, "[bindings] %s: %d\n", stage_name, out->binding_count);
+  for (int i = 0; i < out->binding_count; i++) {
+    const asc_shader_binding& b = out->bindings[i];
+    fprintf(stderr, "[bindings]   %d kind=%d slot=%d size=%d comp=%d base=%d %s\n",
+            b.stage, b.kind, b.binding, b.size, b.components, b.base_type, b.name);
   }
 }
 
@@ -377,10 +463,12 @@ bool cross_compile(const std::vector<uint32_t>& spv, spvc_backend backend, int s
     return false;
   }
   result->source.assign(src);
+  if (backend == SPVC_BACKEND_MSL) normalize_msl_param_refs(result->source);
   // Reflection must run AFTER compile: the automatic resource indices are assigned
   // during code generation, so querying earlier returns unset decorations.
   if (backend == SPVC_BACKEND_MSL) {
     reflect_msl(comp, stage, out, cap);
+    dump_bindings(stage == 0 ? "vs" : "fs", out);
     if (stage == 1) result->color_attachments = count_color_attachments(comp);
   }
   spvc_context_destroy(ctx);  // frees comp/ir/strings; we already copied the text

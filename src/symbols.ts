@@ -7675,6 +7675,15 @@ export class SymbolTable {
           // exactly when this is called. Without it `textureLod` in a vertex shader
           // (the ocean's LOD selection) has nothing above level 0 to choose.
           ['generateMipmaps', im({ kind: 'void' }, [p('texture', 'TextureBase')])],
+          // Sampler state, scoped to a STAGE. Stage3D's setSamplerStateAt takes a
+          // register index and is therefore shared between the vertex and fragment
+          // programs; SPIRV-Cross numbers native samplers per stage, so unit 0 of a
+          // vertex program is a different Metal sampler from unit 0 of the fragment
+          // program. A material that reads repeat-wrapped displacement atlases in the
+          // vertex program and a clamp-wrapped screen texture at unit 0 in the fragment
+          // program needs both, and only this call can say so. `stage` is the
+          // compiler's numbering: 0 = vertex, 1 = fragment.
+          ['setSamplerStateAtStage', im({ kind: 'void' }, [p('stage', 'int'), p('unit', 'int'), p('wrap', 'String'), p('filter', 'String'), p('mipfilter', 'String')])],
           ['setRenderTargets', im({ kind: 'void' }, [p('colors', 'Array'), p('depth', 'TextureBase', { kind: 'Null' })])],
           ['setBackBuffer', im({ kind: 'void' }, [])],
         ]),

@@ -26204,6 +26204,20 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
+    // Wraps as_s3d_native_set_sampler_state. Stage is the compiler's (0 = vertex,
+    // 1 = fragment) so a vertex-stage repeat atlas and a fragment-stage clamp screen
+    // texture can coexist at the same unit number -- they are different Metal samplers.
+    this.line('void Context3DNative_setSamplerStateAtStage(void* _this, int stage, int unit, char* wrap, char* filter, char* mip) {');
+    this.indent++;
+    this.line('Context3DNative* self = (Context3DNative*)_this;');
+    this.line('if (self->context == NULL) as_throw(Error_new((char*)"Context3DNative: not bound to a Context3D", 0));');
+    this.line('int w = (wrap != NULL && strcmp(wrap, "repeat") == 0) ? 1 : 0;');
+    this.line('int f = (filter != NULL && strcmp(filter, "nearest") == 0) ? 1 : 0;');
+    this.line('int m = 0;');
+    this.line('if (mip != NULL) { if (strcmp(mip, "nearest") == 0) m = 1; else if (strcmp(mip, "linear") == 0) m = 2; }');
+    this.line('as_s3d_native_set_sampler_state(self->context->gpu, stage, unit, f, w, m);');
+    this.indent--;
+    this.line('}');
     this.line('void Context3DNative_setUniform1f(void* _this, NativeProgram3D* p, char* name, double v1) { float f[4] = { (float)v1, 0.0f, 0.0f, 0.0f }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 1); }');
     this.line('void Context3DNative_setUniform2f(void* _this, NativeProgram3D* p, char* name, double v1, double v2) { float f[4] = { (float)v1, (float)v2, 0.0f, 0.0f }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 2); }');
     this.line('void Context3DNative_setUniform3f(void* _this, NativeProgram3D* p, char* name, double v1, double v2, double v3) { float f[4] = { (float)v1, (float)v2, (float)v3, 0.0f }; as_shader_set_uniform_vec((Context3DNative*)_this, p, name, f, 3); }');

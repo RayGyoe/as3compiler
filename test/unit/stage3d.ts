@@ -165,9 +165,14 @@ function checkStage3dAgalSamplerFlags(): string[] {
   // entry point must delegate rather than keep its own copy).
   const glue = readFileSync(join(root, 'vendor', 'stage3d_glue.mm'), 'utf8');
   const ifn = glue.slice(glue.indexOf('void s3d_set_sampler_state_i('));
+  // Per STAGE rows: Stage3D has one register file shared by both stages, but Metal
+  // numbers a native program's samplers per stage, so a vertex-only sampler and a
+  // fragment-only sampler may both own unit 0. The AGAL entry point still writes
+  // BOTH rows, because the AGAL register semantics are not stage-split.
   check('s3d_set_sampler_state_i records filter/wrap/mip on the unit',
-    /c->samplerFilter\[unit\] = filter;/.test(ifn) && /c->samplerMip\[unit\] = mip;/.test(ifn)
-    && /c->samplerStateSet\[unit\] = 1;/.test(ifn));
+    /c->samplerFilter\[st\]\[unit\] = filter;/.test(ifn) && /c->samplerMip\[st\]\[unit\] = mip;/.test(ifn)
+    && /c->samplerStateSet\[st\]\[unit\] = 1;/.test(ifn)
+    && /for \(int st = 0; st < 2; st\+\+\)/.test(ifn));
   const sfn = glue.slice(glue.indexOf('void s3d_set_sampler_state(void* ctx'));
   const sBody = sfn.slice(0, sfn.indexOf('\n}\n'));
   check('s3d_set_sampler_state (setSamplerStateAt) delegates to the same storage',
@@ -248,9 +253,12 @@ function checkStage3dMipSemantics(): string[] {
   // placement is load-bearing: GL samples an incomplete texture as BLACK, so the
   // drop has to be decided after the deferred clear (the frame still clears, as
   // AIR does) and before the program is bound.
+  // Metal reads the FRAGMENT stage's row: the drop rule follows the sampling stage,
+  // and a native program's units are numbered per stage.
+  const dropMetal = 'c->samplerStateSet[S3D_STAGE_FS][i] && c->samplerMip[S3D_STAGE_FS][i] != 0 && c->texHasMips[S3D_STAGE_FS][i] == 0';
   const drop = 'c->samplerStateSet[i] && c->samplerMip[i] != 0 && c->texHasMips[i] == 0';
   check('Metal glue drops the draw on a mip-filtered unit with no chain',
-    metal.includes(drop) && /asc_tr_mipdrop\+\+/.test(metal));
+    metal.includes(dropMetal) && /asc_tr_mipdrop\+\+/.test(metal));
   check('Metal glue still consumes the pending colour clear in the dropped-draw pass',
     /loadAction = MTLLoadActionClear/.test(metal.slice(metal.indexOf('asc_tr_mipdrop'))));
   check('WebGL glue drops the draw on the same rule (byte-identical condition)',
@@ -261,7 +269,7 @@ function checkStage3dMipSemantics(): string[] {
   // Both glues must clear the flag when a unit is unbound (a stale flag would let
   // a later mip-filtered draw of a chainless texture go through).
   check('Metal glue clears the chain flag when the texture is destroyed/unbound',
-    /texHasMips\[i\] = 0/.test(metal));
+    /texHasMips\[st\]\[i\] = 0/.test(metal));
   check('WebGL glue clears the chain flag when the texture is destroyed/unbound',
     /texHasMips\[i\] = 0/.test(webgl));
 
@@ -1960,8 +1968,8 @@ function checkStage3dVertexTexture(): string[] {
   // 3. Backends. Metal keeps texture/sampler tables per STAGE, D3D12 gates them
   //    by root-parameter visibility, WebGL shares one unit space (nothing to do).
   check('Metal binds the vertex texture and sampler stages as well',
-    /setVertexTexture:c->textures\[i\] atIndex:i/.test(metal)
-    && /setVertexSamplerState:smp atIndex:i/.test(metal));
+    /setVertexTexture:c->textures\[S3D_STAGE_VS\]\[i\] atIndex:i/.test(metal)
+    && /setVertexSamplerState:smpV? atIndex:i/.test(metal));
   check('D3D12 shows the SRV and sampler tables to both stages',
     /p\[2\]\.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;/.test(d3d)
     && /p\[3\]\.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;/.test(d3d));
