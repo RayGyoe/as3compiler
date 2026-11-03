@@ -1061,6 +1061,11 @@ static void s3d_prog_release(S3DProg* e) {
   e->npso = 0;
 }
 
+// s3d_select_pso needs the current render target -- its pixel format is baked into
+// the PSO -- so the accessor is declared before the pipeline cache. The definition
+// stays with the render-target binding code further down.
+static S3DTexture* s3d_cur_target(S3DContext* c);
+
 // Build (or fetch) the pipeline for the state currently recorded on the context.
 // The key is the WHOLE draw state -- see the file header for why D3D12 needs this
 // where Metal had a separate MTLDepthStencilState.
@@ -1258,8 +1263,6 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
 }
 
 // ---- render target binding -------------------------------------------------
-
-static S3DTexture* s3d_cur_target(S3DContext* c);  // used by s3d_select_pso above
 
 static S3DTexture* s3d_cur_target(S3DContext* c) {
   return c->renderOverride != NULL ? c->renderOverride : c->target;
@@ -2649,6 +2652,10 @@ int s3d_max_texture_size(void) { return 16384; }
 
 // ---- render-to-texture -----------------------------------------------------
 
+// Same split as the Metal and WebGL backends: the isHalf variant is the real entry
+// point, the no-format wrapper below calls it, so it is declared first.
+void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf);
+
 void* s3d_create_render_texture(void* ctx, int width, int height) {
   return s3d_create_render_texture_fmt(ctx, width, height, 0);
 }
@@ -2664,18 +2671,39 @@ void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf
   return (void*)s3d_make_texture_fmt(c, width, height, 1, 1, 1, 0, isHalf ? 1 : 0);
 }
 
-// Bytes of texture this backend will attempt in ONE allocation. D3D12 exposes the
-// real budget through QueryVideoMemoryInfo; the segment for LOCAL (VRAM) memory
-// carries both the budget and the current usage. Falls back to 2 GiB when the query
-// is unavailable, which is above every realistic single texture and still stops a
-// 16384x16384x8 B = 2 GiB half-float request from being attempted.
+// Bytes of texture this backend will attempt in ONE allocation: what is left of the
+// LOCAL (VRAM) budget. QueryVideoMemoryInfo is an IDXGIAdapter3 method, NOT an
+// ID3D12Device one -- the device only hands out the adapter it was created on -- so
+// the path is device -> IDXGIDevice::GetAdapter -> IDXGIAdapter3. That is also why
+// the segment-group enum is DXGI_MEMORY_SEGMENT_GROUP_LOCAL rather than the
+// D3D12_* spelling. Falls back to 2 GiB when the query is unavailable, which is
+// above every realistic single texture and still stops a 16384x16384x8 B = 2 GiB
+// half-float request from being attempted.
 double s3d_max_texture_memory(void) {
   if (s3d_live_n > 0 && s3d_live[0]->device != NULL) {
-    D3D12_QUERY_VIDEO_MEMORY_INFO info = {};
-    s3d_live[0]->device->QueryVideoMemoryInfo(0, D3D12_MEMORY_SEGMENT_GROUP_LOCAL, &info);
-    if (info.Budget > 0) {
-      const UINT64 free = info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
-      return (double)free;
+    IDXGIDevice* dxgiDev = NULL;
+    if (SUCCEEDED(s3d_live[0]->device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) &&
+        dxgiDev != NULL) {
+      IDXGIAdapter* adapter = NULL;
+      if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter != NULL) {
+        IDXGIAdapter3* adapter3 = NULL;
+        if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&adapter3)) &&
+            adapter3 != NULL) {
+          DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+          if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) &&
+              info.Budget > 0) {
+            const UINT64 freeBytes =
+                info.Budget > info.CurrentUsage ? info.Budget - info.CurrentUsage : 0;
+            adapter3->Release();
+            adapter->Release();
+            dxgiDev->Release();
+            return (double)freeBytes;
+          }
+          adapter3->Release();
+        }
+        adapter->Release();
+      }
+      dxgiDev->Release();
     }
   }
   return 2147483648.0;
