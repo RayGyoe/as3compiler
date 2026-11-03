@@ -19295,7 +19295,53 @@ opt in）。这组钉子存在的理由就是**回归不可见**：示例回归�
 八个示例都**不引用 `Loader`**，因此与本阶段无关。
 ---
 
+### 阶段三百六十一：`BitmapData.draw()` 忽略**被画对象自己**的 `visible`/`alpha` —— 「错误没了但动画不出来」（v0.4.323 → v0.4.324）
+
+**起点**：阶段三百六十修掉「高级礼物」的 `#1009` 之后，用户实测反馈——**报错没有了，但动画没有出来**。
+
+**定位**：高级礼物走 `GiftSvgaSlide` → `com.svgaplayer.Player`。`Player.draw()` 把整棵树放进
+`rootLayer`，设 `rootLayer.visible = false`，再 `bitmapData.draw(rootLayer, rootLayer.transform.matrix, …)`
+出图（`draw()` 之后每帧 `update()` 重画一次）。AOT 的 `as_render_object` 开头就是
+`if (o == NULL || !o->visible) return;` ⇒ 光栅结果恒空。
+
+**实测**（`temp/svgaprobe/`，同一份源码两端同跑；ink = alpha≠0 像素数，sumA = alpha 之和）：
+
+| 场景 | adl 51.4.1 | 修前 AOT |
+|---|---|---|
+| 根 `visible=true`（对照） | 1600 | 1600 |
+| **根 `visible=false`** | **1600** | **0** |
+| 同一对象作为**子件**且 `visible=false` | 0 | 0 |
+| **根 `alpha=0`** | **1600** | **0** |
+| **根 `alpha=0.5`**（sumA） | **408000**（全不透明） | 203200 |
+| 子件 `alpha=0.5`（sumA） | 203200 | 203200 |
+| 子件 `alpha=0` | 0 | 0 |
+| Bitmap 作为**根**，`visible=false` / `alpha=0` | 400 / 400 | 0 / 0 |
+
+顺带量清的两条既有口径（本来就在正确一侧，用作对照）：`draw()` **忽略源对象自身的 transform**
+（`F width/height scale ink=1600`）、`drawPath` 与嵌套 Bitmap 子件照常出图（820 / 400）。
+
+**根因**：`draw()` 的口径是「看内容，不看这个对象自己的外观状态」，但**只对传进去的那个对象**成立；
+后代照常按 `visible`/`alpha` 过滤。旧实现把这条规则套在了根上。
+
+**修法**：`BitmapData.draw` 的 DisplayObject 分支在把 transform 清零的同时，把 `visible` 存下、临时置
+`true`、`alpha` 置 `1.0`，光栅后与 transform 一起还原。指纹 `as_render_fp(sdo)` 必须留在**改动之前**
+（它同时被窗口 pass 用来判烘焙，改动后取会让两路永远算不到同一个值、彼此每帧作废烘焙）。注释里写清
+「根忽略、后代生效」这条差别，并推翻旧注释「Appearance (alpha, visible, …) still applies」。
+
+**回归钉**：`examples/bd-draw-root-aspect.as`（上表压成 8 条断言 + 「draw 之后字段原样还回」1 条，链
+Skia，`test/examples.ts` 已注册）；`test/unit/render.ts` 新增 `unit: render/DrawRootAspect` 8 钉（保存 /
+强制 / 还原三处都在、顺序正确、指纹在强制之前、`as_render_object` 仍跳过不可见对象、transform 的
+清零/还原形态仍在）。三个语义变异（只强制 visible、只强制 alpha、漏还原 alpha）**全红**，还原后绿。
+文档：`docs/{zh-cn,en}/skia.md` 新增 §6.17，含上面那张实测表。
+
+**真应用验证**：`bin-aot` 用修好的编译器重编 **Build successful**，生成的 C 里 `TalkMED Meeting.c`
+确认是 `as_render_fp(sdo);` → 保存 → `sdo->visible = true; sdo->alpha = 1.0;` → `as_render_object` → 还原
+的正确顺序。
+
+---
+
 ### 遗留待开发
+> **2026-11-03 追加（阶段三百六十一：`draw()` 忽略被画对象自己的 `visible`/`alpha`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑不出画面的一条实错（「高级礼物」不报错也不出图），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**口径提醒**：这类缺陷**任何断言都不会红**——它不抛异常、不打日志，示例套件里也没有程序会把「自己设为 invisible 再 draw 自己」当作正常用法；它是靠「用户说动画没出来」反推出来、再用同源探针量出来的。今后凡是「应用层看不见结果但没有报错」的反馈，第一件事就是把该路径的每个渲染/读取原语拿 adl 逐项对照，而不是继续查应用代码。
 > **2026-11-03 追加（记账勘误；不占阶段号、不升版本号）**：两件事都是**记录与事实不符**，不动一行代码。
 > ① **主表最后一行**（`scrollRect` 窗口边与内容边重合时的覆盖率组合口径）状态由 `未开始` 改为 **`部分完成`**——
 > 它的主缺陷（尺寸取整与整像素吸附）已在阶段三百四十九 修净，行内只剩一条组合口径，原标签与行内自述矛盾；

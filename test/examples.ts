@@ -402,6 +402,12 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 后刷新，上面的卡片跳下来再恢复」。断言是像素（白色画布上蓝块的落点），纯 C 构建
   // 没有光栅后端（draw 是空桩），故与 draw-over.as 一样链 Skia。
   'alpha-sibling.as': ['--manifest', join(dir, 'alpha-sibling.build.json')],
+  // bd-draw-root-aspect.as（阶段三百六十一）断言的是「draw() 忽略参数对象**自己**的
+  // visible/alpha，但子对象照常生效」——逐像素 ink / alpha 和，与 adl 51.4.1 实测
+  // （temp/svgaprobe/VisProbe.as，15 项）逐条一致。真应用里 com.svgaplayer.Player
+  // 把 rootLayer 设成 visible=false 再 bitmapData.draw，修前整帧为空（「高级礼物」不报错
+  // 也不出画面）。纯 C 构建 draw() 是空桩，故与 alpha-sibling.as 一样链 Skia。
+  'bd-draw-root-aspect.as': ['--manifest', join(dir, 'bd-draw-root-aspect.build.json')],
   // autosize-metrics.as 断言的是**字体度量**（`textWidth`/`textHeight`/`numLines`）与
   // 「反复 `BitmapData.draw` 后字段宽度不得自噬」，两者都只在 Skia 文本后端下存在，
   // 故与 bakecrisp.as 一样链 Skia（阶段一百六十八的 autoSize/字族兜底回归）。

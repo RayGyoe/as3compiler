@@ -2426,3 +2426,70 @@ function checkScrollRectWindowRounding(): string[] {
   return bad;
 }
 registerGroup('unit: render/ScrollRectWindowRounding', checkScrollRectWindowRounding);
+
+// ---- 阶段三百六十一: BitmapData.draw() 忽略**参数对象自己**的 visible/alpha ----
+//
+// AIR 的口径是「draw() 看内容、不看这个对象自己的外观状态」，但**后代**照常生效。
+// adl 51.4.1 逐像素实测（temp/svgaprobe/VisProbe.as，A..O 共 15 项，AOT 修后逐条一致）：
+//   root.visible=false        -> 1600 ink（照画），作为子件时 0 ink；
+//   root.alpha=0 / 0.5        -> ink 1600 / alpha 和 408000（全不透明），而子件 0.5 是 203200、0 是 0；
+//   Bitmap 作为根 visible/alpha 归零 -> 同样 400 ink 照画。
+//
+// 为什么这条值得专门钉：com.svgaplayer.Player（「高级礼物」的播放器）把整棵树放进
+// rootLayer 后设 rootLayer.visible = false，再用 bitmapData.draw(rootLayer, ...) 出图。
+// 修前 as_render_object 开头就 `if (o == NULL || !o->visible) return;`，于是**每帧都是空的**
+// ——不报错、也没有画面，正是用户看到的「错误没了但动画不出来」。
+//
+// 行为由 examples/bd-draw-root-aspect.as 端到端钉住（3 个变异全红）；这里只钉生成的 C
+// 必须把两个字段**临时**改成可见/不透明并在光栅后**还原**，且还原不能排在 as_render_object 之前。
+function checkDrawRootAspect(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [drawroot] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [drawroot] ${label}`); }
+  };
+  const src = [
+    'import flash.display.Sprite;',
+    'import flash.display.BitmapData;',
+    'var bd:BitmapData = new BitmapData(8, 8, false, 0);',
+    'var s:Sprite = new Sprite();',
+    'bd.draw(s);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  const save = 'bool sx_kv = sdo->visible; double sx_ka = sdo->alpha;';
+  const force = 'sdo->visible = true; sdo->alpha = 1.0;';
+  const restore = 'sdo->visible = sx_kv; sdo->alpha = sx_ka;';
+  const raster = 'as_render_object(canvas, sdo);';
+  const fp = 'as_render_fp(sdo);';
+
+  check('the root appearance is saved', c.includes(save));
+  check('...forced to visible+opaque for the raster', c.includes(force));
+  check('...and restored afterwards', c.includes(restore));
+  check('the force happens before the raster pass',
+    c.indexOf(force) >= 0 && c.indexOf(force) < c.indexOf(raster));
+  check('the restore happens after the raster pass',
+    c.indexOf(restore) > c.indexOf(raster));
+  // The fingerprint the window pass also computes must hash the REAL appearance,
+  // otherwise the two paths disagree and each drops the other's bake every frame.
+  check('the fingerprint is taken before the appearance is clobbered',
+    c.indexOf(fp) >= 0 && c.indexOf(fp) < c.indexOf(force));
+
+  // The descendant rule this fix must NOT change: as_render_object still skips an
+  // invisible object, which is what makes an invisible CHILD vanish (ADL: 0 ink).
+  const rb = c.indexOf('static void as_render_object(void* canvas, DisplayObject* o) {');
+  check('as_render_object still skips invisible objects (the descendant rule)',
+    rb >= 0 && c.slice(rb, rb + 400).includes('if (o == NULL || !o->visible) return;'));
+
+  // The transform fields keep the same save/force/restore shape (regression guard for
+  // whoever edits this block next).
+  check('the transform zeroing/restore is still in place',
+    c.includes('sdo->x = 0.0; sdo->y = 0.0; sdo->rotation = 0.0; sdo->scaleX = 1.0; sdo->scaleY = 1.0;')
+    && c.includes('sdo->x = sx_kx; sdo->y = sx_ky; sdo->rotation = sx_kr; sdo->scaleX = sx_ksx; sdo->scaleY = sx_ksy;'));
+
+  console.log(`[drawroot] ${ok} draw-root-appearance checks passed`);
+  return bad;
+}
+registerGroup('unit: render/DrawRootAspect', checkDrawRootAspect);

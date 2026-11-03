@@ -933,6 +933,36 @@ asaotui 的 `compiler-gaps.md` G29 是「样式字段 `overflow` 被接受、被
 纯 C 构建自跳过）＋`unit: render/ScrollRectWindowRounding`（12 条：发射点、`rint`、AA 开关、
 整像素快路、seam 三态、以及示例里的实测表）。
 
+### 6.17 `BitmapData.draw()` 忽略**被画对象自己**的 `visible` / `alpha`（阶段三百六十一，一个「不报错也没有画面」）
+
+`draw()` 的口径是「看内容，不看这个对象自己的外观状态」——但**只对传进去的那个对象**成立，它的**后代**照常
+生效。这条差别很窄，窄到只看代码看不出来，于是它以最安静的方式坏过一次：talkmed meeting 的「高级礼物」
+是 SVGA 播放器（`com.svgaplayer.Player`），它把整棵树放进 `rootLayer`、设 `rootLayer.visible = false`，
+再用 `bitmapData.draw(rootLayer, rootLayer.transform.matrix, …)` 出图。旧实现里 `as_render_object` 开头就是
+`if (o == NULL || !o->visible) return;` ⇒ **每一帧的光栅结果都是空的**，不抛异常、不打日志。
+
+adl 51.4.1 逐像素实测（`temp/svgaprobe/VisProbe.as`，同一份源码两端同跑，ink = alpha≠0 的像素数，
+sumA = alpha 之和）：
+
+| 场景 | adl | 修前 AOT |
+|---|---|---|
+| 根 `visible=true`（对照） | 1600 | 1600 |
+| **根 `visible=false`** | **1600** | **0** |
+| 同一对象作为**子件**且 `visible=false` | 0 | 0 |
+| **根 `alpha=0`** | **1600** | **0** |
+| **根 `alpha=0.5`**（sumA） | **408000**（=1600×255，全不透明） | 203200 |
+| 子件 `alpha=0.5`（sumA） | 203200 | 203200 |
+| 子件 `alpha=0` | 0 | 0 |
+| Bitmap 作为**根**，`visible=false` / `alpha=0` | 400 / 400 | 0 / 0 |
+
+所以 `draw()` 期间这两个字段被**临时**改成可见 / 不透明，光栅之后原样还回去（与源对象自身 transform 的
+清零 / 还原同一处、同一形态）；指纹 `as_render_fp` 必须在**改动之前**取，否则窗口 pass 与 `draw()` 两路
+永远算不到同一个值，彼此的烘焙每帧互相作废。
+
+回归：`examples/bd-draw-root-aspect.as`（上表 15 项压成 8 条断言 + 「draw 之后字段原样还回」1 条，
+链 Skia）+ `unit: render/DrawRootAspect`（8 钉：保存 / 强制 / 还原三处都存在、顺序正确、指纹在强制**之前**、
+`as_render_object` 仍跳过不可见对象）。三个语义变异（只强制 visible、只强制 alpha、漏还原 alpha）全红。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

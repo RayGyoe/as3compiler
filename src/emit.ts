@@ -22726,9 +22726,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     // with the 2x2 matrix the backlog row asked for (temp/bakeprobe/): a container
     // whose scaleX/scaleY are 2 renders at 1x (ext 41x21 for a 40x20 field, not
     // 81x41), and with a scale-3 matrix as well the result is 121x61 = the matrix
-    // only, i.e. the two do NOT multiply. Appearance (alpha, visible, filters,
-    // children) still applies, so the transform fields are zeroed for the duration
-    // of the raster and restored right after instead of skipping as_render_object.
+    // only, i.e. the two do NOT multiply.
+    //
+    // The ROOT's own visible/alpha are ignored as well, and that is NOT the same
+    // rule as for the rest of the subtree. Measured on adl 51.4.1 with per-pixel
+    // alpha sums (temp/svgaprobe, VisProbe.as):
+    //   * root.visible=false        -> 1600 ink (fully drawn), 0 when the same
+    //                                  sprite is drawn as a CHILD (C = 0);
+    //   * root.alpha=0 / 0.5        -> 1600 ink / alpha sum 408000 (= 1600*255),
+    //                                  i.e. full opacity, while a child with
+    //                                  alpha 0.5 sums 203200 and alpha 0 paints 0;
+    //   * a Bitmap root with visible=false / alpha=0 -> 400 ink either way.
+    // So draw() renders its argument regardless of the argument's own appearance,
+    // while descendants keep theirs. Both fields are therefore forced to the
+    // visible/opaque state for the raster and restored right after, exactly like
+    // the transform fields below. Without this, com.svgaplayer.Player -- which sets
+    // rootLayer.visible = false and blits it with bitmapData.draw -- produced a
+    // completely blank gift animation.
     this.line('DisplayObject* sdo = (DisplayObject*)src;');
     // Refresh the fingerprint BEFORE the source transform is zeroed for the
     // raster: the hash covers the object's own x/y/rotation/scale plus its whole
@@ -22737,8 +22751,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // agree on the value and each would drop the other's bake every frame.
     this.line('as_render_fp(sdo);');
     this.line('double sx_kx = sdo->x, sx_ky = sdo->y, sx_kr = sdo->rotation, sx_ksx = sdo->scaleX, sx_ksy = sdo->scaleY;');
+    this.line('bool sx_kv = sdo->visible; double sx_ka = sdo->alpha;');
     this.line('Matrix* sx_km = (sdo->transform != NULL) ? sdo->transform->matrix : NULL;');
     this.line('sdo->x = 0.0; sdo->y = 0.0; sdo->rotation = 0.0; sdo->scaleX = 1.0; sdo->scaleY = 1.0;');
+    this.line('sdo->visible = true; sdo->alpha = 1.0;');
     this.line('double _bdt0 = as_now_ms();');
     this.line('if (sdo->transform != NULL) sdo->transform->matrix = NULL;');
     this.line('as_skia_canvas_scale(canvas, rs, rs);');
@@ -22746,6 +22762,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_render_object(canvas, sdo);');
     this.line('ASC_draw_path = 0;');
     this.line('sdo->x = sx_kx; sdo->y = sx_ky; sdo->rotation = sx_kr; sdo->scaleX = sx_ksx; sdo->scaleY = sx_ksy;');
+    this.line('sdo->visible = sx_kv; sdo->alpha = sx_ka;');
     this.line('if (sdo->transform != NULL) sdo->transform->matrix = sx_km;');
     this.line('owned = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
     this.line('if (owned == NULL) { as_skia_surface_delete(surface); ASC_render_scale = keep_render_scale; return; }');

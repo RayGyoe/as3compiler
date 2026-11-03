@@ -849,6 +849,38 @@ backend) plus `unit: render/OverflowClip` (6 scope checks: the clip brackets the
 comes before the object transform, the mask is a binary `clipPath`, no `restore` may sit between the outer
 `save` and the mask, and `scrollRect` opens its own `save`).
 
+### 6.17 `BitmapData.draw()` ignores the **drawn object's own** `visible` / `alpha` (stage 361; a "no error, no picture" bug)
+
+`draw()` renders the content and ignores the appearance state of the object you hand it -- but only for **that
+object**, not for its **descendants**, which keep theirs. The difference is narrow enough to be invisible in code
+review, and it broke quietly once: talkmed meeting's "advanced gift" is an SVGA player
+(`com.svgaplayer.Player`) that puts the whole tree in `rootLayer`, sets `rootLayer.visible = false`, and then
+blits it with `bitmapData.draw(rootLayer, rootLayer.transform.matrix, …)`. The old `as_render_object` began with
+`if (o == NULL || !o->visible) return;` -- so **every frame rasterised to nothing**, with no exception and no log.
+
+Measured per pixel on adl 51.4.1 (`temp/svgaprobe/VisProbe.as`, same source on both sides; ink = pixels with
+alpha≠0, sumA = sum of alpha):
+
+| case | adl | AOT before the fix |
+|---|---|---|
+| root `visible=true` (control) | 1600 | 1600 |
+| **root `visible=false`** | **1600** | **0** |
+| the same object as a **child** with `visible=false` | 0 | 0 |
+| **root `alpha=0`** | **1600** | **0** |
+| **root `alpha=0.5`** (sumA) | **408000** (=1600x255, fully opaque) | 203200 |
+| child `alpha=0.5` (sumA) | 203200 | 203200 |
+| child `alpha=0` | 0 | 0 |
+| Bitmap as the **root**, `visible=false` / `alpha=0` | 400 / 400 | 0 / 0 |
+
+Both fields are therefore forced visible / opaque for the duration of the raster and restored afterwards, in the
+same place and shape as the source transform zeroing; the fingerprint `as_render_fp` must be refreshed **before**
+the change, or the window pass and `draw()` never agree on the value and keep invalidating each other's bake.
+
+Regressions: `examples/bd-draw-root-aspect.as` (the table above condensed into 8 assertions plus "the fields are
+restored afterwards", Skia-linked) + `unit: render/DrawRootAspect` (8 pins: save / force / restore all present,
+in the right order, fingerprint before the force, `as_render_object` still skipping invisible objects). Three
+semantic mutations (force visible only, force alpha only, drop the alpha restore) all go red.
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.
