@@ -338,7 +338,8 @@ typedef void (*sk_key_cb)(int win, const char* type, int keyCode, int charCode, 
 // on_*/as_skia_*/as_window_* pass-through) unchanged. The buffer is per window and
 // cleared by the drain, and SDL delivers at most SDL_TEXTINPUTEVENT_TEXT_SIZE
 // bytes per event, so nothing is lost.
-typedef void (*sk_redraw_cb)(int win);
+// 1 = pixels changed and the backend must present; 0 = identical frame, skip.
+typedef int (*sk_redraw_cb)(int win);
 typedef void (*sk_frame_cb)(int win);
 typedef double (*sk_frame_delay_cb)(int win);
 // Invoked after the window changed size or moved to a display with a different
@@ -443,6 +444,7 @@ struct WinCtx {
   int edit_start;
   int edit_len;
   sk_resize_cb on_resize;
+  uint64_t redraw_generation;
   sk_redraw_cb on_redraw;
   sk_frame_cb on_frame;
   sk_frame_delay_cb on_frame_delay;
@@ -972,8 +974,8 @@ static double sk_pump_frame(void) {
     WinCtx* c = &g_wins[i];
     if (!c->used || c->destroy_pending) continue;
     if (c->visible && c->dirty && c->on_redraw != NULL) {
-      c->on_redraw(i);
-      if (!c->is_gpu) present_frame(c, c->pixels, c->pw, c->ph, c->rowBytes);
+      int painted = c->on_redraw(i);
+      if (!c->is_gpu && painted) present_frame(c, c->pixels, c->pw, c->ph, c->rowBytes);
       c->dirty = 0;
     }
   }
@@ -1014,6 +1016,11 @@ static int SDLCALL live_resize_watch(void* userdata, SDL_Event* e) {
 // caller falls back to a compiler-side default). Queried live because a
 // cross-display drag changes the answer — caching the primary's rate is what let
 // a 120 Hz target beat against a 50 Hz external monitor and jitter the interval.
+uint64_t sk_window_redraw_generation(int win) {
+  if (win < 0 || win >= SK_MAX_WINDOWS || !g_wins[win].used) return 0;
+  return g_wins[win].redraw_generation;
+}
+
 double sk_window_get_display_refresh(int win) {
   WinCtx* c = sk_slot(win);
   if (c != NULL && c->win != NULL) {
@@ -1770,6 +1777,7 @@ static void sk_run_loop(void) {
             // next frame.
             c->close_request = 1;
           } else if (e.window.event == SDL_WINDOWEVENT_EXPOSED) {
+            c->redraw_generation++;
             c->dirty = 1;
           } else if (e.window.event == SDL_WINDOWEVENT_LEAVE) {
             // Is the pointer really outside now? Raising/activating a window that

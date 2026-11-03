@@ -396,7 +396,9 @@ function checkTransformMatrix(): string[] {
     ['tf->_sel_begin', 'tf->_sel_end', 'tf->_scroll_h'].every((f) => fp.includes(f)));
   check('...and the run list, so a text change invalidates it', fp.includes('tf->_runs'));
   check('...and the layout inputs (align / autoSize / textColor)',
-    ['f->align', 'tf->autoSize', 'tf->textColor'].every((f) => fp.includes(f)));
+    fp.includes('as_textformat_fp(h, as_tf_base_fmt(tf))')
+    && c.includes('as_fp_str(h, f->align)')
+    && ['tf->autoSize', 'tf->textColor'].every((f) => fp.includes(f)));
 
   // (5) Cursor: the glue seam must exist on every backend, the sampler must run
   // after the mouse dispatch (a listener may set Mouse.cursor or toggle

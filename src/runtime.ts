@@ -10079,6 +10079,11 @@ extern int sk_gpu_init(int id, void* native_handle);
 extern void sk_gpu_destroy(int id);
 extern void* sk_gpu_begin_frame(int id, int w, int h);
 extern void sk_gpu_flush(int id);
+// Zero while the device is lost; otherwise a per-window value changed whenever
+// its swapchain/surfaces are rebuilt. A static 2D tree must still repaint after
+// GPU recovery, so this is part of the window content key.
+extern uint64_t sk_gpu_generation(int id);
+static inline uint64_t as_gpu_generation(int id) { return sk_gpu_generation(id); }
 extern void sk_gpu_draw_texture(void* canvas, void* backendTexture, int w, int h, double dx, double dy, double dw, double dh);
 #endif
 extern void* sk_surface_canvas(void* surface);
@@ -10464,7 +10469,7 @@ extern int sk_window_show(void* surface, int w, int h, int pw, int ph, const cha
                           void (*on_mouse)(int, double, double, const char*),
                           void (*on_wheel)(int, double, double, double),
                           void (*on_key)(int, const char*, int, int, int),
-                          void (*on_redraw)(int),
+                          int (*on_redraw)(int),
                           void (*on_frame)(int),
                           double (*on_frame_delay)(int),
                           void* (*on_resize)(int, int, int, int, int, double),
@@ -10477,6 +10482,10 @@ extern int sk_window_get_stage_full_size(int* w, int* h);
 // Refresh rate of the display a GIVEN window sits on: with several windows open
 // each one paces its own frame clock, so "the app's display" is not well defined.
 extern double sk_window_get_display_refresh(int win);
+// OS-driven repaint generation: EXPOSED/restore invalidates even an unchanged
+// display tree because the previously presented pixels are not a retained cache.
+extern uint64_t sk_window_redraw_generation(int win);
+static inline uint64_t as_window_redraw_generation(int win) { return sk_window_redraw_generation(win); }
 // Display enumeration for flash.display.Screen: the number of attached displays,
 // and per display its full rectangle (bounds) plus its usable area (visibleBounds,
 // menu bar / Dock excluded). These are two different quantities on the same
@@ -10493,7 +10502,7 @@ extern int sk_window_create(int w, int h, const char* title, int resizable, int 
                            void (*on_mouse)(int, double, double, const char*),
                            void (*on_wheel)(int, double, double, double),
                            void (*on_key)(int, const char*, int, int, int),
-                           void (*on_redraw)(int),
+                           int (*on_redraw)(int),
                            void (*on_frame)(int),
                            double (*on_frame_delay)(int),
                            void* (*on_resize)(int, int, int, int, int, double),
@@ -10583,7 +10592,7 @@ extern int sk_window_show_gpu(int w, int h, const char* title, int fullscreen,
                                 void (*on_mouse)(int, double, double, const char*),
                                 void (*on_wheel)(int, double, double, double),
                                 void (*on_key)(int, const char*, int, int, int),
-                                void (*on_redraw)(int),
+                                int (*on_redraw)(int),
                                 void (*on_frame)(int),
                                 double (*on_frame_delay)(int),
                                 void* (*on_resize)(int, int, int, int, int, double),
@@ -10642,7 +10651,7 @@ static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int
                                               void (*on_mouse)(int, double, double, const char*),
                                               void (*on_wheel)(int, double, double, double),
                                               void (*on_key)(int, const char*, int, int, int),
-                                              void (*on_redraw)(int),
+                                              int (*on_redraw)(int),
                                               void (*on_frame)(int),
                                               double (*on_frame_delay)(int),
                                               void* (*on_resize)(int, int, int, int, int, double),
@@ -10663,7 +10672,7 @@ static inline int as_skia_surface_show_window_gpu(int w, int h,
                                                     void (*on_mouse)(int, double, double, const char*),
                                                     void (*on_wheel)(int, double, double, double),
                                                     void (*on_key)(int, const char*, int, int, int),
-                                                    void (*on_redraw)(int),
+                                                    int (*on_redraw)(int),
                                                     void (*on_frame)(int),
                                                     double (*on_frame_delay)(int),
                                                     void* (*on_resize)(int, int, int, int, int, double),
@@ -10700,7 +10709,7 @@ static inline int as_window_create(int w, int h, const char* title, int resizabl
                                    void (*on_mouse)(int, double, double, const char*),
                                    void (*on_wheel)(int, double, double, double),
                                    void (*on_key)(int, const char*, int, int, int),
-                                   void (*on_redraw)(int),
+                                   int (*on_redraw)(int),
                                    void (*on_frame)(int),
                                    double (*on_frame_delay)(int),
                                    void* (*on_resize)(int, int, int, int, int, double),
@@ -11224,14 +11233,14 @@ static inline int as_clipboard_get_text(char* buf, int cap) { (void)buf; (void)c
 static inline int sk_window_text_take(int id, char* buf, int cap) { (void)id; (void)buf; (void)cap; return 0; }
 static inline int sk_window_text_edit_take(int id, char* buf, int cap, int* start, int* length) { (void)id; (void)buf; (void)cap; (void)start; (void)length; return 0; }
 static inline void sk_window_set_text_input_rect(int id, double x, double y, double w, double h) { (void)id; (void)x; (void)y; (void)w; (void)h; }
-static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int ph, const char* title, int fullscreen, void (*on_mouse)(int, double, double, const char*), void (*on_wheel)(int, double, double, double), void (*on_key)(int, const char*, int, int, int), void (*on_redraw)(int), void (*on_frame)(int), double (*on_frame_delay)(int), void* (*on_resize)(int, int, int, int, int, double), void (*on_close)(int)) { (void)s; (void)w; (void)h; (void)pw; (void)ph; (void)title; (void)fullscreen; (void)on_mouse; (void)on_wheel; (void)on_key; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; (void)on_close; return 0; }
+static inline int as_skia_surface_show_window(void* s, int w, int h, int pw, int ph, const char* title, int fullscreen, void (*on_mouse)(int, double, double, const char*), void (*on_wheel)(int, double, double, double), void (*on_key)(int, const char*, int, int, int), int (*on_redraw)(int), void (*on_frame)(int), double (*on_frame_delay)(int), void* (*on_resize)(int, int, int, int, int, double), void (*on_close)(int)) { (void)s; (void)w; (void)h; (void)pw; (void)ph; (void)title; (void)fullscreen; (void)on_mouse; (void)on_wheel; (void)on_key; (void)on_redraw; (void)on_frame; (void)on_frame_delay; (void)on_resize; (void)on_close; return 0; }
 static inline int as_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,
                                    int decorated, int highdpi,
                                    int gpu,
                                    void (*on_mouse)(int, double, double, const char*),
                                    void (*on_wheel)(int, double, double, double),
                                    void (*on_key)(int, const char*, int, int, int),
-                                   void (*on_redraw)(int),
+                                   int (*on_redraw)(int),
                                    void (*on_frame)(int),
                                    double (*on_frame_delay)(int),
                                    void* (*on_resize)(int, int, int, int, int, double),
@@ -14105,6 +14114,11 @@ static int as_dbg_frame_n = 0;
 // AS_BAKE_MAX_PIXELS fallback.
 static int as_dbg_live_n = 0;
 static int as_dbg_cached_n = 0;
+static int as_dbg_present_skip_n = 0;
+static int as_dbg_key_fp_n = 0;
+static int as_dbg_key_s3d_n = 0;
+static int as_dbg_key_gpu_n = 0;
+static int as_dbg_key_window_n = 0;
 static double as_dbg_prev_ms = 0.0;
 static int as_dbg_frame_on = -1;
 static size_t as_dbg_free_bytes = 0;
@@ -14144,17 +14158,22 @@ static void as_dbg_frame(double gc_ms) {
     for (int li = 0; li < GC_SMALL_CLASSES + 2; li++)
         for (gc_header* h = *gc_free_list_at(li); h != NULL; h = h->next) freeb += h->size;
     as_dbg_free_bytes = freeb;
-    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB arena=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%ldobj segs=%zu freeb=%.0fMB | live=%d cached=%d\\n",
+    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB arena=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%ldobj segs=%zu freeb=%.0fMB | live=%d cached=%d presentskip=%d keychg=%d/%d/%d/%d\\n",
             n, as_dbg_sort_ms[n / 2], as_dbg_sort_ms[n * 95 / 100], as_dbg_sort_ms[n * 99 / 100],
             as_dbg_sort_ms[n - 1], as_dbg_gc_ms[worst], over8, over17,
             gc_max, gc_sum / (double)n, frame_sum > 0 ? 100.0 * gc_sum / frame_sum : 0.0,
             as_system_private_memory() / 1048576.0, (double)as_arena_used_bytes() / 1048576.0, gc_heap_total_bytes() / 1048576.0,
             (double)gc_dbg_inuse_bytes() / 1048576.0, gc_dbg_inuse_count(), segs,
-            (double)as_dbg_free_bytes / 1048576.0, as_dbg_live_n, as_dbg_cached_n);
+            (double)as_dbg_free_bytes / 1048576.0, as_dbg_live_n, as_dbg_cached_n, as_dbg_present_skip_n, as_dbg_key_fp_n, as_dbg_key_s3d_n, as_dbg_key_gpu_n, as_dbg_key_window_n);
     fflush(stderr);
     as_dbg_frame_n = 0;
     as_dbg_live_n = 0;
     as_dbg_cached_n = 0;
+    as_dbg_present_skip_n = 0;
+    as_dbg_key_fp_n = 0;
+    as_dbg_key_s3d_n = 0;
+    as_dbg_key_gpu_n = 0;
+    as_dbg_key_window_n = 0;
 }
 
 // System.gc(): force a stop-the-world collection. AIR exposes this for manual

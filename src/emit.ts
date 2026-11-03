@@ -1956,6 +1956,7 @@ export class Emitter {
           this.line('uint32_t _auto_fp;');
           this.line('int _auto_still;');
           this.line('int _auto_baked;');
+           this.line('int _dbg_fp_changes;');
           // The clipDepth stencil needs no field here: the masked object points at
           // the mask SIBLING through `_clip_src` (declared in the DisplayObject
           // symbol table, so the GC marks it) and the path is rebuilt per frame.
@@ -11504,6 +11505,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static int ASC_stage3d_w;');
     this.line('static int ASC_stage3d_h;');
     this.line('static int ASC_stage3d_ready;');
+    // Unlike the display tree, a Stage3D texture is mutated behind Skia's back.
+    // present() is therefore the frame boundary the window change detector uses.
+    this.line('static uint64_t ASC_stage3d_serial;');
     // The Stage3D back buffer's size in *stage* units (what Context3D was asked to
     // configure). Under HiDPI these are smaller than the actual render target
     // (ASC_stage3d_w/h), which AIR allocates at device resolution — the compositor
@@ -27146,7 +27150,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->backBufferWidth = bbw; o->backBufferHeight = bbh; o->antiAlias = (int)antiAlias; o->enableDepthAndStencil = enableDepthAndStencil;');
     // The compositor needs the logical (stage-unit) size to place the target in
     // the display list — see ASC_stage3d_lw/lh.
-    this.line('ASC_stage3d_lw = (int)width; ASC_stage3d_lh = (int)height;');
+    this.line('ASC_stage3d_lw = (int)width; ASC_stage3d_lh = (int)height; ASC_stage3d_serial++;');
     // Lazily create the offscreen GPU context on first configureBackBuffer, or
     // resize it on a later call (window resize). Pure-C builds: gpu stays NULL.
     this.line('if (o->gpu == NULL) o->gpu = as_s3d_create(bbw, bbh);');
@@ -27201,6 +27205,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_s3d_readback_render(o->gpu, ASC_stage3d_pixels);');
     this.line('#endif');
     this.line('ASC_stage3d_ready = 1;');
+    this.line('ASC_stage3d_serial++;');
     // Debug probe (ASC_S3D_TRACE=1): what present() handed to the compositor.
     this.line('{ static int n = 0; if (n++ % 120 == 0 && getenv("ASC_S3D_TRACE") != NULL) fprintf(stderr, "s3d_trace present: w=%d h=%d tex=%p lw=%d lh=%d\\n", w, h, ASC_stage3d_tex, ASC_stage3d_lw, ASC_stage3d_lh); }');
     this.indent--;
@@ -27970,6 +27975,44 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('MouseEvent* evt = MouseEvent_new((char*)"mouseWheel", true, false, x - o->x, y - o->y, NULL, false, false, false, false, delta);');
     this.line('EventDispatcher_dispatchEvent(target, (Event*)evt);');
+    this.indent--;
+    this.line('}');
+    // ASC_BAKE_STATS: account the actual retained offscreen images, not just
+    // the number of cached draw calls. Nested caches are real independent images,
+    // so their pixels deliberately add up; that is the memory cost to optimize.
+    this.line('static uint64_t as_bake_stat_pixels = 0, as_bake_stat_valid_pixels = 0;');
+    this.line('static int as_bake_stat_nodes = 0, as_bake_stat_valid_nodes = 0;');
+    this.line('static double as_bake_stat_max_w = 0.0, as_bake_stat_max_h = 0.0;');
+    this.line('static void* as_bake_stat_max_o = NULL;');
+    this.line('static int ASC_fp_trace = -1;');
+    this.line('static void as_bake_stat_walk(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('if (ASC_fp_trace > 0 && o->_dbg_fp_changes > 0) {');
+    this.indent++;
+    this.line('as_vtable_header* vt = (as_vtable_header*)((as_object_header*)o)->vtable;');
+    this.line('const char* cn = (vt != NULL && vt->fqn != NULL) ? vt->fqn : ((vt != NULL && vt->name != NULL) ? vt->name : "?");');
+    this.line('const char* tx = as_is(o, &TextField_vt) && ((TextField*)o)->text != NULL ? ((TextField*)o)->text : "-";');
+    this.line('fprintf(stderr, "FPCHG n=%d o=%p cls=%s text=%.80s\\n", o->_dbg_fp_changes, (void*)o, cn, tx);');
+    this.line('o->_dbg_fp_changes = 0;');
+    this.indent--;
+    this.line('}');
+    this.line('if (o->_cache_image != NULL && o->_cache_w > 0.0 && o->_cache_h > 0.0) {');
+    this.indent++;
+    this.line('uint64_t px = (uint64_t)(o->_cache_w * o->_cache_h); as_bake_stat_pixels += px; as_bake_stat_nodes++;');
+    this.line('if (o->_cache_valid) { as_bake_stat_valid_pixels += px; as_bake_stat_valid_nodes++; }');
+    this.line('if (px >= (uint64_t)(as_bake_stat_max_w * as_bake_stat_max_h)) { as_bake_stat_max_w = o->_cache_w; as_bake_stat_max_h = o->_cache_h; as_bake_stat_max_o = (void*)o; }');
+    this.indent--;
+    this.line('}');
+    this.line('if (as_is(o, &DisplayObjectContainer_vt)) { DisplayObjectContainer* c = (DisplayObjectContainer*)o; if (c->children != NULL) for (int i = 0; i < c->children->length; i++) as_bake_stat_walk((DisplayObject*)as_v_obj_val(c->children->data[i])); }');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_bake_stat_report(Stage* st, int id) {');
+    this.indent++;
+    this.line('if (getenv("ASC_BAKE_STATS") == NULL) return;');
+    this.line('as_bake_stat_pixels = 0; as_bake_stat_valid_pixels = 0; as_bake_stat_nodes = 0; as_bake_stat_valid_nodes = 0; as_bake_stat_max_w = 0; as_bake_stat_max_h = 0; as_bake_stat_max_o = NULL;');
+    this.line('as_bake_stat_walk((DisplayObject*)st);');
+    this.line('fprintf(stderr, "BAKE win=%d nodes=%d valid=%d pixels=%.1fMB valid=%.1fMB max=%.0fx%.0f o=%p\\n", id, as_bake_stat_nodes, as_bake_stat_valid_nodes, (double)as_bake_stat_pixels * 4.0 / 1048576.0, (double)as_bake_stat_valid_pixels * 4.0 / 1048576.0, as_bake_stat_max_w, as_bake_stat_max_h, as_bake_stat_max_o);');
     this.indent--;
     this.line('}');
     // Stage.dispatchFrame(): broadcast ENTER_FRAME once per rendered frame. AIR
@@ -28850,7 +28893,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return h;');
     this.indent--;
     this.line('}');
+    this.line('static uint32_t as_fp_num_value(uint32_t h, as_value v) { h = as_fp_u32(h, v.tag); return as_fp_dbl(h, as_v_num_val(v)); }');
+    this.line('static uint32_t as_fp_bool_value(uint32_t h, as_value v) { h = as_fp_u32(h, v.tag); return as_fp_bool(h, as_v_bool_val(v)); }');
+    this.line('static uint32_t as_textformat_fp(uint32_t h, TextFormat* f) {');
+    this.indent++;
+    this.line('if (f == NULL) return as_fp_u32(h, 0u);');
+    this.line('h = as_fp_str(h, f->font); h = as_fp_num_value(h, f->size); h = as_fp_num_value(h, f->color);');
+    this.line('h = as_fp_bool_value(h, f->bold); h = as_fp_bool_value(h, f->italic); h = as_fp_bool_value(h, f->underline);');
+    this.line('h = as_fp_num_value(h, f->leading); h = as_fp_bool_value(h, f->kerning); h = as_fp_num_value(h, f->letterSpacing);');
+    this.line('h = as_fp_num_value(h, f->leftMargin); h = as_fp_num_value(h, f->rightMargin); h = as_fp_num_value(h, f->indent);');
+    this.line('h = as_fp_num_value(h, f->blockIndent); h = as_fp_bool_value(h, f->bullet);');
+    this.line('h = as_fp_str(h, f->align); h = as_fp_str(h, f->display); h = as_fp_str(h, f->url); h = as_fp_str(h, f->target);');
+    this.line('as_array* ts = (as_array*)as_v_obj_val(f->tabStops);');
+    this.line('if (ts != NULL) { h = as_fp_i32(h, ts->length); for (int i = 0; i < ts->length; i++) h = as_fp_num_value(h, ts->data[i]); }');
+    this.line('return h;');
+    this.indent--;
+    this.line('}');
     this.line('static uint32_t as_render_fp(DisplayObject* o);');
+    this.line('static DisplayObject* as_fp_mask_stack[32];');
+    this.line('static int as_fp_mask_depth = 0;');
     this.line('static int as_single_primitive(DisplayObject* o);');
     // Environment probes hoisted out of the per-object loops. getenv() is a linear
     // scan of the whole environment block, and both of these gate a decision that
@@ -28859,11 +28920,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     // hoisted (same scene, same draws, same bake decisions).
     this.line('static int ASC_no_auto_bake = -1;');
     this.line('static int ASC_bake_trace = -1;');
+    this.line('static double ASC_auto_bake_cap = 1000000.0;');
     this.line('static uint32_t as_render_fp(DisplayObject* o) {');
     this.indent++;
     this.line('uint32_t h = 2166136261u;');
     this.line('if (o == NULL) return h;');
-    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; }');
+    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; ASC_fp_trace = getenv("ASC_FP_TRACE") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
     // MovieClip button states are settled HERE as well as in as_render_object, and
     // this pass is the one that matters when an ANCESTOR is auto-baked: a baked
     // ancestor paints its cached image and never walks its descendants, so the
@@ -28877,6 +28939,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('h = as_fp_dbl(h, o->x); h = as_fp_dbl(h, o->y);');
     this.line('h = as_fp_dbl(h, o->rotation); h = as_fp_dbl(h, o->scaleX); h = as_fp_dbl(h, o->scaleY);');
     this.line('h = as_fp_dbl(h, o->alpha); h = as_fp_bool(h, o->visible);');
+    this.line('h = as_fp_bool(h, o->_s9_on); h = as_fp_bool(h, o->_s9_apply);');
+    this.line('if (o->_s9_on) { h = as_fp_dbl(h, o->_s9x); h = as_fp_dbl(h, o->_s9y); h = as_fp_dbl(h, o->_s9w); h = as_fp_dbl(h, o->_s9h); }');
+    // The stage clear and content transform happen OUTSIDE as_render_object, so
+    // they cannot rely on a descendant changing the key.
+    this.line('if (as_is(o, &Stage_vt)) {');
+    this.indent++;
+    this.line('Stage* fps = (Stage*)o;');
+    this.line('h = as_fp_u32(h, fps->stage_color); h = as_fp_str(h, fps->scale_mode); h = as_fp_str(h, fps->align);');
+    this.line('if (fps->stage3ds != NULL) { h = as_fp_i32(h, fps->stage3ds->length); for (int i = 0; i < fps->stage3ds->length; i++) { Stage3D* s3 = fps->stage3ds->data[i]; h = as_fp_dbl(h, s3->x); h = as_fp_dbl(h, s3->y); h = as_fp_bool(h, s3->visible); } }');
+    this.indent--;
+    this.line('}');
     // The timeline frame of a MovieClip is an input of its render exactly like
     // scrollRect below: a frame move REPLACES children, but a move between two
     // frames whose children happen to hash the same (or, more commonly, a move
@@ -28906,6 +28979,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('h = as_fp_dbl(h, m->d); h = as_fp_dbl(h, m->tx); h = as_fp_dbl(h, m->ty);');
     this.indent--;
     this.line('}');
+    this.line('h = as_fp_str(h, o->blendMode);');
+    this.line('h = as_fp_bool(h, as_v_is_number(o->opaqueBackground));');
+    this.line('if (as_v_is_number(o->opaqueBackground)) h = as_fp_dbl(h, as_v_num_val(o->opaqueBackground));');
+    this.line('ColorTransform* fpct = (o->transform != NULL) ? o->transform->colorTransform : NULL;');
+    this.line('if (fpct != NULL) {');
+    this.indent++;
+    this.line('h = as_fp_dbl(h, fpct->redMultiplier); h = as_fp_dbl(h, fpct->greenMultiplier); h = as_fp_dbl(h, fpct->blueMultiplier); h = as_fp_dbl(h, fpct->alphaMultiplier);');
+    this.line('h = as_fp_dbl(h, fpct->redOffset); h = as_fp_dbl(h, fpct->greenOffset); h = as_fp_dbl(h, fpct->blueOffset); h = as_fp_dbl(h, fpct->alphaOffset);');
+    this.indent--;
+    this.line('}');
     this.line('Graphics* g = as_graphics_of(o);');
     // Any object that owns a Graphics (Shape, or a Sprite/MovieClip that drew in
     // itself) hashes its drawing; the chain below still only covers Bitmap and
@@ -28926,8 +29009,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('h = as_fp_ptr(h, g->fill); h = as_fp_ptr(h, g->stroke);');
     this.indent--;
     this.line('}');
+    this.line('if (as_is(o, &SimpleButton_vt)) {');
+    this.indent++;
+    this.line('DisplayObject* st = as_sbtn_state(o);');
+    this.line('h = as_fp_ptr(h, st); if (st != NULL) h = as_fp_u32(h, as_render_fp(st));');
+    this.indent--;
+    this.line('}');
     this.line('if (as_is(o, &Bitmap_vt)) {');
     this.indent++;
+    this.line('h = as_fp_bool(h, ((Bitmap*)o)->smoothing);');
     this.line('BitmapData* bd = ((Bitmap*)o)->bitmapData;');
     this.line('if (bd != NULL) h = as_fp_ptr(h, bd->image);');
     // A Bitmap painted from its LIVE pixels (a bitmap built by `new BitmapData`,
@@ -28949,17 +29039,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('TextField* tf = (TextField*)o;');
     this.line('h = as_fp_ptr(h, tf->text); h = as_fp_ptr(h, tf->_dtf); h = as_fp_ptr(h, tf->_insFmt);');
-    this.line('if (as_tf_base_fmt(tf) != NULL) {');
-    this.indent++;
-    this.line('TextFormat* f = as_tf_base_fmt(tf);');
-    this.line('h = as_fp_ptr(h, f->font); h = as_fp_dbl(h, as_v_num_val(f->size)); h = as_fp_u32(h, (uint32_t)as_v_num_val(f->color));');
-    this.line('h = as_fp_bool(h, as_v_bool_val(f->bold)); h = as_fp_bool(h, as_v_bool_val(f->italic)); h = as_fp_dbl(h, as_v_num_val(f->leading));');
-    // align is an input too: as_tf_paragraph folds it into layoutAlign (the
-    // paragraph cache re-lays out when it moves), so a horizontalAlign toggle
-    // must invalidate the bake.
-    this.line('h = as_fp_ptr(h, f->align);');
-    this.indent--;
-    this.line('}');
+    this.line('h = as_textformat_fp(h, as_tf_base_fmt(tf));');
     this.line('h = as_fp_dbl(h, tf->_fieldWidth); h = as_fp_dbl(h, tf->_fieldHeight);');
     this.line('h = as_fp_bool(h, tf->background); h = as_fp_u32(h, tf->backgroundColor);');
     // border/borderColor must be fingerprinted too: a plain field write bumps no
@@ -28988,6 +29068,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (preview x position, masked layout string) without touching anything above.
     this.line('h = as_fp_str(h, tf->_comp);');
     this.line('h = as_fp_i32(h, tf->_sel_caret);');
+    this.line('h = as_fp_bool(h, as_focus_obj == (void*)tf);');
     // The blink PHASE, and only while THIS field owns the caret. The caret is painted
     // into whatever snapshot is current, so a window with nothing else moving
     // auto-bakes its stage after a few idle frames and then keeps blitting that
@@ -28998,10 +29079,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     // renders live (a focused TextField never comes from a bake) and the bar blinks.
     this.line('if (as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) h = as_fp_i32(h, as_tf_caret_on());');
     this.line('h = as_fp_bool(h, tf->displayAsPassword);');
+    this.line('h = as_fp_bool(h, tf->selectable); h = as_fp_str(h, tf->type);');
     // Rich-text run table identity + size (a setTextFormat/htmlText rebuild replaces
     // the array; in-place mutation of a run's TextFormat is still cached).
     this.line('h = as_fp_ptr(h, tf->_runs);');
-    this.line('if (tf->_runs != NULL) h = as_fp_i32(h, tf->_runs->length);');
+    this.line('if (tf->_runs != NULL) {');
+    this.indent++;
+    this.line('h = as_fp_i32(h, tf->_runs->length);');
+    this.line('for (int i = 0; i < tf->_runs->length / 3; i++) {');
+    this.indent++;
+    this.line('h = as_fp_i32(h, as_v_int_val(tf->_runs->data[i * 3])); h = as_fp_i32(h, as_v_int_val(tf->_runs->data[i * 3 + 1]));');
+    this.line('h = as_textformat_fp(h, (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]));');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('if (o->filters != NULL) {');
@@ -29021,18 +29113,28 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('h = as_fp_dbl(h, ds->distance); h = as_fp_dbl(h, ds->angle); h = as_fp_u32(h, ds->color);');
     this.line('h = as_fp_dbl(h, ds->alpha); h = as_fp_dbl(h, ds->blurX); h = as_fp_dbl(h, ds->blurY);');
     this.line('h = as_fp_dbl(h, ds->strength); h = as_fp_i32(h, ds->quality);');
-    this.line('h = as_fp_bool(h, ds->inner); h = as_fp_bool(h, ds->knockout); h = as_fp_bool(h, ds->hideObject);');
+    this.line('h = as_fp_bool(h, ds->inner); h = as_fp_bool(h, ds->knockout); h = as_fp_bool(h, ds->hideObject); h = as_fp_bool(h, ds->_shadow_only);');
     this.indent--;
     this.line('} else if (as_is(f, &GlowFilter_vt)) {');
     this.indent++;
     this.line('GlowFilter* gf = (GlowFilter*)f;');
     this.line('h = as_fp_u32(h, gf->color); h = as_fp_dbl(h, gf->alpha); h = as_fp_dbl(h, gf->blurX);');
     this.line('h = as_fp_dbl(h, gf->blurY); h = as_fp_dbl(h, gf->strength); h = as_fp_i32(h, gf->quality);');
-    this.line('h = as_fp_bool(h, gf->inner); h = as_fp_bool(h, gf->knockout);');
+    this.line('h = as_fp_bool(h, gf->inner); h = as_fp_bool(h, gf->knockout); h = as_fp_bool(h, gf->_shadow_only);');
     this.indent--;
     this.line('}');
     this.indent--;
     this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('DisplayObject* fp_masks[2]; fp_masks[0] = o->_clip_src; fp_masks[1] = o->_mask_ref;');
+    this.line('for (int i = 0; i < 2; i++) {');
+    this.indent++;
+    this.line('DisplayObject* m = fp_masks[i];');
+    this.line('if (m == NULL || m->parent != NULL) continue;');
+    this.line('int seen = 0; for (int j = 0; j < as_fp_mask_depth; j++) if (as_fp_mask_stack[j] == m) seen = 1;');
+    this.line('if (seen || as_fp_mask_depth >= 32) { h = as_fp_ptr(h, m); continue; }');
+    this.line('as_fp_mask_stack[as_fp_mask_depth++] = m; h = as_fp_u32(h, as_render_fp(m)); as_fp_mask_depth--;');
     this.indent--;
     this.line('}');
     this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
@@ -29061,7 +29163,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // meeting client, whose buttons/labels/thumbnails/rows all opt in through
     // `cacheAsBitmapAndMatrix()` and then change their text and bitmaps.
     this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
-    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (o->_auto_baked || o->_cache_flag) { if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path); o->_auto_baked = 0; o->_cache_valid = 0; } }');
+    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (ASC_fp_trace > 0) o->_dbg_fp_changes++; if (o->_auto_baked || o->_cache_flag) { if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path); o->_auto_baked = 0; o->_cache_valid = 0; } }');
     this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES && !as_single_primitive(o)) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
@@ -29198,6 +29300,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('int pw = (int)ceil((double)lw * sx); int ph = (int)ceil((double)lh * sy);');
+    // Large automatic snapshots are a poor memory/GPU trade: in the same meeting,
+    // an unlimited cache used 369 MB private / 4.66% GPU, while the 1M cap used
+    // 254 MB / 3.74% (10 s medians). 250K raised GPU to 7.97%. Keep small caches,
+    // paint large subtrees live. The env is an A/B override (0 = unlimited); an
+    // explicit AS3 cacheAsBitmap request is never capped by this internal policy.
+    this.line('if (o->_auto_baked && !o->_cache_flag && ASC_auto_bake_cap > 0.0 && (double)pw * (double)ph > ASC_auto_bake_cap) { as_render_live(canvas, o); return; }');
     // A mis-phased image is not a cache hit: the surface was rasterized against
     // ANOTHER canvas' pixel grid (see _cache_phx), so blitting it here would shift
     // the content by a fraction of a device pixel -- the very class of error the
@@ -30034,6 +30142,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('Stage* stage;');
     this.line('void* canvas;');
     this.line('void* surface;');
+    // Last presented content. ENTER_FRAME still runs at full rate; an unchanged
+    // window only skips the redundant raster + Present, never AS3/timers/input.
+    this.line('uint32_t render_fp;');
+    this.line('uint64_t render_s3d_serial;');
+    this.line('uint64_t render_gpu_generation;');
+    this.line('uint64_t render_window_generation;');
+    this.line('int render_valid;');
     this.line('double scale;');   // device pixel ratio (2.0 on a Retina window)
     this.line('int design_w, design_h;');  // size the window was asked for
     this.line('int lw, lh;');              // current logical (client) size
@@ -30520,11 +30635,39 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Rasterize one window's tree into its current surface. The canvas transform is
     // device-scale -> align-offset -> content-scale, so AS3 code always draws in
     // logical stage coordinates while the pixels land 1:1 on a Retina drawable.
-    this.line('static void ASC_window_render(int id) {');
+    this.line('static int ASC_window_render(int id) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(id);');
-    this.line('if (w == NULL) return;');
+    this.line('if (w == NULL) return 0;');
     this.line('Stage* st = w->stage;');
+    this.line('if (st == NULL) return 0;');
+    // Fingerprint BEFORE acquiring a drawable. A static window must not pay for
+    // a swapchain acquire, a full clear, or a vsync-blocking Present. The same
+    // fingerprint already covers display-tree pixels; Stage3D and GPU recovery
+    // have their own generations because neither is a DisplayObject field.
+    this.line('as_mouse_refresh_target((DisplayObject*)st);');
+    this.line('if (as_dbg_frame_n == 1) as_bake_stat_report(st, id);');
+    this.line('uint32_t _window_fp = as_render_fp((DisplayObject*)st);');
+    this.line('if (as_dbg_frame_n == 1 && ASC_fp_trace > 0) fprintf(stderr, "WKEY win=%d valid=%d old=%08x new=%08x stagefp=%08x\\n", id, w->render_valid, w->render_fp, _window_fp, ((DisplayObject*)st)->_auto_fp);');
+    this.line('uint64_t _gpu_generation = 0;');
+    this.line('uint64_t _window_generation = 0;');
+    this.line('#ifdef ASC_RENDER_WINGPU');
+    this.line('if (w->is_gpu) _gpu_generation = as_gpu_generation(id);');
+    this.line('#endif');
+    this.line('#ifdef ASC_USE_WINDOW');
+    this.line('_window_generation = as_window_redraw_generation(id);');
+    this.line('#endif');
+    this.line('if (w->render_valid) {');
+    this.indent++;
+    this.line('if (w->render_fp != _window_fp) as_dbg_key_fp_n++;');
+    this.line('if (w->render_s3d_serial != ASC_stage3d_serial) as_dbg_key_s3d_n++;');
+    this.line('if (w->render_gpu_generation != _gpu_generation) as_dbg_key_gpu_n++;');
+    this.line('if (w->render_window_generation != _window_generation) as_dbg_key_window_n++;');
+    this.indent--;
+    this.line('}');
+    this.line('if (w->render_valid && w->render_fp == _window_fp && w->render_s3d_serial == ASC_stage3d_serial && w->render_gpu_generation == _gpu_generation && w->render_window_generation == _window_generation && getenv("ASC_NO_PRESENT_SKIP") == NULL) { as_dbg_present_skip_n++; return 0; }');
+    // Any early return below must retry next frame, never accept a half-new state.
+    this.line('w->render_valid = 0;');
     this.line('void* canvas = NULL;');
     // Retire every pending Stage3D batch BEFORE Skia acquires the drawable and
     // samples the render target: this is the single point that guarantees the
@@ -30536,11 +30679,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_s3d_flush_all_async();');
     this.line('double _p0 = as_now_ms();');
     this.line('#ifdef ASC_RENDER_WINGPU');
-    this.line('if (w->is_gpu) { canvas = as_skia_gpu_begin_frame(id, w->pw, w->ph); if (canvas == NULL) return; }');
+    this.line('if (w->is_gpu) { canvas = as_skia_gpu_begin_frame(id, w->pw, w->ph); if (canvas == NULL) return 0; }');
     this.line('else');
     this.line('#endif');
-    this.line('{ canvas = w->canvas; if (canvas == NULL) return; }');
-    this.line('if (st == NULL) return;');
+    this.line('{ canvas = w->canvas; if (canvas == NULL) return 0; }');
     this.line('double _p1 = as_now_ms();');
     this.line('ASC_win_scale = w->scale;');
     this.line('double cx = 1.0, cy = 1.0;');
@@ -30626,8 +30768,6 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('#endif');
     this.line('ASC_render_scale = w->scale;');
-    this.line('as_mouse_refresh_target((DisplayObject*)st);');
-    this.line('as_render_fp((DisplayObject*)st);');
     // Window composition pass: the caret overlay is drawn only here (see the
     // ASC_caret_pass note). as_render_fp above does NOT set it, so the fingerprint
     // (and therefore any bake) never sees a caret.
@@ -30639,7 +30779,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
     this.line('#endif');
+    this.line('w->render_fp = _window_fp; w->render_s3d_serial = ASC_stage3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
     this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _p3 = as_now_ms(); if (_p3 - _p0 >= 4.0) fprintf(stderr, "t=%.0f pass paint acquire=%.2f draw=%.2f flush=%.2f live=%d cached=%d\\n", as_now_ms(), _p1 - _p0, _p2 - _p1, _p3 - _p2, as_dbg_live_n, as_dbg_cached_n); }');
+    this.line('return 1;');
     this.indent--;
     this.line('}');
     // ---- mouse pointer shape (AIR parity) ----
@@ -31279,11 +31421,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (planted) as_frame_guard = 0;');
     this.indent--;
     this.line('}');
-    this.line('static void ASC_window_on_redraw(int id) {');
+    this.line('static int ASC_window_on_redraw(int id) {');
     this.indent++;
     this.line('double _pt0 = as_now_ms(); int _pl = as_dbg_live_n, _pc = as_dbg_cached_n;');
-    this.line('ASC_window_render(id);');
+    this.line('int painted = ASC_window_render(id);');
     this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _pdt = as_now_ms() - _pt0; if (_pdt >= 4.0) fprintf(stderr, "t=%.0f pass paint ms=%.2f live=%d cached=%d\\n", as_now_ms(), _pdt, as_dbg_live_n - _pl, as_dbg_cached_n - _pc); }');
+    this.line('return painted;');
     this.indent--;
     this.line('}');
     // One-shot-at-startup + on-change reporter for the display refresh rate. AIR
@@ -31409,7 +31552,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // is ignored.
     this.line('if (w->is_gpu) {');
     this.indent++;
-    this.line('w->lw = lw; w->lh = lh; w->pw = pw; w->ph = ph;');
+    this.line('w->lw = lw; w->lh = lh; w->pw = pw; w->ph = ph; w->render_valid = 0;');
     this.line('w->scale = scale; ASC_win_scale = scale;');
     this.line('if (w->stage != NULL) {');
     this.indent++;
@@ -31429,7 +31572,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (s == NULL) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('w->surface = s;');
     this.line('w->canvas = as_skia_surface_canvas(s);');
-    this.line('w->lw = lw; w->lh = lh; w->pw = pw; w->ph = ph;');
+    this.line('w->lw = lw; w->lh = lh; w->pw = pw; w->ph = ph; w->render_valid = 0;');
     // The device pixel ratio can change when the window is dragged onto a monitor
     // with a different backing scale (e.g. 2x Retina -> 1x external). Use the
     // scale handed in by the glue layer (authoritative, from SDL) rather than

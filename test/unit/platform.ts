@@ -491,8 +491,8 @@ function checkNativeWindow(): string[] {
     nwCtor.includes('if (!w->is_gpu) {')
     && nwCtor.indexOf('if (!w->is_gpu) {') < nwCtor.indexOf('void* surface = as_skia_surface_new(pw, ph);'));
   check('the GPU frame calls carry the window id (a shared layer would corrupt)',
-    body('static void ASC_window_render(int id) {').includes('as_skia_gpu_begin_frame(id, w->pw, w->ph)')
-    && body('static void ASC_window_render(int id) {').includes('if (w->is_gpu) as_skia_gpu_flush(id);'));
+    body('static int ASC_window_render(int id) {').includes('as_skia_gpu_begin_frame(id, w->pw, w->ph)')
+    && body('static int ASC_window_render(int id) {').includes('if (w->is_gpu) as_skia_gpu_flush(id);'));
   // The initial window's title must honour an assignment made BEFORE the OS window
   // exists: the document class runs first, so `stage.nativeWindow.title = X` lands in
   // w->title while the glue (which only touches an already-open window) ignores it.
@@ -501,7 +501,7 @@ function checkNativeWindow(): string[] {
     body('void Stage_showWindow(void* _this, double width, double height, char* title) {')
       .includes('if (w->title != NULL && w->title[0] != 0) title = w->title;'));
   check('Stage3D composites only into a GPU window (AIR: software windows do not)',
-    body('static void ASC_window_render(int id) {')
+    body('static int ASC_window_render(int id) {')
       .includes('if (w->is_gpu && ASC_stage3d_ready && ASC_stage3d_tex != NULL) {'));
   // A resize must not hand a GPU window a CPU surface it never draws into: the
   // next frame walks the is_gpu branch and would leak the replacement surface.
@@ -641,14 +641,14 @@ function checkBackendParity(): string[] {
   const wingpu = preamble.slice(wingpuStart, preamble.indexOf('#endif', wingpuStart));
   const gpuSeam = [...new Set([...wingpu.matchAll(/extern\s+\S+\s+\**(sk_gpu_\w+)\s*\(/g)].map((m) => m[1]))];
   // 定义形态：行首是返回类型，参数表之后紧跟 `{`（多行签名也认，因 [^;] 可跨行）。
-  const gpuDefRe = /^[ \t]*(?:int|void|void\*)\s+(sk_gpu_\w+)\s*\([^;]*\)\s*\{/gm;
+  const gpuDefRe = /^[ \t]*(?:int|void|void\*|uint64_t)\s+(sk_gpu_\w+)\s*\([^;]*\)\s*\{/gm;
   const defsOf = (rel: string): Set<string> =>
     new Set([...readFileSync(join(root, rel), 'utf8').matchAll(gpuDefRe)].map((m) => m[1]));
   const metalDefs = defsOf(join('vendor', 'metal_glue.mm'));
   const d3dDefs = defsOf(join('vendor', 'd3d_glue.cc'));
-  check(`the GPU-window seam is those five names and no more (${gpuSeam.join(', ')})`,
-    gpuSeam.length === 5
-    && gpuSeam.every((n) => /^sk_gpu_(init|destroy|begin_frame|flush|draw_texture)$/.test(n)));
+  check(`the GPU-window seam is those six names and no more (${gpuSeam.join(', ')})`,
+    gpuSeam.length === 6
+    && gpuSeam.every((n) => /^sk_gpu_(init|destroy|begin_frame|flush|draw_texture|generation)$/.test(n)));
   check('metal_glue.mm implements every sk_gpu_* the generated C can reference',
     gpuSeam.every((n) => metalDefs.has(n)));
   check('d3d_glue.cc implements every sk_gpu_* the generated C can reference',

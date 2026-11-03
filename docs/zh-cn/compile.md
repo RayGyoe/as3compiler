@@ -590,6 +590,27 @@ AIR 描述符的 `<windows>` 里确实有同类先例 —— `<maxD3D>` 选择 D
 （约 1.1–1.3 ms/帧），不是总帧时。像素等价性也量过：同帧对比差 1026 px（0.067%），且全部落在 y=84..92
 一条 9–10px 横带内 —— 同一个 exe 连跑两次在同一带内也差 114 px（示例动画的时序抖动），故不是后端差异。
 
+##### 实测：自动缓存的 1M 像素上限与静止窗口跳帧
+
+同一可执行文件、同一会议、同一操作路径，D3D12 下各取 10 秒进程中位数（AIR 那轮实际 15 个样本）：
+
+| 配置 | CPU | GPU | Private | Working Set | 会议窗缓存像素 |
+|---|---:|---:|---:|---:|---:|
+| 自动缓存无尺寸上限 | 0.088% | 4.655% | 369.3 MB | 409.3 MB | 43.7 MB |
+| `ASC_AUTO_BAKE_MAX_PIXELS=250000` | 0.104% | 7.972% | 239.1 MB | 277.5 MB | 4.7 MB |
+| **`ASC_AUTO_BAKE_MAX_PIXELS=1000000`（现默认）** | **0.105%** | **3.743%** | **254.4 MB** | **292.9 MB** | **11.1 MB** |
+| `ASC_NO_AUTO_BAKE=1` | 0.140% | 9.736% | 229.9 MB | 267.9 MB | 0.3 MB（仅显式缓存） |
+| AIR 51.4.1 | 0.190% | 7.321% | 292.4 MB | 216.9 MB | — |
+
+因此默认只给**我们自己的自动缓存**设 1,000,000 像素上限：大子树走活态光栅，小缓存保留；
+显式 AS3 `cacheAsBitmap` 不受这个内部策略限制。`ASC_AUTO_BAKE_MAX_PIXELS=0` 可恢复无上限 A/B。
+这不是降低分辨率：超过上限时按目标设备分辨率活态绘制，不生成放大的缓存图。
+
+窗口还会在「显示树指纹 + Stage3D 序号 + GPU 代次 + 系统重绘代次」全部不变时跳过冗余光栅和
+Present；`ENTER_FRAME`、计时器与输入仍按原频率运行，`ASC_NO_PRESENT_SKIP=1` 可同 exe 做 A/B。
+静止 CPU 窗口实测 512 帧跳过 512 次；另一轮计时器移动图形时为 511/512，逻辑仍满 600 帧。
+会议主窗口的 FPS/MS 文本逐帧变化时指纹也逐帧变化，**正确地不命中**，不能靠忽略动态节点制造收益。
+
 ##### 已知边界（未测项照实列）
 
 - **present 模型不同**：D3D12 走 `FLIP_DISCARD`（Win10+ 唯一能进 independent flip 的交换模型），WGL 的
@@ -1450,7 +1471,9 @@ no-op」（见下文 `runtime.ts` 的条件编译）。因此同一个 `.as` 换
 
 | 旋钮 | 目标 | 形态 | 说明 |
 |---|---|---|---|
-| `ASC_FRAME_STATS` | native | 运行时 env（`getenv`） | 每 512 帧打印帧时 `p50/p95/p99/max` + GC 占比 + RSS/段数（见 [`gc.md`](gc.md)） |
+| `ASC_FRAME_STATS` | native | 运行时 env（`getenv`） | 每 512 帧打印帧时 `p50/p95/p99/max` + GC 占比 + RSS/段数 + `presentskip`/四类 `keychg` 累计（见 [`gc.md`](gc.md)） |
+| `ASC_NO_PRESENT_SKIP` | native window | 运行时 env | 设为 `1` 时关闭静止窗口的重复光栅/Present 跳过，供同 exe A/B；不改变逻辑帧率 |
+| `ASC_AUTO_BAKE_MAX_PIXELS` | native 渲染器 | 运行时 env | 覆盖自动缓存的默认 1,000,000 像素上限；`0` 恢复无上限。只影响内部自动缓存，不限制显式 `cacheAsBitmap` |
 | `ASC_FRAME_STATS` | **web** | **编译期 define**（`-D ASC_FRAME_STATS=1`） | 浏览器无 env；每秒把 `frames`/`loopcalls`/`skips`/`renderMs`/`rafPeriodMs`/`skip` 发到 `window.__ascFrameStats`（见 [`html5-web.md`](html5-web.md) §3.2） |
 
 web 侧的 `loopcalls` 与 `frames` 之差直接区分「rAF 本身慢（刷新率上限）」与「节拍缺陷」：

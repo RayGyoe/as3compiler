@@ -384,6 +384,19 @@ and never silent). The criterion: the same input that `adl` runs correctly but w
 The full 19-item list (the rest being Lottie, FFI, server-side rendering…) and the five criteria are in
 [`docs/en/enhancements.md`](docs/en/enhancements.md).
 
+## Rendering performance
+
+Automatic display-tree snapshots default to a **1,000,000-pixel cap**. Larger subtrees paint live at device
+resolution; explicit AS3 `cacheAsBitmap` is not capped. In the same D3D12 meeting, 10-second process medians
+changed from **0.088% CPU / 4.655% GPU / 369.3 MB Private** without a cap to **0.105% / 3.743% / 254.4 MB**.
+A 250K cap used less memory but raised GPU to 7.972%, so it was not chosen.
+
+Windows whose display-tree fingerprint, Stage3D serial, GPU generation and OS redraw generation are unchanged
+skip redundant rasterization and Present while `ENTER_FRAME`, timers and input continue normally.
+`ASC_NO_PRESENT_SKIP=1` and `ASC_AUTO_BAKE_MAX_PIXELS=0` provide same-binary A/B switches. Dynamic FPS text
+correctly invalidates the key; it is never ignored to produce hits. See [`compile.md`](docs/en/compile.md) §3.4.6
+for the full measurements and caveats.
+
 ## Examples
 - `examples/hello.as` — expressions, string concatenation, `trace`, `if/else`
 - `examples/fib.as` — functions, `while`, `for`, recursion boundary

@@ -631,7 +631,7 @@ function checkCaret(): string[] {
   // (4) the window compose pass switches it on; Stage.render (the screenshot hook)
   // does too; the fingerprint and every bake never do.
   check('ASC_window_render enables the caret pass around the display list only',
-    /as_render_fp\(\(DisplayObject\*\)st\);\n\s*ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)st\);\n\s*ASC_caret_pass = 0;/.test(c));
+    /ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)st\);\n\s*ASC_caret_pass = 0;/.test(c));
   check('Stage.render (screenshot hook) enables the caret pass',
     /as_render_fp\(\(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 0;/.test(c));
   const fp = c.match(/static uint32_t as_render_fp\(DisplayObject\* o\) \{[\s\S]*?\n\}/);

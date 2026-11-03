@@ -36,7 +36,8 @@ static int g_pw = 0, g_ph = 0;
 // generated C is byte-for-byte identical across the two window backends.
 static void (*g_on_mouse)(int, double, double, const char*) = nullptr;
 static void (*g_on_wheel)(int, double, double, double) = nullptr;
-static void (*g_on_redraw)(int) = nullptr;
+static int (*g_on_redraw)(int) = nullptr;
+static uint64_t g_redraw_generation = 0;
 static void (*g_on_frame)(int) = nullptr;
 static double (*g_on_frame_delay)(int) = nullptr;
 
@@ -227,8 +228,9 @@ static void main_loop(void) {
   double t_frame0 = emscripten_get_now();
 #endif
   if (g_on_frame) g_on_frame(0);
-  if (g_on_redraw) g_on_redraw(0);
-  present_frame();
+  int painted = 1;
+  if (g_on_redraw) painted = g_on_redraw(0);
+  if (painted) present_frame();
 #ifdef ASC_FRAME_STATS
   double t_frame1 = emscripten_get_now();
   g_fs_render_ms += (t_frame1 - t_frame0);
@@ -348,6 +350,7 @@ int sk_window_get_stage_full_size(int* w, int* h) {
 // would not help — the AS3-side deadline pacer has no way to express "every Nth
 // vsync", which is the only pacing a compositor honors.
 double sk_window_get_display_refresh(int win) { (void)win; return 0.0; }
+uint64_t sk_window_redraw_generation(int win) { (void)win; return g_redraw_generation; }
 
 // ---------- display enumeration (flash.display.Screen) ----------
 // A page sees exactly one display: the one its window is on. `bounds` stays the
@@ -410,6 +413,7 @@ static void sk_web_canvas_size_changed(int cw, int ch) {
   int pw = 0, ph = 0;
   double scale = sk_window_probe_scale(cw, ch, highdpi, &pw, &ph);
   if (cw == g_lw && ch == g_lh && pw == g_pw && ph == g_ph) return;
+  g_redraw_generation++;
   g_lw = cw;
   g_lh = ch;
   g_scale = scale;
@@ -453,7 +457,7 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
                    int fullscreen, void (*on_mouse)(int, double, double, const char*),
                    void (*on_wheel)(int, double, double, double),
                    void (*on_key)(int, const char*, int, int, int),
-                   void (*on_redraw)(int), void (*on_frame)(int),
+                   int (*on_redraw)(int), void (*on_frame)(int),
                    double (*on_frame_delay)(int),
                    void* (*on_resize)(int, int, int, int, int, double),
                    void (*on_close)(int)) {

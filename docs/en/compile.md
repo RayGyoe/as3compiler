@@ -632,6 +632,31 @@ Stated plainly: **all three have the same frame time**; the bottleneck is the AS
 was measured too: the same frame differs by 1026 px (0.067%), all inside a 9–10 px band at y=84..92 — and the same
 exe run twice differs by 114 px inside that same band (animation timing jitter), so it is not a backend difference.
 
+##### Measured: the 1M-pixel automatic-cache cap and static-window present skip
+
+Same executable, meeting and interaction path under D3D12; process medians over 10 seconds (the AIR run yielded
+15 actual samples):
+
+| Configuration | CPU | GPU | Private | Working Set | Meeting-window cache pixels |
+|---|---:|---:|---:|---:|---:|
+| Unlimited automatic-cache size | 0.088% | 4.655% | 369.3 MB | 409.3 MB | 43.7 MB |
+| `ASC_AUTO_BAKE_MAX_PIXELS=250000` | 0.104% | 7.972% | 239.1 MB | 277.5 MB | 4.7 MB |
+| **`ASC_AUTO_BAKE_MAX_PIXELS=1000000` (current default)** | **0.105%** | **3.743%** | **254.4 MB** | **292.9 MB** | **11.1 MB** |
+| `ASC_NO_AUTO_BAKE=1` | 0.140% | 9.736% | 229.9 MB | 267.9 MB | 0.3 MB (explicit caches only) |
+| AIR 51.4.1 | 0.190% | 7.321% | 292.4 MB | 216.9 MB | — |
+
+The default therefore caps only **our automatic snapshots** at 1,000,000 pixels: large subtrees paint live and
+small caches remain. An explicit AS3 `cacheAsBitmap` request is not capped by this internal policy;
+`ASC_AUTO_BAKE_MAX_PIXELS=0` restores the unlimited behavior for A/B runs. This is not a resolution reduction:
+an over-cap subtree is rasterized live at the destination device resolution instead of magnifying a cached image.
+
+A window also skips redundant rasterization and Present when its display-tree fingerprint, Stage3D serial, GPU
+generation and OS redraw generation all match. `ENTER_FRAME`, timers and input still run at their normal rates;
+`ASC_NO_PRESENT_SKIP=1` provides a same-binary A/B switch. A static CPU-window probe skipped 512/512 presents;
+a second run where a timer moved a shape skipped 511/512 while logic still completed 600 frames. The meeting
+window's FPS/MS text changes every frame, so its fingerprint correctly changes too — dynamic nodes are never
+ignored to manufacture hits.
+
 ##### Known limits (untested items listed as such)
 
 - **Different present model**: D3D12 uses `FLIP_DISCARD` (the only swap model on Win10+ that can reach independent
@@ -1581,7 +1606,9 @@ source.
 
 | Knob | Target | Form | Description |
 |---|---|---|---|
-| `ASC_FRAME_STATS` | native | runtime env (`getenv`) | every 512 frames prints frame-time `p50/p95/p99/max` + GC share + RSS/segment count (see [`gc.md`](gc.md)) |
+| `ASC_FRAME_STATS` | native | runtime env (`getenv`) | every 512 frames prints frame-time `p50/p95/p99/max` + GC share + RSS/segment count + cumulative `presentskip`/four `keychg` counters (see [`gc.md`](gc.md)) |
+| `ASC_NO_PRESENT_SKIP` | native window | runtime env | `1` disables static-window raster/Present skipping for a same-binary A/B; it does not change the logic frame rate |
+| `ASC_AUTO_BAKE_MAX_PIXELS` | native renderer | runtime env | overrides the automatic cache's default 1,000,000-pixel cap; `0` restores unlimited size. Internal automatic caches only; explicit `cacheAsBitmap` is not capped |
 | `ASC_FRAME_STATS` | **web** | **compile-time define** (`-D ASC_FRAME_STATS=1`) | browsers have no env; every second it posts `frames`/`loopcalls`/`skips`/`renderMs`/`rafPeriodMs`/`skip` to `window.__ascFrameStats` (see [`html5-web.md`](html5-web.md) §3.2) |
 
 On the web side, the difference between `loopcalls` and `frames` directly distinguishes "rAF itself is slow

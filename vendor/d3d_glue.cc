@@ -211,6 +211,7 @@ typedef struct {
   HANDLE fence_event;
   uint64_t fence_values[SK_D3D_NUM_FRAMES];
   int width, height;
+  uint64_t generation;
   // A failed swapchain rebuild must not be attempted on every frame: without GPU
   // quiescence the old swapchain can make CreateSwapChainForHwnd fail repeatedly.
   double recreate_retry_at;
@@ -225,6 +226,7 @@ static gr_cp<IDXGIAdapter1> g_adapter;
 static gr_cp<ID3D12Device> g_device;
 static gr_cp<ID3D12CommandQueue> g_queue;
 static sk_sp<GrDirectContext> g_context;
+static uint64_t g_d3d_generation = 0;
 static long g_d3d_frames = 0;
 static double g_d3d_t_first = 0.0;
 
@@ -509,6 +511,7 @@ static int d3d_setup_surfaces(D3DWin* w) {
       return 0;
     }
   }
+  w->generation = ++g_d3d_generation;
   return 1;
 }
 
@@ -769,6 +772,19 @@ void sk_gpu_destroy(int win_id) {
   g_queue.reset();
   g_device.reset();
   g_adapter.reset();
+}
+
+// Content-key half of the static-window fast path. This performs the same
+// local device-lost query begin_frame used to do on every frame; after a loss,
+// zero forces one acquire attempt (which owns the throttled recovery path).
+uint64_t sk_gpu_generation(int win_id) {
+  if (!g_d3d_lost && g_device.get() != nullptr) {
+    HRESULT removed = g_device->GetDeviceRemovedReason();
+    if (FAILED(removed)) d3d_mark_lost("GetDeviceRemovedReason", removed);
+  }
+  if (g_d3d_lost) return 0;
+  D3DWin* w = d3d_slot(win_id);
+  return w != nullptr ? w->generation : 0;
 }
 
 // Begin a frame: make sure the swapchain matches the requested physical size,

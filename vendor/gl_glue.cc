@@ -105,10 +105,12 @@ typedef struct {
   // is resized (the framebuffer itself follows the window on its own).
   sk_sp<SkSurface> surface;
   int width, height;
+  uint64_t generation;
   int stencil_bits;
 } GLWin;
 
 static GLWin g_gl[SK_GL_MAX_WINDOWS];
+static uint64_t g_gl_generation = 0;
 static long g_gl_frames = 0;
 static double g_gl_t_first = 0.0;
 
@@ -457,6 +459,7 @@ int sk_gpu_init(int win_id, void* native_handle) {
   gpu_trace("surface");
 
   w->used = 1;
+  w->generation = ++g_gl_generation;
   fprintf(stderr, "gl_glue: window %d bound to %dx%d WGL context\n",
           win_id, w->width, w->height);
   return 1;
@@ -580,6 +583,11 @@ static void gl_dump_backbuffer(GLWin* w) {
 // return the canvas to draw into. Returns NULL when the frame cannot start so the
 // render loop skips it instead of drawing into a surface that no longer matches
 // the window.
+uint64_t sk_gpu_generation(int win_id) {
+  GLWin* w = gl_slot(win_id);
+  return w != nullptr ? w->generation : 0;
+}
+
 void* sk_gpu_begin_frame(int win_id, int width, int height) {
   GLWin* w = gl_slot(win_id);
   if (w == nullptr || w->ctx == nullptr) return nullptr;
@@ -596,6 +604,7 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
     w->height = height;
     glViewport(0, 0, width, height);
     if (!gl_build_surface(w)) return nullptr;
+    w->generation = ++g_gl_generation;
   }
 
   SkCanvas* canvas = w->surface != nullptr ? w->surface->getCanvas() : nullptr;

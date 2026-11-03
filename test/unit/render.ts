@@ -402,6 +402,12 @@ function checkBakeResolution(): string[] {
     emitted.includes('if (dt_y * f > cap) f = cap / dt_y;') &&
     emitted.includes('double area = sqrt(AS_BAKE_MAX_PIXELS / ((double)lw * (double)lh));') &&
     emitted.includes('if (area > AS_BAKE_MAX_PIXELS) f *= sqrt(AS_BAKE_MAX_PIXELS / area);'));
+  check('automatic snapshots default to the measured 1M-pixel memory/GPU balance',
+    emitted.includes('static double ASC_auto_bake_cap = 1000000.0;')
+    && emitted.includes('getenv("ASC_AUTO_BAKE_MAX_PIXELS")'));
+  check('the automatic cap paints large subtrees live but never overrides cacheAsBitmap',
+    emitted.includes('o->_auto_baked && !o->_cache_flag && ASC_auto_bake_cap > 0.0 && (double)pw * (double)ph > ASC_auto_bake_cap')
+    && emitted.includes('ASC_auto_bake_cap) { as_render_live(canvas, o); return; }'));
   // (1c) When either cap had to shrink the surface, an AUTO-bake is skipped
   // entirely and the object renders live at the exact device resolution. A
   // magnified bake is strictly softer than live rendering, and because a
@@ -1508,7 +1514,7 @@ function checkFrameCanvasHygiene(): string[] {
     else { bad.push(label); console.log(`FAIL  [canvasreset] ${label}`); }
   };
   const c = generateC(parse('var n:int = 1;\n')).c;
-  const head = 'static void ASC_window_render(int id) {';
+  const head = 'static int ASC_window_render(int id) {';
   const at = c.indexOf(head);
   check('the window pass is emitted', at >= 0);
   const body = at >= 0 ? c.slice(at, c.indexOf('\n}', at)) : '';
@@ -1539,6 +1545,73 @@ function checkFrameCanvasHygiene(): string[] {
   console.log(`[canvasreset] ${ok} frame-canvas hygiene checks passed`);
   return bad;
 }
+function checkPresentSkip(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [presentskip] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [presentskip] ${label}`); }
+  };
+  const c = generateC(parse('var n:int = 1;\n')).c;
+  const at = c.indexOf('static int ASC_window_render(int id) {');
+  const body = at < 0 ? '' : c.slice(at, c.indexOf('\n}', at));
+  check('the content key is computed before drawable acquisition',
+    body.indexOf('uint32_t _window_fp = as_render_fp') >= 0
+    && body.indexOf('uint32_t _window_fp = as_render_fp') < body.indexOf('as_skia_gpu_begin_frame'));
+  check('a hit requires a previously completed frame and every generation to match',
+    body.includes('w->render_valid && w->render_fp == _window_fp')
+    && body.includes('w->render_s3d_serial == ASC_stage3d_serial')
+    && body.includes('w->render_gpu_generation == _gpu_generation')
+    && body.includes('w->render_window_generation == _window_generation'));
+  check('the A/B escape hatch and the diagnostic counter are present',
+    body.includes('getenv("ASC_NO_PRESENT_SKIP") == NULL') && body.includes('as_dbg_present_skip_n++'));
+  check('a partial frame is never committed as valid',
+    body.indexOf('w->render_valid = 0;') >= 0
+    && body.indexOf('w->render_valid = 0;') < body.indexOf('as_skia_gpu_begin_frame')
+    && body.indexOf('w->render_valid = 1;') > body.indexOf('as_render_object(canvas'));
+  check('window and GPU generations are guarded for no-window and CPU-window builds',
+    body.includes('#ifdef ASC_USE_WINDOW') && body.includes('#ifdef ASC_RENDER_WINGPU')
+    && body.includes('uint64_t _window_generation = 0;'));
+
+  const fs = c.indexOf('static uint32_t as_render_fp(DisplayObject* o) {');
+  const fp = fs < 0 ? '' : c.slice(fs, c.indexOf('\nstatic ', fs + 10));
+  check('the fingerprint covers blend mode, opaque background and all colour-transform channels',
+    fp.includes('as_fp_str(h, o->blendMode)') && fp.includes('as_v_is_number(o->opaqueBackground)')
+    && ['redMultiplier', 'greenMultiplier', 'blueMultiplier', 'alphaMultiplier', 'redOffset', 'greenOffset', 'blueOffset', 'alphaOffset']
+      .every((f) => fp.includes('fpct->' + f)));
+  check('the fingerprint covers Bitmap sampling and SimpleButton state pixels',
+    fp.includes('as_fp_bool(h, ((Bitmap*)o)->smoothing)') && fp.includes('DisplayObject* st = as_sbtn_state(o);')
+    && fp.includes('as_render_fp(st)'));
+  const textInputs = fp.includes('as_focus_obj == (void*)tf')
+    && fp.includes('as_textformat_fp(h, as_tf_base_fmt(tf))')
+    && fp.includes('tf->_runs->data[i * 3 + 1]')
+    && fp.includes('as_textformat_fp(h, (TextFormat*)as_v_obj_val')
+    && fp.includes('tf->selectable') && fp.includes('as_fp_str(h, tf->type)');
+  check('TextField focus, base/run formats and run boundaries are pixel inputs', textInputs);
+  const tfAt = c.indexOf('static uint32_t as_textformat_fp');
+  const tf = tfAt < 0 ? '' : c.slice(tfAt, c.indexOf('\nstatic ', tfAt + 10));
+  check('every TextFormat layout/style field is hashed by value, including null tags and tab stops',
+    ['size', 'color', 'leading', 'letterSpacing', 'leftMargin', 'rightMargin', 'indent', 'blockIndent']
+      .every((f) => tf.includes('as_fp_num_value(h, f->' + f + ')'))
+    && ['bold', 'italic', 'underline', 'kerning', 'bullet'].every((f) => tf.includes('as_fp_bool_value(h, f->' + f + ')'))
+    && tf.includes('as_fp_str(h, f->display)') && tf.includes('ts->data[i]'));
+  check('stage clear/content transforms and scale9 grids are window pixel inputs',
+    fp.includes('as_fp_u32(h, fps->stage_color)') && fp.includes('as_fp_str(h, fps->scale_mode)')
+    && fp.includes('as_fp_str(h, fps->align)') && fp.includes('o->_s9x') && fp.includes('o->_s9h'));
+  check('off-list masks are fingerprinted with a cycle guard',
+    fp.includes('as_fp_mask_stack') && fp.includes('m->parent != NULL') && fp.includes('if (seen || as_fp_mask_depth >= 32)'));
+  check('Stage3D present advances the compositor serial',
+    /void Context3D_present[\s\S]*?ASC_stage3d_serial\+\+;/.test(c));
+
+  const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
+  check('the CPU backend presents only a frame that was actually rasterized',
+    glue.includes('int painted = c->on_redraw(i);') && glue.includes('if (!c->is_gpu && painted) present_frame'));
+  check('OS exposure invalidates an otherwise unchanged swapchain',
+    glue.includes('e.window.event == SDL_WINDOWEVENT_EXPOSED') && glue.includes('c->redraw_generation++;'));
+  console.log(`[presentskip] ${ok} static-present checks passed`);
+  return bad;
+}
+
 function checkAlphaLayerBalance(): string[] {
   // `saveLayerAlpha` is a SAVE, not a cosmetic flag: it pushes a layer that must be
   // popped by its own restore. The unbalanced version (阶段二百一十四 前的真缺陷) let a
@@ -1795,6 +1868,7 @@ registerGroup('unit: render/SwcJpeg3Alpha', checkSwcJpeg3Alpha);
 registerGroup('unit: render/AirAppFonts', checkAirAppFonts);
 registerGroup('unit: render/SkiaAbi', checkSkiaAbi);
 registerGroup('unit: render/FrameCanvasHygiene', checkFrameCanvasHygiene);
+registerGroup('unit: render/PresentSkip', checkPresentSkip);
 registerGroup('unit: render/AlphaLayerBalance', checkAlphaLayerBalance);
 
 // ---- 阶段三百一十五: a single-primitive object folds its alpha into the paint ----

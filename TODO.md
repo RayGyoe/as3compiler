@@ -19358,6 +19358,35 @@ AOT（`--air-app`，开窗）与 adl 同源同跑：
 
 ---
 
+### 阶段三百六十二：真会议的自动缓存像素预算 + 静止窗口只跳光栅/Present（v0.4.324 → v0.4.325）
+
+**起点**：同一会议实测自动缓存以约 139MB Private 换约 5.1 个百分点 GPU，不能全局关闭；窗口则每帧完整光栅并
+Present。目标是在保持 60 FPS 与全部逻辑事件的前提下，降低缓存内存，并省掉真正静止窗口的重复提交。
+
+- **自动缓存默认 1,000,000 像素上限**：只限制我们自己的 `_auto_baked`，显式 AS3 `cacheAsBitmap` 不受限；
+  超上限不是降分辨率，而是按目标设备分辨率活态绘制。`ASC_AUTO_BAKE_MAX_PIXELS=0` 恢复无上限 A/B。
+  同一 exe/会议/路径的最终 10 秒中位数：**0.105% CPU / 3.743% GPU / 254.4MB Private / 292.9MB Working Set**，
+  缓存像素 **11.1MB**；无上限为 **0.088% / 4.655% / 369.3MB / 409.3MB**、缓存 **43.7MB**；250K 虽降到
+  239.1MB Private，但 GPU 回升到 **7.972%**，故不采用。AIR 同会议 15 样本为 **0.190% / 7.321% / 292.4MB**。
+- **静止窗口跳帧**：窗口键由显示树指纹、`ASC_stage3d_serial`、GPU generation、系统 redraw generation 和
+  `render_valid` 共同组成；命中只跳过 raster/Present，不跳过 `ENTER_FRAME`、计时器、输入或异步回调。
+  `ASC_NO_PRESENT_SKIP=1` 可同 exe 关闭。CPU/GPU/web 的 redraw 回调统一返回是否真正绘制；D3D12/GL/Metal
+  都实现 GPU 代次，SDL `EXPOSED` 与 web 画布尺寸变化都有失效来源。
+- **像素键审查补齐**：`blendMode`/`opaqueBackground`/完整 `colorTransform`、Bitmap smoothing、SimpleButton
+  当前状态子树、scale9Grid、Stage color/scaleMode/align、TextField 焦点/IME/caret/selection/type/全部 run 区间、
+  完整 TextFormat（含 null tag、margins/indent/kerning/letterSpacing/tabStops）、filter `_shadow_only` 与离屏 mask
+  递归（32 层循环守卫）。Stage3D `configureBackBuffer` 与 `present` 都推进合成序号。诊断 `getenv` 全部 hoist，
+  不在逐节点热路径重复扫描环境块。
+- **验收**：静止 CPU 窗口 `presentskip=512/512`；计时器移动图形的一轮为 **511/512、keychg=1**，
+  `timerFired=true`、逻辑满 **600** 帧。会议主窗口 FPS/MS 文本逐帧变化，`keychg` 持续而 `presentskip=0`，
+  这是正确行为，未忽略动态节点。`unit: render/PresentSkip` 14 钉，5 个真语义变异（blendMode、OS 代次、
+  未绘制仍 Present、Stage 清屏/布局键、TextFormat 排版键）全部被判红；CPU window 实链通过，55 项相关定向测试全绿。
+  真应用默认构建实际桌面图可见会议顶栏、FPS 与头像，日志无异常，稳定 60 FPS。
+  最终全量 `node test.ts`：**613 tests / 602 pass / 8 fail / 3 skip**；8 红与优化前 Windows 宿主基线逐项相同，
+  新增失败 **0**（日志 `temp/perf-skip/full-regression-final-2.log`）。
+
+---
+
 ### 遗留待开发
 > **2026-11-03 追加（阶段三百六十一：`draw()` 忽略被画对象自己的 `visible`/`alpha`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑不出画面的一条实错（「高级礼物」不报错也不出图），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**口径提醒**：这类缺陷**任何断言都不会红**——它不抛异常、不打日志，示例套件里也没有程序会把「自己设为 invisible 再 draw 自己」当作正常用法；它是靠「用户说动画没出来」反推出来、再用同源探针量出来的。今后凡是「应用层看不见结果但没有报错」的反馈，第一件事就是把该路径的每个渲染/读取原语拿 adl 逐项对照，而不是继续查应用代码。
 > **2026-11-03 追加（记账勘误；不占阶段号、不升版本号）**：两件事都是**记录与事实不符**，不动一行代码。

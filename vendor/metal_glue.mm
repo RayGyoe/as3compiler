@@ -47,6 +47,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <CoreFoundation/CoreFoundation.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -81,9 +82,12 @@ typedef struct {
   CAMetalLayer* layer;
   id<CAMetalDrawable> drawable;
   sk_sp<SkSurface> surface;
+  int width, height;
+  uint64_t generation;
 } MtlWin;
 
 static MtlWin g_mtl[SK_MTL_MAX_WINDOWS];
+static uint64_t g_mtl_generation = 0;
 // Process-wide backend: created with the first GPU window and torn down when the
 // last one goes away. Skia requires these to outlive the context.
 static id<MTLDevice> g_device = nil;
@@ -223,6 +227,9 @@ int sk_mtl_init(int win_id, void* layer) {
   g_mtl[win_id].layer = l;
   g_mtl[win_id].drawable = nil;
   g_mtl[win_id].surface = nullptr;
+  g_mtl[win_id].width = 0;
+  g_mtl[win_id].height = 0;
+  g_mtl[win_id].generation = ++g_mtl_generation;
   return 1;
 }
 
@@ -276,6 +283,11 @@ void* sk_mtl_begin_frame(int win_id, int width, int height) {
   // The drawable size is set from SDL's own physical-pixel query (see
   // window_glue.cc), so the surface always matches the backing store even across
   // a HiDPI change. nextDrawable respects this size on subsequent frames.
+  if (m->width != width || m->height != height) {
+    m->width = width;
+    m->height = height;
+    m->generation = ++g_mtl_generation;
+  }
   m->layer.drawableSize = CGSizeMake((CGFloat)width, (CGFloat)height);
 
   if (m->surface) m->surface.reset();
@@ -420,6 +432,10 @@ void sk_mtl_draw_texture(void* canvas, void* mtlTexture, int w, int h,
 
 int sk_gpu_init(int win_id, void* layer) { return sk_mtl_init(win_id, layer); }
 void sk_gpu_destroy(int win_id) { sk_mtl_destroy(win_id); }
+uint64_t sk_gpu_generation(int win_id) {
+  MtlWin* w = mtl_slot(win_id);
+  return w != nullptr ? w->generation : 0;
+}
 void* sk_gpu_begin_frame(int win_id, int width, int height) {
   return sk_mtl_begin_frame(win_id, width, height);
 }
