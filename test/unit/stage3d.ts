@@ -263,9 +263,12 @@ function checkStage3dMipSemantics(): string[] {
     /loadAction = MTLLoadActionClear/.test(metal.slice(metal.indexOf('asc_tr_mipdrop'))));
   check('WebGL glue drops the draw on the same rule (byte-identical condition)',
     webgl.includes(drop) && /S3D mip-drop/.test(webgl));
+  // Scoped to s3d_draw: `glUseProgram(c->prog)` also appears in the native layout
+  // function, and a whole-file indexOf would compare the drop against THAT bind.
+  const drawFn = webgl.slice(webgl.indexOf('int s3d_draw(void* ctx, int numTriangles)'));
   check('WebGL drop is decided after the deferred clear and before the program is bound',
-    webgl.indexOf('S3D mip-drop') > webgl.indexOf('if (c->clearPending) {')
-    && webgl.indexOf('S3D mip-drop') < webgl.indexOf('glUseProgram(c->prog)'));
+    drawFn.indexOf('S3D mip-drop') > drawFn.indexOf('if (c->clearPending) {')
+    && drawFn.indexOf('S3D mip-drop') < drawFn.indexOf('glUseProgram(c->prog)'));
   // Both glues must clear the flag when a unit is unbound (a stale flag would let
   // a later mip-filtered draw of a chainless texture go through).
   check('Metal glue clears the chain flag when the texture is destroyed/unbound',

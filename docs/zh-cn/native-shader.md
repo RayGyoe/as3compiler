@@ -511,6 +511,57 @@ Metal 要求一次 pass 的所有附件采样数相同。**为什么 `generateMi
 **边界**：`setRenderTargetSamples` 不改 drawable（那个仍归 `ASC_S3D_MSAA`）；`renderOverride` 的 pass
 （阴影 prepass、`drawToBitmapData`）永远 1 采样（D54）；目标重建后 companion 会丢，调用方要重推一次。
 
+### 6.11 WebGL2 直通臂：同一份 GLSL ES 3.00，不经过 SPIR-V（2026-11-03）
+
+原生通道原先只有 Metal 一条臂，web/wasm 构建**拒绝** `--features native-shader`，于是 M30/M31/M32/M33/M34
+五个 demo 被判成「只能原生」。本轮复核认定这条判定是错的：作者写的是 **GLSL ES 3.00 源语言**，而 GLSL ES
+3.00 正是 WebGL2 的原生着色语言——把它翻译成 MSL 再在浏览器里跑，等于绕地球一圈。
+
+**结论：wasm 也允许 `native-shader`，但两条臂的编译输入不同。**
+
+| | native（Metal / D3D12） | wasm（WebGL2） |
+|---|---|---|
+| 编译链 | glslang → SPIR-V → SPIRV-Cross → MSL/HLSL | **无**：ES 3.00 源码直接 `glCompileShader` |
+| 链接的工具库 | 链接 `vendor/glslang`、`vendor/SPIRV-Cross`（宿主档案） | **不链接**（`shader_compiler.cc` 不编，wasm 里没有 SPIRV-Cross） |
+| 反射来源 | SPIRV-Cross 的 `spvc_*` 资源列表 | **驱动**：`glGetActiveUniform` / `glGetActiveAttrib`（链接后的 program） |
+| 槽位语义 | `spvc_compiler_msl_get_automatic_resource_binding`：`[[buffer(N)]]` / `[[texture(N)]]` | 同一语义：**按 (kind, stage) 各自从 0 编号**（见下） |
+| 上限 | 31 buffer / 31 texture（每 stage） | 16 texture unit（两 stage **共享**一个全局 unit 命名空间） |
+
+`test/unit/native-shader.ts` 把这段契约钉成四条：wasm 接受该 feature、wasm 不编 `shader_compiler.cc`、
+wasm 不链 `glslang`/`SPIRV-Cross`、native 在有档案时仍编 shim。
+
+**接线（`vendor/stage3d_webgl.cc`，全在 `S3DContext` 内）**：`s3d_native_use` 建程序、`s3d_native_uniform`
+按 (stage, slot) 暂存 64 字节载荷、`s3d_native_bind_texture` / `s3d_native_set_sampler_state` 记绑定、
+`s3d_native_set_targets` / `s3d_native_target_create` 建 FBO、`s3d_native_reflect` 顶替
+`asc_shader_translate` 填同一份 `asc_shader_program`（`translatedVertex/Fragment` 就是作者源码本身，
+`asc_shader_backend_info` 如实报「driver reflection」）。`s3d_native_layout` 在 Metal 侧是 **no-op**
+（绑定已被 SPIRV-Cross 烘进 `[[buffer(N)]]`），在 WebGL2 侧是必修的一步（GL 的 uniform 按**名字**寻址）。
+
+**三条「编译过、结果错」的坑**（都只在 WebGL2 出现，Metal 侧结构上不存在）：
+
+1. **反射必须在链接之后的 program 上做**。GLES3 里 `glGetActiveUniform` 是 program 级的，先对着编译好的
+   shader 对象问会一直答「没有这个 uniform」。同一处还要把每个 program uniform 归属到 stage——由
+   `s3d_declares_uniform(vs, name)` / `(fs, name)` 扫源码完成，所以 `setUniform` 的 (stage, slot) 与
+   Metal 的 `[[buffer(N)]]` 同键。
+2. **槽位按 (kind, stage) 编号，不是跨 kind 连续编号**。第一版跨 kind 连续编号，于是「几个 uniform + 几个
+   sampler」的程序里 sampler 拿到 slot 8..10，而采样器表只到 7 —— 天空程序因此在未绑定的 unit 上采样，
+   整片海洋渲染成**黑色且 `glError == 0`**。同一处还有第二个上限：绑定循环遍历的是 `S3D_MAX_TEX`（8，
+   AGAL 的纹理寄存器上限），而原生程序的采样器上限是 16，`ocean-m32` 的水面程序声明 10 个 —— 超出的
+   slot 每次都被静默跳过，读到的位移图是「常数」（画面是平静水面、读回极差 0/255）。
+3. **正面朝向（front face）要翻转，而不是补全剔除模式**。AGAL 的 GLSL 顶点级会把裁剪空间 Y 取反，所以
+   `GL_CCW` 恰好等于 Stage3D 的正面；原生程序自己写 `gl_Position`、没有那次取反，同一批三角形在 GL 眼里
+   绕序相反。**补全 cull 模式能救回 dM30 的四边形，但 `gl_FrontFacing` 仍是反的** —— ocean-m34 的水面
+   pass 于是把每个片元判成「水面下侧」（49.9% underside / 0.2% top side，自检红），改法是一行：
+   `glFrontFace(c->nativeMode ? GL_CW : GL_CCW)`。
+
+**验收**：五个 demo 全部在真浏览器里自检绿 —— `shader-m30`（`#version 300 es` 直通、中心像素
+`#804020`）、`shader-m31`（float32/half/MRT/depth/texelFetch/uint）、`shader-m33`（helpers/导数/混合/
+离屏/图集）、`ocean-m32`（FFT 位移极差 `-1.498..1.420 m`，spread 186/255）、`ocean-m34`（7 条自检全 PASS：
+位移 `-10.0..10.0 m`、sky LUT `0.078..20.0`、反射 `0.235..10.0`、caustics `0.000..1.042`、水面覆盖
+49.9%/0.2%、光柱、从下方）。**剩余差异如实登记**：WebGL2 的 `setRenderTargetSamples`（§6.10）仍是
+「拒绝并报明」（离屏 MSAA 需要 multisample renderbuffer + `glBlitFramebuffer` 解析，而解析必须与 pass 链
+交织，不是逐贴图开关），页面会打印一行注明边缘保持单采样。
+
 ---
 
 ## 7. AS 侧（asaot3d）要动的清单
@@ -711,7 +762,7 @@ E6 落地后，**FFT 的归属从「被迫 CPU」翻转为「可以 GPU」**：
 | 阶段 | 内容 | 验收 | 后端 | 状态 |
 |---|---|---|---|---|
 | **P1 · Metal 单后端起步** | glslang+SPIRV-Cross 入 `build-tools/`；`--features native-shader` 注册；`stage3d_glue.mm` 增 float RT + MRT + 原生 MSL 编译；`NativeShaderRenderer` + `ShaderMaterial` | AOT-macOS 出画面，float RT 可渲可读，MSL **真编译** | Metal | ✅ **M3 + M6 已验收**：`shader-m30` 15 项 PASS、像素 `#804020`/`#361b0e`。验收方式从 `xcrun metal` 改运行期 `newLibraryWithSource:`（§3.4：本机无离线工具链） |
-| **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一画面，零交叉编译 | WebGL2 | ❌ 未做（现在 `--features native-shader` 只声明 `native` 目标） |
+| **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一画面，零交叉编译 | WebGL2 | ✅ 2026-11-03 落地，见 §6.11 |
 | **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 | ❌ 未做（SPIRV-Cross 的 HLSL 半边库已链好） |
 | **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | 🟡 **第一阶段已落**：`asaot3d/apps/ocean-m32` = Tessendorf FFT 海洋（256²×2 cascade、34 pass/帧、顶点纹理取值位移、MRT 位移+法线、高度读回 ±1.6 m）。**未做**：caustics / 水下 pass / 喷雾 / 4 cascade / 平面反射 / 天空梯度 |
 

@@ -2869,6 +2869,20 @@ void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
   }
 }
 
+// The reflected name->slot table, handed over once per program bind (the generated C
+// calls this right after s3d_native_use). A DELIBERATE NO-OP HERE: Metal binds a
+// native uniform at `[[buffer(slot)]]`, and SPIRV-Cross already wrote that slot into the
+// translated source from the same reflection table, so there is no name to resolve at
+// draw time. The WEB arm is the one that needs this -- GL addresses uniforms by name --
+// and having a single call site (rather than an #ifdef in the emitted C) keeps the two
+// arms of the channel on one contract.
+void s3d_native_layout(void* ctx, const char* const* names, const int* kinds,
+                       const int* stages, const int* slots, const int* base_types,
+                       const int* components, const int* sizes, int count) {
+  (void)ctx; (void)names; (void)kinds; (void)stages; (void)slots;
+  (void)base_types; (void)components; (void)sizes; (void)count;
+}
+
 void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {
   if (ctx == NULL) return;
   S3DContext* c = (S3DContext*)ctx;

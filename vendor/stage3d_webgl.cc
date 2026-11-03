@@ -59,6 +59,24 @@
 //    so every entry point that touches GL marks Ganesh's state dirty via
 //    sk_gr_reset_context() — cheap (it sets a bit); the actual state re-sync
 //    happens on Ganesh's next operation.
+//
+//  * Native shaders (E6, `--features native-shader`). WebGL2 is the one backend
+//    that runs the author's GLSL ES 3.00 AS WRITTEN, so this file is also the
+//    native channel's web arm -- and it is a *passthrough*, not a translation:
+//    glCompileShader consumes the source, and the reflection table Context3DNative
+//    reports comes from the driver (glGetActiveUniform / glGetActiveAttrib) rather
+//    than from glslang. Nothing about the native path is cross-compiled here; the
+//    MSL/HLSL arms of vendor/shader_compiler.cc are simply not in this build.
+//    What STILL has to exist is the host half: s3d_native_* (program bind, uniform
+//    upload by reflected slot, sampler units, MRT/float/depth targets), which is
+//    what this section below adds. Two GL-specific consequences are worth knowing
+//    before reading it:
+//      - Metal binds a native uniform at buffer index == its reflected slot, so
+//        SPIRV-Cross bakes the slot into the source. GL binds uniforms BY NAME, so
+//        the name->slot table has to be handed to this file once per program
+//        (s3d_native_layout) to be turned into glGetUniformLocation results.
+//      - fragment slots map to texture units 0..7 and vertex slots to 8..15, since
+//        GL has one unit namespace while Metal has one per stage.
 
 #ifdef __EMSCRIPTEN__
 
@@ -68,8 +86,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string.h>   // strdup: <cstring> does not declare the POSIX extension
+#include <ctype.h>    // isalnum, in the uniform-declaration scan
 #include <cmath>
 #include <cstdint>
+
+// The reflection/binding table Context3DNative is built on. Declared by the same
+// header the native arm's cross-compiler uses, so the two arms of the channel cannot
+// disagree about the struct layout the emitted C hands them.
+#ifdef ASC_USE_NATIVE_SHADER
+#include "shader_compiler.h"
+#endif
 
 // Ganesh state invalidation (skia_glue.cc). Declared here rather than in a shared
 // header to keep this file's dependency surface flat, like the Metal glue.
@@ -126,6 +153,25 @@ struct S3DRtTex {
   int width, height;
   int isHalf;     // GL_RGBA16F instead of GL_RGBA8 (readback must narrow it)
 };
+
+// A native (Context3DNative) target set: up to four colour attachments plus an
+// optional depth attachment, all TEXTURES the caller owns. Cached by the set's
+// identity because a pass list alternates between a handful of sets every frame and
+// a per-frame glGenFramebuffers/attach/check would churn the object tables.
+struct S3DNativeTarget {
+  int used;
+  GLuint fbo;
+  GLuint colors[4];
+  int ncolors;
+  GLuint depth;
+  int width, height;
+  int complete;      // 0 = the GL driver refused this set (reported once)
+};
+#define S3D_MAX_NATIVE_TARGETS 8
+// Samplers a native program may declare in one stage. Not S3D_MAX_TEX (8): that is the
+// AGAL limit on texture *registers*, and a translated GLSL ES 3.00 program is not
+// written in AGAL. GLES3 guarantees 16 per stage, which is the real ceiling here.
+#define S3D_MAX_NATIVE_TEX 16
 
 // Registry entry for a texture object's GL target. A cube map can only ever be
 // bound to GL_TEXTURE_CUBE_MAP (and its sampler parameters live on that target),
@@ -246,14 +292,46 @@ struct S3DContext {
   int texStateN;
   S3DTexTarget texTarget[64];
   int texTargetN;
-  S3DRtTex rtTex[32];
+  // Registry of render-target textures: id -> size. WebGL2 dropped
+  // glGetTexLevelParameteriv (ES 3.1), so this is the only way to know how big a
+  // texture is when an FBO has to be created for it. GROWABLE on purpose: the ocean
+  // demo alone creates 48 targets, and a fixed 32-entry table silently stopped
+  // recording after the FFT cascades -- every later target then sized its framebuffer
+  // from the SCREEN, drew through a viewport four times too large, and produced a
+  // constant LUT and a black composite (the bug this comment replaces).
+  S3DRtTex* rtTex;
   int rtTexN;
+  int rtTexCap;
   // Scratch buffer for pixel upload/readback conversions (BGRA <-> RGBA), grown
   // on demand and reused: a per-frame malloc of 8+ MB would shred the wasm heap.
   uint8_t* scratch;
   int scratchBytes;
   // VAO for the attribute setup; the element-buffer binding is VAO state in GLES3.
   GLuint vao;
+  // ---- E6 native shader channel (see the header note; unused unless a
+  // Context3DNative program is bound). `nativeMode` mirrors the Metal glue: once a
+  // native program is live the constant-register model is off for this context.
+  int nativeMode;
+  int nativeNColor;                       // colour attachments the live program writes
+  unsigned char nativeUniform[2][16][64]; // staged floats, by stage and reflected slot
+  unsigned char nativeUniformSet[2][16];
+  int nativeLoc[2][16];                   // glGetUniformLocation per (stage, slot)
+  int nativeBase[2][16];                  // ASC_SHADER_BASE_* of that uniform
+  int nativeComps[2][16];                 // scalars per element (1..4, 4/9/16 for mats)
+  int nativeSize[2][16];                  // array element count (1 for a plain uniform)
+  int nativeUnit[2][S3D_MAX_NATIVE_TEX];  // sampler (stage, slot) -> GL texture unit
+  GLuint nativeTex[2][S3D_MAX_NATIVE_TEX];   // texture bound at that sampler
+  int nativeSampler[2][S3D_MAX_NATIVE_TEX][3];  // filter, wrap, mip per (stage, slot)
+  int nativeSamplerSet[2][S3D_MAX_NATIVE_TEX];
+  // Which (stage, slot) pairs the LIVE program actually declares as samplers. Binding is
+  // driven by this and not by "whatever slots are non-zero", so an unit is never left with
+  // the previous program's texture on it: an unbound sampler then samples black, which is
+  // the loud failure, instead of silently sampling a plausible-looking wrong texture.
+  unsigned char nativeTexTable[2][S3D_MAX_NATIVE_TEX];
+  S3DNativeTarget nativeTargets[S3D_MAX_NATIVE_TARGETS];
+  S3DNativeTarget* nativeTarget;          // NULL = draw to the back buffer
+  GLuint nativeLayoutProg;                // program the layout table was resolved for
+  unsigned long long nativeLayoutHash;    // and the table it was resolved from
 };
 
 // Program-cache helper, defined with s3d_compile further down but needed by the
@@ -279,7 +357,21 @@ static void s3d_unbind_texture_everywhere(GLuint t) {
   for (int k = 0; k < s3d_live_n; k++) {
     S3DContext* c = s3d_live[k];
     for (int i = 0; i < S3D_MAX_TEX; i++) if (c->textures[i] == t) { c->textures[i] = 0; c->texHasMips[i] = 0; }
+    for (int s = 0; s < 2; s++)
+      for (int i = 0; i < S3D_MAX_NATIVE_TEX; i++) if (c->nativeTex[s][i] == t) c->nativeTex[s][i] = 0;
     if (c->overrideRt != NULL && c->overrideRt->color == t) c->overrideRt = NULL;
+    // A destroyed attachment leaves its cached FBO unusable, and a stale entry would
+    // be found again by the identity match (ids are recycled) and drawn into.
+    for (int i = 0; i < S3D_MAX_NATIVE_TARGETS; i++) {
+      S3DNativeTarget* nt = &c->nativeTargets[i];
+      if (!nt->used) continue;
+      int hit = (nt->depth == t);
+      for (int k2 = 0; k2 < nt->ncolors; k2++) if (nt->colors[k2] == t) hit = 1;
+      if (!hit) continue;
+      if (c->nativeTarget == nt) c->nativeTarget = NULL;
+      if (nt->fbo != 0) glDeleteFramebuffers(1, &nt->fbo);
+      memset(nt, 0, sizeof *nt);
+    }
   }
 }
 
@@ -464,6 +556,13 @@ void* s3d_create(int width, int height) {
   c->stencilReadMask = 0xFF;
   c->stencilWriteMask = 0xFF;
   c->colorMaskR = c->colorMaskG = c->colorMaskB = c->colorMaskA = 1;
+  c->nativeLoc[0][0] = c->nativeLoc[1][0] = -1;
+  for (int s = 0; s < 2; s++)
+    for (int i = 0; i < 16; i++) { c->nativeLoc[s][i] = -1; c->nativeBase[s][i] = 0; c->nativeComps[s][i] = 1; }
+  for (int s = 0; s < 2; s++)
+    for (int i = 0; i < S3D_MAX_NATIVE_TEX; i++) c->nativeUnit[s][i] = (s == 0) ? (8 + i) : i;
+  c->nativeLayoutProg = 0;
+  c->nativeTarget = NULL;
   c->uniVC[0] = -1;  // memset already zeroed; -1 marks "not linked yet"
   for (int i = 0; i < 256; i++) { c->uniVC[i] = -1; c->uniFC[i] = -1; }
   // WebGL only lets a shader use '#extension GL_EXT_frag_depth' after the
@@ -475,6 +574,15 @@ void* s3d_create(int width, int height) {
   // Returns 0 when the platform does not offer it; the od shader then fails to
   // compile with a clear driver message instead of silently dropping the write.
   emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_frag_depth");
+  // The native channel renders into float targets (rgba32f / r16f / rgba16f); WebGL2
+  // keeps those non-renderable until one of these extensions is enabled. Enabling is
+  // idempotent and harmless for demos that never allocate one, so it is unconditional
+  // here rather than a lazily-guarded call in create_texture_fmt -- a failed
+  // allocation must be attributable to the format, not to whether the first call
+  // happened to win a race with the context.
+  emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_color_buffer_float");
+  emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "EXT_color_buffer_half_float");
+  emscripten_webgl_enable_extension(emscripten_webgl_get_current_context(), "OES_texture_float_linear");
   if (!s3d_alloc_target(c, width, height)) { delete c; return NULL; }
   glGenVertexArrays(1, &c->vao);
   s3d_register_ctx(c);
@@ -497,7 +605,10 @@ void s3d_destroy(void* ctx) {
   if (c->color != 0) glDeleteTextures(1, &c->color);
   if (c->depthStencil != 0) glDeleteRenderbuffers(1, &c->depthStencil);
   if (c->vao != 0) glDeleteVertexArrays(1, &c->vao);
+  for (int i = 0; i < S3D_MAX_NATIVE_TARGETS; i++)
+    if (c->nativeTargets[i].fbo != 0) glDeleteFramebuffers(1, &c->nativeTargets[i].fbo);
   // c->textures[] and overrideRt->color are BORROWED (owned by Texture->gpu).
+  free(c->rtTex);
   free(c->scratch);
   delete c;
   sk_gr_reset_context();
@@ -585,6 +696,30 @@ int s3d_upload_constants(void* ctx, int isFragment, const double* data, int coun
 }
 
 // ---- textures --------------------------------------------------------------
+
+// Record id -> size. Called by every path that creates a texture this file may later
+// be asked to make drawable. Growing is not optional bookkeeping: losing an entry
+// means the FBO below falls back to the screen size, which draws wrong rather than
+// failing, so a failed realloc is reported instead of swallowed.
+static void s3d_rt_register(S3DContext* c, GLuint id, int width, int height, int isHalf) {
+  if (c->rtTexN >= c->rtTexCap) {
+    int cap = c->rtTexCap == 0 ? 32 : c->rtTexCap * 2;
+    S3DRtTex* nx = (S3DRtTex*)realloc(c->rtTex, (size_t)cap * sizeof *nx);
+    if (nx == NULL) {
+      fprintf(stderr, "stage3d_webgl: out of memory recording texture %u (%dx%d); a framebuffer for it would be sized from the screen\n",
+              (unsigned)id, width, height);
+      return;
+    }
+    c->rtTex = nx;
+    c->rtTexCap = cap;
+  }
+  S3DRtTex* e = &c->rtTex[c->rtTexN++];
+  e->id = id;
+  e->width = width;
+  e->height = height;
+  e->isHalf = isHalf;
+}
+
 
 // Upload pixels into a new GL texture and return its name (the caller caches it in
 // Texture->gpu and releases it with s3d_destroy_texture). It does NOT bind to any
@@ -783,13 +918,7 @@ void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  if (c->rtTexN < 32) {
-    c->rtTex[c->rtTexN].id = tex;
-    c->rtTex[c->rtTexN].width = width;
-    c->rtTex[c->rtTexN].height = height;
-    c->rtTex[c->rtTexN].isHalf = isHalf ? 1 : 0;
-    c->rtTexN++;
-  }
+  s3d_rt_register(c, tex, width, height, isHalf ? 1 : 0);
   sk_gr_reset_context();
   return (void*)(uintptr_t)tex;
 }
@@ -1031,6 +1160,800 @@ int s3d_compile(void* ctx, void* key, const char* vs_glsl, const char* fs_glsl, 
   return 1;
 }
 
+// ---- E6 native shader channel (WebGL2 passthrough) --------------------------
+//
+// Everything below exists only when the build asked for `--features native-shader`.
+// It is the web arm of the channel the Metal glue implements with MTLProgram and the
+// SPIRV-Cross reflection table; here the shaders are the author's own GLSL ES 3.00
+// (WebGL2 compiles it as written) and the reflection table comes from the driver.
+//
+// The four host-side facts that shape this code:
+//
+//  1. GL has ONE uniform namespace per program, while Metal has one per stage. The
+//     AS3 API carries a stage with every binding, so reflection here is done per
+//     SHADER OBJECT (glGetActiveUniform works on a shader) -- that is what makes
+//     "this sampler belongs to the fragment stage" knowable, and it is why a
+//     fragment-only sampler does not get bound to a vertex unit.
+//  2. Uniforms are addressed by NAME in GL. setUniform* only carries the reflected
+//     slot, so the caller hands the name->slot table over once per program
+//     (s3d_native_layout) and this file turns it into glGetUniformLocation results.
+//  3. Texture units are one namespace: fragment slot s -> unit s, vertex slot s ->
+//     unit 8+s (GLES3 guarantees MAX_VERTEX_TEXTURE_IMAGE_UNITS >= 16).
+//  4. Same-source re-uploads and per-frame program switches must not re-link or
+//     re-query: the program cache (s3d_compile) and nativeLayoutProg do that.
+#ifdef ASC_USE_NATIVE_SHADER
+
+// Format token -> GL internal format. Same id space as the Metal glue's
+// s3d_fmt_from_id and emit.ts's as_shader_format_id (0 BGRA8 / 1 rgba32f / 2 r32f /
+// 3 rg32f / 4 rgbaHalfFloat / 5 r16f / 6 rg16f / 7 r11g11b10f / 8 r8 / 9 depth32f /
+// 10 depth16). `format`/`type` are the *transfer* descriptors, which only matter when
+// pixels are uploaded -- these textures are GPU-written, so they are NULL here.
+static int s3d_fmt_web(int fmtId, GLint* internal, GLenum* format, GLenum* type, int* isDepth) {
+  *isDepth = 0;
+  switch (fmtId) {
+    case 0:  *internal = GL_RGBA8;    *format = GL_RGBA; *type = GL_UNSIGNED_BYTE; return 1;
+    case 1:  *internal = GL_RGBA32F;  *format = GL_RGBA; *type = GL_FLOAT; return 1;
+    case 2:  *internal = GL_R32F;     *format = GL_RED;  *type = GL_FLOAT; return 1;
+    case 3:  *internal = GL_RG32F;    *format = GL_RG;   *type = GL_FLOAT; return 1;
+    case 4:  *internal = GL_RGBA16F;  *format = GL_RGBA; *type = GL_HALF_FLOAT; return 1;
+    case 5:  *internal = GL_R16F;     *format = GL_RED;  *type = GL_HALF_FLOAT; return 1;
+    case 6:  *internal = GL_RG16F;    *format = GL_RG;   *type = GL_HALF_FLOAT; return 1;
+    case 7:  *internal = GL_R11F_G11F_B10F; *format = GL_RGB; *type = GL_HALF_FLOAT; return 1;
+    case 8:  *internal = GL_R8;       *format = GL_RED;  *type = GL_UNSIGNED_BYTE; return 1;
+    case 9:  *internal = GL_DEPTH_COMPONENT32F; *format = GL_DEPTH_COMPONENT; *type = GL_FLOAT; *isDepth = 1; return 1;
+    case 10: *internal = GL_DEPTH_COMPONENT16;  *format = GL_DEPTH_COMPONENT; *type = GL_UNSIGNED_SHORT; *isDepth = 1; return 1;
+    default: return 0;
+  }
+}
+
+// ---- the GLSL ES 3.00 gate ------------------------------------------------
+//
+// The channel's contract is "GLSL ES 3.00 in" on EVERY backend: the native arm
+// checks it in shader_compiler.cc (refusing `#version 100`, prepending `300 es` when
+// the directive is absent) and this arm has to reach the same verdict for the same
+// source, or the same ShaderMaterial would be accepted on web and refused on Metal.
+// WebGL2 is happy to compile an ES 1.00 shader, so silence here would be a real
+// behavioural difference, not a technicality.
+//
+// Returns a malloc'd ES 3.00 source (the caller frees it) or NULL with `err` filled.
+static char* s3d_es3_source(const char* src, const char* stage, char* err, int errcap) {
+  const char* def = "#version 300 es\n";
+  size_t i = 0, n = strlen(src);
+  // Only the leading comment/blank block may hold `#version` (same rule as the
+  // native arm's scan_version): anything later is the driver's error to report.
+  for (;;) {
+    while (i < n && (src[i] == ' ' || src[i] == '\t' || src[i] == '\r' || src[i] == '\n')) i++;
+    if (i + 1 < n && src[i] == '/' && src[i + 1] == '/') {
+      while (i < n && src[i] != '\n') i++;
+      continue;
+    }
+    if (i + 1 < n && src[i] == '/' && src[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) i++;
+      i = (i + 1 < n) ? i + 2 : n;
+      continue;
+    }
+    break;
+  }
+  if (i + 8 <= n && strncmp(src + i, "#version", 8) == 0) {
+    size_t j = i + 8;
+    while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
+    int num = 0;
+    while (j < n && src[j] >= '0' && src[j] <= '9') { num = num * 10 + (src[j] - '0'); j++; }
+    while (j < n && (src[j] == ' ' || src[j] == '\t')) j++;
+    int is_es = (j + 1 < n && src[j] == 'e' && src[j + 1] == 's');
+    if (num == 300 && is_es) return strdup(src);
+    snprintf(err, (size_t)errcap,
+             "%s shader: only `#version 300 es` (GLSL ES 3.00) is accepted, found `#version %d%s`",
+             stage, num, is_es ? " es" : "");
+    return NULL;
+  }
+  // Absent: accepted (the three.js shape), by prepending the directive. Same
+  // permissive reading as the native arm's kDefaultVersion.
+  size_t dl = strlen(def);
+  char* out = (char*)malloc(dl + n + 1);
+  if (out == NULL) { snprintf(err, (size_t)errcap, "%s shader: out of memory", stage); return NULL; }
+  memcpy(out, def, dl);
+  memcpy(out + dl, src, n + 1);
+  return out;
+}
+
+// glGetActiveUniform / glGetActiveAttrib type -> (kind, base type, scalars per element).
+// The base type is not cosmetic: setUniformInts hands over INT BITS in a float
+// payload, so an `int` uniform must go through glUniform*iv and a float one through
+// glUniform*fv (see the header comment on asc_shader_binding.base_type).
+static void s3d_gl_type_parts(GLenum type, int* kind, int* base, int* comps) {
+  *kind = ASC_SHADER_KIND_UNIFORM;
+  *base = ASC_SHADER_BASE_FLOAT;
+  *comps = 1;
+  switch (type) {
+    case GL_FLOAT: *comps = 1; return;
+    case GL_FLOAT_VEC2: *comps = 2; return;
+    case GL_FLOAT_VEC3: *comps = 3; return;
+    case GL_FLOAT_VEC4: *comps = 4; return;
+    case GL_FLOAT_MAT2: *comps = 4; return;
+    case GL_FLOAT_MAT3: *comps = 9; return;
+    case GL_FLOAT_MAT4: *comps = 16; return;
+    case GL_INT: *base = ASC_SHADER_BASE_INT; *comps = 1; return;
+    case GL_INT_VEC2: *base = ASC_SHADER_BASE_INT; *comps = 2; return;
+    case GL_INT_VEC3: *base = ASC_SHADER_BASE_INT; *comps = 3; return;
+    case GL_INT_VEC4: *base = ASC_SHADER_BASE_INT; *comps = 4; return;
+    case GL_UNSIGNED_INT: *base = ASC_SHADER_BASE_UINT; *comps = 1; return;
+    case GL_UNSIGNED_INT_VEC2: *base = ASC_SHADER_BASE_UINT; *comps = 2; return;
+    case GL_UNSIGNED_INT_VEC3: *base = ASC_SHADER_BASE_UINT; *comps = 3; return;
+    case GL_UNSIGNED_INT_VEC4: *base = ASC_SHADER_BASE_UINT; *comps = 4; return;
+    case GL_BOOL: *base = ASC_SHADER_BASE_BOOL; *comps = 1; return;
+    case GL_BOOL_VEC2: *base = ASC_SHADER_BASE_BOOL; *comps = 2; return;
+    case GL_BOOL_VEC3: *base = ASC_SHADER_BASE_BOOL; *comps = 3; return;
+    case GL_BOOL_VEC4: *base = ASC_SHADER_BASE_BOOL; *comps = 4; return;
+    case GL_SAMPLER_2D: case GL_SAMPLER_3D: case GL_SAMPLER_CUBE:
+    case GL_SAMPLER_2D_ARRAY: case GL_SAMPLER_2D_SHADOW:
+    case GL_INT_SAMPLER_2D: case GL_INT_SAMPLER_3D: case GL_INT_SAMPLER_CUBE:
+    case GL_INT_SAMPLER_2D_ARRAY: case GL_UNSIGNED_INT_SAMPLER_2D:
+    case GL_UNSIGNED_INT_SAMPLER_3D: case GL_UNSIGNED_INT_SAMPLER_CUBE:
+    case GL_UNSIGNED_INT_SAMPLER_2D_ARRAY:
+      *kind = ASC_SHADER_KIND_TEXTURE;
+      *base = ASC_SHADER_BASE_INT;
+      *comps = 1;
+      return;
+    default:
+      // Unreachable for a program the driver accepted (every active uniform has one
+      // of the types above); leaving the float default is the harmless branch.
+      return;
+  }
+}
+
+// Count the fragment outputs that carry an explicit `layout(location = N)`. WebGL2 has
+// no query for "how many draw buffers does this program write" (glGetProgramResource*
+// is GL 4.3), and MRT programs are exactly the ones that need the count right, so the
+// declaration is read back from the source. A program with no explicit location has
+// one output, which is the language default.
+static int s3d_count_frag_outputs(const char* fs) {
+  int maxLoc = -1;
+  for (const char* p = fs; (p = strstr(p, "location")) != NULL; p++) {
+    const char* q = p + 8;
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q != '=') continue;
+    q++;
+    while (*q == ' ' || *q == '\t') q++;
+    int n = 0, digits = 0;
+    while (*q >= '0' && *q <= '9') { n = n * 10 + (*q - '0'); q++; digits = 1; }
+    if (!digits) continue;
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q != ')') continue;
+    q++;
+    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+    // `out` (and not `in`): the qualifier that follows the layout block.
+    if (strncmp(q, "out", 3) != 0) continue;
+    if (n > maxLoc) maxLoc = n;
+  }
+  return maxLoc >= 0 ? maxLoc + 1 : 1;
+}
+
+// Compile one stage. Returns 0 with `err` prefixed by the stage name on failure.
+static GLuint s3d_compile_stage(GLenum type, const char* src, const char* stage, char* err, int errcap) {
+  GLuint s = glCreateShader(type);
+  glShaderSource(s, 1, &src, NULL);
+  glCompileShader(s);
+  GLint ok = 0;
+  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    char log[512];
+    log[0] = 0;
+    glGetShaderInfoLog(s, sizeof(log) - 1, NULL, log);
+    fprintf(stderr, "stage3d_webgl: native GLSL(%s) compile failed: %s\n%s\n", stage, log, src);
+    if (err != NULL && errcap > 0) snprintf(err, (size_t)errcap, "GLSL(%s): %s", stage, log);
+    glDeleteShader(s);
+    return 0;
+  }
+  return s;
+}
+
+// Does this source DECLARE `name` as a uniform? Needed because GL exposes one uniform
+// namespace per PROGRAM: glGetActiveUniform on the linked program answers "there is a
+// uniform called uColor" but not "which stage declared it", and the stage decides which
+// texture unit a sampler gets (fragment 0..7 vs vertex 8..15). (The obvious alternative
+// -- reflecting each SHADER object -- does not exist in GLES 3.0: the active-uniform
+// query is program-only there, measured as an empty list on this backend.)
+//
+// The scan is deliberately narrow: walk tokens, and when `uniform` is seen, compare the
+// whole declaration (up to the closing semicolon) token by token. That covers
+// `uniform mat4 m;`, `uniform sampler2D t[8];`, `uniform highp float f;` and the block
+// form `uniform Foo { ... } bar;` without pretending to parse GLSL.
+static int s3d_declares_uniform(const char* src, const char* name) {
+  if (src == NULL || name == NULL || name[0] == '\0') return 0;
+  size_t n = strlen(src), i = 0;
+  int armed = 0;   // inside a uniform declaration, before the ';'
+  while (i < n) {
+    char c = src[i];
+    if (c == '/' && i + 1 < n && src[i + 1] == '/') { while (i < n && src[i] != '\n') i++; continue; }
+    if (c == '/' && i + 1 < n && src[i + 1] == '*') {
+      i += 2;
+      while (i + 1 < n && !(src[i] == '*' && src[i + 1] == '/')) i++;
+      i = (i + 1 < n) ? i + 2 : n;
+      continue;
+    }
+    if (!(isalnum((unsigned char)c) || c == '_')) {
+      if (c == ';') armed = 0;
+      i++;
+      continue;
+    }
+    size_t j = i;
+    while (j < n && (isalnum((unsigned char)src[j]) || src[j] == '_')) j++;
+    size_t len = j - i;
+    if (!armed) {
+      if (len == 7 && strncmp(src + i, "uniform", 7) == 0) armed = 1;
+    } else {
+      size_t nl = strlen(name);
+      if (len == nl && strncmp(src + i, name, nl) == 0) return 1;
+    }
+    i = j;
+  }
+  return 0;
+}
+
+// Fill the reflection table from the linked PROGRAM. One entry per stage that declares
+// the uniform (two when both do, which is how Metal reports it too -- the AS3 side keys
+// setUniform on (stage, slot)).
+static int s3d_reflect_uniforms(GLuint prog, const char* vs, const char* fs,
+                                asc_shader_binding** buf, int* n, int* cap) {
+  GLint count = 0;
+  glGetProgramiv(prog, GL_ACTIVE_UNIFORMS, &count);
+  // Slots are numbered PER (kind, stage), starting at 0 -- exactly what Metal's
+  // spvc_compiler_msl_get_automatic_resource_binding hands out, where [[buffer(N)]] and
+  // [[texture(N)]] are independent namespaces inside a stage. Numbering them across kinds
+  // instead (the first version of this function) pushed a program's samplers past slot 7
+  // as soon as it also declared a few uniforms, and the sampler table then refused them:
+  // the sky sampled an unbound unit and the whole ocean rendered black with no GL error.
+  int nextSlot[3][2] = { { 0, 0 }, { 0, 0 }, { 0, 0 } };
+  for (GLint i = 0; i < count; i++) {
+    char name[256];
+    GLsizei len = 0;
+    GLint size = 1;
+    GLenum type = 0;
+    glGetActiveUniform(prog, (GLuint)i, (GLsizei)sizeof(name), &len, &size, &type, name);
+    if (len <= 0) continue;
+    // An array uniform is reported as "uFoo[0]": the table names the uniform, which is
+    // what glGetUniformLocation also takes.
+    char* bracket = strchr(name, '[');
+    if (bracket != NULL) *bracket = '\0';
+    int kind = ASC_SHADER_KIND_UNIFORM, base = ASC_SHADER_BASE_FLOAT, comps = 1;
+    s3d_gl_type_parts(type, &kind, &base, &comps);
+    int in_vs = s3d_declares_uniform(vs, name);
+    int in_fs = s3d_declares_uniform(fs, name);
+    if (!in_vs && !in_fs) in_fs = 1;   // a program-level uniform nothing declared: report once
+    for (int stage = 0; stage < 2; stage++) {
+      if (stage == 0 && !in_vs) continue;
+      if (stage == 1 && !in_fs) continue;
+      if (*n >= *cap) {
+        int ncap = (*cap) * 2;
+        asc_shader_binding* nb = (asc_shader_binding*)realloc(*buf, (size_t)ncap * sizeof **buf);
+        if (nb == NULL) return 0;
+        *buf = nb;
+        *cap = ncap;
+      }
+      asc_shader_binding* b = &(*buf)[(*n)++];
+      memset(b, 0, sizeof *b);
+      b->name = strdup(name);
+      b->kind = kind;
+      // The slot is the binding index the AS3 side keys setUniform/setTextureAt on:
+      // sequential per (kind, stage), see nextSlot above.
+      {
+        int k = (kind >= 0 && kind <= 2) ? kind : 1;
+        b->binding = nextSlot[k][stage]++;
+      }
+      b->stage = stage;
+      b->size = size > 0 ? size : 1;
+      b->components = comps;
+      b->base_type = base;
+    }
+  }
+  return 1;
+}
+
+// ---- reflection by the driver ---------------------------------------------
+//
+// Replaces asc_shader_translate for this backend: same output struct, same contract
+// (ok/infoLog/reflection), no cross-compiler. `ctx` is unused (reflection needs the
+// GL context only implicitly -- the driver is already current), and it stays in the
+// signature because the seam is shared with the native arm.
+int s3d_native_reflect(void* ctx, const char* vs, const char* fs, asc_shader_program* out) {
+  (void)ctx;
+  if (out == NULL) return 0;
+  memset(out, 0, sizeof *out);
+  if (vs == NULL || fs == NULL) {
+    snprintf(out->error, sizeof out->error, "native shader: vertex and fragment source are both required");
+    return 0;
+  }
+  char e[1024];
+  e[0] = 0;
+  char* v3 = s3d_es3_source(vs, "vertex", e, (int)sizeof e);
+  if (v3 == NULL) { snprintf(out->error, sizeof out->error, "%s", e); return 0; }
+  char* f3 = s3d_es3_source(fs, "fragment", e, (int)sizeof e);
+  if (f3 == NULL) { free(v3); snprintf(out->error, sizeof out->error, "%s", e); return 0; }
+
+  GLuint vsh = s3d_compile_stage(GL_VERTEX_SHADER, v3, "vertex", out->error, (int)sizeof out->error);
+  if (vsh == 0) { free(v3); free(f3); return 0; }
+  GLuint fsh = s3d_compile_stage(GL_FRAGMENT_SHADER, f3, "fragment", out->error, (int)sizeof out->error);
+  if (fsh == 0) { glDeleteShader(vsh); free(v3); free(f3); return 0; }
+
+  int cap = 32, n = 0;
+  asc_shader_binding* bindings = (asc_shader_binding*)calloc((size_t)cap, sizeof *bindings);
+  if (bindings == NULL) {
+    glDeleteShader(vsh); glDeleteShader(fsh); free(v3); free(f3);
+    snprintf(out->error, sizeof out->error, "native shader: out of memory");
+    return 0;
+  }
+
+  GLuint prog = glCreateProgram();
+  glAttachShader(prog, vsh);
+  glAttachShader(prog, fsh);
+  glLinkProgram(prog);
+  GLint ok = 0;
+  glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+  if (!ok) {
+    char log[512];
+    log[0] = 0;
+    glGetProgramInfoLog(prog, sizeof(log) - 1, NULL, log);
+    fprintf(stderr, "stage3d_webgl: native GLSL link failed: %s\n", log);
+    snprintf(out->error, sizeof out->error, "GLSL link: %s", log);
+    glDeleteProgram(prog); glDeleteShader(vsh); glDeleteShader(fsh);
+    for (int i = 0; i < n; i++) free(bindings[i].name);
+    free(bindings); free(v3); free(f3);
+    return 0;
+  }
+  // Reflection is program-level (see s3d_declares_uniform for why), so it happens here,
+  // after the link, with both sources at hand to attribute each uniform to its stage.
+  s3d_reflect_uniforms(prog, v3, f3, &bindings, &n, &cap);
+  // Attributes need the linked program (glGetAttribLocation takes one). Their
+  // `binding` is the vertex location, which is exactly the vertex-stream index the
+  // draw binds -- that is the contract a native vertex shader signs by declaring
+  // `layout(location = N) in ...`.
+  GLint nattr = 0;
+  glGetProgramiv(prog, GL_ACTIVE_ATTRIBUTES, &nattr);
+  for (GLint i = 0; i < nattr; i++) {
+    char name[256];
+    GLsizei len = 0;
+    GLint size = 1;
+    GLenum type = 0;
+    glGetActiveAttrib(prog, (GLuint)i, (GLsizei)sizeof(name), &len, &size, &type, name);
+    if (len <= 0) continue;
+    int loc = glGetAttribLocation(prog, name);
+    if (n >= cap) {
+      int ncap = cap * 2;
+      asc_shader_binding* nb = (asc_shader_binding*)realloc(bindings, (size_t)ncap * sizeof *bindings);
+      if (nb == NULL) break;
+      bindings = nb;
+      cap = ncap;
+    }
+    int kind = ASC_SHADER_KIND_UNIFORM, base = ASC_SHADER_BASE_FLOAT, comps = 1;
+    s3d_gl_type_parts(type, &kind, &base, &comps);
+    asc_shader_binding* b = &bindings[n++];
+    memset(b, 0, sizeof *b);
+    b->name = strdup(name);
+    b->kind = ASC_SHADER_KIND_ATTRIBUTE;
+    b->binding = loc;
+    b->stage = 0;
+    b->size = size > 0 ? size : 1;
+    b->components = comps;
+    b->base_type = base;
+  }
+  out->bindings = bindings;
+  out->binding_count = n;
+  out->color_attachments = s3d_count_frag_outputs(f3);
+  // On this backend "translated" means "the text that was compiled": the author's own
+  // ES 3.00 (with the directive prepended when it was absent). Reporting it keeps
+  // getTranslatedSource useful instead of answering "" -- and a caller asserting on it
+  // (shader-m30 does) sees reality rather than a lie about a nonexistent translation.
+  out->vertex_source = v3;
+  out->fragment_source = f3;
+  glDeleteProgram(prog);
+  glDeleteShader(vsh);
+  glDeleteShader(fsh);
+  return 1;
+}
+
+// asc_shader_program_free lives in the cross-compiler on the native arm, which this
+// build does not link. Same contract (owns both sources and every binding name).
+void asc_shader_program_free(asc_shader_program* p) {
+  if (p == NULL) return;
+  free(p->vertex_source);
+  free(p->fragment_source);
+  for (int i = 0; i < p->binding_count; i++) free(p->bindings[i].name);
+  free(p->bindings);
+  memset(p, 0, sizeof *p);
+}
+
+// The banner's answer on this backend: there is no cross-compiler here at all.
+const char* asc_shader_backend_info(void) {
+  return "WebGL2 passthrough (driver reflection; no cross-compiler)";
+}
+
+// ---- the host half -------------------------------------------------------
+
+int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor, char* err, int errcap) {
+  if (ctx == NULL || vs == NULL || fs == NULL) return 0;
+  S3DContext* c = (S3DContext*)ctx;
+  if (ncolor < 1) ncolor = 1;
+  if (ncolor > 4) ncolor = 4;
+  // The staged uniforms belong to the program that was current, not to this one.
+  memset(c->nativeUniformSet, 0, sizeof c->nativeUniformSet);
+  c->nativeMode = 1;
+  c->nativeNColor = ncolor;
+  // The same submit path as Metal: `vs` is the translated text the caller owns and one
+  // NativeProgram3D has exactly one, so it is the compile-cache key.
+  if (!s3d_compile(ctx, (void*)vs, vs, fs, err, errcap)) {
+    // Leave nativeMode set: the caller throws on 0, and a half-configured context that
+    // then fell back to AGAL would draw with the wrong uniform model.
+    return 0;
+  }
+  return 1;
+}
+
+void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats) {
+  if (ctx == NULL || f == NULL || nfloats <= 0) return;
+  S3DContext* c = (S3DContext*)ctx;
+  if (stage < 0 || stage > 1 || slot < 0 || slot > 15) return;
+  int n = nfloats * 4;
+  if (n > 64) n = 64;   // the 64-byte per-slot payload ceiling of the whole channel
+  memcpy(c->nativeUniform[stage][slot], f, (size_t)n);
+  c->nativeUniformSet[stage][slot] = 1;
+}
+
+void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  if (slot < 0 || slot >= S3D_MAX_NATIVE_TEX) {
+    if (asc_s3d_dump())
+      fprintf(stderr, "stage3d_webgl: native texture slot %d is outside 0..%d (not bound)\n",
+              slot, S3D_MAX_NATIVE_TEX - 1);
+    return;
+  }
+  if (stage < 0 || stage > 1) stage = 1;
+  c->nativeTex[stage][slot] = (GLuint)(uintptr_t)tex;
+}
+
+void s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  if (stage < 0 || stage > 1 || unit < 0 || unit >= S3D_MAX_NATIVE_TEX) return;
+  c->nativeSampler[stage][unit][0] = filter;
+  c->nativeSampler[stage][unit][1] = wrap;
+  c->nativeSampler[stage][unit][2] = mip;
+  c->nativeSamplerSet[stage][unit] = 1;
+}
+
+// Resolve the caller's name->slot table into GL locations for the LIVE program. Called
+// once per program bind (the caller cannot know when it is already resolved), so the
+// (program, table) pair is hashed and a repeat is a no-op -- otherwise every frame
+// would cost one glGetUniformLocation per binding per material.
+void s3d_native_layout(void* ctx, const char* const* names, const int* kinds, const int* stages,
+                       const int* slots, const int* base_types, const int* components,
+                       const int* sizes, int count) {
+  if (ctx == NULL || names == NULL || count <= 0) return;
+  S3DContext* c = (S3DContext*)ctx;
+  if (c->prog == 0) return;
+  unsigned long long h = 1469598103934665603ULL;
+  for (int i = 0; i < count; i++) {
+    const char* p = names[i];
+    for (; p != NULL && *p != '\0'; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+    h ^= (unsigned long long)(kinds[i] * 131 + stages[i] * 17 + slots[i]);
+    h *= 1099511628211ULL;
+  }
+  if (c->nativeLayoutProg == c->prog && c->nativeLayoutHash == h) return;
+  GLint prev = 0;
+  glGetIntegerv(GL_CURRENT_PROGRAM, &prev);
+  glUseProgram(c->prog);
+  // Texture units are ONE global namespace in GL (glActiveTexture) although the sampler
+  // uniforms that name them live per stage, so the two stages' slot ranges must not
+  // overlap: Metal keeps them apart by construction ([[texture(N)]] in the vertex stage
+  // and in the fragment stage are different bindings), GL does not. Count each stage's
+  // samplers and lay them out back to back, vertex first. Splitting at a fixed 8 (the
+  // AGAL convention) breaks the ocean program, which declares 7 + 9.
+  int texSlots[2] = { 0, 0 };
+  for (int i = 0; i < count; i++) {
+    if (kinds[i] != ASC_SHADER_KIND_TEXTURE) continue;
+    int st0 = stages[i] < 0 ? 0 : (stages[i] > 1 ? 1 : stages[i]);
+    if (slots[i] >= 0 && slots[i] < S3D_MAX_NATIVE_TEX && slots[i] + 1 > texSlots[st0]) texSlots[st0] = slots[i] + 1;
+  }
+  int texBase[2];
+  texBase[0] = 0;
+  texBase[1] = texSlots[0];
+  if (texBase[1] + texSlots[1] > 16) {
+    static int warned = 0;
+    if (!warned) {
+      fprintf(stderr, "stage3d_webgl: native program needs %d + %d samplers, more than the 16 texture units this seam shares between stages; the excess is unbound\n",
+              texSlots[0], texSlots[1]);
+      warned = 1;
+    }
+  }
+  for (int s = 0; s < 2; s++) {
+    for (int i = 0; i < 16; i++) { c->nativeLoc[s][i] = -1; c->nativeComps[s][i] = 1; c->nativeSize[s][i] = 1; }
+    memset(c->nativeTexTable[s], 0, sizeof c->nativeTexTable[s]);
+  }
+  for (int i = 0; i < count; i++) {
+    if (names[i] == NULL || names[i][0] == '\0') continue;
+    int stage = stages[i] < 0 ? 0 : (stages[i] > 1 ? 1 : stages[i]);
+    int slot = slots[i];
+    if (slot < 0) continue;
+    if (kinds[i] == ASC_SHADER_KIND_ATTRIBUTE) continue;  // layout(location=N) IS the stream index
+    if (kinds[i] == ASC_SHADER_KIND_TEXTURE) {
+      // Slots are per (kind, stage), so a sampler's slot means nothing to the uniform
+      // table and is deliberately NOT written there -- the two tables only share the
+      // context, never the index.
+      if (slot >= S3D_MAX_NATIVE_TEX) continue;
+      int unit = texBase[stage] + slot;
+      GLint sloc = glGetUniformLocation(c->prog, names[i]);
+      c->nativeUnit[stage][slot] = unit;
+      c->nativeTexTable[stage][slot] = 1;
+      // A sampler uniform's value is the texture UNIT, and it is program state: bind it
+      // once here rather than on every draw.
+      if (sloc >= 0) glUniform1i(sloc, unit);
+      continue;
+    }
+    if (slot > 15) continue;
+    GLint loc = glGetUniformLocation(c->prog, names[i]);
+    c->nativeLoc[stage][slot] = loc;
+    c->nativeBase[stage][slot] = base_types[i];
+    c->nativeComps[stage][slot] = components != NULL && components[i] > 0 ? components[i] : 1;
+    c->nativeSize[stage][slot] = sizes != NULL && sizes[i] > 0 ? sizes[i] : 1;
+  }
+  c->nativeLayoutProg = c->prog;
+  c->nativeLayoutHash = h;
+  if (prev != (GLint)c->prog) glUseProgram((GLuint)prev);
+  sk_gr_reset_context();
+}
+
+// Apply the staged uniforms of the live native program. GL has no notion of "a buffer
+// per uniform slot", so each entry is a glUniform* call whose width/array length comes
+// from the reflection: matrices by components 4/9/16, vectors by 1..4, integer
+// uniforms through the *iv entry points (the payload carries int bits, not floats).
+static void s3d_apply_native_uniforms(S3DContext* c) {
+  for (int stage = 0; stage < 2; stage++) {
+    for (int slot = 0; slot < 16; slot++) {
+      if (!c->nativeUniformSet[stage][slot]) continue;
+      int loc = c->nativeLoc[stage][slot];
+      if (loc < 0) continue;   // optimized out by the driver: same as Metal's unused buffer
+      const float* f = (const float*)c->nativeUniform[stage][slot];
+      int comps = c->nativeComps[stage][slot];
+      int size = c->nativeSize[stage][slot];
+      if (size < 1) size = 1;
+      int base = c->nativeBase[stage][slot];
+      if (comps == 16) { glUniformMatrix4fv(loc, size, GL_FALSE, f); continue; }
+      if (comps == 9) { glUniformMatrix3fv(loc, size, GL_FALSE, f); continue; }
+      if (comps < 1 || comps > 4) comps = 4;
+      int n = size;
+      // The 64-byte payload ceiling caps what one call can carry; a longer array was
+      // already truncated at the AS3 boundary (setUniformFloats rejects > 16).
+      int maxn = 16 / comps;
+      if (n > maxn) n = maxn;
+      if (base == ASC_SHADER_BASE_INT || base == ASC_SHADER_BASE_BOOL) {
+        const GLint* v = (const GLint*)f;
+        switch (comps) {
+          case 1: glUniform1iv(loc, n, v); break;
+          case 2: glUniform2iv(loc, n, v); break;
+          case 3: glUniform3iv(loc, n, v); break;
+          default: glUniform4iv(loc, n, v); break;
+        }
+      } else if (base == ASC_SHADER_BASE_UINT) {
+        const GLuint* v = (const GLuint*)f;
+        switch (comps) {
+          case 1: glUniform1uiv(loc, n, v); break;
+          case 2: glUniform2uiv(loc, n, v); break;
+          case 3: glUniform3uiv(loc, n, v); break;
+          default: glUniform4uiv(loc, n, v); break;
+        }
+      } else {
+        switch (comps) {
+          case 1: glUniform1fv(loc, n, f); break;
+          case 2: glUniform2fv(loc, n, f); break;
+          case 3: glUniform3fv(loc, n, f); break;
+          default: glUniform4fv(loc, n, f); break;
+        }
+      }
+    }
+  }
+}
+
+// Bind the native samplers to their units and give each bound texture the sampler state
+// the caller asked for at that (stage, slot). Sampler state lives on the TEXTURE OBJECT
+// in GL, so a per-material change has to touch the object -- and it invalidates the AGAL
+// path's "already applied" cache for that texture, which is why the cache is dropped.
+static void s3d_bind_native_textures(S3DContext* c) {
+  int dirty = 0;
+  for (int stage = 0; stage < 2; stage++) {
+    // S3D_MAX_NATIVE_TEX, not S3D_MAX_TEX: the AGAL path has eight texture registers per
+    // stage, a translated GLSL ES 3.00 program may declare sixteen, and the ocean's water
+    // program declares ten. Looping to eight left slots 8..15 unbound on their unit -- the
+    // displacement cascade then sampled whatever the previous draw left on unit 0, which
+    // reads as a perfectly flat (constant) height field rather than as an error.
+    for (int slot = 0; slot < S3D_MAX_NATIVE_TEX; slot++) {
+      if (!c->nativeTexTable[stage][slot]) continue;   // this program has no sampler here
+      int unit = c->nativeUnit[stage][slot];
+      if (unit < 0 || unit >= 32) continue;
+      glActiveTexture(GL_TEXTURE0 + unit);
+      GLuint tex = c->nativeTex[stage][slot];
+      if (tex == 0) { glBindTexture(GL_TEXTURE_2D, 0); glBindTexture(GL_TEXTURE_CUBE_MAP, 0); continue; }
+      GLenum tgt = s3d_tex_gltarget(c, tex);
+      glBindTexture(tgt, tex);
+      if (c->nativeSamplerSet[stage][slot]) {
+        int f = c->nativeSampler[stage][slot][0];
+        int w = c->nativeSampler[stage][slot][1];
+        int m = c->nativeSampler[stage][slot][2];
+        s3d_set_tex_params(tgt, f, w, m);
+        c->texStateN = 0;
+        dirty = 1;
+      }
+    }
+  }
+  glActiveTexture(GL_TEXTURE0);
+  (void)dirty;
+}
+
+// A native target set: up to four colour textures plus an optional depth texture, cached
+// by identity. Everything is attached as a TEXTURE (not a renderbuffer) because the
+// whole point of a native target is that the same object is sampled afterwards.
+static S3DNativeTarget* s3d_native_target_create(S3DContext* c, const GLuint* colors, int ncolors, GLuint depth) {
+  S3DNativeTarget* t = NULL;
+  for (int i = 0; i < S3D_MAX_NATIVE_TARGETS; i++)
+    if (!c->nativeTargets[i].used) { t = &c->nativeTargets[i]; break; }
+  if (t == NULL) {
+    // No free slot: recycle the first. A pass list with more than eight live sets is
+    // outside what this channel is used for, and reusing one is visible (a wasted
+    // create) rather than silently wrong.
+    t = &c->nativeTargets[0];
+    if (t->fbo != 0) glDeleteFramebuffers(1, &t->fbo);
+  }
+  memset(t, 0, sizeof *t);
+  t->ncolors = ncolors;
+  t->depth = depth;
+  for (int i = 0; i < ncolors && i < 4; i++) t->colors[i] = colors[i];
+  // Size comes from the registry: WebGL2 has no glGetTexLevelParameteriv (that is ES
+  // 3.1), so every texture this file creates records its dimensions at creation.
+  int w = 0, h = 0;
+  for (int i = 0; i < c->rtTexN; i++) {
+    if (ncolors > 0 && c->rtTex[i].id == colors[0]) { w = c->rtTex[i].width; h = c->rtTex[i].height; break; }
+    if (ncolors == 0 && depth != 0 && c->rtTex[i].id == depth) { w = c->rtTex[i].width; h = c->rtTex[i].height; break; }
+  }
+  if (w <= 0 || h <= 0) { w = c->width; h = c->height; }
+  t->width = w;
+  t->height = h;
+  glGenFramebuffers(1, &t->fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
+  GLenum bufs[4] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3 };
+  for (int i = 0; i < ncolors && i < 4; i++) {
+    if (colors[i] != 0) glFramebufferTexture2D(GL_FRAMEBUFFER, (GLenum)(GL_COLOR_ATTACHMENT0 + i), GL_TEXTURE_2D, colors[i], 0);
+  }
+  if (ncolors > 0) glDrawBuffers(ncolors, bufs);
+  else { GLenum none = GL_NONE; glDrawBuffers(1, &none); }
+  if (depth != 0) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, depth, 0);
+  GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  t->used = 1;
+  t->complete = (st == GL_FRAMEBUFFER_COMPLETE);
+  if (!t->complete) {
+    // Reported with the ids so the caller can map them back to its own passes: an
+    // incomplete native target is otherwise a silently black picture. The most common
+    // cause on WebGL2 is a MRT set whose attachments differ in FORMAT (the spec
+    // requires them to match), which no amount of correct shader code fixes.
+    fprintf(stderr, "stage3d_webgl: native target FBO incomplete (0x%x) colors=%u,%u,%u,%u depth=%u %dx%d\n",
+            (unsigned)st, (unsigned)t->colors[0], (unsigned)t->colors[1], (unsigned)t->colors[2],
+            (unsigned)t->colors[3], (unsigned)depth, w, h);
+  }
+  return t;
+}
+
+void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  int n = colors != NULL ? ncolors : 0;
+  if (n > 4) n = 4;
+  if (n < 0) n = 0;
+  GLuint col[4] = { 0, 0, 0, 0 };
+  for (int i = 0; i < n; i++) col[i] = (GLuint)(uintptr_t)(colors[i]);
+  GLuint d = (GLuint)(uintptr_t)depth;
+  if (n == 0 && d == 0) { c->nativeTarget = NULL; sk_gr_reset_context(); return; }
+  S3DNativeTarget* t = NULL;
+  for (int i = 0; i < S3D_MAX_NATIVE_TARGETS; i++) {
+    S3DNativeTarget* e = &c->nativeTargets[i];
+    if (!e->used || e->ncolors != n || e->depth != d) continue;
+    int same = 1;
+    for (int k = 0; k < n; k++) if (e->colors[k] != col[k]) { same = 0; break; }
+    if (same) { t = e; break; }
+  }
+  if (t == NULL) t = s3d_native_target_create(c, col, n, d);
+  c->nativeTarget = t;
+  if (t != NULL) c->nativeNColor = t->ncolors > 0 ? t->ncolors : 1;
+  sk_gr_reset_context();
+}
+
+void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId, int renderable, int mipmapped) {
+  if (ctx == NULL || width <= 0 || height <= 0) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  GLint internal = 0;
+  GLenum format = 0, type = 0;
+  int isDepth = 0;
+  if (!s3d_fmt_web(fmtId, &internal, &format, &type, &isDepth)) {
+    fprintf(stderr, "stage3d_webgl: createTexture: unsupported format id %d\n", fmtId);
+    return NULL;
+  }
+  GLuint tex = 0;
+  glGenTextures(1, &tex);
+  glBindTexture(GL_TEXTURE_2D, tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0, format, type, NULL);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  // LINEAR even for float formats: OES_texture_float_linear is enabled at context
+  // creation for the formats that need it, and a GPU-data pass that wanted NEAREST
+  // sets it through setSamplerStateAtStage anyway.
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  if (isDepth) {
+    // Sampled as a float (`texture(tDepth, uv).r`), never compared: WebGL2 keeps a depth
+    // texture filterable only in this mode, and the ocean's underwater absorption reads
+    // it exactly that way. GL does not need the texture to be "incomplete" to be
+    // sampleable once the compare mode is off.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_NONE);
+  }
+  (void)renderable;
+  s3d_rt_register(c, tex, width, height, fmtId == 4 ? 1 : 0);
+  (void)mipmapped;  // the chain is allocated by the first s3d_generate_mips call
+  sk_gr_reset_context();
+  return (void*)(uintptr_t)tex;
+}
+
+void s3d_generate_mips(void* ctx, void* tex) {
+  if (ctx == NULL || tex == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  GLuint t = (GLuint)(uintptr_t)tex;
+  GLenum tgt = s3d_tex_gltarget(c, t);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(tgt, t);
+  while (glGetError() != 0) { }
+  glGenerateMipmap(tgt);
+  // A refused chain is invisible at the call site and black at the sample site: a
+  // textureLod past level 0 of an unmipmapped texture returns (0,0,0,1), which looks
+  // exactly like "my sky shader does nothing". WebGL2 refuses glGenerateMipmap for a
+  // format the device cannot filter (a float target without the linear-filter
+  // extension), so it is reported rather than left to be debugged as a shader bug.
+  {
+    GLenum e = glGetError();
+    if (e != 0) {
+      static int warned = 0;
+      if (!warned) {
+        fprintf(stderr, "stage3d_webgl: glGenerateMipmap(0x%x) failed on texture %u (0x%x); every LOD>0 sample of it will read black\n",
+                (unsigned)e, (unsigned)t, (unsigned)tgt);
+        warned = 1;
+      }
+    }
+  }
+  // The chain exists now: the AGAL path's "this texture has no mips ⇒ drop the draw"
+  // rule (AIR fidelity) has to see that, or a mip-filtered sample of a target that was
+  // just generated would be dropped for the rest of the frame.
+  for (int i = 0; i < S3D_MAX_TEX; i++) if (c->textures[i] == t) c->texHasMips[i] = 1;
+  sk_gr_reset_context();
+}
+
+// Per-target multisample level. NOT IMPLEMENTED on this backend yet: WebGL2 can do it
+// (multisampled renderbuffers + glBlitFramebuffer resolve) but the resolve has to be
+// interleaved with the pass list rather than being a per-texture flag, and a control
+// that silently does nothing is worse than one that reports (AGENTS.md §0). Returns 0,
+// which the AS3 side reports as "the device refused the level".
+int s3d_set_target_samples(void* ctx, void* tex, int samples) {
+  (void)tex;
+  (void)samples;
+  if (ctx == NULL) return 0;
+  static int warned = 0;
+  if (!warned) {
+    fprintf(stderr, "stage3d_webgl: setRenderTargetSamples: per-target MSAA is not implemented on "
+                    "WebGL2 yet — the level is refused (reported), edges stay aliased\n");
+    warned = 1;
+  }
+  return 0;
+}
+
+#endif  // ASC_USE_NATIVE_SHADER
+
 // ---- render ----------------------------------------------------------------
 
 void s3d_clear(void* ctx, float r, float g, float b, float a, float depth, unsigned int stencil, int maskBits) {
@@ -1166,9 +2089,36 @@ int s3d_draw(void* ctx, int numTriangles) {
   if (c->ibo == 0) return 0;
   if (numTriangles <= 0) { c->clearPending = 0; return 0; }
 
-  GLuint fbo = (c->overrideRt != NULL) ? c->overrideRt->fbo : c->fbo;
-  int tw = (c->overrideRt != NULL) ? c->overrideRt->width : c->width;
-  int th = (c->overrideRt != NULL) ? c->overrideRt->height : c->height;
+  // Which surface this draw lands on. Three cases, in priority order:
+  //   native target set (Context3DNative.setRenderTargets) -- the E6 channel renders
+  //     into up to four float/half textures and an optional depth texture, so the FBO
+  //     is the cached one for that set rather than the AGAL render override;
+  //   AGAL render override (setRenderTarget) -- one texture;
+  //   the back buffer.
+  // An incomplete native set refuses the draw instead of falling through to the back
+  // buffer: silently drawing the scene into the visible surface while the caller
+  // samples an untouched texture is the exact "plausible wrong picture" this codebase
+  // rules out.
+  GLuint fbo;
+  int tw, th;
+  if (c->nativeMode && c->nativeTarget != NULL) {
+    if (!c->nativeTarget->complete) {
+      if (asc_s3d_dump())
+        fprintf(stderr, "S3D native-drop: the active native target set is incomplete (see the create log)\n");
+      return 0;
+    }
+    fbo = c->nativeTarget->fbo;
+    tw = c->nativeTarget->width;
+    th = c->nativeTarget->height;
+  } else if (c->overrideRt != NULL) {
+    fbo = c->overrideRt->fbo;
+    tw = c->overrideRt->width;
+    th = c->overrideRt->height;
+  } else {
+    fbo = c->fbo;
+    tw = c->width;
+    th = c->height;
+  }
   glBindFramebuffer(GL_FRAMEBUFFER, fbo);
   glViewport(0, 0, tw, th);
 
@@ -1218,16 +2168,22 @@ int s3d_draw(void* ctx, int numTriangles) {
   // would treat the texture as INCOMPLETE and sample black, i.e. draw a black
   // quad where AIR draws nothing -- so the drop is enforced here. Placed AFTER
   // the deferred clear so the frame still clears, which is what AIR does.
-  for (int i = 0; i < S3D_MAX_TEX; i++) {
-    if (c->samplerStateSet[i] && c->samplerMip[i] != 0 && c->texHasMips[i] == 0 && c->textures[i] != 0) {
-      if (asc_s3d_dump())
-        fprintf(stderr, "S3D mip-drop: unit %d asks for mipmaps but the bound texture has no chain (AIR drops the draw)\n", i);
-      return 0;
+  if (!c->nativeMode) {
+    for (int i = 0; i < S3D_MAX_TEX; i++) {
+      if (c->samplerStateSet[i] && c->samplerMip[i] != 0 && c->texHasMips[i] == 0 && c->textures[i] != 0) {
+        if (asc_s3d_dump())
+          fprintf(stderr, "S3D mip-drop: unit %d asks for mipmaps but the bound texture has no chain (AIR drops the draw)\n", i);
+        return 0;
+      }
     }
   }
 
   glUseProgram(c->prog);
-  s3d_flush_constants(c);
+  // Two uniform models share this draw. AGAL stages its constants in vc/fc and they are
+  // flushed here; a native program gets one uniform at a time through setUniform* into
+  // nativeUniform, which is uploaded with the width the reflection reported.
+  if (c->nativeMode) s3d_apply_native_uniforms(c);
+  else s3d_flush_constants(c);
 
   // Depth/stencil are only *used* by passes that need them, mirroring the Metal
   // glue: an always-attached D24S8 costs a per-draw load/store of the whole
@@ -1235,6 +2191,15 @@ int s3d_draw(void* ctx, int numTriangles) {
   int dsNeeded = (c->depthCompare != NULL && strcmp(c->depthCompare, "always") != 0)
               || (c->stencilCompare != NULL && strcmp(c->stencilCompare, "always") != 0)
               || (c->stencilBothPass != NULL && strcmp(c->stencilBothPass, "keep") != 0);
+  // A native target set carries its OWN depth attachment (or none). Enabling
+  // GL_DEPTH_TEST against an FBO with no depth attachment is a no-op in GL, so the
+  // state would claim a test that cannot happen; say so through the dump hook and leave
+  // it off, which is also what Metal does with a nil depth texture.
+  if (c->nativeMode && c->nativeTarget != NULL && c->nativeTarget->depth == 0) {
+    if (asc_s3d_dump() && dsNeeded)
+      fprintf(stderr, "S3D native: draw asks for a depth test but the target set has no depth attachment (test off)\n");
+    dsNeeded = 0;
+  }
   if (dsNeeded) {
     glEnable(GL_DEPTH_TEST);
     glDepthMask(c->depthWrite ? GL_TRUE : GL_FALSE);
@@ -1269,16 +2234,29 @@ int s3d_draw(void* ctx, int numTriangles) {
 
   // Culling. Stage3D's "frontAndBack" is its "do not cull" default (Starling
   // renders with it), NOT GL's cull-everything. Front faces are CCW because the
-  // GLSL vertex stage negates clip-space Y (see the header): Stage3D's front face
-  // is CW on Metal, which does not flip.
-  if (c->cullMode != NULL && !strcmp(c->cullMode, "back")) {
-    glEnable(GL_CULL_FACE); glCullFace(GL_BACK);
-  } else if (c->cullMode != NULL && !strcmp(c->cullMode, "front")) {
-    glEnable(GL_CULL_FACE); glCullFace(GL_FRONT);
-  } else {
-    glDisable(GL_CULL_FACE);
+  // AGAL GLSL vertex stage negates clip-space Y (see the header): Stage3D's front
+  // face is CW on Metal, which does not flip.
+  //
+  // A NATIVE program gets no such help -- it writes gl_Position itself, with no Y
+  // negation -- so GL judges the SAME geometry with the opposite winding. The fix is to
+  // flip the FRONT-FACE WINDING for native draws rather than to complement the cull mode:
+  // complementing the cull mode does put the same triangles on screen, but it leaves
+  // gl_FrontFacing inverted, and that is a second, silent difference. Without either fix
+  // a FrontSide quad (shader-m30 has exactly that) is culled away -- uniforms and
+  // attributes all resolve, glError stays 0, and the screen is the clear colour; with
+  // only the cull complement the ocean's surface pass classified every fragment as the
+  // UNDERSIDE of the water (49.9% underside / 0.2% top side) for the same reason.
+  glFrontFace(c->nativeMode ? GL_CW : GL_CCW);
+  {
+    const char* cull = c->cullMode;
+    if (cull != NULL && !strcmp(cull, "back")) {
+      glEnable(GL_CULL_FACE); glCullFace(GL_BACK);
+    } else if (cull != NULL && !strcmp(cull, "front")) {
+      glEnable(GL_CULL_FACE); glCullFace(GL_FRONT);
+    } else {
+      glDisable(GL_CULL_FACE);
+    }
   }
-  glFrontFace(GL_CCW);
 
   // Color write mask (setColorMask): GL keeps it as context state, so an
   // unmasked draw must explicitly restore all four channels (unlike Metal, whose
@@ -1318,7 +2296,9 @@ int s3d_draw(void* ctx, int numTriangles) {
     glDisable(GL_SCISSOR_TEST);
   }
 
-  // Vertex streams -> attributes 0..7 (bound by name in s3d_compile).
+  // Vertex streams -> attributes 0..7 (bound by name in s3d_compile). This is the same
+  // rule for a native program: the author signs the contract by declaring
+  // `layout(location = N) in ...`, so stream N feeds attribute N.
   glBindVertexArray(c->vao);
   for (int i = 0; i < S3D_MAX_ATTR; i++) {
     if (c->vbo[i] != 0 && c->components[i] > 0) {
@@ -1329,24 +2309,30 @@ int s3d_draw(void* ctx, int numTriangles) {
       glDisableVertexAttribArray(i);
     }
   }
-  // Fragment samplers fs0..fs7 -> texture units 0..7 (wired at link time), with
-  // each unit's recorded sampler state applied to its texture object. The bind
-  // target must match what the texture was created as (a cube map on
-  // GL_TEXTURE_2D is GL_INVALID_OPERATION and samples black); an empty unit
-  // clears BOTH targets, since a leftover cube binding would otherwise be what a
-  // samplerCube samples.
-  for (int i = 0; i < S3D_MAX_TEX; i++) {
-    glActiveTexture(GL_TEXTURE0 + i);
-    if (c->textures[i] != 0) {
-      GLenum tgt = s3d_tex_gltarget(c, c->textures[i]);
-      glBindTexture(tgt, c->textures[i]);
-      s3d_apply_sampler(c, c->textures[i], i);
-    } else {
-      glBindTexture(GL_TEXTURE_2D, 0);
-      glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+  if (c->nativeMode) {
+    // Native samplers: named ones, at their own units (fragment 0..7 / vertex 8..15),
+    // with the state setSamplerStateAtStage recorded for that (stage, slot).
+    s3d_bind_native_textures(c);
+  } else {
+    // Fragment samplers fs0..fs7 -> texture units 0..7 (wired at link time), with
+    // each unit's recorded sampler state applied to its texture object. The bind
+    // target must match what the texture was created as (a cube map on
+    // GL_TEXTURE_2D is GL_INVALID_OPERATION and samples black); an empty unit
+    // clears BOTH targets, since a leftover cube binding would otherwise be what a
+    // samplerCube samples.
+    for (int i = 0; i < S3D_MAX_TEX; i++) {
+      glActiveTexture(GL_TEXTURE0 + i);
+      if (c->textures[i] != 0) {
+        GLenum tgt = s3d_tex_gltarget(c, c->textures[i]);
+        glBindTexture(tgt, c->textures[i]);
+        s3d_apply_sampler(c, c->textures[i], i);
+      } else {
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0);
+      }
     }
+    glActiveTexture(GL_TEXTURE0);
   }
-  glActiveTexture(GL_TEXTURE0);
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c->ibo);
 
   if (c->instanceCount > 1) {

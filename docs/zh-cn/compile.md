@@ -353,7 +353,7 @@ as-aot app.as --air-app app.xml --features none     # 清空（见下：会把�
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | `native` / `wasm` | 额外图片格式 WebP / BMP / ICO（AIR 对它们报 `#2124`，故**默认拒绝**——见 §3.4.3.1） |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | 仅 `native` | 相机 RAW / DNG（默认拒绝——见 §3.4.3.1；web 侧 Skia 无 piex/dng_sdk 归档，故目标不支持时就报错） |
 | `tray` | `ASC_USE_TRAY=1` | 仅 `native`，**且宿主须为 macOS** | `SystemTrayIcon` 背后是真 `NSStatusItem`（见 §3.4.5）。AIR 在 macOS 上根本没有托盘（`supportsSystemTrayIcon=false`、`#2012`），故默认关闭 |
-| `native-shader` | `ASC_USE_NATIVE_SHADER=1` | 仅 `native` | 注册 `flash.display3D.Context3DNative` / `NativeProgram3D`（作者 GLSL ES 3.00 → glslang + SPIRV-Cross → MSL），并链上 `vendor/shader` 的 14 个静态库。AIR 只有 AGAL 寄存器语言，故默认关闭——**默认构建里这两个类不存在**，`getDefinitionByName` 与 `adl` 同形抛 `#1065`。见 [`native-shader.md`](native-shader.md) |
+| `native-shader` | `ASC_USE_NATIVE_SHADER=1` | `native` + `wasm` | 注册 `flash.display3D.Context3DNative` / `NativeProgram3D`。native 侧走作者 GLSL ES 3.00 → glslang + SPIRV-Cross → MSL 并链上 `vendor/shader` 的 14 个静态库；**wasm 侧是直通**：同一份 ES 3.00 直接交给 WebGL2 编译、驱动反射，不编 `shader_compiler.cc` 也不链那两个库。AIR 只有 AGAL 寄存器语言，故默认关闭——**默认构建里这两个类不存在**，`getDefinitionByName` 与 `adl` 同形抛 `#1065`。见 [`native-shader.md`](native-shader.md) |
 
 这张表是**全部**的具名增强开关：`--features` 只登记「AIR 超集能力」——默认关、开后改变产物语义。
 窗口 GPU 后端**不在**表里：`--features gl` 会按未知名字报错。后端是**独立开关** `--gpu-backend`

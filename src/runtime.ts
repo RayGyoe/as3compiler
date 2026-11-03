@@ -15878,6 +15878,22 @@ typedef struct {
 extern int asc_shader_translate(const char* vs, const char* fs, int target, asc_shader_program* out);
 extern void asc_shader_program_free(asc_shader_program* p);
 extern const char* asc_shader_backend_info(void);
+// The WebGL2 arm's reflection source: the DRIVER, not a cross-compiler. It compiles
+// and links the pair with the real GL context, then answers
+// glGetActiveUniform/glGetActiveAttrib -- so the table describes the program the GPU
+// will actually run, not a translation of it. Declared only for the GLSL backend:
+// on Metal there is no such symbol and nothing may name one (AGENTS.md §2.5).
+#ifdef ASC_S3D_GLSL
+extern int s3d_native_reflect(void* ctx, const char* vs, const char* fs, asc_shader_program* out);
+#endif
+// The name->slot table that came out of reflection, handed to the backend once per
+// successful program bind. Metal needs nothing here (SPIRV-Cross baked the slots
+// into [[buffer(N)]] attributes); GL needs it because its bindings are *names*,
+// and setUniform/setSamplerStateAt only carry the slot number.
+//   kinds: ASC_SHADER_KIND_*; stages: 0 vertex / 1 fragment; base_types: ASC_SHADER_BASE_*.
+extern void s3d_native_layout(void* ctx, const char* const* names, const int* kinds,
+                              const int* stages, const int* slots, const int* base_types,
+                              const int* components, const int* sizes, int count);
 
 // Which language the linked Stage3D backend actually consumes. Mirrors
 // ASC_AGAL_TARGET's three-way split (runtime.ts above): MSL for Metal, GLSL ES for
@@ -15890,6 +15906,23 @@ extern const char* asc_shader_backend_info(void);
 #else
 #define AS_SHADER_BACKEND_TARGET ASC_SHADER_TARGET_MSL
 #endif
+
+// One entry point for "compile this pair and reflect it", because the two arms
+// answer the question in genuinely different ways and only this file may know that:
+//   native -> asc_shader_translate (glslang -> SPIR-V -> SPIRV-Cross -> MSL/HLSL)
+//   web    -> s3d_native_reflect   (glCompileShader + glGetActiveUniform: no
+//             translation happens, WebGL2 runs the author's GLSL ES 3.00 as written)
+// gpu is the backend handle from Context3D (unused on the native arm). Keeping one
+// call site means the AS3-facing contract (ok / infoLog / bindings / attachments)
+// cannot drift between the two, which is the whole point of the seam.
+static inline int as_shader_translate_program(void* gpu, const char* vs, const char* fs, asc_shader_program* out) {
+#ifdef ASC_S3D_GLSL
+    return s3d_native_reflect(gpu, vs, fs, out);
+#else
+    (void)gpu;
+    return asc_shader_translate(vs, fs, AS_SHADER_BACKEND_TARGET, out);
+#endif
+}
 
 // getInfoLog on a program that compiled cleanly answers the empty string (AIR's
 // Program3D has no such method, so there is no behaviour to mirror -- but three.js
@@ -16338,6 +16371,9 @@ extern void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, i
 extern void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex);
 extern void s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip);
 extern void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth);
+extern void s3d_native_layout(void* ctx, const char* const* names, const int* kinds,
+                              const int* stages, const int* slots, const int* base_types,
+                              const int* components, const int* sizes, int count);
 extern void* s3d_create_texture_fmt(void* ctx, int w, int h, int fmtId, int renderable, int mipmapped);
 // Multisample level of ONE offscreen render target (Context3DNative.setRenderTargetSamples).
 // Per target, not per context: multisampling averages subpixel coverage, so a
@@ -16363,6 +16399,20 @@ static inline void as_s3d_native_uniform(void* ctx, int stage, int slot, const f
     s3d_native_uniform(ctx, stage, slot, f, nfloats);
 #else
     (void)ctx; (void)stage; (void)slot; (void)f; (void)nfloats;
+#endif
+}
+// Reflected name->slot table for the live program (see the declaration above for
+// why the web backend needs it and Metal does not). A backend without Stage3D drops
+// it: there is no program to resolve names against, and the native-use call that
+// precedes it has already reported the absence.
+static inline void as_s3d_native_layout(void* ctx, const char* const* names, const int* kinds,
+                                        const int* stages, const int* slots, const int* base_types,
+                                        const int* components, const int* sizes, int count) {
+#ifdef ASC_RENDER_STAGE3D
+    s3d_native_layout(ctx, names, kinds, stages, slots, base_types, components, sizes, count);
+#else
+    (void)ctx; (void)names; (void)kinds; (void)stages; (void)slots; (void)base_types;
+    (void)components; (void)sizes; (void)count;
 #endif
 }
 static inline void as_s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {

@@ -26116,7 +26116,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('p->fragmentSource = fs; gc_write_barrier((void*)fs);');
     this.line('asc_shader_program sp;');
     this.line('memset(&sp, 0, sizeof(sp));');
-    this.line('int ok = asc_shader_translate(vs, fs, AS_SHADER_BACKEND_TARGET, &sp);');
+    this.line('int ok = as_shader_translate_program(self->context != NULL ? self->context->gpu : NULL, vs, fs, &sp);');
     this.line('p->ok = ok != 0;');
     this.line('if (!ok) {');
     this.indent++;
@@ -26125,8 +26125,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return p;');
     this.indent--;
     this.line('}');
-    this.line('p->translatedVertex = as_str_dup(sp.vertex_source != NULL ? sp.vertex_source : ""); gc_write_barrier((void*)p->translatedVertex);');
-    this.line('p->translatedFragment = as_str_dup(sp.fragment_source != NULL ? sp.fragment_source : ""); gc_write_barrier((void*)p->translatedFragment);');
+    this.line('p->translatedVertex = as_str_dup(sp.vertex_source != NULL ? sp.vertex_source : vs); gc_write_barrier((void*)p->translatedVertex);');
+    this.line('p->translatedFragment = as_str_dup(sp.fragment_source != NULL ? sp.fragment_source : fs); gc_write_barrier((void*)p->translatedFragment);');
     this.line('p->colorAttachments = sp.color_attachments > 0 ? sp.color_attachments : 1;');
     this.line('p->infoLog = as_str_dup(""); gc_write_barrier((void*)p->infoLog);');
     this.line('for (int i = 0; i < sp.binding_count; i++) {');
@@ -26162,6 +26162,37 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
+    // Hand the reflected name->slot table to the backend once, right after the
+    // program is accepted. WHY THIS EXISTS AT ALL: on Metal the slots are already
+    // baked into the translated source as `[[buffer(N)]]`, but on WebGL2 nothing is
+    // translated -- the GL program's uniforms are NAMES, and setUniform only ever
+    // carries a slot number, so the backend needs this table to call
+    // glGetUniformLocation once per binding instead of per setUniform. Attributes are
+    // passed too (harmlessly unused by both backends today): their location is the
+    // vertex-stream index, and a backend that cannot honour `layout(location=N)`
+    // would need them to complain instead of drawing from the wrong buffer.
+    this.line('static void as_shader_apply_layout(Context3DNative* self, NativeProgram3D* p) {');
+    this.indent++;
+    this.line('if (self == NULL || self->context == NULL || p == NULL) return;');
+    this.line('int n = p->bindingNames != NULL ? p->bindingNames->length : 0;');
+    this.line('if (n <= 0) return;');
+    this.line('if (n > 256) as_throw(Error_new((char*)"Context3DNative: program has more than 256 reflected bindings", 0));');
+    this.line('char* names[256]; int kinds[256]; int stages[256]; int slots[256]; int baseTypes[256]; int comps[256]; int sizes[256];');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('const char* nm = as_v_str_val(p->bindingNames->data[i]);');
+    this.line('names[i] = (char*)(nm != NULL ? nm : "");');
+    this.line('kinds[i] = as_v_int_val(p->bindingKinds->data[i]);');
+    this.line('stages[i] = as_v_int_val(p->bindingStages->data[i]);');
+    this.line('slots[i] = as_v_int_val(p->bindingSlots->data[i]);');
+    this.line('baseTypes[i] = as_v_int_val(p->bindingBaseTypes->data[i]);');
+    this.line('comps[i] = as_v_int_val(p->bindingComponents->data[i]);');
+    this.line('sizes[i] = as_v_int_val(p->bindingSizes->data[i]);');
+    this.indent--;
+    this.line('}');
+    this.line('as_s3d_native_layout(self->context->gpu, names, kinds, stages, slots, baseTypes, comps, sizes, n);');
+    this.indent--;
+    this.line('}');
     this.line('void Context3DNative_useProgram(void* _this, NativeProgram3D* p) {');
     this.indent++;
     this.line('as_shader_require_ok(p, "useProgram");');
@@ -26176,6 +26207,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_throw(Error_new(msg, 0));');
     this.indent--;
     this.line('}');
+    this.line('as_shader_apply_layout(self, p);');
     this.indent--;
     this.line('}');
     // setUniform*f: a name that the reflection table does not carry is an

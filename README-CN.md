@@ -445,7 +445,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - **macOS 菜单栏状态项** — `SystemTrayIcon` 背后是真 `NSStatusItem`（`--features tray`；AIR 在 macOS 上 `supportsSystemTrayIcon=false`、构造抛 `#2012`）
 **进行中（1 / 19）**：
 
-- **原生着色器直通**（E6）— `Context3DNative` 吃 GLSL ES 3.00 源码，经 glslang + SPIR-V + SPIRV-Cross 出 MSL（`--features native-shader`，仅 native；AIR 只有 AGAL 寄存器语言，默认构建里这几个类**不存在**，`getDefinitionByName` 与 `adl` 同形抛 `#1065`）。**通路已真机验收**（`asaot3d/apps/shader-m30`：作者一对 GLSL 画四边形，读回中心 `#804020` 与表达式逐位相符；默认构建/`adl` 打印 `NO-CHANNEL` 并拒画）。**尚未完成**：Web 直通、D3D12、深度纹理的 `sampler2DShadow` 比较采样（清单见 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md) §11）。离屏目标可**逐目标**多重采样（`Context3DNative.setRenderTargetSamples(tex, 1|2|4|8)`，默认 1＝AIR 等价路径；绘制进 companion、读取前惰性 resolve，见同文档 §6.10）
+- **原生着色器直通**（E6）— `Context3DNative` 吃 GLSL ES 3.00 源码，经 glslang + SPIR-V + SPIRV-Cross 出 MSL（`--features native-shader`；AIR 只有 AGAL 寄存器语言，默认构建里这几个类**不存在**，`getDefinitionByName` 与 `adl` 同形抛 `#1065`）。**通路已真机验收**（`asaot3d/apps/shader-m30`：作者一对 GLSL 画四边形，读回中心 `#804020` 与表达式逐位相符；默认构建/`adl` 打印 `NO-CHANNEL` 并拒画）。**Web 直通已落地**（同一份 GLSL ES 3.00 直接交给 WebGL2 编译、用驱动反射，wasm 侧不链接 glslang/SPIRV-Cross，见同文档 §6.11）；**尚未完成**：D3D12、深度纹理的 `sampler2DShadow` 比较采样（清单见 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md) §11）。离屏目标可**逐目标**多重采样（`Context3DNative.setRenderTargetSamples(tex, 1|2|4|8)`，默认 1＝AIR 等价路径；绘制进 companion、读取前惰性 resolve，见同文档 §6.10）
 
 完整 19 项清单（余 Lottie、FFI、服务端出图…）与五条判定标准见
 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md)。

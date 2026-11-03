@@ -536,9 +536,14 @@ function checkFeatures(): string[] {
     effectiveDefines(withNativeShader).includes('ASC_USE_NATIVE_SHADER=1'));
   check('a default build defines no native-shader macro',
     !effectiveDefines(dflt).some((d) => d.startsWith('ASC_USE_NATIVE_SHADER')));
-  check('native-shader is native-only, and says why', (() => {
-    try { validateFeatures(['native-shader'], 'wasm'); return false; }
-    catch (e) { return String(e).includes('native'); }
+  check('native-shader is accepted on BOTH backends, for two different reasons', (() => {
+    // native cross-compiles GLSL ES 3.00 -> SPIR-V -> MSL/HLSL with the vendored
+    // archives; WebGL2 compiles the author's source as written (driver reflection,
+    // no cross-compiler at all -- see unit: native-shader/ and
+    // docs/zh-cn/native-shader.md 6.11). What is NOT shared is the build input:
+    // a wasm link line must never carry host archives, which unit: native-shader/
+    // pins on the resolved config.
+    try { validateFeatures(['native-shader'], 'wasm'); return true; } catch { return false; }
   })());
 
   // (3c) E6 / 阶段二百六十: `tray` -- a REAL macOS menu-bar status item. The one

@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { knownFeatures, validateFeatures } from '../../src/build.ts';
+import { knownFeatures, validateFeatures, applyFeatureDeps, defaultBuildConfig } from '../../src/build.ts';
 import { registerGroup, dir, root, readNorm } from '../harness.ts';
 
 // A program that names the gated class in TYPE position. AS3 answers that at compile
@@ -34,10 +34,28 @@ export function checkNativeShader(): string[] {
 
   // ---- the gate exists and is spelled the same everywhere ----
   ok(knownFeatures().includes('native-shader'), 'native-shader must be a known feature');
-  const off: string[] = [];
-  try { validateFeatures(['native-shader'], 'wasm'); } catch { off.push('wasm'); }
-  ok(off.length === 1, 'native-shader must be refused for --target wasm (host archives only)');
+  // BOTH targets carry the channel, for two different reasons: native cross-compiles
+  // GLSL ES 3.00 to MSL/HLSL with the vendored glslang + SPIRV-Cross pair, while WebGL2
+  // compiles the author's source as written and reflects it with the driver. What must
+  // stay true is the *build input* split: a wasm link line must not carry the host
+  // archives (emcc would reject Mach-O/ELF objects) and must not add the shim.
   validateFeatures(['native-shader'], 'native');   // must not throw
+  validateFeatures(['native-shader'], 'wasm');     // must not throw either: no archives needed
+  const wasmCfg = applyFeatureDeps({ ...defaultBuildConfig(), target: 'wasm', features: ['native-shader'] });
+  ok(wasmCfg.sources.every((s2) => !s2.endsWith('shader_compiler.cc')),
+    'a wasm build must not compile the native cross-compiler shim');
+  ok(wasmCfg.linkLibs.length === 0 && wasmCfg.linkPaths.length === 0,
+    'a wasm build must not link the host glslang/SPIRV-Cross archives');
+  // Native keeps the archives: the feature owns its dependency (the first shader-m30
+  // build compiled and then died at link on _asc_shader_translate).
+  let nativeCfgOk = true;
+  try {
+    const nat = applyFeatureDeps({ ...defaultBuildConfig(), features: ['native-shader'] });
+    nativeCfgOk = nat.sources.some((s2) => s2.endsWith('shader_compiler.cc'));
+  } catch {
+    nativeCfgOk = true;   // no vendored archives on this machine: the loud error is correct
+  }
+  ok(nativeCfgOk, 'a native build must keep the cross-compiler shim on the compile line');
 
   // ---- DEFAULT build: the classes do not exist ----
   const symbolsOff = new (Object.getPrototypeOf({}).constructor)() as never;   // unused placeholder

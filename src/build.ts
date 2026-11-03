@@ -1062,14 +1062,19 @@ const FEATURES: Readonly<Record<string, {
   // classes (Context3DNative / NativeProgram3D) do not exist at all and nothing is
   // linked, keeping a default build both AIR-identical and the same size.
   //
-  // Native only for now: `build-tools/shader/build.sh` produces host archives, and
-  // the web target's shim is a separate step (docs/zh-cn/native-shader.md §5, M4)
-  // because a WebGL2 build submits the author's GLSL verbatim and needs no
-  // cross-compiler at all.
+  // BOTH targets, for two different reasons. Native cross-compiles GLSL ES 3.00 to
+  // MSL/HLSL with the linked glslang + SPIRV-Cross pair (vendor/shader_compiler.cc),
+  // because Metal/D3D12 speak neither GLSL nor SPIR-V. WebGL2 *does* speak GLSL ES
+  // 3.00, so the web arm submits the author's text verbatim and needs no
+  // cross-compiler at all -- but it still needs the host half of the channel (the
+  // s3d_native_* seam in vendor/stage3d_webgl.cc) and a reflection table, which the
+  // driver provides there via glGetActiveUniform/glGetActiveAttrib. The two arms
+  // differ in how they translate; they agree on everything the AS3 side sees
+  // (NativeProgram3D.ok / infoLog / bindingNames / colorAttachments).
   'native-shader': {
     macro: 'ASC_USE_NATIVE_SHADER=1',
-    targets: ['native'],
-    why: 'glslang/SPIRV-Cross are built as host archives under vendor/shader/<host>; the web (WebGL2) side of the channel is a separate milestone',
+    targets: ['native', 'wasm'],
+    why: '',
   },
 };
 
@@ -1319,11 +1324,12 @@ export function shaderFeatureArgs(cfg: BuildConfig): string[] {
 // must happen earlier than any flag assembly).
 export function applyFeatureDeps(cfg: BuildConfig): BuildConfig {
   if (!cfg.features.includes(SHADER_FEATURE)) return cfg;
-  if (cfg.target === 'wasm') {
-    throw new Error(
-      '--features native-shader is a native-only enhancement: the web backend feeds the ' +
-      'author GLSL to WebGL2 as-is, so it needs no cross-compiler.');
-  }
+  // wasm/web: nothing to link. The reflection table comes from the WebGL2 driver
+  // (stage3d_webgl.cc's s3d_native_reflect), and the author's GLSL is what
+  // glCompileShader consumes, so neither the shim nor the archives appear on a
+  // web link line. Adding them would also be wrong, not just useless: they are
+  // host (Mach-O/ELF) archives and emcc would reject them.
+  if (cfg.target === 'wasm') return cfg;
   const root = shaderVendorRoot();
   const shim = resolve(shaderVendorParent(), 'shader_compiler.cc');
   const sources = cfg.sources.includes(shim) ? cfg.sources : [shim, ...cfg.sources];
