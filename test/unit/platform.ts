@@ -520,10 +520,15 @@ function checkNativeWindow(): string[] {
   // counts the arguments of every sk_open_window call site instead of trusting one
   // signature to have been updated everywhere (see unit: platform/InitialWindowStyle).
   const seamDefs = count(preamble, 'as_window_create(int w, int h, const char* title, int resizable, int maximizable, int minimizable,');
+  // The stub's cast is matched as the whole decorated/highdpi/gpu run, not as a bare
+  // (void)gpu;: the shader seam (as_shader_translate_program) now also takes a gpu
+  // handle it discards on the non-GLSL arm, so a whole-file count of the bare cast
+  // would measure that function too and go red on a change that has nothing to do
+  // with windows.
   check(`every as_window_create definition takes the backend request (${seamDefs})`,
     seamDefs === 2
     && count(preamble, 'int gpu,') === seamDefs + 1  // + the sk_window_create extern
-    && count(preamble, '(void)gpu;') === seamDefs
+    && count(preamble, '(void)decorated; (void)highdpi; (void)gpu;') === seamDefs
     && preamble.includes('return sk_window_create(w, h, title, resizable, maximizable, minimizable, decorated, highdpi, gpu,'));
   check('the GPU frame helpers take the window id too',
     preamble.includes('static inline void* as_skia_gpu_begin_frame(int id, int w, int h)')
