@@ -2341,9 +2341,12 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
-    // Loader: a DisplayObjectContainer that holds loaded content. load(url) is a
-    // synchronous simulation: it builds a LoaderInfo, records the URL, and dispatches
-    // INIT then COMPLETE. Real asynchronous loading (URLRequest/URLLoader) is stage 63.
+    // Loader: a DisplayObjectContainer that holds loaded content. load(url) /
+    // loadBytes(bytes) submit an async decode job (阶段八十九·四十五); it builds a
+    // LoaderInfo, records the URL, and returns with content == NULL. INIT then
+    // COMPLETE arrive from the job's finish thunk with the content already
+    // published (阶段三百二十一, measured on adl 51.4.1: a listener reading
+    // loader.content during INIT gets the Bitmap).
     const ldf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Loader', isStatic: false, isConst: false });
     const ldg = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Loader', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     this.classMap.set('Loader', {

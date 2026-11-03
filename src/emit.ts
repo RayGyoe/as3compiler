@@ -15390,6 +15390,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // loader.content draws nothing at all. It also makes the content dispatch
     // addedToStage when the Loader is already on the stage, like AIR.
     this.line('DisplayObjectContainer_addChildAt((void*)o, (DisplayObject*)bmp, 0);');
+    // INIT means "the content is initialized": AIR fires its INIT listener with a
+    // READY content and only then COMPLETE (measured, temp/initprobe/). It is
+    // dispatched HERE rather than in load()/loadBytes() because the decode is what
+    // produces the content; a failure path above returns before this, so a failed
+    // load reports ioError and never a bogus INIT.
+    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
     this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"complete", false, false));');
     this.indent--;
     this.line('}');
@@ -15400,8 +15406,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('char* url = (request != NULL) ? request->url : NULL;');
     this.line('li->url = url; gc_write_barrier((void*)url);');
     this.line('li->bytesLoaded = 0; li->bytesTotal = 0;');
-    // AIR nulls `content` for the duration of the load and dispatches Event.INIT
-    // synchronously; the decode + COMPLETE arrive via the job's finish thunk.
+    // AIR nulls `content` for the duration of the load; the decode, INIT and
+    // COMPLETE all arrive later via the job's finish thunk. INIT is NOT dispatched
+    // from here: measured on adl 51.4.1 (temp/initprobe/), load()/loadBytes()
+    // return with content == NULL and the INIT listener then sees a READY content
+    // (bitmapData readable) -- content is only set just before INIT. Dispatching
+    // INIT synchronously left content NULL inside the listener, so every caller
+    // that does `(loader.content as Bitmap).bitmapData` on INIT (the SVGA gift
+    // player's VideoEntity does exactly that) threw TypeError #1009.
     // The PREVIOUS content leaves the child list at the same moment: measured on
     // adl 51.4.1 (temp/ldr2/), right after a second load()/loadBytes() returns the
     // Loader reports numChildren == 0 and content == null, and after COMPLETE
@@ -15414,7 +15426,6 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // The transport is chosen from the URL inside the runtime (a local path is a
     // file read, http(s):// is the HTTP job), so this line stays one call.
     this.line('if (url != NULL) as_async_submit_image((void*)o, Loader__imageFinish, url);');
-    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
     this.indent--;
     this.line('}');
     // unload() detaches the content the way AIR does: the loaded child leaves the
@@ -15439,7 +15450,6 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // the job at submit time, so the caller may clear/dispose the ByteArray (as
     // Starling's AssetManager does) while the decode is still in flight.
     this.line('as_async_submit_bytes(AS_JOB_DECODE, (void*)o, Loader__imageFinish, (bytes != NULL) ? bytes->data : NULL, (bytes != NULL) ? (size_t)bytes->length : 0);');
-    this.line('EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));');
     this.indent--;
     this.line('}');
     this.line('');

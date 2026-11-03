@@ -780,6 +780,7 @@ AIR 侧的观测方式是**截 `adl` 窗口的屏幕**（`adl` 吞掉 `trace()`�
 | 事件序列（`open`→`httpResponseStatus`→`httpStatus`→…） | `200` → `open` → … → `complete`（同 §6.7.1） | 同 | ✅（文案不同，事件集相同） |
 | 两张互联网 PNG（`Loader.load`，阶段八十九·五十四） | 两张均上屏：`753×751` / `815×814` 缩到 340 宽（`340×339` / `340×340`），位于 `(10,60)` / `(370,60)`，`bytesTotal` `487042` / `511484` | 逐项相同（含 `bytesTotal` 与缩放后的取整尺寸） | ✅ |
 | 图片加载的终态事件（同左） | `INIT` → `COMPLETE`，`content` 为 `Bitmap`，`numChildren == 1` | 同（同一份 `Main.as`、同一个 `Loader__imageFinish`） | ✅ |
+| 事件与 `content` 的先后（阶段三百二十一） | `load()`/`loadBytes()` 返回时 `content == null` 且**不派发任何事件**；`INIT` 到达时 `content` **已就位**（监听器里读 `(content as Bitmap).bitmapData` 可用），随后才是 `COMPLETE`；失败只报 `ioError`、**不报 `INIT`** | 同（`Loader__imageFinish` 内先挂 `content`／`addChildAt`，再 `INIT`、再 `COMPLETE`；错误分支提前 `return`） | ✅ |
 | 失败路径（无后端） | —（AIR 总能联网） | 两处请求都落诚实 `ioError`（反向对照） | ✅ |
 
 > 反向对照：同一份 `.as` 用**默认构建**（无 `ASC_HAVE_CURL`）跑 → 第一处登录就落在

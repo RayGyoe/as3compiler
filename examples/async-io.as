@@ -143,7 +143,15 @@ check(failState.indexOf("ioError:") == 0, "an unreadable URL reports IO_ERROR on
 check(failState != "complete", "an unreadable URL never reports COMPLETE");
 check(fail.data != null && fail.data == "", "a failed load publishes an EMPTY value, not null (AIR: data=String len=0)");
 
-// --- 6. Loader.loadBytes: reads the payload, INIT is synchronous, decode may fail ---
+// --- 6. Loader.loadBytes: the decode is a job; INIT follows the content ---
+// Measured on adl 51.4.1 (temp/initprobe/): loadBytes() returns with content
+// null and dispatches NO event. When the decode finishes, INIT arrives with an
+// ALREADY-PUBLISHED content (a listener that reads loader.content there gets the
+// Bitmap) and only then COMPLETE. A failed load reports ioError ALONE, with no
+// INIT (temp/initprobe/FailProbe: #2124, content still null). Dispatching INIT
+// synchronously from loadBytes left content NULL inside the listener, so every
+// caller doing `(loader.content as Bitmap).bitmapData` on INIT (the SVGA gift
+// player's VideoEntity does exactly that) threw TypeError #1009.
 var ldr:Loader = new Loader();
 var ldrInit:Boolean = false;
 var ldrComplete:Boolean = false;
@@ -155,7 +163,7 @@ ldr.contentLoaderInfo.addEventListener(LoaderInfo.INIT, onLdrInit);
 ldr.contentLoaderInfo.addEventListener(LoaderInfo.COMPLETE, onLdrComplete);
 ldr.contentLoaderInfo.addEventListener(LoaderInfo.IO_ERROR, onLdrError);
 ldr.loadBytes(payload);
-check(ldrInit, "loadBytes dispatches INIT synchronously");
+check(!ldrInit, "loadBytes dispatches no event synchronously (AIR: INIT follows the decode)");
 check(!ldrComplete && !ldrError, "loadBytes dispatches no terminal event synchronously");
 check(ldr.content == null, "loadBytes leaves content null until the terminal event");
 tickTimers();
@@ -168,6 +176,7 @@ check(ldr.contentLoaderInfo.bytesTotal == payload.length, "loadBytes reports the
 // pre-stage-89-45 code did by falling through to a 0x0 BitmapData.
 check(ldrError, "an undecodable payload reports IO_ERROR");
 check(!ldrComplete, "an undecodable payload never reports COMPLETE");
+check(!ldrInit, "a failed load never reports INIT (AIR: ioError alone)");
 check(ldr.content == null, "an undecodable payload leaves content null, not an empty Bitmap");
 
 trace("async-io: all asynchronous IO assertions passed");

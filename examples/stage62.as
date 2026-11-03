@@ -96,7 +96,9 @@ loader.load(new URLRequest("test.swf"));
 check(loader.contentLoaderInfo.url == "test.swf", "load records url");
 check(loader.contentLoaderInfo.bytesLoaded == 0 && loader.contentLoaderInfo.bytesTotal == 0, "bytes stay 0 while loading");
 check(loader.content == null, "content stays null until the event fires");
-check(initFired, "load dispatches INIT synchronously");
+// adl 51.4.1 实测（temp/initprobe/LoadFailProbe）：读不到的 URL 只派发 ioError
+// （#2035），**不派发 INIT**——INIT 属于解码，不属于这次调用。
+check(!initFired, "a failed load dispatches no INIT (AIR: ioError alone)");
 check(!completeFired, "load does not dispatch COMPLETE synchronously");
 tickTimers();
 check(!completeFired, "an unreadable URL never reports COMPLETE");

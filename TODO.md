@@ -4135,6 +4135,10 @@ for (init; cond; upd)  ->  for (init; ;) { <cond prelude> if (!(cond)) break;
 - emit 侧（`src/emit.ts`）：`Loader_load` → `as_async_submit_image`；`Loader__imageFinish` 优先用
   `as_job_bytes/as_job_len` 建图，无 payload 才回落到 `as_skia_image_from_file(li->url)`（payload 是
   更具体的答案）。事件契约**完全不变**：`INIT` 同步、`COMPLETE`/`IO_ERROR` 在下一帧边界。
+  > **〔阶段三百六十勘误〕** 这句里的「`INIT` 同步」**是错的**：adl 51.4.1 实测 `INIT` 与
+  > `COMPLETE` 一样在解码完成后异步到达（见 `temp/initprobe/`、`docs/zh-cn/flash-net.md` 事件
+  > 矩阵），同步派发会让 `content` 在监听器里为空——这正是「高级礼物」`#1009` 的根因。原文保留
+  > 以存证当时的错误口径，现行契约见阶段三百六十。
 - 构建层**零改动**：沿用阶段八十九·五十三 的静态 curl（`-l curl -l nghttp2` +
   `-I/-L vendor/curl/...` + `--framework Security --framework SystemConfiguration`）。
 
@@ -19251,6 +19255,44 @@ opt in）。这组钉子存在的理由就是**回归不可见**：示例回归�
 **文档**：`html5-web.md` 新增 §3.7 并把「输入」那一行与 §6 第 13 条的「`on_resize` 仍未接线」改掉（键盘
 传输与 `on_close` 仍未接线，口径不变）；`compile.md` 的 web 实现要点加一条。
 
+---
+
+### 阶段三百六十：`Loader` 的 `INIT` 属于**解码**，不属于那次调用 —— 「高级礼物」的 `#1009`（v0.4.322 → v0.4.323）
+
+**起点**：talkmed meeting（Windows AIR 应用）点「高级礼物」里的**红包-散落**，弹
+`TypeError: Error #1009: Cannot access a property or method of a null object reference.`。
+
+**定位**：礼物流有两条动画实现——普通礼物走 `GiftAnimationSlide`（位图 + TweenLite），高级礼物走
+`GiftSvgaSlide` → `com.svgaplayer.Player`。后者把 SVGA 里内嵌的每张图交给
+`Loader.loadBytes()`，**在 `Event.INIT` 的回调里**读 `(loader.content as Bitmap).bitmapData` 填进
+`_images` 表（`VideoEntity.resetImages`）。同源探针（`temp/initprobe/`，同一份字节、同一个 PNG）：
+
+| 观测点 | adl 51.4.1 | 修前 AOT |
+|---|---|---|
+| `loadBytes()` 返回后 `content` | `NULL` | `NULL`（一致） |
+| `INIT` 时刻 `content` / `bitmapData` | **已就位 / 可读** | **`NULL`** ⇒ `#1009` |
+| 事件顺序 | `INIT` → `COMPLETE`，两者都在**异步** | `INIT` **同步**（解码前），`COMPLETE` 异步 |
+| 失败（`FailProbe`：非图片字节；`LoadFailProbe`：读不到的 URL） | 只有 `ioError`（`#2124` / `#2035`），**没有 `INIT`** | 修前先发一个 `INIT` 再发 `ioError` |
+
+**根因**：`Loader_load`/`Loader_loadBytes` 把 `init` 同步派发在调用里，而**解码是异步 job**——
+那一刻 `content` 必然是 `NULL`。`INIT` 的语义是「内容已初始化」，与「这次调用返回了」无关。
+
+**修法**：两处同步派发删掉，`init` 搬进 `Loader__imageFinish`——先挂 `content`／`addChildAt`，再
+`INIT`，再 `COMPLETE`。错误分支本来就在前面 `return`，于是失败路径仍然只说 `ioError`，不会发一个
+指向空内容的 `INIT`（§2.5：宁可少一个事件，也不给假事件）。
+
+**回归钉**：`test/unit/transport.ts` 新增 `transport/LoaderInitContent` 9 钉（两个调用点都不含
+`init`、finish thunk 里有且**在 `content` 之后**、**在 `COMPLETE` 之前**、错误分支在前、注释带证据
+路径、示例断言两侧同步）；`examples/async-io.as` 第 6 节与 `examples/stage62.as` 的两条反向断言从
+「INIT 同步」改成实测契约（无同步事件、失败不报 INIT）。`docs/{zh-cn,en}/flash-net.md` 的事件矩阵各补
+一行先后关系。
+
+**顺带发现（不在本次范围，未修）**：本机全量回归里 `examples/with-fn-class-regexp.as` 在 **Windows 宿主**上编译失败——
+生成 C 里出现 `as_class* __w64 = &KC_cls;`，而 MSVC 把 `__w64` 当关键字（`error: expected identifier or '('`）。来源是
+`tmpName('w')` 先产出 `_w64`，`sanitizeCIdent` 为去重**再加一个下划线前缀** ⇒ `__w64`，而 `__` 开头的名字按 C 标准属
+**实现保留**。`src/c-reserved.gen.ts` 里没有 `__w64`，`C_RESERVED_SCOPE` 也没拦「前缀化之后落到 `__`」。同批红了 7 个
+示例（`socket` / `stage94d` / `status-item` / `htmltext-metrics` / `text-underline` / `stage64` / `native-shader-probe`），
+八个示例都**不引用 `Loader`**，因此与本阶段无关。
 ---
 
 ### 遗留待开发

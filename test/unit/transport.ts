@@ -742,6 +742,57 @@ function checkSharedObjectStore(): string[] {
   return bad;
 }
 
+// ---- Loader INIT timing: the event belongs to the DECODE, not to the call ----
+// Measured on adl 51.4.1 (temp/initprobe/): load()/loadBytes() return with
+// content == null and dispatch nothing; the INIT listener then sees a READY
+// content, and only COMPLETE follows. A failed load reports ioError alone
+// (temp/initprobe/FailProbe: #2124, content null, no INIT). The emitter used to
+// dispatch INIT synchronously from both call sites — content was still NULL
+// there, so any listener reading `(loader.content as Bitmap).bitmapData` threw
+// TypeError #1009. This is the defect that broke the TalkMED 高级礼物 (SVGA)
+// animation: com.svgaplayer.VideoEntity fills its image map from the INIT
+// handler. The assertions are structural because a headless example links no
+// image decoder, so the success path cannot be reached from examples/.
+function checkLoaderInitContent(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const ex = readFileSync(join(dir, 'async-io.as'), 'utf8');
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [loader-init] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [loader-init] ${label}`); }
+  };
+  const between = (from: string, to: string): string => {
+    const i = emitSource.indexOf(from);
+    if (i < 0) return '';
+    const j = emitSource.indexOf(to, i + from.length);
+    return emitSource.slice(i, j < 0 ? emitSource.length : j);
+  };
+  const finish = between('static void Loader__imageFinish(void* job) {', 'void Loader_load(void* _this, URLRequest* request) {');
+  const load = between('void Loader_load(void* _this, URLRequest* request) {', 'void Loader_unload(void* _this) {');
+  const bytes = between('void Loader_loadBytes(void* _this, ByteArray* bytes, LoaderContext* context) {', 'flash.system.LoaderContext');
+  const initLine = 'EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"init", false, false));';
+  const completeLine = 'EventDispatcher_dispatchEvent((void*)li, (Event*)Event_new((char*)"complete", false, false));';
+
+  check('load() dispatches no INIT of its own (content is not decoded yet)', load.length > 0 && !load.includes('"init"'));
+  check('loadBytes() dispatches no INIT of its own either', bytes.length > 0 && !bytes.includes('"init"'));
+  check('the finish thunk dispatches INIT', finish.includes(initLine));
+  check('INIT comes AFTER the content is published', finish.includes(initLine)
+    && finish.indexOf('o->content = (DisplayObject*)bmp;') < finish.indexOf(initLine));
+  check('INIT comes BEFORE COMPLETE, as AIR orders them', finish.includes(initLine)
+    && finish.indexOf(initLine) < finish.indexOf(completeLine));
+  check('the failure branch returns before INIT, so a failed load reports ioError alone',
+    finish.indexOf('if (err != 0) {') >= 0 && finish.indexOf('if (err != 0) {') < finish.indexOf(initLine));
+  check('the emitted comment names the measurement (temp/initprobe)', emitSource.includes('temp/initprobe/'));
+  check('examples/async-io.as pins the no-synchronous-event rule',
+    ex.includes('"loadBytes dispatches no event synchronously (AIR: INIT follows the decode)"'));
+  check('…and the no-INIT-on-failure rule',
+    ex.includes('"a failed load never reports INIT (AIR: ioError alone)"'));
+
+  if (ok > 0) console.log(`[loader-init] ${ok} Loader-INIT checks passed`);
+  return bad;
+}
+
 registerGroup('unit: transport/IoErrorFidelity', checkIoErrorFidelity);
 registerGroup('unit: transport/HttpStatusTerminal', checkHttpStatusTerminal);
 registerGroup('unit: transport/AirAppTransport', checkAirAppTransport);
@@ -750,3 +801,4 @@ registerGroup('unit: transport/RequestContentType', checkRequestContentType);
 registerGroup('unit: transport/RequestMethod', checkRequestMethod);
 registerGroup('unit: transport/JobOwnership', checkJobOwnership);
 registerGroup('unit: transport/SharedObjectStore', checkSharedObjectStore);
+registerGroup('unit: transport/LoaderInitContent', checkLoaderInitContent);

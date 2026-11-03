@@ -884,6 +884,7 @@ out); both sides face the real `api.acme.example`:
 | Event sequence (`open`→`httpResponseStatus`→`httpStatus`→…) | `200` → `open` → … → `complete` (as in §6.7.1) | same | ✅ (text differs, event set is the same) |
 | Two internet PNGs (`Loader.load`, stage eighty-nine / fifty-four) | both on screen: `753×751` / `815×814` scaled to width 340 (`340×339` / `340×340`) at `(10,60)` / `(370,60)`, `bytesTotal` `487042` / `511484` | item-by-item identical (including `bytesTotal` and the rounded scaled sizes) | ✅ |
 | Image-load terminal event (same as left) | `INIT` → `COMPLETE`, `content` is a `Bitmap`, `numChildren == 1` | same (same `Main.as`, same `Loader__imageFinish`) | ✅ |
+| Event vs `content` ordering (stage three hundred twenty-one) | `load()`/`loadBytes()` return with `content == null` and dispatch **no event**; `INIT` arrives with `content` **already published** (a listener can read `(content as Bitmap).bitmapData`), and only then `COMPLETE`; a failure reports `ioError` alone, **never `INIT`** | same (inside `Loader__imageFinish`: publish `content` / `addChildAt` first, then `INIT`, then `COMPLETE`; the error branch returns early) | ✅ |
 | Failure path (no backend) | — (AIR can always go online) | both requests land on the honest `ioError` (reverse comparison) | ✅ |
 
 > Reverse comparison: running the same `.as` with the **default build** (no `ASC_HAVE_CURL`) → the first login
