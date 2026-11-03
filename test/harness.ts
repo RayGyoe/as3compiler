@@ -54,9 +54,11 @@ export function readNorm(path: string): string {
 // does it in", so they read the pair. The split itself is pinned separately
 // (unit: build/TextEngineSplit), which is what keeps the two statements honest.
 export function readGlue(): string {
-  return (
-    readFileSync(join(root, 'vendor', 'skia_glue.cc'), 'utf8') +
-    '\n' +
-    readFileSync(join(root, 'vendor', 'skia_text_glue.cc'), 'utf8')
-  );
+  // Line endings are normalized to LF before the pair is joined. A Windows checkout
+  // materialises CRLF (the repo pins LF only for *.bat -- see .gitattributes), so a
+  // multi-line pin written as `;\n}` reported a fake failure on a tree whose glue
+  // was perfectly fine. The pins ask what the glue does, never which newline it uses.
+  const half = (name: string): string =>
+    readFileSync(join(root, 'vendor', name), 'utf8').replace(/\r\n/g, '\n');
+  return half('skia_glue.cc') + '\n' + half('skia_text_glue.cc');
 }

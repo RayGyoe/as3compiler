@@ -909,7 +909,9 @@ function checkClassValues(): string[] {
   // EventDispatcher DOES implement IEventDispatcher, so `new Sprite() is
   // IEventDispatcher` is true (adl 51.4.1). The interface list is per-class and
   // as_iface_lookup is shallow, so the entry has to be on the built-in itself.
-  const symSrc = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  // LF-normalized: this pin matches across a newline, and a CRLF checkout would
+  // otherwise fail it with the entry sitting there in plain sight.
+  const symSrc = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8').replace(/\r\n/g, '\n');
   check('the built-in EventDispatcher declares IEventDispatcher',
     /superClass: 'Object',\n\s+isFinal: false,\n\s+\/\/ AIR's flash\.events\.EventDispatcher IMPLEMENTS/.test(symSrc));
   check('Sprite carries the inherited interface vtable',

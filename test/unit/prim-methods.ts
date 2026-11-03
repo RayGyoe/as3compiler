@@ -28,7 +28,9 @@ function checkPrimMethods(): string[] {
     else { bad.push(label); console.log(`FAIL  [prim] ${label}`); }
   };
   const flatPre = RUNTIME_PREAMBLE.replace(/\s+/g, ' ');
-  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  // LF-normalized: several pins below match across a newline (the typed-Function
+// receiver test in particular), and a CRLF checkout would fail them spuriously.
+const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8').replace(/\r\n/g, '\n');
 
   // ---- both doorways reach the same implementation ----
   const dyn = generateC(parse('var n:* = 1.5;\nvar s:String = n.toFixed(2);\ntrace(s);\n')).c.replace(/\r\n/g, '\n');

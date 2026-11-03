@@ -83,6 +83,21 @@ function compileToAsm(cSource: string, tag: string): { asm: string; stderr: stri
   return { asm: readFileSync(sfile, 'utf8'), stderr: r.stderr ?? '' };
 }
 
+// Does THIS toolchain guard stack frames with __stack_chk_guard at all? clang
+// targeting MSVC -- every Windows checkout -- leaves -fstack-protector off, and when
+// forced uses __security_cookie rather than the guardian. There the canary pins
+// below cannot tell "the TLS tables removed the guard" from "this compiler never
+// emits one", so the assembly half is reported as SKIPPED instead of counted as a
+// hollow pass. Probing the capability keeps that honest on every host: no platform
+// fork, and macOS/Linux still run the real assertions.
+function toolchainEmitsCanaries(): boolean {
+  const probe = 'int f(int n) { char buf[64]; for (int i = 0; i < 64; i++) buf[i] = (char)(n + i); '
+    + 'return (int)buf[n & 63]; }\n'
+    + 'int main(int argc, char** argv) { (void)argv; return f(argc); }\n';
+  const r = compileToAsm(probe, 'canary-capability');
+  return r !== null && r.asm.includes('stack_chk_guard');
+}
+
 // The body of one function label, from `_name:` to the next top-level label.
 // Mach-O prefixes C symbols with '_' (ELF does not), and both emit local labels
 // that start with 'L' (LBB0_8:) or '.L' -- neither is a function boundary.
@@ -342,15 +357,21 @@ function checkStackCanary(): string[] {
     c.includes('static void* as_v_req_inst(as_value v, void* target_vt, const char* fqn) {'));
   const built = compileToAsm(c, 'canary');
   check('the canary probe compiles to assembly with cc -O2 -S', built !== null);
+  const canaryCapable = built !== null && toolchainEmitsCanaries();
   if (built) {
     const req = functionBody(built.asm, 'as_v_req_inst');
     check('as_v_req_inst is emitted as its own function', req !== null);
-    if (req) {
+    if (!canaryCapable) {
+      console.log('SKIP  [inline] stack canaries -- this toolchain emits no __stack_chk_guard '
+        + '(clang for MSVC uses __security_cookie, and only when asked)');
+    } else if (req) {
       check('as_v_req_inst carries no stack canary (it runs 20M times in oop)',
         !req.includes('stack_chk_guard'));
     }
     const main = functionBody(built.asm, 'main');
-    if (main) check('the guard loop in main carries no stack canary', !main.includes('stack_chk_guard'));
+    if (main && canaryCapable) {
+      check('the guard loop in main carries no stack canary', !main.includes('stack_chk_guard'));
+    }
   }
 
   // 3. Reverse check: with the tables restored to automatic arrays the canary
@@ -363,10 +384,13 @@ function checkStackCanary(): string[] {
     naive !== c && naive.includes('const char* parts['));
   const rev = compileToAsm(naive, 'canary-naive');
   check('the reverse probe compiles to assembly', rev !== null);
-  if (rev) {
+  if (rev && canaryCapable) {
     const req = functionBody(rev.asm, 'as_v_req_inst');
     check('reverse: an automatic parts table puts the canary back in as_v_req_inst',
       req !== null && req.includes('stack_chk_guard'));
+  } else if (rev) {
+    console.log('SKIP  [inline] reverse canary probe -- the toolchain emits no __stack_chk_guard, '
+      + 'so "the guard came back" is not a question this compiler can answer');
   }
 
   console.log(`     [inline] ${ok} check(s) passed`);

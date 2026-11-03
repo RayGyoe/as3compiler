@@ -59,8 +59,15 @@ function checkManifestLayering(): string[] {
   };
   const mpath = join(root, 'examples', 'flash-net-layered.build.example.json');
   const raw = (o: unknown): Manifest => o as Manifest;
-  const merged = (m: Manifest, target: Target): BuildConfig =>
-    applyManifestOverlay(applyManifest(defaultBuildConfig(), m, mpath), m, mpath, target);
+  // `target` is a BuildConfig field the overlay never writes (index.ts sets it from
+  // the final CLI value, then applies the layer), so the simulated config has to
+  // carry it too. Without it a "wasm" config still said `target: 'native'`, and every
+  // host-dependent injection -- Windows zlib in particular -- leaked into the wasm
+  // argv. That was invisible off win32, where windowsZlibArgs() returns nothing.
+  const merged = (m: Manifest, target: Target): BuildConfig => ({
+    ...applyManifestOverlay(applyManifest(defaultBuildConfig(), m, mpath), m, mpath, target),
+    target,
+  });
   const argv = (c: BuildConfig): string => buildCompileCommand(c, 'x.c', 'x.out').join(' ');
 
   // 1) One manifest, two targets: native links curl; wasm must not see it at all.
@@ -3220,7 +3227,18 @@ function checkWindowsZlib(): string[] {
     Object.defineProperty(process, 'platform', { value: real, configurable: true });
   }
 
-  check('off-win32 the list is empty', windowsZlibArgs(cfg()).length === 0);
+  // The guard's other half must hold on EVERY host. Asserting it against the live
+  // process.platform meant this check could only pass on a non-Windows box (a
+  // Windows checkout called it with platform === 'win32' and got the injected set).
+  // Stub the platform -- the same technique the block above uses for win32 -- so the
+  // answer is identical on macOS CI and on a Windows machine.
+  const restoreTo = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+  try {
+    check('off-win32 the list is empty', windowsZlibArgs(cfg()).length === 0);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: restoreTo, configurable: true });
+  }
   if (ok > 0) console.log(`[zlib] ${ok} Windows zlib checks passed`);
   return bad;
 }
