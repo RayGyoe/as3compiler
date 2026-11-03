@@ -130,7 +130,7 @@ present 只是 `GrDirectContext::flush()`，不再有 CPU↔JS 逐像素拷贝�
 | 字体后端 | `SkFontMgr_New_CoreText()`（枚举 macOS 系统字体） | `SkFontMgr_New_Custom_Data()` + 运行时注入（§4） |
 | 窗口 / 上屏 | SDL2 `SDL_PollEvent` 阻塞循环 | `vendor/web_glue.cc`：cpu 模式 `putImageData` blit；direct/gpu 模式 `GrDirectContext::flush` |
 | 帧驱动 | SDL 事件循环（自走时，`SDL_Delay` 到截止期） | `emscripten_set_main_loop` + **rAF 整 tick 节拍**（§3.2） |
-| 输入 | SDL 事件 | `emscripten_set_mousedown_callback`/`mouseup`/`mousemove`/`mouseleave`/`wheel`（键盘传输与 `on_resize`/`on_close` **仍未接线**，见 §6） |
+| 输入 | SDL 事件 | `emscripten_set_mousedown_callback`/`mouseup`/`mousemove`/`mouseleave`/`wheel`（键盘传输与 `on_close` **仍未接线**；`on_resize` 走 §3.7 的 canvas 跟随契约，见 §6 第 13 条） |
 | Stage3D | `vendor/stage3d_glue.mm`（Metal + MSL 着色器） | `vendor/stage3d_webgl.cc`（WebGL2 + GLSL ES 着色器，§3.3） |
 | 网络（`flash.net`） | libcurl（opt-in `ASC_HAVE_CURL`） | 浏览器 `fetch`（opt-in `ASC_HAVE_FETCH`，见 §3.4）；无后端时诚实 `ioError` |
 
@@ -368,6 +368,33 @@ window.__ascErrors = [];   // window 'error' + 'unhandledrejection'
 `fclose`），那通常不是 libc 的问题，而是**传进去的对象已被释放或损坏** —— 
 当时正是 `as_job_retire` 对着一个已被 AS3 `close()` 关掉的 `FILE*` 再关一次。
 
+### 3.7 canvas 尺寸：页面就是窗口
+
+桌面上的窗口管理器负责改变窗口大小，胶水通过 `on_resize` 报给 AS3 侧（重建 drawable、更新
+`stageWidth/stageHeight`、派发 `Event.RESIZE`）。**页面没有窗口管理器**——canvas 就是窗口——所以早先
+这里直接把 `on_resize` 丢掉，canvas 在整个标签页生命周期里都是描述符里那个尺寸。宿主只有两个坏选择：
+显示一张邮票，或者 CSS 放大位图（软像素，且指针坐标与 AS3 侧以为的 stage 不再对应）。
+
+**契约是逐页 opt-in 的**：页面给 canvas 加 `data-asc-fill`（`writeWebIndex()` 生成的页面默认带，样式为
+`position:fixed; inset:0; width/height:100%`），从此 CSS box 归样式表、胶水只把结果镜像进 stage；没有
+这个属性时 canvas 保持 AIR 的 `<width>/<height>` 盒子，想要固定尺寸的嵌入页不必改任何东西。**不默认对
+所有页面生效**：静默改掉别人嵌入页的尺寸属静默降级。
+
+`sk_web_canvas_size_changed()` 的四条硬约定：
+
+- 尺寸从 **canvas 自己的 CSS box** 重读（事件里的 viewport 只是代理，页面可以给 canvas 加 padding）；
+- 未变化的 box 直接丢——浏览器会为我们自己造成的变化（窗口缩放、浏览器缩放、CSS 重排）再发一次事件；
+- backing store 只在 CPU 光栅路径写（`present_frame` 要 blit 进它），GPU 路径留给 `sk_surface_gpu_new`
+  重包 FBO 0 时改：先写会把新 surface 正要渲染进去的缓冲清掉；
+- 回调返回**新 surface**，胶水接管它；返回 `NULL` 表示 AS3 侧没能重建，旧 surface 继续按老尺寸出画面，
+  而不是在帧循环底下被释放。
+
+设备像素比沿用 `runtime.ts` `as_window_device_scale` 的口径（`<requestedDisplayResolution>high` 才按
+backing scale 折），与 native 的 Retina 处理是同一口径的两个入口。
+
+验证：`unit: platform/WebResizeSeam`（10 钉）。这组钉子存在的理由就是**回归不可见**——示例回归与
+`--target` 验收都走原生窗口后端，wasm 页面只会被以单一尺寸加载一次。
+
 ## 4. 字体：网络加载 + 运行时注入
 
 wasm 沙箱没有系统字体可枚举，`CoreText` 后端不可用。web 字体链路：
@@ -533,8 +560,9 @@ try { Module._main(); } catch (e) { if (e !== 'unwind') throw e; }
     （悬停、拖拽、文字选择拖动都靠它）；`mouseleave` 送 `0,0` —— AIR 在指针离开时**不碰**
     `mouseX`/`mouseY`，故坐标被忽略、窗口的 roll-over 状态回滚到 up/out（与 native 的
     `SDL_WINDOWEVENT_LEAVE` 同一口径；阶段二百零七只修了 native，本轮把 web 那一半补齐）。
-    键盘传输与 `on_resize`/`on_close` **仍未接线**（在胶水里 `(void)` 显式忽略；键盘一路另登记在
-    `TODO.md`，不静默丢键）；`NativeWindow` 创建仍**按设计失败**（浏览器开不了第二个 OS 窗口，抛错报明）。
+    键盘传输与 `on_close` **仍未接线**（在胶水里 `(void)` 显式忽略；键盘一路另登记在
+    `TODO.md`，不静默丢键）；`on_resize` 已接线，但**只在页面 opt in 时生效**（canvas 带 `data-asc-fill`，
+    见 §3.7）；`NativeWindow` 创建仍**按设计失败**（浏览器开不了第二个 OS 窗口，抛错报明）。
     `NativeApplication.exit()` 现在真的停帧：`sk_window_request_exit` 调
     `emscripten_cancel_main_loop()`（此前是静默空操作），只停 `sk_window_show` 起的 rAF 循环，
     页进程本身不会被结束。

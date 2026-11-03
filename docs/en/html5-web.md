@@ -143,7 +143,7 @@ glue files:
 | Font backend | `SkFontMgr_New_CoreText()` (enumerates macOS system fonts) | `SkFontMgr_New_Custom_Data()` + runtime injection (§4) |
 | Window / presentation | SDL2 `SDL_PollEvent` blocking loop | `vendor/web_glue.cc`: cpu mode `putImageData` blit; direct/gpu mode `GrDirectContext::flush` |
 | Frame driving | SDL event loop (when self-driving, `SDL_Delay` until the deadline) | `emscripten_set_main_loop` + **rAF whole-tick pacing** (§3.2) |
-| Input | SDL events | `emscripten_set_mousedown_callback`/`mouseup`/`mousemove`/`mouseleave`/`wheel` (the keyboard transport and `on_resize`/`on_close` are **still unwired**, see §6) |
+| Input | SDL events | `emscripten_set_mousedown_callback`/`mouseup`/`mousemove`/`mouseleave`/`wheel` (the keyboard transport and `on_close` are **still unwired**; `on_resize` follows the canvas contract in §3.7, see §6 item 13) |
 | Stage3D | `vendor/stage3d_glue.mm` (Metal + MSL shaders) | `vendor/stage3d_webgl.cc` (WebGL2 + GLSL ES shaders, §3.3) |
 | Network (`flash.net`) | libcurl (opt-in `ASC_HAVE_CURL`) | browser `fetch` (opt-in `ASC_HAVE_FETCH`, see §3.4); honest `ioError` with no backend |
 
@@ -414,6 +414,39 @@ unrelated libc function (stage eighty-nine / seventy's `fclose`), that is usuall
 **object passed in having been freed or corrupted** — at that time `as_job_retire` was closing an already
 `close()`d `FILE*` again.
 
+### 3.7 Canvas size: the page is the window
+
+On a desktop the window manager resizes the window and the glue reports it through `on_resize` (the AS3 side
+rebuilds the drawable, updates `stageWidth`/`stageHeight` and dispatches `Event.RESIZE`). **A page has no
+window manager** — the canvas *is* the window — so this used to discard `on_resize`, and the canvas kept the
+descriptor's size for the life of the tab. The host had two bad options: show a postage stamp, or CSS-scale
+the bitmap (soft pixels, and pointer coordinates that no longer match what the AS3 side thinks the stage is).
+
+**The contract is opt-in per page**: the page marks the canvas with `data-asc-fill` (the page emitted by
+`writeWebIndex()` does, styling it `position:fixed; inset:0; width/height:100%`), after which the CSS box
+belongs to the stylesheet and the glue only mirrors the result into the stage. Without that attribute the
+canvas keeps AIR's `<width>/<height>` box, so an embedding page that wants a fixed-size surface changes
+nothing. It is **not** on by default: silently resizing somebody's embedded page is a silent downgrade.
+
+Four hard rules in `sk_web_canvas_size_changed()`:
+
+- the size is re-read from **the canvas' own CSS box** (the event's viewport is only a proxy; a page may pad
+  the canvas);
+- an unchanged box is dropped — the browser fires resize events for changes we caused ourselves (window
+  resize, browser zoom, a CSS-driven relayout);
+- the backing store is written only on the CPU raster path (`present_frame` blits into it); the GPU path lets
+  `sk_surface_gpu_new` resize it as it re-wraps FBO 0 — writing it first would clear the buffer the new
+  surface is about to render into;
+- the callback returns the **new surface** and the glue adopts it; `NULL` means the AS3 side could not
+  rebuild, so the old surface keeps presenting at its old size rather than being freed under the frame loop.
+
+The device scale follows `runtime.ts`'s `as_window_device_scale` rule (`<requestedDisplayResolution>high`
+is the only case that folds the backing scale), the same rule as native's Retina handling.
+
+Pinned by `unit: platform/WebResizeSeam` (10 checks). The point of those checks is that **the regression is
+invisible**: the example suite and `--target` acceptance both go through the native window backend, and a
+wasm page is only ever loaded at one size.
+
 ## 4. Fonts: Network Loading + Runtime Injection
 
 The wasm sandbox has no system fonts to enumerate, so the `CoreText` backend is unavailable. The web font
@@ -607,8 +640,9 @@ must be written before `showWindow`, with `showWindow` as the last statement. Th
     AIR **does not touch** `mouseX`/`mouseY` on a leave, so the coordinates are ignored and the
     window's roll-over state rolls back to up/out (the same contract as native's
     `SDL_WINDOWEVENT_LEAVE`; stage 207 fixed only native, this round adds the web
-    half). The keyboard transport and `on_resize`/`on_close` are **still unwired** (`(void)`-ignored in the
-    glue; the keyboard path is additionally recorded in `TODO.md`, rather than silently dropping keys);
+    half). The keyboard transport and `on_close` are **still unwired** (`(void)`-ignored in the glue; the
+    keyboard path is additionally recorded in `TODO.md`, rather than silently dropping keys); `on_resize` is
+    wired but **only takes effect when the page opts in** (canvas carries `data-asc-fill`, see §3.7);
     `NativeWindow` creation still **fails by design** (a browser cannot open a second OS window; it throws
     naming the limitation).
     `NativeApplication.exit()` now really stops the frame loop: `sk_window_request_exit` calls

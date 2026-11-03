@@ -1402,6 +1402,10 @@ as-aot examples/web/hello-web.as \
 - **`EXPORTED_FUNCTIONS`**：显式导出 `_main`/`_malloc`/`_free`/`_sk_fontmgr_register_data`（字体
   注入引导脚本依赖；漏掉会让字体注入静默失败或无人启动 main）。
 - **`INVOKE_RUN=0`**：JS 在字体注入完成后才调 `Module._main()`。
+- **canvas 跟随页面尺寸**：生成的页面的 canvas 带 `data-asc-fill`，`web_glue.cc` 便上了
+  `emscripten_set_resize_callback`，把 canvas 的 CSS box 镜像进 stage（重建 drawable、更新
+  `stageWidth/Height`、派发 `Event.RESIZE`）；想保留 AIR `<width>/<height>` 固定尺寸的嵌入页只需去掉那个
+  属性。逐页 opt-in 的理由与四条实现约定见 [`html5-web.md`](html5-web.md) §3.7。
 
 完整架构、字体注入流程与已知限制见 [`html5-web.md`](html5-web.md)。
 

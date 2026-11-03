@@ -19204,9 +19204,46 @@ backend request」被本阶段**误伤**——那条钉子用 `count(preamble, '
 **文档**：`native-shader.md` 新增 §6.11 并把 P2 行翻成 ✅；`compile.md` / `enhancements.md` / 两份
 README 里「仅 native」改成「native + wasm」。
 
+### 阶段三百五十九：web 的 canvas 就是窗口 —— stage 跟随页面尺寸（v0.4.321 → v0.4.322）
+
+**起点**：`web_glue.cc` 的 `sk_window_show` 把 `on_resize` 直接丢弃（`(void)on_resize;  // fixed
+canvas`），页面的 canvas 从加载到关标签页永远是描述符里那个尺寸。这条**不会红**：构建是绿的，每个 demo
+的自检都在自己那个尺寸下通过。唯一症状是视觉的——想要更大 stage 的页面只能 CSS 放大位图（软像素，且
+指针坐标与 AS3 侧以为的 stage 不再对应）。
+
+**契约：逐页 opt-in**。页面给 canvas 加 `data-asc-fill`（`writeWebIndex` 生成的页面默认带），CSS box 归
+样式表（`position:fixed; inset:0`），glue 只把结果镜像进 stage；没有该属性时 canvas 保持 AIR 的
+`<width>/<height>` 盒子，嵌入页要的固定尺寸照旧。刻意不做全局改动：静默改掉别人嵌入页的尺寸属于 §1.5
+禁止的静默降级。NO_SCALE 的 stage（`asaot3d` 的 `Stage3DApp`）会重排版、Stage3D 后台缓冲跟随
+`configureBackBuffer`，于是 app 在真实尺寸上重渲染，而不是被 CSS 拉大。
+
+**为什么这么写**（每条都对应一种会错的方式）：
+
+- 尺寸从 **canvas 自己的 CSS box** 重读，不取事件里的 viewport——页面可以给 canvas 加 padding/inset，而
+  像素要对齐的是 box；
+- 未变化的 box 直接丢：浏览器会为我们自己造成的变化（窗口缩放、浏览器缩放、CSS 重排）再发一次事件，
+  把同一个尺寸重装一次 drawable 是白费；
+- backing store 只在 **CPU 光栅路径**写，GPU 路径留给 `sk_surface_gpu_new` 重包 FBO 0 时改——先写会把新
+  surface 正要渲染进去的缓冲清掉；
+- 返回值是**新 surface**：`NULL` 表示 AS3 侧没能重建，旧 surface 继续按老尺寸出画面，不会在帧循环底下
+  被释放；
+- 出第一帧前先同步一次，启动不是特例。
+
+**设备像素比**沿用 `runtime.ts` `as_window_device_scale` 的口径（`ASC_DISPLAY_HIGH` 才按 backing scale
+折），与阶段三百五十四 修掉的 Retina 减半是同一口径的两个入口。
+
+**钉子**：`unit: platform/WebResizeSeam`（10 条：丢弃回调的那行消失、确实订了 resize 事件、首帧前同步、
+box 不变时幂等、backing store 只在 CPU 路径写、新 surface 被接管、fill 是逐页显式契约、生成的页面确实
+opt in）。这组钉子存在的理由就是**回归不可见**：示例回归与 `--target` 验收都走原生窗口后端，wasm 页面
+只会被以单一尺寸加载一次。
+
+**文档**：`html5-web.md` 新增 §3.7 并把「输入」那一行与 §6 第 13 条的「`on_resize` 仍未接线」改掉（键盘
+传输与 `on_close` 仍未接线，口径不变）；`compile.md` 的 web 实现要点加一条。
+
 ---
 
 ### 遗留待开发
+> **2026-11-03 追加（阶段三百五十九：web 的 canvas 就是窗口）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表数据行 **90 → 90 行**（`未开始` 70 / `部分完成` 19 / `调研完成·实现暂缓` 1）。web 的 canvas 固定尺寸从来没入表——它不是一条登记过的缺口，而是`(void)on_resize;  // fixed canvas`这行注释背后的**安静未支持**：构建绿、每个 demo 在自己的尺寸下自检也绿，只有视觉上看得见。**口径提醒**：这类缺口只能靠「拿它真用一次」发现（本轮是拿页面当真窗口用），示例回归与 `--target` 验收都不会碰到。
 > **2026-11-03 追加（阶段三百五十八：E6 M4 WebGL2 直通臂）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表数据行 **90 → 90 行**（`未开始` 70 / `部分完成` 19 / `调研完成·实现暂缓` 1）。本阶段落的是 `native-shader.md` 里 P2 那行（**阶段小节里的计划项**，不在本表），而 WebGL2 侧如实留下的缺口（`setRenderTargetSamples` 拒绝并报明、D3D12 未动）已在阶段节与同文档 §6.11 登记，不重复入表。**同阶段修净、不占表**：`unit: platform/NativeWindow` 的窗口接缝审计被本阶段新增的 `(void)gpu;` 误伤（全文计数式审计的假红），已改成匹配整段前缀。
 > **2026-11-02 追加（阶段三百五十四：`NativeWindow.systemMinSize`/`systemMaxSize` 与拖拽进行中的 `moving`/`resizing`）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **90 → 90 行**（`未开始` 70 / `部分完成` 19 / `调研完成·实现暂缓` 1）。**改写 1 行**是 `NativeWindow` 家族那行——②③ 两条（静态系统极限、拖拽中的 `moving`/`resizing`）落地，剩下的只有 `NativeMenu` **整个子系统**（依赖面最大，仍最低优先）。**同阶段修净、不占表**：`requestedDisplayResolution=standard` 的窗口在 Retina 屏上被**减半**（`sk_client_size_live`/`sk_window_device_scale` 无条件折 backing scale ⇒ 400x300 读回 `200x166`、stage 只有一半大）——它先于本轮改动存在，是示例里那三条失败的真正原因；现在两处都以 `SDL_WINDOW_ALLOW_HIGHDPI` 为门。**口径提醒**：这类「尺寸口径」缺陷只在**Retina + 1x 渲染**的组合里现形，非 Retina 机器上怎么量都是绿的，故 `docs/{zh-cn,en}/compile.md` 的 `requestedDisplayResolution` 段已写明门控条件。
 > **2026-11-02 追加（阶段三百五十二：AGAL4 顶点纹理取值）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **91 → 90 行**（`未开始` **71 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1）。**移出 1 行**：「顶点纹理取值（VTF）」——三翻译器的顶点 sampler 声明 + 三后端绑定 + stage/version 门控（`#3622`/`#3803`/`#3805`/`#3757`）全部落地，Metal 真机 26 条断言。**同阶段修净、不占表**：① `Program3D` 重 upload 不重新编译着色器（缓存键是指针，改成「指针 + `uploadSerial`」）；② `as_agal_errid` 让 AGAL 校验错误的 `errorID` 与 AIR 一致（此前恒 0）。**一处刻意的实现分歧**：AIR 的顶点 `tld` **忽略 LOD 字节**（恒采 mip0），我们按指令本意用该值 —— 在 AIR 上跑对的程序都写 lod=0，故行为等价。

@@ -1527,6 +1527,11 @@ Implementation notes (`src/build.ts` `buildWebCompileSteps()` + `src/index.ts` `
 - **`EXPORTED_FUNCTIONS`**: explicitly exports `_main`/`_malloc`/`_free`/`_sk_fontmgr_register_data` (the font
   injection bootstrap depends on them; omitting them fails font injection or leaves main unstarted).
 - **`INVOKE_RUN=0`**: JS calls `Module._main()` only after font injection completes.
+- **The canvas follows the page size**: the emitted page marks its canvas with `data-asc-fill`, and
+  `web_glue.cc` then subscribes to `emscripten_set_resize_callback`, mirroring the canvas' CSS box into the
+  stage (rebuild the drawable, update `stageWidth`/`Height`, dispatch `Event.RESIZE`). An embedding page that
+  wants AIR's fixed `<width>/<height>` box just drops the attribute. Why it is opt-in per page, plus the four
+  implementation rules, are in [`html5-web.md`](html5-web.md) §3.7.
 
 Full architecture, font-injection flow, and known limitations are in [`html5-web.md`](html5-web.md).
 
