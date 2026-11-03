@@ -19138,9 +19138,76 @@ bit-identical 的值，多采样只多花显存与一次 resolve。**为什么�
 **未做（明确登记）**：屏上路径仍只由 `ASC_S3D_MSAA` 环境变量控制（没有运行时 API 面）；MSAA 目标的
 `drawToBitmapData` 读回走的是 resolve 后的单样本纹理（正确，但没做逐样本断言）。
 
+### 阶段三百五十八：E6 M4 —— WebGL2 直通臂（v0.4.320 → v0.4.321）
+
+**起点**：原生通道只有 Metal 一条臂，`--features native-shader` 的 `targets` 声明是 `['native']`，于是
+M30–M34 五个 demo 一直被当成「只能原生」，`native-shader.md` 的 P2（Web 免费点）行挂着 ❌。复核认为
+**这条判定本身就是错的**：作者写的是 GLSL ES 3.00，而它正是 WebGL2 的原生着色语言——把源码翻成 MSL 再
+塞进浏览器，等于绕地球一圈。
+
+**分叉点只有一个**：「怎么把一对源码变成链接后的 program + 反射表」。上层
+（`NativeProgram3D` / `ShaderMaterial` / `setUniform` 的 (stage, slot) 键）两端完全相同。
+
+| | native（Metal / D3D12） | wasm（WebGL2） |
+|---|---|---|
+| 编译链 | glslang → SPIR-V → SPIRV-Cross | 无：`glCompileShader` 直接吃 ES 3.00 |
+| 链接的工具库 | `vendor/glslang`、`vendor/SPIRV-Cross`（宿主档案） | **不链接**（`shader_compiler.cc` 不编，进 emcc 链接行会报错） |
+| 反射来源 | SPIRV-Cross 的 `spvc_*` 资源列表 | **驱动**：`glGetActiveUniform` / `glGetActiveAttrib` |
+| 槽位语义 | 编译期烘进 `[[buffer(N)]]` / `[[texture(N)]]` | 按**名字**寻址，需要一张 name→slot 表 |
+| 上限 | 31 buffer / 31 texture（每 stage） | 16 texture unit（两 stage **共享**一个全局命名空间） |
+
+**接线**：`runtime.ts` 的 `as_shader_translate_program` 成为唯一分派点（由 `ASC_S3D_GLSL` 选臂），
+`emit.ts` 的 `NativeProgram3D.compile` 走它、`translatedVertex/Fragment` 回落成作者源码本身，
+`useProgram` 时 `as_shader_apply_layout` 把反射表交给后端；`stage3d_webgl.cc`（+1072 行）落地
+`s3d_native_*` 整套——建程序、按 (stage, slot) 暂存 64 字节 uniform 载荷、按名字绑采样器、FBO 目标、
+驱动反射（顶替 `asc_shader_translate` 填同一份 `asc_shader_program`，`asc_shader_backend_info` 如实报
+driver reflection）；`stage3d_glue.mm` 的 `s3d_native_layout` 是 **no-op**（Metal 的槽位已被 SPIRV-Cross
+烘进属性，没有名字可解析）。`build.ts` 里该 feature 的 `targets` 加 `wasm`，`applyFeatureDeps` 对 wasm
+直接返回——宿主档案不能进 emcc 链接行。
+
+**三个「编译过、结果错」的坑**（都只在 WebGL2 出现，Metal 侧结构上不存在）：
+
+1. **反射必须做在链接之后的 program 上**。GLES3 的 `glGetActiveUniform` 是 program 级的，先对着编译好的
+   shader 对象问会一直答「没有这个 uniform」；同一处还要把每个 program uniform 归属回 stage，才能与
+   `setUniform(stage, slot)` 同键。
+2. **槽位按 (kind, stage) 各自从 0 编号**，不是跨 kind 连续编号。第一版跨 kind 连续编号，于是「几个
+   uniform + 几个 sampler」的程序里 sampler 拿到 slot 8..10，而绑定循环的上界是 AGAL 的纹理寄存器上限 8
+   ——天空程序因此在未绑定的 unit 上采样，整片海洋**黑色且 `glError == 0`**。同一处还有第二个上限：绑定
+   循环遍历 `S3D_MAX_TEX`（8），而原生程序的采样器上限是 16，`ocean-m32` 的水面程序声明 10 个，超出的
+   slot 每次被静默跳过、位移图读成「常数」（画面是平静水面、读回极差 0/255）。
+3. **正面朝向要翻转，而不是补全剔除模式**。原生程序自己写 `gl_Position`、没有 AGAL 顶点级那次 Y 取反，
+   同一批三角形在 GL 眼里绕序相反。改法是一行 `glFrontFace(nativeMode ? GL_CW : GL_CCW)`；只补 cull 模式
+   能救回 dM30 的四边形，但 `gl_FrontFacing` 仍是反的——`ocean-m34` 的水面 pass 于是把每个片元判成
+   「水面下侧」（49.9% underside / 0.2% top side，自检红）。
+
+**验收**：五个 demo 全部在**真浏览器**里自检绿——`shader-m30`（`#version 300 es` 直通、中心像素
+`#804020`）、`shader-m31`（float32/half/MRT/depth/texelFetch/uint）、`shader-m33`（helpers/导数/混合/
+离屏/图集）、`ocean-m32`（FFT 位移极差 `-1.498..1.420 m`、spread 186/255）、`ocean-m34`（7 条自检全
+PASS）。逐项数字与口径见 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md) §6.11。
+
+**未做（明确登记）**：WebGL2 的 `setRenderTargetSamples` 仍是「拒绝并报明」——离屏 MSAA 需要
+multisample renderbuffer + `glBlitFramebuffer` 解析，而解析必须与 pass 链交织，不是逐贴图开关；页面会
+打印一行注明边缘保持单采样。D3D12/HLSL（P3）未动。
+
+**钉子**：`test/unit/native-shader.ts` 把原先四条反向断言**翻转**（wasm 接受该 feature、wasm 不编
+`shader_compiler.cc`、wasm 不链 glslang/SPIRV-Cross、native 有档案时仍编 shim）；`test/unit/build.ts`
+同步；`test/unit/stage3d.ts` 的 mip-drop 顺序断言**收窄到 `s3d_draw` 函数体内**——新加的 layout 函数里也
+有 `glUseProgram`，全文 `indexOf` 会比到错位置。
+
+**同阶段修净、不占表**：`unit: platform/NativeWindow` 的「every as_window_create definition takes the
+backend request」被本阶段**误伤**——那条钉子用 `count(preamble, '(void)gpu;') === seamDefs` 统计两个窗口
+存根，而 `as_shader_translate_program` 里也有一行 `(void)gpu;`（它在非 GLSL 臂上丢弃一个无关的 gpu
+句柄），计数从 2 变 3。改成匹配整段 `(void)decorated; (void)highdpi; (void)gpu;`（只在两个存根里出现），
+仍然抓得住「有定义没跟上」这个真回归。**口径提醒**：全文件计数式审计在文件新增同形代码时会假红，审计
+要么锚定唯一上下文，要么匹配一整段不可分的前缀。
+
+**文档**：`native-shader.md` 新增 §6.11 并把 P2 行翻成 ✅；`compile.md` / `enhancements.md` / 两份
+README 里「仅 native」改成「native + wasm」。
+
 ---
 
 ### 遗留待开发
+> **2026-11-03 追加（阶段三百五十八：E6 M4 WebGL2 直通臂）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表数据行 **90 → 90 行**（`未开始` 70 / `部分完成` 19 / `调研完成·实现暂缓` 1）。本阶段落的是 `native-shader.md` 里 P2 那行（**阶段小节里的计划项**，不在本表），而 WebGL2 侧如实留下的缺口（`setRenderTargetSamples` 拒绝并报明、D3D12 未动）已在阶段节与同文档 §6.11 登记，不重复入表。**同阶段修净、不占表**：`unit: platform/NativeWindow` 的窗口接缝审计被本阶段新增的 `(void)gpu;` 误伤（全文计数式审计的假红），已改成匹配整段前缀。
 > **2026-11-02 追加（阶段三百五十四：`NativeWindow.systemMinSize`/`systemMaxSize` 与拖拽进行中的 `moving`/`resizing`）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **90 → 90 行**（`未开始` 70 / `部分完成` 19 / `调研完成·实现暂缓` 1）。**改写 1 行**是 `NativeWindow` 家族那行——②③ 两条（静态系统极限、拖拽中的 `moving`/`resizing`）落地，剩下的只有 `NativeMenu` **整个子系统**（依赖面最大，仍最低优先）。**同阶段修净、不占表**：`requestedDisplayResolution=standard` 的窗口在 Retina 屏上被**减半**（`sk_client_size_live`/`sk_window_device_scale` 无条件折 backing scale ⇒ 400x300 读回 `200x166`、stage 只有一半大）——它先于本轮改动存在，是示例里那三条失败的真正原因；现在两处都以 `SDL_WINDOW_ALLOW_HIGHDPI` 为门。**口径提醒**：这类「尺寸口径」缺陷只在**Retina + 1x 渲染**的组合里现形，非 Retina 机器上怎么量都是绿的，故 `docs/{zh-cn,en}/compile.md` 的 `requestedDisplayResolution` 段已写明门控条件。
 > **2026-11-02 追加（阶段三百五十二：AGAL4 顶点纹理取值）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **91 → 90 行**（`未开始` **71 → 70** / `部分完成` 19 / `调研完成·实现暂缓` 1）。**移出 1 行**：「顶点纹理取值（VTF）」——三翻译器的顶点 sampler 声明 + 三后端绑定 + stage/version 门控（`#3622`/`#3803`/`#3805`/`#3757`）全部落地，Metal 真机 26 条断言。**同阶段修净、不占表**：① `Program3D` 重 upload 不重新编译着色器（缓存键是指针，改成「指针 + `uploadSerial`」）；② `as_agal_errid` 让 AGAL 校验错误的 `errorID` 与 AIR 一致（此前恒 0）。**一处刻意的实现分歧**：AIR 的顶点 `tld` **忽略 LOD 字节**（恒采 mip0），我们按指令本意用该值 —— 在 AIR 上跑对的程序都写 lod=0，故行为等价。
 > **2026-11-02 追加（阶段三百五十一：`Context3DTextureFormat` 六常量 · 半浮点纹理 · `ignoreResourceLimits` 真实语义）**：**新登记 0 行 / 改写 1 行 / 移出 2 行** ⇒ 按「项数以表内实际行数**为准**」逐行重数，主表数据行 **93 → 91 行**（`未开始` **73 → 71** / `部分完成` 18 / `调研完成·实现暂缓` 1）。**移出 2 行**：① 「`Context3DTextureFormat` 与 AIR 官方全集有 4 处偏差」（六常量对齐、`RGBA` 删除、`#2008`/`#3745`/`#3759` 按实测顺序接入、六种格式的上传解码与字节数全部落地）；③ 「旗标打开后的显存预检与分配失败上报」（`as_tex_check_budget` 单次分配估算 + `as_tex_alloc_failed` 在 create 与三个上传入口翻译后端失败，守卫无后端构建）。**改写 1 行**：② 收窄成「顶点纹理取值（VTF）」——AGAL4 版本与指令预算已放行（`f9a2292`），剩下的只有三翻译器的顶点 sampler 声明与三后端绑定，属独立立项。**一处旧口径被推翻并同阶段修净（不占表）**：阶段二百二十七 把 `ignoreResourceLimits=true` 实现成「上限放到设备上限 16384」，实测（三档一致）是「上限不动、只把 `#3683` 换成 `#3684`」——旧实现比 AIR 更宽松，正是文档警告的那个输入；该分歧连同 `test/unit/stage3d.ts` 的 8 号钉一起按新口径改写，`docs/{zh-cn,en}/display3d.md` §9.14 正文同步。**另记一条 AIR 自身行为**：present 之后读回半浮点渲染目标恒为 `ff000000`（`Half3.as`），我们连续返回 `ff8040bf`（更正确），**不复制**。
