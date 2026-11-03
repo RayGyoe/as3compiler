@@ -13,10 +13,15 @@
 > [`display3d.md`](display3d.md)（Stage3D 对齐与 AGAL 翻译）、[`compile.md`](compile.md)（构建清单与后端）、
 > `asaot3d/three-api-design.md` §9（渲染接缝与 `NativeShaderRenderer`）。
 >
-> **进展（2026-11-02）**：M1 交叉编译链 / M2 编译器侧 / M3 Metal 后端 / M6 引擎侧 **已落地并真机验收**
+> **进展（2026-11-03 复核）**：M1 交叉编译链 / M2 编译器侧 / M3 Metal 后端 / M6 引擎侧 **已落地并真机验收**
 > —— `asaot3d/apps/shader-m30` 用作者写的一对 GLSL ES 3.00 画四边形，`drawToBitmapData` 读回
 > 中心 `#804020`（= `uColor.rgb * vUV.x`）与 3/8 处 `#361b0e`，同一份 `.as` 在默认构建/`adl` 下
-> 打印 `NO-CHANNEL` 并退出 0（§8 红线）。**M4 Web 直通 / M5 D3D12 / M7 Ultra-Water 对齐未做**。
+> 打印 `NO-CHANNEL` 并退出 0（§8 红线）。**M3 的能力面**（浮点目标读写、MRT 两附件分别读回、深度纹理
+> 作附件）由 `apps/shader-m31` 的 13 项补验（阶段三百五十五）；**M4 Web 直通**已落地（阶段三百五十八，
+> 见 §6.11）——wasm 直接吃 GLSL ES 3.00 源，native 仍走 glslang+SPIRV-Cross；**M7 Ultra-Water 对齐**
+> 在引擎侧由 `apps/ocean-m34` 落地（86 pass/帧、7 条自检全 PASS）。
+> **仍未做**：**M5 D3D12/HLSL**（`stage3d_d3d.cc` 的 float `DXGI_FORMAT` + 原生 HLSL 编译），以及深度
+> 纹理的 `sampler2DShadow` 比较采样（契约暂定为「深度 = 渲染附件」）。
 > 施工图与逐条 as-built（含落地时暴露的四个真缺陷）见 [`native-shader-plan.md`](native-shader-plan.md)。
 
 ---
@@ -764,7 +769,7 @@ E6 落地后，**FFT 的归属从「被迫 CPU」翻转为「可以 GPU」**：
 | **P1 · Metal 单后端起步** | glslang+SPIRV-Cross 入 `build-tools/`；`--features native-shader` 注册；`stage3d_glue.mm` 增 float RT + MRT + 原生 MSL 编译；`NativeShaderRenderer` + `ShaderMaterial` | AOT-macOS 出画面，float RT 可渲可读，MSL **真编译** | Metal | ✅ **M3 + M6 已验收**：`shader-m30` 15 项 PASS、像素 `#804020`/`#361b0e`。验收方式从 `xcrun metal` 改运行期 `newLibraryWithSource:`（§3.4：本机无离线工具链） |
 | **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一画面，零交叉编译 | WebGL2 | ✅ 2026-11-03 落地，见 §6.11 |
 | **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 | ❌ 未做（SPIRV-Cross 的 HLSL 半边库已链好） |
-| **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | 🟡 **第一阶段已落**：`asaot3d/apps/ocean-m32` = Tessendorf FFT 海洋（256²×2 cascade、34 pass/帧、顶点纹理取值位移、MRT 位移+法线、高度读回 ±1.6 m）。**未做**：caustics / 水下 pass / 喷雾 / 4 cascade / 平面反射 / 天空梯度 |
+| **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | ✅ **已落地（引擎侧）**：`asaot3d/apps/ocean-m34` 完成 Ultra-Water 全量对齐（4 级 FFT + 大气 LUT + caustics + 平面反射 + 延迟水面 + spray + 水下光柱 + 合成，86 pass/帧，7 条自检全 PASS，见 `asaot3d/three-api-design.md` §39），起点是 `ocean-m32` 的 Tessendorf FFT（256²×2 cascade、顶点纹理取值位移、MRT 位移+法线、高度读回 ±1.6 m）。**与 three.js 参考的残余**（直接光镜面项偏亮 3.4×、雾抬升偏弱）记在 `three-api-design.md` §29.8 / §30.7，属引擎侧账，不占编译器 DoD |
 
 **第一批只落 Metal** 的理由成立：本机 macOS + Metal，MSL 与 GLSL ES 3.00 语法接近，先把
 「E6 + float RT + MRT + texelFetch」的最小闭环钉死，再铺开。
@@ -796,16 +801,18 @@ E6 一个阶段「做完」须同时满足（对齐 AGENTS.md §4）。**下表�
 | # | 标准 | 状态 |
 |---|---|---|
 | 1 | `--features native-shader` 开启后，`Context3DNative`（§6.3）能提交 GLSL ES 3.00 源码并正确编译到目标后端 | ✅ **已验收**——但不是 `xcrun metal`（本机无离线工具链，§3.4），而是运行期 `newLibraryWithSource:`；`shader-m30` 的 15 项里前 12 项就是这个通路（含顶点译文里的 `[[buffer(n)]]` 与 `main0` 入口、ES1.00/legacy 拒绝带行号） |
-| 2 | float RT（至少 `RGBA_HALF_FLOAT` / `RGBA_FLOAT` / `R32F`）读写正确，读回数值在容差内 | ❌ **未验收**——`shader-m30` 画到**后台缓冲**再 `drawToBitmapData` 读回，没碰浮点目标；格式创建面（11 个 id）代码已落 |
-| 3 | MRT 至少两附件，`layout(location=0/1) out` 落对 | 🟡 **部分**——反射已验（`examples/native-shader-probe.as` 报 `colorAttachments == 2`）， **两张附件分别读回像素未验** |
+| 2 | float RT（至少 `RGBA_HALF_FLOAT` / `RGBA_FLOAT` / `R32F`）读写正确，读回数值在容差内 | ✅ **已验收**——阶段三百五十五 的 `asaot3d/apps/shader-m31` 13 项：32F/16F 目标可渲可读，且 fp16 **确实丢位**（不是被抬成 32F）。此前只有 `shader-m30` 画后台缓冲再 `drawToBitmapData` 的通路验证 |
+| 3 | MRT 至少两附件，`layout(location=0/1) out` 落对 | ✅ **已验收**——阶段三百五十五：两附件**分别**读回（不再只是反射里那句 `colorAttachments == 2`） |
 | 4 | `examples/*.as` 有最小示例，`as-aot --features native-shader examples/x.as --run` 跑通 | ✅ **已验收**——`examples/native-shader-probe.as`（编译器侧）+ `asaot3d/apps/shader-m30`（引擎侧）。**不是「FFT 海洋」**：原 DoD 写的是海洋，实际改成四边形，理由见 §9 |
 | 5 | 默认构建（不带 `--features native-shader`）**逐字节不变**，`Context3DTextureFormat` 与 AIR 六常量逐字对齐 | ✅ **已验收**——`test/unit/native-shader.ts` 双向钉（默认构建无 native 方法体 + `#define ASC_HAS_NATIVE_SHADER 0`） |
 | 6 | AIR 侧如实报明（不静默黑屏） | ✅ **已验收**——默认构建/`adl` 下 `shader-m30` 打印 `NO-CHANNEL` 并退出 0，`ShaderMaterial` 直接抛错 |
 | 7 | `test/unit/` 有源级钉子（新格式枚举、MRT、`--features` 注册、负例「AIR 不支持」） | ✅ `test/unit/native-shader.ts` |
 | 8 | `enhancements.md` §3 E6 状态更新、`README-CN.md`/`README.md` 同步、版本号递增 | ✅ v0.4.314 立项+M2、v0.4.316 M3 通路 + M6 |
 
-> **1/2/3 的区别很重要**：通路（源码 → MSL → 管线 → draw → 像素）已经端到端跑通，但**浮点目标与 MRT 的读回**没验。
-> 所以「浮点渲染目标可用」这句话今天只能说到「API 在、格式建得出来」，不能说到「数值对」。这正是 M7（FFT 需要两张浮点图）开工前必须补的第一件事。
+> **1/2/3 的区别曾经很重要**：通路（源码 → MSL → 管线 → draw → 像素）先跑通，而**浮点目标与 MRT 的读回**当时没验，
+> 所以那句话当时只能说到「API 在、格式建得出来」，不能说到「数值对」——它正是 M7（FFT 需要两张浮点图）开工前必须补的第一件事。
+> **2026-11-03 补记**：三项已由阶段三百五十五 的 `shader-m31` 补齐（32F/16F 读写且 fp16 丢位、MRT 两附件分别读回、
+> 深度纹理作附件的遮挡判定），M7 随后在引擎侧落地（`ocean-m34`）。
 
 ---
 

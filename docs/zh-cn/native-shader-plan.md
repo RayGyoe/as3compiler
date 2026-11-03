@@ -63,10 +63,10 @@
 | **M1 交叉编译链** | `build-tools/shader/` 建 glslang + SPIRV-Cross；`vendor/shader_compiler.cc` 的 C 接口；独立 C 测试程序 | `./temp/shc-test` 打印出正确 MSL（含反射表） |
 | **M2 编译器侧** ✅ | `--features native-shader` 注册；`Context3DNative` 内建类 + 格式常量 + `uploadProgram`/绑定/draw；`ASC_HAS_NATIVE_SHADER` 门控 | `examples/native-shader-probe.as` 绿：MRT=2、反射 5 条、ES1.00/legacy 双双带行号拒绝 |
 | **M3 Metal 后端** ✅ | 浮点 RT 格式面、原生程序绑定（uniform/纹理/属性）、MRT、深度纹理、`texelFetch`/整数哈希 | **真机全绿**（2026-11-02 补验，`asaot3d/apps/shader-m31` 13 项 PASS）：32F/16F RT 可渲染且**半浮点确实丢位**（`1+1/4096` 在 32F 保住、16F 归零）、MRT 两附件分别读回、`texelFetch` 非中心 texel 精确、PCG `uvec2` 哈希分散、深度纹理**作为附件**的遮挡判定正确。**深度纹理不能当彩色采样器**（MSL 只给 `depth2d`，GLSL `sampler2D` 落到 `texture2d<float>` 读 0）——见 §8 待定项 6 的结论 |
-| **M4 Web 免费点** | `stage3d_webgl.cc` 直通 + `EXT_color_buffer_float` | `--target wasm` 同一份 `.as` 出同一画面，零交叉编译 |
+| **M4 Web 免费点** ✅ | `stage3d_webgl.cc` 直通 + `EXT_color_buffer_float`（wasm 直接吃 ES 3.00 源、**不链** SPIRV-Cross；反射走驱动，见 `native-shader.md` §6.11） | ✅ 2026-11-03（阶段三百五十八）：`--target wasm` 同一份 `.as` 出同一画面、零交叉编译，五个 demo（m30/m31/m33/ocean-m32/ocean-m34）真浏览器自检绿 |
 | **M5 D3D12** | `stage3d_d3d.cc` 浮点 `DXGI_FORMAT` + 原生 HLSL | Windows 出图（CI/实机） |
 | **M6 引擎侧** ✅ | `ShaderMaterial` + `NativeShaderRenderer` + `RendererFactory` + `extra-roots` 清单字段 | `apps/shader-m30` **15 项全 PASS**；`adl`/默认构建打印 NO-CHANNEL 并如实拒画（§8 红线）；引擎侧决策见 `asaot3d/three-api-design.md` §37 |
-| **M7 Ultra-Water 对齐** | FFT 海洋 → caustics → 大气 → 水下 | 与 three.js 参考逐项对拍 |
+| **M7 Ultra-Water 对齐** ✅ | FFT 海洋 → caustics → 大气 → 水下 | ✅ **已落（引擎侧）**：`apps/ocean-m34` 86 pass/帧、7 条自检全 PASS（`asaot3d/three-api-design.md` §39）；与 three.js 参考的残余（直接光镜面偏亮、雾抬升偏弱）记在该文档 §29.8 / §30.7，属引擎侧账 |
 
 ---
 
@@ -300,6 +300,13 @@ void asc_shader_program_free(AscShaderProgram* p);
 | 纹理/采样器 | 复用 0..7 单元；未显式 `setSamplerStateAt` 时给 linear+clamp，否则沿用 AGAL 记下的状态 |
 
 ### 5.4 M4 · Web
+
+> **as-built（2026-11-03，阶段三百五十八）**：本节是**设计期的草稿**，落地时的情况按现行口径看 `native-shader.md` §6.11。
+> 与下面四行草稿的差异：① 直通本身确实只是“源码直接交给 `glCompileShader`”，但**反射不能只当自动枚举用**——
+> GLES3 的 `glGetActiveUniform` 是 program 级且按**名字**寻址，must 在链接后的 program 上做，并把这每个 uniform
+> 归属到 stage（`native-shader.md` §6.11 三个坑的第 1、2 条）；② **槽位按 (kind, stage) 各自从 0 编号**，
+> 不是跨 kind 连续编号（第一版因此整片海洋变黑且 `glError == 0`）；③ 还有一条草稿没提到的：**正面朝向要翻转**
+> （`GL_CCW` 是 AGAL 那臂的口径，原生程序没有那次 Y 取反）。
 
 | 动作 | 说明 |
 |---|---|

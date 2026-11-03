@@ -68,11 +68,11 @@ Each row was checked against the code before starting, so nothing already presen
 | **M0 kick-off** | this document + `enhancements.md` E6 status + the `TODO.md` stage entry | docs committed, `node test.ts` unchanged |
 | **M1 cross-compile chain** | `build-tools/shader/` builds glslang + SPIRV-Cross; the C interface in `vendor/shader_compiler.cc`; a standalone C test program | `./temp/shc-test` prints correct MSL (with a reflection table) |
 | **M2 compiler side** ✅ | `--features native-shader` registered; `Context3DNative` built-in class + format constants + `uploadProgram`/binding/draw; `ASC_HAS_NATIVE_SHADER` gating | `examples/native-shader-probe.as` green: MRT=2, 5 reflection entries, both ES1.00/legacy rejections carry line numbers |
-| **M3 Metal backend** 🟡 | float RT format surface, native program binding (uniform/texture/attribute), MRT, depth textures | **path verified on device, three capability faces unverified**: `apps/shader-m30` centre `#804020` / 3-8 position `#361b0e`, bit-exact against `uColor.rgb * vUV.x` — but it draws to the **backbuffer**; **float RT readback, per-attachment MRT readback and depth-texture sampling are unverified** (format creation and the 11 ids have landed). Fix these three before M7 (design §11 table) |
-| **M4 the free web point** | `stage3d_webgl.cc` passthrough + `EXT_color_buffer_float` | the same `.as` under `--target wasm` shows the same image, zero cross-compilation |
+| **M3 Metal backend** ✅ | float RT format surface, native program binding (uniform/texture/attribute), MRT, depth textures | **all green on device** (2026-11-02, `asaot3d/apps/shader-m31` 13 items PASS): 32F/16F targets render and half precision **really does lose bits**, the two MRT attachments read back **separately**, depth texture works as an attachment; `apps/shader-m30` still pins the path (centre `#804020` / 3-8 position `#361b0e`, bit-exact against `uColor.rgb * vUV.x`) |
+| **M4 the free web point** ✅ | `stage3d_webgl.cc` passthrough + `EXT_color_buffer_float` (wasm consumes the ES 3.00 source verbatim and does **not** link SPIRV-Cross; reflection comes from the driver, see `native-shader.md` §6.11) | ✅ 2026-11-03 (stage 358): the same `.as` under `--target wasm` shows the same image with zero cross-compilation; all five demos (m30/m31/m33/ocean-m32/ocean-m34) green in a real browser |
 | **M5 D3D12** | `stage3d_d3d.cc` float `DXGI_FORMAT` + native HLSL | on screen on Windows (CI / real machine) |
 | **M6 engine side** ✅ | `ShaderMaterial` + `NativeShaderRenderer` + `RendererFactory` + the `extra-roots` manifest field | `apps/shader-m30` **15/15 PASS**; `adl`/default build prints `NO-CHANNEL` and refuses to draw (§8 red line); engine-side decisions in `asaot3d/three-api-design.md` §37 |
-| **M7 Ultra-Water alignment** | FFT ocean → caustics → atmosphere → underwater | compared item by item against the three.js reference |
+| **M7 Ultra-Water alignment** ✅ | FFT ocean → caustics → atmosphere → underwater | ✅ **landed (engine side)**: `apps/ocean-m34` does 86 passes/frame with 7 self-checks all PASS (`asaot3d/three-api-design.md` §39); residuals against the three.js reference (direct specular too bright, fog lift too weak) live in that document's §29.8 / §30.7 and are engine-side accounts |
 
 ---
 
@@ -318,6 +318,15 @@ void asc_shader_program_free(AscShaderProgram* p);
 | Textures/samplers | reuse units 0..7; without an explicit `setSamplerStateAt` they get linear+clamp, otherwise the state AGAL recorded is used |
 
 ### 5.4 M4 · Web
+
+> **As built (2026-11-03, stage 358)**: this section is the **design-time sketch**; for what actually landed see
+> `native-shader.md` §6.11. Three differences from the four draft rows below: ① passthrough really is "hand the
+> source to `glCompileShader`", but **reflection cannot be treated as mere automatic enumeration** — GLES3's
+> `glGetActiveUniform` is program-level and name-addressed, so it must run on the linked program and every
+> uniform must be attributed to a stage (§6.11 traps 1 and 2); ② **slots are numbered from 0 per (kind, stage)**,
+> not consecutively across kinds (the first version therefore rendered the whole ocean black with
+> `glError == 0`); ③ the draft does not mention that **front face has to be flipped** (`GL_CCW` is the AGAL
+> arm's convention; a native program has no Y negation).
 
 | Action | Note |
 |---|---|

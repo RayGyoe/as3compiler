@@ -19,13 +19,19 @@
 > [`display3d.md`](display3d.md) (Stage3D alignment and AGAL translation), [`compile.md`](compile.md) (manifest
 > and backends), `asaot3d/three-api-design.md` §9 and §37 (render seam, `NativeShaderRenderer`).
 >
-> **Status (2026-11-02)**: M1 cross-compile chain / M2 compiler side / M3 Metal backend / M6 engine side are
+> **Status (2026-11-03 re-check)**: M1 cross-compile chain / M2 compiler side / M3 Metal backend / M6 engine side are
 > **landed and verified on device** — `asaot3d/apps/shader-m30` draws a quad from a pair of author-written
 > GLSL ES 3.00 shaders and `drawToBitmapData` reads back centre `#804020` (= `uColor.rgb * vUV.x`) and
 > `#361b0e` at 3/8; the same `.as` under a default build / `adl` prints `NO-CHANNEL` and exits 0 (§8 red
-> line). **M4 Web passthrough / M5 D3D12 / M7 Ultra-Water alignment are not done.** Work breakdown and
-> per-item as-built notes (including the four real defects exposed during landing) are in
-> [`native-shader-plan.md`](native-shader-plan.md).
+> line). **M3's capability surface** (float-target read/write, per-attachment MRT readback, depth texture as
+> an attachment) was filled in by the 13 items of `apps/shader-m31` (stage 355); **M4 Web passthrough**
+> landed in stage 358 (§6.11) — wasm consumes the GLSL ES 3.00 source verbatim while native still goes
+> through glslang + SPIRV-Cross; **M7 Ultra-Water alignment** landed on the engine side in
+> `apps/ocean-m34` (86 passes/frame, 7 self-checks all PASS).
+> **Still not done**: **M5 D3D12/HLSL** (float `DXGI_FORMAT` + native HLSL compilation in `stage3d_d3d.cc`),
+> and `sampler2DShadow` comparison sampling for depth textures (the contract currently stands at "depth =
+> render attachment"). Work breakdown and per-item as-built notes (including the four real defects exposed
+> during landing) are in [`native-shader-plan.md`](native-shader-plan.md).
 
 ---
 
@@ -467,7 +473,25 @@ straight to the backend) — but they must be listed completely so nobody assume
 | **Shadow compare sampling** `sampler2DShadow` | OceanSurface.js:271, UnderwaterPass.js:17 | none (ES 1.00 manual `texture2DProj`) | §6.4(c) — today the comparison is done in the shader, not in hardware |
 | **Integer types + bit ops** `uint`/`uvec2`/`^`/`>>` | OceanSim.js:38/41/51 PCG hash | none (AGAL has no integers) | ES 3.00 core, native on all three |
 
-### 6.9 Render-target MSAA: `setRenderTargetSamples` (M34, enhancement)
+### 6.9 Channel constraint list (derived from M3 + the FFT ocean, 2026-11-02)
+
+None of these five is "not implemented" — each is "writing it this way is wrong". Every one was forced out by
+an actual crash or a silent black screen in `apps/shader-m31` / `apps/ocean-m32`; they are contract now:
+
+| # | Constraint | Symptom (what you see) | Correct form |
+|---|---|---|---|
+| 1 | **Vertex attributes must carry `layout(location = N)`** | `MSL(vertex) compile failed: invalid type 'vs_main_in' of input declaration with attribute 'stage_in'` / `field with missing attribute 'attribute'` | `layout(location = 0) in vec3 aPos;`, numbered 0..n contiguously |
+| 2 | **GLSL helper functions that read `uniform` do not translate** | `cannot bind reference in address space 'constant' to object in default address space` | Inline it; or copy the uniform into a local first (`vec3 w = uFoo;`) and pass that (locals live in the `thread` address space) |
+| 3 | **Integer uniforms must not go through `setUniform1f`** | Pass 2, the shader reads `1073741824` (the IEEE bit pattern of `2.0`) | `Context3DNative.setUniformInts(program, name, values)`; the reflection's `base_type` decides the dispatch, `components`/`size` decide `setUniform1f..4f` / `setUniformFloats` / `setUniformMatrix4` |
+| 4 | **Never submit a draw with an "empty" render-target set** | The Metal draw aborts; the process dies near `MTLResourceListAddResource` | Read the backbuffer with `setBackBuffer()` (or `setRenderToBackBuffer()`); never `setRenderTargets([], null)` |
+| 5 | **`drawToBitmapData`'s destination may be smaller than the backbuffer** (a compiler defect fixed in this round) | The readback is correct, then the **next** frame dies inside Metal (method cache corrupted) — looking like "a Metal bug" | Clip the copy to the **destination** size (`min(bb, dest)`); the old code wrote the full backbuffer, so a 64x64 probe wrote through a 256 KB heap buffer |
+
+Item 5 is a **semantic defect** in `Context3D.drawToBitmapData`, not a channel problem: AIR requires the
+destination to be no smaller than the backbuffer, we relax that to "copy the overlap, leave the rest alone" —
+but **never write out of bounds**. That defect had been there since the first readback probe; the probe then
+exited immediately so the heap corruption never surfaced, until a 34-passes-per-frame ocean caught it.
+
+### 6.10 Render-target MSAA: `setRenderTargetSamples` (M34, enhancement)
 
 `ASC_S3D_MSAA` multisamples the **drawable** only; offscreen targets were pinned to one sample (D54/D55).
 The offscreen-chain apps need edge antialiasing there, so M34 adds a **per-target** knob:
@@ -492,6 +516,69 @@ against the draws under MSAA.
 Measured (ocean-m34, frozen time, identical camera): off vs 4x differs on 1.58% of pixels (mean 0.185), and
 92.5% of that lands on strong edges; the Breakers view shows 1.12% with hard-step pixels down 1.8%. A
 difference covering flat surfaces means the wrong targets were multisampled.
+
+**Boundaries**: `setRenderTargetSamples` does not touch the drawable (that still belongs to `ASC_S3D_MSAA`);
+`renderOverride` passes (shadow prepass, `drawToBitmapData`) are always one sample (D54); the companion is
+lost when the target is recreated, so the caller must push it again.
+
+### 6.11 The WebGL2 passthrough arm: the same GLSL ES 3.00, no SPIR-V (2026-11-03)
+
+The native channel used to have a single arm (Metal), and web/wasm builds **rejected**
+`--features native-shader`, so the five demos M30/M31/M32/M33/M34 were written off as "native only". This
+round judged that wrong: the author writes **GLSL ES 3.00**, which is exactly WebGL2's native shading
+language — translating it to MSL and then running it in a browser is a trip around the world.
+
+**Conclusion: wasm accepts `native-shader` too, but the two arms take different compile inputs.**
+
+| | native (Metal / D3D12) | wasm (WebGL2) |
+|---|---|---|
+| Compile chain | glslang → SPIR-V → SPIRV-Cross → MSL/HLSL | **none**: ES 3.00 source goes straight to `glCompileShader` |
+| Linked tool libs | links `vendor/glslang`, `vendor/SPIRV-Cross` (host archives) | **not linked** (`shader_compiler.cc` is not built; there is no SPIRV-Cross in wasm) |
+| Reflection source | SPIRV-Cross's `spvc_*` resource list | **the driver**: `glGetActiveUniform` / `glGetActiveAttrib` on the linked program |
+| Slot semantics | `spvc_compiler_msl_get_automatic_resource_binding`: `[[buffer(N)]]` / `[[texture(N)]]` | the same semantics: **numbered from 0 per (kind, stage)** (see below) |
+| Limits | 31 buffers / 31 textures (per stage) | 16 texture units (both stages **share** one global unit namespace) |
+
+`test/unit/native-shader.ts` pins this contract in four assertions: wasm accepts the feature, wasm does not
+build `shader_compiler.cc`, wasm does not link `glslang`/`SPIRV-Cross`, and native still builds the shim when
+the archives are present.
+
+**Wiring (`vendor/stage3d_webgl.cc`, all inside `S3DContext`)**: `s3d_native_use` creates the program,
+`s3d_native_uniform` stages a 64-byte payload per (stage, slot), `s3d_native_bind_texture` /
+`s3d_native_set_sampler_state` record bindings, `s3d_native_set_targets` / `s3d_native_target_create` build
+FBOs, and `s3d_native_reflect` replaces `asc_shader_translate` while filling the same `asc_shader_program`
+(`translatedVertex/Fragment` are the author's source itself, and `asc_shader_backend_info` honestly reports
+"driver reflection"). `s3d_native_layout` is a **no-op** on Metal (the bindings are already baked into
+`[[buffer(N)]]` by SPIRV-Cross) and a required step on WebGL2 (GL addresses uniforms **by name**).
+
+**Three "it compiles but the result is wrong" traps** (all WebGL2-only; structurally impossible on Metal):
+
+1. **Reflection must run on the program after linking.** In GLES3 `glGetActiveUniform` is program-level;
+   asking the compiled shader object always answers "no such uniform". The same place must attribute every
+   program uniform to a stage — done by scanning the source with `s3d_declares_uniform(vs, name)` /
+   `(fs, name)` — so `setUniform`'s (stage, slot) has the same key as Metal's `[[buffer(N)]]`.
+2. **Slots are numbered per (kind, stage), not consecutively across kinds.** The first version numbered
+   consecutively, so in a program with "a few uniforms + a few samplers" the samplers got slots 8..10 while
+   the sampler table ends at 7 — the sky program therefore sampled unbound units and the entire ocean
+   rendered **black with `glError == 0`**. The same spot had a second limit: the binding loop walked
+   `S3D_MAX_TEX` (8, AGAL's texture-register ceiling) while native programs allow 16 samplers and
+   `ocean-m32`'s water program declares 10 — the extra slots were silently skipped every time, so the
+   displacement map read back as a constant (a glassy surface, spread 0/255).
+3. **Front face must be flipped, not completed with cull modes.** AGAL's GLSL vertex-level negates clip-space
+   Y, so `GL_CCW` happens to equal Stage3D's front; a native program writes `gl_Position` itself, without that
+   negation, so the same triangles look reversed to GL. **Completing the cull modes fixes dM30's quad, but
+   `gl_FrontFacing` is still inverted** — `ocean-m34`'s water pass then judged every fragment "underside"
+   (49.9% underside / 0.2% top side, self-check red). The fix is one line:
+   `glFrontFace(c->nativeMode ? GL_CW : GL_CCW)`.
+
+**Acceptance**: all five demos are green in a real browser — `shader-m30` (`#version 300 es` passthrough,
+centre pixel `#804020`), `shader-m31` (float32/half/MRT/depth/texelFetch/uint), `shader-m33` (helpers /
+derivatives / blending / offscreen / atlas), `ocean-m32` (FFT displacement range `-1.498..1.420 m`, spread
+186/255), `ocean-m34` (all 7 self-checks PASS: displacement `-10.0..10.0 m`, sky LUT `0.078..20.0`,
+reflection `0.235..10.0`, caustics `0.000..1.042`, water coverage 49.9%/0.2%, shafts, from below).
+**Remaining difference, registered honestly**: WebGL2's `setRenderTargetSamples` (§6.10) still "rejects and
+says so" (offscreen MSAA needs a multisample renderbuffer plus `glBlitFramebuffer` resolution, and the
+resolution must interleave with the pass chain rather than being a per-texture switch); the page prints one
+line noting that edges stay single-sampled.
 
 ---
 
@@ -707,9 +794,9 @@ loudly** instead of showing a silent black screen. The landed shape is harder th
 | Stage | Content | Acceptance | Backend | Status |
 |---|---|---|---|---|
 | **P1 · Metal only** | glslang+SPIRV-Cross into `build-tools/`; `--features native-shader` registered; `stage3d_glue.mm` gains float RT + MRT + native MSL compile; `NativeShaderRenderer` + `ShaderMaterial` | a program on screen | Metal | ✅ **M1+M2+M3 path done**: `apps/shader-m30` reads back centre `#804020` bit-exact. Not via `xcrun metal` (no offline toolchain on this machine, §3.4) but via the runtime `newLibraryWithSource:` path |
-| **P2 · the free web point** | `stage3d_webgl.cc` passes GLSL ES 3.00 through + `EXT_color_buffer_float`; the same `ShaderMaterial` runs under `--target wasm` | the same image in a browser, zero cross-compilation | WebGL2 | ❌ not done (`--features native-shader` currently lists only `native` as a target) |
+| **P2 · the free web point** | `stage3d_webgl.cc` passes GLSL ES 3.00 through + `EXT_color_buffer_float`; the same `ShaderMaterial` runs under `--target wasm` | the same image in a browser, zero cross-compilation | WebGL2 | ✅ **landed 2026-11-03** (stage 358) — `--features native-shader` now lists both `native` and `wasm`; the two arms take different compile inputs (source verbatim vs glslang+SPIRV-Cross) |
 | **P3 · D3D12** | `stage3d_d3d.cc` gains float `DXGI_FORMAT` + native HLSL compilation | on screen on Windows | D3D12 | ❌ not done (SPIRV-Cross's HLSL half is already linked) |
-| **P4 · Ultra-Water alignment** | caustics / atmosphere LUT / underwater / foam / buoyancy, ported and compared item by item | close to the three.js reference on every item | all three | ❌ not done (this round proved the **path**, not the **ocean**) |
+| **P4 · Ultra-Water alignment** | caustics / atmosphere LUT / underwater / foam / buoyancy, ported and compared item by item | close to the three.js reference on every item | all three | ✅ **landed (engine side)** — `asaot3d/apps/ocean-m34`: 4-cascade FFT + atmosphere LUT + caustics + planar reflection + deferred surface + spray + underwater shafts + composite, 86 passes/frame, 7 self-checks all PASS (`asaot3d/three-api-design.md` §39). Residuals against the three.js reference (direct specular 3.4x too bright, fog lift too weak) are recorded in `three-api-design.md` §29.8 / §30.7 and belong to the engine side, not the compiler DoD |
 
 **Why batch 1 is Metal only**: this machine is macOS + Metal, MSL and GLSL ES 3.00 are syntactically close, so the
 minimal loop "E6 + float RT + MRT + texelFetch" gets nailed down first before spreading out.
@@ -741,18 +828,19 @@ verified from unverified** so "the code landed" is never confused with "it was a
 | # | Criterion | Status |
 |---|---|---|
 | 1 | With `--features native-shader`, `Context3DNative` (§6.3) submits GLSL ES 3.00 and it compiles correctly to the target backend | ✅ **verified** — via the runtime `newLibraryWithSource:`, **not** `xcrun metal` (no offline Metal toolchain on this machine, §3.4) |
-| 2 | float RT (at least `RGBA_HALF_FLOAT` / `RGBA_FLOAT` / `R32F`) reads and writes correctly, values within tolerance | ❌ **unverified** — `shader-m30` draws to the **backbuffer** and reads back with `drawToBitmapData`; it never touches a float target. The format-creation surface (11 ids) has landed |
-| 3 | MRT with at least two attachments, `layout(location=0/1) out` lands correctly | 🟡 **partial** — reflection verified (`examples/native-shader-probe.as` reports `colorAttachments == 2`), **per-attachment pixel readback not verified** |
+| 2 | float RT (at least `RGBA_HALF_FLOAT` / `RGBA_FLOAT` / `R32F`) reads and writes correctly, values within tolerance | ✅ **verified** — the 13 items of `apps/shader-m31` (stage 355): 32F/16F targets render and read back, and fp16 **really does lose bits** (it is not silently promoted to 32F). Earlier only the `shader-m30` backbuffer path existed |
+| 3 | MRT with at least two attachments, `layout(location=0/1) out` lands correctly | ✅ **verified** — stage 355 reads back the two attachments **separately** (no longer just the reflection's `colorAttachments == 2`) |
 | 4 | An `examples/*.as` minimal sample; `as-aot --features native-shader examples/x.as --run` works | ✅ **verified** — `examples/native-shader-probe.as` (compiler side) + `asaot3d/apps/shader-m30` (engine side) |
 | 5 | The default build (no `--features native-shader`) is **byte-identical**, and `Context3DTextureFormat` matches AIR's six constants verbatim | ✅ **verified** — `test/unit/native-shader.ts` pins both directions |
 | 6 | The AIR side reports honestly (no silent black screen) | ✅ **verified** — default build / `adl` prints `NO-CHANNEL` and exits 0; `ShaderMaterial` throws |
 | 7 | `test/unit/` has source-level pins (new format enums, MRT, `--features` registration, the negative "AIR does not support it") | ✅ `test/unit/native-shader.ts` |
 | 8 | `enhancements.md` §3's E6 row updated, `README-CN.md`/`README.md` synced, version bumped | ✅ v0.4.314 (project start + M2), v0.4.316 (M3 path + M6) |
 
-> **Why 1/2/3 differ matters**: the path (source → MSL → pipeline → draw → pixels) is verified end to end, but
-> **float-target and MRT readback** are not. So "float render targets work" can only be said as far as "the API is
-> there and the format can be created", not "the numbers are right". That is exactly the first thing to fix
-> before M7 (whose FFT needs two float attachments).
+> **Why 1/2/3 once differed**: the path (source → MSL → pipeline → draw → pixels) was verified end to end, but
+> **float-target and MRT readback** were not. So "float render targets work" could only be said as far as "the API is
+> there and the format can be created", not "the numbers are right" — which was exactly the first thing to fix
+> before M7 (whose FFT needs two float attachments). **2026-11-03 note**: all three are now covered by
+> `shader-m31` (stage 355), and M7 subsequently landed on the engine side (`ocean-m34`).
 
 ---
 
@@ -776,7 +864,7 @@ verified from unverified** so "the code landed" is never confused with "it was a
 - **⑤ UBO**: not implemented (nothing computes std140 offsets); `uniformsGroups` is not borrowed.
 - **⑥ `RawShaderMaterial`**: not implemented — `ShaderMaterial` already takes raw source, a separate class would
   have carried three.js's "no built-in uniforms/attributes" semantics that we inject anyway.
-- **⑦ Offscreen MSAA**: per-target `setRenderTargetSamples(tex, n)`, default 1 (§6.9). Not a `Context3D`-wide
+- **⑦ Offscreen MSAA**: per-target `setRenderTargetSamples(tex, n)`, default 1 (§6.10). Not a `Context3D`-wide
   switch: a global one would drag the full-screen data passes into multisampling for no gain.
 
 **Still open**:

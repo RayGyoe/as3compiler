@@ -112,8 +112,9 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 
 > **已完成 8 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）、E19 macOS 菜单栏状态项（`SystemTrayIcon`）。
 > **进行中 1 项**：**E6 原生着色器直通**——通路（作者 GLSL ES 3.00 → glslang → SPIR-V → MSL →
-> 管线 → draw → 像素）已真机验收，**但不算完成**：M4 Web 直通 / M5 D3D12 / M7 Ultra-Water 未做，
-> 且浮点 RT / MRT 读回 / 深度纹理三项**未验**（设计 §11 表）。所以它不在上面那 8 项里。
+> 管线 → draw → 像素）已真机验收，M3 的浮点 RT / MRT 读回 / 深度纹理三项也已补验，**M4 Web 直通已落地**
+> （wasm 直接吃 ES 3.00 源，五个 demo 真浏览器自检绿）；**仍未做** M5 D3D12/HLSL 与深度纹理的
+> `sampler2DShadow` 比较采样（设计 §11 表）。所以它不在上面那 8 项里。
 > **另有 1 项现状即增强、无需开工**：E17（无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`）——
 > AIR 的 `software` 渲染模式在这里会直接 `#3702`，我们照常给上下文；详细实测见
 > [`display3d.md`](display3d.md) §9.14。

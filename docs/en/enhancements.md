@@ -135,9 +135,10 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 > status item (`SystemTrayIcon`).
 >
 > **One item is in progress**: **E6 raw shader passthrough** — the path (author GLSL ES 3.00 → glslang →
-> SPIR-V → MSL → pipeline → draw → pixels) is verified on device, **but it does not count as done**: M4 Web
-> passthrough / M5 D3D12 / M7 Ultra-Water are not started, and float RT / MRT readback / depth textures are
-> **unverified** (design §11 table). Hence it is not among the 8 above.
+> SPIR-V → MSL → pipeline → draw → pixels) is verified on device, M3's three capability faces (float RT /
+> MRT readback / depth texture) have since been filled in, and **M4's web passthrough has landed** (wasm
+> consumes the ES 3.00 source verbatim; all five demos green in a real browser); **still missing** are
+> M5 D3D12/HLSL and `sampler2DShadow` comparison sampling (design §11 table). Hence it is not among the 8 above.
 >
 > **One more item is measured and explicitly not scheduled**: E10 (`Vector.<Number>` batch SIMD) — on arm64
 > AArch64 NEON has only **2** `f64` lanes while Apple-silicon scalar FP ports are already wide: hand-written
