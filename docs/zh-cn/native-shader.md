@@ -101,8 +101,9 @@ E6 属于后者：Adobe 的 Stage3D 从设计上就**没有**浮点渲染目标�
 
 ### 4.3 为什么是 ES 3.00 而不是 ES 1.00
 
-现有 AGAL 翻译器的 GLSL 档输出的是 **ES 1.00**（`attribute`/`varying`/`texture2D`，无 `#version` 指令，
-见 `runtime.ts` 注释与 [`display3d.md`](display3d.md) §3）。但 E6 需要的全是 ES 3.00 独有特性：
+现有 AGAL 翻译器的 GLSL 档**自阶段三百五十七起输出 ES 3.00**（`#version 300 es` + `in`/`out`/`texture`，
+之前是 ES 1.00，原因见 [`display3d.md`](display3d.md) §3）。但 E6 需要的还有一批 ES 3.00 独有特性，
+AGAL 的强类型寄存器模型表达不了：
 
 | 特性 | ES 1.00 | ES 3.00 | Ultra-Water 依赖 |
 |---|---|---|---|
@@ -114,7 +115,8 @@ E6 属于后者：Adobe 的 Stage3D 从设计上就**没有**浮点渲染目标�
 | 顶点纹理采样（vertex texture fetch） | 可选扩展 | 核心 | `OceanSurface.js` 顶点 `textureLod` 位移 |
 | `sampler2DShadow`（阴影比较） | 无 | 有 | `OceanSurface.js`、`UnderwaterPass.js` 阴影 |
 
-所以 E6 的源语言**必须**是 ES 3.00，不能复用现有 AGAL→GLSL(ES 1.00) 的产物。
+所以 E6 的源语言**必须**是 ES 3.00，不能复用 AGAL→GLSL 的产物（那一档虽然也是 ES 3.00，但它是**十六进制
+字节码**的翻译器，作者写的 GLSL 根本进不去）。
 
 ---
 
@@ -450,9 +452,9 @@ as-built：`computeReachable(parsedFiles, mainClass, [...swcBaseRoots, ...cfg.ex
 
 | 特性 | Ultra-Water 出处 | AGAL | E6 原生路径 |
 |---|---|---|---|
-| **实例化**（`gl_InstanceID` / `instanceMatrix`） | terrain.js:256 `InstancedMesh`、terrain.js:170/175 `instanceMatrix` | 无（`runtime.ts` 因 ES 1.00 无 `gl_InstanceID` 而响亮拒绝） | Metal `[[instance_id]]`（已有）、WebGL2 原生、D3D12 `SV_InstanceID` |
-| **顶点纹理采样**（vertex texture fetch） | OceanSurface.js:223-225 顶点里 `textureLod` 位移 | 无（ES 1.00 是可选扩展 `VERTEX_TEXTURE_FETCH`） | ES 3.00 核心特性，三端原生 |
-| **阴影比较采样** `sampler2DShadow` | OceanSurface.js:271、UnderwaterPass.js:17 | 无（ES 1.00 用 `texture2DProj` 手动比较） | §6.4(c) |
+| **实例化**（`gl_InstanceID` / `instanceMatrix`） | terrain.js:256 `InstancedMesh`、terrain.js:170/175 `instanceMatrix` | 无（GLSL 档对 `iid` 响亮拒绝：`gl_InstanceID` 是 `int`，AGAL 的 `iid` 是 `float4` 广播，GL 侧尚未接） | Metal `[[instance_id]]`（已有）、WebGL2 原生、D3D12 `SV_InstanceID` |
+| **顶点纹理采样**（vertex texture fetch） | OceanSurface.js:223-225 顶点里 `textureLod` 位移 | 有（AGAL4 `tld` → `textureLod`，顶点阶段） | ES 3.00 核心特性，三端原生 |
+| **阴影比较采样** `sampler2DShadow` | OceanSurface.js:271、UnderwaterPass.js:17 | 无（AGAL 没有比较采样器：只能 `texture()` 后手写比较） | §6.4(c) |
 | **整数类型 + 位运算** `uint`/`uvec2`/`^`/`>>` | OceanSim.js:38/41/51 PCG 哈希 | 无（AGAL 无整数） | ES 3.00 核心，三端原生 |
 | **整数坐标采样** `texelFetch` | OceanSim.js:132/163/164、UnderwaterPass.js:127 | 无（只有归一化 `tex`） | ES 3.00 核心 |
 | **显式 LOD** `textureLod` | 遍布 OceanSurface/Caustics/atmosphere/UnderwaterPass | 无（`tex` 隐式 LOD） | ES 3.00 核心 |

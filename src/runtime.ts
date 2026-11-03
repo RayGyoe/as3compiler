@@ -14785,13 +14785,14 @@ static void agal_swizzle(unsigned swz, char* out) {
 //   target 0 (MSL)  : array-indexed uniforms/attributes (vc[i]) and a
 //                     [[stage_in]] struct attribute (va -> in.aN).
 //   target 1 (GLSL) : one named uniform/attribute per register (vcN/vaN) plus
-//                     the built-in gl_Position / gl_FragColor / gl_FragDepth.
+//                     the built-ins gl_Position / as_outColor / gl_FragDepth
+//                     (GLSL ES 3.00 -- see the header of the GLSL arm below).
 //   target 2 (HLSL) : array-indexed *cbuffer* members (vc[i] inside
 //                     'cbuffer VCBuf : register(b0)'), a stage-input struct
 //                     attribute (va -> input.aN) and the local op/oc/ocN/od that
 //                     the entry point packs into its SV_* output struct.
 // EVERY branch below must stay three-way. The 'else' arms used to mean "GLSL",
-// and the GLSL spellings (gl_FragColor/gl_Position/gl_FragDepth) are hard-coded
+// and the GLSL spellings (as_outColor/gl_Position/gl_FragDepth) are hard-coded
 // there: leaving one branch two-way would silently emit GLSL identifiers into an
 // HLSL shader, which is exactly the "compiles but the result is wrong" failure
 // AGENTS.md 2.5 forbids.
@@ -14811,10 +14812,10 @@ static void agal_reg_name(char* out, int type, int num, int target) {
             sprintf(out, agal_is_frag ? "ft%d" : "vt%d", num); break;
         case AGAL_OP: // output: op in vertex, oc in fragment (ocN = MRT, HLSL only)
             // MSL/GLSL keep the single-output shape they have always had
-            // (oc -> one 'oc' / gl_FragColor); HLSL maps oc0..oc3 onto
+            // (oc -> one 'oc' / one declared ES 3.00 out); HLSL maps oc0..oc3 onto
             // SV_Target0..3, so the register number has to survive here.
             if (agal_is_frag) {
-                if (target == 1) strcpy(out, "gl_FragColor");
+                if (target == 1) strcpy(out, "as_outColor");
                 else if (target == 2 && num != 0) sprintf(out, "oc%d", num);
                 else strcpy(out, "oc");
             } else {
@@ -14926,11 +14927,18 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
     // 3-component constructor, needed by nrm (see its arm below).
     const char* v3 = target == 1 ? "vec3" : "float3";
     // Builtins whose spelling differs between targets but whose call SHAPE is
-    // the same, so one format string still serves all three: MSL/GLSL say
-    // fract / dfdx / dfdy, HLSL says frac / ddx / ddy.
+    // the same, so one format string still serves all three: MSL says
+    // dfdx/dfdy, HLSL says ddx/ddy, and GLSL spells the same derivative with a
+    // CAPITAL F -- dFdx/dFdy. Emitting the Metal spelling into a GLSL source is
+    // not a near miss: ESSL has no such identifier, so ANGLE rejects the whole
+    // shader with "'dfdx' : no matching overloaded function found" and the draw
+    // is refused. Measured on the web target (2026-11-03): every program that
+    // takes a derivative died this way -- the standard material's tangent-less
+    // normal mapping (gltf-m8, walk-m26, asset-load), i.e. all PBR demos except
+    // the two that get tangents from computeTangents.
     const char* f_fract = (target == 2) ? "frac" : "fract";
-    const char* f_ddx   = (target == 2) ? "ddx"  : "dfdx";
-    const char* f_ddy   = (target == 2) ? "ddy"  : "dfdy";
+    const char* f_ddx   = (target == 2) ? "ddx"  : (target == 1 ? "dFdx" : "dfdx");
+    const char* f_ddy   = (target == 2) ? "ddy"  : (target == 1 ? "dFdy" : "dfdy");
     for (int k = 0; k < n; k++) {
         unsigned op = ins[k].op;
         unsigned dst = ins[k].dst, s1lo = ins[k].s1lo, s1hi = ins[k].s1hi, s2lo = ins[k].s2lo, s2hi = ins[k].s2hi;
@@ -15084,7 +15092,7 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 // the two targets need a different vararg count -- keep them as two
                 // separate sprintf calls (a ternary format string would mis-read the
                 // tail, see the compare-op note below).
-                else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else sprintf(rhs, "%s(%s, %s%s).%c", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3, c1); }
+                else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s).%c", s2b, n2, s1, c3, c1); else sprintf(rhs, "%s(%s, %s%s).%c", "texture", s2b, s1, c3, c1); }
                 // tld (AGAL4, VERTEX only): the same fetch with an EXPLICIT level of
                 // detail, because a vertex shader has no derivatives to derive one
                 // from. LOD is byte 2 of the sampler operand; the register number is
@@ -15096,7 +15104,7 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
                 // top row, and the <filter>/<wrap> bits of the SAME sampler word
                 // apply (nearest vs linear at a texel corner: white vs 0x808080;
                 // wrap repeat at u=2.4: 0xff0000 vs the clamped edge texel).
-                else if (op == 0x2e) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; int lod = (int)((s2lo >> 16) & 0xFFu); if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s, level(%d.0)).%c", s2b, n2, s1, c3, lod, c1); else if (target == 2) sprintf(rhs, "%s.SampleLevel(smp%d, %s%s, %d.0).%c", s2b, n2, s1, c3, lod, c1); else sprintf(rhs, "%s(%s, %s%s, %d.0).%c", agal_is_cube(n2) ? "textureCubeLod" : "texture2DLod", s2b, s1, c3, lod, c1); }
+                else if (op == 0x2e) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; int lod = (int)((s2lo >> 16) & 0xFFu); if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s, level(%d.0)).%c", s2b, n2, s1, c3, lod, c1); else if (target == 2) sprintf(rhs, "%s.SampleLevel(smp%d, %s%s, %d.0).%c", s2b, n2, s1, c3, lod, c1); else sprintf(rhs, "%s(%s, %s%s, %d.0).%c", "textureLod", s2b, s1, c3, lod, c1); }
                 else if (op == 0x29) sprintf(rhs, "(%s.%c >= %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2a) sprintf(rhs, "(%s.%c < %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
                 else if (op == 0x2c) sprintf(rhs, "(%s.%c == %s.%c) ? 1.0 : 0.0", s1b, c1, s2b, c2);
@@ -15138,9 +15146,9 @@ static void agal_emit_body(as_json_buf* b, const agal_instr* ins, int n, int tar
         else if (op == 0x16) { if (target == 2) sprintf(rhs, "saturate(%s)", s1); else sprintf(rhs, "clamp(%s, 0.0, 1.0)", s1); }
         else if (op == 0x1a) sprintf(rhs, "%s(%s)", f_ddx, s1);
         else if (op == 0x1b) sprintf(rhs, "%s(%s)", f_ddy, s1);
-        else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s)", s2b, n2, s1, c3); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s)", s2b, n2, s1, c3); else sprintf(rhs, "%s(%s, %s%s)", agal_is_cube(n2) ? "textureCube" : "texture2D", s2b, s1, c3); }
+        else if (op == 0x28) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s)", s2b, n2, s1, c3); else if (target == 2) sprintf(rhs, "%s.Sample(smp%d, %s%s)", s2b, n2, s1, c3); else sprintf(rhs, "%s(%s, %s%s)", "texture", s2b, s1, c3); }
         // tld: explicit-LOD fetch, vertex only (see the masked arm above).
-        else if (op == 0x2e) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; int lod = (int)((s2lo >> 16) & 0xFFu); if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s, level(%d.0))", s2b, n2, s1, c3, lod); else if (target == 2) sprintf(rhs, "%s.SampleLevel(smp%d, %s%s, %d.0)", s2b, n2, s1, c3, lod); else sprintf(rhs, "%s(%s, %s%s, %d.0)", agal_is_cube(n2) ? "textureCubeLod" : "texture2DLod", s2b, s1, c3, lod); }
+        else if (op == 0x2e) { const char* c3 = agal_is_cube(n2) ? ".xyz" : ".xy"; int lod = (int)((s2lo >> 16) & 0xFFu); if (target == 0) sprintf(rhs, "%s.sample(smp%d, %s%s, level(%d.0))", s2b, n2, s1, c3, lod); else if (target == 2) sprintf(rhs, "%s.SampleLevel(smp%d, %s%s, %d.0)", s2b, n2, s1, c3, lod); else sprintf(rhs, "%s(%s, %s%s, %d.0)", "textureLod", s2b, s1, c3, lod); }
         // Compare instructions: sge/slt/seq/sne produce a per-component 0.0/1.0
         // mask. The operands are float4 (or 4-component swizzles), so the natural
         // 'cond ? v4(1.0) : v4(0.0)' is invalid in BOTH targets -- MSL needs a
@@ -15409,15 +15417,17 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
     //   * 'iid' is a VERTEX-only source in AGAL3 (AGAL.min reference: iid is
     //     readable only in the vertex program); a fragment program reading it has
     //     no stage that can supply it.
-    //   * the GLSL target compiles as ES 1.00 (attribute/varying/texture2D), which
-    //     has no gl_InstanceID at all. Refusing says so; emitting it would only move
-    //     the failure into the driver's shader log.
+    //   * the GLSL target compiles as ES 3.00, where gl_InstanceID exists -- but
+    //     the GGAL 'iid' register is a float4 broadcast and the GL arm has not
+    //     wired that broadcast (or its swizzle) up yet. Refusing says so; emitting a
+    //     bare int identifier into vec4 arithmetic would only move the failure into
+    //     the driver's shader log.
     if (isFragment && agal_is_used(AGAL_IID, 0)) {
         as_agal_errmsg = "AGAL: iid is readable only in a vertex program";
         return NULL;
     }
     if (target == 1 && agal_is_used(AGAL_IID, 0)) {
-        as_agal_errmsg = "AGAL: iid is not available on the GLSL target (ES 1.00 has no gl_InstanceID)";
+        as_agal_errmsg = "AGAL: iid is not available on the GLSL target yet (gl_InstanceID is an int, the register is a float4 broadcast)";
         return NULL;
     }
     as_json_buf b; as_json_buf_init(&b);
@@ -15517,31 +15527,42 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         }
         as_json_buf_append_cstr(&b, "}\\n");
     } else if (target == 1) {
-        // ---- GLSL ES 1.00 (WebGL2 accepts ES 1.00 sources) ----
+        // ---- GLSL ES 3.00 ----
+        // WHY 3.00 AND NOT 1.00. WebGL2 accepts ES 1.00 sources, and this arm used
+        // to emit exactly that -- which is fine until a program needs derivatives.
+        // In a WebGL2 context an ES 1.00 shader cannot enable
+        // GL_OES_standard_derivatives: the extension was promoted to core in
+        // ES 3.00, so there is nothing to enable, and the driver reports both
+        // "extension is not supported" and "'dFdx' : no matching overloaded
+        // function found". Measured on apps/pbr-cube: the fragment program failed
+        // to compile on every frame and the page drew a black canvas while printing
+        // 650 perfectly normal lines of stdout (see docs/web-gallery.md).
+        // ES 3.00 also gives gl_InstanceID and is what a WebGL2 context compiles
+        // natively, so the whole arm speaks it. The vocabulary that had to move:
+        // attribute -> in, varying -> out (vertex) / in (fragment), texture2D /
+        // textureCube -> texture, *Lod -> textureLod, gl_FragColor -> a declared
+        // out, gl_FragDepthEXT -> gl_FragDepth.
+        as_json_buf_append_cstr(&b, "#version 300 es\\n");
         // Precision: highp everywhere. ES 3.00 (and therefore WebGL2) guarantees
         // highp in fragment shaders, and Starling's programs do matrix math on
         // stage coordinates whose magnitude exceeds mediump's usable range.
-        if (isFragment && agal_is_used(AGAL_OD, 0))
-            as_json_buf_append_cstr(&b, "#extension GL_EXT_frag_depth : enable\\n");
+        // Derivatives (AGAL ddx/ddy, opcodes 0x1a/0x1b) need no directive here:
+        // they are core built-ins of this version.
         as_json_buf_append_cstr(&b, "precision highp float;\\n");
         for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VC, i)) { char t[40]; sprintf(t, "uniform vec4 %s%d;\\n", isFragment ? "fc" : "vc", i); as_json_buf_append_cstr(&b, t); }
-        // Attributes (vertex) and varyings. ES 1.00 has no [[stage_in]] struct, so
-        // the vertex stage declares v0..vN as varying at file scope (the MSL path
-        // uses local temps copied into out.varyingN instead) and the fragment stage
-        // reads the same declarations; they must match exactly or the varying is
-        // undefined.
-        for (int i = 0; i < 256; i++) if (agal_is_used(isFragment ? AGAL_V : AGAL_VA, i)) { char t[48]; sprintf(t, "%s vec4 %s%d;\\n", isFragment ? "varying" : "attribute", isFragment ? "v" : "va", i); as_json_buf_append_cstr(&b, t); }
-        if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[40]; sprintf(t, "varying vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
-        // Sampler uniforms are declared for BOTH stages: ES 1.00 has no stage
-        // split for uniforms, and AGAL4's vertex texture fetch ('tld' in this
-        // program) reads the same 'uniform sampler2D fsN'. The fragment stage's
-        // declaration was gated on isFragment before, so a vertex sampler was
-        // simply undeclared and the shader failed to compile.
-        //
-        // The LOD-explicit fetch in ES 1.00 is texture2DLod/textureCubeLod, which
-        // is a VERTEX-stage built-in (§8.7) -- exactly where 'tld' is legal. It is
-        // core, not the GL_EXT_shader_texture_lod extension (that one only adds the
-        // *fragment* spellings).
+        // Attributes (vertex) and varyings. There is no [[stage_in]] struct here, so
+        // the vertex stage declares va0..vaN as 'in' and v0..vN as 'out' at file
+        // scope; the fragment stage reads the same names as 'in'. They must match
+        // exactly (ES 3.00 links varyings by name) or the varying is undefined.
+        for (int i = 0; i < 256; i++) if (agal_is_used(isFragment ? AGAL_V : AGAL_VA, i)) { char t[48]; sprintf(t, "%s vec4 %s%d;\\n", "in", isFragment ? "v" : "va", i); as_json_buf_append_cstr(&b, t); }
+        if (!isFragment) for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_V, i)) { char t[40]; sprintf(t, "out vec4 v%d;\\n", i); as_json_buf_append_cstr(&b, t); }
+        // The fragment output. ES 3.00 has no gl_FragColor, so the register name for
+        // 'oc' resolves to this declared variable (see agal_reg_name).
+        if (isFragment) as_json_buf_append_cstr(&b, "out vec4 as_outColor;\\n");
+        // Sampler uniforms are declared for BOTH stages: AGAL4's vertex texture
+        // fetch ('tld' in this program) reads the same 'uniform sampler2D fsN'.
+        // The fragment stage's declaration was gated on isFragment before, so a
+        // vertex sampler was simply undeclared and the shader failed to compile.
         for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_FS, i)) { char t[40]; sprintf(t, "uniform %s fs%d;\\n", agal_is_cube(i) ? "samplerCube" : "sampler2D", i); as_json_buf_append_cstr(&b, t); }
         as_json_buf_append_cstr(&b, "void main() {\\n");
         // Same four-component local as the other two targets (see the AGAL_OD arm
@@ -15550,12 +15571,11 @@ static char* as_agal_translate(const unsigned char* bytes, int len, int target) 
         for (int i = 0; i < 256; i++) if (agal_is_used(AGAL_VT, i)) { char t[32]; sprintf(t, "  vec4 %s%d;\\n", isFragment ? "ft" : "vt", i); as_json_buf_append_cstr(&b, t); }
         agal_emit_body(&b, ins, n, target);
         if (as_agal_errmsg != NULL) { free(b.buf); return NULL; }
-        // The extension builtin is gl_FragDepthEXT, NOT gl_FragDepth: the source is
-        // ES 1.00 (attribute/varying/texture2D), where gl_FragDepth does not exist --
-        // only GL_EXT_frag_depth's gl_FragDepthEXT does. Writing the ES 3.00 name
-        // into an ES 1.00 shader is a compile error in every WebGL implementation.
+        // ES 3.00 spells the depth builtin gl_FragDepth (core), so no
+        // GL_EXT_frag_depth and no ...EXT suffix -- the ES 1.00 spellings are a
+        // compile error in this version.
         if (isFragment && agal_is_used(AGAL_OD, 0))
-            as_json_buf_append_cstr(&b, "  gl_FragDepthEXT = od.x;\\n");
+            as_json_buf_append_cstr(&b, "  gl_FragDepth = od.x;\\n");
         // Orientation: AS3 (and Metal, and every AIR backend) stores render-target
         // row 0 at the TOP of the image -- which is also how BitmapData pixels are
         // laid out, hence how texture coordinate v=0 is defined. GL stores row 0 at

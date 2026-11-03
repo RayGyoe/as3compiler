@@ -233,8 +233,9 @@ as-aot --air-app <app.xml> --target wasm --package web -D ASC_FRAME_STATS=1
 9. **AGAL 比较指令的全掩码形态**（阶段八十九·三十二）：MSL 侧用 `select(float4(0.0), float4(1.0), a >= b)`，
    而 GLSL ES 1.00 没有 `select`，唯一可用的是 `mix(vec4(0.0), vec4(1.0), vec4(greaterThanEqual(a, b)))`——
    `mix(genType, genType, genType)` 是 ES 1.00 §8.3 的合法重载，`vec4(bvec4)`（逐分量 bool→float 构造）
-   由 §5.4.2 明文允许；反之 `mix(vec4, vec4, bvec4)` 是 **ES 3.00 才有的重载**，在我们的 GLSL（不带
-   `#version`，按 ES 1.00 编译）下编不过。⚠️ 实现上**不能**把两个目标写成「一个 `sprintf` + 三元格式串」：
+   由 §5.4.2 明文允许；反之 `mix(vec4, vec4, bvec4)` 是 **ES 3.00 才有的重载** —— 阶段三百五十七之前
+   GLSL 档按 ES 1.00 编译，那一支必然编不过（现在带了 `#version 300 es`，两支都合法，但发射器保持
+   `vec4(greaterThanEqual(...))` 形态不动：语义等价，没有理由改）。⚠️ 实现上**不能**把两个目标写成「一个 `sprintf` + 三元格式串」：
    两支的 `%s` 个数不同（MSL 4 个、GLSL 5 个）而 varargs 是同一份固定列表，会静默错位成
    `v0(greaterThanEqual(v0, vec4))`（`vec4` 是裸标识符）→ `')' : syntax error`，四个 opcode
    （`sge`/`slt`/`seq`/`sne`）在 web 上全部失效（Starling 的「Switch Filter」崩溃即此，阶段八十九·三十二）；

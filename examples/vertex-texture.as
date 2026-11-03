@@ -3,7 +3,7 @@
 // 覆盖：
 //  1. 翻译器：顶点阶段 `tld` 在三目标（MSL/HLSL/GLSL）上生成正确声明与取值
 //     （`[[texture(N)]]`+`[[sampler(N)]]` / `register(tN)`+`register(sN)` /
-//     `uniform sampler2D` + `texture2DLod`），LOD 字节真的进源码。
+//     `uniform sampler2D` + `textureLod`），LOD 字节真的进源码。
 //  2. stage/version 门控按 AIR 号码与文案报错（实测 temp/vtfprobe）：
 //     顶点 `tex` → #3622、片元 `tld` → #3803、顶点 `tld` v3 → #3805、
 //     两阶段版本不同 → #3757。四条都在 Program3D.upload 抛（AIR 亦如此）。
@@ -103,18 +103,18 @@ check(mslVs.indexOf("fragment ") < 0, "the vertex program does not produce a fra
 
 var glslVs:String = AGALTranslator.translate(vsTld(4, 0, 1, 0), "glsl");
 has(glslVs, "uniform sampler2D fs0;", "GLSL declares the sampler uniform for the vertex stage too");
-has(glslVs, "texture2DLod(fs0, va1.xy, 0.0)", "GLSL vertex 'tld' uses the ES 1.00 vertex-stage LOD fetch");
+has(glslVs, "textureLod(fs0, va1.xy, 0.0)", "GLSL vertex 'tld' uses the ES 3.00 vertex-stage LOD fetch");
 
 var hlslVs:String = AGALTranslator.translate(vsTld(4, 0, 1, 0), "hlsl");
 has(hlslVs, "Texture2D<float4> fs0 : register(t0);", "HLSL declares the SRV for the vertex stage");
 has(hlslVs, "SamplerState smp0 : register(s0);", "HLSL declares the sampler for the vertex stage");
 has(hlslVs, "fs0.SampleLevel(smp0, input.a1.xy, 0.0)", "HLSL vertex 'tld' uses SampleLevel");
 
-// LOD 字节（sampler 操作数的 byte2）真的进源码：lod=2 → level/texture2DLod/SampleLevel 的 2.0。
+// LOD 字节（sampler 操作数的 byte2）真的进源码：lod=2 → level/textureLod/SampleLevel 的 2.0。
 var mslLod2:String = AGALTranslator.translate(vsTld(4, 2, 1, 0), "msl");
 has(mslLod2, "level(2.0)", "the LOD byte of a vertex 'tld' reaches the MSL source");
 var glslLod2:String = AGALTranslator.translate(vsTld(4, 2, 1, 0), "glsl");
-has(glslLod2, "texture2DLod(fs0, va1.xy, 2.0)", "the LOD byte of a vertex 'tld' reaches the GLSL source");
+has(glslLod2, "textureLod(fs0, va1.xy, 2.0)", "the LOD byte of a vertex 'tld' reaches the GLSL source");
 // sampler 号（低 16 位）是**与片元共享的单元号**：vs3 → fs3 / register(t3)。
 var mslUnit3:String = AGALTranslator.translate(vsTld(4, 0, 1, 3), "msl");
 has(mslUnit3, "fs3 [[texture(3)]]", "the sampler register number of a vertex 'tld' is the shared texture unit");

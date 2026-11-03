@@ -103,8 +103,9 @@ has(vmsl, "vt0.y = in.a1.w", "swizzle .w expanded");
 has(vmsl, "v0 = vt0", "mov v0,vt0 translated");
 
 var vglsl:String = AGALTranslator.translate(makeVertex(), "glsl");
+has(vglsl, "#version 300 es", "GLSL declares ES 3.00 (derivatives/gl_InstanceID are core there)");
 has(vglsl, "gl_Position", "GLSL vertex output position");
-has(vglsl, "attribute vec4 va0", "GLSL attribute declaration");
+has(vglsl, "in vec4 va0", "GLSL attribute declaration");
 has(vglsl, "uniform vec4 vc0", "GLSL uniform declaration");
 
 var fmsl:String = AGALTranslator.translate(makeFragment(), "msl");
@@ -112,8 +113,9 @@ has(fmsl, ".sample(smp0,", "MSL tex -> sample()");
 has(fmsl, "oc = ft0 * fc[0]", "mul oc,ft0,fc0 translated");
 
 var fglsl:String = AGALTranslator.translate(makeFragment(), "glsl");
-has(fglsl, "texture2D(", "GLSL tex -> texture2D()");
-has(fglsl, "gl_FragColor", "GLSL fragment output color");
+has(fglsl, "texture(", "GLSL tex -> texture()");
+has(fglsl, "out vec4 as_outColor;", "GLSL fragment output color is a declared out");
+has(fglsl, "as_outColor = ft0 * fc0", "GLSL writes the fragment output register");
 has(fglsl, "uniform sampler2D fs0", "GLSL sampler declaration");
 
 // ===== 多采样器：MSL 每个被采样的纹理寄存器各声明一个 sampler =====
@@ -181,7 +183,7 @@ has(mmsmsl, "ft2.x = fs3.sample(smp3, in.v1.xy).x", "masked tex on fs3 samples t
 has(mmsmsl, "ft2.y = fs3.sample(smp3, in.v1.xy).y", "masked tex on fs3 samples through smp3 (.y)");
 check(mmsmsl.indexOf("smp0") < 0, "a program sampling only fs3 declares no smp0");
 var mmsglsl:String = AGALTranslator.translate(makeMaskedSamplerFragment(), "glsl");
-has(mmsglsl, "ft2.x = texture2D(fs3, v1.xy).x", "GLSL masked tex keeps its operands in order");
+has(mmsglsl, "ft2.x = texture(fs3, v1.xy).x", "GLSL masked tex keeps its operands in order");
 
 var msglsl:String = AGALTranslator.translate(makeMultiSamplerFragment(), "glsl");
 has(msglsl, "uniform sampler2D fs0;", "GLSL declares fs0 as its own uniform sampler");
@@ -189,15 +191,17 @@ has(msglsl, "uniform sampler2D fs3;", "GLSL declares fs3 as its own uniform samp
 check(msglsl.indexOf("uniform sampler2D fs1;") < 0, "GLSL declares no unused sampler uniform");
 
 // ===== GLSL 目标专属断言（web 的 Stage3D 后端依赖这些形态）=====
-// GLSL ES 1.00 要求显式精度限定，MSL 不需要 —— 缺了它程序直接编译失败。
+// GLSL ES 3.00：显式精度限定仍是必填（MSL 不需要 —— 缺了它程序直接编译失败），
+// 而 attribute/varying 已改为 in/out。
 has(vglsl, "precision highp float;", "GLSL vertex declares default float precision");
 has(fglsl, "precision highp float;", "GLSL fragment declares default float precision");
 // Y 轴翻转：GL 的渲染目标行 0 在下、AS3/Metal 在上，故顶点阶段统一取反；
 // 采样与 glReadPixels 的行序、以及绕序（保持 GL_CCW 为正面）都依赖这一行。
 check(vglsl.indexOf("gl_Position.y = -gl_Position.y;") >= 0, "GLSL vertex flips clip-space Y");
-// varying 必须在顶点/片元两阶段用一致的声明，否则 GL 拒绝链接；顶点阶段只声明它写过的。
-has(vglsl, "varying vec4 v0;", "GLSL vertex declares the varying it writes");
-has(fglsl, "varying vec4 v0;", "GLSL fragment declares the varying it reads");
+// varying 必须在顶点/片元两阶段用一致的声明（ES 3.00 按名字 link），否则 GL 拒绝链接；
+// 顶点阶段只声明它写过的。
+has(vglsl, "out vec4 v0;", "GLSL vertex declares the varying it writes");
+has(fglsl, "in vec4 v0;", "GLSL fragment declares the varying it reads");
 
 // 矩阵指令（m44/m34/m33）读的是基址起的连续寄存器，GLSL 目标逐寄存器声明 uniform，
 // 故翻译器的 mark-use 必须把整段行都标上：只标基址会让 vc2/vc3 等未声明，
@@ -244,11 +248,10 @@ function makeOdFragment():ByteArray {
   return ba;
 }
 var odglsl:String = AGALTranslator.translate(makeOdFragment(), "glsl");
-// ES 1.00 源里没有 gl_FragDepth（那是 ES 3.00 的名字），只有扩展提供的 gl_FragDepthEXT。
-has(odglsl, "gl_FragDepthEXT = od.x;", "od write maps to gl_FragDepthEXT");
+// ES 3.00 的深度内建就是 gl_FragDepth（核心），不需要 GL_EXT_frag_depth 扩展。
+has(odglsl, "gl_FragDepth = od.x;", "od write maps to gl_FragDepth");
 has(odglsl, "vec4 od;", "GLSL declares the four-component od local");
-has(odglsl, "#extension GL_EXT_frag_depth : enable", "od enables GL_EXT_frag_depth");
-check(fglsl.indexOf("#extension GL_EXT_frag_depth") < 0, "programs without od must not request the extension");
+check(odglsl.indexOf("#extension GL_EXT_frag_depth") < 0, "ES 3.00 needs no frag-depth extension");
 
 // 同一段 AGAL 在 MSL 上必须真的编得过：Metal 没有 gl_FragDepth 这类内建，深度只能从
 // 片段输出结构体的 [[depth(any)]] 成员交出，所以入口返回 FSOut 而不是 float4，od 也必须
@@ -464,7 +467,7 @@ has(fhlsl, "FSOut fs_main(FSIn input) {", "HLSL fragment entry point");
 has(fhlsl, "ft0 = fs0.Sample(smp0, input.v0.xy);", "HLSL tex -> Texture2D.Sample(sampler, uv)");
 has(fhlsl, "oc = ft0 * fc[0];", "HLSL mul oc,ft0,fc0 translated");
 has(fhlsl, "output.color0 = oc;", "HLSL packs oc into SV_Target0");
-check(fhlsl.indexOf("gl_FragColor") < 0, "HLSL must not use gl_FragColor");
+check(fhlsl.indexOf("as_outColor") < 0, "HLSL must not use the GLSL fragment output");
 check(fhlsl.indexOf("texture2D(") < 0, "HLSL must not use GLSL texture2D");
 check(fhlsl.indexOf(".sample(") < 0, "HLSL must not use MSL sample()");
 
@@ -539,7 +542,7 @@ has(dmsl, "ft0 = float4(dot(in.v0.xyz, in.v1.xyz));", "MSL dp3 keeps the vector 
 has(dmsl, "oc = float4(dot(in.v0, in.v1));", "MSL dp4 keeps the vector constructor");
 var dglsl:String = AGALTranslator.translate(makeDotFragment(), "glsl");
 has(dglsl, "ft0 = vec4(dot(v0.xyz, v1.xyz));", "GLSL dp3 keeps the vector constructor");
-has(dglsl, "gl_FragColor = vec4(dot(v0, v1));", "GLSL dp4 keeps the vector constructor");
+has(dglsl, "as_outColor = vec4(dot(v0, v1));", "GLSL dp4 keeps the vector constructor");
 var dhlsl:String = AGALTranslator.translate(makeDotFragment(), "hlsl");
 has(dhlsl, "ft0 = dot(input.v0.xyz, input.v1.xyz).xxxx;", "HLSL dp3 splats through a scalar swizzle");
 has(dhlsl, "oc = dot(input.v0, input.v1).xxxx;", "HLSL dp4 splats through a scalar swizzle");

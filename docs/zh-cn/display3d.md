@@ -109,17 +109,17 @@ Stage3D 的着色器是 **AGAL（Adobe 图形汇编语言）二进制字节码**
 （MRT、实例化、`iid` 寄存器、`fragment output index`）。
 
 > **三档的覆盖差异（如实记录）**：片元 **MRT**（`oc1..oc3` → 多输出）目前只有 **HLSL 档**（`SV_TargetN`），
-> MSL/GLSL 两档仍把片元折叠成**单一输出**（`oc` / `gl_FragColor`）；这一条仍在 `TODO.md` 的
+> MSL/GLSL 两档仍把片元折叠成**单一输出**（`oc` / `as_outColor`）；这一条仍在 `TODO.md` 的
 > `### 遗留待开发`。
 >
 > **深度输出（`od`）与 AGAL3 `iid` 已于阶段二百六十一 修净**（原来只有 HLSL 档是对的）：`od` 在三档里
 > 都是 `float4 od` **局部**（写掩码 `0xF` 走整寄存器赋值、`0x1` 走逐分量赋值，标量装不下），出口写目标
 > 各自的深度槽 —— MSL `struct FSOut { … float depth [[depth(any)]]; }`、GLSL
-> `gl_FragDepthEXT = od.x;`（**不是** `gl_FragDepth`：ES 1.00 源里只有扩展的名字，且 WebGL 还要求上下文
-> 先 `getExtension('EXT_frag_depth')`，见 `vendor/stage3d_webgl.cc` 的 `s3d_create`）、HLSL
-> `output.depth = od.x;`。`iid` 在 MSL/HLSL 走宿主系统值（`uint iid [[instance_id]]` /
-> `SV_InstanceID`）并广播成 `float4`；**GLSL ES 1.00 没有 `gl_InstanceID`（那是 ES 3.00）**，故 GLSL 档
-> **响亮拒绝**，片元程序读 `iid` 三档一律拒绝 —— 不再发未声明的 `r<num>`。空 `VSIn`/`FSIn` 也与 HLSL 一样
+> `gl_FragDepth = od.x;`（阶段三百五十七起 GLSL 档是 **ES 3.00**，深度内建是核心的 `gl_FragDepth`，
+> 不再需要 `GL_EXT_frag_depth`/`gl_FragDepthEXT`）、HLSL `output.depth = od.x;`。`iid` 在 MSL/HLSL 走
+> 宿主系统值（`uint iid [[instance_id]]` / `SV_InstanceID`）并广播成 `float4`；GLSL 档仍**响亮拒绝**——
+> 不是 ES 版本问题（ES 3.00 有 `gl_InstanceID`），而是它是 `int`、AGAL 的 `iid` 是 `float4` 广播，
+> 这条广播 GL 侧还没接 —— 片元程序读 `iid` 三档一律拒绝 —— 不再发未声明的 `r<num>`。空 `VSIn`/`FSIn` 也与 HLSL 一样
 > 按实际使用抑制。**注意区分「实例化」本身**：`drawTrianglesInstanced` → `instanceCount` 三端**都已上屏**，
 > 缺的只是着色器里读**每实例 ID 的寄存器**（GLSL 档至今给不出，故如实拒绝）。
 > 验收：`xcrun metal` 真编译 7/7 过（旧形态两份都编不过），WebGL 真编译过，证据 `temp/metalshader/`。

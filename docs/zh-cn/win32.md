@@ -498,9 +498,12 @@ Win7 上无解。而 WGL 从 Vista 起就在系统里。所以除了「能不能
 | 后端表面 | `GrD3DBackendSurfaceInfo` | FBO 0 + `GR_GL_RGBA8` + `kBottomLeft`（套 Skia 自己的 `GLWindowContext` 契约） |
 | 运行期依赖 | `d3d12.dll` / `dxgi.dll` / `d3dcompiler_47.dll` | `opengl32.dll`（系统自带） |
 
-**为什么刻意用 compat profile**：AGAL→GLSL 生成器输出的是 **ES 1.00**（`attribute`/`varying`/`texture2D`，
-无 `#version`），core profile 下这些当场失效。要升到 core 得改那份 **web 共用的**生成器，回归面比一个
-窗口后端大得多。同理没走 ARB 的 `wglChoosePixelFormatARB`：传统 `ChoosePixelFormat` 在每台机器上都有。
+**为什么用 compat profile**：Skia 的原生 GL 通路（`GrGLMakeNativeInterface` + `GLWindowContext` 契约、
+FBO 0）按 compat 建；`ASC_S3D_GLSL` 只在 **web** 构建里定义，Windows 原生侧没有 Stage3D GL 后端，所以
+这条选择不受 AGAL→GLSL 的版本影响。**（历史理由已失效）** 原先还有一个理由是「AGAL→GLSL 生成器输出
+ES 1.00（`attribute`/`varying`/`texture2D`），core 下当场失效」，阶段三百五十七把那份生成器升到
+`#version 300 es` 后不再成立；要不要顺带把窗口上下文换成 core，是与 Skia 侧一起评估的另一件事，未做。
+同理没走 ARB 的 `wglChoosePixelFormatARB`：传统 `ChoosePixelFormat` 在每台机器上都有。
 
 **为什么它**还不是**默认**：换后端提不了帧率（实测数据见 [`compile.md`](compile.md) §3.4.6 的表：
 三后端帧时都是 42.00 ms，GL 省下的是 1.1–1.3 ms/帧的**提交路径**），而风险不是 0（present 模型更贵、

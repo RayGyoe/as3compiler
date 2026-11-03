@@ -602,8 +602,10 @@ AIR 描述符的 `<windows>` 里确实有同类先例 —— `<maxD3D>` 选择 D
   成员、再跑 `/OPT:REF`，所以同对象里 `MakeDirect3D` 的两条 D3D 引用必须先被解析。逐项实测与逐字节对比见
   [`win32.md`](win32.md) §3.1.1。产物**导入表是干净的**（实测只有 `OPENGL32` + 系统 DLL，**不含**
   `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`）：**链接期依赖 ≠ 运行期依赖**。
-- 上下文**刻意建 compat profile**：AGAL→GLSL 生成器输出的是 ES 1.00（`attribute`/`varying`/`texture2D`），
-  升到 core profile 要动 web 共用的那份生成器，回归面更大。
+- 上下文**建的是 compat profile**：Skia 的原生 GL 通路按 compat 契约接（`GLWindowContext`/FBO 0），
+  与 Stage3D 无关 —— `ASC_S3D_GLSL` 只在 web 构建里定义，Windows 原生侧没有 Stage3D GL 后端。
+  （这条原本还有一个理由「AGAL→GLSL 生成器输出 ES 1.00」；阶段三百五十七把那份生成器升到
+  `#version 300 es` 后，这个理由不再成立，但换 core profile 仍是另一件事，未改。）
 
 平台侧的取舍与 Windows 专属细节见 [`win32.md`](win32.md) §3.1.1。
 

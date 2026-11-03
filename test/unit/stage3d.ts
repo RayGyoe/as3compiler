@@ -830,7 +830,7 @@ registerGroup('stage3d/program-cache', checkStage3dProgramCache);
 // parameterised by `target`, and the arms of its shared emitters used to be written
 // as "if (target == 0) ... else ..." where the else meant GLSL. Adding a third
 // target therefore risks the opposite of a missing feature: an HLSL shader quietly
-// carrying a GLSL identifier (gl_FragColor, gl_Position, mix(), greaterThanEqual()).
+// carrying a GLSL identifier (as_outColor, gl_Position, mix(), greaterThanEqual()).
 // That is the "compiles but the result is wrong" failure AGENTS.md 2.5 forbids, and
 // no example can catch it -- examples/ runs in pure-C mode, with no GPU and no D3D
 // compiler anywhere near it.
@@ -887,22 +887,20 @@ function checkStage3dAgalHlsl(): string[] {
   // ---- dialect isolation -----------------------------------------------------
   // Every GLSL built-in must sit inside an explicit "if (target == 1)" test. A bare
   // 'else' emitting one is precisely how a two-way arm becomes a wrong third target.
-  // Leading whitespace is allowed inside the literal ("  gl_FragDepthEXT = od.x;"),
-  // and `gl_FragDepth` matches its ES 1.00 extension spelling `gl_FragDepthEXT`
-  // too -- that name is the one a wrong ES-level assumption gets wrong.
-  const glslLines = noComments(runtime).split('\n').filter((l) => /"\s*(gl_Position|gl_FragColor|gl_FragDepth)/.test(l));
+  // Leading whitespace is allowed inside the literal ("  gl_FragDepth = od.x;"),
+  // and `as_outColor` is the GLSL arm's own fragment output (ES 3.00 has no
+  // gl_FragColor), so it belongs in the same isolation check.
+  const glslLines = noComments(runtime).split('\n').filter((l) => /"\s*(gl_Position|as_outColor|gl_FragDepth)/.test(l));
   // Two legitimate homes for a GL built-in: a line that carries its own
-  // "target == 1" test, or the body of the GLSL branch (which IS the test). Stage
-  // 261's `gl_FragDepthEXT = od.x;` lives in the second kind, so the pin checks the
-  // branch too instead of being weakened to "no check at all".
-  const glslBranch = region('// ---- GLSL ES 1.00', '// ---- HLSL (Direct3D shader model 4+)');
+  // "target == 1" test, or the body of the GLSL branch (which IS the test).
+  const glslBranch = region('// ---- GLSL ES 3.00', '// ---- HLSL (Direct3D shader model 4+)');
   const inGlslBranch = (l: string): boolean => glslBranch.includes(l.trim());
   check('every GLSL built-in is emitted only under an explicit target == 1 test',
     glslLines.length >= 3 && glslLines.every((l) => l.includes('target == 1') || inGlslBranch(l)));
-  const msl = region('// ---- MSL ----', '// ---- GLSL ES 1.00');
+  const msl = region('// ---- MSL ----', '// ---- GLSL ES 3.00');
   const hlsl = region('// ---- HLSL (Direct3D shader model 4+) ----', 'char* out = as_str_alloc(b.len + 1);');
   check('the MSL branch carries no D3D or GL spelling',
-    msl.length > 500 && !/SV_|cbuffer|TEXCOORD|\.Sample\(|gl_Position|gl_FragColor/.test(noComments(msl)));
+    msl.length > 500 && !/SV_|cbuffer|TEXCOORD|\.Sample\(|gl_Position|as_outColor/.test(noComments(msl)));
   check('the HLSL branch carries no GL or Metal spelling',
     hlsl.length > 1500 && !/"gl_|metal_stdlib|\[\[stage_in\]\]|\.sample\(/.test(noComments(hlsl)));
   check('the HLSL vertex stage does not flip clip-space Y (D3D is top-down like AS3)',
@@ -915,15 +913,16 @@ function checkStage3dAgalHlsl(): string[] {
     runtime.includes('else if (target == 2) sprintf(out, "input.a%d", num);')
     && runtime.includes('else if (agal_is_frag && target == 2) sprintf(out, "input.v%d", num);')
     && runtime.includes('else if (target == 2 && num != 0) sprintf(out, "oc%d", num);')
-    // `iid` is a system value on D3D/Metal and NON-EXISTENT on ES 1.00: HLSL and
-    // MSL get the uint broadcast to a float4, and the GLSL target never reaches
-    // this name because as_agal_translate refuses the program first (pinned below).
+    // `iid` is a system value on D3D/Metal and, on the GLSL target, an int
+    // gl_InstanceID that this arm does not broadcast to the register's float4: HLSL
+    // and MSL get the uint broadcast, and the GLSL target never reaches this name
+    // because as_agal_translate refuses the program first (pinned below).
     && runtime.includes('else strcpy(out, "float4(iid, iid, iid, iid)");'));
   // The refusals that replaced the undeclared-register spellings. A program that
   // reads `iid` must either get a real system value or a CLEAR error -- never a
   // shader the driver cannot compile.
   check('iid is refused on the GLSL target and in fragment programs',
-    runtime.includes('"AGAL: iid is not available on the GLSL target (ES 1.00 has no gl_InstanceID)"')
+    runtime.includes('"AGAL: iid is not available on the GLSL target yet')
     && runtime.includes('"AGAL: iid is readable only in a vertex program"'));
   // Both od arms must hand the depth slot a COMPONENT of the four-component local:
   // the write mask can be 0xF (whole register) or a per-component subset, so a
@@ -931,7 +930,7 @@ function checkStage3dAgalHlsl(): string[] {
   check('od is a float4/vec4 local on every target, with the depth slot fed from .x',
     runtime.includes('if (hasOd) as_json_buf_append_cstr(&b, "  float4 od;')
     && runtime.includes('fso.depth = od.x;') && runtime.includes('output.depth = od.x;')
-    && runtime.includes('gl_FragDepthEXT = od.x;'));
+    && runtime.includes('gl_FragDepth = od.x;'));
   check('the HLSL instruction spellings are all three-way',
     runtime.includes('(target == 2) ? "frac" : "fract"')
     && runtime.includes('(target == 2) ? "ddx"')
@@ -1967,7 +1966,7 @@ function checkStage3dVertexTexture(): string[] {
   check('the tld arm samples with an explicit LOD on all three targets',
     /sample\(smp%d, %s%s, level\(%d\.0\)\)/.test(runtime)
     && /SampleLevel\(smp%d, %s%s, %d\.0\)/.test(runtime)
-    && /texture2DLod|textureCubeLod/.test(runtime));
+    && /"textureLod"/.test(runtime));
 
   // 3. Backends. Metal keeps texture/sampler tables per STAGE, D3D12 gates them
   //    by root-parameter visibility, WebGL shares one unit space (nothing to do).
