@@ -19334,6 +19334,24 @@ Skia，`test/examples.ts` 已注册）；`test/unit/render.ts` 新增 `unit: ren
 清零/还原形态仍在）。三个语义变异（只强制 visible、只强制 alpha、漏还原 alpha）**全红**，还原后绿。
 文档：`docs/{zh-cn,en}/skia.md` 新增 §6.17，含上面那张实测表。
 
+**端到端验证（不止钉原语）**：`temp/svgaapp/` 用**真 .svga**（`temp/svgaplay/make-svga.cjs` 现场生成：
+zlib 压缩的 protobuf，`MovieParams` 200×200 / fps 10 / 10 帧，一张内嵌 40×40 PNG，10 个 `FrameEntity` 的
+`transform.tx` 每帧 +16）跑**应用真正走的那条链**——`MovieEntity.mergeFrom` → `VideoEntity`（`Loader.loadBytes`
+异步解码内嵌图，靠 `Event.INIT`）→ `Player.setVideoItem/setFrame/stepToFrame` → `bitmapData.draw(rootLayer)`。
+AOT（`--air-app`，开窗）与 adl 同源同跑：
+
+| | AOT | adl 51.4.1 |
+|---|---|---|
+| 解压 + protobuf | `bytes=778 w=200 frames=10 images=1` | 同 |
+| 内嵌图解码 | `video ready sprites=1`（异步完成） | 同 |
+| 每帧 ink | 1600 恒定 | 1681 恒定 |
+| 每帧左边界 | 0,16,…,144（每帧 +16） | 0,16,…,144 |
+
+**位移动画两端逐帧一致**（左边界完全相同），说明「不出画面」确实只剩这一条。ink 差 81 px（1600 对
+1681 = 41×41）是 AIR 在 `smoothing=true` 的 1:1 采样上多一圈 1px 半透明淡边，我们走精确复制的快路；
+它**与本次改动无关**（修前根为 visible 时同样是 1600，`examples/draw-over.as` 钉的就是这条采样口径），
+只记一笔、不改。
+
 **真应用验证**：`bin-aot` 用修好的编译器重编 **Build successful**，生成的 C 里 `TalkMED Meeting.c`
 确认是 `as_render_fp(sdo);` → 保存 → `sdo->visible = true; sdo->alpha = 1.0;` → `as_render_object` → 还原
 的正确顺序。
