@@ -3096,3 +3096,67 @@ function checkTransparentPointer(): string[] {
 }
 
 registerGroup('unit: platform/TransparentPointer', checkTransparentPointer);
+
+// ---- web canvas ← stage resize (阶段二百九十五) ----
+//
+// The web backend used to DISCARD on_resize (`(void)on_resize;  // fixed canvas`),
+// so a page's canvas kept the descriptor's size for the life of the tab. Nothing
+// went red: the build was green, every demo self-check passed at its own size, and
+// the only symptom was visual -- a host that wanted a bigger stage had to CSS-scale
+// the bitmap (soft pixels, pointer coordinates off by the scale factor). These
+// checks pin the seam that replaced it, because a regression here is invisible to
+// every other test in this suite: examples/target the native window backend, and
+// the wasm pages are only ever loaded at one size.
+function checkWebResizeSeam(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [webresize] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [webresize] ${label}`); }
+  };
+  const raw = readFileSync(join(root, 'vendor', 'web_glue.cc'), 'utf8').replace(/\r\n/g, '\n');
+  const code = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const show = code.slice(code.indexOf('int sk_window_show('));
+  // Only that one function: the rest of the file has its own "unused parameter"
+  // casts (sk_window_create takes the same callback set and legitimately ignores
+  // it -- a page cannot open a second window).
+  const showBody = show.slice(0, show.indexOf('\n}\n') + 3);
+
+  check('sk_window_show keeps the resize callback instead of discarding it',
+    !/\(void\)on_resize/.test(showBody) && /g_on_resize = on_resize;/.test(showBody));
+  check('...and subscribes to the browser resize event, the web analogue of the WM',
+    /emscripten_set_resize_callback\(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_FALSE, on_window_resize_evt\);/.test(showBody));
+  check('...and syncs once before the first frame, so startup is not a special case',
+    /if \(g_fill\) sk_web_sync_canvas_size\(\);/.test(showBody)
+    && showBody.indexOf('if (g_fill) sk_web_sync_canvas_size();') < showBody.indexOf('present_frame();')),
+
+  // Idempotent: the browser reports changes we caused ourselves. Showing the same
+  // box to the AS3 side twice would rebuild the drawable on every event.
+  check('an unchanged box never reaches the AS3 side',
+    /if \(cw == g_lw && ch == g_lh && pw == g_pw && ph == g_ph\) return;/.test(code));
+  // The two present paths size the drawing buffer differently: the CPU blit needs
+  // the backing store written here, while sk_surface_gpu_new re-sizes it as it
+  // re-wraps FBO 0 (writing it first would clear the buffer the new surface is
+  // about to render into).
+  check('the backing store is only written on the CPU present path',
+    /#ifndef ASC_RENDER_GPU\s*EM_ASM\(\{ Module\.canvas\.width = \$0; Module\.canvas\.height = \$1; \}, pw, ph\);/.test(code));
+  check('the replacement surface is adopted, so present never reads a freed one',
+    /void\* s = g_on_resize\(0, cw, ch, pw, ph, scale\);\n\s*if \(s != nullptr\) g_surface = s;/.test(code));
+  // Opt-in per page: the canvas follows its CSS box only when the page says so,
+  // which keeps an embedding page's fixed-size surface working.
+  check('fill mode is an explicit per-page contract, not a silent global change',
+    /c\.hasAttribute\('data-asc-fill'\)/.test(code) && /static int g_fill = 0;/.test(code));
+
+  // The page the build emits must opt in, or none of the above is reachable for a
+  // shipped demo. writeWebIndex is not exported, so this is pinned at source level.
+  const idx = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+  check('the emitted web page marks its canvas data-asc-fill',
+    /<canvas id="canvas" data-asc-fill="1"/.test(idx));
+  check('...and sizes that canvas to the viewport',
+    /canvas\[data-asc-fill\] \{ position: fixed; inset: 0; width: 100%; height: 100%; \}/.test(idx));
+
+  console.log(`     [webresize] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/WebResizeSeam', checkWebResizeSeam);

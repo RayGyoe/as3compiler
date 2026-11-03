@@ -40,6 +40,33 @@ static void (*g_on_redraw)(int) = nullptr;
 static void (*g_on_frame)(int) = nullptr;
 static double (*g_on_frame_delay)(int) = nullptr;
 
+// ---- responsive canvas (the web analogue of a resizable OS window) ----
+//
+// On a desktop the window manager resizes the window and the glue reports it
+// through on_resize: the AS3 side rebuilds the drawable at the new physical size,
+// updates stageWidth/stageHeight and dispatches Event.RESIZE. A page has no such
+// window manager -- the canvas IS the window -- so without this seam the canvas
+// keeps the descriptor's size for the life of the page, and a host that wants a
+// different size has only two bad options: show a postage stamp, or CSS-scale the
+// bitmap (soft pixels, and pointer coordinates that no longer match what the AS3
+// side thinks the stage is).
+//
+// The page opts in by marking the canvas with data-asc-fill="1" (the page
+// writeWebIndex emits does): the CSS box then belongs to the stylesheet
+// (100% x 100% of the viewport) and this glue only mirrors the resulting box into
+// the stage. Without the attribute the canvas keeps its AIR<width>/<height> box,
+// which is what an embedding page that wants a fixed-size surface asks for.
+//
+// Mirroring is what makes the difference visible: a NO_SCALE stage (asaot3d's
+// Stage3DApp) re-lays-out and its Stage3D back buffer follows configureBackBuffer,
+// i.e. the app re-renders at the real size instead of being upscaled.
+static int g_fill = 0;          // canvas follows its CSS box (data-asc-fill)
+static int g_lw = 0, g_lh = 0;  // logical (CSS px) size last reported to AS3
+static double g_scale = 1.0;    // device pixels per logical pixel
+static void* (*g_on_resize)(int, int, int, int, int, double) = nullptr;
+
+double sk_window_probe_scale(int w, int h, int highdpi, int* pw, int* ph);
+
 // Present the Skia surface to the canvas. Two backends, selected at compile
 // time by <renderMode> (efficiency-first — not AIR's "direct = CPU compose +
 // GPU blit" split):
@@ -360,6 +387,64 @@ int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h) {
   return 1;
 }
 
+// Mirror the canvas' CSS box into the stage (fill mode only). Idempotent and cheap:
+// an unchanged box is dropped before it can reach the AS3 side, which matters
+// because the browser fires a resize event for changes we caused ourselves
+// (window resize, browser zoom, a CSS-driven relayout).
+//
+// WHY THE SIZE IS RE-READ FROM THE CANVAS AND NOT TAKEN FROM THE EVENT: the event
+// reports the viewport, while the stage is the canvas' own box. With data-asc-fill
+// they coincide, but a page may pad or inset the canvas, and the box is what the
+// pixels have to match.
+static void sk_web_canvas_size_changed(int cw, int ch) {
+  if (!g_fill || g_on_resize == nullptr) return;
+  if (cw <= 0 || ch <= 0) return;
+  // Same device-scale rule as the initial sizing (runtime.ts as_window_device_scale):
+  // <requestedDisplayResolution>high means physical pixels, otherwise the backing
+  // store mirrors CSS pixels and the compositor scales it like any other page.
+#ifdef ASC_DISPLAY_HIGH
+  int highdpi = 1;
+#else
+  int highdpi = 0;
+#endif
+  int pw = 0, ph = 0;
+  double scale = sk_window_probe_scale(cw, ch, highdpi, &pw, &ph);
+  if (cw == g_lw && ch == g_lh && pw == g_pw && ph == g_ph) return;
+  g_lw = cw;
+  g_lh = ch;
+  g_scale = scale;
+  g_pw = pw;
+  g_ph = ph;
+#ifndef ASC_RENDER_GPU
+  // CPU raster path: the 2D context present (present_frame) blits pw x ph pixels
+  // into the canvas, so the backing store has to be set here. The GPU path leaves
+  // it to sk_surface_gpu_new, which re-sizes the drawing buffer as it re-wraps
+  // FBO 0 -- doing it twice would clear the buffer the fresh surface is about to
+  // render into.
+  EM_ASM({ Module.canvas.width = $0; Module.canvas.height = $1; }, pw, ph);
+#endif
+  // The AS3 side rebuilds the drawable, re-derives stageWidth/stageHeight and
+  // dispatches Event.RESIZE. A NULL return means it could not (an allocation
+  // failure); the previous surface is then still installed and keeps presenting
+  // at its old size rather than being freed under the frame loop.
+  void* s = g_on_resize(0, cw, ch, pw, ph, scale);
+  if (s != nullptr) g_surface = s;
+}
+
+// Read the canvas' CSS box and push it through. Used both by the resize callback
+// and once at startup, so the first presented frame is already the right size.
+static void sk_web_sync_canvas_size(void) {
+  int cw = EM_ASM_INT({ var c = Module.canvas; return c ? c.clientWidth : 0; });
+  int ch = EM_ASM_INT({ var c = Module.canvas; return c ? c.clientHeight : 0; });
+  sk_web_canvas_size_changed(cw, ch);
+}
+
+static EM_BOOL on_window_resize_evt(int eventType, const EmscriptenUiEvent* e, void* ud) {
+  (void)eventType; (void)e; (void)ud;
+  sk_web_sync_canvas_size();
+  return EM_TRUE;
+}
+
 // Present the Skia raster surface in the canvas and run the rAF frame loop until
 // the page is closed. Mirrors sk_window_show's signature in window_glue.cc so the
 // generated C calls it identically. `w`/`h` are logical size (AIR <width>/<height>),
@@ -372,7 +457,6 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
                    double (*on_frame_delay)(int),
                    void* (*on_resize)(int, int, int, int, int, double),
                    void (*on_close)(int)) {
-  (void)on_resize;  // resize not yet wired on web (fixed canvas for now)
   (void)on_close;   // a page has no window to close; the tab is the window
   // The keyboard transport is NOT wired on web yet: a page delivers keys through
   // DOM events on the canvas, whose keyCode/charCode are the browser's, not AIR's,
@@ -388,18 +472,30 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
   g_on_redraw = on_redraw;
   g_on_frame = on_frame;
   g_on_frame_delay = on_frame_delay;
+  g_on_resize = on_resize;
+  g_lw = w;
+  g_lh = h;
+  g_scale = (w > 0 && pw > 0) ? (double)pw / (double)w : 1.0;
+  g_fill = EM_ASM_INT({
+    var c = Module.canvas;
+    if (!c) return 0;
+    if (c.hasAttribute('data-asc-fill')) return 1;
+    return Module.ascFill ? 1 : 0;
+  });
 
   // Size the canvas backing store to the physical pixels but its CSS box to the
   // logical size, so a high-DPI surface presents 1:1 without blur. Also set the
-  // document title to the AIR window title.
+  // document title to the AIR window title. In fill mode the CSS box belongs to
+  // the page's stylesheet (100% x 100%), so only the backing store is written
+  // here; the first sk_web_sync_canvas_size below sizes it for real.
   EM_ASM({
     var canvas = Module.canvas;
     canvas.width = $0;
     canvas.height = $1;
-    canvas.style.width = $2 + 'px';
-    canvas.style.height = $3 + 'px';
-    if ($4) document.title = UTF8ToString($4);
-  }, pw, ph, w, h, title ? title : "");
+    if ($4) canvas.style.width = $2 + 'px';
+    if ($4) canvas.style.height = $3 + 'px';
+    if ($5) document.title = UTF8ToString($5);
+  }, pw, ph, w, h, g_fill ? 0 : 1, title ? title : "");
 
   // Full-screen mirrors Stage.displayState = FULL_SCREEN via the Fullscreen API.
   if (fullscreen) {
@@ -427,6 +523,12 @@ int sk_window_show(void* surface, int w, int h, int pw, int ph, const char* titl
       el.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
     }
   });
+
+  // Resize transport (fill mode): the browser's resize event is what a window
+  // manager's resize is to the native backend. Registered before the initial sync
+  // so a resize that lands during startup is not missed.
+  emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_FALSE, on_window_resize_evt);
+  if (g_fill) sk_web_sync_canvas_size();
 
   // Initial frame (the surface is already rasterized by Stage_showWindow).
   present_frame();

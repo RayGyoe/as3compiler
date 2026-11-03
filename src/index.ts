@@ -1363,10 +1363,16 @@ function writeWebIndex(base: string, fontUrls: string[]): string {
 <style>
   body { margin: 0; background: #0f1115; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
   canvas { background: #000; image-rendering: pixelated; }
+  /* On web the page IS the window, so the canvas takes the viewport and the stage
+     size follows it (vendor/web_glue.cc's resize seam): the app re-renders at the
+     real size instead of a descriptor-sized bitmap being stretched by the CSS.
+     A page that wants a fixed-size surface drops data-asc-fill and the glue keeps
+     the AIR <width>/<height> box instead. */
+  canvas[data-asc-fill] { position: fixed; inset: 0; width: 100%; height: 100%; }
 </style>
 </head>
 <body>
-<canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+<canvas id="canvas" data-asc-fill="1" oncontextmenu="event.preventDefault()"></canvas>
 <script>
 // 页面级错误收集：wasm 加载失败、Promise 抛错都会落到这里，供人和自动化读取
 // （window.__ascErrors）。运行期错误如果只出现在控制台，自动化验收就看不见。
