@@ -29162,9 +29162,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static int as_is_boundary(DisplayObject* o) { return o != NULL && o->_cache_flag; }');
     // Write-time invalidation: mark o and every ancestor up to the nearest
     // cacheAsBitmap boundary dirty. O(depth) on write, O(1) to test at render time.
+    //
+    // Do NOT short-circuit on !o->_render_dirty. A non-boundary child's flag can
+    // stay set across frames (the bake path paints content, it does not re-walk the
+    // tree, so nothing clears the child), while an ancestor boundary is consumed
+    // and cleared that same frame. If that same child changes again next frame, the
+    // short-circuit would skip the ancestor and leave the boundary stale -- the
+    // DIRTY_MISS storm in 阶段三百六十七 等价性验证. Always walk the full chain.
     this.line('static void as_mark_dirty(DisplayObject* o) {');
     this.indent++;
-    this.line('while (o != NULL && !o->_render_dirty) {');
+    this.line('while (o != NULL) {');
     this.indent++;
     this.line('o->_render_dirty = 1;');
     this.line('if (o->_cache_flag) break;');

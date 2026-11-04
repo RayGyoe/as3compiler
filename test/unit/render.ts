@@ -2597,6 +2597,8 @@ function checkRepaintBoundary(): string[] {
   check('as_mark_dirty sets the flag', emitted.includes('o->_render_dirty = 1;'));
   check('as_mark_dirty stops bubbling at a cacheAsBitmap boundary', emitted.includes('if (o->_cache_flag) break;'));
   check('as_mark_dirty walks the parent chain', emitted.includes('o = (DisplayObject*)o->parent;'));
+  check('as_mark_dirty always walks the full chain (no dirty short-circuit)',
+    !emitted.includes('while (o != NULL && !o->_render_dirty) {') && emitted.includes('while (o != NULL) {'));
   check('as_mark_dirty is forward-declared for user-code call sites',
     emitted.includes('static void as_mark_dirty(DisplayObject* o);'));
   check('the cache branch re-bakes on _render_dirty',

@@ -19540,15 +19540,20 @@ filter 字段。这些不是 AS3 字段写/accessor，不能靠 `emitAssign` 覆
 6. **Stage3D**：加 `Stage* _owner`（`Stage_get_stage3Ds` 写回）；`Stage3D_set_x/y/visible` 标脏 `_owner`。
 7. **SimpleButton hover**：加 `DisplayObject* _sbtn_prev`，`as_render_fp` 检测 `as_sbtn_state` 变化即标脏
    （状态是读时计算，非写点）。
+8. **`as_mark_dirty` 短路优化 bug（第二轮复验定位，根本性）**：`while (o != NULL && !o->_render_dirty)`
+   的 `!o->_render_dirty` 短路是错的——非边界子对象的 `_render_dirty` 会跨帧保持脏（烘焙路径只画内容、
+   不重走子树，无人清它），而祖先边界同帧被消费清脏。子对象下一帧再变时，短路跳过了冒泡，边界
+   `_render_dirty` 保持 0，`DIRTY_MISS` 持续报（最典型是 cacheAsBitmap Sprite 里播放中的 MovieClip，
+   同一指针重复上百次）。改为 `while (o != NULL)` 每次都完整冒泡到边界，冒泡 O(depth) 可接受。
 
 **验收**：
 - 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
-- `unit: render/RepaintBoundary` 由 25 钉扩展到 **35 钉**（新增 7 类内部状态 + 等价性探针）。
+- `unit: render/RepaintBoundary` 由 25 钉扩展到 **36 钉**（新增 7 类内部状态 + 等价性探针 + 全链冒泡钉子）。
 - 同步放宽 `text-input/Caret` 的 `as_tf_extend_caret` 正则（520→800 字符，函数体因标脏变长）。
 
-**如实报明**：仍是**并行阶段**，指纹兜底完整保留。`DIRTY_MISS` 探针已能打印 `cls/auto/cache/tx`；
-TalkMED 真机复验（重新编译跑 `ASC_DIRTY_TRACE`）待用户在有窗口环境执行，确认 7 类补齐后无剩余 `DIRTY_MISS`。
-阶段 B 切换与阶段 C 仍未开始。
+**如实报明**：仍是**并行阶段**，指纹兜底完整保留。第二轮复验（重新编译跑 `ASC_DIRTY_TRACE`）发现
+`DIRTY_MISS` 仍未清零，进一步定位为 `as_mark_dirty` 的 `!o->_render_dirty` 短路 bug（见逐项 8），已修复。
+第三轮复验待用户执行，确认修复后无剩余 `DIRTY_MISS`。阶段 B 切换与阶段 C 仍未开始。
 
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 
