@@ -2586,6 +2586,7 @@ function checkRepaintBoundary(): string[] {
   };
 
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const symSource = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
 
   check('DisplayObject struct declares the _render_dirty field', emitted.includes('int _render_dirty;'));
@@ -2605,6 +2606,47 @@ function checkRepaintBoundary(): string[] {
   check('the render-input set lists the nine plain geometry/colour fields',
     emitSource.includes("'x', 'y', 'rotation', 'scaleX', 'scaleY'")
     && emitSource.includes("'alpha', 'visible', 'blendMode', 'opaqueBackground'"));
+
+  // ---- Stage B write points: BitmapData reverse edges ----
+  check('BitmapData declares the _refs reverse edge', symSource.includes("['_refs', bdf({ kind: 'array' })]"));
+  check('Bitmap declares the _bound_bd back edge', symSource.includes("['_bound_bd', bmpf({ kind: 'object', className: 'BitmapData' })]"));
+  check('Bitmap.bitmapData writes route through a setter', symSource.includes("['bitmapData', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'BitmapData'"));
+  check('as_bd_bind / as_bd_unbind / as_bd_mark_dirty are forward-declared',
+    emitted.includes('static void as_bd_bind(BitmapData* bd, Bitmap* b);')
+    && emitted.includes('static void as_bd_unbind(BitmapData* bd, Bitmap* b);')
+    && emitted.includes('static void as_bd_mark_dirty(BitmapData* bd);'));
+  check('as_bd_mark_dirty bumps _px_ver then marks every referring Bitmap',
+    emitted.includes('static void as_bd_mark_dirty(BitmapData* bd) {')
+    && emitted.includes('bd->_px_ver++;')
+    && emitted.includes('as_mark_dirty((DisplayObject*)as_v_obj_val(bd->_refs->data[i]));'));
+  check('Bitmap_set_bitmapData re-wires the reverse edge and marks dirty',
+    emitted.includes('void Bitmap_set_bitmapData(void* _this, BitmapData* value) {')
+    && emitted.includes('as_bd_unbind(b->_bound_bd, b);')
+    && emitted.includes('as_bd_bind(value, b);'));
+  check('removeChild unbinds the removed subtree from its BitmapData',
+    emitted.includes('static void as_disp_unbind_bd(DisplayObject* o) {')
+    && emitted.includes('as_disp_unbind_bd(child);'));
+  check('BitmapData mutators call as_bd_mark_dirty (no bare _px_ver++ outside the helper)',
+    emitted.includes('as_bd_mark_dirty(bd);') && emitted.includes('as_bd_mark_dirty(dst);'));
+
+  // ---- Stage B write points: TextField + Stage accessors ----
+  check('TextField text/htmlText setters mark dirty',
+    emitted.includes('void TextField_set_text(void* _this, char* value) {')
+    && emitted.includes('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); as_mark_dirty((DisplayObject*)_this); }'));
+  check('TextField colour setters mark dirty',
+    emitted.includes('void TextField_set_textColor(void* _this, unsigned int value) { ((TextField*)_this)->textColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }'));
+  check('TextField text-mutation methods (appendText/replaceText/scrollH/selection/setTextFormat) mark dirty',
+    emitted.includes('void TextField_appendText(void* _this, char* s) {')
+    && emitted.includes('void TextField_replaceText(void* _this, int beginIndex, int endIndex, char* newText) {')
+    && emitted.includes('void TextField_set_scrollH(void* _this, int value) {')
+    && emitted.includes('void TextField_setSelection(void* _this, int begin, int end) {')
+    && emitted.includes('void TextField_setTextFormat(void* _this, TextFormat* format, int begin, int end) {'));
+  check('TextField render-input field set is declared',
+    emitSource.includes("['TextField', new Set(['multiline', 'wordWrap', 'background', 'border', 'scrollV'"));
+  check('Stage color/align/scaleMode setters mark dirty',
+    emitSource.includes("const stageRenderDirty = new Set(['color', 'align', 'scaleMode']);")
+    && emitted.includes('void Stage_set_scaleMode(void* _this, char* value) {')
+    && emitted.includes('as_mark_dirty((DisplayObject*)_this);'));
 
   console.log(`[repaint] ${ok} repaint-boundary checks passed`);
   return bad;

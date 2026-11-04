@@ -19470,6 +19470,51 @@ IPv6 **link-local 丢弃**（只剩它的接口整个不出现）；同接口内
 （版本计数 + 反向引用）、`TextField`、`mask`/`scrollRect`/`filters`/`transform`、`addChild`/`removeChild`。
 漏掉任何一个写点就切换 ⇒ 该写点导致边界冻结（指纹已移除）。阶段 C（边界内脏矩形裁剪）未开始。
 
+### 阶段三百六十六：RepaintBoundary 阶段 B 完整写点 —— BitmapData 反向引用 + 全字段/accessor 覆盖（v0.4.328 → v0.4.329）
+
+**起点**：阶段三百六十五只覆盖 9 个直接字段，其余写点仍靠指纹兜底。本轮补齐**所有渲染输入写点**，
+让 `_render_dirty` 与 `as_render_fp` 的覆盖集合一致，为「先并行、后切换」铺路。
+
+**结论：写时脏标记已覆盖 DisplayObject 字段、accessor、容器结构、MovieClip 帧、Graphics、Transform、
+Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData 像素写经**反向引用**（`_refs`）O(1) 传播到引用者。**
+仍为并行阶段（指纹兜底保留），等价性验证与切换未做。
+
+**逐项**（语义依据见 [`docs/zh-cn/repaint-boundary.md`](docs/zh-cn/repaint-boundary.md) §4/§5）：
+1. **DisplayObject accessor**：`width`/`height`（`as_do_set_width`/`as_do_set_height`）、`scale9Grid`、`filters`、
+   `mask`、`scrollRect`、`cacheAsBitmap` 均在 setter 内 `as_mark_dirty`（`cacheAsBitmap` 额外标父，因边界地位变化）。
+2. **容器结构**：`addChild`/`removeChild`/`addChildAt` 标父；`removeChild` 额外 `as_disp_unbind_bd(child)`
+   递归解绑被移除子树里的每个 Bitmap 与 BitmapData._refs 的强引用，避免强引用反边 pin 住已离树对象。
+3. **MovieClip 帧推进**：`gotoAndStop`/`gotoAndPlay`/`nextFrame`/`prevFrame` 统一经 `as_mc_goto`，
+   `f != currentFrame` 时标脏。
+4. **Graphics**：加 `DisplayObject* _owner`（`Sprite.graphics`/`Shape.graphics` 时写回）；`as_gpath_pt`（路径点）、
+   `as_gflush`（style 关闭组）、`Graphics_clear` 三处标脏 `_owner`，覆盖全部绘制命令。
+5. **Transform**：加 `DisplayObject* _owner`；`matrix`/`colorTransform` 字段写标脏 `_owner`（不是 Transform 本身，
+   它非 DisplayObject），覆盖经局部变量 `var t = o.transform` 的别名写。
+6. **Bitmap**：`bitmapData` 改为「字段读 + setter 写」（同 TextField.text 模式），setter 内 `as_bd_unbind` 旧值 +
+   `as_bd_bind` 新值 + 标脏；`smoothing` 字段写标脏。
+7. **BitmapData**：加 `as_array* _refs`（强引用引用它的 Bitmap）与 `Bitmap._bound_bd`；13 个 mutator
+   （setPixel/setPixel32/setPixels/fillRect/copyPixels/draw/copyChannel/setVector/scroll/perlinNoise/applyFilter/…）
+   统一把裸 `_px_ver++` 改为 `as_bd_mark_dirty(bd)`（内部 `_px_ver++` + 遍历 `_refs` 标脏）。Mark-Sweep 把
+   Bitmap↔BitmapData 环当整体回收；`removeChild` 解绑防止「Bitmap 离树但 BitmapData 仍活」的泄漏。
+   FRE 的 `as_fre_bmd_dirty_impl` 同步改走 `as_bd_mark_dirty`（视频帧回快照路径）。
+8. **TextField**：`text`/`htmlText`/`scrollH`/`type`/`borderColor`/`backgroundColor`/`textColor` setter 与
+   `appendText`/`replaceText`/`setSelection`/`setTextFormat` 标脏；`multiline`/`wordWrap`/`background`/`border`/
+   `scrollV`/`selectable`/`autoSize`/`embedFonts`/`antiAliasType` 字段写标脏。
+9. **Stage**：`color`/`align`/`scaleMode`（窗口级渲染输入）setter 标脏（`align`/`color` 仍是纯字段写，不加
+   `ASC_stage_size_refresh`；`scaleMode` 既 refresh 又标脏）。
+
+**验收**：
+- 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
+- `unit: render/RepaintBoundary` 由 11 钉扩展到 **24 钉**（新增 BitmapData 反边、Bitmap setter、容器解绑、
+  TextField/Stage 写点、mutator 统一走 `as_bd_mark_dirty`）。
+- `example: air-native`（`--air-app` + Skia 链接）编译链接通过。
+- 同步修正 4 个因实现变更而需跟进的钉（旧 `_px_ver++` 精确文本 → `as_bd_mark_dirty`）：`text-input/TextSelection`、
+  `emit/BitmapLivePixels`、`emit/StageSizeFollowsScaleMode`、`fre/BitmapDataAcquire`。
+
+**如实报明**：仍是**并行阶段**，`as_render_fp` 每帧指纹掉烘完整保留，脏标记对行为仍是冗余影子路径。
+**尚未完成**：① 等价性验证（指纹变 ⇔ 脏标记置位的同真同假探针）未做；② 阶段 B 切换未做（关闭指纹掉烘、
+仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
+
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 
 **起点**：用户拿来一段 `bin-aot/TalkMED Meeting.c`（41.4 万行）的编译输出，问这些警告能不能修掉。

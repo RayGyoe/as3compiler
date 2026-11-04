@@ -2358,7 +2358,7 @@ function checkRenderBitmapLivePixels(): string[] {
     sp.includes('if (le) { a = src[3]; r = src[2]; g = src[1]; b = src[0]; }'));
   check('bigEndian keeps reading A,R,G,B (alpha first)',
     sp.includes('else { a = src[0]; r = src[1]; g = src[2]; b = src[3]; }'));
-  check('setPixels bumps the pixel version', sp.includes('bd->_px_ver++;'));
+  check('setPixels marks the pixel data dirty', sp.includes('as_bd_mark_dirty(bd);'));
 
   // 1b. The pixels come off the ByteArray CURSOR, and a short array is an
   //     EOFError rather than an over-read: AIR fills the cells it can and then
@@ -2386,7 +2386,7 @@ function checkRenderBitmapLivePixels(): string[] {
   for (const sig of mutators) {
     const fn = body(sig);
     const name = sig.slice('void '.length, sig.indexOf('('));
-    check(name + ' bumps _px_ver', fn.length > 0 && fn.includes('_px_ver++'));
+    check(name + ' marks the pixel data dirty', fn.length > 0 && fn.includes('as_bd_mark_dirty'));
   }
   // draw/filter are emitted inline with their argument list on the same line.
   // draw's first parameter is IBitmapDrawable (AIR's declared type), not BitmapData.
@@ -2399,7 +2399,7 @@ function checkRenderBitmapLivePixels(): string[] {
     ['applyFilter', 'void BitmapData_applyFilter(void* _this, BitmapData* source, Rectangle* sourceRect, Point* destPoint, BitmapFilter* filter) {'],
   ]) {
     const fn = body(sig);
-    check(name + ' bumps _px_ver', fn.length > 0 && fn.includes('_px_ver++'));
+    check(name + ' marks the pixel data dirty', fn.length > 0 && fn.includes('as_bd_mark_dirty'));
   }
 
   // 3. The render branch draws the live pixel view, not only a decoded image.
@@ -2778,10 +2778,11 @@ function checkStageSizeFollowsScaleMode(): string[] {
   check('it finds the window that owns this Stage', body.includes('ASC_wins[i].stage == (Stage*)stage'));
   check('...and re-derives through the single stage-size writer',
     body.includes('ASC_window_apply_stage_size(i);') && !body.includes('stage_w = '));
-  // Only scaleMode. align/quality/color are plain writes; adding the refresh to them
-  // would turn every stage property write into a window-table scan.
-  const align = 'void Stage_set_align(void* _this, char* value) { ((Stage*)_this)->align = value; }';
-  check('align stays a plain field write', c.includes(align));
+  // Only scaleMode triggers a size refresh. align/color (render inputs) append a
+  // dirty mark but never scan the window table; adding the refresh to them would
+  // turn every stage property write into a window-table scan.
+  const align = 'void Stage_set_align(void* _this, char* value) { ((Stage*)_this)->align = value; as_mark_dirty((DisplayObject*)_this); }';
+  check('align stays a plain field write (dirty mark only, no size refresh)', c.includes(align));
   // ---- 跨端：这段实现是目标无关的 ----
   // generateC 不按 --target/--package 分叉（native 与 wasm 产出的 .c 逐字节相同，实测
   // 2561482 字节完全相等），所以 macOS 与 web 拿到的是**同一份** setter + 助手。这里钉住

@@ -429,7 +429,7 @@ function checkFreBitmapDataAcquire(): string[] {
   // image cache watches. If either side renames or re-keys, a video frame stops
   // being re-snapshotted and the picture freezes with no error at all.
   check('the dirty hook moves the version counter the image cache watches',
-    dirty.includes('bd->_px_ver++;')
+    dirty.includes('as_bd_mark_dirty(bd);')
     && live.includes('bd->_live_ver == bd->_px_ver'));
   check('the dirty hook ignores a bitmap with no pixels left',
     dirty.includes('if (bd == NULL || bd->pixels == NULL) return;'));

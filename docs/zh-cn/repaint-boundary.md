@@ -205,7 +205,9 @@ if (边界 && 命中快照) {
 `BitmapData` 的 `_px_ver`/`_uid` 版本计数器（现已被指纹读取）在脏标记方案里**语义不变**——它仍然是
 「BitmapData 内容变了」的权威信号，只是从「被指纹每帧读」改成「写时直接置脏其所有显示实例」。这一步是
 阶段 B 里最需要小心的：一个 `BitmapData` 可能被多个 `Bitmap` 显示，写它要置脏**所有**引用它的 Bitmap
-（现方案靠 `_px_ver` 全局递增让每个 Bitmap 的指纹都变，天然覆盖了这一点）。
+（现方案靠 `_px_ver` 全局递增让每个 Bitmap 的指纹都变，天然覆盖了这一点）。阶段三百六十六已把它落地为
+`BitmapData._refs` 强引用反向边：13 个 mutator 统一走 `as_bd_mark_dirty`（`_px_ver++` + 遍历 `_refs` 标脏每个
+引用者），`removeChild` 时递归解绑防泄漏（Mark-Sweep 把 Bitmap↔BitmapData 环当整体回收）。
 
 ---
 
@@ -221,14 +223,17 @@ if (边界 && 命中快照) {
 
 ### 阶段 B：写时脏标记 + 边界级失效（核心）
 
-> **实施状态（阶段三百六十五）**：骨架 + 字段写点子集已落地，指纹兑底仍在（并行阶段）。其余写点、等价性
-> 验证与切换未做——见 TODO.md 阶段三百六十五的「如实报明」。
+> **实施状态（阶段三百六十六）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
+> 帧、Graphics、Transform、Bitmap/BitmapData 反向引用、TextField、Stage）。指纹兑底仍在（并行阶段）。等价性
+> 验证与切换未做——见 TODO.md 阶段三百六十六的「如实报明」。
 
 - [x] `DisplayObject` 增 `_render_dirty` 字段与 `as_is_boundary` 判定（§4.2）。
-- [~] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
-      **已注入 9 个直接字段**（`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground`）；
-      `Graphics`/`MovieClip`/`Bitmap`/`TextField`/`mask`/`scrollRect`/`filters`/`transform`/`addChild`
-      等写点仍靠指纹兑底。
+- [x] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
+      **已覆盖**：9 个直接字段（`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground`）+
+      `width`/`height`/`scale9Grid`/`filters`/`mask`/`scrollRect`/`cacheAsBitmap` accessor、`addChild`/`removeChild`
+      结构、`MovieClip` 帧推进、`Graphics` 绘制命令（经 `_owner`）、`Transform.matrix/colorTransform`（经 `_owner`）、
+      `Bitmap.bitmapData`/`smoothing`、`BitmapData` 13 个 mutator（经 `_refs` 反向引用）、`TextField` 文本/格式/颜色/滚动
+      写点、`Stage.color/align/scaleMode`。
 - [x] `as_render_object` 缓存分支改为「脏则重烘、不脏则 blit」，去静置延迟（§4.4 阶段 B）。
       （当前与指纹掉烘并存：脏则清脏 + `_cache_valid=0` 当帧重烘，指纹兑底发现漏点。）
 - [~] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。

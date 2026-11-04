@@ -526,7 +526,7 @@ function checkTextSelection(): string[] {
 
   // 三个颜色属性写入时丢掉 alpha 字节（adl 实测：0x8000FF00 读回 0xff00）。
   check('colour setters DROP the alpha byte, like adl',
-    c.includes('void TextField_set_borderColor(void* _this, unsigned int value) { ((TextField*)_this)->borderColor = value & 0xFFFFFFu; }')
+    c.includes('((TextField*)_this)->borderColor = value & 0xFFFFFFu;')
     && c.includes('((TextField*)_this)->backgroundColor = value & 0xFFFFFFu;')
     && c.includes('((TextField*)_this)->textColor = value & 0xFFFFFFu;'));
   check('the colour properties keep plain field reads and only write through setters',

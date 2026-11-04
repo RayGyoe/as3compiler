@@ -248,15 +248,18 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 
 ### Stage B: write-time dirty marking + boundary-level invalidation (core)
 
-> **Implementation status (stage three-sixty-five)**: skeleton + the field-write subset have landed, with the
-> fingerprint fallback still present (parallel phase). Remaining write points, equivalence verification, and the
-> switch are not yet done — see the "report plainly" note in TODO.md stage three-sixty-five.
+> **Implementation status (stage three-sixty-six)**: write points now cover every render input (DisplayObject
+> fields/accessors, container structure, MovieClip frames, Graphics, Transform, Bitmap/BitmapData reverse edges,
+> TextField, Stage). The fingerprint fallback is still present (parallel phase). Equivalence verification and the
+> switch are not yet done — see the "report plainly" note in TODO.md stage three-sixty-six.
 
 - [x] Add `_render_dirty` field and `as_is_boundary` predicate to `DisplayObject` (§4.2).
-- [~] Following `as_render_fp`'s field list, inject `as_mark_dirty(o)` + upward propagation into every render-input
-  write point (§4.3). **Nine plain fields are injected**
-  (`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground`); `Graphics`/`MovieClip`/`Bitmap`/
-  `TextField`/`mask`/`scrollRect`/`filters`/`transform`/`addChild` still fall back to the fingerprint.
+- [x] Following `as_render_fp`'s field list, inject `as_mark_dirty(o)` + upward propagation into every render-input
+  write point (§4.3). **Covered**: the nine plain fields (`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/`
+  `opaqueBackground`) + `width`/`height`/`scale9Grid`/`filters`/`mask`/`scrollRect`/`cacheAsBitmap` accessors,
+  `addChild`/`removeChild` structure, `MovieClip` frame advance, `Graphics` draw commands (via `_owner`),
+  `Transform.matrix/colorTransform` (via `_owner`), `Bitmap.bitmapData`/`smoothing`, `BitmapData`'s 13 mutators
+  (via `_refs` reverse edges), `TextField` text/format/colour/scroll write points, and `Stage.color/align/scaleMode`.
 - [x] Change `as_render_object`'s cache branch to "re-bake if dirty, else blit", removing the sit-still latency
   (§4.4 stage B). (Currently coexists with the fingerprint drop: dirty → clear + `_cache_valid=0` same-frame re-bake;
   the fingerprint fallback catches any missed write point.)

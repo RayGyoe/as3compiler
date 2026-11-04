@@ -6349,6 +6349,10 @@ export class SymbolTable {
         // other Graphics, so `_clip` keeps deciding for plain shapes.
         ['_mdecl', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
         ['_ml', gpf2()], ['_mt', gpf2()], ['_mw', gpf2()], ['_mh', gpf2()],
+        // The DisplayObject that owns this Graphics surface (set by the Shape /
+        // Sprite graphics getter). Drawing methods mark it dirty so a cached
+        // ancestor re-bakes on the next frame (write-time invalidation).
+        ['_owner', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'Graphics', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['moveTo', gpm({ kind: 'void' }, [greq('x', 'Number'), greq('y', 'Number')])],
@@ -6466,6 +6470,9 @@ export class SymbolTable {
     this.classMap.set('Bitmap', {
       fields: new Map([
         ['bitmapData', bmpf({ kind: 'object', className: 'BitmapData' })],
+        // The BitmapData this Bitmap is currently bound to (mirrors `bitmapData`
+        // but tracks the OLD value so a swap can unbind from the previous _refs).
+        ['_bound_bd', bmpf({ kind: 'object', className: 'BitmapData' })],
         ['smoothing', bmpf({ kind: 'bool' })],
         // pixelSnapping: a plain String field, because in this backend no pixel
         // snapping ever happens -- the value is stored and read back verbatim
@@ -6478,7 +6485,13 @@ export class SymbolTable {
       staticFields: new Map(),
       staticMethods: new Map(),
       getters: new Map(),
-      setters: new Map(),
+      setters: new Map([
+        // `bitmapData` stays a FIELD for reads (plain `bmp->bitmapData`), but
+        // writes go through a setter so the BitmapData↔Bitmap reverse edge can be
+        // re-wired: unbind from the old data, bind to the new one, then mark the
+        // bitmap render-dirty (docs/zh-cn/repaint-boundary.md §BitmapData).
+        ['bitmapData', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'BitmapData', defaultValue: null, isRest: false }], owner: 'Bitmap', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
       constructor: { params: [
         { name: 'bitmapData', type: 'BitmapData', defaultValue: { kind: 'Null' }, isRest: false },
         // AIR's full signature: Bitmap(bitmapData = null, pixelSnapping = "auto",
@@ -6518,6 +6531,13 @@ export class SymbolTable {
         // meeting client: every slide after the first one froze). A monotonic id,
         // unlike a pointer, cannot be re-used by a later allocation.
         ['_uid', bdf({ kind: 'uint' })],
+        // Reverse edge for write-time invalidation: the set of Bitmap objects
+        // currently displaying this bitmap data. Every mutator bumps `_px_ver` AND
+        // marks each referring Bitmap render-dirty, so a cached ancestor re-bakes
+        // without a per-frame pixel fingerprint. Strongly held: the mark-sweep GC
+        // reclaims the Bitmap↔BitmapData cycle as a whole once the display tree no
+        // longer reaches it (a removed Bitmap is also unbound by removeChild).
+        ['_refs', bdf({ kind: 'array' })],
       ]),
       methods: new Map([
         ['getPixel', bdm({ kind: 'uint' }, [
@@ -7552,6 +7572,10 @@ export class SymbolTable {
         fields: new Map([
           ['matrix', tf({ kind: 'object', className: 'Matrix' })],
           ['colorTransform', tf({ kind: 'object', className: 'ColorTransform' })],
+          // The DisplayObject whose transform this is (set by DisplayObject_ctor).
+          // colorTransform/matrix writes mark this owner render-dirty; it is the
+          // reverse edge that lets a Transform reach the object it renders for.
+          ['_owner', tf({ kind: 'object', className: 'DisplayObject' })],
         ]),
         methods: new Map(),
         staticFields: new Map(),

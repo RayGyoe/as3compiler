@@ -395,12 +395,21 @@ export class Emitter {
   // so an enclosing cacheAsBitmap boundary re-bakes this frame instead of waiting
   // for the per-frame fingerprint. These nine are plain fields (not accessors), so
   // they reach emitAssign's direct field-write tail; the rest of the input set
-  // (Graphics/MovieClip/Bitmap/TextField/mask/scrollRect/filters/transform) still
-  // falls back to the fingerprint until their write points get markers too.
-  private static readonly DO_RENDER_DIRTY_FIELDS = new Set([
-    'x', 'y', 'rotation', 'scaleX', 'scaleY',
-    'alpha', 'visible', 'blendMode', 'opaqueBackground',
+  // Write-time invalidation: which fields, per owner class, mark the object (and
+  // its cached ancestors) render-dirty when assigned. DisplayObject's own scalar
+  // transform/visibility fields are the bulk; Bitmap's bitmapData/smoothing are the
+  // subclass render inputs that live as plain fields rather than accessors. A field
+  // defined on an ancestor keys on THAT ancestor's owner (f.owner is the declaring
+  // class), so `Bitmap.x` still hits the DisplayObject entry.
+  private static readonly DO_RENDER_DIRTY_FIELDS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+    ['DisplayObject', new Set(['x', 'y', 'rotation', 'scaleX', 'scaleY', 'alpha', 'visible', 'blendMode', 'opaqueBackground', 'transform'])],
+    ['Bitmap', new Set(['bitmapData', 'smoothing'])],
+    ['TextField', new Set(['multiline', 'wordWrap', 'background', 'border', 'scrollV', 'selectable', 'autoSize', 'embedFonts', 'antiAliasType'])],
   ]);
+  private static isRenderDirtyField(owner: string, name: string): boolean {
+    const s = Emitter.DO_RENDER_DIRTY_FIELDS.get(owner);
+    return s != null && s.has(name);
+  }
   // The CORE language classes used as Class VALUES. None of these has a ClassInfo
   // (they are C primitives or runtime structs, and `Array`/`String`/... resolve to
   // their C type in type position), so `var c:Class = int` / `return String` /
@@ -3050,6 +3059,9 @@ export class Emitter {
     // declaration is the single source; the render preamble only defines them.
     this.line('static int as_is_boundary(DisplayObject* o);');
     this.line('static void as_mark_dirty(DisplayObject* o);');
+    this.line('static void as_bd_bind(BitmapData* bd, Bitmap* b);');
+    this.line('static void as_bd_unbind(BitmapData* bd, Bitmap* b);');
+    this.line('static void as_bd_mark_dirty(BitmapData* bd);');
     // The Function-value #1063 helper is defined with the class registry, which is
     // emitted AFTER every calling thunk that raises it, so it is declared here.
     this.line('static void as_fn_arity_error(const char* qname, int expected, int argc);');
@@ -12898,6 +12910,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // A literal, so it never lives in the GC heap and needs no write barrier.
     this.line('o->blendMode = (char*)"normal";');
     this.line('o->transform = Transform_new();');
+    this.line('o->transform->_owner = o;');
     this.line('gc_write_barrier((void*)o->transform);');
     this.line('o->_cache_flag = false;');
     this.line('o->_mask_object = false;');
@@ -12976,6 +12989,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('void DisplayObject_set_scale9Grid(void* _this, Rectangle* value) {');
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
+    this.line('as_mark_dirty(o);');
     this.line('o->_s9_valid = 0;');
     this.line('if (o->_s9_image != NULL) { as_skia_image_delete(o->_s9_image); o->_s9_image = NULL; }');
     this.line('if (value == NULL) { o->_s9_on = 0; o->_s9_apply = 0; return; }');
@@ -12987,7 +13001,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('as_array* DisplayObject_get_filters(void* _this) { return ((DisplayObject*)_this)->filters; }');
-    this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) gc_write_barrier((void*)value); }');
+    this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) gc_write_barrier((void*)value); as_mark_dirty(o); }');
     // DisplayObject.mask (阶段三百一十八). AIR stencils the object with the MASK's
     // ink -- a binary clip, not an alpha composite (measured on adl 51.4.1,
     // temp/mask/*.as: the mask's alpha and its `visible` flag are both ignored, a
@@ -13007,6 +13021,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (o->_mask_ref != NULL) o->_mask_ref->_mask_user = false;');
     this.line('o->_mask_ref = value;');
     this.line('if (value != NULL) { gc_write_barrier((void*)value); value->_mask_user = true; }');
+    this.line('as_mark_dirty(o);');
     this.indent--;
     this.line('}');
     // cacheAsBitmapMatrix: stored (AIR's getter hands back what was set) but not
@@ -13019,6 +13034,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('if (o == NULL) return;');
     this.line('o->_cache_matrix = value;');
+    this.line('as_mark_dirty(o);');
     this.line('if (value != NULL) { gc_write_barrier((void*)value); as_shell_unsupported("DisplayObject.cacheAsBitmapMatrix (this renderer caches at the object\'s own resolution)"); }');
     this.indent--;
     this.line('}');
@@ -13041,6 +13057,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('if (o == NULL) return;');
+    this.line('as_mark_dirty(o);');
     this.line('if (value == NULL) { o->_scroll_rect = NULL; return; }');
     // Store a private copy (the same reason the getter copies): the renderer reads
     // this every frame, so keeping the caller's instance would make a mutation
@@ -13060,6 +13077,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('if (o->_cache_flag == value) return;');
+    this.line('as_mark_dirty(o);');
+    this.line('if (o->parent != NULL) as_mark_dirty((DisplayObject*)o->parent);');
     this.line('o->_cache_flag = value;');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_valid = 0;');
@@ -13184,6 +13203,19 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('  if (c->children == NULL) return;');
     this.line('  for (int i = 0; i < c->children->length; i++) as_disp_stage_walk((DisplayObject*)as_v_obj_val(c->children->data[i]), type);');
     this.line('}');
+    // Unbind every Bitmap in the removed subtree from its BitmapData._refs so a
+    // detached Bitmap is not pinned by the reverse edge (docs/zh-cn/repaint-boundary.md
+    // §BitmapData). Mirrors as_disp_stage_walk's container walk.
+    this.line('static void as_disp_unbind_bd(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('if (as_is((void*)o, &Bitmap_vt)) { Bitmap* b = (Bitmap*)o; if (b->_bound_bd != NULL) { as_bd_unbind(b->_bound_bd, b); b->_bound_bd = NULL; } }');
+    this.line('if (!as_is((void*)o, &DisplayObjectContainer_vt)) return;');
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children == NULL) return;');
+    this.line('for (int i = 0; i < c->children->length; i++) as_disp_unbind_bd((DisplayObject*)as_v_obj_val(c->children->data[i]));');
+    this.indent--;
+    this.line('}');
     this.line('DisplayObject* DisplayObjectContainer_addChild(void* _this, DisplayObject* child) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)_this;');
@@ -13197,6 +13229,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (child->parent != NULL) DisplayObjectContainer_removeChild((void*)child->parent, child);');
     this.line('as_array_push(c->children, as_v_obj((void*)child));');
     this.line('child->parent = (Object*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)c);');
     // AIR dispatches Event.ADDED ("added", bubbles=true) first -- the parent is
     // already in the bubble path -- and only then ADDED_TO_STAGE. Measured in
     // temp/dlprobe/: `kid:added b=1 p=2`, `kid:added b=1 p=3` (the parent), then
@@ -13225,6 +13258,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('gc_write_barrier_value(c->children->data[index]);');
     this.line('c->children->length++;');
     this.line('child->parent = (Object*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)c);');
     this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
     this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
     this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage + %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');
@@ -13267,6 +13301,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('if (child->parent == (Object*)_this) child->parent = NULL;');
+    this.line('as_mark_dirty((DisplayObject*)c);');
+    this.line('as_disp_unbind_bd(child);');
     // G25 contract 1: a hovered subtree that leaves the list still gets its
     // mouseOut/rollOut, on the next beat, on the detached node.
     this.line('as_hover_on_remove((void*)_this, child);');
@@ -13380,6 +13416,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (cur < index) { for (int i = cur; i < index; i++) c->children->data[i] = c->children->data[i + 1]; }');
     this.line('else { for (int i = cur; i > index; i--) c->children->data[i] = c->children->data[i - 1]; }');
     this.line('c->children->data[index] = v;');
+    this.line('as_mark_dirty((DisplayObject*)c);');
     this.indent--;
     this.line('}');
     this.line('int DisplayObjectContainer_get_numChildren(void* _this) {');
@@ -14761,9 +14798,16 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // re-derivation lives with the window table much further down the file, so it
     // is forward-declared here.
     this.line('static void ASC_stage_size_refresh(void* stage);');
+    // color/align/scaleMode are window-level render inputs: writing them must mark
+    // the stage dirty (docs/zh-cn/repaint-boundary.md). The rest are pure slots.
+    const stageRenderDirty = new Set(['color', 'align', 'scaleMode']);
     for (const [an, cf, ct] of stageFieldAccessors) {
       if (an === 'scaleMode') continue;
-      this.line(`void Stage_set_${an}(void* _this, ${ct} value) { ((Stage*)_this)->${cf} = value; }`);
+      if (stageRenderDirty.has(an)) {
+        this.line(`void Stage_set_${an}(void* _this, ${ct} value) { ((Stage*)_this)->${cf} = value; as_mark_dirty((DisplayObject*)_this); }`);
+      } else {
+        this.line(`void Stage_set_${an}(void* _this, ${ct} value) { ((Stage*)_this)->${cf} = value; }`);
+      }
     }
     // The ordering this fixes is the ONE every AIR app with a NativeWindow uses
     // (measured on this runtime, temp/nworder/):
@@ -14779,6 +14823,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('((Stage*)_this)->scale_mode = value;');
     this.line('ASC_stage_size_refresh(_this);');
+    this.line('as_mark_dirty((DisplayObject*)_this);');
     this.indent--;
     this.line('}');
     // frameRate is deliberately NOT field-backed: AIR keeps ONE frame rate for the
@@ -15342,6 +15387,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('else if (f > o->currentFrame) as_swc_tl_apply(o->_tl_char, (DisplayObject*)o, f);');
     this.indent--;
     this.line('}');
+    this.line('if (f != o->currentFrame) as_mark_dirty((DisplayObject*)o);');
     this.line('o->currentFrame = f;');
     // Run the frame's timeline script (`_self.gotoAndStop(...)`, `stop()`, …). The
     // dispatcher is emitted by the SWC bake; without one (or for a charId with no
@@ -22057,6 +22103,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // so geometry survives a PURE-C build and width/height never touch Skia.
     this.line('static void as_gpath_pt(Graphics* g, double x, double y) {');
     this.indent++;
+    this.line('if (g->_owner != NULL) as_mark_dirty(g->_owner);');
     this.line('if (!g->_has_b) { g->_bl = x; g->_bt = y; g->_br = x; g->_bb = y; g->_has_b = 1; return; }');
     this.line('if (x < g->_bl) g->_bl = x;');
     this.line('if (y < g->_bt) g->_bt = y;');
@@ -22117,6 +22164,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_gflush(Graphics* g) {');
     this.indent++;
     this.line('if (!g->_cur_has) return;');
+    this.line('if (g->_owner != NULL) as_mark_dirty(g->_owner);');
     this.line('as_gdraw* d = (as_gdraw*)malloc(sizeof(as_gdraw));');
     this.line('if (d == NULL) return;');
     this.line('d->path = g->path; d->fill = g->fill; d->stroke = g->stroke;');
@@ -22172,6 +22220,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->_lastx = 0.0; o->_lasty = 0.0; o->_cur_open = 0; o->_cur_has = 0;');
     this.line('o->_bl = 0.0; o->_bt = 0.0; o->_br = 0.0; o->_bb = 0.0; o->_has_b = 0;');
     this.line('o->_clip = 0; o->_clx = 0.0; o->_cly = 0.0; o->_clw = 0.0; o->_clh = 0.0;');
+    this.line('o->_owner = NULL;');
     this.indent--;
     this.line('}');
     this.line('Graphics* Graphics_new(void) {');
@@ -22485,6 +22534,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void Graphics_clear(void* _this) {');
     this.indent++;
     this.line('Graphics* g = (Graphics*)_this;');
+    this.line('if (g->_owner != NULL) as_mark_dirty(g->_owner);');
     // The group list is malloc'd (the SkPath/SkPaint handles it holds are owned by
     // the glue layer), so clear() is the one place they are released.
     this.line('as_gdraw* d = (as_gdraw*)g->draws;');
@@ -22513,6 +22563,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('DisplayObject_ctor((DisplayObject*)o);');
     this.line('o->graphics = Graphics_new();');
+    this.line('o->graphics->_owner = (DisplayObject*)o;');
     this.indent--;
     this.line('}');
     this.line('Shape* Shape_new(void) { Shape* o = (Shape*)gc_alloc(GCT_CLASS, sizeof(Shape)); o->vtable = &Shape_vt; Shape_ctor(o); return o; }');
@@ -22528,6 +22579,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('gc_write_barrier((void*)o->_graphics);');
     this.indent--;
     this.line('}');
+    this.line('o->_graphics->_owner = (DisplayObject*)o;');
     this.line('return o->_graphics;');
     this.indent--;
     this.line('}');
@@ -22616,7 +22668,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('if (bd->pixels == NULL || x < 0 || y < 0 || x >= bd->width || y >= bd->height) return;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('((unsigned*)bd->pixels)[y * bd->width + x] = 0xFF000000u | (color & 0xFFFFFFu);');
     this.indent--;
     this.line('}');
@@ -22635,7 +22687,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('if (bd->pixels == NULL || x < 0 || y < 0 || x >= bd->width || y >= bd->height) return;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('((unsigned*)bd->pixels)[y * bd->width + x] = bd->transparent ? color : (0xFF000000u | (color & 0xFFFFFFu));');
     this.indent--;
     this.line('}');
@@ -22679,7 +22731,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w <= 0 || h <= 0) return;');
     this.line('unsigned a = bd->transparent ? (color >> 24) : 0xFFu;');
     this.line('unsigned argb = (a << 24) | (color & 0xFFFFFFu);');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('unsigned* p = (unsigned*)bd->pixels;');
     this.line('for (int y = y0; y < y0 + h; y++) for (int x = x0; x < x0 + w; x++) p[y * bd->width + x] = argb;');
     this.indent--;
@@ -22774,7 +22826,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // below instead of failing the call-site coercion with #1034.
     this.line('void* src = source.obj;');
     this.line('if (src == NULL || bd->pixels == NULL) return;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('if (blendMode != NULL && strcmp(blendMode, "normal") != 0) { as_throw(Error_new((char*)"BitmapData.draw: blendMode not implemented", 0)); return; }');
     this.line('int cx0 = 0, cy0 = 0, cx1 = bd->width, cy1 = bd->height;');
     this.line('if (clipRect != NULL) { cx0 = (int)clipRect->x; cy0 = (int)clipRect->y; cx1 = cx0 + (int)clipRect->width; cy1 = cy0 + (int)clipRect->height; if (cx0 < 0) cx0 = 0; if (cy0 < 0) cy0 = 0; if (cx1 > bd->width) cx1 = bd->width; if (cy1 > bd->height) cy1 = bd->height; }');
@@ -23003,12 +23055,31 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('DisplayObject_ctor((DisplayObject*)o);');
     this.line('o->bitmapData = bitmapData;');
     this.line('gc_write_barrier((void*)bitmapData);');
+    this.line('o->_bound_bd = bitmapData;');
+    this.line('as_bd_bind(bitmapData, o);');
     this.line('o->pixelSnapping = pixelSnapping;');
     this.line('gc_write_barrier((void*)pixelSnapping);');
     this.line('o->smoothing = smoothing;');
     this.indent--;
     this.line('}');
     this.line('Bitmap* Bitmap_new(BitmapData* bitmapData, char* pixelSnapping, bool smoothing) { Bitmap* o = (Bitmap*)gc_alloc(GCT_CLASS, sizeof(Bitmap)); o->vtable = &Bitmap_vt; Bitmap_ctor(o, bitmapData, pixelSnapping, smoothing); return o; }');
+    // bitmapData write path (docs/zh-cn/repaint-boundary.md §BitmapData): re-wire
+    // the reverse edge and invalidate. Reading stays a plain `bmp->bitmapData`.
+    this.line('void Bitmap_set_bitmapData(void* _this, BitmapData* value) {');
+    this.indent++;
+    this.line('Bitmap* b = (Bitmap*)_this;');
+    this.line('if (b->_bound_bd != value) {');
+    this.indent++;
+    this.line('as_bd_unbind(b->_bound_bd, b);');
+    this.line('b->bitmapData = value;');
+    this.line('gc_write_barrier((void*)value);');
+    this.line('b->_bound_bd = value;');
+    this.line('as_bd_bind(value, b);');
+    this.indent--;
+    this.line('}');
+    this.line('as_mark_dirty((DisplayObject*)b);');
+    this.indent--;
+    this.line('}');
     this.line('');
     // ---- flash.filters (stage 61) ----
     // Filter value bundles. BitmapFilter is an abstract base; concrete filters are
@@ -23110,7 +23181,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('unsigned* blurred = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
     this.line('as_blur_apply(blurred, region, sw, sh, blurX / 2, blurY / 2, quality);');
     this.line('unsigned* dp = (unsigned*)dst->pixels;');
-    this.line('dst->_px_ver++;');
+    this.line('as_bd_mark_dirty(dst);');
     this.line('for (int y = 0; y < sh; y++) { int ty = dy + y; if (ty < 0 || ty >= dst->height) continue; for (int x = 0; x < sw; x++) { int tx = dx + x; if (tx < 0 || tx >= dst->width) continue; dp[(size_t)ty * dst->width + tx] = blurred[(size_t)y * sw + x]; } }');
     this.line('free(region); free(blurred);');
     this.indent--;
@@ -23123,7 +23194,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('(void)baseX; (void)baseY; (void)numOctaves; (void)stitch; (void)fractalNoise;');
     this.line('if (bd->pixels == NULL) return;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('unsigned* p = (unsigned*)bd->pixels;');
     this.line('unsigned seed = (unsigned)randomSeed;');
     this.line('for (int y = 0; y < bd->height; y++) {');
@@ -23153,7 +23224,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('bd->pixels = NULL;');
     this.line('if (bd->image != NULL) { as_final_release(bd, bd->image); as_skia_image_delete(bd->image); bd->image = NULL; }');
     this.line('if (bd->_live_image != NULL) { as_final_release(bd, bd->_live_image); as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.indent--;
     this.line('}');
     // setPixels(rect, inputByteArray): copy 32-bit ARGB pixel values out of the
@@ -23190,7 +23261,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
     this.line('int w = (int)rect->width, h = (int)rect->height;');
     this.line('int le = ba->endian != NULL && strcmp(ba->endian, "littleEndian") == 0;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
     this.line('// One word per rect cell (in rect order) off the array cursor; a short');
     this.line('// array keeps the cells already filled and throws #2030 right here.');
@@ -23212,7 +23283,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('BitmapData* bd = (BitmapData*)_this;');
     this.line('(void)alphaBmp; (void)alphaPt; (void)mergeAlpha;');
     this.line('if (bd == NULL || bd->pixels == NULL || src == NULL || src->pixels == NULL || srcRect == NULL || dest == NULL) return;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('int sx0 = (int)srcRect->x, sy0 = (int)srcRect->y;');
     this.line('int w = (int)srcRect->width, h = (int)srcRect->height;');
     this.line('int dx0 = (int)dest->x, dy0 = (int)dest->y;');
@@ -23239,7 +23310,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int w = (int)srcRect->width, h = (int)srcRect->height;');
     this.line('int dx0 = (int)dest->x, dy0 = (int)dest->y;');
     this.line('unsigned mask = 0xFFu << ds;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
     this.indent++;
     this.line('int sx = sx0 + x, sy = sy0 + y, dx = dx0 + x, dy = dy0 + y;');
@@ -23280,7 +23351,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (src == NULL) return;');
     this.line('memcpy(src, bd->pixels, sizeof(unsigned) * (size_t)(w * h));');
     this.line('unsigned* dst = (unsigned*)bd->pixels;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('for (int y = 0; y < h; y++) {');
     this.indent++;
     this.line('int sy = y - dy;');
@@ -23307,7 +23378,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (bd->pixels == NULL || rect == NULL || v == NULL) return;');
     this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
     this.line('int rw = (int)rect->width, rh = (int)rect->height;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.line('for (int yy = 0; yy < rh; yy++) { for (int xx = 0; xx < rw; xx++) {');
     this.indent++;
     this.line('int px = x0 + xx, py = y0 + yy;');
@@ -24826,6 +24897,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_set_scrollH(void* _this, int value) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('int m = TextField_get_maxScrollH(_this);');
     this.line('if (value < 0) value = 0;');
     this.line('if (value > m) value = m;');
@@ -24891,6 +24963,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_setSelection(void* _this, int begin, int end) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     // setSelection(0, 0) collapses the selection like any other pair. An earlier
     // stage recorded it as a NO-OP (temp/xformcmp/seldir round 8); that was a
     // measurement artefact, re-measured on adl 51.4.1 across six previous states
@@ -24916,6 +24989,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_setTextFormat(void* _this, TextFormat* format, int begin, int end) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     // AIR refuses a null format here exactly like the defaultTextFormat setter
     // does (measured on adl 51.4.1, temp/tfc2/Main3.as G1: setTextFormat(null,0,2)
     // throws TypeError #2007 "Parameter format must be non-null."), so this used
@@ -25464,6 +25538,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_set_text(void* _this, char* value) {'),
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('as_skia_textlayout_delete(tf->_para);');
     this.line('tf->_para = NULL;');
     this.line('tf->_para_text = NULL;');
@@ -25503,6 +25578,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_set_type(void* _this, char* value) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('char* cur = (tf->type != NULL) ? tf->type : (char*)"";');
     this.line('char* nv = (value != NULL) ? value : (char*)"";');
     this.line('if (strcmp(cur, nv) != 0) tf->tabEnabled = (strcmp(nv, "input") == 0);');
@@ -25534,7 +25610,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // paragraph would re-read `_insFmt` anyway, so leaving it is also cheaper.
     this.indent--;
     this.line('}');
-    this.line('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); }');
+    this.line('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); as_mark_dirty((DisplayObject*)_this); }');
     this.line('char* TextField_get_htmlText(void* _this) { return ((TextField*)_this)->text; }');
     // The three colour properties are 24-bit RGB: AIR DROPS the alpha byte on
     // write, so it is gone from the read-back too. Measured on adl 51.4.1
@@ -25543,9 +25619,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // 0xFF00FF00 -> 0xff00. Painting already used a separate alpha argument
     // (as_skia_paint_fill(rgb, 1.0)), so the mask belongs on the WRITE; without
     // it the value read back was 0x8000FF00 while adl reported 0x0000FF00.
-    this.line('void TextField_set_borderColor(void* _this, unsigned int value) { ((TextField*)_this)->borderColor = value & 0xFFFFFFu; }');
-    this.line('void TextField_set_backgroundColor(void* _this, unsigned int value) { ((TextField*)_this)->backgroundColor = value & 0xFFFFFFu; }');
-    this.line('void TextField_set_textColor(void* _this, unsigned int value) { ((TextField*)_this)->textColor = value & 0xFFFFFFu; }');
+    this.line('void TextField_set_borderColor(void* _this, unsigned int value) { ((TextField*)_this)->borderColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }');
+    this.line('void TextField_set_backgroundColor(void* _this, unsigned int value) { ((TextField*)_this)->backgroundColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }');
+    this.line('void TextField_set_textColor(void* _this, unsigned int value) { ((TextField*)_this)->textColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }');
     // Point/Rectangle/Matrix/ColorTransform hold only double fields, so they are
     // plain value bundles (no GC pointers); Transform holds Matrix/ColorTransform
     // object references and is marked via its prop table.
@@ -25720,7 +25796,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('');
     // Transform holds an identity Matrix and ColorTransform by default; wiring to
     // DisplayObject.transform is deferred to a later stage.
-    this.line('void Transform_ctor(Transform* o) { o->matrix = Matrix_new(1.0, 0.0, 0.0, 1.0, 0.0, 0.0); o->colorTransform = ColorTransform_new(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0); }');
+    this.line('void Transform_ctor(Transform* o) {');
+    this.indent++;
+    this.line('o->matrix = Matrix_new(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);');
+    this.line('o->colorTransform = ColorTransform_new(1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0);');
+    this.line('o->_owner = NULL;');
+    this.indent--;
+    this.line('}');
     this.line('Transform* Transform_new(void) { Transform* o = (Transform*)gc_alloc(GCT_CLASS, sizeof(Transform)); o->vtable = &Transform_vt; Transform_ctor(o); return o; }');
     this.line('');
     // --- Vector3D (flash.geom stage 79): 4-component vector, pure double bundle. ---
@@ -28230,6 +28312,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_appendText(void* _this, char* s) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('if (s == NULL) return;');
     this.line('int oldLen = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
     this.line('int addLen = (int)strlen(s);');
@@ -28259,6 +28342,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextField_replaceText(void* _this, int beginIndex, int endIndex, char* newText) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)_this;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('if (newText == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter text must be non-null.", 2007)); return; }');
     this.line('if (beginIndex < 0 || endIndex < 0 || beginIndex > endIndex) return;');
     this.line('int len = (int)strlen(as_tf_text(tf));');
@@ -28650,6 +28734,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the property moves; after clear() the scale stays (adl measured both).
     this.line('static void as_do_set_width(DisplayObject* o, double value) {');
     this.indent++;
+    this.line('as_mark_dirty(o);');
     this.line('if (as_is((void*)o, &TextField_vt)) { ((TextField*)o)->_fieldWidth = value; return; }');
     this.line('double cur = as_do_width(o);');
     this.line('if (cur == 0.0 || cur != cur) { o->scaleX = 0.0; return; }');
@@ -28658,6 +28743,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static void as_do_set_height(DisplayObject* o, double value) {');
     this.indent++;
+    this.line('as_mark_dirty(o);');
     this.line('if (as_is((void*)o, &TextField_vt)) { ((TextField*)o)->_fieldHeight = value; return; }');
     this.line('double cur = as_do_height(o);');
     this.line('if (cur == 0.0 || cur != cur) { o->scaleY = 0.0; return; }');
@@ -28845,6 +28931,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('if (m == NULL) return;');
+    this.line('as_mark_dirty(o);');
     this.line('double det = m->a * m->d - m->b * m->c;');
     this.line('double sx = sqrt(m->a * m->a + m->b * m->b);');
     this.line('double sy = sqrt(m->c * m->c + m->d * m->d);');
@@ -29051,11 +29138,53 @@ void FileStream_writeObject(void* _this, as_value v) {
     // cacheAsBitmap boundary dirty. O(depth) on write, O(1) to test at render time.
     this.line('static void as_mark_dirty(DisplayObject* o) {');
     this.indent++;
-    this.line('while (o != NULL) {');
+    this.line('while (o != NULL && !o->_render_dirty) {');
     this.indent++;
     this.line('o->_render_dirty = 1;');
     this.line('if (o->_cache_flag) break;');
     this.line('o = (DisplayObject*)o->parent;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // BitmapData → Bitmap reverse edges (docs/zh-cn/repaint-boundary.md §BitmapData).
+    // The mark-sweep GC reclaims the Bitmap↔BitmapData cycle as a whole once the
+    // display tree stops reaching it, and removeChild unbinds a removed Bitmap, so
+    // the strong references in `_refs` do not leak. A mutator bumps `_px_ver` AND
+    // marks each referring Bitmap dirty, replacing the per-frame pixel fingerprint.
+    this.line('static void as_bd_bind(BitmapData* bd, Bitmap* b) {');
+    this.indent++;
+    this.line('if (bd == NULL || b == NULL) return;');
+    this.line('if (bd->_refs == NULL) bd->_refs = as_array_new();');
+    this.line('as_array_push(bd->_refs, as_v_obj((void*)b));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_bd_unbind(BitmapData* bd, Bitmap* b) {');
+    this.indent++;
+    this.line('if (bd == NULL || b == NULL || bd->_refs == NULL) return;');
+    this.line('as_array* refs = bd->_refs;');
+    this.line('for (int i = 0; i < refs->length; i++) {');
+    this.indent++;
+    this.line('if (as_v_obj_val(refs->data[i]) == (void*)b) {');
+    this.indent++;
+    this.line('for (int j = i; j < refs->length - 1; j++) refs->data[j] = refs->data[j + 1];');
+    this.line('refs->length--;');
+    this.line('refs->data[refs->length] = as_v_null();');
+    this.line('break;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_bd_mark_dirty(BitmapData* bd) {');
+    this.indent++;
+    this.line('if (bd == NULL) return;');
+    this.line('bd->_px_ver++;');
+    this.line('if (bd->_refs == NULL) return;');
+    this.line('for (int i = 0; i < bd->_refs->length; i++) {');
+    this.indent++;
+    this.line('as_mark_dirty((DisplayObject*)as_v_obj_val(bd->_refs->data[i]));');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -33169,7 +33298,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)p;');
     this.line('if (bd == NULL || bd->pixels == NULL) return;');
-    this.line('bd->_px_ver++;');
+    this.line('as_bd_mark_dirty(bd);');
     this.indent--;
     this.line('}');
     this.line('static void as_fre_wire_classes(void) {');
@@ -36326,7 +36455,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         // Unqualified `name = null` inside a DisplayObject subclass is the same
         // property (AIR throws #2007 there too), so record it for the guard.
         if (f.owner === 'DisplayObject' && name === 'name') this.lastDoNameTarget = true;
-        if (f.owner === 'DisplayObject' && Emitter.DO_RENDER_DIRTY_FIELDS.has(name)) this.lastDoDirtyRecv = self;
+        if (Emitter.isRenderDirtyField(f.owner, name)) this.lastDoDirtyRecv = self;
         return { code: `${self}->${this.cIdent(f.cName ?? name)}`, type: f.type };
       }
       const sf = cinfo?.staticFields.get(name);
@@ -39248,7 +39377,15 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
       // Record a DisplayObject.name target for the assignment emitter's #2007 guard.
       if (f.owner === 'DisplayObject' && expr.property === 'name') this.lastDoNameTarget = true;
-      if (f.owner === 'DisplayObject' && Emitter.DO_RENDER_DIRTY_FIELDS.has(expr.property)) this.lastDoDirtyRecv = recv;
+      // colorTransform/matrix live on a Transform, whose `_owner` is the
+      // DisplayObject it renders for: a write there invalidates that owner, not
+      // the Transform itself (which is not a DisplayObject). This also covers a
+      // Transform reached through a local variable (`var t = o.transform`).
+      if (obj.type.className === 'Transform' && (expr.property === 'colorTransform' || expr.property === 'matrix')) {
+        this.lastDoDirtyRecv = `(${recv})->_owner`;
+      } else if (Emitter.isRenderDirtyField(f.owner, expr.property)) {
+        this.lastDoDirtyRecv = recv;
+      }
       return { code: `(${recv}->${this.cIdent(f.cName ?? expr.property)})`, type: f.type };
     }
     // getter accessor: obj.prop -> dispatch through the runtime object's vtable
