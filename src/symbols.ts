@@ -2408,6 +2408,9 @@ export class SymbolTable {
         ['overState', sbf({ kind: 'object', className: 'DisplayObject' })],
         ['downState', sbf({ kind: 'object', className: 'DisplayObject' })],
         ['hitTestState', sbf({ kind: 'object', className: 'DisplayObject' })],
+        // Last settled state (set in as_render_fp); a hover/press flip marks the
+        // button render-dirty since its state is read-time computed, not written.
+        ['_sbtn_prev', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'SimpleButton', isStatic: false, isConst: false }],
       ]),
       methods: new Map(),
       staticFields: new Map(),
@@ -6712,7 +6715,12 @@ export class SymbolTable {
     const flf = (t: CType, owner: string): FieldInfo => ({ type: t, init: null, visibility: 'public', owner, isStatic: false, isConst: false });
     const flm = (ret: CType, params: Param[], owner: string): MethodInfo => ({ returnType: ret, params, owner, visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     this.classMap.set('BitmapFilter', {
-      fields: new Map(),
+      fields: new Map([
+        // The DisplayObject this filter is attached to (set by DisplayObject_set_filters).
+        // Filter field writes mark this owner render-dirty: the reverse edge lets a
+        // `blur.blurX = 5` reach the object it filters (阶段三百六十六 等价性验证).
+        ['_owner', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'BitmapFilter', isStatic: false, isConst: false }],
+      ]),
       methods: new Map([
         ['clone', flm({ kind: 'object', className: 'BitmapFilter' }, [], 'BitmapFilter')],
       ]),
@@ -8479,6 +8487,9 @@ export class SymbolTable {
           ['visible', s3f({ kind: 'bool' })],
           ['context3d', s3f({ kind: 'object', className: 'Context3D' })],
           ['renderMode', s3f({ kind: 'string' })],
+          // The Stage this slot belongs to (set by Stage_get_stage3Ds). x/y/visible
+          // writes mark this owner render-dirty (阶段三百六十六 等价性验证).
+          ['_owner', { type: { kind: 'object', className: 'Stage' }, init: null, visibility: 'private', owner: 'Stage3D', isStatic: false, isConst: false }],
         ]),
         methods: new Map([
           // AIR's signature is

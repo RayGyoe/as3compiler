@@ -611,7 +611,7 @@ function checkCaret(): string[] {
   check('a plain caret move restarts the blink',
     /static void as_tf_set_caret\(TextField\* tf, int pos\) \{[\s\S]{0,420}?as_tf_blink_reset\(\);/.test(c));
   check('a shift-extend restarts the blink',
-    /static void as_tf_extend_caret\(TextField\* tf, int pos\) \{[\s\S]{0,520}?as_tf_blink_reset\(\);/.test(c));
+    /static void as_tf_extend_caret\(TextField\* tf, int pos\) \{[\s\S]{0,800}?as_tf_blink_reset\(\);/.test(c));
   // (3) drawn only in a window/compose pass and only on a focused + selectable
   // field, as a 1-device-pixel fill rect at the caret box in the text colour.
   // 阶段二百四十二: the gate also requires an INPUT field -- measured on adl 51.4.1, a

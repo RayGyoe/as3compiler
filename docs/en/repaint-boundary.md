@@ -248,10 +248,11 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 
 ### Stage B: write-time dirty marking + boundary-level invalidation (core)
 
-> **Implementation status (stage three-sixty-six)**: write points now cover every render input (DisplayObject
+> **Implementation status (stage three-sixty-seven)**: write points now cover every render input (DisplayObject
 > fields/accessors, container structure, MovieClip frames, Graphics, Transform, Bitmap/BitmapData reverse edges,
-> TextField, Stage). The fingerprint fallback is still present (parallel phase). Equivalence verification and the
-> switch are not yet done — see the "report plainly" note in TODO.md stage three-sixty-six.
+> TextField, Stage) plus seven runtime-internal states (focus, selection/caret, IME composition, caret blink,
+> filter fields, Stage3D, SimpleButton hover). The fingerprint fallback is still present (parallel phase). The
+> TalkMED real-machine re-run and the switch are not yet done — see TODO.md stage three-sixty-seven.
 
 - [x] Add `_render_dirty` field and `as_is_boundary` predicate to `DisplayObject` (§4.2).
 - [x] Following `as_render_fp`'s field list, inject `as_mark_dirty(o)` + upward propagation into every render-input
@@ -267,8 +268,10 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
   re-bakes), not a unified end-of-frame reset.
 - [~] **Parallel verification**: dirty-marking ≡ fingerprint true-iff-true (§4.5); switch only after full
   `node test.ts` green. The probe is in place (`ASC_DIRTY_TRACE` + `DIRTY_MISS`: a fingerprint drop with
-  `_render_dirty==0` reports a missed write point); `autobake.as`/`cacheasbitmap.as` show no `DIRTY_MISS`;
-  the full real-world scene (air-native/TalkMED GUI) still needs a windowed Skia run.
+  `_render_dirty==0` reports a missed write point); the first TalkMED real-machine run produced **many
+  `DIRTY_MISS`** and located them as "fingerprint inputs ≠ AS3 write points" — seven runtime-internal-state
+  write points were then added (stage three-sixty-seven); the re-run (recompile + `ASC_DIRTY_TRACE`) still needs
+  a windowed Skia run.
 - **Acceptance**:
   - `temp/` probe: writing `x` twice → second write (dirty already set) re-bakes same frame, no 3-frame sit-still
     (via `ASC_BAKE_TRACE` timestamps).

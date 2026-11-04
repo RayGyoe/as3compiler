@@ -406,6 +406,10 @@ export class Emitter {
     ['Bitmap', new Set(['bitmapData', 'smoothing'])],
     ['TextField', new Set(['multiline', 'wordWrap', 'background', 'border', 'scrollV', 'selectable', 'autoSize', 'embedFonts', 'antiAliasType'])],
   ]);
+  // Filter concrete classes (BitmapFilter subclasses whose fields are all render
+  // inputs). A field write on one of these marks the filter's `_owner` (the
+  // DisplayObject it is attached to) render-dirty, mirroring Transform._owner.
+  private static readonly FILTER_CLASSES: ReadonlySet<string> = new Set(['BlurFilter', 'DropShadowFilter', 'GlowFilter']);
   private static isRenderDirtyField(owner: string, name: string): boolean {
     const s = Emitter.DO_RENDER_DIRTY_FIELDS.get(owner);
     return s != null && s.has(name);
@@ -13001,7 +13005,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('as_array* DisplayObject_get_filters(void* _this) { return ((DisplayObject*)_this)->filters; }');
-    this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) gc_write_barrier((void*)value); as_mark_dirty(o); }');
+    this.line('void DisplayObject_set_filters(void* _this, as_array* value) { DisplayObject* o = (DisplayObject*)_this; o->filters = value; if (value != NULL) { gc_write_barrier((void*)value); for (int _fi = 0; _fi < value->length; _fi++) { void* _f = as_v_obj_val(value->data[_fi]); if (_f != NULL && as_is(_f, &BitmapFilter_vt)) ((BitmapFilter*)_f)->_owner = o; } } as_mark_dirty(o); }');
     // DisplayObject.mask (阶段三百一十八). AIR stencils the object with the MASK's
     // ink -- a binary clip, not an alpha composite (measured on adl 51.4.1,
     // temp/mask/*.as: the mask's alpha and its `visible` flag are both ignored, a
@@ -13448,6 +13452,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // the field's render fingerprint (gated on focus) so a still field never bakes a
     // frozen caret. Not a GC pointer, so it needs no root.
     this.line('static double as_tf_blink_t0 = 0.0;');
+    // Previous caret-blink phase, tracked so the window compose can detect a phase
+    // flip and mark the focused field dirty — the blink is a pure function of time,
+    // so it has no write point (阶段三百六十六 等价性验证).
+    this.line('static int as_tf_blink_prev = -1;');
     this.line('static void as_tf_blink_reset(void) { as_tf_blink_t0 = as_now_ms(); }');
     this.line('static int as_tf_caret_on(void) {');
     this.indent++;
@@ -13493,6 +13501,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // Focus change restarts the caret blink so a freshly focused field shows a
     // solid caret immediately (阶段一百三十五).
     this.line('as_tf_blink_reset();');
+    // Focus state is folded into every TextField's fingerprint (as_focus_obj == tf)
+    // and the caret blink phase, so a focus change must mark both ends render-dirty
+    // (阶段三百六十六 等价性验证漏写点).
+    this.line('as_mark_dirty(old);');
+    this.line('as_mark_dirty(obj);');
     this.line('as_focus_dispatch(old, (char*)"focusOut", (Object*)obj);');
     this.line('as_focus_dispatch(obj, (char*)"focusIn", (Object*)old);');
     this.indent--;
@@ -13606,6 +13619,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('int len = (tf->text != NULL) ? (int)strlen(tf->text) : 0;');
     this.line('tf->_sel_begin = 0; tf->_sel_end = len; tf->_sel_caret = len;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.indent--;
     this.line('}');
     this.line('');
@@ -13789,6 +13803,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('int len = (int)strlen(as_tf_text(tf));');
     this.line('if (pos < 0) pos = 0; if (pos > len) pos = len;');
     this.line('tf->_sel_begin = pos; tf->_sel_end = pos; tf->_sel_caret = pos;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     // A caret move restarts the blink: the caret stays solid while the user is
     // navigating or typing (阶段一百三十五).
     this.line('as_tf_blink_reset();');
@@ -13809,6 +13824,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (anchor < 0) anchor = 0; if (anchor > len) anchor = len;');
     this.line('if (pos <= anchor) { tf->_sel_begin = pos; tf->_sel_end = anchor; } else { tf->_sel_begin = anchor; tf->_sel_end = pos; }');
     this.line('tf->_sel_caret = pos;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('as_tf_blink_reset();');
     this.line('tf->_goal_col = -1;');
     this.indent--;
@@ -14086,6 +14102,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('tf->_sel_begin = lo;');
     this.line('tf->_sel_end = hi;');
     this.line('tf->_sel_caret = hi;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.indent--;
     this.line('}');
     this.line('static int as_tf_word_right(const char* t, int len, int pos) {');
@@ -14424,6 +14441,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('tf->_sel_begin = 0;');
     this.line('tf->_sel_end = (hi > caret) ? hi : caret;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -14432,6 +14450,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('tf->_sel_begin = (lo < caret) ? lo : caret;');
     this.line('tf->_sel_end = len;');
     this.line('tf->_sel_caret = len;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('return;');
     this.indent--;
     this.line('}');
@@ -14563,6 +14582,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('tf->_comp = NULL;');
     this.line('tf->_comp_start = -1;');
     this.line('tf->_comp_len = 0;');
+    // The composition string is fingerprinted, so any change (set or clear) must
+    // mark the field render-dirty (阶段三百六十六 等价性验证漏写点).
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('if (text == NULL || text[0] == 0) return;');
     this.line('size_t n = strlen(text);');
     this.line('char* c = (char*)malloc(n + 1);');
@@ -21948,6 +21970,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} else {');
     this.indent++;
     this.line('tf->_sel_begin = idx; tf->_sel_end = idx; tf->_sel_caret = idx;');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
     this.line('drag_tf = tf;');
     this.line('drag_anchor = idx;');
     this.indent--;
@@ -21972,6 +21995,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (drag_anchor == -2) { }');
     this.line('else if (idx < drag_anchor) { drag_tf->_sel_begin = idx; drag_tf->_sel_end = drag_anchor; drag_tf->_sel_caret = drag_anchor; }');
     this.line('else { drag_tf->_sel_begin = drag_anchor; drag_tf->_sel_end = idx; drag_tf->_sel_caret = idx; }');
+    this.line('as_mark_dirty((DisplayObject*)drag_tf);');
     this.indent--;
     this.line('} else if (strcmp(type, "mouseUp") == 0) {');
     this.indent++;
@@ -21983,6 +22007,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_local_point((DisplayObject*)drag_tf, x, y, &tfx, &tfy);');
     this.line('int idx = as_tf_index_at(drag_tf, tfx, tfy);');
     this.line('drag_tf->_sel_begin = idx; drag_tf->_sel_end = idx; drag_tf->_sel_caret = idx;');
+    this.line('as_mark_dirty((DisplayObject*)drag_tf);');
     this.indent--;
     this.line('}');
     this.line('drag_tf = NULL;');
@@ -28144,13 +28169,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('Context3D* Stage3D_get_context3D(void* _this) { return ((Stage3D*)_this)->context3d; }');
-    this.line('void Stage3D_set_x(void* _this, double value) { ((Stage3D*)_this)->x = value; }');
-    this.line('void Stage3D_set_y(void* _this, double value) { ((Stage3D*)_this)->y = value; }');
-    this.line('void Stage3D_set_visible(void* _this, bool value) { ((Stage3D*)_this)->visible = value; }');
+    this.line('void Stage3D_set_x(void* _this, double value) { Stage3D* o = (Stage3D*)_this; o->x = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
+    this.line('void Stage3D_set_y(void* _this, double value) { Stage3D* o = (Stage3D*)_this; o->y = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
+    this.line('void Stage3D_set_visible(void* _this, bool value) { Stage3D* o = (Stage3D*)_this; o->visible = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
     this.line('as_vector_Stage3D* Stage_get_stage3Ds(void* _this) {');
     this.indent++;
     this.line('Stage* s = (Stage*)_this;');
-    this.line('if (s->stage3ds == NULL) { s->stage3ds = as_vector_Stage3D_new(); gc_write_barrier((void*)s->stage3ds); as_vector_Stage3D_push(s->stage3ds, Stage3D_new()); }');
+    this.line('if (s->stage3ds == NULL) { s->stage3ds = as_vector_Stage3D_new(); gc_write_barrier((void*)s->stage3ds); Stage3D* _s3 = Stage3D_new(); _s3->_owner = s; as_vector_Stage3D_push(s->stage3ds, _s3); }');
     this.line('return s->stage3ds;');
     this.indent--;
     this.line('}');
@@ -29289,6 +29314,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (as_is(o, &SimpleButton_vt)) {');
     this.indent++;
     this.line('DisplayObject* st = as_sbtn_state(o);');
+    this.line('if (((SimpleButton*)o)->_sbtn_prev != st) { ((SimpleButton*)o)->_sbtn_prev = st; as_mark_dirty(o); }');
     this.line('h = as_fp_ptr(h, st); if (st != NULL) h = as_fp_u32(h, as_render_fp(st));');
     this.indent--;
     this.line('}');
@@ -29447,7 +29473,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (o->_auto_baked || o->_cache_flag) {');
     this.indent++;
     this.line('if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path);');
-    this.line('if (ASC_dirty_trace > 0 && o->_cache_valid && !o->_render_dirty) fprintf(stderr, "DIRTY_MISS o=%p: fingerprint changed but _render_dirty was 0 (missed write point)\\n", (void*)o);');
+    this.line('if (ASC_dirty_trace > 0 && o->_cache_valid && !o->_render_dirty) {');
+    this.indent++;
+    this.line('const char* dm_tx = (as_is(o, &TextField_vt) && ((TextField*)o)->text != NULL) ? ((TextField*)o)->text : "-";');
+    this.line('fprintf(stderr, "DIRTY_MISS o=%p cls=%s auto=%d cache=%d tx=%s: fp changed but _render_dirty was 0\\n", (void*)o, as_cls_of((void*)o), o->_auto_baked, o->_cache_flag, dm_tx);');
+    this.indent--;
+    this.line('}');
     this.line('o->_auto_baked = 0; o->_cache_valid = 0;');
     this.indent--;
     this.line('}');
@@ -30940,6 +30971,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     // fingerprint already covers display-tree pixels; Stage3D and GPU recovery
     // have their own generations because neither is a DisplayObject field.
     this.line('as_mouse_refresh_target((DisplayObject*)st);');
+    // Caret-blink phase flip → mark the focused field dirty. The blink phase is a
+    // pure function of time (as_tf_caret_on reads the wall clock), so unlike every
+    // other fingerprint input it has no write point; the fingerprint used to drop
+    // the bake on each flip and, without this, a baked ancestor would freeze the
+    // caret bar (阶段三百六十六 等价性验证).
+    this.line('if (as_focus_obj != NULL && as_is((void*)as_focus_obj, &TextField_vt)) {');
+    this.indent++;
+    this.line('TextField* _btf = (TextField*)as_focus_obj;');
+    this.line('if (_btf->selectable && as_tf_is_input(_btf)) {');
+    this.indent++;
+    this.line('int _kon = as_tf_caret_on();');
+    this.line('if (as_tf_blink_prev >= 0 && _kon != as_tf_blink_prev) as_mark_dirty((DisplayObject*)_btf);');
+    this.line('as_tf_blink_prev = _kon;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('if (as_dbg_frame_n == 1) as_bake_stat_report(st, id);');
     this.line('uint32_t _window_fp = as_render_fp((DisplayObject*)st);');
     this.line('if (as_dbg_frame_n == 1 && ASC_fp_trace > 0) fprintf(stderr, "WKEY win=%d valid=%d old=%08x new=%08x stagefp=%08x\\n", id, w->render_valid, w->render_fp, _window_fp, ((DisplayObject*)st)->_auto_fp);');
@@ -39395,6 +39443,8 @@ void FileStream_writeObject(void* _this, as_value v) {
       // the Transform itself (which is not a DisplayObject). This also covers a
       // Transform reached through a local variable (`var t = o.transform`).
       if (obj.type.className === 'Transform' && (expr.property === 'colorTransform' || expr.property === 'matrix')) {
+        this.lastDoDirtyRecv = `(${recv})->_owner`;
+      } else if (Emitter.FILTER_CLASSES.has(f.owner)) {
         this.lastDoDirtyRecv = `(${recv})->_owner`;
       } else if (Emitter.isRenderDirtyField(f.owner, expr.property)) {
         this.lastDoDirtyRecv = recv;

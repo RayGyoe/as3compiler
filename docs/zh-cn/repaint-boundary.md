@@ -223,9 +223,10 @@ if (边界 && 命中快照) {
 
 ### 阶段 B：写时脏标记 + 边界级失效（核心）
 
-> **实施状态（阶段三百六十六）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
-> 帧、Graphics、Transform、Bitmap/BitmapData 反向引用、TextField、Stage）。指纹兑底仍在（并行阶段）。等价性
-> 验证与切换未做——见 TODO.md 阶段三百六十六的「如实报明」。
+> **实施状态（阶段三百六十七）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
+> 帧、Graphics、Transform、Bitmap/BitmapData 反向引用、TextField、Stage）+ 7 类运行时内部状态（焦点、选择/caret、
+> IME 组合、caret 闪烁、filter 字段、Stage3D、SimpleButton hover）。指纹兑底仍在（并行阶段）。TalkMED 真机
+> `ASC_DIRTY_TRACE` 复验与切换未做——见 TODO.md 阶段三百六十七的「如实报明」。
 
 - [x] `DisplayObject` 增 `_render_dirty` 字段与 `as_is_boundary` 判定（§4.2）。
 - [x] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
@@ -239,7 +240,8 @@ if (边界 && 命中快照) {
 - [~] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。
 - [~] **并行验证**：脏标记与指纹同真同假（§4.5 迁移策略），全量 `node test.ts` 绿后才切换。
       探针已就位（`ASC_DIRTY_TRACE` + `DIRTY_MISS`：掉烘时指纹变而 `_render_dirty==0` 即报漏写点）；
-      `autobake.as`/`cacheasbitmap.as` 无 `DIRTY_MISS`；完整真实场景（air-native/TalkMED GUI）留待窗口环境跑。
+      TalkMED 真机首轮跑出**大量 `DIRTY_MISS`**，定位为「指纹输入 ≠ AS3 写点」——补齐 7 类运行时内部状态写点
+      （阶段三百六十七）；复验（重新编译跑 `ASC_DIRTY_TRACE`）待窗口环境执行。
 - **验收**：
   - `temp/` 探针：`x` 连写两次 → 第二次（写时脏已置）当帧重烘，无静置 3 帧延迟（`ASC_BAKE_TRACE` 时间戳）。
   - 单件绘制斜率不再因「掉烘空转」而抖动（§6.14 的 hover 场景 A/B）。

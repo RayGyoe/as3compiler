@@ -19518,6 +19518,38 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
 （关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
+### 阶段三百六十七：RepaintBoundary 等价性验证 —— 补齐运行时内部状态漏写点（v0.4.329 → v0.4.330）
+
+**起点**：阶段三百六十六声称「写点已覆盖全部渲染输入」，但 TalkMED Meeting 真机跑 `ASC_DIRTY_TRACE=1` 暴露
+**大量 `DIRTY_MISS`**（指纹变而 `_render_dirty==0`）。根因：`as_render_fp` 的指纹输入不止「AS3 写点」，还包括
+**渲染引擎内部状态**——焦点、选择/caret、IME 组合、caret 闪烁（时间驱动）、SimpleButton hover、Stage3D、
+filter 字段。这些不是 AS3 字段写/accessor，不能靠 `emitAssign` 覆盖，必须在状态变化点显式标脏。
+
+**结论：等价性验证的价值正在于此**——它证明了「指纹输入 ≠ AS3 写点」，补齐后才具备切换资格。
+本轮把 7 类内部状态变化点全部标脏（caret 闪烁为时间驱动，用相位翻转检测而非写点）。
+
+**逐项**：
+1. **焦点切换**：`as_set_focus` 标脏 `old` + `obj`（指纹 fold `as_focus_obj == tf` 与 caret 相位）。
+2. **选择/caret 移动**：`as_tf_set_caret`/`as_tf_extend_caret`/`as_tf_select_all`/`as_tf_word_select`、
+   `Stage_dispatchMouse` 的 mousedown/mousemove/mouseup、`as_tf_edit_key` 的 Shift+Home/End 均标脏。
+3. **IME 组合**：`as_tf_set_comp` 设置/清空 `_comp` 时标脏。
+4. **caret 闪烁（时间驱动）**：新增 `as_tf_blink_prev`，`ASC_window_render` 在 `as_render_fp` 前检测相位翻转，
+   翻转即 `as_mark_dirty`（无写点，只能靠翻转检测）。
+5. **filter 字段**：`BitmapFilter` 加 `DisplayObject* _owner`（`DisplayObject_set_filters` 写回）；新增
+   `FILTER_CLASSES`，`emitAssign` 字段写尾识别 filter 字段 → 标脏 `_owner`。
+6. **Stage3D**：加 `Stage* _owner`（`Stage_get_stage3Ds` 写回）；`Stage3D_set_x/y/visible` 标脏 `_owner`。
+7. **SimpleButton hover**：加 `DisplayObject* _sbtn_prev`，`as_render_fp` 检测 `as_sbtn_state` 变化即标脏
+   （状态是读时计算，非写点）。
+
+**验收**：
+- 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
+- `unit: render/RepaintBoundary` 由 25 钉扩展到 **35 钉**（新增 7 类内部状态 + 等价性探针）。
+- 同步放宽 `text-input/Caret` 的 `as_tf_extend_caret` 正则（520→800 字符，函数体因标脏变长）。
+
+**如实报明**：仍是**并行阶段**，指纹兜底完整保留。`DIRTY_MISS` 探针已能打印 `cls/auto/cache/tx`；
+TalkMED 真机复验（重新编译跑 `ASC_DIRTY_TRACE`）待用户在有窗口环境执行，确认 7 类补齐后无剩余 `DIRTY_MISS`。
+阶段 B 切换与阶段 C 仍未开始。
+
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 
 **起点**：用户拿来一段 `bin-aot/TalkMED Meeting.c`（41.4 万行）的编译输出，问这些警告能不能修掉。

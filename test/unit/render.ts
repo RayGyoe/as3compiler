@@ -2652,6 +2652,39 @@ function checkRepaintBoundary(): string[] {
     && emitted.includes('getenv("ASC_DIRTY_TRACE")')
     && emitted.includes('DIRTY_MISS'));
 
+  // ---- Stage B write points: runtime internal state (焦点/IME/caret/hover) ----
+  check('focus change marks both ends render-dirty',
+    emitted.includes('static void as_set_focus(DisplayObject* obj) {')
+    && emitted.includes('as_mark_dirty(old);')
+    && emitted.includes('as_mark_dirty(obj);'));
+  check('IME composition changes mark the field dirty',
+    emitted.includes('static void as_tf_set_comp(TextField* tf, const char* text, int start, int length) {')
+    && emitted.includes('as_mark_dirty((DisplayObject*)tf);'));
+  check('caret/selection helpers mark the field dirty',
+    emitted.includes('static void as_tf_set_caret(TextField* tf, int pos) {')
+    && emitted.includes('static void as_tf_extend_caret(TextField* tf, int pos) {')
+    && emitted.includes('static void as_tf_select_all(TextField* tf) {')
+    && emitted.includes('static void as_tf_word_select(TextField* tf, int idx) {'));
+  check('caret-blink phase flip is detected and marks the focused field dirty',
+    emitted.includes('static int as_tf_blink_prev = -1;')
+    && emitted.includes('if (as_tf_blink_prev >= 0 && _kon != as_tf_blink_prev) as_mark_dirty((DisplayObject*)_btf);'));
+  check('BitmapFilter declares the _owner reverse edge',
+    symSource.includes("['_owner', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'BitmapFilter'"));
+  check('filter field writes mark the filter owner via FILTER_CLASSES',
+    emitSource.includes("private static readonly FILTER_CLASSES: ReadonlySet<string> = new Set(['BlurFilter', 'DropShadowFilter', 'GlowFilter'])")
+    && emitSource.includes('Emitter.FILTER_CLASSES.has(f.owner)')
+    && emitSource.includes('`(${recv})->_owner`'));
+  check('DisplayObject_set_filters wires each filter _owner',
+    emitted.includes('void DisplayObject_set_filters(void* _this, as_array* value) {')
+    && emitted.includes('((BitmapFilter*)_f)->_owner = o;'));
+  check('Stage3D declares the _owner reverse edge',
+    symSource.includes("['_owner', { type: { kind: 'object', className: 'Stage' }, init: null, visibility: 'private', owner: 'Stage3D'"));
+  check('Stage3D x/y/visible setters mark the owning stage',
+    emitted.includes('void Stage3D_set_x(void* _this, double value) { Stage3D* o = (Stage3D*)_this; o->x = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }'));
+  check('SimpleButton state flip is detected and marks the button dirty',
+    symSource.includes("['_sbtn_prev', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'SimpleButton'")
+    && emitted.includes('if (((SimpleButton*)o)->_sbtn_prev != st) { ((SimpleButton*)o)->_sbtn_prev = st; as_mark_dirty(o); }'));
+
   console.log(`[repaint] ${ok} repaint-boundary checks passed`);
   return bad;
 }
