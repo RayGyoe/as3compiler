@@ -29180,6 +29180,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
+    // ASC_DIRTY_TRACE diagnostic: dump the subtree of a cacheAsBitmap object that
+    // reported DIRTY_MISS, so the changing leaf (playing MovieClip / live BitmapData /
+    // blinking TextField) can be located. Depth/width-capped; only the first few
+    // explicit-cache misses dump, to avoid flooding the log.
+    this.line('static int as_dirty_dump_n = 0;');
+    this.line('static void as_dirty_dump(DisplayObject* o, int depth) {');
+    this.indent++;
+    this.line('if (o == NULL || depth > 6) return;');
+    this.line('int cur = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->currentFrame : -1;');
+    this.line('unsigned int pxv = (as_is(o, &Bitmap_vt) && ((Bitmap*)o)->bitmapData != NULL) ? ((Bitmap*)o)->bitmapData->_px_ver : 0u;');
+    this.line('fprintf(stderr, "  %*s%s cur=%d pxv=%u dirty=%d\\n", depth * 2, "", as_cls_of((void*)o), cur, pxv, o->_render_dirty);');
+    this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children != NULL) for (int i = 0; i < c->children->length && i < 12; i++) as_dirty_dump((DisplayObject*)as_v_obj_val(c->children->data[i]), depth + 1);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     // BitmapData → Bitmap reverse edges (docs/zh-cn/repaint-boundary.md §BitmapData).
     // The mark-sweep GC reclaims the Bitmap↔BitmapData cycle as a whole once the
     // display tree stops reaching it, and removeChild unbinds a removed Bitmap, so
@@ -29484,6 +29503,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('const char* dm_tx = (as_is(o, &TextField_vt) && ((TextField*)o)->text != NULL) ? ((TextField*)o)->text : "-";');
     this.line('fprintf(stderr, "DIRTY_MISS o=%p cls=%s auto=%d cache=%d tx=%s: fp changed but _render_dirty was 0\\n", (void*)o, as_cls_of((void*)o), o->_auto_baked, o->_cache_flag, dm_tx);');
+    this.line('if (o->_cache_flag && as_dirty_dump_n < 2) { as_dirty_dump_n++; as_dirty_dump(o, 0); }');
     this.indent--;
     this.line('}');
     this.line('o->_auto_baked = 0; o->_cache_valid = 0;');
