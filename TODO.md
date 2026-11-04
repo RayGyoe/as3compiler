@@ -19505,15 +19505,18 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 
 **验收**：
 - 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
-- `unit: render/RepaintBoundary` 由 11 钉扩展到 **24 钉**（新增 BitmapData 反边、Bitmap setter、容器解绑、
-  TextField/Stage 写点、mutator 统一走 `as_bd_mark_dirty`）。
+- `unit: render/RepaintBoundary` 由 11 钉扩展到 **25 钉**（新增 BitmapData 反边、Bitmap setter、容器解绑、
+  TextField/Stage 写点、mutator 统一走 `as_bd_mark_dirty`、等价性探针）。
 - `example: air-native`（`--air-app` + Skia 链接）编译链接通过。
 - 同步修正 4 个因实现变更而需跟进的钉（旧 `_px_ver++` 精确文本 → `as_bd_mark_dirty`）：`text-input/TextSelection`、
   `emit/BitmapLivePixels`、`emit/StageSizeFollowsScaleMode`、`fre/BitmapDataAcquire`。
+- **等价性探针**：新增 `ASC_DIRTY_TRACE` 环境变量 + `DIRTY_MISS` 探针（掉烘时若指纹变而 `_render_dirty==0` 则报），
+  `examples/autobake.as` / `examples/cacheasbitmap.as` 跑 `ASC_DIRTY_TRACE=1` 无 `DIRTY_MISS`。
 
 **如实报明**：仍是**并行阶段**，`as_render_fp` 每帧指纹掉烘完整保留，脏标记对行为仍是冗余影子路径。
-**尚未完成**：① 等价性验证（指纹变 ⇔ 脏标记置位的同真同假探针）未做；② 阶段 B 切换未做（关闭指纹掉烘、
-仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
+**尚未完成**：① 等价性验证的**完整真实场景**（`air-native`/TalkMED GUI 跑 `ASC_DIRTY_TRACE`）未做——探针已就位，
+但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
+（关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 

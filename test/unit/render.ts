@@ -2647,6 +2647,10 @@ function checkRepaintBoundary(): string[] {
     emitSource.includes("const stageRenderDirty = new Set(['color', 'align', 'scaleMode']);")
     && emitted.includes('void Stage_set_scaleMode(void* _this, char* value) {')
     && emitted.includes('as_mark_dirty((DisplayObject*)_this);'));
+  check('equivalence probe (ASC_DIRTY_TRACE) flags a fingerprint drop the dirty marker missed',
+    emitted.includes('static int ASC_dirty_trace = -1;')
+    && emitted.includes('getenv("ASC_DIRTY_TRACE")')
+    && emitted.includes('DIRTY_MISS'));
 
   console.log(`[repaint] ${ok} repaint-boundary checks passed`);
   return bad;

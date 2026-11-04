@@ -237,7 +237,9 @@ if (边界 && 命中快照) {
 - [x] `as_render_object` 缓存分支改为「脏则重烘、不脏则 blit」，去静置延迟（§4.4 阶段 B）。
       （当前与指纹掉烘并存：脏则清脏 + `_cache_valid=0` 当帧重烘，指纹兑底发现漏点。）
 - [~] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。
-- [ ] **并行验证**：脏标记与指纹同真同假（§4.5 迁移策略），全量 `node test.ts` 绿后才切换。
+- [~] **并行验证**：脏标记与指纹同真同假（§4.5 迁移策略），全量 `node test.ts` 绿后才切换。
+      探针已就位（`ASC_DIRTY_TRACE` + `DIRTY_MISS`：掉烘时指纹变而 `_render_dirty==0` 即报漏写点）；
+      `autobake.as`/`cacheasbitmap.as` 无 `DIRTY_MISS`；完整真实场景（air-native/TalkMED GUI）留待窗口环境跑。
 - **验收**：
   - `temp/` 探针：`x` 连写两次 → 第二次（写时脏已置）当帧重烘，无静置 3 帧延迟（`ASC_BAKE_TRACE` 时间戳）。
   - 单件绘制斜率不再因「掉烘空转」而抖动（§6.14 的 hover 场景 A/B）。

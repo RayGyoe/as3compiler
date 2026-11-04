@@ -265,8 +265,10 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
   the fingerprint fallback catches any missed write point.)
 - [~] `_render_dirty` reset (§4.4) — implemented as **clear-on-consume** (cleared right before the cache branch
   re-bakes), not a unified end-of-frame reset.
-- [ ] **Parallel verification**: dirty-marking ≡ fingerprint true-iff-true (§4.5); switch only after full
-  `node test.ts` green.
+- [~] **Parallel verification**: dirty-marking ≡ fingerprint true-iff-true (§4.5); switch only after full
+  `node test.ts` green. The probe is in place (`ASC_DIRTY_TRACE` + `DIRTY_MISS`: a fingerprint drop with
+  `_render_dirty==0` reports a missed write point); `autobake.as`/`cacheasbitmap.as` show no `DIRTY_MISS`;
+  the full real-world scene (air-native/TalkMED GUI) still needs a windowed Skia run.
 - **Acceptance**:
   - `temp/` probe: writing `x` twice → second write (dirty already set) re-bakes same frame, no 3-frame sit-still
     (via `ASC_BAKE_TRACE` timestamps).

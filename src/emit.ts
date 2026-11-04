@@ -28195,6 +28195,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static double as_bake_stat_max_w = 0.0, as_bake_stat_max_h = 0.0;');
     this.line('static void* as_bake_stat_max_o = NULL;');
     this.line('static int ASC_fp_trace = -1;');
+    this.line('static int ASC_dirty_trace = -1;');
     this.line('static void as_bake_stat_walk(DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL) return;');
@@ -29201,7 +29202,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('uint32_t h = 2166136261u;');
     this.line('if (o == NULL) return h;');
-    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; ASC_fp_trace = getenv("ASC_FP_TRACE") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
+    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; ASC_fp_trace = getenv("ASC_FP_TRACE") != NULL ? 1 : 0; ASC_dirty_trace = getenv("ASC_DIRTY_TRACE") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
     // MovieClip button states are settled HERE as well as in as_render_object, and
     // this pass is the one that matters when an ANCESTOR is auto-baked: a baked
     // ancestor paints its cached image and never walks its descendants, so the
@@ -29439,7 +29440,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     // meeting client, whose buttons/labels/thumbnails/rows all opt in through
     // `cacheAsBitmapAndMatrix()` and then change their text and bitmaps.
     this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
-    this.line('else { o->_auto_fp = h; o->_auto_still = 0; if (ASC_fp_trace > 0) o->_dbg_fp_changes++; if (o->_auto_baked || o->_cache_flag) { if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path); o->_auto_baked = 0; o->_cache_valid = 0; } }');
+    this.line('else {');
+    this.indent++;
+    this.line('o->_auto_fp = h; o->_auto_still = 0;');
+    this.line('if (ASC_fp_trace > 0) o->_dbg_fp_changes++;');
+    this.line('if (o->_auto_baked || o->_cache_flag) {');
+    this.indent++;
+    this.line('if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path);');
+    this.line('if (ASC_dirty_trace > 0 && o->_cache_valid && !o->_render_dirty) fprintf(stderr, "DIRTY_MISS o=%p: fingerprint changed but _render_dirty was 0 (missed write point)\\n", (void*)o);');
+    this.line('o->_auto_baked = 0; o->_cache_valid = 0;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES && !as_single_primitive(o)) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
