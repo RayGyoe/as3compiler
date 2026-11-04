@@ -29198,7 +29198,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int ply = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->_playing : 0;');
     this.line('unsigned int pxv = (as_is(o, &Bitmap_vt) && ((Bitmap*)o)->bitmapData != NULL) ? ((Bitmap*)o)->bitmapData->_px_ver : 0u;');
     this.line('int fcs = (as_is(o, &TextField_vt) && as_focus_obj == o) ? 1 : 0;');
+    this.line('if (as_is(o, &TextField_vt)) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)o;');
+    this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d txt=%p runs=%p fw=%.6g fh=%.6g as=%s\\n", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs, (void*)tf->text, (void*)tf->_runs, tf->_fieldWidth, tf->_fieldHeight, tf->autoSize != NULL ? tf->autoSize : "-");');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
     this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d\\n", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs);');
+    this.indent--;
+    this.line('}');
     this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
