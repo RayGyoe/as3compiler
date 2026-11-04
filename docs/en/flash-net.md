@@ -349,7 +349,8 @@ content via `progress`/`complete`, rather than `ioError`".
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **landed (stage eighty-nine / fifty-three)**: TCP base + complete `IDataInput`/`IDataOutput`; `SecureSocket` is API surface only + honest failure (`isSupported=false`, TLS state machine not done). Semantics in detail in §7 |
 | `FileReference`/`FileReferenceList`/`FileFilter` | ❌ |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌ (`NetStream` has only a dynamic `client` slot, see `symbols.ts:2451`) |
-| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion`/`Responder` | ❌ |
+| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **landed (stage 363)**: `findInterfaces()` really enumerates through `getifaddrs` (MAC / `active` / `mtu` / IPv4+IPv6 addresses with prefix lengths), with return-value and identity semantics aligned to adl 51.4.1 measurements; Windows and WASI still report the gap honestly and return an empty Vector. Contract and acceptance: §6.10 |
+| `Responder` | ❌ |
 | Static self-contained packaging (including the `vendor/` static library with curl) | ✅ **landed (stage eighty-nine / fifty-three)**: `vendor/curl` provides `libcurl.a`/`libnghttp2.a`/`libz.a`, and `otool -L` no longer shows `libcurl.4.dylib` (see §4.1) |
 | Proxy / cookie jar / HTTP-2 | ✅ **landed (stage eighty-nine / fifty-three)**: process-level `CURLSH` sharing cookies (`URLRequest.manageCookies`), two routes (environment variables and the **system proxy**), `ASC_HTTP2` opt-in (still defaults to 1.1, see §4.1) |
 | WASI preview2 `wasi:http` | ⚠️ not done (preview1 has no socket primitive; the honest `ioError` is the current terminal state, see §5-G) |
@@ -1465,6 +1466,79 @@ reaches those paths. On the real app the verification looked like this:
 `examples/sharedobject.as` pins the container shape into the regression set: it **hand-writes** a `.sol` in the
 byte format above and reads it back through `getLocal` (also pinning `00 BF` / `TCSO` / version 4 /
 `00 00 00 03` / the header name-length field), and asserts that `size` equals the actual file length.
+
+---
+
+### 6.10 `NetworkInfo.findInterfaces()` interface enumeration — **executed (stage 363)**
+
+#### 6.10.1 Why it had to be done: an **empty Vector is not a degradation, it is a different program**
+
+`talkmed-meeting-desktop`'s `ServerData.initDevicesUuid()` builds its device id from the first interface
+that reports a `hardwareAddress`:
+
+```as3
+var ifs:Vector.<NetworkInterface> = NetworkInfo.networkInfo.findInterfaces();
+for each (var ni:NetworkInterface in ifs) {
+  if (ni.active && ni.hardwareAddress != null && ni.hardwareAddress.length > 0) macAddress = ni.hardwareAddress;
+}
+if (macAddress.length == 0) deviceId = windowsOnlyPath();  // new File("C:/Windows/System32/cmd.exe")
+```
+
+This build used to make `findInterfaces()` a shell (one `not implemented` line on stderr plus an **empty
+Vector**), so:
+
+1. the Vector was empty ⇒ `macAddress` was empty ⇒ the **Windows-only branch** ran;
+2. on macOS `C:/Windows/...` is **not** an absolute path ⇒ assigning `File.nativePath` threw `ArgumentError #2004`;
+3. that code runs inside the **document class constructor**, before the first window exists ⇒ there is no
+   `as_frame_guard` to recover ⇒ `exit(1)`.
+
+The symptom is "compiles fine, the binary exits at startup, no window". The acceptance criterion is
+accordingly not "returns a Vector" but "returns the **real** interface list".
+
+#### 6.10.2 The measured adl 51.4.1 contract (`temp/netprobe/`, all first-hand)
+
+| Observation | adl result |
+|---|---|
+| `NetworkInfo.networkInfo` | a **singleton** (`===` is true); `new NetworkInfo()` throws `#2012` (no public constructor) |
+| `NetworkInfo` statics | `isSupported=true`, `permissionStatus="denied"` (macOS desktop), `disableNetworkChanges=false`; extends `EventDispatcher` |
+| each `findInterfaces()` call | a **new Vector with new objects** (`sameVec=false`, `sameIfaceObj=false`) |
+| `NetworkInterface` superclass | **`Object`** (not `EventDispatcher`) |
+| `NetworkInterface` members | exactly 8: `name`/`displayName`/`hardwareAddress`/`active`/`mtu`/`parent`/`addresses`/`subInterfaces`. **No** `subType`/`subTypeName`/`manufacturer` (reading one is `#1069`) |
+| a fresh `NetworkInterface` | `""`/`""`/`""`/`false`/**`-1`**/`null`/**`null`**/**`null`** — `addresses`/`subInterfaces` are **NULL**, not empty Vectors |
+| `InterfaceAddress` members/defaults | `address`/`broadcast`/`ipVersion`/`prefixLength`; fresh is `""`/`""`/`"IPv4"`/**`-1`** |
+| `IPVersion` | `IPV4="IPv4"`, `IPV6="IPv6"` |
+| `hardwareAddress` format | lowercase hex joined with `:`, **with one trailing space** (`"c2:15:48:c4:50:d4 "`, length 18); `""` when there is no link layer |
+| `active` | true only when the interface is UP **and** RUNNING **and** not loopback (`lo0` is `false`) |
+| `mtu` | from `SIOCGIFMTU` (`lo0` = 16384) |
+| IPv6 link-local | `fe80::/10` is **dropped**, so an interface that only has those (`utun*`, `awdl0`) does not appear at all |
+| ordering inside one interface | IPv4 addresses come **before** IPv6 |
+| repeated reads of `ni.addresses` | the **same** Vector for the same instance |
+
+The two easiest to get wrong: the **trailing space** (callers ship that string to a server as a device id,
+so "tidying it up" silently changes externally visible behaviour) and **`addresses` starting as null**
+(`if (ni.addresses)` can tell, an empty Vector lies).
+
+#### 6.10.3 Implementation contract
+
+| Layer | Where | What |
+|---|---|---|
+| platform seam (C) | `as_net_scan()` in `runtime.ts` | `getifaddrs` in two passes: count, then fill. One `as_net_row{name,mac,addr,bcast,prefix,v6,active,mtu}` per **address**, strings inlined (no GC). MAC via Apple `AF_LINK`/`sockaddr_dl`/`LLADDR` or Linux `AF_PACKET`/`sockaddr_ll`; `active`/`mtu` are collected **separately** from the MAC (an `AF_LINK`-only rule leaves every tunnel at `false`/`-1` forever) |
+| semantic layer (C) | `NetworkInfo_findInterfaces` in `emit.ts` | group the rows by name: `NetworkInterface_new()` + push on a name change, one `InterfaceAddress` per row pushed into `cur->addresses`. The row buffer is `malloc`/`free` — no GC garbage and no arena growth per call |
+| class shape | `symbols.ts` | `NetworkInterface extends Object` with the 8 members above; new `InterfaceAddress`; `NetworkInfo` gains `disableNetworkChanges` plus the static `isSupported`/`permissionStatus`; new `constClass('IPVersion')` |
+| fresh-object defaults | `SHELL_CTOR_EXTRA` in `emit.ts` | overwrite the shell's auto-filled empty Vectors: `addresses`/`subInterfaces` = `NULL`, `mtu=-1`; `InterfaceAddress` = `ipVersion="IPv4"`, `prefixLength=-1` |
+| other targets | the `#else` arm in the same file | Windows/WASI have **no** ifaddrs: `as_shell_unsupported` reports once and returns 0 (the honesty rule in §2) |
+
+Netmask trap: the prefix length cannot be read at a fixed offset. `m+4` yields 96 for `lo0`'s IPv6 netmask
+on macOS; take `sin_addr` / `sin6_addr` per `sa_family` and count the leading ones.
+
+#### 6.10.4 Acceptance
+
+| Acceptance | Method | Result |
+|---|---|---|
+| contract alignment | `examples/net-interfaces.as` runs the **same assertions** under AOT and under `mxmlc + adl` (the latter writes its verdict to `~/Documents/ni-adl.txt`) | `OK` on both |
+| value-by-value comparison | diff of `temp/netprobe/Cmp.as` output against the adl probe output | identical (including `hw.len=18`, `mtu=16384`, `prefix=128`, `subInterfaces=null`, `sameIfaceObj=false`) |
+| structural pins | `unit: platform/NetworkInventory`, 27 pins (generated C + `RUNTIME_PREAMBLE`) | all pass |
+| real app end to end | `bin-aot/build-aot.sh --run` (TalkMED Meeting, macOS) | login window appears normally; log reads `uuid mac == c2:15:48:c4:50:d4 `, request body `"uuid":"c2:15:48:c4:50:d4 "`; the `#2004` is gone |
 
 ---
 

@@ -359,6 +359,26 @@ const SHELL_CTOR_EXTRA = new Map<string, string[]>([
     'o->standardOutput = ByteArray_new();',
     'o->standardError = ByteArray_new();',
   ]],
+  // flash.net.NetworkInterface / InterfaceAddress report a FRESH object's exact
+  // state on adl 51.4.1 (temp/netprobe): empty strings, mtu -1, and addresses /
+  // subInterfaces NULL rather than the empty Vectors the shell auto-fill would
+  // install; an InterfaceAddress starts as IPv4 with prefixLength -1. These run
+  // after that auto-fill, so they overwrite it on purpose -- AIR does not hand
+  // out a populated interface until findInterfaces enumerates one.
+  ['NetworkInterface', [
+    'o->name = (char*)"";',
+    'o->displayName = (char*)"";',
+    'o->hardwareAddress = (char*)"";',
+    'o->mtu = -1;',
+    'o->addresses = NULL;',
+    'o->subInterfaces = NULL;',
+  ]],
+  ['InterfaceAddress', [
+    'o->address = (char*)"";',
+    'o->broadcast = (char*)"";',
+    'o->ipVersion = (char*)"IPv4";',
+    'o->prefixLength = -1;',
+  ]],
 ]);
 
 export class Emitter {
@@ -4339,9 +4359,11 @@ export class Emitter {
         this.line(`${name}* ${name}_new_default(void) { return ${name}_new(${defaults}); }`);
       }
       // Instance methods, then getters/setters, then the static side. Every one is
-      // a no-op returning the type's zero value.
+      // a no-op returning the type's zero value -- except the few that have a real
+      // backend (findInterfaces is the first: see emitNetworkInfoFindInterfaces).
       for (const [mname, m] of info.methods) {
         if (m.owner !== name) continue;
+        if (name === 'NetworkInfo' && mname === 'findInterfaces') { this.emitNetworkInfoFindInterfaces(); continue; }
         this.emitShellStub(`${name}_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, m.returnType, `${label}.${mname}`);
       }
       for (const [mname, m] of info.getters) {
@@ -4385,6 +4407,69 @@ export class Emitter {
       this.line('');
     }
     if (any) this.line('');
+  }
+
+  // flash.net.NetworkInfo.findInterfaces -- the ONE shell member with a real
+  // backend (阶段三百六十三). The platform walk lives in the runtime preamble
+  // (as_net_scan, src/runtime.ts), which answers plain C rows; this body only
+  // turns rows into the AS3 object graph. Everything it installs was measured on
+  // adl 51.4.1, not guessed (temp/netprobe/README.md):
+  //   * a NEW Vector and NEW NetworkInterface objects on every call (identity is
+  //     never shared between two calls), while the NetworkInfo receiver is the
+  //     documented singleton;
+  //   * one InterfaceAddress per address, with ipVersion "IPv4"/"IPv6",
+  //     prefixLength from the netmask and broadcast "" for anything that is not
+  //     an IPv4 broadcast;
+  //   * the SAME Vector on repeated reads of one interface's addresses field (the
+  //     field holds the vector; there is no per-read rebuild);
+  //   * hardwareAddress carries AIR's trailing space verbatim -- a caller that
+  //     stores it as a device id sends it to its server, so tidying it up here
+  //     would quietly change what the outside world sees.
+  // The rows are malloc'd scratch, freed before returning: no GC object and no
+  // arena growth per call, so a program that polls this on a timer does not leak.
+  private emitNetworkInfoFindInterfaces(): void {
+    this.line('as_vector_NetworkInterface* NetworkInfo_findInterfaces(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('as_vector_NetworkInterface* out = as_vector_NetworkInterface_new();');
+    this.line('int cap = as_net_scan(NULL, 0);');
+    this.line('if (cap <= 0) return out;');
+    this.line('as_net_row* rows = (as_net_row*)malloc((size_t)cap * sizeof(as_net_row));');
+    this.line('if (rows == NULL) return out;');
+    this.line('int n = as_net_scan(rows, cap);');
+    this.line('NetworkInterface* cur = NULL;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('if (cur == NULL || strcmp(cur->name, rows[i].name) != 0) {');
+    this.indent++;
+    this.line('cur = NetworkInterface_new();');
+    this.line('cur->name = as_str_dup(rows[i].name);');
+    this.line('cur->displayName = as_str_dup("");');
+    this.line('cur->hardwareAddress = as_str_dup(rows[i].mac);');
+    this.line('cur->active = rows[i].active != 0;');
+    this.line('cur->mtu = rows[i].mtu;');
+    this.line('cur->addresses = as_vector_InterfaceAddress_new();');
+    this.line('gc_write_barrier((void*)cur->name);');
+    this.line('gc_write_barrier((void*)cur->displayName);');
+    this.line('gc_write_barrier((void*)cur->hardwareAddress);');
+    this.line('as_vector_NetworkInterface_push(out, cur);');
+    this.indent--;
+    this.line('}');
+    this.line('InterfaceAddress* ia = InterfaceAddress_new();');
+    this.line('ia->address = as_str_dup(rows[i].addr);');
+    this.line('ia->broadcast = as_str_dup(rows[i].bcast);');
+    this.line('ia->prefixLength = rows[i].prefix;');
+    this.line('ia->ipVersion = as_str_dup(rows[i].v6 != 0 ? "IPv6" : "IPv4");');
+    this.line('gc_write_barrier((void*)ia->address);');
+    this.line('gc_write_barrier((void*)ia->broadcast);');
+    this.line('gc_write_barrier((void*)ia->ipVersion);');
+    this.line('as_vector_InterfaceAddress_push(cur->addresses, ia);');
+    this.indent--;
+    this.line('}');
+    this.line('free(rows);');
+    this.line('return out;');
+    this.indent--;
+    this.line('}');
   }
 
   // `class X extends Array` (stage 136) through a DYNAMIC receiver: an instance

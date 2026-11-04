@@ -311,7 +311,8 @@ AIR 默认设 `ACCEPT` 头为一串 MIME 列表（除非你在 `requestHeaders` 
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **已落地（阶段八十九·五十三）**：TCP 底座 + 完整 `IDataInput`/`IDataOutput`；`SecureSocket` 仅 API 面 + 诚实失败（`isSupported=false`，TLS 状态机未做）。语义详见 §7 |
 | `FileReference`/`FileReferenceList`/`FileFilter` | ❌ |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌（`NetStream` 仅有 dynamic `client` 槽，见 `symbols.ts:2451`） |
-| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion`/`Responder` | ❌ |
+| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **已落地（阶段三百六十三）**：`findInterfaces()` 走 `getifaddrs` 真枚举（MAC / `active` / `mtu` / IPv4+IPv6 地址与前缀长度），返回值与身份语义全部按 adl 51.4.1 实测对齐；Windows 与 WASI 仍是诚实报明 + 空 Vector。契约与验收见 §6.10 |
+| `Responder` | ❌ |
 | 静态自包含打包（含 curl 的 `vendor/` 静态库） | ✅ **已落地（阶段八十九·五十三）**：`vendor/curl` 提供 `libcurl.a`/`libnghttp2.a`/`libz.a`，`otool -L` 不再出现 `libcurl.4.dylib`（见 §4.1） |
 | 代理 / cookie jar / HTTP-2 | ✅ **已落地（阶段八十九·五十三）**：进程级 `CURLSH` 共享 cookie（`URLRequest.manageCookies`）、环境变量与**系统代理**两路、`ASC_HTTP2` opt-in（默认仍 1.1，见 §4.1） |
 | WASI preview2 `wasi:http` | ⚠️ 未做（preview1 无 socket 原语，诚实 `ioError` 是当前终态，见 §5-G） |
@@ -1287,6 +1288,76 @@ AOT 侧清单注入同一对 define，因此两端指向同一个 `.sol`：
 
 `examples/sharedobject.as` 把容器形状钉进回归：它按上述字节格式**手写**一个 `.sol` 再让 `getLocal` 读回
 （同时钉 `00 BF` / `TCSO` / 版本 4 / `00 00 00 03` / 头部名字长度字段），并断言 `size` 与实际文件长度相等。
+
+---
+
+### 6.10 `NetworkInfo.findInterfaces()` 的网卡枚举 —— **已执行（阶段三百六十三）**
+
+#### 6.10.1 为什么必须做：**空 Vector 不是"降级"，是另一个程序**
+
+`talkmed-meeting-desktop` 的 `ServerData.initDevicesUuid()` 用第一个带 `hardwareAddress` 的接口
+造设备 id：
+
+```as3
+var ifs:Vector.<NetworkInterface> = NetworkInfo.networkInfo.findInterfaces();
+for each (var ni:NetworkInterface in ifs) {
+  if (ni.active && ni.hardwareAddress != null && ni.hardwareAddress.length > 0) macAddress = ni.hardwareAddress;
+}
+if (macAddress.length == 0) deviceId = windowsOnlyPath();  // new File("C:/Windows/System32/cmd.exe")
+```
+
+本构建此前把 `findInterfaces()` 做成 shell（stderr 一行 `not implemented` + **空 Vector**），于是：
+
+1. 向量空 ⇒ `macAddress` 空 ⇒ 落进 **Windows 专用分支**；
+2. 在 macOS 上 `C:/Windows/...` **不是**绝对路径 ⇒ `File.nativePath` 赋值抛 `ArgumentError #2004`；
+3. 这段代码在**文档类构造函数**里跑，第一个窗口还没建 ⇒ 没有 `as_frame_guard` 可恢复 ⇒ `exit(1)`。
+
+现象就是「编译成功、二进制一启动就退出、没有窗口」。所以这一项的验收标准不是「返回一个 Vector」，
+而是「返回**真**的接口清单」。
+
+#### 6.10.2 adl 51.4.1 实测契约（`temp/netprobe/`，全部一手）
+
+| 观察 | adl 结果 |
+|---|---|
+| `NetworkInfo.networkInfo` | **单例**（`===` 为真）；`new NetworkInfo()` 抛 `#2012`（无公开构造器） |
+| `NetworkInfo` 静态 | `isSupported=true`、`permissionStatus="denied"`（macOS 桌面）、`disableNetworkChanges=false`；extends `EventDispatcher` |
+| 每次 `findInterfaces()` | **新 Vector + 新对象**（`sameVec=false`、`sameIfaceObj=false`） |
+| `NetworkInterface` 父类 | **`Object`**（不是 `EventDispatcher`） |
+| `NetworkInterface` 成员 | 恰 8 个：`name`/`displayName`/`hardwareAddress`/`active`/`mtu`/`parent`/`addresses`/`subInterfaces`。**没有** `subType`/`subTypeName`/`manufacturer`（读即 `#1069`） |
+| 新建 `NetworkInterface` 初值 | `""`/`""`/`""`/`false`/**`-1`**/`null`/**`null`**/**`null`** —— `addresses`/`subInterfaces` 是 **NULL**，不是空 Vector |
+| `InterfaceAddress` 成员/初值 | `address`/`broadcast`/`ipVersion`/`prefixLength`；新建为 `""`/`""`/`"IPv4"`/**`-1`** |
+| `IPVersion` | `IPV4="IPv4"`、`IPV6="IPv6"` |
+| `hardwareAddress` 格式 | 小写 hex 用 `:` 连接，**带一个尾随空格**（`"c2:15:48:c4:50:d4 "`，长度 18）；无链路层时是 `""` |
+| `active` | 仅接口 UP **且** RUNNING **且非** loopback 为真（`lo0` 是 `false`） |
+| `mtu` | 取自 `SIOCGIFMTU`（`lo0` = 16384） |
+| IPv6 link-local | **丢弃** `fe80::/10`；因此只剩 link-local 的接口（`utun*`、`awdl0`）整个不出现 |
+| 同一接口内顺序 | IPv4 地址在 IPv6 **之前** |
+| `ni.addresses` 重复读 | 同一实例返回**同一个** Vector |
+
+两条最容易踩的：**尾随空格**（调用方会把它当设备 id 发上服务器，"顺手 trim" 是静默改变外部可见行为）
+和 **`addresses` 初值是 null**（`if (ni.addresses)` 能区分，空 Vector 骗人）。
+
+#### 6.10.3 实现口径
+
+| 层 | 位置 | 做什么 |
+|---|---|---|
+| 平台 seam（C） | `runtime.ts` 的 `as_net_scan()` | `getifaddrs` 走两遍：先数、再填。每**地址**一行 `as_net_row{name,mac,addr,bcast,prefix,v6,active,mtu}`，字符串内联在结构里（不占 GC）。MAC 走 Apple `AF_LINK`/`sockaddr_dl`/`LLADDR`、Linux `AF_PACKET`/`sockaddr_ll`；`active`/`mtu` 与 MAC **分开收集**（只认 `AF_LINK` 的写法则会让没有链路层的隧道永远 `false`/`-1`） |
+| 语义层（C） | `emit.ts` 的 `NetworkInfo_findInterfaces` | 把行按名字分组：名字变就 `NetworkInterface_new()` + push，每行一个 `InterfaceAddress` push 进 `cur->addresses`。行缓冲 `malloc` / `free`，每次调用零 GC 垃圾堆积、零 arena 增长 |
+| 类形状 | `symbols.ts` | `NetworkInterface extends Object` + 上面 8 个成员；新增 `InterfaceAddress`；`NetworkInfo` 补 `disableNetworkChanges` 与静态 `isSupported`/`permissionStatus`；新增 `constClass('IPVersion')` |
+| 新对象初值 | `emit.ts` 的 `SHELL_CTOR_EXTRA` | 覆盖 shell 自动填的空 Vector：`addresses`/`subInterfaces` 置 `NULL`、`mtu=-1`；`InterfaceAddress` 置 `ipVersion="IPv4"`、`prefixLength=-1` |
+| 其它目标 | 同文件 `#else` 分支 | Windows/WASI **没有** ifaddrs：`as_shell_unsupported` 报明一次并返回 0（规矩见 §2 的「诚实报明」口径） |
+
+前缀长度的**坑**：netmask 不能按固定偏移取。`m+4` 在 macOS 上对 `lo0` 的 IPv6 netmask 会算成 96，
+必须按 `sa_family` 分别取 `sin_addr` / `sin6_addr` 再数前导 1。
+
+#### 6.10.4 验收
+
+| 验收 | 方法 | 结果 |
+|---|---|---|
+| 契约对齐 | `examples/net-interfaces.as` **同一份断言**同时跑 AOT 与 `mxmlc + adl`（后者把失败信息写进 `~/Documents/ni-adl.txt`） | 两边都 `OK` |
+| 逐值对照 | `temp/netprobe/Cmp.as` 的输出与 adl 探针输出逐行 diff | 完全相同（含 `hw.len=18`、`mtu=16384`、`prefix=128`、`subInterfaces=null`、`sameIfaceObj=false`） |
+| 结构钉子 | `unit: platform/NetworkInventory` 27 钉（生成 C + `RUNTIME_PREAMBLE`） | 全过 |
+| 真机端到端 | `bin-aot/build-aot.sh --run`（TalkMED Meeting，macOS） | 登录窗正常出现；日志 `uuid mac == c2:15:48:c4:50:d4 `，请求体 `"uuid":"c2:15:48:c4:50:d4 "`；`#2004` 消失 |
 
 ---
 

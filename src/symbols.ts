@@ -4138,6 +4138,9 @@ export class SymbolTable {
       OVERLAY: 'overlay', HARDLIGHT: 'hardlight', SHADER: 'shader',
     });
     constClass('StageQuality', { LOW: 'low', MEDIUM: 'medium', HIGH: 'high', BEST: 'best' });
+    // flash.net.IPVersion: the token class InterfaceAddress.ipVersion answers with
+    // ("IPv4"/"IPv6", measured on adl 51.4.1).
+    constClass('IPVersion', { IPV4: 'IPv4', IPV6: 'IPv6' });
 
     // ---- flash.data: local SQL database (phases A-D, docs/zh-cn/flash-data.md) --
     // The engine is the official SQLite amalgamation (AIR's PLAINTEXT databases ARE
@@ -5085,18 +5088,54 @@ export class SymbolTable {
       implements: [],
       fqn: 'flash.desktop::SystemTrayIcon',
     });
-    // flash.net.NetworkInterface / NetworkInfo: the interface inventory.
-    shell('NetworkInterface', 'flash.net::NetworkInterface', 'EventDispatcher',
+    // flash.net.NetworkInterface / NetworkInfo / InterfaceAddress: the interface
+    // inventory (阶段三百六十三). findInterfaces is REAL now (emitted in emit.ts on
+    // top of the runtime's as_net_scan); the rest of the surface is still a shell,
+    // but its SHAPE is AIR 51.4.1's, read off describeType rather than invented
+    // (temp/netprobe):
+    //   * NetworkInterface extends **Object**, not EventDispatcher (AIR's
+    //     describeType says base="Object" and lists no addEventListener), and its
+    //     eight members are name/displayName/hardwareAddress/active/mtu/parent/
+    //     addresses/subInterfaces. The older shell also declared
+    //     subType/subTypeName/manufacturer -- AIR 51.4.1 has none of the three
+    //     (reading one throws #1069) -- and typed addresses as Vector.<Object>
+    //     instead of Vector.<InterfaceAddress>. Both are fixed here.
+    //   * a FRESH NetworkInterface reports ""/""/""/false/**-1**/null/null/null:
+    //     mtu is -1, and addresses/subInterfaces are NULL rather than empty
+    //     Vectors (SHELL_CTOR_EXTRA in emit.ts installs exactly that).
+    //   * InterfaceAddress was missing from this build altogether. AIR has
+    //     address/broadcast/ipVersion/prefixLength, and a fresh instance reports
+    //     ""/""/"IPv4"/-1.
+    /* NetworkInfo is a singleton: AIR has no public constructor (new NetworkInfo()
+       is Error #2012), isSupported is TRUE and permissionStatus is "denied" on
+       macOS desktop -- both measured on adl 51.4.1, neither guessed. */
+    shell('NetworkInterface', 'flash.net::NetworkInterface', 'Object',
       [['name', { kind: 'string' }], ['displayName', { kind: 'string' }], ['hardwareAddress', { kind: 'string' }],
-       ['active', { kind: 'bool' }], ['mtu', { kind: 'int' }], ['manufacturer', { kind: 'string' }],
-       ['subType', { kind: 'string' }], ['subTypeName', { kind: 'string' }],
+       ['active', { kind: 'bool' }], ['mtu', { kind: 'int' }],
        ['parent', shObj('NetworkInterface')],
-       ['addresses', { kind: 'vector', elem: shObj('Object') }]],
+       ['addresses', { kind: 'vector', elem: shObj('InterfaceAddress') }],
+       ['subInterfaces', { kind: 'vector', elem: shObj('NetworkInterface') }]],
+      [], []);
+    shell('InterfaceAddress', 'flash.net::InterfaceAddress', 'Object',
+      [['address', { kind: 'string' }], ['broadcast', { kind: 'string' }],
+       ['ipVersion', { kind: 'string' }], ['prefixLength', { kind: 'int' }]],
       [], []);
     shell('NetworkInfo', 'flash.net::NetworkInfo', 'EventDispatcher',
-      [], [], [],
+      [['disableNetworkChanges', { kind: 'bool' }]], [], [],
       [['findInterfaces', { kind: 'vector', elem: shObj('NetworkInterface') }, []]],
       [], [['networkInfo', shObj('NetworkInfo')]]);
+    {
+      // isSupported/permissionStatus are read-only ACCESSORS in AIR, not constants;
+      // a static read-only field is the same observation for every caller (there is
+      // no setter to reject either way). Kind-of-platform: macOS desktop answers
+      // "denied" for the permission, which is AIR's own accounting and not a
+      // statement about this build.
+      const ni = this.classMap.get('NetworkInfo');
+      if (ni) {
+        ni.staticFields.set('isSupported', { type: { kind: 'bool' }, init: { kind: 'Bool', value: true }, visibility: 'public', owner: 'NetworkInfo', isStatic: true, isConst: true });
+        ni.staticFields.set('permissionStatus', { type: { kind: 'string' }, init: { kind: 'Str', value: 'denied' }, visibility: 'public', owner: 'NetworkInfo', isStatic: true, isConst: true });
+      }
+    }
     // flash.net.LocalConnection: AIR has no such transport (it is a Flash Player
     // feature used by libraries only as a GC/"am I local?" trick).
     shell('LocalConnection', 'flash.net::LocalConnection', 'EventDispatcher',
@@ -8455,6 +8494,8 @@ export class SymbolTable {
       NativeMenuItem: 'flash.display::NativeMenuItem',
       NetworkInterface: 'flash.net::NetworkInterface',
       NetworkInfo: 'flash.net::NetworkInfo',
+      InterfaceAddress: 'flash.net::InterfaceAddress',
+      IPVersion: 'flash.net::IPVersion',
       LocalConnection: 'flash.net::LocalConnection',
       Microphone: 'flash.media::Microphone',
       ClipboardFormats: 'flash.desktop::ClipboardFormats',

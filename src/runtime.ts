@@ -13018,6 +13018,223 @@ static void as_job_release(as_job* j) {
 #define ASC_SOCK_POSIX 1
 #endif
 
+// ---- flash.net.NetworkInfo.findInterfaces: the OS interface inventory ----
+//
+// Not a socket, but the same platform seam: the inventory of network interfaces
+// as AS3 sees it (NetworkInterface/InterfaceAddress). This one is load-bearing for
+// a real project rather than decoration: talkmed-meeting derives its device id
+// from the first interface with a hardwareAddress and falls through to a
+// Windows-only branch when the Vector is empty (src/cn/edoctor/net/ServerData.as,
+// initDevicesUuid). With the old stub answering an empty Vector that branch ran on
+// macOS and reached new File("C:/Windows/System32/cmd.exe"), which throws
+// ArgumentError #2004 -- in the document class constructor, before any window
+// exists, so the application printed one line and exited(1) at startup.
+//
+// Every rule below was read off adl 51.4.1 on macOS, not inferred (temp/netprobe):
+//
+//   * only interfaces that have at least one usable address are reported;
+//   * IPv6 LINK-LOCAL addresses (fe80::/10) are dropped, and an interface left
+//     with none (utunN, awdl0 here) does not appear at all;
+//   * within one interface the IPv4 addresses come before the IPv6 ones;
+//   * hardwareAddress is lowercase hex joined with ':' PLUS ONE TRAILING SPACE
+//     ("c2:15:48:c4:50:d4 ", 18 characters), or "" when the interface has no
+//     link-layer address (lo0). The trailing space is AIR's, and a caller that
+//     stores it as a device id sends it to its server, so it is reproduced
+//     verbatim rather than tidied up;
+//   * active is true only for an interface that is UP, RUNNING and NOT loopback
+//     (lo0 reports false although it is up and running);
+//   * mtu comes from SIOCGIFMTU (lo0 is 16384).
+//
+// Windows and the wasm targets have no inventory here: they report themselves
+// once and return an empty Vector instead of inventing interfaces.
+#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#if defined(__APPLE__)
+#include <net/if_dl.h>
+#else
+#include <netpacket/packet.h>
+#endif
+#define ASC_NET_IFADDRS 1
+#endif
+
+// One ADDRESS row. The strings are inline char arrays on purpose: the scan runs
+// outside the GC (it is called once per findInterfaces, not per frame), so it
+// owns no GC memory and leaks nothing into the arena; the generated code copies
+// each field into a GC string when it builds the AS3 objects.
+typedef struct as_net_row {
+    char name[32];
+    char mac[32];
+    char addr[64];
+    char bcast[64];
+    int prefix;
+    int v6;
+    int active;
+    int mtu;
+} as_net_row;
+
+#ifdef ASC_NET_IFADDRS
+// Count the leading one-bits of a netmask (NetworkInterface prefixLength).
+static int as_net_prefix_bits(const unsigned char* b, int n) {
+    int bits = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned v = b[i];
+        while (v) { bits += (int)(v & 1u); v >>= 1; }
+    }
+    return bits;
+}
+
+// "aa:bb:cc:dd:ee:ff " -- see the trailing space in the header comment.
+static void as_net_mac_str(char* out, const unsigned char* hw, int len) {
+    int p = 0;
+    out[0] = '\\0';
+    if (len <= 0) return;
+    for (int i = 0; i < len; i++) {
+        p += snprintf(out + p, 4, "%02x", hw[i]);
+        if (i + 1 < len) out[p++] = ':';
+    }
+    out[p++] = ' ';
+    out[p] = '\\0';
+}
+
+// The link-layer entry for one interface: address bytes, flags and MTU. macOS
+// carries it as AF_LINK (sockaddr_dl, which is where LLADDR lives); Linux uses
+// AF_PACKET (sockaddr_ll). Split because sockaddr_dl does not exist on Linux.
+static int as_net_link_info(struct ifaddrs* list, const char* name, char* mac, int macsz, int* active, int* mtu) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int have_flags = 0, have_mac = 0;
+    for (struct ifaddrs* p = list; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr == NULL || strcmp(p->ifa_name, name) != 0) continue;
+        // Flags and MTU belong to the INTERFACE, while the hardware address
+        // belongs to its link-layer entry, so they are collected separately: an
+        // interface with no AF_LINK/AF_PACKET row (a tunnel, say) still answers
+        // active/mtu instead of reporting false/-1 for its whole lifetime.
+        if (!have_flags) {
+            *active = ((p->ifa_flags & IFF_UP) && (p->ifa_flags & IFF_RUNNING) && !(p->ifa_flags & IFF_LOOPBACK)) ? 1 : 0;
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof ifr);
+            snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "%s", name);
+            if (sock >= 0 && ioctl(sock, SIOCGIFMTU, &ifr) == 0) *mtu = ifr.ifr_mtu;
+            have_flags = 1;
+        }
+        if (!have_mac) {
+#if defined(__APPLE__)
+            if (p->ifa_addr->sa_family == AF_LINK) {
+                struct sockaddr_dl* dl = (struct sockaddr_dl*)p->ifa_addr;
+                as_net_mac_str(mac, (const unsigned char*)LLADDR(dl), dl->sdl_alen);
+                have_mac = 1;
+            }
+#else
+            if (p->ifa_addr->sa_family == AF_PACKET) {
+                struct sockaddr_ll* ll = (struct sockaddr_ll*)p->ifa_addr;
+                as_net_mac_str(mac, ll->sll_addr, ll->sll_halen);
+                have_mac = 1;
+            }
+#endif
+        }
+        if (have_flags && have_mac) break;
+    }
+    if (sock >= 0) close(sock);
+    return 0;
+}
+
+// Fill up to cap rows (address-per-row, grouped per interface) and return the
+// TOTAL row count, which is what lets the caller size its buffer with a first
+// call of as_net_scan(NULL, 0). Rows are ordered: interface by first appearance,
+// and inside one interface IPv4 before IPv6.
+static int as_net_scan(as_net_row* out, int cap) {
+    struct ifaddrs* list = NULL;
+    if (getifaddrs(&list) != 0) return 0;
+    int total = 0;
+    for (struct ifaddrs* p = list; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr == NULL) continue;
+        int fam = p->ifa_addr->sa_family;
+        if (fam != AF_INET && fam != AF_INET6) continue;
+        if (fam == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&((struct sockaddr_in6*)p->ifa_addr)->sin6_addr)) continue;
+        total++;
+    }
+    if (total == 0) { freeifaddrs(list); return 0; }
+    // Address rows, then a scratch list of the names already emitted.
+    typedef struct { char name[32]; char addr[64]; char bcast[64]; int prefix; int v6; } as_net_arow;
+    as_net_arow* rows = (as_net_arow*)calloc((size_t)total, sizeof(as_net_arow));
+    char (*seen)[32] = (char (*)[32])calloc((size_t)total, 32);
+    if (rows == NULL || seen == NULL) { free(rows); free(seen); freeifaddrs(list); return 0; }
+    int nrows = 0, nseen = 0, n = 0;
+    for (struct ifaddrs* p = list; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr == NULL) continue;
+        int fam = p->ifa_addr->sa_family;
+        if (fam != AF_INET && fam != AF_INET6) continue;
+        if (fam == AF_INET6 && IN6_IS_ADDR_LINKLOCAL(&((struct sockaddr_in6*)p->ifa_addr)->sin6_addr)) continue;
+        as_net_arow* r = &rows[nrows++];
+        snprintf(r->name, sizeof r->name, "%s", p->ifa_name);
+        r->v6 = (fam == AF_INET6);
+        if (fam == AF_INET) {
+            struct sockaddr_in* sa = (struct sockaddr_in*)p->ifa_addr;
+            inet_ntop(AF_INET, &sa->sin_addr, r->addr, sizeof r->addr);
+            if ((p->ifa_flags & IFF_BROADCAST) && p->ifa_dstaddr != NULL && p->ifa_dstaddr->sa_family == AF_INET) {
+                struct sockaddr_in* bc = (struct sockaddr_in*)p->ifa_dstaddr;
+                inet_ntop(AF_INET, &bc->sin_addr, r->bcast, sizeof r->bcast);
+            }
+        } else {
+            struct sockaddr_in6* sa6 = (struct sockaddr_in6*)p->ifa_addr;
+            inet_ntop(AF_INET6, &sa6->sin6_addr, r->addr, sizeof r->addr);
+        }
+        if (p->ifa_netmask != NULL && p->ifa_netmask->sa_family == fam) {
+            if (fam == AF_INET) {
+                r->prefix = as_net_prefix_bits((const unsigned char*)&((struct sockaddr_in*)p->ifa_netmask)->sin_addr, 4);
+            } else {
+                r->prefix = as_net_prefix_bits((const unsigned char*)&((struct sockaddr_in6*)p->ifa_netmask)->sin6_addr, 16);
+            }
+        }
+    }
+    for (int i = 0; i < nrows; i++) {
+        int dup = 0;
+        for (int k = 0; k < nseen; k++) if (strcmp(seen[k], rows[i].name) == 0) { dup = 1; break; }
+        if (dup) continue;
+        snprintf(seen[nseen++], 32, "%s", rows[i].name);
+        char mac[32];
+        int active = 0, mtu = -1;
+        mac[0] = '\\0';
+        as_net_link_info(list, rows[i].name, mac, (int)sizeof mac, &active, &mtu);
+        for (int pass = 0; pass < 2; pass++) {
+            for (int j = 0; j < nrows; j++) {
+                if (strcmp(rows[j].name, rows[i].name) != 0) continue;
+                if ((pass == 0) != (rows[j].v6 == 0)) continue;
+                if (out != NULL && n < cap) {
+                    as_net_row* o = &out[n];
+                    snprintf(o->name, sizeof o->name, "%s", rows[j].name);
+                    snprintf(o->mac, sizeof o->mac, "%s", mac);
+                    snprintf(o->addr, sizeof o->addr, "%s", rows[j].addr);
+                    snprintf(o->bcast, sizeof o->bcast, "%s", rows[j].bcast);
+                    o->prefix = rows[j].prefix;
+                    o->v6 = rows[j].v6;
+                    o->active = active;
+                    o->mtu = mtu;
+                }
+                n++;
+            }
+        }
+    }
+    free(rows);
+    free(seen);
+    freeifaddrs(list);
+    return n;
+}
+#else
+// No interface inventory on this target. Reported once (the helper caps its own
+// output) so the empty Vector is never mistaken for "this machine has no
+// network": a program that checks NetworkInfo.isSupported still sees the gap.
+static int as_net_scan(as_net_row* out, int cap) {
+    (void)out;
+    (void)cap;
+    as_shell_unsupported("flash.net.NetworkInfo.findInterfaces (this target has no interface inventory; the Vector comes back empty)");
+    return 0;
+}
+#endif
+
 // Closing a raw descriptor is the ONE socket operation the platform-neutral part
 // of the state machine still needs: as_sock_drop_fd/as_sock_free run on every
 // target, including the ones with no backend, where fd is always -1. Wrapping it

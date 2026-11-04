@@ -19387,7 +19387,61 @@ Present。目标是在保持 60 FPS 与全部逻辑事件的前提下，降低�
 
 ---
 
+### 阶段三百六十三：`NetworkInfo.findInterfaces()` 真实网卡枚举 —— 「编译成功、启动即退出」（v0.4.325 → v0.4.326）
+
+**起点**：用户报「从 git 拉了代码、又合了 Windows 那边的更新之后，用 `bin-aot/build-aot.sh --run` 编出来的
+macOS 二进制一启动就没了 —— 打印几行、没有窗口、`EXIT=1`」。
+
+**症状**：`[as3-aot] not implemented by this build: flash.net.NetworkInfo.findInterfaces` → 几行正常启动日志 →
+`Uncaught exception: Error #2004: One of the parameters is invalid.` → 进程消失。
+
+**根因链（四步，每步都验过）**：
+1. `NetworkInfo`/`NetworkInterface` 在本构建里是 **shell 类**，`findInterfaces()` 生成的是
+   `as_shell_unsupported(...); return as_vector_NetworkInterface_new();` ⇒ **空 Vector**。
+2. `talkmed-meeting-desktop/src/cn/edoctor/net/ServerData.as` 的 `initDevicesUuid()` 从「`active` 且
+   `hardwareAddress` 非空」的接口取 MAC；空了就落进 **Windows 专用分支** `new File("C:/Windows/System32/cmd.exe")`。
+3. macOS 上 `C:/Windows/...` **不是**绝对路径 ⇒ `nativePath` 赋值抛 `ArgumentError #2004`。
+4. 这段代码在**文档类 Main 的构造函数**里跑，第一个窗口还没建 ⇒ 没有 `as_frame_guard` 可恢复 ⇒ `exit(1)`。
+
+复刻探针 `temp/netprobe/Scan.as`（就是那段代码）在修前输出**同一个 `#2004` 与 `EXIT=1`**，链子闭合。
+**要点**：空 Vector 不是「降级」—— 它把程序推到了另一条分支上，所以这是个**语义错误**，不是缺功能。
+
+**AIR 口径**（`adl 51.4.1` 一手实测，夹具 `temp/netprobe/`，索引见其 `README.md`）：`networkInfo` 是单例、
+`new NetworkInfo()` 抛 `#2012`；每次 `findInterfaces()` 返回**新 Vector + 新对象**；`NetworkInterface` 继承
+**`Object`** 且**只有 8 个成员**（`subType`/`subTypeName`/`manufacturer` 不存在，读即 `#1069`——旧 shell 的
+虚构）；新建对象 `""`/`""`/`""`/`false`/**`-1`**/`null`/**`null`**/**`null`**；`hardwareAddress` 小写 hex
+`:` 连接**带一个尾随空格**（长度 18）；`active` = UP ∧ RUNNING ∧ ¬loopback；`mtu` 来自 `SIOCGIFMTU`；
+IPv6 **link-local 丢弃**（只剩它的接口整个不出现）；同接口内 v4 先于 v6。
+
+**落地**（三层）：
+- **平台 seam**（`src/runtime.ts`，`as_net_scan`）：`getifaddrs` 两遍（先数再填），每**地址**一行
+  `as_net_row{name,mac,addr,bcast,prefix,v6,active,mtu}`，字符串内联不占 GC；MAC 走 Apple
+  `AF_LINK`/`sockaddr_dl`/`LLADDR` 与 Linux `AF_PACKET`/`sockaddr_ll`；`active`/`mtu` 与 MAC **分开收集**
+  （只认链路层的写法会让没有链路层的隧道永远 `false`/`-1`）；netmask 前缀**按 `sa_family` 分别取**
+  （固定偏移 `m+4` 在 macOS 上会给 `lo0` 的 v6 netmask 算出 96）。臂限定 POSIX，Windows/WASI 走
+  `as_shell_unsupported` 报明 + 空 Vector。
+- **语义层**（`src/emit.ts`，`NetworkInfo_findInterfaces`）：按接口名分组，名字变就 `NetworkInterface_new()`
+  + push，每行一个 `InterfaceAddress` push 进 `cur->addresses`；行缓冲 `malloc`/`free`（轮询不堆积 GC、不涨 arena）；
+  六处 GC 指针都补写屏障。
+- **类形状**（`src/symbols.ts`）：`NetworkInterface extends Object` + 上述 8 成员；新增 `InterfaceAddress`；
+  `NetworkInfo` 补 `disableNetworkChanges` 与静态 `isSupported`/`permissionStatus`；新增 `constClass('IPVersion')`。
+  `SHELL_CTOR_EXTRA` 补两类的**新对象初值**（覆盖 shell 自动填的空 Vector）。
+
+**验收**：
+- **同一份断言双端**：`examples/net-interfaces.as` 在 AOT 与 `mxmlc + adl` 上都通过（后者把结论写进
+  `~/Documents/ni-adl.txt`，读数为 `OK`）。
+- **逐值对照**：`temp/netprobe/Cmp.as` 的 stdout 与 adl 探针 `~/Documents/netprobe-adl.txt` **逐行相同**
+  （含 `hw.len=18`、`mtu=16384`、`prefix=128`、`subInterfaces=null`、`sameIfaceObj=false`）。
+- **结构钉子**：`unit: platform/NetworkInventory` **27 钉**（生成 C + `RUNTIME_PREAMBLE`）。
+- **真机端到端**：`bin-aot/build-aot.sh --run` 编出 22MB 二进制，登录窗正常出现；日志 `uuid mac ==
+  c2:15:48:c4:50:d4 `、请求体 `"uuid":"c2:15:48:c4:50:d4 "`，`#2004` 消失、无 Uncaught。
+
+**如实报明**：Windows/WASI 仍是报明 + 空 Vector（没有 `getifaddrs`，且 Windows 分支本身是应用里的合法路径）；
+`displayName`/`parent`/`subInterfaces` 恒为空/`null`（`adl` 在本机两个接口上也是这个读数，但未穷举所有接口类型，
+故不宣称「永远如此」）。
+
 ### 遗留待开发
+> **2026-11-04 追加（阶段三百六十三：`NetworkInfo.findInterfaces()` 真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。这一项此前登记在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) 的「真能力缺口」表里（不在本表），本阶段把它做成真实枚举后，那张表从 8 行降到 6 行。按 §1.5 它本来是「`adl` 跑得对、我们跑不出」的**遗留缺陷**，且同阶段修净 ⇒ 不入表。**教训值得单独记一笔**：空 Vector 不会让任何断言变红（shell 只打一行 `not implemented`），但应用会因此在 `if (mac.length == 0)` 处**换一条执行路径**，于是在没有窗口、没有帧守卫的构造函数里撞成 `exit(1)`——「编译成功、启动即死」这类反馈，第一件事是看**日志里最后一条 `not implemented`** 有没有被当成控制流输入。
 > **2026-11-03 追加（阶段三百六十一：`draw()` 忽略被画对象自己的 `visible`/`alpha`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑不出画面的一条实错（「高级礼物」不报错也不出图），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**口径提醒**：这类缺陷**任何断言都不会红**——它不抛异常、不打日志，示例套件里也没有程序会把「自己设为 invisible 再 draw 自己」当作正常用法；它是靠「用户说动画没出来」反推出来、再用同源探针量出来的。今后凡是「应用层看不见结果但没有报错」的反馈，第一件事就是把该路径的每个渲染/读取原语拿 adl 逐项对照，而不是继续查应用代码。
 > **2026-11-03 追加（记账勘误；不占阶段号、不升版本号）**：两件事都是**记录与事实不符**，不动一行代码。
 > ① **主表最后一行**（`scrollRect` 窗口边与内容边重合时的覆盖率组合口径）状态由 `未开始` 改为 **`部分完成`**——

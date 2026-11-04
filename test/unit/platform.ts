@@ -3165,3 +3165,147 @@ function checkWebResizeSeam(): string[] {
 }
 
 registerGroup('unit: platform/WebResizeSeam', checkWebResizeSeam);
+
+// ---- flash.net.NetworkInfo.findInterfaces: the OS interface inventory ----
+//
+// 阶段三百六十三. The TalkMED desktop client builds its device id from the first
+// interface that reports a hardwareAddress and, when the Vector is empty, falls
+// into a Windows-only branch that does `new File("C:/Windows/System32/cmd.exe")`.
+// While this class was a shell (empty Vector + one "not implemented" line on
+// stderr), that branch ran on macOS, the non-absolute nativePath threw
+// ArgumentError #2004 inside the document class constructor -- before any window
+// existed, so there was no frame guard to recover -- and the app exited(1) at
+// startup. The Vector is therefore not a nice-to-have: an EMPTY one is a
+// different program, not a degraded one.
+//
+// The shape below is measured on adl 51.4.1 (temp/netprobe/README.md), and three
+// of the measurements contradicted the shell that was here:
+//   * NetworkInterface extends Object (not EventDispatcher) and has exactly eight
+//     members -- subType / subTypeName / manufacturer do not exist (reading one is
+//     #1069), so a program that used them was being kept quiet by a fiction;
+//   * addresses / subInterfaces start as NULL, not as empty Vectors: null and [] are
+//     distinguishable to `if (ni.addresses)`, and the shell guessed wrong;
+//   * hardwareAddress comes back as lowercase hex joined by ':' WITH ONE TRAILING
+//     SPACE ("c2:15:48:c4:50:d4 ", length 18). Callers ship that string to a server
+//     as a device id, so trimming it would silently change what the outside world
+//     sees -- hence the string is copied from the platform row verbatim.
+function checkNetworkInventory(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [netif] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [netif] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.net.NetworkInfo;\n' +
+    'import flash.net.NetworkInterface;\n' +
+    'import flash.net.InterfaceAddress;\n' +
+    'import flash.net.IPVersion;\n' +
+    'var v:Vector.<NetworkInterface> = NetworkInfo.networkInfo.findInterfaces();\n' +
+    'var i:NetworkInterface = v[0];\n' +
+    'var p:NetworkInterface = i.parent;\n' +
+    'var s:Vector.<NetworkInterface> = i.subInterfaces;\n' +
+    'var a:Vector.<InterfaceAddress> = i.addresses;\n' +
+    'var q:int = i.mtu;\n' +
+    'var ia:InterfaceAddress = a[0];\n' +
+    'var ip:String = ia.ipVersion;\n' +
+    'var pre:int = ia.prefixLength;\n' +
+    'var iv:String = IPVersion.IPV6;\n'
+  )).c;
+  const preamble = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+
+  // (1) The method has a body of its own -- and no unsupported-report left behind.
+  const start = c.indexOf('as_vector_NetworkInterface* NetworkInfo_findInterfaces(void* _this) {');
+  check('findInterfaces is implemented, not an unsupported shell stub', start >= 0);
+  const body = start >= 0 ? c.slice(start, c.indexOf('\n}', start)) : '';
+  check('...and nothing still announces it as missing', !c.includes('"flash.net.NetworkInfo.findInterfaces"'));
+
+  // (2) Two passes over the platform seam: count, then fill. The count is what
+  // makes the malloc exact, so a machine that gains an interface between the two
+  // calls loses rows instead of overrunning the buffer.
+  check('the platform seam is called twice (size, then fill)',
+    /\bint cap = as_net_scan\(NULL, 0\);/.test(body) && /as_net_scan\(rows, cap\)/.test(body));
+  check('...and the scratch rows are freed before returning, so polling does not leak',
+    body.includes('malloc(') && body.includes('free(rows);') && body.lastIndexOf('free(rows);') < body.lastIndexOf('return out;'));
+
+  // (3) One interface object per interface, one address object per row: the
+  // interface is created on a name change and pushed once, and every row lands in
+  // that interface's addresses Vector.
+  check('interfaces are grouped by name, one object per interface',
+    /if \(cur == NULL \|\| strcmp\(cur->name, rows\[i\]\.name\) != 0\) \{/.test(body)
+    && body.includes('as_vector_NetworkInterface_push(out, cur);'));
+  check('every row becomes an InterfaceAddress in that interface\'s Vector',
+    body.includes('as_vector_InterfaceAddress_push(cur->addresses, ia);')
+    && body.includes('as_vector_InterfaceAddress_new()'));
+
+  // (4) Every installed GC pointer is write-barriered -- otherwise an incremental
+  // mark that started before this call never sees the new strings.
+  const barriers = ['cur->name', 'cur->displayName', 'cur->hardwareAddress', 'ia->address', 'ia->broadcast', 'ia->ipVersion'];
+  check('all six installed strings are write-barriered',
+    barriers.every((p) => body.includes(`gc_write_barrier((void*)${p});`)));
+
+  // (5) Values come from the row, not from a guess: the MAC string is copied
+  // verbatim (trailing space intact) and ipVersion picks the IPVersion constant.
+  check('hardwareAddress is copied from the platform row verbatim',
+    body.includes('cur->hardwareAddress = as_str_dup(rows[i].mac);'));
+  check('ipVersion is one of the two IPVersion constants',
+    /rows\[i\]\.v6 != 0 \? "IPv6" : "IPv4"/.test(body));
+
+  // (6) The declared shape matches AIR: extends Object, eight members, addresses
+  // typed to the address class. The struct body is sliced so a `subType`
+  // elsewhere in 40k lines of built-ins cannot mask a regression here.
+  const st = c.indexOf('struct NetworkInterface {');
+  const struct = st >= 0 ? c.slice(st, c.indexOf('};', st)) : '';
+  check('NetworkInterface extends Object, as measured (not EventDispatcher)',
+    /static NetworkInterface_vtable NetworkInterface_vt = \{ "NetworkInterface", &Object_vt,/.test(c));
+  check('...with the eight AIR members and nothing invented',
+    struct.includes('NetworkInterface* parent;')
+    && struct.includes('as_vector_InterfaceAddress* addresses;')
+    && struct.includes('as_vector_NetworkInterface* subInterfaces;')
+    && !/subType|manufacturer/.test(struct));
+  check('InterfaceAddress carries address / broadcast / ipVersion / prefixLength',
+    c.includes('struct InterfaceAddress {')
+    && c.includes('char* ipVersion;') && c.includes('int prefixLength;'));
+  check('NetworkInfo keeps the EventDispatcher base AIR gives it', /static NetworkInfo_vtable NetworkInfo_vt = \{ "NetworkInfo", &EventDispatcher_vt,/.test(c));
+  check('...and its static contract (isSupported true, permissionStatus denied)', c.includes('NetworkInfo_isSupported = true')
+    && /NetworkInfo_permissionStatus = "denied"/.test(c));
+
+  // (7) A fresh object's defaults are the measured ones, and they OVERWRITE the
+  // shell auto-fill (null, not an empty Vector; mtu -1, not 0).
+  const niCtor = c.slice(c.indexOf('static void NetworkInterface_ctor(NetworkInterface* o) {'));
+  const niCtorBody = niCtor.slice(0, niCtor.indexOf('\n}'));
+  check('a fresh NetworkInterface reports mtu -1', niCtorBody.includes('o->mtu = -1;'));
+  check('...and NULL addresses / subInterfaces, overwriting the auto-filled Vectors',
+    niCtorBody.includes('o->addresses = NULL;') && niCtorBody.includes('o->subInterfaces = NULL;')
+    && niCtorBody.indexOf('o->addresses = NULL;') > niCtorBody.indexOf('o->addresses = as_vector_InterfaceAddress_new();'));
+  const iaCtor = c.slice(c.indexOf('static void InterfaceAddress_ctor(InterfaceAddress* o) {'));
+  const iaCtorBody = iaCtor.slice(0, iaCtor.indexOf('\n}'));
+  check('a fresh InterfaceAddress starts as IPv4 with prefixLength -1',
+    /o->ipVersion = \(char\*\)"IPv4";/.test(iaCtorBody) && iaCtorBody.includes('o->prefixLength = -1;'));
+  check('IPVersion exposes AIR\'s two constants', preamble.length > 0 && c.includes('IPVersion_IPV4 = "IPv4"') && c.includes('IPVersion_IPV6 = "IPv6"'));
+
+  // (8) The platform walk itself. These are the four things a naive getifaddrs
+  // implementation gets wrong on macOS, each pinned to the line that handles it.
+  check('the walk is getifaddrs', preamble.includes('if (getifaddrs(&list) != 0) return 0;'));
+  check('IPv6 link-local addresses are dropped (an interface with only those disappears)',
+    (preamble.match(/IN6_IS_ADDR_LINKLOCAL/g) || []).length >= 2);
+  check('the MAC string gets AIR\'s trailing space', preamble.includes("out[p++] = ' ';"));
+  check('active = UP && RUNNING && !LOOPBACK, exactly AIR\'s rule',
+    preamble.includes('*active = ((p->ifa_flags & IFF_UP) && (p->ifa_flags & IFF_RUNNING) && !(p->ifa_flags & IFF_LOOPBACK)) ? 1 : 0;'));
+  check('mtu comes from SIOCGIFMTU', preamble.includes('ioctl(sock, SIOCGIFMTU, &ifr)'));
+  check('flags/mtu and the MAC are collected separately, so a link-less tunnel still answers them',
+    preamble.includes('if (!have_flags) {') && preamble.includes('if (!have_mac) {'));
+  check('the netmask prefix is read per address family (a fixed offset gives 96 on lo0)',
+    preamble.includes('((struct sockaddr_in*)p->ifa_netmask)->sin_addr')
+    && preamble.includes('((struct sockaddr_in6*)p->ifa_netmask)->sin6_addr'));
+  check('a target with no inventory reports the gap instead of pretending to be offline',
+    /as_shell_unsupported\("flash\.net\.NetworkInfo\.findInterfaces \(this target has no interface inventory/.test(preamble));
+  check('the arm is POSIX-only, so wasm/win32 keep the honest fallback',
+    preamble.includes('#define ASC_NET_IFADDRS 1') && /#if !defined\(__wasi__\) && !defined\(__EMSCRIPTEN__\)/.test(preamble));
+
+  console.log(`     [netif] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/NetworkInventory', checkNetworkInventory);

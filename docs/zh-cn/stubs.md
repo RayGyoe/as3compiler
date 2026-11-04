@@ -58,7 +58,11 @@
 > `NativeWindowBoundsEvent` / `NativeWindowDisplayStateEvent` 属「模型类真被窗口后端使用」，
 > 登记在 shell 列表里只是因为它们的成员集合由 shell 生成；这两个类是**能用的**。
 
-### 2.2 真能力缺口（8 个）
+### 2.2 真能力缺口（6 个）
+
+> 阶段三百六十三之前这里还有 `NetworkInfo` / `NetworkInterface` 两行。它们已经不是缺口了：
+> `findInterfaces()` 现在真的走 `getifaddrs` 枚举网卡，`NetworkInterface` / `InterfaceAddress`
+> 随之变成真实数据类（字段集合也按 adl 实测改对了）。契约与验收见 `flash-net.md` §6.10。
 
 | 类 | 包 | 应用引用 | 现在调用会发生什么（实测） | 真实现需要 |
 |---|---|---|---|---|
@@ -66,8 +70,6 @@
 | `NativeProcessStartupInfo` | `flash.desktop` | 13 | 7 个字段真赋值；`arguments` 空 Vector、`executable=null` | 无（数据类，配合上一行） |
 | `StageWebView` | `flash.media` | 3 | `isSupported=false`；实例可建，`location`/`title`/`viewPort` 全 `null`，`loadURL()` 报明 | 内嵌浏览器（WebView2 / WKWebView） |
 | `NativeDragManager` | `flash.desktop` | 1 | `isSupported=false`、`dropAction=null`（报明）；`doDrag`/`acceptDragDrop` 空转 | OS 拖放源 + 拖放目标注册 |
-| `NetworkInterface` | `flash.net` | 3 | 10 个字段真赋值（若有实例） | 网卡枚举 |
-| `NetworkInfo` | `flash.net` | 3 | `findInterfaces()` 报明并返回**空 Vector** | 同上 |
 | `Microphone` | `flash.media` | 4 | `isSupported=false`、`names` 空数组（报明）、`getMicrophone()` 返回 `null`（报明） | 音频采集 |
 | `LocalConnection` | `flash.net` | 4 | `isSupported=false`；`send`/`connect`/`close` 空转 | AIR 本身**没有**这个传输（Flash Player 特性），库只拿它当「我是不是在本地」的探针 ⇒ 保持空壳是**正确**答案 |
 
