@@ -390,6 +390,17 @@ export class Emitter {
   private static readonly STATIC_ONLY_CLASSES = new Set([
     'System', 'Capabilities', 'Math', 'JSON', 'int', 'uint',
   ]);
+  // DisplayObject instance fields whose WRITE is a render input (RepaintBoundary
+  // stage B, docs/zh-cn/repaint-boundary.md): assigning one marks the object dirty
+  // so an enclosing cacheAsBitmap boundary re-bakes this frame instead of waiting
+  // for the per-frame fingerprint. These nine are plain fields (not accessors), so
+  // they reach emitAssign's direct field-write tail; the rest of the input set
+  // (Graphics/MovieClip/Bitmap/TextField/mask/scrollRect/filters/transform) still
+  // falls back to the fingerprint until their write points get markers too.
+  private static readonly DO_RENDER_DIRTY_FIELDS = new Set([
+    'x', 'y', 'rotation', 'scaleX', 'scaleY',
+    'alpha', 'visible', 'blendMode', 'opaqueBackground',
+  ]);
   // The CORE language classes used as Class VALUES. None of these has a ClassInfo
   // (they are C primitives or runtime structs, and `Array`/`String`/... resolve to
   // their C type in type position), so `var c:Class = int` / `return String` /
@@ -490,6 +501,12 @@ export class Emitter {
   // paths clear it before emitting the target and consume it immediately after,
   // so a stale value from an unrelated member read can never leak into a write.
   private lastDoNameTarget = false;
+  // RepaintBoundary stage B: when emitExpr resolves a Member/Var target to one of
+  // DisplayObject's render-input fields (DO_RENDER_DIRTY_FIELDS), this records the
+  // RECEIVER code so emitAssign can append an as_mark_dirty after the store. Set on
+  // the read paths and consumed (then cleared) by the direct field-write tail, the
+  // same lifetime contract as lastDoNameTarget.
+  private lastDoDirtyRecv: string | null = null;
   private anonFuncs: { name: string; asName: string | null; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[]; cname: string | null; isStatic: boolean; depth: number; methodName: string | null }[] = [];
   // Free-variable pre-pass: the stack of `with` bodies currently being walked, by
   // the receiver's static type (the capture's env field type). An entry's INDEX is
@@ -1977,6 +1994,11 @@ export class Emitter {
           this.line('int _auto_still;');
           this.line('int _auto_baked;');
            this.line('int _dbg_fp_changes;');
+          // Write-time dirty flag (RepaintBoundary stage B, docs/zh-cn/repaint-boundary.md):
+          // set by every write to a render input, bubbled up to the nearest
+          // cacheAsBitmap boundary. Consumed by as_render_object's cache branch.
+          // C-runtime only (not AS3-visible); a plain int, so no GC write barrier.
+          this.line('int _render_dirty;');
           // The clipDepth stencil needs no field here: the masked object points at
           // the mask SIBLING through `_clip_src` (declared in the DisplayObject
           // symbol table, so the GC marks it) and the path is rebuilt per frame.
@@ -3021,6 +3043,13 @@ export class Emitter {
   // against `TouchPhase_BEGAN`, or read a static const — all of which need a
   // declaration to precede the closure body.
   private emitForwardDecls(): void {
+    // RepaintBoundary helpers (docs/zh-cn/repaint-boundary.md): declared here, in
+    // the very first forward-decl pass, because field-write points in USER code
+    // (both emitFunctionValues closure bodies and emitDefinitions method bodies)
+    // call as_mark_dirty long before the render preamble defines it. This one
+    // declaration is the single source; the render preamble only defines them.
+    this.line('static int as_is_boundary(DisplayObject* o);');
+    this.line('static void as_mark_dirty(DisplayObject* o);');
     // The Function-value #1063 helper is defined with the class registry, which is
     // emitted AFTER every calling thunk that raises it, so it is declared here.
     this.line('static void as_fn_arity_error(const char* qname, int expected, int argc);');
@@ -12878,6 +12907,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_auto_fp = 0;');
     this.line('o->_auto_still = 0;');
     this.line('o->_auto_baked = 0;');
+    this.line('o->_render_dirty = 0;');
     this.line('o->_clip_src = NULL;');
     this.line('o->_s9_on = 0;');
     this.line('o->_s9_apply = 0;');
@@ -29011,6 +29041,25 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static DisplayObject* as_fp_mask_stack[32];');
     this.line('static int as_fp_mask_depth = 0;');
     this.line('static int as_single_primitive(DisplayObject* o);');
+    // RepaintBoundary (docs/zh-cn/repaint-boundary.md): a cacheAsBitmap object is a
+    // repaint boundary -- the subtree bakes into a standalone bitmap and the parent
+    // only blits it, so invalidation stops here. Stage B keeps the existing
+    // fingerprint path in parallel; this predicate is consumed once the cache branch
+    // reads _render_dirty.
+    this.line('static int as_is_boundary(DisplayObject* o) { return o != NULL && o->_cache_flag; }');
+    // Write-time invalidation: mark o and every ancestor up to the nearest
+    // cacheAsBitmap boundary dirty. O(depth) on write, O(1) to test at render time.
+    this.line('static void as_mark_dirty(DisplayObject* o) {');
+    this.indent++;
+    this.line('while (o != NULL) {');
+    this.indent++;
+    this.line('o->_render_dirty = 1;');
+    this.line('if (o->_cache_flag) break;');
+    this.line('o = (DisplayObject*)o->parent;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     // Environment probes hoisted out of the per-object loops. getenv() is a linear
     // scan of the whole environment block, and both of these gate a decision that
     // runs once per object per frame -- measured on output/perf/chat, 192 image
@@ -29716,6 +29765,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     // live instead (阶段一百三十五).
     this.line('} else if ((o->_cache_flag || o->_auto_baked) && !(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)) {');
     this.indent++;
+    // RepaintBoundary stage B: a write-time dirty flag re-bakes this frame (no
+    // ASC_AUTO_BAKE_FRAMES settle delay). The fingerprint path in as_render_fp is
+    // kept as a fallback, so a write point the marker does not yet cover still
+    // invalidates through the fingerprint (slower, never freezes). Consumed here.
+    this.line('if (o->_render_dirty) { o->_render_dirty = 0; o->_cache_valid = 0; }');
     this.line('as_render_cached(canvas, o);');
     this.indent--;
     this.line('} else if (o->filters != NULL && o->filters->length > 0) {');
@@ -36272,6 +36326,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         // Unqualified `name = null` inside a DisplayObject subclass is the same
         // property (AIR throws #2007 there too), so record it for the guard.
         if (f.owner === 'DisplayObject' && name === 'name') this.lastDoNameTarget = true;
+        if (f.owner === 'DisplayObject' && Emitter.DO_RENDER_DIRTY_FIELDS.has(name)) this.lastDoDirtyRecv = self;
         return { code: `${self}->${this.cIdent(f.cName ?? name)}`, type: f.type };
       }
       const sf = cinfo?.staticFields.get(name);
@@ -37878,12 +37933,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     }
 
     // The target emission records whether it resolved to DisplayObject's own
-    // `name` slot (see lastDoNameTarget); capture it before the value expression
-    // runs, since emitting the value may resolve other, unrelated fields.
+    // `name` slot (see lastDoNameTarget) or one of its render-input fields (see
+    // lastDoDirtyRecv); capture both before the value expression runs, since
+    // emitting the value may resolve other, unrelated fields.
     this.lastDoNameTarget = false;
+    this.lastDoDirtyRecv = null;
     const t = this.emitExpr(target);
     const doNameWrite = this.lastDoNameTarget;
+    const doDirtyRecv = this.lastDoDirtyRecv;
     this.lastDoNameTarget = false;
+    this.lastDoDirtyRecv = null;
     const v = this.emitExpr(expr.value);
 
     if (expr.op === '=') {
@@ -37901,10 +37960,21 @@ void FileStream_writeObject(void* _this, as_value v) {
       // target can also name an instance field / captured closure slot (e.g. a
       // setter body's `_name = value`), so those heap-field writes need the same
       // barrier as an explicit `o.field = v`.
-      if (target.kind === 'Member' || this.resolvesToHeapField(target)) {
+      const heapField = target.kind === 'Member' || this.resolvesToHeapField(target);
+      if (heapField) {
         const store = this.gcWriteAssign(t.code, t.type, code);
-        if (store) return { code: store, type: t.type, discard: true };
+        if (store) {
+          // A render-input field that is ALSO a GC pointer (blendMode is a String,
+          // opaqueBackground is a boxed as_value) still needs its write barrier, so
+          // the dirty mark is sequenced AFTER the barrier-bearing store. Re-reading
+          // the field for the expression value is side-effect free.
+          if (doDirtyRecv !== null) return { code: `(${store}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
+          return { code: store, type: t.type, discard: true };
+        }
       }
+      // Render-input scalar field (x/rotation/alpha/visible, none of which is a GC
+      // pointer): no barrier, so the dirty mark folds straight into the sequence.
+      if (doDirtyRecv !== null) return { code: `(${t.code} = ${code}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type };
       return { code: `(${t.code} = ${code})`, type: t.type };
     }
 
@@ -37912,10 +37982,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     const op = COMPOUND_BASE[expr.op];
     const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
     const code = this.convert(combined, t.type);
-    if (target.kind === 'Member' || this.resolvesToHeapField(target)) {
+    const heapField2 = target.kind === 'Member' || this.resolvesToHeapField(target);
+    if (heapField2) {
       const store = this.gcWriteAssign(t.code, t.type, code);
-      if (store) return { code: store, type: t.type, discard: true };
+      if (store) {
+        if (doDirtyRecv !== null) return { code: `(${store}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
+        return { code: store, type: t.type, discard: true };
+      }
     }
+    if (doDirtyRecv !== null) return { code: `(${t.code} = ${code}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type };
     return { code: `(${t.code} = ${code})`, type: t.type };
   }
 
@@ -39173,6 +39248,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
       // Record a DisplayObject.name target for the assignment emitter's #2007 guard.
       if (f.owner === 'DisplayObject' && expr.property === 'name') this.lastDoNameTarget = true;
+      if (f.owner === 'DisplayObject' && Emitter.DO_RENDER_DIRTY_FIELDS.has(expr.property)) this.lastDoDirtyRecv = recv;
       return { code: `(${recv}->${this.cIdent(f.cName ?? expr.property)})`, type: f.type };
     }
     // getter accessor: obj.prop -> dispatch through the runtime object's vtable

@@ -825,6 +825,12 @@ as_skia_canvas_restore(canvas);                    // 只够关掉「对象自�
 `draw_circle`、九宫格、文本、Stage3D 的绘制入口都接进折叠通道——漏一个就是整块不透明，
 所以本轮只做「单图元」这一档，其余留给后续阶段（已入 `TODO.md` 遗留表）。
 
+> **「每帧全量重绘」的上限与本节的续篇**：§6.10~§6.14 已经把「被动 auto-bake + 帧指纹」这条线
+> 优化到单件 2.56 µs（AIR 1.85）的局部极值，再往下压必须换失效模型——把「每帧指纹探测」改成
+> 「写时脏标记 + 边界隔离 + 只重绘脏层」。这正是 Flutter `RepaintBoundary` 的机制，也是
+> `TODO.md` 阶段四十七记的「脏矩形 invalidate 管线」。完整设计见
+> [`repaint-boundary.md`](repaint-boundary.md)。
+
 
 ### 6.15 `DisplayObject.mask` 是**二值模板**，不是 alpha 合成（阶段三百一十八）
 

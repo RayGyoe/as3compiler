@@ -2567,3 +2567,46 @@ function checkDrawRootAspect(): string[] {
   return bad;
 }
 registerGroup('unit: render/DrawRootAspect', checkDrawRootAspect);
+
+// ---- RepaintBoundary (stage B skeleton, docs/zh-cn/repaint-boundary.md) ----
+//
+// Pins the SOURCE-LEVEL structure of the write-time dirty-marking path: the
+// DisplayObject layout flag, the boundary predicate, the upward-bubbling marker,
+// the forward declaration, the cache branch that consumes the flag, and the
+// field-write tail that appends the marker after a render-input store. These are
+// the invariants a later "remove the fingerprint fallback" switch must not break
+// (the fingerprint path is still present during the parallel phase, so a
+// behaviour-level pin is premature until the switch lands).
+function checkRepaintBoundary(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [repaint] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [repaint] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+
+  check('DisplayObject struct declares the _render_dirty field', emitted.includes('int _render_dirty;'));
+  check('DisplayObject_ctor zeroes _render_dirty', emitted.includes('o->_render_dirty = 0;'));
+  check('as_is_boundary treats cacheAsBitmap as a repaint boundary',
+    emitted.includes('static int as_is_boundary(DisplayObject* o) { return o != NULL && o->_cache_flag; }'));
+  check('as_mark_dirty is defined', emitted.includes('static void as_mark_dirty(DisplayObject* o) {'));
+  check('as_mark_dirty sets the flag', emitted.includes('o->_render_dirty = 1;'));
+  check('as_mark_dirty stops bubbling at a cacheAsBitmap boundary', emitted.includes('if (o->_cache_flag) break;'));
+  check('as_mark_dirty walks the parent chain', emitted.includes('o = (DisplayObject*)o->parent;'));
+  check('as_mark_dirty is forward-declared for user-code call sites',
+    emitted.includes('static void as_mark_dirty(DisplayObject* o);'));
+  check('the cache branch re-bakes on _render_dirty',
+    emitted.includes('if (o->_render_dirty) { o->_render_dirty = 0; o->_cache_valid = 0; }'));
+  check('the field-write tail appends as_mark_dirty after a render-input store',
+    emitSource.includes('as_mark_dirty((DisplayObject*)${doDirtyRecv})'));
+  check('the render-input set lists the nine plain geometry/colour fields',
+    emitSource.includes("'x', 'y', 'rotation', 'scaleX', 'scaleY'")
+    && emitSource.includes("'alpha', 'visible', 'blendMode', 'opaqueBackground'"));
+
+  console.log(`[repaint] ${ok} repaint-boundary checks passed`);
+  return bad;
+}
+registerGroup('unit: render/RepaintBoundary', checkRepaintBoundary);

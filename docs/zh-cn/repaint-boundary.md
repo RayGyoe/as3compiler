@@ -1,0 +1,300 @@
+# RepaintBoundary 脏层重绘 — 设计文档（施工计划）
+
+> 状态：**设计阶段，未实施**。本文是后续阶段的施工蓝图，不是已落地行为。
+>
+> 一句话：把渲染失效从「每帧全量指纹探测」升级为「**写时脏标记 + 边界隔离 + 只重绘脏层**」，
+> 对齐 AIR 的 `cacheAsBitmap` 写时失效语义，并向 Flutter 的 `RepaintBoundary` 靠拢。
+>
+> 动机与性能缺口、现有 auto-bake 机制的完整实测，见 [`skia.md`](skia.md) §6.10~§6.14 与
+> [`gc.md`](gc.md) §6。本文只讲「脏层重绘」这一条线的设计。
+
+---
+
+## 1. 背景与动机
+
+### 1.1 现状：每帧全量重绘 + 被动 auto-bake
+
+当前渲染是**保留语义、每帧全量**的组合：
+
+1. **窗口级脏检测**（已存在）：`ASC_window_render(id)` 先对整棵 Stage 算 `render_fp`，指纹不变就跳过
+   swapchain acquire + clear + `Present`（`src/emit.ts` 的 `ASCWin.render_fp`）。这是**整帧**粒度，不是子树。
+2. **子树级被动烘焙**（已存在）：`as_render_fp(o)` 每帧递归整树算指纹；一个对象指纹连续
+   `ASC_AUTO_BAKE_FRAMES`（=3）帧不变，且非单图元节点（`!as_single_primitive`），就 `_auto_baked=1` 烘成
+   一张 `SkImage`（`_cache_image`），之后 `as_render_object` 走 `as_render_cached` 只 blit 快照。显式
+   `cacheAsBitmap`（`_cache_flag`）走同一条烘焙路径。
+3. **没有**主动失效：指纹一变，`_auto_baked=0`、`_cache_valid=0`，对象掉烘焙 → 走 N 帧 live 重画整棵子树 →
+   静置 N 帧 → 重新烘。
+
+### 1.2 性能缺口（已实测，非推测）
+
+- `skia.md` §6.14：面板场景优化后单件绘制仍 **2.56 µs/项**，AIR 是 **1.85 µs/项**；`panel_192`
+  **1.331 ms/帧**。交叉点从 ≈46 项推到 >1100 项，但海量显示对象（几百行列表）仍是输的场景。
+- `TODO.md` 阶段四十七：FPS 场景 native 每帧全量 CPU 光栅化 2000×1360 + SDL blit，而 AIR 是
+  GPU 合成 + **脏矩形**（只重绘 90×20 的 TextField 小块）。
+- 被动探测的两个固有代价：
+  - **每帧 O(树) 指纹**：`as_render_fp` 无论画面变没变，都要递归整树哈希所有渲染输入（变换、graphics、
+    文本、滤镜、子列表…），这笔开销与「要不要重画」无关。
+  - **失效延迟**：静置 3 帧才烘、掉烘焙后要空转 3 帧 live 再烘。hover/滚动/编辑这类「变一下、又静止」的
+    交互，正好在「烘 ↔ 掉烘」之间来回，§6.12/§6.14 里的「抖动」「clear 又 blur」都源于此。
+
+### 1.3 Flutter 的对照
+
+Flutter 的 `RepaintBoundary` 之所以快，不是后端（它也用 Skia/Impeller）比我们快，而是它在光栅化之上
+搭了**保留模式 + 脏标记 + 层合成**：`markNeedsPaint` 把「谁脏了」沿树向上传到最近的 `RepaintBoundary`，
+帧内**只重绘那一个脏层**，兄弟层、父层、背景层一帧都不动。我们要补的正是这一层「写时失效 + 只重绘脏层」，
+而不是换后端。
+
+---
+
+## 2. 目标与非目标
+
+### 2.1 目标
+
+1. **写时脏标记**：渲染输入的每一次写（`x`/`text`/`graphics`/`addChild`/…）都置脏并向上传播，替代「每帧
+   全量指纹探测」这一读路径。
+2. **边界隔离**：把 `cacheAsBitmap` 确立为显式重绘边界（它本来就是「子树烘成独立位图、父级只 blit」），
+   并让自动边界（auto-bake）继承同一套失效语义。
+3. **只重绘脏层**：帧内只有脏的边界层重新光栅化，其余层复用上一帧快照；边界内（阶段 C）进一步只重绘
+   脏区域/脏子树。
+
+### 2.2 非目标
+
+- **不改 AIR 已定义行为**：`cacheAsBitmap` 的 AS3 语义（`getCacheAsBitmap`、含 filters 时隐式开启、
+  `cacheAsBitmapMatrix`）逐字保持。本设计只在**失效时机**上对齐 AIR（见 §4.1），不新增/改写任何 AIR 语义。
+- **不引入第三方依赖**（§3.1 铁律）：脏标记是运行时 C 结构 + 发射器注入，Skia 之外的任何库都不碰。
+- **首版不做完整 DisplayList 记录**：Flutter 的 `DisplayList`（绘制命令录制 + replay）是更大的工程，
+  列为阶段 D（可选），不在阶段 A~C 的验收范围内。
+- **不做分代 GC**：GC 的每帧 `gc_step()` 预算、写屏障开销是另一条线（`gc.md` §6），不在本文范围内。
+
+---
+
+## 3. 现状盘点
+
+| 能力 | 现状 | 位置 |
+|---|---|---|
+| 窗口级脏检测（整帧跳过 Present） | ✅ | `ASC_window_render` / `ASCWin.render_fp` |
+| 子树级被动烘焙（auto-bake） | ✅ | `as_render_fp` → `_auto_baked`，`as_render_cached` |
+| 显式烘焙（cacheAsBitmap） | ✅ | `_cache_flag` → 同一 `as_render_cached` |
+| 快照位图 + 设备栅格吸附 + 相位 | ✅ | `_cache_image` / `_cache_phx` / `_cache_phy` / §6.12 |
+| 单图元 alpha 折叠 / 单图元拒绝烘焙 | ✅ | `as_single_primitive` / `as_draw_count` |
+| **写时脏标记 + 向上传播** | ❌ | 无 |
+| **边界内局部重绘（脏矩形/脏子树）** | ❌ | 无（`emit.ts:40320` 明确「no AIR-style region list」） |
+| 渲染输入全集枚举 | ✅（作为指纹） | `as_render_fp` 的哈希字段清单 |
+
+**关键观察**：`as_render_fp` 已经是「渲染输入全集」的枚举——它哈希了 `x/y/rotation/scale*/alpha/visible/
+blendMode/mask/scrollRect/transform/filters/graphics/bitmapData/text/…` 每一项。这个清单**就是**「需要注入
+脏标记的写点清单」的现成来源：把它从「每帧读哈希」改成「写时置位」，就是阶段 B 的全部核心工作。这大大
+降低了「漏掉哪个写点」的风险——指纹漏过的输入，本来就会导致烘焙冻结（文档里已有大量教训），所以清单是
+被逐次踩坑补全过的。
+
+---
+
+## 4. 核心设计
+
+### 4.1 API 形态：为什么复用 `cacheAsBitmap`
+
+AIR **没有** `RepaintBoundary` 这个概念。AIR 里的对应物是三件套：
+
+1. `cacheAsBitmap`：子树烘成位图，对象或其子变化时**再生**位图；
+2. `scrollRect`：滚动窗口；
+3. GPU 硬件合成器：把这些位图按变换合成上屏，配合**脏矩形**只重绘失效区域。
+
+其中 `cacheAsBitmap` 在语义上**已经是一个重绘边界**——它把子树与父级隔离成两层。而且 AIR 的失效是
+**写时**的：`skia.md` §6.10 已实测确认「AIR's cache is not a snapshot: the player regenerates the bitmap
+when the object or its children change」。也就是说，**对齐 AIR 的正确实现本来就该是「写时失效 + 变化时重烘」，
+而不是我们现在「读时指纹探测 + 静置 3 帧才烘」**。
+
+结论：
+
+- **主方案**：`cacheAsBitmap` = 显式 RepaintBoundary。不新增 AS3 API，语义对齐 AIR，只在失效模型上从
+  「帧指纹探测」升级为「写时脏标记」。这是**修实现、不是增强**——AIR 的 cacheAsBitmap 失效本来就是写时的。
+- **辅助方案**：auto-bake 作为「自动边界」，沿用同一套脏标记（把 auto-bake 从「静置探测」升级为「写时失效」）。
+- **可选增强**（真正超出 AIR、必须 opt-in）：新增 `flash.display.RepaintBoundary` 容器类，或构建清单
+  `repaint-boundaries` 自动插入边界。这部分**默认关闭**，与 AIR 同构。列为阶段 C 之后的独立增强，本文只
+  给出接口形状，不承诺首版落地。
+
+### 4.2 数据结构
+
+在 `DisplayObject` 结构体上新增（`src/emit.ts` 的 `_cache_*` 字段旁，字段清单见 §3 的表）：
+
+```c
+int   _render_dirty;     // 自己或子树自上次渲染以来是否失效
+// 阶段 C 才有：
+double _dirty_l, _dirty_t, _dirty_r, _dirty_b;  // 失效矩形（对象自身坐标系，-INF 表示未初始化）
+```
+
+边界判定复用现有语义：
+
+- `_cache_flag`（显式 `cacheAsBitmap`）⇒ 是边界；
+- `_auto_baked`（自动烘焙）⇒ 是边界，但它是**运行时决策**（见 §4.5 与帧指纹的关系）。
+
+新增一个内联判定 `as_is_boundary(o)` = `_cache_flag || _auto_baked`（阶段 B 只有 `_cache_flag` 是稳定边界，
+`_auto_baked` 因为会被掉烘而退化成非边界，见 §6 风险 3）。
+
+### 4.3 失效传播（写时置脏 + 向上冒泡）
+
+**核心不变量**：任何「会改变渲染输出」的写，都必须把**自己**和**祖先链上直到最近边界**的对象标记为脏。
+越过边界即停——边界隔离了失效，父级只看边界的位图，不需要知道边界内哪个叶子变了。
+
+```
+写 leaf.x = 10
+  → leaf._render_dirty = 1
+  → 沿 parent 链上溯：
+     对每个祖先 a：
+       a._render_dirty = 1
+       若 a 是边界（_cache_flag）→ 停止（边界自己脏，父级不用动）
+```
+
+写点注入的三类来源（清单来自 `as_render_fp` 的字段枚举，见 §3）：
+
+1. **DisplayObject accessor setter**：`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/mask/scrollRect/
+   filters/transform/opaqueBackground/cacheAsBitmap`。这些在 `src/emit.ts` 里是发射出的 getter/setter
+   C 函数，注入点明确。
+2. **方法调用**：`Graphics` 的 `beginFill/lineStyle/moveTo/lineTo/curveTo/draw*/clear`；`DisplayObjectContainer`
+   的 `addChild/removeChild/setChildIndex/swapChildren/…`；`TextField` 的 `text/appendText/htmlText/
+   setTextFormat/scrollV/scrollH/…`；`MovieClip` 的 `gotoAndStop/play/stop` 与帧推进（`as_mc_tick`）。
+3. **间接输入**：`BitmapData` 的写（已有 `_px_ver` 版本计数器，可把它读作「脏」，见 §4.5）、
+   `Matrix`/`ColorTransform` 字段写（`transform.matrix` / `transform.colorTransform` 的逐字段 setter）、
+   SWC 时间轴帧切换。
+
+**关键工程约束**：脏标记必须覆盖**全部**写点。漏一处 = 该对象永不失效 = 边界缓存冻结（和现有「指纹漏算 →
+画面冻结」是同一类 bug，`skia.md` §6.10/§6.14 里已有多处实测教训）。这是阶段 B 最大的工作量，也是最大的
+回归风险面。
+
+### 4.4 边界隔离与局部重绘
+
+**渲染入口改造**（`as_render_object` 的缓存分支，现 `src/emit.ts:29717`）：
+
+```
+// 现：命中 _cache_flag/_auto_baked 就走 as_render_cached（blit 快照）
+// 改：命中边界时先问「脏不脏」
+if (边界 && 命中快照) {
+  if (!o._render_dirty) { blit 快照; }          // 复用，不重画
+  else { 重绘该边界（阶段 B：整边界重烘；阶段 C：只重绘脏区域）; o._render_dirty = 0; }
+}
+```
+
+- **阶段 B**：边界脏 → 重烘整张快照（等价于现在「掉烘焙 → 重画 → 再烘」，但**去掉了静置延迟**：脏了就
+  当帧重烘，不空转 3 帧 live）。
+- **阶段 C**：边界脏 → 用 `_dirty_l/t/r/b` 裁剪，只重绘快照里脏矩形覆盖的像素，其余 blit 旧快照。这是
+  「FPS 场景只重绘 90×20 小块」的落地形态，也是收益最大、最难做对的一步。
+
+**帧末复位**：`ASC_window_render` 在 Present 后，把**所有**对象的 `_render_dirty` 清 0（边界重绘过的和
+未重绘的都要清，因为下一帧的脏要从零累积）。这与现在 `as_render_fp` 每帧递归更新 `_auto_fp` 的时机对齐。
+
+### 4.5 与帧指纹的关系（关键取舍）
+
+帧指纹 `as_render_fp` 是**读时探测**（每帧算，O(树)），脏标记是**写时置位**（写时 O(1)，读时 O(脏)）。
+两者不是等价替换，各有用途：
+
+| 用途 | 现方案 | 新方案 |
+|---|---|---|
+| 窗口级「整帧没变跳过 Present」 | `render_fp`（整树哈希） | **保留** `render_fp`，但它的输入可以是「本帧是否有脏」而非「重新哈希全部字段」 |
+| cacheAsBitmap 失效 | 指纹变 → 掉烘 | **改为** 写时脏标记（对齐 AIR） |
+| auto-bake 触发 | 静置 3 帧才烘 | **改为** 写时脏标记（脏了就烘，静止即烘，无静置延迟） |
+| 渲染输入全集（防漏清单） | `as_render_fp` 的哈希字段 | **保留为「写点注入清单」的来源**，但不再每帧执行 |
+
+**迁移策略（防回归）**：阶段 B **先并行、后切换**。新增脏标记与现有指纹**并存**一段时间：
+- 脏标记置位的写点，同时也让 `as_render_fp` 保持原样运行（不删指纹代码）；
+- 用断言/探针验证「指纹变 ⇔ 脏标记置位」在全部示例上**同真同假**；
+- 全量回归绿后，再让 `_cache_flag` 的失效切换到脏标记，auto-bake 最后切换；
+- 最终**保留** `as_render_fp` 的字段枚举作为「写点注入清单」的源文档，删除每帧执行。
+
+这样把「漏标记」的风险从「画面冻结」降级为「阶段 B 期间可被指纹兜底发现」。
+
+`BitmapData` 的 `_px_ver`/`_uid` 版本计数器（现已被指纹读取）在脏标记方案里**语义不变**——它仍然是
+「BitmapData 内容变了」的权威信号，只是从「被指纹每帧读」改成「写时直接置脏其所有显示实例」。这一步是
+阶段 B 里最需要小心的：一个 `BitmapData` 可能被多个 `Bitmap` 显示，写它要置脏**所有**引用它的 Bitmap
+（现方案靠 `_px_ver` 全局递增让每个 Bitmap 的指纹都变，天然覆盖了这一点）。
+
+---
+
+## 5. 分阶段实施
+
+> 阶段编号只表示本文内部的实施顺序；真正开工时纳入 `TODO.md` 路线图，按项目惯例分配「阶段三百六十五 +」全局编号。
+
+### 阶段 A：边界语义收口（文档化，基本已有）
+
+- [ ] 把 `cacheAsBitmap` 确立为「显式重绘边界」的文档口径（本文 §4.1），在 `skia.md` 补一段对照。
+- [ ] 盘点 `_cache_flag` / `_auto_baked` 的边界语义差异，明确「稳定边界（显式） vs 运行时边界（自动）」。
+- **验收**：无代码行为变更，仅文档；现有 `unit: render/*` 与 `examples/autobake-*.as` 全绿。
+
+### 阶段 B：写时脏标记 + 边界级失效（核心）
+
+> **实施状态（阶段三百六十五）**：骨架 + 字段写点子集已落地，指纹兑底仍在（并行阶段）。其余写点、等价性
+> 验证与切换未做——见 TODO.md 阶段三百六十五的「如实报明」。
+
+- [x] `DisplayObject` 增 `_render_dirty` 字段与 `as_is_boundary` 判定（§4.2）。
+- [~] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
+      **已注入 9 个直接字段**（`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground`）；
+      `Graphics`/`MovieClip`/`Bitmap`/`TextField`/`mask`/`scrollRect`/`filters`/`transform`/`addChild`
+      等写点仍靠指纹兑底。
+- [x] `as_render_object` 缓存分支改为「脏则重烘、不脏则 blit」，去静置延迟（§4.4 阶段 B）。
+      （当前与指纹掉烘并存：脏则清脏 + `_cache_valid=0` 当帧重烘，指纹兑底发现漏点。）
+- [~] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。
+- [ ] **并行验证**：脏标记与指纹同真同假（§4.5 迁移策略），全量 `node test.ts` 绿后才切换。
+- **验收**：
+  - `temp/` 探针：`x` 连写两次 → 第二次（写时脏已置）当帧重烘，无静置 3 帧延迟（`ASC_BAKE_TRACE` 时间戳）。
+  - 单件绘制斜率不再因「掉烘空转」而抖动（§6.14 的 hover 场景 A/B）。
+  - 新增 `test/unit/render.ts` 源级钉：脏标记字段存在、`as_is_boundary`、注入点覆盖清单、帧末复位。
+
+### 阶段 C：边界内脏矩形/脏子树增量重绘（最难，收益最大）
+
+- [ ] `DisplayObject` 增 `_dirty_l/t/r/b`（§4.2）。
+- [ ] 写点注入时**合并**脏矩形：`leaf._dirty` 与父级 `_dirty` 的并集沿链合并（父的脏矩形覆盖所有脏后代）。
+- [ ] 边界重绘走**脏区域裁剪**：`save` + `clipRect(_dirty_*)` 后只重画脏矩形内的内容，其余 blit 旧快照；
+  或（脏子树方案）只重画脏的那棵子树、其余子树 blit。
+- **验收**：
+  - FPS 计数器场景（`TODO.md` 阶段四十七的 90×20 小块）：重绘像素面积从「整帧」降到「小块」，用
+    `ASC_BAKE_TRACE` / 重绘面积计数器断言。
+  - `showRedrawRegions` 从「接受但无覆盖层」（现 `emit.ts:40320`）升级为「真画出脏矩形」——这是 AIR 的
+    调试覆盖层，正好拿来做脏矩形的像素级回归 oracle。
+  - 像素钉子：滚动列表只重绘滚动内容，固定 header 一帧不动（`BitmapData.draw` 前后签名比对）。
+
+### 阶段 D（可选，独立增强）：DisplayList 记录 + replay
+
+- [ ] 把边界的绘制命令录成 DisplayList（类似 `SkPicture`），静态内容只 replay + 平移，不重新生成绘制命令。
+- **明确不承诺首版**：工程量大、与脏矩形方案部分重叠；只有在阶段 C 仍达不到目标时才启动。
+
+---
+
+## 6. 风险与边界（如实报明）
+
+1. **漏标记 = 画面冻结**。这是本设计最大的风险，也是现有 auto-bake「指纹漏算」的同一类 bug（`skia.md`
+   已有多处实测教训）。缓解：§4.5 的「先并行后切换」，让指纹在阶段 B 期间兜底发现漏点。
+2. **写点覆盖是最大工程量**。`DisplayObject`/`Graphics`/`TextField`/`Container`/`MovieClip`/`BitmapData`/
+   `Matrix`/`ColorTransform`/SWC 帧脚本九条线都要注入，且要与「直接字段写 vs accessor」的实际发射形态对齐。
+   低估它会导致阶段 B 长期红。
+3. **auto-bake 作为「运行时边界」的漂移**：`_auto_baked` 会被掉烘退化成非边界，边界集合每帧可变；脏标记
+   传播到「上一帧是边界、这一帧不是」的对象时会冒泡过头或不够。阶段 B 应**先只对显式 `_cache_flag` 做脏标记**，
+   auto-bake 最后切换（§4.5 顺序）。
+4. **增强与 AIR 同构的边界**：`cacheAsBitmap` 的失效改造成脏标记，是**对齐 AIR 的修实现**，不是增强；
+   但「新增 `RepaintBoundary` 类 / 自动插入边界」（§4.1 可选）是**超出 AIR 的增强**，必须 opt-in、默认关闭。
+5. **跨端差异**：web（WASI + emcc）无 `Present` 概念，脏层跳过与 GPU 合成路径要按后端显式分流；Windows
+   的 D3D12 合成与 macOS Metal 的边界重绘成本不同，阶段 C 的脏矩形裁剪两端都要真机验证（当前 Windows 无法
+   本机验证，记 `TODO.md`）。
+6. **与 `BitmapData.draw` / 滤镜 pass 的交互**：这些路径走「烘焙到另一张画布」（`skia.md` §6.12 的相位/落点），
+   脏标记的「对象自身坐标系脏矩形」在这些非窗口画布上的语义要单独定义，否则会读到错的裁剪窗口。
+
+---
+
+## 7. 验收与回归总纲
+
+- **语义对齐**：`cacheAsBitmap` on/off 的像素输出**逐字节不变**（`examples/autobake-origin.as` 的既有钉子
+  必须继续绿）——脏标记只改「何时重绘」，不改「画成什么样」。
+- **行为对齐**：同一份 `.as` 双端跑（AOT + `mxmlc`/`adl`），`cacheAsBitmap` 失效时机与像素一致（AIR 的
+  cacheAsBitmap 是写时失效，改造后应比现在更贴近 adl）。
+- **结构钉**：`test/unit/render.ts` 增脏标记字段、`as_is_boundary`、注入点清单、帧末复位、脏矩形合并的源级钉。
+- **性能**：阶段 B 后 `output/perf/chat` 的 `panel_192` 斜率不再因掉烘空转而抖动；阶段 C 后 FPS 场景的重绘
+  面积降到小块级。
+- **全量回归**：每个阶段收尾 `node test.ts` 全绿 + 文档双语同步 + 版本 bump（§2.7）。
+
+---
+
+## 8. 参考
+
+- [`skia.md`](skia.md) §6.10~§6.14：auto-bake / cacheAsBitmap / 帧指纹 / 单图元折叠的完整实测。
+- [`gc.md`](gc.md) §6：增量 GC 的每帧预算与写屏障（与本设计正交的另一条性能线）。
+- `src/emit.ts`：`as_render_fp`（`29022`）、`as_render_cached`（`29293`）、`as_render_object`（`29559`）、
+  `as_render_object_content`（`29839`）、`ASC_window_render`（`30736`）、`Stage_render`（`30174`）。
+- `TODO.md` 阶段四十七（`947-948`）：脏矩形 invalidate 管线的原始记录。

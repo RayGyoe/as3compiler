@@ -19440,6 +19440,36 @@ IPv6 **link-local 丢弃**（只剩它的接口整个不出现）；同接口内
 `displayName`/`parent`/`subInterfaces` 恒为空/`null`（`adl` 在本机两个接口上也是这个读数，但未穷举所有接口类型，
 故不宣称「永远如此」）。
 
+### 阶段三百六十五：RepaintBoundary 脏层重绘 —— 阶段 B 骨架 + 字段写点注入（v0.4.327 → v0.4.328）
+
+**起点**：[`docs/zh-cn/repaint-boundary.md`](docs/zh-cn/repaint-boundary.md) 已给出 Flutter 式脏层重绘的设计
+（阶段 A/B/C），本轮落地阶段 B 的**骨架 + 字段写点注入**——不是一次切换，而是「先并行、后切换」的第一步。
+
+**结论：写时脏标记先作为影子与帧指纹并存，等其余写点覆盖完再切换。** 关键发现：`x/y/rotation/…` 是
+**直接字段**（不是 accessor setter），所以脏标记不能塞进 setter，必须在 `emitAssign` 的字段写尾注入。
+
+**逐项**（语义依据见 [`docs/zh-cn/repaint-boundary.md`](docs/zh-cn/repaint-boundary.md) §4/§5）：
+1. `DisplayObject` 结构体加 `int _render_dirty`（纯 C 运行时，非 AS3 可见，非指针故无 GC 写屏障）。
+2. 新增 `as_is_boundary`（`_cache_flag` 即重绘边界）与 `as_mark_dirty`（置脏 + 沿 `parent` 链向上冒泡、
+   到 `_cache_flag` 边界或根停止），并在用户代码之前的前置声明区加声明（避免字段写点先于定义而 implicit-decl）。
+3. 渲染缓存分支读 `_render_dirty`：脏则清脏 + `_cache_valid = 0` 当帧重烘（不引入静置延迟）。
+4. 字段写点注入：`emitAssign` 的字段写尾识别「owner 是 DisplayObject 且字段在渲染输入集
+   （`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground`）」→ 追加 `as_mark_dirty`；
+   经 `lastDoDirtyRecv` 记录接收者（照搬 `lastDoNameTarget` 的「读路径记、写路径消费」协议），
+   GC 指针字段（`blendMode` 是 String、`opaqueBackground` 是 box）在写屏障**之后**追加脏标记。
+
+**验收**：
+- `examples/autobake.as`、`examples/cacheasbitmap.as` 编译运行正常；生成 C 里字段写后正确追加 `as_mark_dirty`。
+- 新增 `test/unit/render.ts` 的 `unit: render/RepaintBoundary`（11 钉）：结构字段、边界谓词、向上冒泡、
+  前置声明、缓存分支消费、字段写尾注入、渲染输入集。
+- `unit: render/*`（24）、`unit: display/*`（14）、`unit: emit/*`（47）全绿。
+
+**如实报明**：这是**并行阶段**，`as_render_fp` 的每帧指纹掉烘仍完整保留——脏标记当前对行为是**冗余**的
+（指纹掉烘抢先生效），它的收益（去掉每帧 O(树) 哈希、消除 auto-bake 静置延迟）要到**切换**后才兑现。
+切换前必须先补齐其余写点：`Graphics` 方法（需 owner 追踪，最难）、`MovieClip` 帧推进、`Bitmap`/`BitmapData`
+（版本计数 + 反向引用）、`TextField`、`mask`/`scrollRect`/`filters`/`transform`、`addChild`/`removeChild`。
+漏掉任何一个写点就切换 ⇒ 该写点导致边界冻结（指纹已移除）。阶段 C（边界内脏矩形裁剪）未开始。
+
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 
 **起点**：用户拿来一段 `bin-aot/TalkMED Meeting.c`（41.4 万行）的编译输出，问这些警告能不能修掉。

@@ -881,6 +881,12 @@ restored afterwards", Skia-linked) + `unit: render/DrawRootAspect` (8 pins: save
 in the right order, fingerprint before the force, `as_render_object` still skipping invisible objects). Three
 semantic mutations (force visible only, force alpha only, drop the alpha restore) all go red.
 
+> **From "per-frame full redraw" to "dirty-layer redraw"**: the passive auto-bake + per-frame fingerprint line
+> (§6.10–§6.17) is already tuned to its local optimum. Pushing further means changing the invalidation model from
+> per-frame fingerprint probing to write-time dirty marking + boundary isolation + redrawing only the dirty layer
+> -- the Flutter `RepaintBoundary` mechanism. The full design lives in
+> [`repaint-boundary.md`](repaint-boundary.md).
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.
