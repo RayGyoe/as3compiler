@@ -29189,8 +29189,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('if (o == NULL || depth > 6) return;');
     this.line('int cur = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->currentFrame : -1;');
+    this.line('int ply = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->_playing : 0;');
     this.line('unsigned int pxv = (as_is(o, &Bitmap_vt) && ((Bitmap*)o)->bitmapData != NULL) ? ((Bitmap*)o)->bitmapData->_px_ver : 0u;');
-    this.line('fprintf(stderr, "  %*s%s cur=%d pxv=%u dirty=%d\\n", depth * 2, "", as_cls_of((void*)o), cur, pxv, o->_render_dirty);');
+    this.line('int fcs = (as_is(o, &TextField_vt) && as_focus_obj == o) ? 1 : 0;');
+    this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d\\n", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs);');
     this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
