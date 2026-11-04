@@ -24631,8 +24631,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (para == NULL) return;');
     this.line('double tw = as_tf_longest_line(para);');
     this.line('double th = as_skia_textlayout_height(para);');
-    this.line('if (!tf->wordWrap) tf->_fieldWidth = tw + 4.0;');
-    this.line('tf->_fieldHeight = th + 4.0;');
+    this.line('double nw = tf->wordWrap ? tf->_fieldWidth : tw + 4.0;');
+    this.line('double nh = th + 4.0;');
+    // autoSize derives the box from the text, so it writes _fieldWidth/_fieldHeight
+    // directly (not through as_do_set_width/height). Those two are render-fingerprint
+    // inputs, so a size change must invalidate the bake the same way an explicit
+    // width/height set does -- without this a cacheAsBitmap ancestor kept its stale
+    // snapshot while an autoSized field re-derived its box (DIRTY_MISS storm).
+    this.line('if (nw != tf->_fieldWidth || nh != tf->_fieldHeight) { tf->_fieldWidth = nw; tf->_fieldHeight = nh; as_mark_dirty((DisplayObject*)tf); }');
     this.indent--;
     this.line('}');
     // The accumulated scale of a DisplayObject's OWN transform plus every

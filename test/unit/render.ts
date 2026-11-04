@@ -2645,6 +2645,9 @@ function checkRepaintBoundary(): string[] {
     && emitted.includes('void TextField_setTextFormat(void* _this, TextFormat* format, int begin, int end) {'));
   check('TextField render-input field set is declared',
     emitSource.includes("['TextField', new Set(['multiline', 'wordWrap', 'background', 'border', 'scrollV'"));
+  check('autoSize re-derivation marks the field dirty when the box changes',
+    emitted.includes('double nw = tf->wordWrap ? tf->_fieldWidth : tw + 4.0;')
+    && emitted.includes('if (nw != tf->_fieldWidth || nh != tf->_fieldHeight) { tf->_fieldWidth = nw; tf->_fieldHeight = nh; as_mark_dirty((DisplayObject*)tf); }'));
   check('Stage color/align/scaleMode setters mark dirty',
     emitSource.includes("const stageRenderDirty = new Set(['color', 'align', 'scaleMode']);")
     && emitted.includes('void Stage_set_scaleMode(void* _this, char* value) {')

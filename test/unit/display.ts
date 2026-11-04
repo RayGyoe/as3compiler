@@ -874,8 +874,8 @@ function checkAutoSizeMetrics(): string[] {
 
   // ① autoSize：宽度只在 wordWrap=false 时才跟 textWidth 走
   check('the width hug is guarded on wordWrap (height stays unconditional)',
-    emitted.includes('if (!tf->wordWrap) tf->_fieldWidth = tw + 4.0;') &&
-    emitted.includes('tf->_fieldHeight = th + 4.0;') &&
+    emitted.includes('double nw = tf->wordWrap ? tf->_fieldWidth : tw + 4.0;') &&
+    emitted.includes('double nh = th + 4.0;') &&
     !/^\ttf->_fieldWidth = tw \+ 4\.0;$/m.test(emitted));
 
   // ①b 几何读取也要刷新 autoSize（adl 赋值后不画就能读到新高度）

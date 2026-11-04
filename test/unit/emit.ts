@@ -3113,7 +3113,7 @@ function checkTextFieldLongestLine(): string[] {
     helperAt >= 0 && consumers.every((s) => c.indexOf(s) > helperAt));
 
   check('autoSize takes its width from the clamped helper',
-    /double tw = as_tf_longest_line\(para\);\s*double th = as_skia_textlayout_height\(para\);\s*if \(!tf->wordWrap\) tf->_fieldWidth = tw \+ 4\.0;/.test(c));
+    /double tw = as_tf_longest_line\(para\);\s*double th = as_skia_textlayout_height\(para\);\s*double nw = tf->wordWrap \? tf->_fieldWidth : tw \+ 4\.0;/.test(c));
   check('TextAlignment dx does too',
     /double tw = as_tf_longest_line\(para\);\s*if \(a == 2\) return \(tf->_fieldWidth - 4\.0 - tw\) \/ 2\.0;/.test(c));
   check('TextField.textWidth does too (and still reports 0 for an empty paragraph)',
