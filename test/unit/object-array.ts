@@ -121,11 +121,14 @@ function checkObjectSlotArray(): string[] {
   // ---- the negative controls the fix must NOT have touched ----
   check('a `*`-slot `is Array` still uses the box tag',
     mainOf('var u:* = [1];\nvar b:Boolean = u is Array;\ntrace(b);\n').includes('as_v_is_array('));
-  // An Array-typed operand is still decided at compile time: the answer reaches the
-  // printf through a hoisted `bool _onceN = true`, and no runtime check is emitted.
+  // An Array-typed operand is still decided at compile time: the answer is the
+  // literal `true` at the use site (since stage 364 `is`/`as` count as pure, so the
+  // fold is not hoisted into a `bool _onceN = true` anymore -- both shapes mean the
+  // same thing and no runtime check is emitted).
   const arrIs = mainOf('var a:Array = [1];\ntrace(a is Array);\n');
   check('an Array-typed `is Array` is still folded (no as_obj_is_array emitted)',
-    !arrIs.includes('as_obj_is_array') && /bool _once\d+ = true;/.test(arrIs));
+    !arrIs.includes('as_obj_is_array')
+    && (/as_str_from_bool\(true\)/.test(arrIs) || /bool _once\d+ = true;/.test(arrIs)));
   check('Number/String/Boolean in an Object slot keep their specialized tests',
     mainOf('var n:Object = 1;\ntrace(n is Number);\n').includes('as_is_number_obj(')
     && mainOf('var s:Object = "x";\ntrace(s is String);\n').includes('as_is_string_obj('));

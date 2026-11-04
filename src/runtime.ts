@@ -3729,14 +3729,14 @@ static void as_throw_1034(as_value v, const char* fqn);
 // 我们不复刻 ICU 的 locale 折叠（那需要一张表，且 AIR 的表现随宿主 locale 变）。
 static int as_lower_ascii(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 static int as_str_cmp_ci(const char* x, const char* y) {
-    while (*x != '\0' && *y != '\0') {
+    while (*x != '\\0' && *y != '\\0') {
         int a = as_lower_ascii((unsigned char)*x);
         int b = as_lower_ascii((unsigned char)*y);
         if (a != b) return a < b ? -1 : 1;
         x++; y++;
     }
-    if (*x != '\0') return 1;
-    if (*y != '\0') return -1;
+    if (*x != '\\0') return 1;
+    if (*y != '\\0') return -1;
     return 0;
 }
 
@@ -11583,7 +11583,7 @@ static int as_net_trace(void) {
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("ASC_NET_TRACE");
-        on = (e != NULL && e[0] != '0' && e[0] != '\0') ? 1 : 0;
+        on = (e != NULL && e[0] != '0' && e[0] != '\\0') ? 1 : 0;
     }
     return on;
 }

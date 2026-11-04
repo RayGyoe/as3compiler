@@ -1343,6 +1343,19 @@ export function applyFeatureDeps(cfg: BuildConfig): BuildConfig {
   return { ...cfg, sources, includePaths, linkPaths, linkLibs };
 }
 
+// A library named twice on one link line makes ld warn ("ignoring duplicate
+// libraries: '-lz'"): the same archive routinely reaches the config from both the
+// manifest's `link-libs` and a backend rule that also needs it. Order-preserving
+// dedupe, applied only where the `-l` flags are emitted, so the config keeps the
+// duplicates a user wrote (resolving them is the linker's call -- see the
+// c-flags note).
+function uniqueLinkLibs(libs: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const l of libs) if (!seen.has(l)) { seen.add(l); out.push(l); }
+  return out;
+}
+
 export function windowsZlibArgs(cfg: BuildConfig): string[] {
   if (process.platform !== 'win32' || cfg.target !== 'native') return [];
   if (cfg.linkLibs.includes('z')) return [];
@@ -1673,7 +1686,7 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
       ...exportDynamicFlags(cfg),
       ...windowsLinkFlags(cfg)
     );
-    for (const l of posixLinkLibs()) args.push(l);
+    for (const l of posixLinkLibsFor(cfg)) args.push(l);
     for (const l of platformLinkLibs()) args.push('-l', l);
     args.push('-o', outPath);
   }
@@ -1689,7 +1702,7 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
   for (const o of cfg.objects) args.push(o);
   for (const p of cfg.linkPaths) args.push('-L', p);
   args.push(...windowsZlibArgs(cfg));
-  for (const l of cfg.linkLibs) args.push('-l', l);
+  for (const l of uniqueLinkLibs(cfg.linkLibs)) args.push('-l', l);
   args.push(...frameworkFlags(cfg));
   // Static-archive order: libraries must follow the objects that reference
   // them, hence -lsetjmp here rather than in the wasm branch above.
@@ -1707,6 +1720,15 @@ export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: st
 function posixLinkLibs(): string[] {
   if (process.platform === 'win32') return [];
   return ['-lm', '-lz'];
+}
+
+// The fixed `-lz` above is the SYSTEM zlib (macOS/Linux ship it). A config that
+// already names `z` in its `link-libs` -- every `--air-app` build does, see
+// air-app.ts -- would put `-lz` on the line twice, and ld answers with
+// "ignoring duplicate libraries: '-lz'". Drop the fixed one in that case rather
+// than the config's, so the position the user asked for is the one that stays.
+function posixLinkLibsFor(cfg: BuildConfig): string[] {
+  return posixLinkLibs().filter((l) => !(l === '-lz' && cfg.linkLibs.includes('z')));
 }
 
 // Extra platform link libraries for the NATIVE targets. iconv is what the
@@ -1902,8 +1924,8 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   if (icuData) linkArgs.push(icuData.object);
   for (const o of cfg.objects) linkArgs.push(o);
   for (const p of cfg.linkPaths) linkArgs.push('-L', p);
-  for (const l of cfg.linkLibs) linkArgs.push('-l', l);
-  linkArgs.push(...posixLinkLibs());
+  for (const l of uniqueLinkLibs(cfg.linkLibs)) linkArgs.push('-l', l);
+  linkArgs.push(...posixLinkLibsFor(cfg));
   for (const l of platformLinkLibs()) linkArgs.push('-l', l);
   linkArgs.push(...frameworkFlags(cfg));
   steps.push(linkArgs);
@@ -2217,7 +2239,7 @@ export function buildWebCompileSteps(cfg: BuildConfig, cPath: string, base: stri
   for (const f of cppFiles) linkArgs.push(objOf(f));
   for (const o of cfg.objects) linkArgs.push(o);
   for (const p of cfg.linkPaths) linkArgs.push('-L', p);
-  for (const l of cfg.linkLibs) linkArgs.push('-l', l);
+  for (const l of uniqueLinkLibs(cfg.linkLibs)) linkArgs.push('-l', l);
   linkArgs.push('-s', 'ALLOW_MEMORY_GROWTH=1');
   linkArgs.push('-s', 'USE_ZLIB=1');
   // MAX_WEBGL_VERSION=2 enables WebGL2 support in Emscripten's generated JS glue.

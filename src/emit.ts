@@ -4,7 +4,7 @@
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
-import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation } from './symbols.ts';
+import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation, stmtCompletesNormally } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 import type { SwcResourceSpec, SwcBake, SwcBakeMorph, SwcBakeMorphGroup } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
@@ -2377,7 +2377,10 @@ export class Emitter {
     this.line('void* vt = obj != NULL ? ((as_object_header*)obj)->vtable : NULL;');
     this.line('const char* fqn = vt != NULL ? ((as_vtable_header*)vt)->fqn : NULL;');
     this.line('if (fqn == NULL || fqn[0] == 0) fqn = "Object";');
-    this.line('static ASC_TLS char* parts[3]; parts[0] = (char*)"Error #1123: Filter operator not supported on type "; parts[1] = (char*)fqn; parts[2] = (char*)".";');
+    // `const char*[]`: as_str_concat_n takes `const char**`, and a `char*[]`
+    // array decays to `char**`, which discards qualifiers in the nested pointee
+    // (-Wincompatible-pointer-types-discards-qualifiers).
+    this.line('static ASC_TLS const char* parts[3]; parts[0] = "Error #1123: Filter operator not supported on type "; parts[1] = fqn; parts[2] = ".";');
     this.line('as_throw(TypeError_new(as_str_concat_n(3, parts), 1123));');
     this.line('return as_v_null();');
     this.indent--;
@@ -8369,6 +8372,15 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // for anonymous function expressions (typed body + thunk). Capturing closures
   // additionally get an environment struct, a heap-allocating constructor, and
   // an impl that takes the environment as its first argument.
+  // A non-void C function must not reach its closing brace, or clang warns
+  // `-Wreturn-type` and the caller reads garbage. For an UNTYPED (`*`) function
+  // AS3 defines the fall-through value as `undefined`, so the body ends with an
+  // explicit `return as_v_undefined();`; a TYPED body that can fall through was
+  // already rejected by checkAllPathsReturn (symbols.ts), exactly as mxmlc does.
+  private emitFunctionBodyEnd(body: Block, ret: CType): void {
+    if (ret.kind === 'any' && stmtCompletesNormally(body)) this.line('return as_v_undefined();');
+  }
+
   private emitFunctionValues(): void {
     for (const [fname, f] of this.symbols.funcs) {
       this.emitThunk(`${this.freeCName(fname)}__call`, this.freeCName(fname), f.params, f.returnType, null, null, undefined, this.fnQName(null, fname));
@@ -8630,6 +8642,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.currentFuncAsName = fn.asName;
       this.currentFuncArity = this.requiredArity(fn.params);
       this.emitBlockBody(fn.body);
+      this.emitFunctionBodyEnd(fn.body, rt);
       this.currentFuncCName = null;
       this.currentFuncAsName = null;
       this.currentFuncArity = 0;
@@ -32677,6 +32690,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
+          this.emitFunctionBodyEnd(m.body, returnType);
           this.indent--;
           this.line('}');
           this.line('');
@@ -32688,6 +32702,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
+          this.emitFunctionBodyEnd(m.body, returnType);
           this.indent--;
           this.line('}');
           this.line('');
@@ -32698,6 +32713,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
+          this.emitFunctionBodyEnd(m.body, returnType);
           this.indent--;
           this.line('}');
           this.line('');
@@ -32709,6 +32725,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
+          this.emitFunctionBodyEnd(m.body, returnType);
           this.indent--;
           this.line('}');
           this.line('');
@@ -32720,6 +32737,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
+          this.emitFunctionBodyEnd(m.body, returnType);
           this.indent--;
           this.line('}');
           this.line('');
@@ -32731,6 +32749,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
           this.emitBlockBody(m.body);
+          this.emitFunctionBodyEnd(m.body, returnType);
           this.indent--;
           this.line('}');
           this.line('');
@@ -32760,6 +32779,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.emitClosureCellLocals();
       this.emitArgsIfUsed(stmt.body, stmt.params);
       this.emitBlockBody(stmt.body);
+      this.emitFunctionBodyEnd(stmt.body, f.returnType);
       this.indent--;
       this.line('}');
       this.line('');
@@ -33305,7 +33325,21 @@ void FileStream_writeObject(void* _this, as_value v) {
         // A write-barrier field assignment's comma expression carries a value that
         // is intentionally discarded in statement position; (void) silences clang's
         // -Wunused-value while the value stays for chained-assignment contexts.
-        this.line(e.discard ? `(void)(${e.code});` : `${e.code};`);
+        // A sequenced expression (`sequenceValueExpr` prepends side-effect statements
+        // and joins the value with commas) has the same problem: its tail is a temp
+        // read nobody wants, which clang reports as "expression result unused" --
+        // including when the discarded operand is a void call ("left operand of
+        // comma operator has no effect").
+        // A statement whose expression only READS values (a bare `i;`, a cast or a
+        // `?:` of pure parts) has nothing to do; the value is unused, and clang
+        // says so ("expression result unused", "should this cast be to 'void'?").
+        // A `?:` statement (and an `is`/`as` statement) is a value expression with
+        // nothing to store; its branches may still carry side effects (a sequencer
+        // temp, a setter call), so the cast is what tells clang the value is
+        // deliberately dropped.
+        const valueOnlyStmt = stmt.expr.kind === 'Conditional' || stmt.expr.kind === 'As' || stmt.expr.kind === 'Is';
+        const voidCast = e.discard || this.isCommaExprText(e.code) || valueOnlyStmt || this.isPureExpr(stmt.expr);
+        this.line(voidCast ? `(void)(${e.code});` : `${e.code};`);
         this.discardedExprNode = outerDiscarded;
         break;
       }
@@ -33317,7 +33351,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'If': {
         this.sequenceValueExpr(stmt.cond, true, true);
         const c = this.emitExpr(stmt.cond);
-        this.line(`if (${this.condExpr(c)}) {`);
+        this.line(`if ${this.clauseParens(this.condExpr(c))} {`);
         this.indent++;
         this.emitStmt(stmt.then);
         this.indent--;
@@ -33831,7 +33865,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     const c = this.emitExpr(stmt.cond);
     if (prelude.length === 0) {
       this.continueTargets.push({ depth, label: null, used: false });
-      this.line(`while (${this.condExpr(c)}) {`);
+      this.line(`while ${this.clauseParens(this.condExpr(c))} {`);
       this.indent++;
       this.emitStmt(stmt.body);
       if (continueLabel) this.line(`${continueLabel}: ;`);
@@ -33868,7 +33902,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.emitStmt(stmt.body);
       if (continueLabel) this.line(`${continueLabel}: ;`);
       this.indent--;
-      this.line(`} while (${this.condExpr(c)});`);
+      this.line(`} while ${this.clauseParens(this.condExpr(c))};`);
       this.continueTargets.pop();
       this.breakTargets.pop();
       return;
@@ -33922,6 +33956,9 @@ void FileStream_writeObject(void* _this, as_value v) {
         // regardless of valueCtx.
         this.sequenceValueExpr(stmt.init.expr, false, true);
         init = this.emitExpr(stmt.init.expr).code;
+        // `for (i; …)`: the init slot is an expression statement too, so a pure
+        // read there is discarded exactly like a statement body's.
+        if (this.isPureExpr(stmt.init.expr)) init = `(void)(${init})`;
       }
     }
     // The condition and update run *per iteration*; their preludes are captured
@@ -33934,7 +33971,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (condPrelude.length === 0 && updPrelude.length === 0) {
       this.continueTargets.push({ depth, label: null, used: false });
       const update = stmt.update ? this.emitExpr(stmt.update).code : '';
-      this.line(`for (${init}; ${cond}; ${update}) {`);
+      this.line(`for (${init}; ${cond ? this.clauseParens(cond) : ''}; ${update}) {`);
       this.indent++;
       this.emitStmt(stmt.body);
       if (continueLabel) this.line(`${continueLabel}: ;`);
@@ -35008,6 +35045,22 @@ void FileStream_writeObject(void* _this, as_value v) {
       (classish(a) && primish(b)) || (classish(b) && primish(a));
   }
 
+  // The value a C function of this type hands back when it has no real result:
+  // used only by the index switch's provably-unreachable `default:` label (see
+  // emitSwitchChained), where clang cannot prove exhaustiveness by itself.
+  private zeroValueCode(t: CType): string {
+    switch (t.kind) {
+      case 'interface': return `(${this.cTypeName(t)}){0}`;
+      case 'any': return 'as_v_null()';
+      case 'number': return '0.0';
+      case 'bool': return 'false';
+      case 'int': case 'uint': return '0';
+      case 'int64': case 'uint64': return '0';
+      case 'void': return '';
+      default: return 'NULL';
+    }
+  }
+
   // Non-integer switch (string/Number/bool) lowers to an if/else chain using strict
   // equality. Each case is an independent branch, so `break` inside is suppressed.
   // A switch that cannot become a native C `switch`: a non-integer discriminant,
@@ -35046,7 +35099,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         ? `as_v_seq(${this.boxExpr(disc)}, ${this.boxExpr(test)})`
         : this.emitEquality(disc, test, '==');
       const kw = i === 0 ? 'if' : 'else if';
-      this.line(`${kw} (${cond}) ${tmp} = ${i + 1};`);
+      this.line(`${kw} ${this.clauseParens(cond)} ${tmp} = ${i + 1};`);
     }
     // No label matched: the default body's index, or 0 (skip the whole switch).
     this.line(`else ${tmp} = ${def ? cases.length + 1 : 0};`);
@@ -35064,6 +35117,16 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.indent++;
       for (const s of def.body) this.emitStmt(s);
       this.indent--;
+    }
+    // The chain above assigns the index one of exactly these labels, so this
+    // `default` can never be taken -- clang's control-flow analysis just cannot
+    // prove it, and without a default label a switch whose every case returns was
+    // still reported as "control reaches end of non-void function". Only emitted
+    // when the enclosing C function returns a value; in a void function there is
+    // nothing to hand back.
+    const ret = this.currentReturnType;
+    if (def && ret !== null && ret.kind !== 'void') {
+      this.line(`default: return ${this.zeroValueCode(ret)};`);
     }
     this.indent--;
     this.line('}');
@@ -35274,6 +35337,17 @@ void FileStream_writeObject(void* _this, as_value v) {
         return this.isPureExpr(e.operand);
       case 'Typeof':
         return this.isPureExpr(e.operand);
+      // A conditional evaluates its condition and exactly ONE branch, so it is
+      // side-effect-free iff every part is. (Needed so a discarded `a ? b : c;`
+      // statement -- and a logical assignment whose RHS is a conditional -- is
+      // recognized as pure.)
+      case 'Conditional':
+        return this.isPureExpr(e.cond) && this.isPureExpr(e.then) && this.isPureExpr(e.else);
+      // `is` / `as` only inspect the operand (no throw, no allocation that is
+      // observable), so they are pure when the operand is.
+      case 'Is':
+      case 'As':
+        return this.isPureExpr(e.obj);
       case 'Binary': {
         // Arithmetic/comparison/bitwise AND logical `&&`/`||` are all pure (no
         // side effects) when both operands are. Even though `&&`/`||` short-circuit,
@@ -35929,6 +36003,18 @@ void FileStream_writeObject(void* _this, as_value v) {
         // declaration lands ahead of it — and deliberately left uninitialized, so
         // the branch that is not taken leaves no side effect behind.
         if (expr.target.kind === 'Index') {
+          // Statement position (`x[i]++;`): the pre-increment value is unobservable,
+          // so emit just the read-modify-write store. Keeping the scratch temp and
+          // the trailing value left clang reporting the unused temp inside the
+          // discarded comma chain ("left operand of comma operator has no effect").
+          if (this.discardedExprNode !== null && this.discardedExprNode === expr) {
+            const synth = this.indexUpdateStore(expr.target, expr.op);
+            const saved = this.discardedExprNode;
+            this.discardedExprNode = synth;
+            const code = this.emitAssign(synth).code;
+            this.discardedExprNode = saved;
+            return { code, type: { kind: 'number' } };
+          }
           const num: CType = { kind: 'number' };
           const sign = expr.op === '++' ? '+' : '-';
           const t = this.tmpName('upd');
@@ -36632,6 +36718,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     // comparison
     if (op === '==' || op === '!=' || op === '===' || op === '!==') {
       const strict = op === '===' || op === '!==';
+      // A PRIMITIVE is never null. AS3's `==` against null matches only null/
+      // undefined, so `false == null` and `0 == null` are both FALSE (adl 51.4.1,
+      // temp/warnprobe/adl: bf==null false, i==null false, nan==null false). The
+      // plain C compare we used to emit says the opposite -- `false == NULL` is
+      // TRUE in C, so a guard like `if (!(this->flag == null))` inverted its
+      // branch -- and `0.0 == NULL` is not even valid C ("invalid operands to
+      // binary expression ('double' and 'void *')"), which broke compilation of
+      // any `Number == null` source. Fold instead, keeping the operand's side
+      // effects (`f() == null` must still call f).
+      const nullTyped = (t: CType) => t.kind === 'null';
+      const primitive = (t: CType) =>
+        t.kind === 'int' || t.kind === 'uint' || t.kind === 'number' || t.kind === 'bool' ||
+        t.kind === 'int64' || t.kind === 'uint64';
+      if (nullTyped(l.type) !== nullTyped(r.type)) {
+        const prim = nullTyped(l.type) ? r : l;
+        if (primitive(prim.type)) {
+          const pure = this.isPureExpr(nullTyped(l.type) ? expr.right : expr.left);
+          const result = (op === '!=' || op === '!==') ? 'true' : 'false';
+          return { code: pure ? result : `((${prim.code}), ${result})`, type: { kind: 'bool' } };
+        }
+      }
       if (this.needsDynamicEquality(l.type, r.type)) {
         // Strict equality (`===`/`!==`) dispatches on tag only; loose (`==`/`!=`)
         // is ES3 Abstract Equality (undefined == null, and a String/Boolean
@@ -37139,7 +37246,17 @@ void FileStream_writeObject(void* _this, as_value v) {
         throw new CodegenError(`logical assignment ${expr.op} needs a side-effect-free receiver and index`);
       }
       const read = this.emitExpr(target);
-      const write = this.emitAssign({ ...expr, op: '=' });
+      // In STATEMENT position nothing observes the short-circuit value, so neither
+      // the re-read that carries it ("left operand of comma operator has no effect"
+      // -- clang's wording for the scratch temp the store leaves behind) nor the
+      // temp itself is needed. Emitting the bare store there is what `x[i] ||= 0;`
+      // (com.hurlant's MD5 buffer hole-filling) and `x[i] &&= 2;` ask for.
+      const discarded = this.discardedExprNode !== null && this.discardedExprNode === expr;
+      const synth = { ...expr, op: '=' };
+      const savedDiscard = this.discardedExprNode;
+      if (discarded) this.discardedExprNode = synth;
+      const write = this.emitAssign(synth);
+      this.discardedExprNode = savedDiscard;
       const truthy = this.condExpr(read);
       // The element setters report the element's AS3 type but their C helpers return
       // void (as_vector_*_set / as_array_set / ByteArray_set_index), so the store is
@@ -37147,7 +37264,11 @@ void FileStream_writeObject(void* _this, as_value v) {
       // repeatable) and the value read back IS the value just stored. The RHS still
       // appears exactly once (inside write.code); the only cost is one extra element
       // read for the dynamic forms, whose setters do return a value.
-      const writeVal = `(${write.code}, ${read.code})`;
+      // In STATEMENT position the short-circuit value is thrown away, so the
+      // re-read is pure noise -- and clang reports the trailing element read as
+      // "left operand of comma operator has no effect" (`x[i] ||= 0;` is the
+      // hole-filling idiom com.hurlant's MD5 opens its buffer with).
+      const writeVal = discarded ? write.code : `(${write.code}, ${read.code})`;
       if (expr.op === '||=') {
         return { code: `(${truthy} ? ${read.code} : ${writeVal})`, type: read.type, discard: true };
       }
@@ -40017,11 +40138,17 @@ void FileStream_writeObject(void* _this, as_value v) {
   // as_cap_version); the AS-AOT marker is `manufacturer` = "AS-AOT". os/
   // cpuArchitecture use #ifdef; screenResolution* are
   // 0 in headless builds (no SDL2 window backend) and the real display otherwise.
+  // A String-typed slot is `char*` in the emitted C, so the three helpers that
+  // return `const char*` (as_cap_os/as_cap_cpu_arch/as_cap_language — they hand
+  // back stable literals or GC strings the caller never writes) are cast at this
+  // boundary; without it every `Capabilities.os` read emitted a function whose
+  // declared result type discarded qualifiers
+  // (-Wincompatible-pointer-types-discards-qualifiers).
   private emitCapabilitiesConst(name: string): { code: string; type: CType } {
     switch (name) {
       case 'version': return { code: 'as_cap_version()', type: { kind: 'string' } };
-      case 'os': return { code: 'as_cap_os()', type: { kind: 'string' } };
-      case 'cpuArchitecture': return { code: 'as_cap_cpu_arch()', type: { kind: 'string' } };
+      case 'os': return { code: '(char*)as_cap_os()', type: { kind: 'string' } };
+      case 'cpuArchitecture': return { code: '(char*)as_cap_cpu_arch()', type: { kind: 'string' } };
       case 'cpuAddressSize': return { code: '(int)(sizeof(void*) * 8)', type: { kind: 'int' } };
       case 'supports64BitProcesses': return { code: '(sizeof(void*) == 8)', type: { kind: 'bool' } };
       case 'supports32BitProcesses': return { code: '(sizeof(void*) == 4)', type: { kind: 'bool' } };
@@ -40029,7 +40156,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'manufacturer': return { code: '"AS-AOT"', type: { kind: 'string' } };
       case 'isDebugger': return { code: 'false', type: { kind: 'bool' } };
       case 'touchscreenType': return { code: '"none"', type: { kind: 'string' } };
-      case 'language': return { code: 'as_cap_language()', type: { kind: 'string' } };
+      case 'language': return { code: '(char*)as_cap_language()', type: { kind: 'string' } };
       // languages: the preferred-language list, most preferred first (an Array of
       // BCP-47 strings whose first entry is the same as `language`). Read from the
       // system locale like `language` — see as_cap_languages in runtime.ts.
@@ -41977,6 +42104,69 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   // Turn an expression that must denote an Array into the `as_array*` C code
+  // True when the whole C text is ONE parenthesized group, i.e. `(a == b)` but
+  // not `(char*)(p)` or `f(x)`. Quoted segments are skipped so a string literal
+  // containing a paren cannot desync the depth count. Shared by clauseParens and
+  // isCommaExprText, which both need the same notion of "a wrapper".
+  private isSingleGroup(code: string): boolean {
+    if (code.length < 2 || code[0] !== '(' || code[code.length - 1] !== ')') return false;
+    let depth = 0;
+    for (let i = 0; i < code.length; i++) {
+      const ch = code[i];
+      if (ch === '"' || ch === '\'') {
+        const q = ch;
+        for (i++; i < code.length; i++) {
+          if (code[i] === '\\') { i++; continue; }
+          if (code[i] === q) break;
+        }
+        continue;
+      }
+      if (ch === '(') depth++;
+      else if (ch === ')') {
+        depth--;
+        // A group that closes before the end (`(char*)(p)`, `(f())(x)`) is not a
+        // wrapper for the whole text.
+        if (depth === 0) return i === code.length - 1;
+      }
+    }
+    return false;
+  }
+
+  // The parentheses a clause (`if`, `while`, `for`'s middle slot, a switch's
+  // `else if`) needs around a condition. Emitted condition text often already IS
+  // one fully parenthesized group -- every comparison comes back as `(a == b)` --
+  // and wrapping it again produces `if ((a == b))`, which clang reports as
+  // -Wparentheses-equality ("equality comparison with extraneous parentheses").
+  // Strip ONE redundant balanced outer layer instead of adding a second.
+  private clauseParens(code: string): string {
+    return this.isSingleGroup(code) ? code : `(${code})`;
+  }
+
+  // True when the code is a C comma expression, whose VALUE is discarded in
+  // statement position. clang then complains about the leftover temp
+  // ("expression result unused", or "left operand of comma operator has no
+  // effect" when that operand is a void call); a `(void)` cast on the whole
+  // statement is what silences it, which the ExprStmt emitter does.
+  private isCommaExprText(code: string): boolean {
+    const text = this.isSingleGroup(code) ? code.slice(1, -1) : code;
+    let depth = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === '"' || ch === '\'') {
+        const q = ch;
+        for (i++; i < text.length; i++) {
+          if (text[i] === '\\') { i++; continue; }
+          if (text[i] === q) break;
+        }
+        continue;
+      }
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') depth--;
+      else if (ch === ',' && depth === 0) return true;
+    }
+    return false;
+  }
+
   // needed to index or mutate it. Accepts a statically-typed Array or a
   // dynamically-typed (`any`) value that is an array at runtime.
   private arrayTarget(obj: { code: string; type: CType }): string {

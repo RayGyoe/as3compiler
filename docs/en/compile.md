@@ -498,8 +498,9 @@ exactly this shape):
 ```
 
 > The `frameworks` field is equivalent to the CLI's `--framework` (links `-framework <name>`). `libz.a` has
-> the same name as the system `libz`, and a static hit is ensured by **library search-path order** (you may
-> see a `ld: warning: ignoring duplicate libraries: '-lz'` notice, with no side effects). Acceptance
+> the same name as the system `libz`, and a static hit is ensured by **library search-path order**. When a
+> manifest names `z`, the fixed link table's `-lz` is **dropped** (the manifest's position wins), so the
+> `ld: warning: ignoring duplicate libraries: '-lz'` notice no longer appears (stage 364). Acceptance
 > criterion: the output of `otool -L` **should not** contain `libcurl.4.dylib`/`libz.dylib`.
 > **The default build (not declaring these macros/libraries) is entirely unaffected.**
 

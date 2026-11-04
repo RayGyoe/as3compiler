@@ -41,6 +41,12 @@ ActionScript source (.as)
 when implementing heavy lifting such as graphics (skia/cairo/SDL), the correct approach is to **link** mature libraries (`-lskia`) rather than hand-rolling rasterization.
 See "Build & Linking" and AGENTS.md §2.9.
 
+"Readable" is not only about layout: a real 414k-line product file now compiles with **0 warnings**
+under clang's **default** warning set (it used to produce 725). Every one of those used to mark a place
+translated into C rather than into AS3 -- `false == null` has the opposite truth value in C and
+`Number == null` does not even compile -- so the fix belongs in the emitter, not in a `-Wno-*` flag.
+Per-item rationale: [`docs/en/as3-semantics.md`](docs/en/as3-semantics.md) §3.10.
+
 ## Running
 
 Install (gives the `as-aot` command): `npm install -g as3compiler` (or locally `npm link`).

@@ -39,6 +39,11 @@ ActionScript 源码 (.as)
 实现图形（skia/cairo/SDL）等重活时，正确做法是把成熟库**链接**进来（`-lskia`），而不是自研光栅化。
 参见「构建与链接」与 AGENTS.md §2.9。
 
+「可读」不只是排版：一份 41 万行的真实产物在 `clang -O2` 的**默认警告集**下现在是 **0 条警告**
+（曾 725 条）。以前每一条都指向「翻成了 C 而不是 AS3」的地方，其中 `false == null` 的真值相反、
+`Number == null` 根本编不过——这类必须**改发射器**，不是加 `-Wno-*`。逐项依据见
+[`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3.10。
+
 生成的 C 里，**与宿主符号撞名的 AS3 顶层函数会自动改名**（只改 C 符号，AS3 侧可见名一字不动）：
 `function log()` → `log__`（撞 `<math.h>`）、`function bind()` → `bind__`（撞 socket 的 `bind(2)`）、
 `function max()` → `max__`（撞 Windows 的 `#define max(a,b)`）。判据表由 `scripts/gen-c-reserved.ts`

@@ -91,12 +91,12 @@ function checkFqnStaticClassRef(): string[] {
   // ---- writes: static field (plain + compound) and a static setter ----
   const wr = body('C.field = 60;\npkg.C.field = 61;');
   check('static field write: both spellings emit the same direct store',
-    wr.includes('(pkg_C_cinit(), pkg_C_field = 60);') && wr.includes('(pkg_C_cinit(), pkg_C_field = 61);')
+    wr.includes('(void)((pkg_C_cinit(), pkg_C_field = 60));') && wr.includes('(void)((pkg_C_cinit(), pkg_C_field = 61));')
     && !dynamic(wr));
 
   const compd = body('pkg.C.field += 5;');
   check('static field compound assignment: FQN folds in the same direct read/write',
-    compd.includes('(pkg_C_cinit(), pkg_C_field = ((pkg_C_cinit(), pkg_C_field) + 5));') && !dynamic(compd));
+    compd.includes('(void)((pkg_C_cinit(), pkg_C_field = ((pkg_C_cinit(), pkg_C_field) + 5)));') && !dynamic(compd));
 
   const setter = body('C.s = 3;\npkg.C.s = 4;');
   check('static setter: both spellings call the same static setter',

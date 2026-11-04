@@ -668,7 +668,7 @@ function checkMemberShadow(): string[] {
     setterOnly = generateC(parse('class T extends Sprite { public function set y(v:Number):void { if (y == v) return; } }')).c;
   } catch (e) { threw = String((e as Error).message); }
   check('a setter-only override does not hide the inherited field on a read',
-    threw === '' && setterOnly.includes('if ((this->y == v)) {'));
+    threw === '' && setterOnly.includes('if (this->y == v) {'));
   check('...while the setter itself is still emitted for writes',
     setterOnly.includes('static void T_set_y(void* _this, double v) {')
     && setterOnly.includes('{ "y", T_set_y__dyn, 0, "Number" },'));

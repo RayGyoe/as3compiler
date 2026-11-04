@@ -465,8 +465,9 @@ as-aot app.as --air-app app.xml -D ASC_USE_SVG=1
 ```
 
 > `frameworks` 字段等价于 CLI 的 `--framework`（链接 `-framework <名>`）。`libz.a` 与系统 `libz`
-> 同名，靠**库搜索路径顺序**保证静态命中（可能看到 `ld: warning: ignoring duplicate libraries: '-lz'`
-> 的提示，无副作用）。验收口径：`otool -L` 的输出里**不应**出现 `libcurl.4.dylib`/`libz.dylib`。
+> 同名，靠**库搜索路径顺序**保证静态命中。清单写了 `z` 时，固定链接表里的 `-lz` 会被**去掉**（保留清单
+> 那一个位置），所以不再出现 `ld: warning: ignoring duplicate libraries: '-lz'`（阶段三百六十四）。
+> 验收口径：`otool -L` 的输出里**不应**出现 `libcurl.4.dylib`/`libz.dylib`。
 > **默认构建（不声明这些宏/库）完全不受影响**。
 
 #### 3.4.5 菜单栏状态项（`tray` / `ASC_USE_TRAY`）

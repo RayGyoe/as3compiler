@@ -373,6 +373,50 @@ hole in `new Array(n)` are all `undefined` on AIR (`u === undefined` is true), w
 stays `null`; that difference decides whether `var x:Object; x.foo` raises `#1009` or `#1010`.
 
 
+### 3.10 Generated C compiles with zero default warnings (stage 364, clang default diagnostics + mxmlc 51.4.1)
+
+A real 414k-line product file (`bin-aot/TalkMED Meeting.c`) produced **725 warnings** under plain
+`clang -O2`. None of them was noise: every **default-on** diagnostic
+(`-Wparentheses-equality`, `-Wreturn-type`, `-Wunused-value`, `-Wnull-character`,
+`-Wpointer-integer-compare`, `-Wmacro-redefined`) marked a place where we translated into C
+semantics instead of AS3 semantics, and two of them hid real bugs (`false == null` has the opposite
+truth value in C, and `Number == null` does not compile at all). The fix therefore lives in the
+emitter, not in a `-Wno-*` flag.
+
+725 -> **0** (what remains in a build log is this compiler's own SWC bake notes, not C warnings).
+
+| Warning | Count | Root cause | Fix |
+|---|---|---|---|
+| `-Wparentheses-equality` | 650 | the clause condition already carries its own parentheses, and we added another -> `if ((a == b))` | emit a clause only after checking whether the text is already a single balanced group |
+| `-Wpointer-integer-compare` | 38 | `false == null` / `1 == null` became C's `false == NULL` (opposite truth) and `0.0 == NULL` (a **compile error**) | when one side is a `null` literal and the other a primitive, **constant-fold** (AS3: a primitive never equals `null`/`undefined`; measured on adl: `bf==null` false, `i==null` false, `n==null` false), keeping side effects as `((expr), false)` |
+| `-Wreturn-type` | 114 | ① a typed function can reach `}`; ② an untyped one (SWC frame scripts return `any`) falls off the end; ③ an indexed `switch` lowered to an `if/else` chain has no `default` | ① reject at compile time with **mxmlc's own rule** (below); ② append `return as_v_undefined();`; ③ append `default: return <zero>;` in non-void functions (the chain always matches; clang just cannot prove it) |
+| `-Wunused-value` | 30 | in statement position the value is discarded, yet a temp was still materialised: `x[i]++`, `x[i] ||= v`, `x[i] &&= v`, `?:` statements, pure reads, a `for (i; …)` init clause | statement position takes the **discard path** (one bare store, no temp, no element re-read); `?:`/pure-read statements and `for` inits get a `(void)` cast |
+| `-Wnull-character` | 5 | a TS source `'\0'` was written with one backslash, so the generated C carried a **real NUL byte** inside a char literal | spell it with two characters |
+| `-Wincompatible-pointer-types-discards-qualifiers` | 2 | `Capabilities` is implemented with `const char*` while the AS3 side holds `char*` | explicit `(char*)` cast; the concat array becomes `const char* parts[]` (`as_str_concat_n` takes `const char**`) |
+| `-Wmacro-redefined` | 3 | one translation unit defined two same-named macros with different meanings (keyboard modifier bits vs AppKit's `NSEventModifierFlag`) | renamed the latter to `SK_KEM_*` |
+
+**The acceptance set for "a non-void function must return on every path" is copied verbatim from
+mxmlc** (`temp/warnprobe/mxmlcchk/RL1..RL8`):
+
+- falling off the end after `if (x) { return 1; }`, or a `switch` with no `default` -> **error**
+  (mxmlc: 「函数没有返回值。」);
+- `try { return } catch { return }`, and a `switch` whose `default: throw`s -> **accepted**;
+- loops are **asymmetric**, and that asymmetry must be copied too: `for (;;)` (condition omitted)
+  counts as "never falls through" and is accepted, while `while (true) {}`, `do {} while (true)` and
+  `for (; true; )` are all **errors** -- the reference compiler does not reason about loop
+  conditions, and accepting `while (true)` would mean compiling a program mxmlc refuses;
+- untyped and `*`/`any` returns are **exempt** (AS3 defines falling off the end as `undefined`) and the
+  emitter appends `return as_v_undefined();`, so C no longer reads a stale register.
+
+The link-time `ld: warning: ignoring duplicate libraries: '-lz'` is gone as well: an `--air-app`
+manifest names `z` while the fixed link table also passes `-lz`; the dedupe **keeps the manifest's**,
+because its position is what the user asked for.
+
+Regression pins: `test/unit/c-warnings.ts` (all the shapes above in one program, compiled with clang's
+**default** warning set, asserting zero warnings -- `-Wall` is deliberately not used, or the runtime's
+C89 struct initialisers would dominate the report) and `r1..r9` in `test/unit/diagnostics.ts` for the
+return-path acceptance set.
+
 ## 4. Fidelity and Enhancement Principles
 
 §2's red lines and §3's divergence points both answer "**how to align with AIR**". This section supplies the

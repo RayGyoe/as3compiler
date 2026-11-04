@@ -4290,7 +4290,10 @@ function checkEmitSystemTrayIcon(): string[] {
   const winGlue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
   check('the app/Dock menus use the same measured table',
     winGlue.includes('sk_menu_apply_mods(item, items[k].mods);')
-    && winGlue.includes('#define SK_MOD_CTRL    (1UL << 18)')
+    // Renamed to SK_KEM_* at stage 364: the same translation unit also defines
+    // SK_MOD_CTRL/SK_MOD_SHIFT for KeyboardEvent modifier bits, and two macros with
+    // one name and two meanings is a -Wmacro-redefined warning.
+    && winGlue.includes('#define SK_KEM_CTRL    (1UL << 18)')
     && !winGlue.includes('not mapped to NSEventModifierFlags yet'));
 
   check('the non-Cocoa build still defines all four seams',

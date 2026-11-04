@@ -410,7 +410,39 @@ function checkCodegenDiagnostics(): string[] {
   const okXml = thrown(() => generateC(parse('var x:XML = <a/>;\nvar s:String = x;')));
   check('XML implicitly stringifies (measured: mxmlc allows it)', okXml === null);
 
-  const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2, s1, s2, c1, c2, c3, c4, c5];
+  // A non-void function that can reach its closing brace is rejected here because
+  // mxmlc rejects it ("函数没有返回值。"), and because emitting it means returning
+  // whatever the register happens to hold (-Wreturn-type's complaint). Every
+  // acceptance/rejection below was measured on mxmlc 51.4.1
+  // (temp/warnprobe/mxmlcchk/RL1..RL8), including the asymmetric loop rule: an
+  // OMITTED `for` condition is the only infinite loop the reference compiler
+  // believes; `while (true)`, `do … while (true)` and `for (; true; )` are all
+  // errors.
+  const r1 = gen('function f(x:Boolean):int { if (x) { return 1; } }');
+  check('a non-void function that can fall off the end is rejected',
+    r1?.message === "Codegen error at 1:1: function 'f' must return a value on every path (the return type is int, and this body can reach its closing brace)");
+  const r2 = gen('class A { public function get v():Number { if (this.v == null) { return 0; } } }');
+  check('...and a class getter is named with its kind',
+    r2?.message === "Codegen error at 1:11: function  getter 'v' of 'A' must return a value on every path (the return type is Number, and this body can reach its closing brace)");
+  const r3 = gen('function f(x:int):int { while (true) { } }');
+  check('`while (true) { }` is an error, exactly as mxmlc (RL1) says',
+    r3 !== null);
+  const r4 = gen('function f(x:int):int { for (;;) { } }');
+  check('an omitted `for` condition is NOT (mxmlc accepts it, RL5)', r4 === null);
+  const r5 = gen('function f(x:int):int { switch (x) { case 1: return 1; } }');
+  check('a switch without a default can fall through (mxmlc, Sw1.as)', r5 !== null);
+  const r6 = gen('function f(x:int):int { switch (x) { case 1: return 1; default: throw new Error("x"); } }');
+  check('a switch whose default throws does NOT (mxmlc accepts it, RL8)', r6 === null);
+  const r7 = gen('function f(x:int):int { try { return 1; } catch (e:Error) { return 2; } }');
+  check('try/catch with both arms returning passes (mxmlc, RL2)', r7 === null);
+  // Untyped / `*` bodies are exempt: AS3 defines falling off the end as
+  // `undefined`, and the emitter appends `return as_v_undefined();` for them.
+  const r8 = gen('function f(x:Boolean) { if (x) { trace(1); } }');
+  check('an untyped function may fall off the end (returns undefined)', r8 === null);
+  const r9 = gen('function f(x:Boolean):* { if (x) { trace(1); } }');
+  check('a `*`-typed function may too', r9 === null);
+
+  const all = [g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g12, g13, gi2, gi3, gi4, t1, t2, t3, t4, t5, t6, t7, t8, t9, i1, i2, s1, s2, c1, c2, c3, c4, c5, r1, r2, r3, r5];
   check('every CodegenError carries a numeric line and col',
     all.every((e) => e !== null && typeof e.line === 'number' && typeof e.col === 'number')
     && all.every((e) => /^Codegen error at \d+:\d+: /.test(e!.message)));

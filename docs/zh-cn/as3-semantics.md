@@ -445,6 +445,43 @@ true、`"name"` 为 false），`toString()` 是常量 `"function Function() {}"`
 在 AIR 上都是 `undefined`（`u === undefined` 为 true），而 `Object` 类型仍是 `null`；这个差别决定
 `var x:Object; x.foo` 报 `#1009` 还是 `#1010`。
 
+### 3.10 生成 C 的默认警告集归零（阶段三百六十四 · clang 默认诊断 + mxmlc 51.4.1 实测）
+
+一份 41.4 万行的真实产物（`bin-aot/TalkMED Meeting.c`）用 `clang -O2` 编译时报了 **725 条警告**。它们
+不是噪声：**默认打开的**诊断（`-Wparentheses-equality`、`-Wreturn-type`、`-Wunused-value`、
+`-Wnull-character`、`-Wpointer-integer-compare`、`-Wmacro-redefined`）每一条都指向一处我们「翻译得像
+C、而不是像 AS3」的地方，其中两条背后是**真的语义 bug**（`false == null` 的真值相反、`Number == null`
+根本编不过）。所以处理方式是**改发射器**，不是加 `-Wno-*`。
+
+修完的账：725 → **0**（剩下的是本编译器自己的 SWC 烘焙说明，不是 C 编译警告）。
+
+| 警告 | 数量 | 根因 | 修法 |
+|---|---|---|---|
+| `-Wparentheses-equality` | 650 | 子句条件本身带括号（`(a == b)`），我们又包一层 → `if ((a == b))` | 发射子句前先看整段是否已是**单个平衡括号组**，是就不再加括号 |
+| `-Wpointer-integer-compare` | 38 | `false == null` / `1 == null` 被直译成 C 的 `false == NULL`（真值相反）与 `0.0 == NULL`（**编译错误**） | 一侧是 `null` 字面量、另一侧是原始类型时**折成常量**（AS3 语义：原始值与 `null`/`undefined` 恒不相等，`adl` 实测 `bf==null → false`、`i==null → false`、`n==null → false`），副作用非纯时保留 `((expr), false)` |
+| `-Wreturn-type` | 114 | ① 有返回类型的函数能落到 `}`；② 未类型化函数（含 SWC 帧脚本，返回 `any`）落空；③ 索引 `switch` 的链式 `if/else` 缺 `default` | ① 按 **mxmlc 同一条规则**在编译期报错（见下）；② 补 `return as_v_undefined();`；③ 非 void 函数补 `default: return <零值>;`（链上必然命中，clang 只是证不出穷尽） |
+| `-Wunused-value` | 30 | 语句位置的值被丢掉，却仍造了中间量：`x[i]++`、`x[i] ||= v`、`x[i] &&= v`、`?:` 语句、纯读取语句、`for (i; …)` 的初始化子句 | 语句位置走**丢弃路径**（只发一句 store，不造 temp、不重复读元素），`?:`/纯读取语句加 `(void)`，`for` 初始化加 `(void)(…)` |
+| `-Wnull-character` | 5 | TS 源码里的 `'\0'` 写成单反斜杠，生成的 C 里是**真的 NUL 字节**塞进 char 字面量 | 改成双反斜杠，生成 `'\0'` 两个字符 |
+| `-Wincompatible-pointer-types-discards-qualifiers` | 2 | `Capabilities` 的实现返回 `const char*`，而 AS3 侧字段是 `char*` | 显式转 `(char*)`；拼接数组改 `const char* parts[]`（`as_str_concat_n` 收 `const char**`） |
+| `-Wmacro-redefined` | 3 | 同一个翻译单元里两组同名宏，含义不同（键盘修饰位 vs AppKit 的 `NSEventModifierFlag`） | 后者更名 `SK_KEM_*` |
+
+**「非 void 函数必须每条路径都返回值」的接受集与 mxmlc 逐字对齐**（`temp/warnprobe/mxmlcchk/RL1..RL8`）：
+
+- `if (x) { return 1; }` 之后落到 `}`、`switch` 没有 `default` → **报错**（mxmlc：「函数没有返回值。」）；
+- `try { return } catch { return }`、`switch` 的 `default: throw` → **接受**；
+- 循环这条**不对称**，且必须照抄：`for (;;)`（省略条件）算「永不落下」而接受，而 `while (true) {}`、
+  `do {} while (true)`、`for (; true; )` **一律报错** —— 参考编译器根本不推理循环条件，我们若自作聪明
+  接受 `while (true)`，就是在编译 `mxmlc` 拒绝的程序；
+- 未类型化与 `*`/`any` 返回的函数**豁免**（AS3 定义落空为 `undefined`），发射器补 `return as_v_undefined();`
+  让 C 不再读脏栈。
+
+链接侧的 `ld: warning: ignoring duplicate libraries: '-lz'` 也一并消掉：`--air-app` 的清单自带 `z`，
+固定链接表里又有 `-lz`，去重时**保留清单写的那一个**（位置是用户的意思）。
+
+回归钉子：`test/unit/c-warnings.ts`（把上述全部形态编进一支程序，用 clang **默认警告集**编译，断言
+零警告；`-Wall` 刻意不用，否则会撞上运行时的 C89 结构初始化器噪声）、`test/unit/diagnostics.ts`
+的 `r1..r9`（返回值路径的接受集）。
+
 ## 4. 保真与增强原则
 
 §2 的红线与 §3 的分歧点都在回答「**怎么和 AIR 对齐**」。本节补上另一半：**对齐之外，什么算「增强」**。

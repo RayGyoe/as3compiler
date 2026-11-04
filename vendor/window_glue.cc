@@ -3625,18 +3625,21 @@ static void* sk_nsmenu_new(const char* title) {
 // renders no glyph for it and none of the four keys can produce it, so the item
 // keeps its "S" text and never fires. The mechanism AIR uses internally is not
 // observable; only these two outcomes are measured.
-#define SK_MOD_CMD     (1UL << 20)  // NSEventModifierFlagCommand
-#define SK_MOD_SHIFT   (1UL << 17)  // NSEventModifierFlagShift
-#define SK_MOD_CTRL    (1UL << 18)  // NSEventModifierFlagControl
-#define SK_MOD_OPT     (1UL << 19)  // NSEventModifierFlagOption
-#define SK_MOD_FN      (1UL << 23)  // NSEventModifierFlagFunction
+// Names deliberately distinct from the KeyboardEvent bits above (SK_MOD_*): the
+// same macro name meant two different things in one translation unit, which is a
+// -Wmacro-redefined warning on every build of this file.
+#define SK_KEM_CMD     (1UL << 20)  // NSEventModifierFlagCommand
+#define SK_KEM_SHIFT   (1UL << 17)  // NSEventModifierFlagShift
+#define SK_KEM_CTRL    (1UL << 18)  // NSEventModifierFlagControl
+#define SK_KEM_OPT     (1UL << 19)  // NSEventModifierFlagOption
+#define SK_KEM_FN      (1UL << 23)  // NSEventModifierFlagFunction
 static void sk_menu_apply_mods(void* item, int mods) {
   unsigned long mask = 0;
-  if (mods & 1) mask |= SK_MOD_CMD;
-  if (mods & 2) mask |= SK_MOD_SHIFT;
-  if (mods & 4) mask |= SK_MOD_CTRL;
-  if (mods & 8) mask |= SK_MOD_OPT;
-  if (mask == 0 && (mods & 16)) mask |= SK_MOD_FN;
+  if (mods & 1) mask |= SK_KEM_CMD;
+  if (mods & 2) mask |= SK_KEM_SHIFT;
+  if (mods & 4) mask |= SK_KEM_CTRL;
+  if (mods & 8) mask |= SK_KEM_OPT;
+  if (mask == 0 && (mods & 16)) mask |= SK_KEM_FN;
   sk_send_void_int(item, "setKeyEquivalentModifierMask:", (long)mask);
 }
 

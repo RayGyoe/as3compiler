@@ -2,7 +2,7 @@
 // emission) and returns the complete C translation unit.
 
 import type { Program } from './ast.ts';
-import { SymbolTable, type ExportedSymbol } from './symbols.ts';
+import { SymbolTable, checkAllPathsReturn, type ExportedSymbol } from './symbols.ts';
 import { Emitter } from './emit.ts';
 import type { SwcResourceSpec, SwcBake } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
@@ -35,6 +35,10 @@ export function generateC(
   // makes getDefinitionByName answer #1065 like adl (see symbols.ts §E6 gate).
   features: readonly string[] = []
 ): CodegenResult {
+  // mxmlc rejects a non-void function that can fall off the end; without this
+  // check we emitted a C function that reaches `}` with no `return` (undefined
+  // behaviour, and a -Wreturn-type warning in every consumer build).
+  checkAllPathsReturn(program);
   const symbols = new SymbolTable();
   symbols.features = features;
   symbols.collect(program, embedFieldInits);

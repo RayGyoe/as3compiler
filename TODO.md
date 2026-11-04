@@ -19440,6 +19440,52 @@ IPv6 **link-local 丢弃**（只剩它的接口整个不出现）；同接口内
 `displayName`/`parent`/`subInterfaces` 恒为空/`null`（`adl` 在本机两个接口上也是这个读数，但未穷举所有接口类型，
 故不宣称「永远如此」）。
 
+### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
+
+**起点**：用户拿来一段 `bin-aot/TalkMED Meeting.c`（41.4 万行）的编译输出，问这些警告能不能修掉。
+基线复现（提取真实命令、只把 `-c` 换成 `-fsyntax-only`；**路径含空格必须加引号**，否则 clang 报的是
+`no such file or directory: 'bin-aot/TalkMED'`）：**725 条** —— `-Wparentheses-equality` 650、
+`-Wpointer-integer-compare` 38、`-Wunused-value` 30、`-Wnull-character` 5、
+`-Wincompatible-pointer-types-discards-qualifiers` 2，另加 `-Wreturn-type`（先按 tag 之外单独统计）。
+
+**结论：不加 `-Wno-*`，全部改发射器。** 默认打开的诊断每一条都指向「翻译成 C 而不是 AS3」的地方，
+其中两条是**真 bug**：`false == null` 在 C 里真值相反（AS3 恒 false）、`0.0 == NULL` **根本编不过**。
+
+**逐项**（语义依据与实测表见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3.10）：
+1. `-Wparentheses-equality`：子句条件本身带括号，又包一层。加 `isSingleGroup`/`clauseParens`——已是
+   单个平衡括号组就不再包（`if`/`while`/`do-while`/`for` 中段/`else if` 五处）。
+2. `-Wpointer-integer-compare`：一边 `null` 字面量、一边原始类型时**折成常量**（副作用非纯时保留
+   `((expr), false)`）。`adl` 实测钉死：`bf==null`/`i==null`/`n==null`/`nan==null`/`s==null` 全 false。
+3. `-Wreturn-type` 三源：① 有返回类型却能落到 `}` ⇒ 按 **mxmlc 同一条规则**编译期报错
+   （`function 'f' must return a value on every path …`，位置由 `setGenPos` 带出）；② 未类型化 / `*` / SWC 帧脚本
+   ⇒ 补 `return as_v_undefined();`；③ 索引 `switch` 的链式 `if/else` 缺 `default` ⇒ 非 void 函数补零值分支。
+4. `-Wunused-value`：语句位置的值被丢掉却仍造中间量。`x[i]++`、`x[i] ||= v`、`x[i] &&= v` 走**丢弃路径**
+   （只发一句 store）；`?:` 与纯读取语句加 `(void)`；`for (i; …)` 的初始化子句加 `(void)(…)`。
+5. `-Wnull-character`：TS 源码里 `'\0'` 写成单反斜杠 ⇒ 生成的 C 里是**真 NUL 字节**。改双反斜杠。
+6. `-Wincompatible-pointer-types-discards-qualifiers`：`Capabilities` 实现返 `const char*` 而 AS3 字段是
+   `char*` ⇒ 显式转换；`parts[3]` 改 `const char*`（`as_str_concat_n` 收 `const char**`）。
+7. `-Wmacro-redefined`：同一 TU 里两组同名宏含义不同（键盘修饰位 vs `NSEventModifierFlag`）⇒ 后者更名
+   `SK_KEM_*`（`vendor/window_glue.cc`）。
+8. `ld: ignoring duplicate libraries: '-lz'`：`--air-app` 清单自带 `z`、固定链接表又有 `-lz` ⇒ 去重时**保留
+   清单那一个**（`uniqueLinkLibs` + `posixLinkLibsFor`）。
+
+**「每条路径都要返回值」的接受集照抄 mxmlc**（`temp/warnprobe/mxmlcchk/RL1..RL8` 一手实测）：`switch`
+无 `default` 报错、`default: throw` 接受、`try/catch` 两臂都 return 接受；循环**不对称**——`for (;;)` 接受，
+而 `while (true) {}`、`do {} while (true)`、`for (; true; )` **一律报错**（参考编译器不推理循环条件）。
+这条不对称原本被我们「优化」成了「`while(true)` 永不落下」，等于**编译了 mxmlc 拒绝的程序**，已改回。
+
+**验收**：
+- **真机产物**：`bin-aot/build-aot.sh` 重建（EXIT=0，22MB 二进制），`/tmp/rebuild8.log` 里 **C 编译警告 0 条**
+  （725 → 0；日志里剩的 4 条是本编译器自己的 SWC 烘焙说明，`ld` 提示也消失）；二进制启动、窗口正常、日志无新异常。
+- **结构钉子**：新增 `test/unit/c-warnings.ts`（`unit: emit/NoWarnings`，9 钉 + 1 次真实 clang 编译）——
+  把七类形态编进一支程序，用 clang **默认警告集**编译并断言零警告；`-Wall` 刻意不用（运行时的 C89
+  结构初始化器噪声不属于本契约）。
+- **诊断钉子**：`test/unit/diagnostics.ts` 增 `r1..r9`（返回值路径接受集，含 getter 命名与 `行:列`）。
+- **双端语义**：`temp/warnprobe/Sem.as` 与 adl 探针（`Sem2.as`，读回 `~/Documents/sem2-adl.txt`）逐行一致。
+
+**如实报明**：警告归零是**这一份产物、这一版 clang**（Apple clang 21）的读数；其他编译器（MSVC、`emcc`）
+的诊断集不同，不宣称「什么编译器都零警告」。`-Wall` 下运行时前导仍有 C89 初始化器噪声，本轮未处理。
+
 ### 遗留待开发
 > **2026-11-04 追加（阶段三百六十三：`NetworkInfo.findInterfaces()` 真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。这一项此前登记在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) 的「真能力缺口」表里（不在本表），本阶段把它做成真实枚举后，那张表从 8 行降到 6 行。按 §1.5 它本来是「`adl` 跑得对、我们跑不出」的**遗留缺陷**，且同阶段修净 ⇒ 不入表。**教训值得单独记一笔**：空 Vector 不会让任何断言变红（shell 只打一行 `not implemented`），但应用会因此在 `if (mac.length == 0)` 处**换一条执行路径**，于是在没有窗口、没有帧守卫的构造函数里撞成 `exit(1)`——「编译成功、启动即死」这类反馈，第一件事是看**日志里最后一条 `not implemented`** 有没有被当成控制流输入。
 > **2026-11-03 追加（阶段三百六十一：`draw()` 忽略被画对象自己的 `visible`/`alpha`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑不出画面的一条实错（「高级礼物」不报错也不出图），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**口径提醒**：这类缺陷**任何断言都不会红**——它不抛异常、不打日志，示例套件里也没有程序会把「自己设为 invisible 再 draw 自己」当作正常用法；它是靠「用户说动画没出来」反推出来、再用同源探针量出来的。今后凡是「应用层看不见结果但没有报错」的反馈，第一件事就是把该路径的每个渲染/读取原语拿 adl 逐项对照，而不是继续查应用代码。

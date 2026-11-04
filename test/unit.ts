@@ -53,3 +53,4 @@ import './unit/sort-dtoa-cast.ts';
 import './unit/windows-release.ts';
 import './unit/devirtualization.ts';
 import './unit/prim-methods.ts';
+import './unit/c-warnings.ts';

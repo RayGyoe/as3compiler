@@ -1,7 +1,7 @@
 // Semantic symbols and types: registers classes/functions, maps AS3 source
 // types to C types, flattens inheritance, and answers visibility queries.
 
-import type { Program, ASType, Param, Expr, Visibility, Metadata } from './ast.ts';
+import type { Program, ASType, Param, Expr, Stmt, Visibility, Metadata } from './ast.ts';
 import { C_RESERVED_HEADERS } from './c-reserved.gen.ts';
 
 // Semantic type representation used during code generation.
@@ -625,6 +625,128 @@ function buildImportAlias(imports: string[], classMap: Map<string, ClassInfo>, p
     alias.set(short, pkg.startsWith('flash.') ? short : qualifiedName(short, pkg));
   }
   return alias;
+}
+
+// ---- all-paths-return validation ------------------------------------------
+//
+// mxmlc REJECTS a non-void function whose body can fall off the end ("函数没有
+// 返回值", measured on AIR SDK 51.4.1: temp/warnprobe/adl/Ret2.as). Our emitter
+// used to accept it and emit a C function that reaches `}` without a `return`,
+// which is undefined behaviour and also a `-Wreturn-type` warning ("non-void
+// function does not return a value in all control paths") in every build.
+//
+// The analysis below is deliberately CONSERVATIVE in the accepting direction: it
+// reports a fall-through only when there is provably a path to the closing brace.
+// Shapes it cannot prove (a `break` hidden in a nested block of a switch case, a
+// label it cannot match) are treated as "may fall through", i.e. an error -- but
+// every construct checked here (block, if/else, loops, switch, try) is handled
+// with the real AS3 rules, so valid AIR code is never rejected.
+
+// Does this statement contain a `break` that would leave the construct at THIS
+// nesting level? Nested loops/switches own their own `break`, so the walk stops
+// there; a LABELED break is assumed to escape (conservative: it makes the
+// enclosing loop fall through, so we never wrongly call a loop infinite).
+function breaksOutOfHere(s: Stmt): boolean {
+  switch (s.kind) {
+    case 'Break': return true;
+    case 'Block': return s.body.some(breaksOutOfHere);
+    case 'If': return breaksOutOfHere(s.then) || (s.else !== null && breaksOutOfHere(s.else));
+    case 'Try':
+      return s.tryBody.body.some(breaksOutOfHere)
+        || s.catches.some((c) => c.body.body.some(breaksOutOfHere))
+        || (s.finallyBody !== null && s.finallyBody.body.some(breaksOutOfHere));
+    case 'With': return breaksOutOfHere(s.body);
+    case 'Label': return breaksOutOfHere(s.body);
+    // `while`/`do`/`for`/`for-in`/`switch` bodies own their breaks, and a nested
+    // function body is never reached from here.
+    default: return false;
+  }
+}
+
+// Can execution reach the end of this switch? True when the discriminant may not
+// match any label (no `default`), when some entry can run off the end of the last
+// case, or when some entry breaks out of the switch.
+function switchFallsThrough(s: Extract<Stmt, { kind: 'Switch' }>): boolean {
+  const hasDefault = s.cases.some((c) => c.test === null);
+  if (!hasDefault) return true;
+  for (let i = 0; i < s.cases.length; i++) {
+    let terminated = false;
+    for (let j = i; j < s.cases.length && !terminated; j++) {
+      for (const stmt of s.cases[j].body) {
+        if (stmt.kind === 'Break') return true; // falls to after the switch
+        if (!stmtCompletesNormally(stmt)) { terminated = true; break; }
+      }
+      // Reaching the end of the LAST case body falls out of the switch.
+      if (!terminated && j === s.cases.length - 1) return true;
+    }
+  }
+  return false;
+}
+
+// Can this statement complete normally (fall through to whatever follows it)?
+// Exported because the emitter needs the same answer for an untyped function:
+// AS3 defines falling off the end as returning `undefined`, so the C function
+// must end in `return as_v_undefined();` instead of reaching `}` with a struct
+// result (-Wreturn-type).
+export function stmtCompletesNormally(s: Stmt): boolean {
+  switch (s.kind) {
+    case 'Return': case 'Throw': case 'Break': case 'Continue': return false;
+    case 'Block': return s.body.every(stmtCompletesNormally);
+    case 'If':
+      return s.else === null ? true : stmtCompletesNormally(s.then) || stmtCompletesNormally(s.else);
+    // MEASURED against mxmlc 51.4.1 (temp/warnprobe/mxmlcchk/RL1..RL7): only an
+    // omitted `for` condition counts as "never falls through". `while (true)`,
+    // `do … while (true)` and `for (; true; )` with the same body are all rejected
+    // with 「函数没有返回值」— the reference compiler does not reason about loop
+    // conditions at all. Matching it exactly keeps our acceptance set identical to
+    // AIR's (accepting more would mean compiling a program mxmlc refuses).
+    case 'While': case 'DoWhile':
+      return true;
+    case 'For':
+      return !(s.cond === null && !breaksOutOfHere(s.body));
+    case 'Switch': return switchFallsThrough(s);
+    case 'Try': {
+      // A `finally` that never completes wins over both branches.
+      if (s.finallyBody !== null && !s.finallyBody.body.every(stmtCompletesNormally)) return false;
+      if (s.tryBody.body.every(stmtCompletesNormally)) return true;
+      // The try body always returns/throws: only a handler can fall through.
+      if (s.catches.length === 0) return false;
+      return s.catches.some((c) => c.body.body.every(stmtCompletesNormally));
+    }
+    case 'With': return stmtCompletesNormally(s.body);
+    case 'Label': return stmtCompletesNormally(s.body);
+    // for-in/for-each and plain statements: a loop may run zero times.
+    default: return true;
+  }
+}
+
+// Reject a non-void function whose body can reach its closing brace, exactly as
+// mxmlc does. `*`-typed and `void` functions are exempt: AS3 lets an untyped
+// function return `undefined` (and a void function has no value at all).
+export function checkAllPathsReturn(program: Program): void {
+  // `void` has no value; an untyped/`*`/`any` return (SWC-generated frame scripts
+  // and hand-written `: *` alike) may legitimately be `undefined`.
+  const isNonVoid = (t: ASType | null): boolean =>
+    t !== null && t !== 'void' && t !== '*' && t !== 'any';
+  const check = (body: Stmt, returnType: ASType | null, what: string): void => {
+    if (!isNonVoid(returnType)) return;
+    if (!stmtCompletesNormally(body)) return;
+    throw new CodegenError(`function ${what} must return a value on every path (the return type is ${returnType}, and this body can reach its closing brace)`);
+  };
+  for (const stmt of program.body) {
+    if (stmt.kind === 'FuncDecl') {
+      setGenPos(stmt.line, stmt.col);
+      check(stmt.body, stmt.returnType, `'${stmt.name}'`);
+    } else if (stmt.kind === 'ClassDecl') {
+      const owner = stmt.packageName ? `${stmt.packageName}.${stmt.name}` : stmt.name;
+      for (const m of stmt.members) {
+        if (m.kind !== 'Method') continue;
+        setGenPos(m.line, m.col);
+        const kind = m.isGetter ? ' getter ' : m.isSetter ? ' setter ' : ' method ';
+        check(m.body, m.returnType, `${kind}'${m.name}' of '${owner}'`);
+      }
+    }
+  }
 }
 
 // Pass 1 of the generator: collect all class/function symbols so forward
