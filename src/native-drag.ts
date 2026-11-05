@@ -149,6 +149,13 @@ static int as_nd_destination(int win, int phase, uint64_t serial, double x, doub
         as_nd_clear_destination(); return 0;
     }
     InteractiveObject* hit = (InteractiveObject*)as_pick_hit(w->stage, sx, sy);
+    // ASC_ND_TRACE=1: the drag path has no other window into it. A drop that
+    // reaches OLE but never raises an AS3 event is either a stage that is not the
+    // one holding the target, a coordinate that misses it, or an empty hit test --
+    // these four numbers separate them.
+    if (getenv("ASC_ND_TRACE") != NULL)
+        fprintf(stderr, "nd phase=%d win=%d x=%.1f y=%.1f sx=%.1f sy=%.1f cx=%.4f cy=%.4f ox=%.1f oy=%.1f stage=%p hit=%p\n",
+            phase, win, x, y, sx, sy, w->cx, w->cy, w->ox, w->oy, (void*)w->stage, (void*)hit);
     if (hit != as_nd_hit) {
         InteractiveObject* old = as_nd_hit;
         if (as_nd_accepted && !as_nd_contains((DisplayObject*)as_nd_accepted, (DisplayObject*)hit)) as_nd_accepted = NULL;

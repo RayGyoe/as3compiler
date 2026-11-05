@@ -1469,6 +1469,61 @@ owner 那个类上 → `stage + MyTip` 是否紧跟着出现。三者缺哪一�
 另外，修后 stage 是 **600×399**，比按 `adl` 装饰量**推算**的 598×397 多 **2 点**（= `SDL_GetWindowBordersSize`
 与 AIR 量装饰的口径/取整差），**未在 `adl` 上逐项对齐**——不要把它当结论。
 
+### 3.23 路径编码：UTF-8 → UTF-16 的**单一 seam**（阶段三百七十七）
+
+AS3 字符串在本运行时里**始终是 UTF-8**；而 Win32 的路径接口有 A/W 两套，A 接口按**当前 ANSI 代码页**
+（本机 CP936）解释字节。直接把 UTF-8 字节喂给 A 接口，等于按错误的码页解码同一个字节串——CJK 路径
+必然错，ASCII 路径碰巧对。这不是某个成员的偶发 bug，而是**整个路径层**的口径错配，症状还很安静：
+
+- `File.createDirectory()` 建出的是**乱码目录名**（实测 `asc-璺緞娴嬭瘯-涓枃`，即 UTF-8 字节被当 CP936 解码）；
+- `FileStream.open()` 打开 CJK 路径 ⇒ **Error #2038**（文件确实不存在——在另一个名字下）；
+- `File.getDirectoryListing()`、`moveTo`/`copyTo`、回收站、`cacheDirectory`、`applicationStorageDirectory`
+  全部继承同一错误，只是报错位置不同。
+
+**修法（单一 seam，不做逐点判断）**：`RUNTIME_PREAMBLE` 增加一层 `as_p_*`，路径参数的唯一形状是 UTF-8，
+进入 Win32 前用 `as_p_wide()`（`MultiByteToWideChar(CP_UTF8, ...)`）转一次，出来用 `as_p_utf8()` 回转。
+覆盖：`as_p_fopen/stat/remove/rename/mkdir/rmdir/attr/attrs_ex/delete_file/remove_dir/create_dir/copy_file/`
+`move_file/touch_new`，以及一个**目录游标** `as_p_dir_new/open/next/close`（Windows：`FindFirstFileW` +
+`FindNextFileW` 并把每个名字转成 UTF-8；POSIX：`DIR*` 原样返回）。游标顺手清掉重复：五个目录遍历点
+（递归删除、递归复制、同步列举、`AS_JOB_DIR` 异步列举、`File.getDirectoryListing`）此前各写一份
+`FindFirstFileA`/`opendir` 分支，改成共用后**平台分支只剩游标内部一处**。
+
+非路径的环境/系统信息同样不能走 CRT 的 ANSI 副本：`as_home_dir`（`USERPROFILE`）、`as_app_storage_dir`
+（`APPDATA`）改 `GetEnvironmentVariableW` + CP_UTF8 转换，`as_app_dir` 改 `GetModuleFileNameW`，
+`as_open_external` 改 `ShellExecuteW`，`as_file_temp_dir` 改 `GetTempPathW`，`spaceAvailable` 改
+`GetVolumePathNameW`/`GetDiskFreeSpaceExW`，回收站的 `SHFileOperationW` 转换从 CP_ACP 改成 **CP_UTF8**
+（原注释「其他调用都是 ANSI」随本次迁移失效）。
+
+四个**必须逐条守住**的陷阱（都是这次改出来的真错，不是假想）：
+
+1. `_wstat` 在 MSVC 里映射到 `_wstat64i32`，结构与 `struct stat` **不同**，不能直接传 `&st`；
+   `as_p_stat` 用一个 `struct _stat64i32` 中转再赋值（`st_mode`/`st_size`/`st_mtime` 三个字段够用）。
+2. `GetLastError()` 必须在 `free(wide)` **之前**读：`as_rmdir_empty` 的「目录非空 ⇒ #3010」判定读的就是它。
+3. `createTempFile` 的「创建但不覆盖」依赖 `CreateFileW(..., CREATE_NEW)` 的**原子性**；写成 stat-then-open
+   会把当初避开的竞态重新引入，所以 `as_p_touch_new` 保留 `CREATE_NEW` 形态。
+4. `as_mkdir_one` 的调用方期望 **0 = 成功**，而 `CreateDirectoryW` 返回 BOOL ⇒ 包装要 `? 0 : -1`。
+
+POSIX 分支**一位未动**（`as_p_remove` 内部仍是 `remove()`，游标内部仍是 `opendir`），所以 macOS/wasm
+的行为与改动之前逐字节相同；跨端差异只存在于「Windows 现在把 UTF-8 当真」这一条，而那正是修复。
+`as_trash_dir` 的 Windows 分支仍是 `return NULL` 的桩（回收站走 `SHFileOperationW`，不经垃圾目录），
+这是既有设计，未因本次迁移改变。
+
+**顺带修掉的两处 MSVC 噪声**（同一批构建里暴露）：`gc_dbg_inuse_count()` 是 `size_t`，帧统计行却用 `%ld`
+打印（macOS 上 `size_t` 是 `unsigned long` 所以看不出来，Windows 上是 64 位的另一个类型，宽度和值都不对）
+⇒ 改 `%zu`；`RUNTIME_PREAMBLE` 顶端补 `_CRT_SECURE_NO_WARNINGS`（必须在第一个 CRT 头之前），否则
+`getenv`/`_wfopen` 这类本构建**有意使用**的调用会在每个 Windows TU 里刷 `-Wdeprecated-declarations`。
+
+**实测（本机 Windows 10 / CP936）**：`temp/wintest/winpath.as` 纯 C 构建 → 目录 `Documents\asc-路径测试-中文`
+（名字正确）、写入 `文件 甲 #1.txt`（18 字节 UTF-8）读回一致、`getDirectoryListing()` 返回该名。改前同一
+探针：目录名乱码、`FileStream.open` 抛 #2038。注意 `String.length` 仍是 **UTF-8 字节长度**（该名 25 字节 →
+17，实测 `FILE_NAME_LEN=17`），那是独立的既有偏差（见 `flash-text.md` D-T8），与路径层无关。
+
+**回归钉**：`test/unit/file-ops.ts`（遍历游标仍按 lstat 判链接、#3010 只在非空目录）、`test/unit/emit.ts`
+（`as_path_is_dir` 仍走跟随链接的 stat；`AS_JOB_DIR` 的枚举经游标、错误仍只认 stat 失败）、
+`test/unit/platform.ts`（废纸篓 CP_UTF8 + DOUBLE-NUL、`spaceAvailable` 的盘卷映射与存在性门、游标的
+`L'\\'`/`NUL` 转义层数）、`test/unit/file-stream.ts`（`GetTempPathW` + UTF-8 回转）、
+`test/unit/transport.ts`（`APPDATA` 取宽字符版、`SharedObject.clear` 走 `as_p_remove`）。
+
 ## 4. 运行形态（D3D12 直连，缺省）
 
 > WGL 那份（`vendor/gl_glue.cc`，§3.1.1）与这里**同形**：也是「进程级 `GrDirectContext` + 窗口级 surface +

@@ -4,7 +4,7 @@
 > `ActionScript 源码 → 词法/语法分析 → 生成可读 C → 交给 clang/cc 编译成原生可执行文件`。
 > 编译器前端只负责"翻译"，优化与机器码生成交给成熟的 C 编译器，不重复造轮子。
 
-> 2026-11-06 文件交互开发：macOS 选择与读写已实测；拖放状态机/Cocoa 桥及 Windows Shell/OLE 代码已接入，完整单元 329/329、示例 306/306。Finder/编辑器真实投递、多窗口/DPI、Windows ACP/UTF-8 路径迁移、编译与真机（当前无环境，默认不启用）仍待验收，M4–M7 不标全完成。详见 [实现与验收状态](docs/zh-cn/desktop-file-interaction.md)。
+> 2026-11-06 文件交互开发：macOS 选择与读写已实测；拖放状态机/Cocoa 桥及 Windows Shell/OLE 后端已接入，且 **Windows 已真机验收首轮**（路径编码 UTF-8→UTF-16 seam、面板弹出/取消/选中、OLE 拖入 ENTER/OVER/DROP、CJK 路径与文件名）。仍待：Finder/编辑器真实投递、owner/模态/多窗口/DPI 矩阵、`IDataObject` 被外部应用接收、拖动图像位置 ⇒ M4/M6/M7 不标全完成。详见 [实现与验收状态](docs/zh-cn/desktop-file-interaction.md)。
 
 ---
 
@@ -14332,13 +14332,14 @@ systems that do not support the concept of a recoverable trash folder, the files
 - **`as_trash_move_shell`**（`#ifdef _WIN32`）：`SHFileOperationW` + `FO_DELETE` +
   `FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT`。选 `SHFileOperationW` 而非
   `IFileOperation`：两者语义上都进回收站，前者是 Win32 老 API、不需要 COM 初始化，**也不给所有
-  Windows 构建再压上 `ole32`**。路径按 `CP_ACP` 转宽字符（与 runtime 其余 ANSI 调用同口径），
-  列表**双 NUL** 结尾。
+  Windows 构建再压上 `ole32`**。路径按 `CP_UTF8` 转宽字符（阶段三百七十七 把整个路径层统一到
+  UTF-8 → UTF-16 的单一 seam 后；本阶段当时用的是 `CP_ACP`，那时的理由是「与 runtime 其余 ANSI
+  调用同口径」，那个口径已经不存在），列表**双 NUL** 结尾。
 - **`as_trash_move` 分派**：`#ifdef _WIN32 return as_trash_move_shell(path);` 先走，`#else` 里是
   **原样不动的 POSIX 体**。**`as_trash_dir` 的 `_WIN32` 分支继续返回 `NULL` 桩**——Windows 没有
   「废纸篓目录」可以 `rename` 进去，那条路对这个宿主是**不可达**，不是未实现。
 - **`spaceAvailable` 的 Windows 臂**：`GetDiskFreeSpaceEx` 只认目录，故先把路径映射到所在卷
-  （`GetVolumePathNameA`）再问容量。**必须加 `as_path_exists` 前置门**：`GetVolumePathName` 会
+  （`GetVolumePathNameW`，阶段三百七十七 起；当时是 `GetVolumePathNameA`）再问容量。**必须加 `as_path_exists` 前置门**：`GetVolumePathName` 会
   **逐级上溯到最近的挂载祖先**，不加门的话一个 OS 解析不了的路径会报出所在卷的容量，而 `adl` 实测报 `0`
   （这条是跑第二遍才暴露的，第一版就是这么错的）。
 - **链接集**：`platformLinkLibs()` 在 win32 上返回 `['shell32']`——`SHFileOperationW` 与**既有的**
@@ -14354,7 +14355,7 @@ systems that do not support the concept of a recoverable trash folder, the files
   （回收站内本次运行的 `$I`/`$R` 与探针目录双双为 0）。
 - `examples/urlstream-api.as`：Windows 上 exit 0，`URLStream + navigateToURL/sendToURL surface assertions passed`。
 - 新钉 `unit: platform/WindowsHostBackends`（10 条）：回收站助手仅 `_WIN32` 包裹 / `FO_DELETE` + `FOF_ALLOWUNDO`
-  标志位 / 双 NUL 与 `CP_ACP` 转换 / `as_trash_move` 在 POSIX 目录查找**之前**分派 / POSIX 体逐字存活于
+  标志位 / 双 NUL 与 `CP_UTF8` 转换 / `as_trash_move` 在 POSIX 目录查找**之前**分派 / POSIX 体逐字存活于
   `#else` / `as_trash_dir` 的 Windows 臂仍是桩 / 卷根映射 / 存在性门 / `shell32` 链接行 / 示例双端可还原性。
 - **变异 6/6 全部被抓**，每步按 sha256 校验还原：撤 `FOF_ALLOWUNDO`、撤 Windows 分派、撤 `shell32`、
   撤存在性门、撤双 NUL 结尾、把示例的载荷清理改回 `deleteFile()`（各自只让对应那条钉转红）。
@@ -17170,7 +17171,8 @@ web 的 DOM `contextmenu` 监听（emsdk 3.1.44 **没有** `emscripten_set_conte
   null、`#2037` 无路径、`#3003` 源不存在、`#3012` 目标已存在未给 `overwrite`、`#3014` 目标在源内部，
   **自动建父目录**，目录递归复制）、`canonicalize`（**只有整条路径存在才 `realpath`** —— `ag.txt` 推翻了
   首版「解析最深已存在祖先」的写法）、`getRelativePath`、`clone`、`createDirectory`、
-  `browseForOpenMultiple`/`browseForSave`（报明，此前连符号都没有 ⇒ 链接失败）。
+  `browseForOpenMultiple`/`browseForSave`（阶段三百七十七 起已真接后端：Shell `IFileDialog` / Cocoa `NSOpenPanel`，见
+  `docs/zh-cn/desktop-file-interaction.md`；此前只报明，再此前连符号都没有 ⇒ 链接失败）。
 - **属性**：`creationDate`/`modificationDate`（真 `Date`，`st_birthtime`/`st_mtim`）、`creator`/`data`（null）、
   `icon`（空 `Icon` + 报明）、`isPackage`、`spaceAvailable`、`url` 的 **setter**（`#2004` 四种坏输入 +
   百分号解码 + `app:` 解析）、`downloaded`/`preventBackup` 的 get/set。
@@ -19994,7 +19996,43 @@ ANE 那一趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70），不是瓶颈。
 产物（Metal）与 WebGL2 浏览器页面验证；CPU 黑屏与字节读入契约已端到端落地，纯 C 无 raster 后端时
 `setYuv420` 不触发渲染，不能据此证明 GPU 直渲等价（见 yuv-direct-render.md §7）。
 
+### 阶段三百七十七：Windows 路径编码 seam + 桌面文件交互默认接入（v0.4.340 → v0.4.341）
+
+**起点**：上一轮（`fa555d5`，不占发布阶段号）把文件对话框与原生拖放的后端写完了，但 Windows 侧刻意
+不接入：运行时整个路径层走 A 接口、按 CP_ACP 解码，而 AS3 字符串是 UTF-8。用户在 Windows 上实测反馈
+「macOS 能用的代码在 Windows 上不生效」，定位到两个根因：① `effectiveDefines` 只对 darwin 回
+`ASC_USE_FILE_DIALOG`/`ASC_USE_NATIVE_DRAG`，`withNativeDesktopBackends` 在 win32 只在宏已存在时才加源文件
+⇒ 默认窗口构建根本没接；② 真缺陷是**路径编码错配**，CJK 路径建出乱码目录、`FileStream.open` 抛 `#2038`。
+
+**一、路径层（单一 seam）**：`RUNTIME_PREAMBLE` 新增 `as_p_wide`/`as_p_utf8` 与 `as_p_fopen/stat/remove/`
+`rename/mkdir/rmdir/attr/attrs_ex/delete_file/remove_dir/create_dir/copy_file/move_file/touch_new`，外加一个
+**目录游标** `as_p_dir_new/open/next/close`（Windows `FindFirstFileW` + UTF-8 名字，POSIX `DIR*`）。五个
+目录遍历点、全部 `stat`/`fopen` 调用点、`File.getDirectoryListing`、`SharedObject` 的 flush/clear 统一改走
+seam；POSIX 分支一位未动。环境与系统信息改宽字符入口（`GetEnvironmentVariableW`/`GetModuleFileNameW`/
+`GetTempPathW`/`GetVolumePathNameW`/`GetDiskFreeSpaceExW`/`ShellExecuteW`），回收站的转换从 CP_ACP 改
+CP_UTF8。四个陷阱：`_wstat64i32` 结果 marshal、`GetLastError` 在 free 前读、`CREATE_NEW` 原子性、
+`as_mkdir_one` 的 0=成功。详见 [win32.md §3.23](docs/zh-cn/win32.md)。
+
+**二、默认接入**：`effectiveDefines` 对 native + (darwin|win32) + 有 `window_glue.cc` 的构建统一给两个宏；
+`withNativeDesktopBackends` 在 win32 无条件附加 `file_dialog_win.cc`/`native_drag_win.cc` 与
+`ole32/shell32/uuid`；`checks.ts` 的 `vendor.file-dialog` 改为按「native + 双平台 + 开窗口」判定，不再看宏。
+
+**三、验收（Windows 真机）**：`temp/wintest/winpath.as` 纯 C：目录 `asc-路径测试-中文`、写读
+`文件 甲 #1.txt`、列举名字均正确（改前：乱码目录 + `#2038`）；`deskprobe.as` 窗口构建：`isSupported=true`、
+原生「选择文件」面板、ESC→CANCEL、选中→SELECT；`dropprobe.as`：资源管理器真拖入 → `drag_enter/drag_drop`
+`hr=0`，AS3 `ENTER/OVER/DROP`，CJK 文件名逐字保留。单元组本机 323/329，余下 6 条与改动前基线逐条相同（环境类）。
+
+**顺带修净**：`gc_dbg_inuse_count()` 的 `%ld` → `%zu`（Windows 上宽度与值都不对）、`_CRT_SECURE_NO_WARNINGS`
+（`getenv`/`_wfopen` 的 MSVC 弃用告警刷屏）。
+
 ### 遗留待开发
+
+> **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /
+> 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表 **92 项**（`未开始` 70 → **69**，`部分完成`
+> 20 → **21**，`调研完成` 1 不变）。改写的是「`File` 家族的原生对话框…仍缺」一行：对话框那半已完成并真机
+> 验证，行内只剩卷枚举与 `download`/`upload`。本阶段修净的路径编码错配按 §1.5 硬判据是**遗留缺陷**且同阶段
+> 落地，不入表；**教训**：这条缺陷任何断言都没红过——ASCII 路径全对、示例套件全绿，只有用户拿 CJK 路径去用
+> 才暴露，而它同时是「默认不接入」的真正原因（不是懒，是当时确实不该接）。
 > **2026-11-05 追加（阶段三百七十四：`setPixels` 的每帧成本与裁剪语义）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表 **90 → 91** 行。本阶段修净的两条（逐格循环的每帧成本、越界矩形的裁剪语义）都是「`adl` 跑得对我们跑不出/跑错」，同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记的 1 行**是同一轮 oracle 量到、与本改动无关的既存分歧：`transparent=false` 的位图 adl 在 `getPixel32`/`getPixels` 输出时强制 alpha=`0xFF`，我们保留源字 alpha。**顺带记一笔口径**：这一轮用户猜的是「ANE 用 ByteArray 再 set 回去」，实测结论相反（那趟 memcpy 我们比 adl 快），真凶是我们自己的 `setPixels`；今后遇到「视频/摄像头掉帧」类反馈，先按「纯拷贝基准 vs 目标原语」分档量，而不是从链路形状推断。
 > **2026-11-04 追加（阶段三百六十三：`NetworkInfo.findInterfaces()` 真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。这一项此前登记在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) 的「真能力缺口」表里（不在本表），本阶段把它做成真实枚举后，那张表从 8 行降到 6 行。按 §1.5 它本来是「`adl` 跑得对、我们跑不出」的**遗留缺陷**，且同阶段修净 ⇒ 不入表。**教训值得单独记一笔**：空 Vector 不会让任何断言变红（shell 只打一行 `not implemented`），但应用会因此在 `if (mac.length == 0)` 处**换一条执行路径**，于是在没有窗口、没有帧守卫的构造函数里撞成 `exit(1)`——「编译成功、启动即死」这类反馈，第一件事是看**日志里最后一条 `not implemented`** 有没有被当成控制流输入。
 > **2026-11-03 追加（阶段三百六十一：`draw()` 忽略被画对象自己的 `visible`/`alpha`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑不出画面的一条实错（「高级礼物」不报错也不出图），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**口径提醒**：这类缺陷**任何断言都不会红**——它不抛异常、不打日志，示例套件里也没有程序会把「自己设为 invisible 再 draw 自己」当作正常用法；它是靠「用户说动画没出来」反推出来、再用同源探针量出来的。今后凡是「应用层看不见结果但没有报错」的反馈，第一件事就是把该路径的每个渲染/读取原语拿 adl 逐项对照，而不是继续查应用代码。
@@ -20304,7 +20342,7 @@ ANE 那一趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70），不是瓶颈。
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
 | **`File` 的两个卷粒度 static 方法缺失**：`getVolumeByDrive(drive:String)` / `getVolumeByPath(path:String)` | 未开始（2026-10-27 阶段二百九十九：B/C 批收窄——成员面其余 14 方法 / 8 属性 / 5 常量 / `getRootDirectories` 均已落地） | 这两个要**卷枚举**（POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`）才能回答「这个路径在哪个卷上」；`StorageVolume` 的构造器和六个 getter 已按实测实现，缺的只是「谁来造它」。当前 `File.getRootDirectories()` 会造出根卷（POSIX `["/"]`、Windows 盘符），但反查没有 | 与「原生对话框」同一批后端活；两条一起做能在真机上一次性验证 `StorageVolumeChangeEvent` |
-| **`File` 家族的原生对话框与卷粒度查询仍缺**：`FileReference.browse`/`load`/`save`/`download`/`upload`、`FileReferenceList.browse`、`File.browseFor*` 只报明（`as_shell_unsupported`，返回 `false`）；两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` 未落地 | 未开始（2026-10-27 阶段二百九十九：C 批把四个**类**与它们的成员面补齐了，剩下的全是**后端**活） | 类与成员现在都在（`FileReference`/`FileReferenceList`/`StorageVolume`/`StorageVolumeChangeEvent`，`FileFilter` 三个字段，`File` 的 14 方法/8 属性/5 static 常量/`getRootDirectories`），**读的语义也按 `adl` 实测**（见阶段二百九十九）。缺的只有两件：① 平台对话框（macOS `NSOpenPanel`/`NSSavePanel`，Windows `IFileOpenDialog`）——没有它，`fileList`/`data`/`name` 这些「选择结果」字段永远为空，所以 `browse()` **报明后返回 `false`**，绝不假装用户点了「取消」；② 卷枚举（`statfs`/`GetDiskFreeSpaceExA`）——`StorageVolume` 的构造器与六个 getter 已按实测实现，但目前只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查 | 两条都是后端活，且都要在真机上验证（Windows 分支本机无环境）。做对话框时应顺手把 `File.browseForOpenMultiple` 的 `FileListEvent` 派发接上——类与事件已完成，只差调用点 |
+| **`File` 家族的卷粒度查询仍缺（对话框部分已于阶段三百七十七 完成）**：`FileReference.browse`/`load`/`save`、`FileReferenceList.browse`、`File.browseFor*` 已真接后端（macOS `NSOpenPanel`/`NSSavePanel`，Windows Shell `IFileDialog`，**两平台均默认接入 native 窗口构建**，见 `docs/zh-cn/desktop-file-interaction.md`）；仍只报明的是 `FileReference.download`/`upload` 与两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` | 部分完成（2026-11-06 阶段三百六十三：对话框后端与 Windows 真机验收完成；卷枚举未开始） | 本行原记的两件缺口中①平台对话框已完成并真机验证（含 CJK 路径、取消、单选/多选），②卷枚举仍未开始：`StorageVolume` 的构造器与六个 getter 已按实测实现，但只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查（`GetDiskFreeSpaceExA` 已随路径层迁移改 W 版） | 剩卷枚举：POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`；`download`/`upload` 是另一条 HTTP 传输活 |
 | **`examples/file-ops.as` 的路径断言是 POSIX 形态**（`/tmp` 字面量 22 处、「反斜杠是合法文件名字节」），`file-symlink.as` / `file-listing-async.as` 亦未在 Windows 实跑 | 未开始（2026-10-27 阶段三百：这三例都要软链夹具，而本机账号建软链报 `EPERM` ⇒ 一直在 `test/examples.ts` 里 `SKIP`，Windows 侧只有 `adl` 探针读数） | 两端 | 待排期（要一台开了 Developer Mode 的 Windows） |
 | **初始窗口的创建晚于文档类构造器**（`FREAcquireNativeWindowHandle(stage.nativeWindow)` 在文档类构造器里得到 `FRE_ILLEGAL_STATE`；`adl` 先建窗再跑构造器，那边拿得到 HWND。**已响亮自报，不是静默 null**；未在 `adl` 上实测这条 FRE 调用——需要把夹具重编回 AIR 版） | 未开始（2026-10-28 阶段三百零九 发现） | 根因是既有取舍：`Stage.showWindow` 在文档类之后建窗，构造器里写的 bounds/title 延后由它生效（`src/emit.ts` 的 `Stage_get_nativeWindow` 上方注释记录了这条约定） | 把初始窗口的创建挪到文档类之前，并重定「构造器里写的窗口属性由谁生效」；改窗口创建时序会波及窗口事件面，需独立阶段 |
 | **`clipDepth` 遮罩的 stencil 对 morph 跟随 ratio，而 AIR 冻结在起始形** | 未开始（2026-10-29 阶段三百一十九 的像素 oracle 量到；本阶段刻意保留「跟当前几何」这一侧，因为它与被遮画面自洽） | `temp/mask3/Teal2.as`（adl）对 `skin_fla.元件77_50` 的 morph 遮罩做逐帧 teal 计数：帧 1/2/3/5/10/20/50/80/99 **逐字节相同**，只有帧 100（换成 `char73`）变；同一探针的 AOT 侧帧 99 窗口已右移到 ratio≈0.99 的位置。AIR 自己**画**该 morph 时是按当前 ratio 画的（阶段三百一十七），所以这是「stencil 冻结、画面不冻结」的 AIR 内部不一致 | 复刻只需在 `as_clip_path` 的 morph 分支换用 `Graphics._mdecl` 声明盒矩形（`as_swc_morph_<id>` 的 `as_swc_clip` 一侧，本库为 `-92.9,-10 .. 0.0,31.6`，与 `adl` 帧 1 的 `clipdbg` 逐位一致）；先与产品确认「遮罩跟画面」与「遮罩冻结」哪个才是要的呈现，再改并补一条 oracle |

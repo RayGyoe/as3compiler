@@ -1,7 +1,14 @@
 // C runtime helpers: the pre-pended preamble providing string concat, type
 // boxing, and the vtable-based runtime subtype check used by `is`/`as`.
 
-export const RUNTIME_PREAMBLE = `#include <stdio.h>
+export const RUNTIME_PREAMBLE = `// MSVC marks the classic CRT calls this runtime is built on (getenv, _wfopen, ...)
+// as deprecated in favour of their _s variants. We link the static UCRT, want those
+// exact calls, and keep the build warning-clean, so silence the class once here --
+// before the first CRT header is pulled in, which is the only place it counts.
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -111,6 +118,10 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 // calls _chsize_s(), which <stdio.h> does not declare at all, so without this
 // include the call is an undeclared function and the TU does not compile.
 #include <io.h>
+// <direct.h> declares the _wmkdir/_wrmdir/_wgetcwd family that the path-encoding
+// seam below calls, and <wchar.h> declares wcslen for the wide entry points.
+#include <direct.h>
+#include <wchar.h>
 #elif !defined(__wasi__)
 #include <sys/resource.h>
 #endif
@@ -170,6 +181,339 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #undef OUT
 #undef OPTIONAL
 #endif
+
+// ---------- path encoding seam ----------
+// AS3 strings are UTF-8, and that is the only string representation this runtime
+// has. A POSIX host takes those bytes verbatim, so a path there IS a byte string.
+// Windows is the exception: every ANSI entry point the CRT and kernel32 expose
+// (fopen, stat, mkdir, FindFirstFileA, GetFileAttributesExA, CreateDirectoryA,
+// ...) decodes its argument through the ANSI code page, so handing it UTF-8
+// addresses a DIFFERENT file. Measured on a CP936 host before this seam existed:
+//
+//   File.documentsDirectory.resolvePath("asc-路径测试-中文").createDirectory()
+//     created the directory "asc-璺緞娴嬭瘯-涓枃" (UTF-8 bytes read as GBK);
+//   FileStream.open(dir.resolvePath("中文.txt"), WRITE)      -> wrote a file
+//   FileStream.open(dir.resolvePath("文件 甲 #1.txt"), WRITE) -> Error #2038
+//
+// i.e. whether a UTF-8 path survived the ACP round trip was a property of the
+// byte sequence, not of the characters, so the old behaviour was not "some
+// characters unsupported" but silent wrong-file I/O. AIR keeps paths as UTF-16
+// end to end, so converting once per call is alignment, not an enhancement.
+//
+// Every path operation therefore goes through as_p_*/as_p_dir_* below: on
+// Windows they convert UTF-8 <-> UTF-16 and call the W entry point, and on every
+// other host they ARE the POSIX call, so a call site reads the same everywhere
+// and the conversion lives in exactly one place.
+#ifdef _WIN32
+static wchar_t* as_p_wide(const char* p) {
+  int n;
+  wchar_t* w;
+  if (p == NULL) return NULL;
+  n = MultiByteToWideChar(CP_UTF8, 0, p, -1, NULL, 0);
+  if (n <= 0) return NULL;
+  w = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));
+  if (w == NULL) return NULL;
+  if (MultiByteToWideChar(CP_UTF8, 0, p, -1, w, n) <= 0) { free(w); return NULL; }
+  return w;
+}
+static char* as_p_utf8(const wchar_t* w) {
+  int n;
+  char* s;
+  if (w == NULL) return NULL;
+  n = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+  if (n <= 0) return NULL;
+  s = (char*)malloc((size_t)n);
+  if (s == NULL) return NULL;
+  if (WideCharToMultiByte(CP_UTF8, 0, w, -1, s, n, NULL, NULL) <= 0) { free(s); return NULL; }
+  return s;
+}
+#endif
+static FILE* as_p_fopen(const char* p, const char* mode) {
+#ifdef _WIN32
+  wchar_t wm[8];
+  wchar_t* w;
+  FILE* f;
+  int i;
+  if (p == NULL || mode == NULL) return NULL;
+  w = as_p_wide(p);
+  if (w == NULL) return NULL;
+  // FileMode maps to a short ASCII mode string ("rb"/"wb"/"ab"/"r+b");
+  // widening it keeps the same set of modes on both hosts.
+  for (i = 0; i < 7 && mode[i] != '\\0'; i++) wm[i] = (wchar_t)mode[i];
+  wm[i] = 0;
+  f = _wfopen(w, wm);
+  free(w);
+  return f;
+#else
+  return fopen(p, mode);
+#endif
+}
+// as_p_stat: the struct stat the rest of the runtime reads (only st_mode,
+// st_size and st_dev are consulted). _wstat64i32 is the wide twin of the very
+// stat() the ANSI build used, so st_size keeps its existing 32-bit limit rather
+// than silently changing shape here.
+static int as_p_stat(const char* p, struct stat* st) {
+#ifdef _WIN32
+  struct _stat64i32 tmp;
+  wchar_t* w;
+  int r;
+  if (p == NULL || st == NULL) return -1;
+  w = as_p_wide(p);
+  if (w == NULL) return -1;
+  r = _wstat64i32(w, &tmp);
+  free(w);
+  if (r != 0) return r;
+  memset(st, 0, sizeof *st);
+  st->st_dev = tmp.st_dev;
+  st->st_ino = tmp.st_ino;
+  st->st_mode = tmp.st_mode;
+  st->st_nlink = tmp.st_nlink;
+  st->st_uid = tmp.st_uid;
+  st->st_gid = tmp.st_gid;
+  st->st_rdev = tmp.st_rdev;
+  st->st_size = tmp.st_size;
+  st->st_atime = (time_t)tmp.st_atime;
+  st->st_mtime = (time_t)tmp.st_mtime;
+  st->st_ctime = (time_t)tmp.st_ctime;
+  return 0;
+#else
+  return as_p_stat(p, st);
+#endif
+}
+static int as_p_remove(const char* p) {
+#ifdef _WIN32
+  wchar_t* w;
+  int r;
+  if (p == NULL) return -1;
+  w = as_p_wide(p);
+  if (w == NULL) return -1;
+  r = _wremove(w);
+  free(w);
+  return r;
+#else
+  return remove(p);
+#endif
+}
+static int as_p_rename(const char* from, const char* to) {
+#ifdef _WIN32
+  wchar_t* a;
+  wchar_t* b;
+  int r = -1;
+  if (from == NULL || to == NULL) return -1;
+  a = as_p_wide(from);
+  b = as_p_wide(to);
+  if (a != NULL && b != NULL) r = _wrename(a, b);
+  free(a);
+  free(b);
+  return r;
+#else
+  return rename(from, to);
+#endif
+}
+static int as_p_mkdir(const char* p, int mode) {
+#ifdef _WIN32
+  wchar_t* w;
+  int r;
+  (void)mode;  // Windows carries no permission bits at creation time.
+  if (p == NULL) return -1;
+  w = as_p_wide(p);
+  if (w == NULL) return -1;
+  r = _wmkdir(w);
+  free(w);
+  return r;
+#else
+  return mkdir(p, (mode_t)mode);
+#endif
+}
+static int as_p_rmdir(const char* p) {
+#ifdef _WIN32
+  wchar_t* w;
+  int r;
+  if (p == NULL) return -1;
+  w = as_p_wide(p);
+  if (w == NULL) return -1;
+  r = _wrmdir(w);
+  free(w);
+  return r;
+#else
+  return remove(p);
+#endif
+}
+#ifdef _WIN32
+// The attribute-shaped queries have no POSIX twin, so they keep the Windows
+// spelling but take the same UTF-8 path as everything else.
+static DWORD as_p_attr(const char* p) {
+  wchar_t* w;
+  DWORD a;
+  if (p == NULL) return INVALID_FILE_ATTRIBUTES;
+  w = as_p_wide(p);
+  if (w == NULL) return INVALID_FILE_ATTRIBUTES;
+  a = GetFileAttributesW(w);
+  free(w);
+  return a;
+}
+static BOOL as_p_attrs_ex(const char* p, WIN32_FILE_ATTRIBUTE_DATA* fa) {
+  wchar_t* w;
+  BOOL r;
+  if (p == NULL || fa == NULL) return 0;
+  w = as_p_wide(p);
+  if (w == NULL) return 0;
+  r = GetFileAttributesExW(w, GetFileExInfoStandard, fa);
+  free(w);
+  return r;
+}
+static BOOL as_p_delete_file(const char* p) {
+  wchar_t* w;
+  BOOL r;
+  if (p == NULL) return 0;
+  w = as_p_wide(p);
+  if (w == NULL) return 0;
+  r = DeleteFileW(w);
+  free(w);
+  return r;
+}
+static BOOL as_p_remove_dir(const char* p) {
+  wchar_t* w;
+  BOOL r;
+  if (p == NULL) return 0;
+  w = as_p_wide(p);
+  if (w == NULL) return 0;
+  r = RemoveDirectoryW(w);
+  free(w);
+  return r;
+}
+static BOOL as_p_create_dir(const char* p) {
+  wchar_t* w;
+  BOOL r;
+  if (p == NULL) return 0;
+  w = as_p_wide(p);
+  if (w == NULL) return 0;
+  r = CreateDirectoryW(w, NULL);
+  free(w);
+  return r;
+}
+static BOOL as_p_copy_file(const char* from, const char* to) {
+  wchar_t* a;
+  wchar_t* b;
+  BOOL r;
+  if (from == NULL || to == NULL) return 0;
+  a = as_p_wide(from);
+  b = as_p_wide(to);
+  if (a == NULL || b == NULL) { free(a); free(b); return 0; }
+  r = CopyFileW(a, b, FALSE);
+  free(a);
+  free(b);
+  return r;
+}
+static BOOL as_p_move_file(const char* from, const char* to) {
+  wchar_t* a;
+  wchar_t* b;
+  BOOL r;
+  if (from == NULL || to == NULL) return 0;
+  a = as_p_wide(from);
+  b = as_p_wide(to);
+  if (a == NULL || b == NULL) { free(a); free(b); return 0; }
+  r = MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING);
+  free(a);
+  free(b);
+  return r;
+}
+// createTempFile needs an ATOMIC "create this name, fail if it exists" -- the
+// ANSI code used CreateFileA with CREATE_NEW for exactly that, and a stat-then-
+// open pair would reintroduce the race it was avoiding.
+static int as_p_touch_new(const char* p) {
+  wchar_t* w;
+  HANDLE h;
+  if (p == NULL) return 0;
+  w = as_p_wide(p);
+  if (w == NULL) return 0;
+  h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  free(w);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  CloseHandle(h);
+  return 1;
+}
+#endif
+// ---- directory enumeration ----
+// One cursor type for both hosts: MSVC has no dirent.h, and the five call sites
+// that walk a directory (remove-recursive, copy-recursive, listing, the async
+// DIR job and the File listing member) each carried their own duplicated
+// FindFirstFileA/opendir pair. as_p_dir_next returns the entry name as UTF-8.
+typedef struct as_p_dir as_p_dir;
+struct as_p_dir {
+#ifdef _WIN32
+  HANDLE h;
+  WIN32_FIND_DATAW fd;
+  char* name;
+#else
+  DIR* d;
+#endif
+};
+static as_p_dir* as_p_dir_new(void) {
+  as_p_dir* d = (as_p_dir*)calloc(1, sizeof(as_p_dir));
+  return d;
+}
+static as_p_dir* as_p_dir_open(const char* path) {
+  as_p_dir* d;
+  if (path == NULL) return NULL;
+#ifdef _WIN32
+  {
+    wchar_t* w = as_p_wide(path);
+    wchar_t* pat;
+    size_t n;
+    size_t i;
+    if (w == NULL) return NULL;
+    n = wcslen(w);
+    pat = (wchar_t*)malloc((n + 3) * sizeof(wchar_t));
+    if (pat == NULL) { free(w); return NULL; }
+    for (i = 0; i < n; i++) pat[i] = (w[i] == L'/') ? L'\\\\' : w[i];
+    pat[n] = L'\\\\';
+    pat[n + 1] = L'*';
+    pat[n + 2] = 0;
+    free(w);
+    d = as_p_dir_new();
+    if (d == NULL) { free(pat); return NULL; }
+    d->h = FindFirstFileW(pat, &d->fd);
+    free(pat);
+    if (d->h == INVALID_HANDLE_VALUE) { free(d); return NULL; }
+    return d;
+  }
+#else
+  d = as_p_dir_new();
+  if (d == NULL) return NULL;
+  d->d = opendir(path);
+  if (d->d == NULL) { free(d); return NULL; }
+  return d;
+#endif
+}
+static const char* as_p_dir_next(as_p_dir* d) {
+  if (d == NULL) return NULL;
+#ifdef _WIN32
+  if (d->h == INVALID_HANDLE_VALUE) return NULL;
+  free(d->name);
+  d->name = as_p_utf8(d->fd.cFileName);
+  if (!FindNextFileW(d->h, &d->fd)) {
+    FindClose(d->h);
+    d->h = INVALID_HANDLE_VALUE;
+  }
+  return d->name;
+#else
+  {
+    struct dirent* e = readdir(d->d);
+    return (e != NULL) ? e->d_name : NULL;
+  }
+#endif
+}
+static void as_p_dir_close(as_p_dir* d) {
+  if (d == NULL) return;
+#ifdef _WIN32
+  if (d->h != INVALID_HANDLE_VALUE) FindClose(d->h);
+  free(d->name);
+#else
+  closedir(d->d);
+#endif
+  free(d);
+}
 
 // __builtin_return_address is a no-op *error* on non-Emscripten wasm (LLVM:
 // "Non-Emscripten WebAssembly hasn't implemented __builtin_return_address").
@@ -271,7 +615,17 @@ static int as_open_external(const char* url) {
     as_web_open_tab(url);
     return 1;
 #elif defined(_WIN32)
-    return (int)(ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > (HINSTANCE)32);
+    // ShellExecuteW, not A: a URL or a file path handed to navigateToURL carries
+    // UTF-8 (the runtime's only string form), and the ANSI form would decode it
+    // through the code page -- the same defect the path-encoding seam fixes.
+    {
+        int ok;
+        wchar_t* w = as_p_wide(url);
+        if (w == NULL) return 0;
+        ok = (int)(ShellExecuteW(NULL, L"open", w, NULL, NULL, SW_SHOWNORMAL) > (HINSTANCE)32);
+        free(w);
+        return ok;
+    }
 #elif defined(__wasi__)
     return 0;  // WASI Preview 1 has no process to launch
 #else
@@ -11776,7 +12130,7 @@ static unsigned char* as_job_read_file(const char* path, size_t* out_len, unsign
     if (out_len != NULL) *out_len = 0;
     if (out_total != NULL) *out_total = 0;
     if (path == NULL) return NULL;
-    FILE* f = fopen(path, "rb");
+    FILE* f = as_p_fopen(path, "rb");
     if (f == NULL) return NULL;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -12577,7 +12931,7 @@ static void as_job_run(as_job* j) {
     switch (j->kind) {
         case AS_JOB_FILE_WRITE: {
             if (j->error) break;
-            FILE* f = j->path ? fopen(j->path, "wb") : NULL;
+            FILE* f = j->path ? as_p_fopen(j->path, "wb") : NULL;
             if (!f) { j->error = AS_JOB_ERR_IO; break; }
             size_t n = j->len ? fwrite(j->bytes, 1, j->len, f) : 0;
             int closed = fclose(f);
@@ -12676,7 +13030,7 @@ static void as_job_run(as_job* j) {
                 else if (strcmp(j->mode, "update") == 0) mode = "r+b";
                 // FileMode.READ ("read") is the default: fall through to "rb".
             }
-            void* h = (void*)fopen(j->path, mode);
+            void* h = (void*)as_p_fopen(j->path, mode);
             if (h == NULL) { j->error = AS_JOB_ERR_IO; break; }
             j->handle = h;
             // APPEND opens at EOF (AIR: position == file length right after open);
@@ -12719,48 +13073,29 @@ static void as_job_run(as_job* j) {
             // failed stat() is. AS_JOB_ERR_IO is left to the allocation failure
             // below, where we could not build the list at all.
             if (j->path == NULL) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
-#ifdef _WIN32
-            // MSVC has no dirent.h: enumerate with FindFirstFile, which wants a
-            // backslash separator and a "<dir>\\*" pattern (same shape as the sync
-            // member's body in emit.ts).
-            size_t pn = strlen(j->path);
-            char* pat = (char*)malloc(pn + 3);
-            if (pat == NULL) { j->error = AS_JOB_ERR_IO; break; }
-            memcpy(pat, j->path, pn);
-            for (size_t i = 0; i < pn; i++) if (pat[i] == '/') pat[i] = '\\\\';
-            pat[pn] = '\\\\'; pat[pn + 1] = '*'; pat[pn + 2] = '\\0';
-            WIN32_FIND_DATAA fd;
-            HANDLE h = FindFirstFileA(pat, &fd);
-            free(pat);
-            if (h == INVALID_HANDLE_VALUE) {
-                struct stat st;
-                // Only a failed stat() is an error; an unreadable-but-existing
-                // directory completes with an empty listing (measured on adl).
-                if (stat(j->path, &st) != 0) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
-                break;
+            {
+                // as_p_dir_* is the shared cursor: it yields UTF-8 entry names on
+                // both hosts (on Windows the wide FindFirstFileW/FindNextFileW pair
+                // converts each name once), so this body no longer needs a platform
+                // branch at all.
+                as_p_dir* d = as_p_dir_open(j->path);
+                int failed = 0;
+                if (d == NULL) {
+                    struct stat st;
+                    // Only a failed stat() is an error; an unreadable-but-existing
+                    // directory completes with an empty listing (measured on adl).
+                    if (as_p_stat(j->path, &st) != 0) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
+                    break;
+                }
+                for (;;) {
+                    const char* name = as_p_dir_next(d);
+                    if (name == NULL) break;
+                    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+                    if (!as_job_dir_push(j, name)) { j->error = AS_JOB_ERR_IO; failed = 1; break; }
+                }
+                as_p_dir_close(d);
+                if (failed) break;
             }
-            do {
-                if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-                if (!as_job_dir_push(j, fd.cFileName)) { j->error = AS_JOB_ERR_IO; break; }
-            } while (FindNextFileA(h, &fd) != 0);
-            FindClose(h);
-#else
-            DIR* d = opendir(j->path);
-            if (d == NULL) {
-                struct stat st;
-                // Same rule as the Windows branch above: a failed stat() means the
-                // path is gone (#3003), anything else -- not a directory, EACCES --
-                // completes with an empty listing, exactly as measured on adl.
-                if (stat(j->path, &st) != 0) { j->error = AS_JOB_ERR_NOT_FOUND; break; }
-                break;
-            }
-            struct dirent* e;
-            while ((e = readdir(d)) != NULL) {
-                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-                if (!as_job_dir_push(j, e->d_name)) { j->error = AS_JOB_ERR_IO; break; }
-            }
-            closedir(d);
-#endif
             break;
         }
         case AS_JOB_HTTP: {
@@ -14506,7 +14841,7 @@ static void as_dbg_frame(double gc_ms) {
     for (int li = 0; li < GC_SMALL_CLASSES + 2; li++)
         for (gc_header* h = *gc_free_list_at(li); h != NULL; h = h->next) freeb += h->size;
     as_dbg_free_bytes = freeb;
-    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB arena=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%ldobj segs=%zu freeb=%.0fMB | live=%d cached=%d presentskip=%d keychg=%d/%d/%d/%d\\n",
+    fprintf(stderr, "FRAME n=%d p50=%.2f p95=%.2f p99=%.2f max=%.2f(worstgc=%.2f) over8ms=%d over17ms=%d | gcmax=%.2f gcavg=%.2f gcshare=%.1f%% | rss=%.0fMB arena=%.0fMB heaptotal=%.0fMB inuse=%.0fMB/%zuobj segs=%zu freeb=%.0fMB | live=%d cached=%d presentskip=%d keychg=%d/%d/%d/%d\\n",
             n, as_dbg_sort_ms[n / 2], as_dbg_sort_ms[n * 95 / 100], as_dbg_sort_ms[n * 99 / 100],
             as_dbg_sort_ms[n - 1], as_dbg_gc_ms[worst], over8, over17,
             gc_max, gc_sum / (double)n, frame_sum > 0 ? 100.0 * gc_sum / frame_sum : 0.0,

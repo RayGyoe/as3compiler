@@ -108,10 +108,14 @@ function checkContract(): string[] {
     c.includes('if (as_path_is_dir(p) && !as_path_is_symlink(p)) return 3006;'));
   check('the recursive walker tests the link itself, not its target',
     c.includes('if (lstat(p, &st) != 0) return 3003;')
-    && c.includes('if (!S_ISDIR(st.st_mode)) return (remove(p) == 0) ? 0 : 2038;'));
+    && c.includes('is_dir = S_ISDIR(st.st_mode) ? 1 : 0;')
+    && c.includes('if (!is_dir) return (as_p_remove(p) == 0) ? 0 : 2038;')
+    // The Win32 arm reaches the same decision through the seam (as_p_attr) and
+    // treats a reparse point as a non-directory, so a junction is deleted, not walked.
+    && c.includes('is_dir = ((a & FILE_ATTRIBUTE_DIRECTORY) != 0 && (a & FILE_ATTRIBUTE_REPARSE_POINT) == 0);'));
   check('the non-recursive form reports #3010 only for a non-empty directory',
     c.includes('return (errno == ENOTEMPTY || errno == EEXIST) ? 3010 : 2038;')
-    && c.includes('return (GetLastError() == ERROR_DIR_NOT_EMPTY) ? 3010 : 2038;'));
+    && c.includes('return (last == ERROR_DIR_NOT_EMPTY) ? 3010 : 2038;'));
 
   // ---- moveTo --------------------------------------------------------------
   // 阶段二百九十九 folded moveTo onto the SAME transfer validator copyToAsync and

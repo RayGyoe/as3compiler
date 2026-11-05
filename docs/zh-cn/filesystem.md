@@ -603,7 +603,10 @@ A 批（§12）之后接着做 B 批与 C 批。**每一条都先在 `adl 51.4.1
 
 - `systemCharset` 在 `adl` 上是**宿主语言设置**（本机 `x-mac-chinesesimp`），我们回 `"UTF-8"`。这是有意的
   偏差：本构建里所有字符串本来就是 UTF-8，报一个我们并不使用的传统代码页才是撒谎。
-- 原生文件对话框（`browseFor*`/`FileReference.browse`）与卷枚举（`getVolumeByDrive`/`getVolumeByPath`）
-  未做，全部走 `as_shell_unsupported` 报明，见 `### 遗留待开发`。
+- 原生文件对话框（`browseFor*`/`FileReference.browse`）已实装并默认接入（见
+  [desktop-file-interaction.md](desktop-file-interaction.md)）；卷枚举（`getVolumeByDrive`/`getVolumeByPath`）仍未做，
+  走 `as_shell_unsupported` 报明，见 `### 遗留待开发`。
 - `File.createTempFile()` 的文件留在 `TMPDIR`，由系统清理（与 AIR 一致）。
-- Windows 分支（`GetDiskFreeSpaceExA` 之外的 `as_file_cache_dir` 等）本机无环境，只做了编译面推导。
+- Windows 分支已在真机上跑过（纯 C + Skia 窗口两种构建）：路径编码、`cacheDirectory`、回收站、
+  `spaceAvailable` 都有实测记录。**Windows 的路径参数一律是 UTF-8，进 Win32 前经 `as_p_*` 转 UTF-16**，
+  详见 [win32.md §3.23](win32.md)；不要在 Windows 分支里再引入 A 接口或 CP_ACP。

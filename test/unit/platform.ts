@@ -2009,7 +2009,7 @@ function checkWindowsHostBackends(): string[] {
     && shell.includes('FOF_NOCONFIRMATION') && shell.includes('FOF_NOERRORUI')
     && shell.includes('if (SHFileOperationW(&op) != 0) return 2038;'));
   check('the path list is DOUBLE-NUL terminated and converted the way the rest of the runtime converts',
-    shell.includes('MultiByteToWideChar(CP_ACP, 0, path, -1, NULL, 0)')
+    shell.includes('MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0)')
     && shell.includes('(size_t)(need + 1) * sizeof(WCHAR)') && shell.includes('from[need] = 0;'));
   check('as_trash_move reaches it on Windows BEFORE the POSIX trash directory lookup',
     move.includes('#ifdef _WIN32') && move.includes('return as_trash_move_shell(path);')
@@ -2022,10 +2022,13 @@ function checkWindowsHostBackends(): string[] {
     && dirFn.slice(dirFn.indexOf('#elif defined(_WIN32)'), dirFn.indexOf('#elif defined(__APPLE__)')).includes('return NULL;')
     && dirFn.includes('.Trashes'));
   check('spaceAvailable maps a path to its volume root, so a FILE answers too',
-    space.includes('GetVolumePathNameA(p, root, MAX_PATH)') && space.includes('GetDiskFreeSpaceExA(root, &freeAvail, NULL, NULL)'));
+    space.includes('GetVolumePathNameW(wp, wroot, MAX_PATH)') && space.includes('GetDiskFreeSpaceExW(wroot, &freeAvail, NULL, NULL)'))
+    // The mapping goes through the seam: the UTF-8 path is widened once and the
+    // wide copy is freed BEFORE the volume query, so neither arm can leak it.
+    && space.includes('wchar_t* wp = as_p_wide(p);') && space.includes('if (wp == NULL) return 0.0;');
   check('...gated on existence, because GetVolumePathName walks up to a mounted ancestor',
     space.includes('if (!as_path_exists(p)) return 0.0;')
-    && space.indexOf('as_path_exists') < space.indexOf('GetVolumePathNameA'));
+    && space.indexOf('as_path_exists') < space.indexOf('GetVolumePathNameW'));
 
   const build = readNorm(join(root, 'src', 'build.ts'));
   check('the Windows link line carries shell32 (SHFileOperationW and ShellExecuteA)',
@@ -2047,14 +2050,18 @@ function checkWindowsHostBackends(): string[] {
   // ① runtime.ts 是模板字符串，`\\` 只在 JS 层掉一层：想发射 C 的 `'\\'` 与 `'\0'`
   //    就得在源码里写双份。少一层时 C 看到的是 `'\'`（反斜杠吞掉收尾引号，字面量
   //    跨到行尾）与一个字面 NUL 字节（`\0` 被 JS 先解释掉了）。
-  const enumAt = c.indexOf('FindFirstFileA(pat,');
+  //    枚举体本身现居 RUNTIME_PREAMBLE 的 as_p_dir_open（五个目录遍历点共用一个游标），
+  //    但转义层数的问题与它当初所在的 emit.ts 一模一样。
+  const enumAt = c.indexOf('FindFirstFileW(pat,');
   const enumBlock = enumAt < 0 ? '' : c.slice(Math.max(0, enumAt - 500), enumAt);
   check('the emitted _WIN32 enumeration block exists at all', enumAt > 0);
   // 反斜杠本身用 fromCharCode 拼：这条断言若再依赖模板/raw 的转义层数，就成了
   // 「用同一类易错语法去证明那类语法没错」。
   const BS = String.fromCharCode(92);
   check('...and its separator/terminator escapes survive the template literal',
-    enumBlock.includes("pat[i] = '" + BS + BS + "';") && enumBlock.includes("pat[pn + 2] = '" + BS + "0';"));
+    enumBlock.includes("pat[i] = (w[i] == L'/') ? L'" + BS + BS + "' : w[i];")
+    && enumBlock.includes("pat[n] = L'" + BS + BS + "';")
+    && enumBlock.includes("pat[n + 2] = 0;"));
   // 字面 NUL 是同一处失误的另一半：它让 C 源码里出现裸 0 字节，clang 只报 warning 时
   // 更危险（值恰好 0，看起来对），所以这里直接禁掉。
   check('...with no raw NUL byte smuggled into the generated C', !enumBlock.includes('\u0000'));

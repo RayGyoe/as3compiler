@@ -619,13 +619,13 @@ function checkSharedObjectStore(): string[] {
     && emitSource.includes('#define ASC_APP_ID "as3aot"')
     && emitSource.includes('Library/Application Support/" ASC_APP_ID "/Local Store'));
   check('on Windows the store root is %APPDATA%/<id>/Local Store (adl writes the same tree)',
-    emitSource.includes('char* appdata = getenv("APPDATA");')
+    emitSource.includes('DWORD n = GetEnvironmentVariableW(L"APPDATA", w,')
     && emitSource.includes('base = as_path_join(appdata, ASC_APP_ID);')
     && emitSource.includes('base = as_path_join(base, "Local Store");'));
   check('a host that does not export APPDATA falls back to the known folder default',
     emitSource.includes('if (appdata == NULL || *appdata ==')
     && emitSource.includes('appdata = as_path_join(home, "AppData/Roaming");'));
-  const winRoot = emitSource.indexOf('char* appdata = getenv("APPDATA");');
+  const winRoot = emitSource.indexOf('DWORD n = GetEnvironmentVariableW(L"APPDATA", w,');
   const macRoot = emitSource.indexOf('Library/Application Support/" ASC_APP_ID');
   check('the Windows root is a sibling #elif of the macOS one, not a fallthrough',
     winRoot > 0 && macRoot > winRoot
@@ -666,7 +666,7 @@ function checkSharedObjectStore(): string[] {
     emitSource.includes('if (o->_data->length == 0) return 0;')
     && emitSource.includes('unsigned char* buf = as_so_serialize(o, &len);'));
   check('flush writes the serialized bytes and clear() removes the file',
-    emitSource.includes('FILE* f = fopen(o->path, "wb");') && emitSource.includes('remove(o->path);'));
+    emitSource.includes('FILE* f = as_p_fopen(o->path, "wb");') && emitSource.includes('as_p_remove(o->path);'));
 
   // -- the AMF3 string table is shared by every entry, and AIR enters BOTH a
   //    string VALUE and a dynamic property NAME into it. The end-of-members

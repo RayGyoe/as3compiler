@@ -177,4 +177,4 @@ SDL2 的 DropEvent 提供 begin/file/text/complete、路径与窗口 ID，未提
 
 ## 当前实施状态（2026-11-06）
 
-M0–M3 的 macOS 文件选择与读写闭环已实现并完成首轮真实面板验证；M4/M7 的运行时、Cocoa 后端和 M5 的 Windows Shell/OLE 后端已接入。完整单元 329/329、完整示例 306/306，Cocoa 桥接探针通过。M4 Finder 投递、M7 外部接收与完整平台矩阵仍未验收；用户暂无 Windows 环境，因此 Windows 保留“未编译/未真机验证”，且因既有 ACP 文件路径与新桥 UTF-8 的差异暂不默认启用，M5/M6 不标完成。详见 [实现与验收状态](desktop-file-interaction.md)。
+M0–M3 的 macOS 文件选择与读写闭环已实现并完成首轮真实面板验证；M4/M7 的运行时、Cocoa 后端和 M5 的 Windows Shell/OLE 后端已接入。M5 的 Windows 部分在 2026-11-06 完成路径编码层迁移后**默认启用并首轮真机验收**（原生面板弹出/取消/选中、OLE 拖入 ENTER/OVER/DROP、CJK 路径与文件名）；M4 Finder 投递、M7 外部接收、owner/模态/多窗口/DPI 矩阵仍未验收，M4/M6/M7 不标完成。详见 [实现与验收状态](desktop-file-interaction.md)。

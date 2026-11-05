@@ -205,9 +205,13 @@ function checkWindows(): string[] {
   check('the Windows cacheDirectory no longer invents a Caches folder',
     !c0.includes('as_path_join(e, "Caches")') && !c0.includes('AppData/Local/Caches'));
   check('as_file_temp_dir asks the OS instead of reading three env vars',
-    c0.includes('DWORD tlen = GetTempPathA((DWORD)sizeof(tmpdir), tmpdir);'));
+    c0.includes('DWORD tlen = GetTempPathW((DWORD)(sizeof(wtmp) / sizeof(wtmp[0])), wtmp);'));
   check('...and refuses a buffer that is too small rather than truncating',
-    c0.includes('if (tlen == 0 || tlen >= (DWORD)sizeof(tmpdir)) return NULL;'));
+    c0.includes('if (tlen == 0 || tlen >= (DWORD)(sizeof(wtmp) / sizeof(wtmp[0]))) return NULL;'));
+  // The wide answer has to come back as UTF-8, or a CJK profile path would be
+  // decoded through the ANSI code page again (the path-encoding seam).
+  check('...and converts the wide answer to UTF-8',
+    c0.includes('n = WideCharToMultiByte(CP_UTF8, 0, wtmp, -1, tmpdir, (int)sizeof(tmpdir), NULL, NULL);'));
 
   // ---- drive-relative paths: kept verbatim, ONE separator appended ----------
   check('a drive-relative path with no separator is not parsed as components',

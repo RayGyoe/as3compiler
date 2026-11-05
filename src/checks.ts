@@ -366,7 +366,10 @@ export const CHECKS: Check[] = [
     id: 'vendor.file-dialog',
     title: 'Native desktop interaction backends',
     kind: 'hard',
-    applies: (c) => isNative(c) && (process.platform === 'darwin' || (process.platform === 'win32' && c.cfg.defines.some(d => d === 'ASC_USE_FILE_DIALOG=1' || d === 'ASC_USE_NATIVE_DRAG=1'))) && opensWindow(c),
+    // effectiveDefines turns both backends on for every native+window build on
+    // macOS and Windows, so the check applies wherever they are compiled in --
+    // a manifest that spells the define out is still honoured.
+    applies: (c) => isNative(c) && (process.platform === 'darwin' || process.platform === 'win32') && opensWindow(c),
     run: (ctx) => {
       const window = ctx.cfg.sources.find(s => /(^|[/\\])window_glue\.cc$/.test(s));
       const folder = window ? dirname(window) : ctx.vendorDir;

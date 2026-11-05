@@ -3542,7 +3542,7 @@ function checkEmitFileIsSymbolicLink(): string[] {
   check('the Windows probe is FILE_ATTRIBUTE_REPARSE_POINT',
     c.includes('(a & FILE_ATTRIBUTE_REPARSE_POINT) != 0'));
   check('the two probes are selected at compile time, not at runtime',
-    /#ifdef _WIN32\s*\n\s*DWORD a = GetFileAttributesA\(p\);/.test(c.substring(c.indexOf('static bool as_path_is_symlink')))
+    /#ifdef _WIN32\s*\n\s*DWORD a = as_p_attr\(p\);/.test(c.substring(c.indexOf('static bool as_path_is_symlink')))
     && c.substring(c.indexOf('static bool as_path_is_symlink')).includes('#else'));
 
   // The OTHER family must stay on stat(): isDirectory follows the link, so for a
@@ -3550,7 +3550,7 @@ function checkEmitFileIsSymbolicLink(): string[] {
   // later "unify the two probes" refactor cannot quietly pass.
   check('isDirectory still follows the link (stat/S_ISDIR)',
     c.includes('static bool as_path_is_dir(const char* p)')
-    && c.includes('&& stat(p, &st) == 0 && S_ISDIR(st.st_mode);'));
+    && c.includes('&& as_p_stat(p, &st) == 0 && S_ISDIR(st.st_mode);'));
 
   console.log(`     [symlink] ${ok} check(s) passed`);
   return bad;
@@ -3593,9 +3593,14 @@ function checkEmitDirListingAsync(): string[] {
       emitSrc.indexOf("'void File_getDirectoryListingAsync(void* _this) {'"),
       emitSrc.indexOf("'void File_deleteFileAsync(void* _this) {'"),
     ).includes('File_getDirectoryListing(_this)'));
-  check('the worker enumerates (opendir on POSIX, FindFirstFile on Windows)',
-    /case AS_JOB_DIR: \{[\s\S]*?opendir\(j->path\)/.test(pre)
-    && pre.includes('FindFirstFileA(pat, &fd)'));
+  check('the worker enumerates through the shared as_p_dir cursor',
+    /case AS_JOB_DIR: \{[\s\S]*?as_p_dir\* d = as_p_dir_open\(j->path\);/.test(pre)
+    && /case AS_JOB_DIR: \{[\s\S]*?as_p_dir_next\(d\)/.test(pre));
+  // The branch the worker no longer carries lives in the cursor itself, which must
+  // keep BOTH arms: the wide Find*FileW pair on Windows (ANSI names would mangle a
+  // CJK entry) and opendir everywhere else.
+  check('the cursor keeps the wide Win32 arm and the POSIX one',
+    pre.includes('FindFirstFileW(') && pre.includes('opendir('));
 
   // 2. The worker must not touch the GC heap: it stages names in malloc'd memory
   //    and only the finish thunk (on the AS3 thread) builds File objects.
@@ -3614,9 +3619,9 @@ function checkEmitDirListingAsync(): string[] {
   //    open failed" must not be turned into an ioError -- that would be a silent
   //    wrong answer for a cleaner, which is exactly the caller this matters to.
   check('a failed stat is the only enumeration error (ioError #3003)',
-    /case AS_JOB_DIR: \{[\s\S]*?stat\(j->path, &st\) != 0\) \{ j->error = AS_JOB_ERR_NOT_FOUND; break; \}/.test(pre));
+    /case AS_JOB_DIR: \{[\s\S]*?as_p_stat\(j->path, &st\) != 0\) \{ j->error = AS_JOB_ERR_NOT_FOUND; break; \}/.test(pre));
   check('an unopenable-but-existing directory is an empty listing, not an error',
-    !/DIR\* d = opendir\(j->path\);\s*\n\s*if \(d == NULL\) \{[\s\S]{0,400}?AS_JOB_ERR_IO/.test(pre));
+    !/as_p_dir\* d = as_p_dir_open\(j->path\);\s*\n\s*if \(d == NULL\) \{[\s\S]{0,400}?AS_JOB_ERR_IO/.test(pre));
   check('the #3003 dispatch carries the measured id and text',
     c.includes('ev->errorID = 3003;')
     && c.includes('Error #3003: File or directory does not exist.'));
@@ -3640,10 +3645,10 @@ function checkEmitDirListingAsync(): string[] {
     emitSrc.includes('if (!as_path_exists(o->_nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));'));
   check('sync throws #3007 for a path that is not a directory',
     emitSrc.includes('if (!as_path_is_dir(o->_nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));'));
-  // The guards must precede the opendir body, or an unreadable directory would be
+  // The guards must precede the enumeration body, or an unreadable directory would be
   // reported as one of them instead of as the empty listing adl answers.
   check('the guards run before the enumeration body',
-    emitSrc.indexOf('Error #3007: Not a directory.') < emitSrc.indexOf('opendir(o->_nativePath)'));
+    emitSrc.indexOf('Error #3007: Not a directory.') < emitSrc.indexOf('as_p_dir_open(o->_nativePath)'));
 
   console.log(`     [dirasync] ${ok} check(s) passed`);
   return bad;

@@ -8,10 +8,15 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include "native_drag.h"
 extern "C" void sk_window_get_client_size(int,int*,int*);
 static sk_drag_callback callback;
 static bool supported;
+// ASC_DRAG_TRACE=1 reports each OLE hand-off on stderr. The drag path is otherwise
+// invisible: a failed RegisterDragDrop, or a DragEnter the AS3 side never saw, both
+// look exactly like "nothing happened" -- this is what separates the two.
+static bool trace_on(void) {static int on=-1;if(on<0)on=(getenv("ASC_DRAG_TRACE")!=NULL)?1:0;return on!=0;}
 static UINT urlFormat;
 static IDataObject* sourceData;
 static int sourceWindow=-1;
@@ -54,10 +59,10 @@ class Target:public IDropTarget {
  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,void** p) override {if(!p)return E_POINTER;*p=NULL;if(riid==IID_IUnknown||riid==IID_IDropTarget){*p=static_cast<IDropTarget*>(this);AddRef();return S_OK;}return E_NOINTERFACE;}
  ULONG STDMETHODCALLTYPE AddRef() override{return (ULONG)InterlockedIncrement(&refs);}
  ULONG STDMETHODCALLTYPE Release() override{LONG n=InterlockedDecrement(&refs);if(!n)delete this;return (ULONG)n;}
- HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* obj,DWORD keys,POINTL p,DWORD* effect) override {serial=++sequence;payload=readPayload(obj);allowed=*effect;return dispatch(1,keys,p,effect);}
+ HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* obj,DWORD keys,POINTL p,DWORD* effect) override {serial=++sequence;payload=readPayload(obj);allowed=*effect;if(trace_on())fprintf(stderr,"drag_enter w=%d files=%d effect=%lu\n",window,(int)payload.paths.size(),(unsigned long)allowed);return dispatch(1,keys,p,effect);}
  HRESULT STDMETHODCALLTYPE DragOver(DWORD keys,POINTL p,DWORD* effect) override {allowed=*effect;return dispatch(2,keys,p,effect);}
  HRESULT STDMETHODCALLTYPE DragLeave() override {POINT p={};GetCursorPos(&p);dispatch(3,0,{p.x,p.y},NULL);payload=Payload();return S_OK;}
- HRESULT STDMETHODCALLTYPE Drop(IDataObject* obj,DWORD keys,POINTL p,DWORD* effect) override {payload=readPayload(obj);allowed=*effect;HRESULT hr=dispatch(4,keys,p,effect);payload=Payload();return hr;}
+ HRESULT STDMETHODCALLTYPE Drop(IDataObject* obj,DWORD keys,POINTL p,DWORD* effect) override {payload=readPayload(obj);allowed=*effect;HRESULT hr=dispatch(4,keys,p,effect);if(trace_on())fprintf(stderr,"drag_drop w=%d hr=0x%08lx effect=%lu\n",window,(unsigned long)hr,(unsigned long)*effect);payload=Payload();return hr;}
 };
 // Snapshot data is owned by this IDataObject until OLE and every recipient release it.
 class Data:public IDataObject {
@@ -107,6 +112,7 @@ extern "C" int sk_drag_attach(int w,void* hwnd) {
  // SDL's default IDropTarget cannot provide synchronous AS3 acceptance. Replace
  // its registration, leaving the SDL window procedure and all input intact.
  RevokeDragDrop((HWND)hwnd);Target* t=new Target(w);HRESULT hr=RegisterDragDrop((HWND)hwnd,t);
+ if(trace_on())fprintf(stderr,"drag_attach w=%d hwnd=%p hr=0x%08lx\n",w,hwnd,(unsigned long)hr);
  if(FAILED(hr)){t->Release();return 0;}slots[w]={(HWND)hwnd,t};return 1;
 }
 extern "C" void sk_drag_detach(int w){if(w<0||w>=16||!slots[w].hwnd)return;if(callback)callback(w,3,0,0,0,0,0,NULL);RevokeDragDrop(slots[w].hwnd);slots[w].target->Release();slots[w]={};}

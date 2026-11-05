@@ -17958,10 +17958,12 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // it needs a prototype before the first call site.
     this.line('static void as_ba_grow(ByteArray* o, int extra);');
     // ---- flash.filesystem (stage 64): File / FileStream / FileMode ----
-    // POSIX filesystem probes. stat() works for both files and directories and is
-    // available on native POSIX and WASI alike.
-    this.line('static bool as_path_exists(const char* p) { struct stat st; return p != NULL && stat(p, &st) == 0; }');
-    this.line('static bool as_path_is_dir(const char* p) { struct stat st; return p != NULL && stat(p, &st) == 0 && S_ISDIR(st.st_mode); }');
+    // Filesystem probes. as_p_stat() is stat() on every host but Windows, where it
+    // converts the UTF-8 path first and calls the wide entry point (see the
+    // path-encoding seam in the preamble). It works for files and directories and
+    // is available on native POSIX and WASI alike.
+    this.line('static bool as_path_exists(const char* p) { struct stat st; return p != NULL && as_p_stat(p, &st) == 0; }');
+    this.line('static bool as_path_is_dir(const char* p) { struct stat st; return p != NULL && as_p_stat(p, &st) == 0 && S_ISDIR(st.st_mode); }');
     // as_path_is_symlink: the ONLY probe that must not follow the link, hence
     // lstat() rather than stat(). Windows has no lstat that reports reparse points
     // reliably, so it asks the file attributes directly -- AIR also answers true for
@@ -17971,7 +17973,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (p == NULL) return false;');
     this.line('#ifdef _WIN32');
     this.indent++;
-    this.line('DWORD a = GetFileAttributesA(p);');
+    this.line('DWORD a = as_p_attr(p);');
     this.line('return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0;');
     this.indent--;
     this.line('#else');
@@ -18158,8 +18160,16 @@ static char* as_path_norm(const char* p) {
     this.line('static char* as_home_dir(void) {');
     this.indent++;
     this.line('#ifdef _WIN32');
-    this.line('char* h = getenv("USERPROFILE");');
-    this.line('return (h == NULL || *h == \'\\0\') ? (char*)"." : h;');
+    this.line('// GetEnvironmentVariableW, not getenv: the CRT copies the environment in the');
+    this.line('// ANSI code page, so a profile under a CJK user name (C:\\Users\\张伟) came');
+    this.line('// back as mojibake and every directory AIR derives from it pointed elsewhere.');
+    this.line('// The wide value is converted to UTF-8 once here (path-encoding seam).');
+    this.line('static char home[4096];');
+    this.line('wchar_t w[4096];');
+    this.line('DWORD n = GetEnvironmentVariableW(L"USERPROFILE", w, (DWORD)(sizeof(w) / sizeof(w[0])));');
+    this.line('if (n == 0 || n >= (DWORD)(sizeof(w) / sizeof(w[0]))) return (char*)".";');
+    this.line('if (WideCharToMultiByte(CP_UTF8, 0, w, -1, home, (int)sizeof(home), NULL, NULL) <= 0) return (char*)".";');
+    this.line('return home;');
     this.line('#else');
     this.line('char* h = getenv("HOME");');
     this.line('return (h == NULL || *h == \'\\0\') ? (char*)"." : h;');
@@ -18183,6 +18193,9 @@ static char* as_path_norm(const char* p) {
     // is Contents/Resources, and --package xcode-project stages no app data into
     // the bundle yet -- so a bundle build gets Contents/MacOS (see TODO.md).
     this.line('static char as_app_dir_buf[4096];');
+    this.line('#ifdef _WIN32');
+    this.line('static wchar_t as_app_dir_wbuf[4096];');
+    this.line('#endif');
     this.line('static int  as_app_dir_ready = 0;');
     this.line('static char* as_app_dir(void) {');
     this.indent++;
@@ -18190,8 +18203,9 @@ static char* as_path_norm(const char* p) {
     this.indent++;
     this.line('as_app_dir_buf[0] = \'\\0\';');
     this.line('#ifdef _WIN32');
-    this.line('DWORD n = GetModuleFileNameA(NULL, as_app_dir_buf, (DWORD)sizeof(as_app_dir_buf));');
-    this.line('if (n == 0 || n >= (DWORD)sizeof(as_app_dir_buf)) as_app_dir_buf[0] = \'\\0\';');
+    this.line('DWORD n = GetModuleFileNameW(NULL, as_app_dir_wbuf, (DWORD)(sizeof(as_app_dir_wbuf) / sizeof(as_app_dir_wbuf[0])));');
+    this.line('if (n == 0 || n >= (DWORD)(sizeof(as_app_dir_wbuf) / sizeof(as_app_dir_wbuf[0]))) as_app_dir_buf[0] = \'\\0\';');
+    this.line('else if (WideCharToMultiByte(CP_UTF8, 0, as_app_dir_wbuf, -1, as_app_dir_buf, (int)sizeof(as_app_dir_buf), NULL, NULL) <= 0) as_app_dir_buf[0] = \'\\0\';');
     this.line('#elif defined(__APPLE__)');
     this.line('uint32_t sz = (uint32_t)sizeof(as_app_dir_buf);');
     this.line('if (_NSGetExecutablePath(as_app_dir_buf, &sz) != 0) as_app_dir_buf[0] = \'\\0\';');
@@ -18283,18 +18297,29 @@ static char* as_path_norm(const char* p) {
 #endif
 }
 static char* as_file_working_dir(void) {
-  char buf[4096];
 #ifdef _WIN32
   // getcwd() is a POSIX name: MSVC declares only _getcwd (in <direct.h>) and has
   // no getcwd at all, which under C99 is an undeclared function -- the whole
   // translation unit failed to compile on Windows before this branch existed.
-  // GetCurrentDirectoryA is the kernel32 form of the same query and needs no
-  // extra header, the route as_mkdir_one and as_app_dir already take.
-  if (GetCurrentDirectoryA((DWORD)sizeof(buf), buf) == 0) return as_home_dir();
+  // GetCurrentDirectoryW is the kernel32 form of the same query, and the wide
+  // result is converted to UTF-8 once here so the rest of the runtime only ever
+  // handles UTF-8 paths (see the path-encoding seam in the preamble).
+  wchar_t wbuf[4096];
+  DWORD n = GetCurrentDirectoryW((DWORD)(sizeof(wbuf) / sizeof(wbuf[0])), wbuf);
+  if (n == 0 || n >= (DWORD)(sizeof(wbuf) / sizeof(wbuf[0]))) return as_home_dir();
+  {
+    char* u = as_p_utf8(wbuf);
+    char* r;
+    if (u == NULL) return as_home_dir();
+    r = as_path_norm(u);
+    free(u);
+    return r;
+  }
 #else
+  char buf[4096];
   if (getcwd(buf, sizeof(buf)) == NULL) return as_home_dir();
-#endif
   return as_path_norm(buf);
+#endif
 }`);
     // systemCharset: AIR reports the OS's LEGACY encoding here (measured: the
     // string "x-mac-chinesesimp" on this Chinese-locale macOS host), which is a
@@ -18304,19 +18329,16 @@ static char* as_file_working_dir(void) {
     this.line('static char* as_file_system_charset(void) { return (char*)"UTF-8"; }');
     this.line('static int as_mkdir_one(const char* p) {');
     this.indent++;
-    this.line('#ifdef _WIN32');
-    this.line('// MSVC names mkdir _mkdir and drops the mode argument, and _mkdir lives in');
-    this.line('// <direct.h> which this preamble does not include. CreateDirectoryA is the');
-    this.line('// kernel32 single-level directory creator and needs no extra header.');
-    this.line('return CreateDirectoryA(p, NULL) ? 0 : -1;');
-    this.line('#else');
-    this.line('return mkdir(p, 0755);');
-    this.line('#endif');
+    this.line('// as_p_mkdir is the seam helper: CreateDirectoryW on Windows (the UTF-8 path is');
+    this.line('// converted to UTF-16 first) and mkdir() everywhere else. Both answer 0 on');
+    this.line('// success, which is the shape as_mkdirs() checks.');
+    this.line('return as_p_mkdir(p, 0755);');
     this.indent--;
     this.line('}');
     // POSIX remove() deletes an empty directory (via rmdir), but MSVC's remove()
     // is _unlink-only and cannot delete a directory. deleteDirectory therefore
-    // needs its own helper: RemoveDirectoryA on Windows, remove() elsewhere.
+    // needs its own helper: RemoveDirectoryW on Windows (through the seam),
+    // remove() elsewhere.
     // remove() rather than rmdir() because rmdir is declared in <unistd.h>, which
     // WASI does not get (the preamble skips it there -- no fork/exec to hand a URL
     // to); wasi-libc declares remove() in <stdio.h> and routes an empty directory
@@ -18325,12 +18347,8 @@ static char* as_file_working_dir(void) {
     // implicit declaration the older clang accepted).
     this.line('static int as_rmdir_one(const char* p) {');
     this.indent++;
-    this.line('#ifdef _WIN32');
-    this.line('// kernel32 single-level empty-directory remover; mirrors as_mkdir_one.');
-    this.line('return RemoveDirectoryA(p) ? 0 : -1;');
-    this.line('#else');
-    this.line('return remove(p);');
-    this.line('#endif');
+    this.line('// Mirrors as_mkdir_one: _wrmdir on Windows, remove() on the POSIX/WASI side.');
+    this.line('return as_p_rmdir(p);');
     this.indent--;
     this.line('}');
     this.line('static void as_mkdirs(const char* p) {');
@@ -18383,7 +18401,17 @@ static char* as_file_working_dir(void) {
     this.line('char* home = as_home_dir();');
     this.line('char* base = NULL;');
     this.line('#ifdef _WIN32');
-    this.line('char* appdata = getenv("APPDATA");');
+    this.line('// GetEnvironmentVariableW: %APPDATA% holds the profile path, which is not ASCII');
+    this.line('// for every user; the CRT environment copy would hand back ANSI bytes.');
+    this.line('char* appdata = NULL;');
+    this.line('{');
+    this.line('  static char appdata_buf[4096];');
+    this.line('  wchar_t w[4096];');
+    this.line('  DWORD n = GetEnvironmentVariableW(L"APPDATA", w, (DWORD)(sizeof(w) / sizeof(w[0])));');
+    this.line('  if (n > 0 && n < (DWORD)(sizeof(w) / sizeof(w[0])) &&');
+    this.line('      WideCharToMultiByte(CP_UTF8, 0, w, -1, appdata_buf, (int)sizeof(appdata_buf), NULL, NULL) > 0)');
+    this.line('    appdata = appdata_buf;');
+    this.line('}');
     this.line('if (appdata == NULL || *appdata == \'\\0\') appdata = as_path_join(home, "AppData/Roaming");');
     this.line('base = as_path_join(appdata, ASC_APP_ID);');
     this.line('base = as_path_join(base, "Local Store");');
@@ -18597,7 +18625,7 @@ File* File_new(char* path) {
   File* o = (File*)_this;
   if (o->_nativePath == NULL) { as_throw(Error_new((char*)"Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.", 2037)); return 0.0; }
   struct stat st;
-  if (stat(o->_nativePath, &st) != 0) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return 0.0; }
+  if (as_p_stat(o->_nativePath, &st) != 0) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return 0.0; }
   if (!S_ISREG(st.st_mode)) return 0.0;
   return (double)st.st_size;
 }`);
@@ -18618,7 +18646,7 @@ File* File_new(char* path) {
     // happily answer for the device, so the type check comes first.
     this.line('#ifndef _WIN32');
     this.indent++;
-    this.line('{ struct stat st; if (stat(p, &st) != 0) return 0.0; if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return 0.0; }');
+    this.line('{ struct stat st; if (as_p_stat(p, &st) != 0) return 0.0; if (!S_ISDIR(st.st_mode) && !S_ISREG(st.st_mode)) return 0.0; }');
     this.indent--;
     this.line('#endif');
     this.line('#ifdef _WIN32');
@@ -18631,12 +18659,19 @@ File* File_new(char* path) {
     this.line('// Name walks UP to the nearest mounted ancestor, so without it an unresolvable');
     this.line('// path would report its volume figure instead (measured: adl reports 0).');
     this.line('if (!as_path_exists(p)) return 0.0;');
-    this.line('char root[MAX_PATH];');
-    this.line('if (!GetVolumePathNameA(p, root, MAX_PATH)) return 0.0;');
-    this.line('ULARGE_INTEGER freeAvail;');
-    this.line('freeAvail.QuadPart = 0;');
-    this.line('if (!GetDiskFreeSpaceExA(root, &freeAvail, NULL, NULL)) return 0.0;');
-    this.line('return (double)freeAvail.QuadPart;');
+    this.line('{');
+    this.line('  wchar_t wroot[MAX_PATH];');
+    this.line('  wchar_t* wp = as_p_wide(p);');
+    this.line('  ULARGE_INTEGER freeAvail;');
+    this.line('  BOOL ok;');
+    this.line('  if (wp == NULL) return 0.0;');
+    this.line('  if (!GetVolumePathNameW(wp, wroot, MAX_PATH)) { free(wp); return 0.0; }');
+    this.line('  free(wp);');
+    this.line('  freeAvail.QuadPart = 0;');
+    this.line('  ok = GetDiskFreeSpaceExW(wroot, &freeAvail, NULL, NULL);');
+    this.line('  if (!ok) return 0.0;');
+    this.line('  return (double)freeAvail.QuadPart;');
+    this.line('}');
     this.indent--;
     this.line('#elif !defined(__wasi__) && !defined(__EMSCRIPTEN__)');
     this.indent++;
@@ -18785,7 +18820,7 @@ File* File_new(char* path) {
 #ifdef _WIN32
   // Attributes describe the link itself, so a link answers even when its target
   // is gone. (An NTFS link is also reported when dangling; a POSIX lstat does.)
-  return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES;
+  return as_p_attr(p) != INVALID_FILE_ATTRIBUTES;
 #else
   struct stat st;
   return lstat(p, &st) == 0;
@@ -18793,65 +18828,71 @@ File* File_new(char* path) {
 }
 // Remove whatever sits at p, recursing through REAL directories only.
 // 0 ok, 3003 missing, 2038 filesystem refusal.
+//
+// The per-entry walk is shared: as_p_dir_* yields UTF-8 names on both hosts, so
+// a CJK entry name goes back through as_path_join (UTF-8) and is then converted
+// once by the next as_p_* call -- the same path representation everywhere.
 static int as_remove_any(const char* p) {
+  int is_dir;
+  int err = 0;
 #ifdef _WIN32
-  DWORD a = GetFileAttributesA(p);
-  if (a == INVALID_FILE_ATTRIBUTES) return 3003;
-  if ((a & FILE_ATTRIBUTE_DIRECTORY) == 0 || (a & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
-    // A file, or a link/junction: never walk into it.
-    if (DeleteFileA(p) || RemoveDirectoryA(p)) return 0;
-    return 2038;
-  }
   {
-    size_t n = strlen(p);
-    char* pat = (char*)malloc(n + 3);
-    int err = 0;
-    size_t i;
-    if (pat == NULL) return 2038;
-    memcpy(pat, p, n);
-    for (i = 0; i < n; i++) if (pat[i] == '/') pat[i] = '\\\\';
-    pat[n] = '\\\\'; pat[n + 1] = '*'; pat[n + 2] = '\\0';
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    free(pat);
-    if (h == INVALID_HANDLE_VALUE) return 2038;
-    do {
-      if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-      err = as_remove_any(as_path_join(p, fd.cFileName));
-      if (err != 0) break;
-    } while (FindNextFileA(h, &fd) != 0);
-    FindClose(h);
-    if (err != 0) return err;
+    DWORD a = as_p_attr(p);
+    if (a == INVALID_FILE_ATTRIBUTES) return 3003;
+    is_dir = ((a & FILE_ATTRIBUTE_DIRECTORY) != 0 && (a & FILE_ATTRIBUTE_REPARSE_POINT) == 0);
+    if (!is_dir) {
+      // A file, or a link/junction: never walk into it.
+      if (as_p_delete_file(p) || as_p_remove_dir(p)) return 0;
+      return 2038;
+    }
   }
-  return RemoveDirectoryA(p) ? 0 : 2038;
 #else
-  struct stat st;
-  if (lstat(p, &st) != 0) return 3003;
-  if (!S_ISDIR(st.st_mode)) return (remove(p) == 0) ? 0 : 2038;
   {
-    DIR* d = opendir(p);
-    int err = 0;
+    struct stat st;
+    if (lstat(p, &st) != 0) return 3003;
+    is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+    if (!is_dir) return (as_p_remove(p) == 0) ? 0 : 2038;
+  }
+#endif
+  {
+    as_p_dir* d = as_p_dir_open(p);
     if (d == NULL) return 2038;
-    struct dirent* e;
-    while ((e = readdir(d)) != NULL) {
-      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-      err = as_remove_any(as_path_join(p, e->d_name));
+    for (;;) {
+      const char* name = as_p_dir_next(d);
+      if (name == NULL) break;
+      if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+      err = as_remove_any(as_path_join(p, name));
       if (err != 0) break;
     }
-    closedir(d);
+    as_p_dir_close(d);
     if (err != 0) return err;
   }
-  return (remove(p) == 0) ? 0 : 2038;
+#ifdef _WIN32
+  return as_p_remove_dir(p) ? 0 : 2038;
+#else
+  return (as_p_remove(p) == 0) ? 0 : 2038;
 #endif
 }
 // Non-recursive directory removal: the EMPTY case only, and the only place where
-// "not empty" (#3010) can arise.
+// "not empty" (#3010) can arise. The Win32 code keeps its own body because the
+// #3010 decision reads GetLastError, and the seam helper frees the converted
+// path before returning -- reading the error after that free would be reading an
+// error code some other call may already have replaced.
 static int as_rmdir_empty(const char* p) {
 #ifdef _WIN32
-  if (RemoveDirectoryA(p)) return 0;
-  return (GetLastError() == ERROR_DIR_NOT_EMPTY) ? 3010 : 2038;
+  {
+    wchar_t* w = as_p_wide(p);
+    BOOL ok;
+    DWORD last;
+    if (w == NULL) return 2038;
+    ok = RemoveDirectoryW(w);
+    last = GetLastError();
+    free(w);
+    if (ok) return 0;
+    return (last == ERROR_DIR_NOT_EMPTY) ? 3010 : 2038;
+  }
 #else
-  if (remove(p) == 0) return 0;
+  if (as_p_remove(p) == 0) return 0;
   return (errno == ENOTEMPTY || errno == EEXIST) ? 3010 : 2038;
 #endif
 }
@@ -18866,7 +18907,7 @@ static int as_file_path_delete_err(const char* p, int isDir, int recursive) {
   }
   // deleteFile: a REAL directory is #3006; a symlink to one is not.
   if (as_path_is_dir(p) && !as_path_is_symlink(p)) return 3006;
-  return (remove(p) == 0) ? 0 : 3001;
+  return (as_p_remove(p) == 0) ? 0 : 3001;
 }
 static int as_file_delete_err(File* o, int isDir, int recursive) {
   if (o->_nativePath == NULL) return 2037;
@@ -18988,7 +19029,7 @@ static void as_file_throw(int err) {
 static int as_file_time_ms(const char* p, int creation, double* out) {
 #ifdef _WIN32
   WIN32_FILE_ATTRIBUTE_DATA fa;
-  if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return 0;
+  if (!as_p_attrs_ex(p, &fa)) return 0;
   const FILETIME* ft = creation ? &fa.ftCreationTime : &fa.ftLastWriteTime;
   ULARGE_INTEGER u;
   u.LowPart = ft->dwLowDateTime;
@@ -18998,7 +19039,7 @@ static int as_file_time_ms(const char* p, int creation, double* out) {
   return 1;
 #else
   struct stat st;
-  if (stat(p, &st) != 0) return 0;
+  if (as_p_stat(p, &st) != 0) return 0;
   *out = as_stat_time_ms(&st, creation);
   return 1;
 #endif
@@ -19137,14 +19178,20 @@ static char* as_file_relpath(const char* a, const char* b, int useDotDot) {
     // exactly that shape, so the name differs per run just as AIR's does.
     this.cblock(`static char* as_file_temp_dir(void) {
 #ifdef _WIN32
-  // GetTempPathA is the OS answer (it consults TMP, then TEMP, then the profile,
+  // GetTempPathW is the OS answer (it consults TMP, then TEMP, then the profile,
   // i.e. the same order AIR follows), so adl and this build name the same folder
   // without this side hard-coding one env var. The old three-getenv chain ended at
   // USERPROFILE: a temp file dropped straight into the profile ROOT whenever TEMP
   // and TMP were unset, which is a writable-looking but wrong answer.
-  static char tmpdir[4096];
-  DWORD tlen = GetTempPathA((DWORD)sizeof(tmpdir), tmpdir);
-  if (tlen == 0 || tlen >= (DWORD)sizeof(tmpdir)) return NULL;
+  // The wide form is what keeps a CJK profile path (C:\\Users\\张伟\\...)
+  // intact: GetTempPathA would decode the bytes through the ANSI code page.
+  static wchar_t wtmp[4096];
+  static char tmpdir[4096 * 3 + 1];
+  DWORD tlen = GetTempPathW((DWORD)(sizeof(wtmp) / sizeof(wtmp[0])), wtmp);
+  int n;
+  if (tlen == 0 || tlen >= (DWORD)(sizeof(wtmp) / sizeof(wtmp[0]))) return NULL;
+  n = WideCharToMultiByte(CP_UTF8, 0, wtmp, -1, tmpdir, (int)sizeof(tmpdir), NULL, NULL);
+  if (n <= 0) return NULL;
   return tmpdir;
 #else
   const char* e = getenv("TMPDIR");
@@ -19163,10 +19210,9 @@ static char* as_file_temp_path(int isDir) {
     p = as_path_join(dir, nm);
     if (as_path_exists_l(p)) continue;
     if (isDir) {
-      if (CreateDirectoryA(p, NULL)) return p;
+      if (as_p_create_dir(p)) return p;
     } else {
-      HANDLE h = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-      if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return p; }
+      if (as_p_touch_new(p)) return p;
     }
   }
   return NULL;
@@ -19224,85 +19270,80 @@ static char* as_file_temp_path(int isDir) {
     // recursively, everything else byte for byte. Returns an AIR error id or 0.
     this.cblock(`static int as_file_copy_any(const char* src, const char* dst) {
 #ifdef _WIN32
-  DWORD attr = GetFileAttributesA(src);
+  DWORD attr = as_p_attr(src);
   if (attr == INVALID_FILE_ATTRIBUTES) return 3003;
   if ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
-    FILE* in = fopen(src, "rb");
-    if (in == NULL) return 3001;
-    FILE* out = fopen(dst, "wb");
-    if (out == NULL) { fclose(in); return 3001; }
+    FILE* in = as_p_fopen(src, "rb");
+    FILE* out;
     unsigned char buf[65536];
     size_t n;
+    if (in == NULL) return 3001;
+    out = as_p_fopen(dst, "wb");
+    if (out == NULL) { fclose(in); return 3001; }
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
     fclose(out);
     fclose(in);
     return 0;
   }
-  if (!CreateDirectoryA(dst, NULL) && !as_path_is_dir(dst)) return 2038;
+  if (!as_p_create_dir(dst) && !as_path_is_dir(dst)) return 2038;
   {
-    size_t len = strlen(src);
-    char* pat = (char*)malloc(len + 3);
+    as_p_dir* d = as_p_dir_open(src);
     int err = 0;
-    size_t i;
-    if (pat == NULL) return 2038;
-    memcpy(pat, src, len);
-    for (i = 0; i < len; i++) if (pat[i] == '/') pat[i] = 92;
-    pat[len] = 92; pat[len + 1] = '*'; pat[len + 2] = 0;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    free(pat);
-    if (h == INVALID_HANDLE_VALUE) return 2038;
-    do {
-      if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-      err = as_file_copy_any(as_path_join(src, fd.cFileName), as_path_join(dst, fd.cFileName));
+    if (d == NULL) return 2038;
+    for (;;) {
+      const char* name = as_p_dir_next(d);
+      if (name == NULL) break;
+      if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+      err = as_file_copy_any(as_path_join(src, name), as_path_join(dst, name));
       if (err != 0) break;
-    } while (FindNextFileA(h, &fd) != 0);
-    FindClose(h);
-    if (err != 0) return err;
-  }
-  return 0;
-#else
-  struct stat st;
-  if (lstat(src, &st) != 0) return 3003;
-  if (S_ISLNK(st.st_mode)) {
-    char buf[4096];
-    ssize_t n = readlink(src, buf, sizeof(buf) - 1);
-    if (n <= 0) return 2038;
-    buf[n] = 0;
-    return (symlink(buf, dst) == 0) ? 0 : 2038;
-  }
-  if (S_ISDIR(st.st_mode)) {
-    if (mkdir(dst, st.st_mode & 07777) != 0 && !as_path_is_dir(dst)) return 2038;
-    DIR* d = opendir(src);
-    int err = 0;
-    if (d == NULL) return 3001;
-    {
-      struct dirent* e;
-      while ((e = readdir(d)) != NULL) {
-        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-        err = as_file_copy_any(as_path_join(src, e->d_name), as_path_join(dst, e->d_name));
-        if (err != 0) break;
-      }
     }
-    closedir(d);
+    as_p_dir_close(d);
     return err;
   }
+#else
   {
-    FILE* in = fopen(src, "rb");
-    FILE* out;
-    unsigned char* buf;
-    size_t n;
-    if (in == NULL) return 3001;
-    out = fopen(dst, "wb");
-    if (out == NULL) { fclose(in); return 3001; }
-    buf = (unsigned char*)malloc(65536);
-    if (buf == NULL) { fclose(out); fclose(in); return 2038; }
-    while ((n = fread(buf, 1, 65536, in)) > 0) fwrite(buf, 1, n, out);
-    free(buf);
-    fclose(out);
-    fclose(in);
-    chmod(dst, st.st_mode & 07777);
-    return 0;
+    struct stat st;
+    if (lstat(src, &st) != 0) return 3003;
+    if (S_ISLNK(st.st_mode)) {
+      char buf[4096];
+      ssize_t n = readlink(src, buf, sizeof(buf) - 1);
+      if (n <= 0) return 2038;
+      buf[n] = 0;
+      return (symlink(buf, dst) == 0) ? 0 : 2038;
+    }
+    if (S_ISDIR(st.st_mode)) {
+      as_p_dir* d;
+      int err = 0;
+      if (as_p_mkdir(dst, st.st_mode & 07777) != 0 && !as_path_is_dir(dst)) return 2038;
+      d = as_p_dir_open(src);
+      if (d == NULL) return 3001;
+      for (;;) {
+        const char* name = as_p_dir_next(d);
+        if (name == NULL) break;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        err = as_file_copy_any(as_path_join(src, name), as_path_join(dst, name));
+        if (err != 0) break;
+      }
+      as_p_dir_close(d);
+      return err;
+    }
+    {
+      FILE* in = as_p_fopen(src, "rb");
+      FILE* out;
+      unsigned char* buf;
+      size_t n;
+      if (in == NULL) return 3001;
+      out = as_p_fopen(dst, "wb");
+      if (out == NULL) { fclose(in); return 3001; }
+      buf = (unsigned char*)malloc(65536);
+      if (buf == NULL) { fclose(out); fclose(in); return 2038; }
+      while ((n = fread(buf, 1, 65536, in)) > 0) fwrite(buf, 1, n, out);
+      free(buf);
+      fclose(out);
+      fclose(in);
+      chmod(dst, st.st_mode & 07777);
+      return 0;
+    }
   }
 #endif
 }`);
@@ -19411,7 +19452,7 @@ void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
   if (nullArg) { as_file_null_dest(); return; }
   if (err == 0) {
     const char* dst = as_file_path_of((void*)newFile);
-    if (rename(o->_nativePath, dst) != 0) {
+    if (as_p_rename(o->_nativePath, dst) != 0) {
       err = as_file_copy_any(o->_nativePath, dst);
       if (err == 0) err = as_remove_any(o->_nativePath);
     }
@@ -19669,7 +19710,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('// directory that still shares the path\'s device is the volume root.');
     this.line('static char* as_volume_root(const char* path) {');
     this.line('  struct stat st;');
-    this.line('  if (path == NULL || stat(path, &st) != 0) return NULL;');
+    this.line('  if (path == NULL || as_p_stat(path, &st) != 0) return NULL;');
     this.line('  dev_t dev = st.st_dev;');
     this.line('  char* cur = as_str_alloc(strlen(path) + 2);');
     this.line('  strcpy(cur, path);');
@@ -19684,7 +19725,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('    cur[plen] = \'\\0\';');
     this.line('    const char* parent = (plen == 0) ? "/" : cur;');
     this.line('    struct stat ps;');
-    this.line('    bool same = (stat(parent, &ps) == 0 && ps.st_dev == dev);');
+    this.line('    bool same = (as_p_stat(parent, &ps) == 0 && ps.st_dev == dev);');
     this.line('    cur[plen] = saved;');
     this.line('    if (!same) break;');
     this.line('    if (plen == 0) { cur[0] = \'/\'; cur[1] = \'\\0\'; n = 1; break; }');
@@ -19755,10 +19796,10 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('  return NULL;');
     this.line('#elif defined(__APPLE__)');
     this.line('  struct stat st;');
-    this.line('  if (path == NULL || stat(path, &st) != 0) return NULL;');
+    this.line('  if (path == NULL || as_p_stat(path, &st) != 0) return NULL;');
     this.line('  char* home = as_home_dir();');
     this.line('  struct stat hs;');
-    this.line('  if (home != NULL && stat(home, &hs) == 0 && hs.st_dev == st.st_dev) {');
+    this.line('  if (home != NULL && as_p_stat(home, &hs) == 0 && hs.st_dev == st.st_dev) {');
     this.line('    char* t = as_path_join(home, ".Trash");');
     this.line('    if (as_path_is_dir(t)) return t;');
     this.line('    as_mkdirs(t);');
@@ -19778,9 +19819,9 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('  // info/, so the desktop can restore it. A path on another volume uses');
     this.line('  // <volume root>/.Trash/<uid>, per the specification.');
     this.line('  struct stat st, hs;');
-    this.line('  if (path == NULL || stat(path, &st) != 0) return NULL;');
+    this.line('  if (path == NULL || as_p_stat(path, &st) != 0) return NULL;');
     this.line('  char* home = as_home_dir();');
-    this.line('  bool home_volume = (home != NULL && stat(home, &hs) == 0 && hs.st_dev == st.st_dev);');
+    this.line('  bool home_volume = (home != NULL && as_p_stat(home, &hs) == 0 && hs.st_dev == st.st_dev);');
     this.line('  char* base;');
     this.line('  if (home_volume) {');
     this.line('    const char* xdg = getenv("XDG_DATA_HOME");');
@@ -19815,7 +19856,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('  if (leaf == NULL) return;');
     this.line('  char* leafinfo = as_str_concat(leaf, ".trashinfo");');
     this.line('  char* note = as_path_join(info, leafinfo);');
-    this.line('  FILE* fp = fopen(note, "w");');
+    this.line('  FILE* fp = as_p_fopen(note, "w");');
     this.line('  if (fp == NULL) return;');
     this.line('  fprintf(fp, "[Trash Info]\\nPath=");');
     this.line('  for (const char* q = original; *q != \'\\0\'; q++) {');
@@ -19844,10 +19885,10 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('// support the concept of a recoverable trash folder, the files are removed');
     this.line('// immediately") -- the shell answering, not a fallback invented here.');
     this.line('//');
-    this.line('// The wide conversion is CP_ACP, not CP_UTF8, because every other Windows path');
-    this.line('// call in this runtime is the ANSI one (stat, GetModuleFileNameA, remove): that');
-    this.line('// is the same reading of the same bytes, whereas decoding as UTF-8 would send');
-    this.line('// the shell to a path the rest of the runtime cannot see.');
+    this.line('// The wide conversion is CP_UTF8 because AS3 strings are UTF-8 and every other');
+    this.line('// Windows path call now reads them the same way (see the path-encoding seam):');
+    this.line('// decoding through the ANSI code page would send the shell to a DIFFERENT');
+    this.line('// path than the one as_p_stat/as_p_fopen just used.');
     this.line('//');
     this.line('// The caller has already rejected NULL/empty (2037) and a path that does not');
     this.line('// exist (3003) -- measured: adl answers those with the same two numbers on');
@@ -19856,10 +19897,10 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('static long as_trash_move_shell(const char* path) {');
     this.line('  // SHFileOperationW takes a DOUBLE-NUL-terminated list of paths, so `from`');
     this.line('  // carries one terminator past the end of the string.');
-    this.line('  int need = MultiByteToWideChar(CP_ACP, 0, path, -1, NULL, 0);');
+    this.line('  int need = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);');
     this.line('  if (need <= 0) return 2038;');
     this.line('  WCHAR* from = (WCHAR*)as_alloc((size_t)(need + 1) * sizeof(WCHAR));');
-    this.line('  if (MultiByteToWideChar(CP_ACP, 0, path, -1, from, need) <= 0) return 2038;');
+    this.line('  if (MultiByteToWideChar(CP_UTF8, 0, path, -1, from, need) <= 0) return 2038;');
     this.line('  from[need] = 0;');
     this.line('  SHFILEOPSTRUCTW op;');
     this.line('  memset(&op, 0, sizeof op);');
@@ -19876,7 +19917,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('static long as_trash_move(const char* path) {');
     this.line('  if (path == NULL || path[0] == \'\\0\') return 2037;');
     this.line('  struct stat st;');
-    this.line('  if (stat(path, &st) != 0) return 3003;');
+    this.line('  if (as_p_stat(path, &st) != 0) return 3003;');
     this.line('#ifdef _WIN32');
     this.line('  return as_trash_move_shell(path);');
     this.line('#else');
@@ -19893,7 +19934,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('  }');
     this.line('  char* target = as_trash_target(dir, name);');
     this.line('  if (target == NULL) return 2038;');
-    this.line('  if (rename(path, target) != 0) return 2038;');
+    this.line('  if (as_p_rename(path, target) != 0) return 2038;');
     this.line('  as_trash_note(dir, target, path);');
     this.line('  return 0;');
     this.line('#endif');
@@ -19965,7 +20006,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('if (err != 0) { as_file_throw(err); return; }');
     // A cross-volume move makes rename() fail (EXDEV). AIR copies and then deletes,
     // and so does this: as_file_copy_any moves the whole tree, then the source goes.
-    this.line('if (rename(o->_nativePath, as_file_path_of((void*)newFile)) != 0) {');
+    this.line('if (as_p_rename(o->_nativePath, as_file_path_of((void*)newFile)) != 0) {');
     this.indent++;
     this.line('const char* dst = as_file_path_of((void*)newFile);');
     this.line('err = as_file_copy_any(o->_nativePath, dst);');
@@ -20110,43 +20151,23 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('if (!as_path_exists(o->_nativePath)) as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003));');
     this.line('if (!as_path_is_dir(o->_nativePath)) as_throw(Error_new((char*)"Error #3007: Not a directory.", 3007));');
     this.line('as_array* result = as_array_new();');
-    this.line('#ifdef _WIN32');
-    this.line('// MSVC has no dirent.h; enumerate with FindFirstFile/FindNextFile, which');
-    this.line('// want a backslash separator (FindFirstFile rejects the \'/\' as_path_join');
-    this.line('// produces), so build a "<dir>\\*" pattern and swap separators as we copy.');
+    this.line('// One cursor for both hosts (as_p_dir_*): it opens the directory, yields');
+    this.line('// each entry name as UTF-8 and closes itself at the end, so this body has');
+    this.line('// no platform branch and a CJK entry name survives intact.');
     this.line('{');
     this.indent++;
-    this.line('size_t n = strlen(o->_nativePath);');
-    this.line('char* pat = (char*)malloc(n + 3);');
-    this.line('size_t i;');
-    this.line('memcpy(pat, o->_nativePath, n);');
-    this.line('for (i = 0; i < n; i++) if (pat[i] == \'/\') pat[i] = \'\\\\\';');
-    this.line('pat[n] = \'\\\\\'; pat[n + 1] = \'*\'; pat[n + 2] = \'\\0\';');
-    this.line('WIN32_FIND_DATAA fd;');
-    this.line('HANDLE h = FindFirstFileA(pat, &fd);');
-    this.line('free(pat);');
-    this.line('if (h == INVALID_HANDLE_VALUE) return result;');
-    this.line('do {');
-    this.indent++;
-    this.line('if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;');
-    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->_nativePath, fd.cFileName))));');
-    this.indent--;
-    this.line('} while (FindNextFileA(h, &fd) != 0);');
-    this.line('FindClose(h);');
-    this.indent--;
-    this.line('}');
-    this.line('#else');
-    this.line('DIR* d = opendir(o->_nativePath);');
+    this.line('as_p_dir* d = as_p_dir_open(o->_nativePath);');
+    this.line('const char* name;');
     this.line('if (d == NULL) return result;');
-    this.line('struct dirent* e;');
-    this.line('while ((e = readdir(d)) != NULL) {');
+    this.line('while ((name = as_p_dir_next(d)) != NULL) {');
     this.indent++;
-    this.line('if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;');
-    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->_nativePath, e->d_name))));');
+    this.line('if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;');
+    this.line('as_array_push(result, as_v_obj((void*)File_new(as_path_join(o->_nativePath, name))));');
     this.indent--;
     this.line('}');
-    this.line('closedir(d);');
-    this.line('#endif');
+    this.line('as_p_dir_close(d);');
+    this.indent--;
+    this.line('}');
     this.line('return result;');
     this.indent--;
     this.line('}');
@@ -20230,7 +20251,7 @@ static int as_fs_begin(FileStream* o, const char* path, int mc) {
   else if (mc == 2) cm = "wb";
   else if (mc == 3) cm = "ab";
   else cm = "r+b";
-  f = fopen(path, cm);
+  f = as_p_fopen(path, cm);
   if (f == NULL) return 2038;
   // APPEND starts at EOF -- AIR reports position == file length right after open
   // (measured: position 6 on a 6-byte file, the next write extending it to 8).
@@ -20789,7 +20810,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static unsigned char* as_so_load_bytes(const char* p, size_t* out_len) {');
     this.indent++;
     this.line('*out_len = 0;');
-    this.line('FILE* f = fopen(p, "rb");');
+    this.line('FILE* f = as_p_fopen(p, "rb");');
     this.line('if (f == NULL) return NULL;');
     this.line('size_t cap = 4096, len = 0, n = 0;');
     this.line('unsigned char* buf = (unsigned char*)as_alloc(cap);');
@@ -20989,7 +21010,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_so_mkparent(o->path);');
     this.line('size_t len = 0;');
     this.line('unsigned char* buf = as_so_serialize(o, &len);');
-    this.line('FILE* f = fopen(o->path, "wb");');
+    this.line('FILE* f = as_p_fopen(o->path, "wb");');
     this.line('if (f == NULL) { free(buf); return 0; }');
     this.line('if (len > 0) fwrite(buf, 1, len, f);');
     this.line('fclose(f);');
@@ -21011,7 +21032,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('SharedObject* o = (SharedObject*)_this;');
     this.line('o->_data = as_object_new();');
     this.line('gc_write_barrier((void*)o->_data);');
-    this.line('if (o->path != NULL) remove(o->path);');
+    // The path is UTF-8, so the unlink goes through the seam (_wremove on Windows).
+    this.line('if (o->path != NULL) as_p_remove(o->path);');
     this.indent--;
     this.line('}');
     // close: AIR documents it as affecting remote objects only (adl-verified: a

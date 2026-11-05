@@ -139,23 +139,37 @@ trace("no-dialog: OK");`, false);
   assert.match(out.stderr, /no platform backend/);
 });
 
-test('unit: desktop/dialog build keeps ICU and compile configuration identical', { skip: process.platform !== 'darwin' }, () => {
+// Native desktop backends (dialogs + OLE drag) are part of every native window
+// build on macOS AND Windows. The Windows pair used to be opt-in because the rest
+// of the runtime spoke ACP paths; the UTF-8 -> UTF-16 seam (as_p_* in the
+// preamble) removed that boundary, so a manifest that does NOT mention either
+// define must still get both backends and the OLE libraries.
+test('unit: desktop backends are wired for every native window build', () => {
   const cfg = { ...defaultBuildConfig(), sources: [join(root, 'vendor', 'window_glue.cc')], defines: ['ASC_USE_WINDOW=1'] };
   const before = objectDir(cfg);
-  assert(effectiveDefines(cfg).includes('ASC_USE_FILE_DIALOG=1'));
-  const steps = buildCompileSteps(cfg, 'main.c', 'main');
-  assert(steps.some(step => step.includes(join(root, 'vendor', 'file_dialog_macos.mm'))));
-  assert.equal(objectDir(cfg), before);
-  for (const step of steps.filter(s => s.includes('-c'))) assert(step.includes('ASC_USE_FILE_DIALOG=1'));
-  assert.equal(cfg.sources.length, 1, 'build enrichment must not mutate its input');
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    assert(effectiveDefines(cfg).includes('ASC_USE_FILE_DIALOG=1'));
+    const macSteps = buildCompileSteps(cfg, 'main.c', 'main');
+    assert(macSteps.some(step => step.includes(join(root, 'vendor', 'file_dialog_macos.mm'))));
+    assert.equal(objectDir(cfg), before);
+    for (const step of macSteps.filter(s => s.includes('-c'))) assert(step.includes('ASC_USE_FILE_DIALOG=1'));
+    assert.equal(cfg.sources.length, 1, 'build enrichment must not mutate its input');
+
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
-    assert(!effectiveDefines(cfg).some(d => /^ASC_USE_(FILE_DIALOG|NATIVE_DRAG)=/.test(d)), 'Windows must stay disabled until the ACP/UTF-8 boundary is migrated');
-    assert.deepEqual(withNativeDesktopBackends(cfg).sources, cfg.sources);
-    const explicit = withNativeDesktopBackends({ ...cfg, defines: [...cfg.defines, 'ASC_USE_FILE_DIALOG=1', 'ASC_USE_NATIVE_DRAG=1'] });
-    assert(explicit.sources.includes(join(root, 'vendor', 'file_dialog_win.cc')));
-    assert(explicit.sources.includes(join(root, 'vendor', 'native_drag_win.cc')));
-    assert(explicit.linkLibs.includes('ole32') && explicit.linkLibs.includes('shell32'));
+    const defs = effectiveDefines(cfg);
+    assert(defs.includes('ASC_USE_FILE_DIALOG=1'), 'Windows gets the dialog backend without a manifest opt-in');
+    assert(defs.includes('ASC_USE_NATIVE_DRAG=1'), 'Windows gets the drag backend without a manifest opt-in');
+    const win = withNativeDesktopBackends(cfg);
+    assert(win.sources.includes(join(root, 'vendor', 'file_dialog_win.cc')));
+    assert(win.sources.includes(join(root, 'vendor', 'native_drag_win.cc')));
+    assert(win.linkLibs.includes('ole32') && win.linkLibs.includes('shell32') && win.linkLibs.includes('uuid'));
+    assert(defs.includes('ASC_USE_FILE_DIALOG=1'));
+
+    // A pure-C build (no window_glue.cc) has no UI thread and must not link them.
+    const plain = { ...cfg, sources: ['main.c'] };
+    assert(!effectiveDefines(plain).some(d => /^ASC_USE_(FILE_DIALOG|NATIVE_DRAG)=/.test(d)));
+    assert.deepEqual(withNativeDesktopBackends(plain).sources, plain.sources);
   } finally { Object.defineProperty(process, 'platform', platform); }
 });

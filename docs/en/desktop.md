@@ -262,6 +262,15 @@ Outside `ASC_USE_WINDOW && __APPLE__` every capability flag is `0` and `sk_menu_
 stubs. A Windows `HWND` menu bar is a stage of its own; the browser has no native menu concept, so `0` is the
 honest answer there.
 
+`flash.desktop.NativeDragManager` and the `File.browseFor*` / `FileReference.browse` family are **not** part of
+this group: they are backed by `vendor/native_drag_win.cc` and `vendor/file_dialog_win.cc` (OLE `IDropTarget` and
+Shell `IFileDialog`) and are attached to every native window build on Windows as well as macOS — no manifest
+opt-in. `NativeDragManager.isSupported` therefore answers `true` in a windowed Windows build and `false` in a
+plain C build. Measured on Windows 10: the Shell dialog opens (ESC dispatches CANCEL, a pick dispatches SELECT
+with the chosen path) and a real Explorer drag delivers ENTER/OVER/DROP with `files=1` and the CJK file name
+intact. See `docs/zh-cn/desktop-file-interaction.md` for the full status table and the path-encoding
+prerequisite (`docs/zh-cn/win32.md` §3.23).
+
 ---
 
 ### 7.6 Semi-transparent pixels: AIR multiplies alpha **twice**, we multiply once (deliberately)

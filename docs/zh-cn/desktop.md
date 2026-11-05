@@ -250,6 +250,13 @@ Win32 `GetCursorPos`）：AIR 在此时**补发**被弹窗吞掉的 `rightMouseU
 Windows 侧将来接 `HWND` 菜单栏是**独立阶段**的事；wasm 没有原生菜单概念，能力位为 `0` 即为正确的
 诚实回答。
 
+`flash.desktop.NativeDragManager` 与 `File.browseFor*` / `FileReference.browse` **不属于这一组**：它们由
+`vendor/native_drag_win.cc`（OLE `IDropTarget`）与 `vendor/file_dialog_win.cc`（Shell `IFileDialog`）支撑，
+在 Windows 上与 macOS 一样**自动接入每个 native 窗口构建**，不需要清单 opt-in。因此 Windows 窗口构建的
+`NativeDragManager.isSupported` 是 `true`，而纯 C 构建是 `false`。Windows 10 实测：Shell 面板弹出（ESC 派发
+CANCEL、选中派发带上路径的 SELECT），资源管理器真拖入投递 ENTER/OVER/DROP 且 `files=1`、CJK 文件名逐字
+保留。完整状态表与前置的路径编码迁移见 `desktop-file-interaction.md` 与 `win32.md` §3.23。
+
 ---
 
 ### 7.6 半透明像素：AIR 会**多乘一次 alpha**，我们只乘一次（刻意不跟）

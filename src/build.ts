@@ -1169,10 +1169,15 @@ export function featureNames(features: readonly string[]): string[] {
 // take a different feature set than the others.
 export function effectiveDefines(cfg: BuildConfig): string[] {
   const defs = [...cfg.defines, ...featureDefines(cfg.features)];
-  if (cfg.target === 'native' && process.platform === 'darwin' &&
-      cfg.sources.some(s => /(^|[/\\])window_glue\.cc$/.test(s)) && !defs.includes('ASC_USE_FILE_DIALOG=1'))
-    defs.push('ASC_USE_FILE_DIALOG=1');
-  if (cfg.target === 'native' && process.platform === 'darwin' && cfg.sources.some(s => /(^|[/\\])window_glue\.cc$/.test(s)) && !defs.includes('ASC_USE_NATIVE_DRAG=1')) defs.push('ASC_USE_NATIVE_DRAG=1');
+  // Both desktop backends exist on macOS AND Windows. The Windows runtimes take
+  // UTF-8 like every other host: the path seam in RUNTIME_PREAMBLE converts to
+  // UTF-16 at the Win32 boundary (as_p_*), and both .cc backends convert their
+  // own strings the same way -- so there is no ACP boundary left to opt in to.
+  const nativeDesktop = cfg.target === 'native' &&
+    (process.platform === 'darwin' || process.platform === 'win32') &&
+    cfg.sources.some(s => /(^|[/\\])window_glue\.cc$/.test(s));
+  if (nativeDesktop && !defs.includes('ASC_USE_FILE_DIALOG=1')) defs.push('ASC_USE_FILE_DIALOG=1');
+  if (nativeDesktop && !defs.includes('ASC_USE_NATIVE_DRAG=1')) defs.push('ASC_USE_NATIVE_DRAG=1');
   return defs;
 }
 
@@ -1888,13 +1893,14 @@ export function withNativeDesktopBackends(cfg: BuildConfig): BuildConfig {
   if (cfg.target !== 'native' || (process.platform !== 'darwin' && process.platform !== 'win32')) return cfg;
   const window = cfg.sources.find(s => /(^|[/\\])window_glue\.cc$/.test(s));
   if (!window) return cfg;
-  // Windows' existing filesystem runtime uses ACP paths. These UTF-8 backends
-  // must remain opt-in until that boundary is migrated and Windows is validated.
+  // Windows used to take these only when the manifest already spelled out the
+  // define, because its filesystem runtime spoke ACP and the UTF-8 backends would
+  // have disagreed with it. The path seam removed that boundary, so both hosts
+  // now pull the backends in unconditionally (effectiveDefines turns them on).
   const names = process.platform === 'darwin' ? ['file_dialog_macos.mm', 'native_drag_macos.mm'] : [
-    ...(cfg.defines.includes('ASC_USE_FILE_DIALOG=1') ? ['file_dialog_win.cc'] : []),
-    ...(cfg.defines.includes('ASC_USE_NATIVE_DRAG=1') ? ['native_drag_win.cc'] : []),
+    'file_dialog_win.cc',
+    'native_drag_win.cc',
   ];
-  if (!names.length) return cfg;
   const sources = names.map(s => join(dirname(window), s));
   for (const source of sources) if (!existsSync(source)) throw new Error(`Native desktop backend missing: ${source}`);
   return { ...cfg, sources: [...cfg.sources, ...sources.filter(s => !cfg.sources.includes(s))],

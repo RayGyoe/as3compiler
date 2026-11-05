@@ -50,7 +50,10 @@
     "${win:uuid}",
     "${win:setupapi}",
     "${win:shell32}",
-    "${win:dinput8}"
+    "${win:dinput8}",
+    "${win:d3d12}",
+    "${win:dxgi}",
+    "${win:d3dcompiler}"
   ],
   "link-paths": [
     "../vendor/skia/lib/${host}",

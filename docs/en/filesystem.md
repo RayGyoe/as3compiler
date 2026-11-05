@@ -678,8 +678,12 @@ ledger row: AIR does cancel, so this was a §1.5 left-over defect, fixed in the 
 - `systemCharset` reports the **host locale's legacy encoding** on `adl` (`x-mac-chinesesimp` here);
   we answer `"UTF-8"`. Deliberate: every string in this build is UTF-8, and naming a code page we
   never use would be a lie.
-- Native file dialogs (`browseFor*`, `FileReference.browse`) and volume enumeration
-  (`getVolumeByDrive`/`getVolumeByPath`) are not implemented; they report themselves through
-  `as_shell_unsupported`, see `TODO.md`.
+- Native file dialogs (`browseFor*`, `FileReference.browse`) are implemented and wired into every
+  native window build (see `docs/zh-cn/desktop-file-interaction.md`); volume enumeration
+  (`getVolumeByDrive`/`getVolumeByPath`) is not, and reports itself through `as_shell_unsupported`,
+  see `TODO.md`.
 - `File.createTempFile()` files stay in `TMPDIR` for the OS to clean (same as AIR).
-- The Windows branch was reasoned through, not run: there is no Windows machine here.
+- The Windows branch has been RUN on real hardware (plain C build and Skia window build): path
+  encoding, `cacheDirectory`, the Recycle Bin and `spaceAvailable` all have measured records.
+  **Every path this runtime hands to Win32 is UTF-8 and is widened by `as_p_*` first**; do not
+  reintroduce the `*A` entry points or CP_ACP in a Windows arm (see `docs/zh-cn/win32.md` §3.23).
