@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>demo.as3.yuv420gpu</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>yuv420-gpu</filename>
+  <architecture>64</architecture>
+  <initialWindow>
+    <content>main.swf</content>
+    <title>YUV420 GPU</title>
+    <visible>true</visible>
+    <width>200</width>
+    <height>200</height>
+    <resizable>false</resizable>
+    <renderMode>direct</renderMode>
+  </initialWindow>
+</application>
