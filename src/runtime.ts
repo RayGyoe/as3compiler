@@ -213,17 +213,17 @@ static int as_getTimer(void) {
     return (int)(as_now_ms() - as_start_ms);
 }
 
-// flash.display.showRedrawRegions(enable, color): see the codegen note. Accepted and
-// recorded, but never painted: this render walk has no AIR-style region list, and a
-// rectangle around our dirty rect would depict a different thing. AS3's default color
-// (0xFF0000) is what the codegen passes when the second argument is omitted.
+// flash.display.showRedrawRegions(enable, color): see the codegen note. The flag is
+// recorded here; as_render_cached paints a 1px outline around the dirty rect it just
+// repainted (bake_patch / whole retained-surface repaint / rebuild) whenever the flag
+// is on — AIR's debug overlay, reused as the dirty-rect regression oracle
+// (docs/zh-cn/repaint-boundary.md). AS3's default color (0xFF0000) is what the codegen
+// passes when the second argument is omitted.
 static int ASC_show_redraw_regions = 0;
 static double ASC_show_redraw_regions_color = 16711680.0;
 static void as_show_redraw_regions(int on, double color) {
     ASC_show_redraw_regions_color = color;
-    if (on == ASC_show_redraw_regions) return;
     ASC_show_redraw_regions = on;
-    if (on) as_shell_unsupported("flash.display.showRedrawRegions (this renderer does not paint region outlines)");
 }
 
 // ---------- external URL launcher (flash.net.navigateToURL / sendToURL) ----------

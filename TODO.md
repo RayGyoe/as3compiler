@@ -19557,6 +19557,45 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 图形）、带 filter、尺寸/相位变化仍整边界重烘。「帧末统一复位」（`as_clear_dirty`）仍未启用——它需与增量重烘配套并
 系统性修掉 auto-bake 增加暴露的漏点；`showRedrawRegions` 仍只接受无覆盖层。
 
+### 阶段三百七十二：RepaintBoundary 阶段 C 收尾 —— 帧末复位 + showRedrawRegions oracle + 重绘面积验收（v0.4.335 → v0.4.336）
+
+**起点**：阶段三百七十一落地增量重烘（bake_patch）后，`as_clear_dirty` 仍「定义但未启用」，`showRedrawRegions`
+仍「接受但无覆盖层」，「FPS 计数器重绘面积降幅」与「滚动列表 header 不动」两项验收也未钉。本阶段把阶段 C 清单
+剩余项全部落地。
+
+**逐项**：
+1. **showRedrawRegions 真画出脏矩形**：`as_render_cached` 在 rebuild/patch/复用整重烘三个消费分支里，消费前记
+   `redrawn=1` 与刚重绘的矩形 `rl/rt/rr/rb`（rebuild/整重烘=边界 bounds，patch=脏矩形）；blit 之后若
+   `ASC_show_redraw_regions` 置位，用 `as_skia_paint_stroke(color,1,1)` 画 1px 轮廓。runtime 侧 `ASC_show_redraw_regions`
+   记录 flag/color，`as_show_redraw_regions` 作为顶层调用经 `emitGlobalCall` 发射。这是 AIR 的调试覆盖层，正好做脏矩
+   形的像素级 oracle。
+2. **帧末统一复位启用**：`Stage_render` 与 `ASC_window_render` 在渲染完成后（`as_render_object` 之后、snapshot/save 前）
+   调 `as_clear_dirty(stage)`，把**所有**对象的 `_render_dirty`/脏矩形清 0（缓存分支消费后已清、live 子树从未被清的那
+   部分也一并清），下一帧从零累积脏。这是增量重烘的配套：否则 live（非缓存）子树的 `_render_dirty` 跨帧保持，
+   auto-bake 永不触发。
+3. **根（stage）不再 auto-bake**：auto-bake 触发条件加 `o->parent != NULL`。否则根烘焙后，任何子对象写点冒泡到根
+   都会把整个窗口 tear-down + re-bake——正是阶段四十七「为了 90×20 FPS 小块重绘整帧 2000×1360」的代价本阶段要消除的。
+   修后 TalkMED 真机 `bake_on` 对象均为小块子树（20×20~332×82），不再出现整窗口尺寸的根。
+4. **三个验收示例**（均链 Skia，判据是像素，无后端时自检跳过）：
+   - `examples/show-redraw-regions.as`：边界比脏矩形大（右下角静态子对象），首次 draw 整边界重建描边覆盖整个边界，
+     改左上角图形后再次 draw 增量重烘只描脏矩形——像素断言「右边缘先有描边后消失 + 脏矩形右边缘有描边」。
+   - `examples/fps-counter.as`：静止大背景（多 primitive）auto-bake 只烘一次、之后 blit，每帧变化的小块走 live；像素断言
+     大背景多帧不变 + 小块每帧更新；`ASC_BAKE_TRACE=1` 观察 bake_on/bake_rebuild 只出现一次而非每帧整帧重烘。
+   - `examples/scroll-header-pin.as`：固定 header 在列表容器之外，滚动只改 `list.scrollRect`（脏只冒泡 list 及其祖先），
+     `BitmapData.draw` 前后采样 header 逐点不变、滚动窗内容随位移变化。
+
+**验收**：
+- `npm run test:unit`：**tests 319 / pass 319 / fail 0**（`render/RepaintBoundary` 新增帧末复位钉 + auto-bake 触发含根排除钉）。
+- 全量 `node test.ts`：**tests 621 / pass 621 / fail 0**（含新增 `show-redraw-regions.as`、`fps-counter.as`、
+  `scroll-header-pin.as` 三个端到端用例）。
+- TalkMED AOT 重建 + 真机 60s（`ASC_BAKE_TRACE=1`）：无崩溃（segfault/abort/malloc 计数 0）；`bake_on 43`、
+  `bake_rebuild 42`、`bake_blit 80`、`bake_patch 0`（无显式 cacheAsBitmap + 同 bounds 精确矩形写场景，属预期）；
+  bake_on 对象均为非根小块子树，无整窗口根。
+
+**如实报明**：帧末复位「信任写点完整」——漏标脏的对象会在下一帧被 auto-bake 烘成旧内容（冻结）；TalkMED 真机 60s
+无冻结/崩溃，但更长的交互验证仍待窗口 GUI 场景。增量重烘（bake_patch）仍只对显式 cacheAsBitmap 成立；auto-bake
+脏仍是掉烘落到 live（非增量），FPS 降幅来自「根不烘 + 静止子树 blit」而非 auto-bake 的矩形级重绘。
+
 ### 阶段三百七十：RepaintBoundary 阶段 C 第二步 —— 彻底移除每帧指纹哈希（v0.4.333 → v0.4.334）
 
 **起点**：阶段三百六十九落地脏矩形基础设施（写了不读），但每帧整树指纹哈希 `as_render_fp` 仍保留——它服务

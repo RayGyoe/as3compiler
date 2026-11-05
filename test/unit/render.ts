@@ -2637,9 +2637,23 @@ function checkRepaintBoundary(): string[] {
   check('as_gflush invalidates the precise accumulated bounds, not the whole object',
     emitted.includes('static void as_gflush(Graphics* g) {')
     && emitted.includes('as_mark_dirty_rect(g->_owner, g->_bl - half, g->_bt - half, g->_br + half, g->_bb + half);'));
-  // Stage C (incremental re-bake) will call as_clear_dirty once after the paint;
-  // until the dirty rectangle is consumed, clearing stays at consume time in the
-  // cache branch and this end-of-frame reset stays disabled.
+  // ---- Stage C: showRedrawRegions paints the dirty-rect oracle (§4.4) ----
+  check('showRedrawRegions records the flag without an unsupported report',
+    !runtimeSource.includes('does not paint region outlines')
+    && runtimeSource.includes('ASC_show_redraw_regions = on;'));
+  check('as_render_cached records the repaint rect before clearing the dirty flag',
+    emitted.includes('redrawn = 1; rl = bl; rt = bt; rr = br; rb = bb;')
+    && emitted.includes('redrawn = 1; rl = dl; rt = dt; rr = dr; rb = db;'));
+  check('a repainted boundary paints a stroke outline of its repaint rect',
+    emitted.includes('if (redrawn && ASC_show_redraw_regions) {')
+    && emitted.includes('as_skia_paint_stroke((unsigned)(long long)ASC_show_redraw_regions_color, 1.0, 1.0);')
+    && emitted.includes('as_skia_canvas_draw_rect(canvas, rl, rt, rr - rl, rb - rt, rrp);'));
+  // Stage C: end-of-frame reset (as_clear_dirty) is ENABLED after incremental
+  // re-bake — it clears live subtrees the cache branch never touches, so auto-bake
+  // can fire on them next frame.
+  check('as_clear_dirty runs end-of-frame in Stage_render and ASC_window_render',
+    emitted.includes('as_clear_dirty((DisplayObject*)_this);')
+    && emitted.includes('as_clear_dirty((DisplayObject*)w->stage);'));
   check('the field-write tail appends as_mark_dirty after a render-input store',
     emitSource.includes('as_mark_dirty((DisplayObject*)${doDirtyRecv})'));
   check('the render-input set lists the nine plain geometry/colour fields',
@@ -2708,8 +2722,8 @@ function checkRepaintBoundary(): string[] {
     && emitted.includes('if (as_is(o, &MovieClip_vt)) as_mc_button_state(o);')
     && emitted.includes('if (as_is(o, &SimpleButton_vt)) {')
     && emitted.includes('as_render_states((DisplayObject*)as_v_obj_val(c->children->data[i]));'));
-  check('auto-bake triggers in as_render_object before the cache decision',
-    emitted.includes('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {')
+  check('auto-bake triggers in as_render_object before the cache decision (root excluded)',
+    emitted.includes('if (!ASC_no_auto_bake && o->parent != NULL && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {')
     && emitted.includes('int use_cache = 0;'));
   check('dynamic field write (as_dyn_set) marks DisplayObject render-dirty via the disp hook',
     runtimeSource.includes('static void (*as_disp_dirty_hook)(void* obj) = NULL;')

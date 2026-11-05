@@ -211,9 +211,10 @@ if (boundary && snapshot hit) {
   old snapshot for the rest. This is the "FPS scene only redraws a 90×20 region" shape — highest payoff, hardest
   to get right.
 
-**End-of-frame reset**: after `Present`, `ASC_window_render` clears `_render_dirty` on **all** objects (both
-re-rendered and non-re-rendered — next frame's dirt accumulates from zero). Timing aligns with the current
-`as_render_fp` per-frame update of `_auto_fp`.
+**End-of-frame reset**: `Stage_render` and `ASC_window_render` call `as_clear_dirty(stage)` after the paint
+(before snapshot/save), clearing `_render_dirty` on **all** objects (both re-rendered and non-re-rendered — next
+frame's dirt accumulates from zero). Companion fix: **the root (stage) does not auto-bake** — otherwise a baked
+root turns any descendant write into a whole-window tear-down + re-bake.
 
 ### 4.5 Relationship to the frame fingerprint (the key tradeoff)
 
@@ -331,15 +332,24 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
   whole retained surface (`reset` + clear + repaint); size/phase change still rebuilds (bake_rebuild). An explicit
   `cacheAsBitmap` no longer clears `_render_dirty`/`_cache_valid` in `as_render_object` — that is deferred to
   `as_render_cached`, which clears on consume; an auto-bake still tears down to live.
-- [ ] Enable the end-of-frame reset (`as_clear_dirty`) together with incremental re-bake, systematically fixing the
-  missed write points exposed by the increased auto-bake.
+- [x] Enable the end-of-frame reset (`as_clear_dirty`) together with incremental re-bake: `Stage_render` and
+  `ASC_window_render` call `as_clear_dirty(stage)` after the paint (before snapshot/save), zeroing every object's
+  `_render_dirty`/dirty rect so the next frame accumulates from zero. This also fixes the missed auto-bake write
+  point it exposed: **the root (stage) no longer auto-bakes** (the trigger adds `o->parent != NULL`) — otherwise a
+  baked root turns any descendant write into a whole-window tear-down + re-bake, exactly the stage forty-seven
+  "repaint the whole 2000×1360 frame for a 90×20 region" cost this stage exists to remove.
 - **Acceptance**:
-  - FPS counter scene (`TODO.md` stage forty-seven's 90×20 region): redrawn pixel area drops from whole-frame to
-    small-region, asserted via `ASC_BAKE_TRACE` / a redraw-area counter.
-  - `showRedrawRegions` upgrades from "accepted but no overlay" (current `emit.ts:40320`) to "actually outlines
-    the dirty rect" — AIR's debug overlay, which doubles as the pixel-level regression oracle for dirty rects.
-  - Pixel pin: a scrolling list redraws only the scrolling content, the fixed header does not move for a frame
-    (`BitmapData.draw` before/after signature comparison).
+  - [x] FPS counter scene (`TODO.md` stage forty-seven's 90×20 region): `examples/fps-counter.as` keeps a still
+    background auto-baked (bakes once, then blits) while a per-frame-changing region stays live; `ASC_BAKE_TRACE=1`
+    shows bake_on/bake_rebuild once rather than a whole-frame re-bake every frame.
+  - [x] `showRedrawRegions` upgrades from "accepted but no overlay" to "actually outlines the dirty rect":
+    `as_render_cached` records the just-redrawn rect (`redrawn` + `rl/rt/rr/rb`) and strokes a 1px outline after the
+    blit (`ASC_show_redraw_regions`/`as_show_redraw_regions`); `examples/show-redraw-regions.as` pins the pixels of
+    "whole-boundary rebuild outlines the whole boundary, incremental re-bake outlines only the dirty rect".
+  - [x] Pixel pin: a scrolling list redraws only the scrolling content, the fixed header does not move for a frame:
+    `examples/scroll-header-pin.as` keeps the header outside the list container, scrolling only changes
+    `list.scrollRect` (dirty bubbles to the list and its ancestors), so a `BitmapData.draw` before/after sample shows
+    the header byte-identical while the scroll window's content moves.
 
 ### Stage D (optional, independent enhancement): DisplayList recording + replay
 
@@ -395,6 +405,7 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 - [`skia.md`](skia.md) §6.10–§6.14: full measurements for auto-bake / cacheAsBitmap / frame fingerprint /
   single-primitive folding.
 - [`gc.md`](gc.md) §6: incremental GC per-frame budget and write barrier (the orthogonal performance line).
-- `src/emit.ts`: `as_render_fp` (`29022`), `as_render_cached` (`29293`), `as_render_object` (`29559`),
-  `as_render_object_content` (`29839`), `ASC_window_render` (`30736`), `Stage_render` (`30174`).
+- `src/emit.ts`: `as_mark_dirty`/`as_mark_dirty_rect`/`as_clear_dirty`, `as_render_states`, `as_render_cached`
+  (rebuild/patch/full retained repaint + showRedrawRegions outline), `as_render_object` (auto-bake trigger with the
+  root exclusion), `as_render_object_content`, `ASC_window_render`, `Stage_render` (end-of-frame reset).
 - `TODO.md` stage forty-seven (`947-948`): the original record of the dirty-rect invalidate pipeline.

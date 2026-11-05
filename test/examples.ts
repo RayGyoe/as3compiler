@@ -489,6 +489,18 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // drawRect 只带精确脏矩形，第二次 render 必须走 bake_patch（保留 raster surface 局部重绘）
   // 而不是整边界 rebuild。判据是像素（中心先蓝后红），故与 bake-bitmap-swap.as 一样链 Skia。
   'cache-patch.as': ['--manifest', join(dir, 'cache-patch.build.json')],
+  // show-redraw-regions.as（阶段三百七十二 · RepaintBoundary 阶段 C）钉的是 showRedrawRegions
+  // 真画出脏矩形描边：边界比脏矩形大（右下角静态子对象），首次 draw 整边界重建描边覆盖
+  // 整个边界，改左上角图形后再次 draw 增量重烘只描脏矩形。判据是像素，故链 Skia。
+  'show-redraw-regions.as': ['--manifest', join(dir, 'show-redraw-regions.build.json')],
+  // fps-counter.as（阶段三百七十二 · RepaintBoundary 阶段 C 验收）钉的是「重绘面积降幅」：
+  // 静止的大背景 auto-bake 只烘一次、之后 blit，每帧变化的小块走 live。像素断言大背景多帧
+  // 不变 + 小块每帧更新。链 Skia。
+  'fps-counter.as': ['--manifest', join(dir, 'fps-counter.build.json')],
+  // scroll-header-pin.as（阶段三百七十二 · RepaintBoundary 阶段 C 验收）钉的是「滚动列表只重绘
+  // 滚动内容，固定 header 一帧不动」：header 在列表容器之外，滚动只改 list.scrollRect（脏只冒泡
+  // list 及其祖先），header 像素逐点不变。判据是像素，故链 Skia。
+  'scroll-header-pin.as': ['--manifest', join(dir, 'scroll-header-pin.build.json')],
 };
 // Examples that need an input file absent from the tree. Skipped loudly so the
 // suite never reports coverage it did not exercise.

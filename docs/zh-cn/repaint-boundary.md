@@ -190,8 +190,10 @@ if (边界 && 命中快照) {
 - **阶段 C**：边界脏 → 用 `_dirty_l/t/r/b` 裁剪，只重绘快照里脏矩形覆盖的像素，其余 blit 旧快照。这是
   「FPS 场景只重绘 90×20 小块」的落地形态，也是收益最大、最难做对的一步。
 
-**帧末复位**：`ASC_window_render` 在 Present 后，把**所有**对象的 `_render_dirty` 清 0（边界重绘过的和
-未重绘的都要清，因为下一帧的脏要从零累积）。这与现在 `as_render_fp` 每帧递归更新 `_auto_fp` 的时机对齐。
+**帧末复位**：`Stage_render` 与 `ASC_window_render` 在 Present 后（渲染完成、snapshot/save 前）调用
+`as_clear_dirty(stage)`，把**所有**对象的 `_render_dirty` 清 0（边界重绘过的和未重绘的都要清，因为下一帧
+的脏要从零累积）。配套地，**根（stage）不 auto-bake**——否则根烘焙后，任何子对象写点冒泡到根都会把整个
+窗口 tear-down + re-bake。
 
 ### 4.5 与帧指纹的关系（关键取舍）
 
@@ -287,13 +289,20 @@ if (边界 && 命中快照) {
       则复用 surface 整重烘（`reset` + clear + 重画）；尺寸/相位变化仍走整边界重建（bake_rebuild）。显式
       `cacheAsBitmap` 脏不再在 `as_render_object` 里清 `_render_dirty`/`_cache_valid`，改为交给 `as_render_cached`
       消费后清脏；auto-bake 脏仍掉烘落到 live。
-- [ ] 「帧末统一复位」（`as_clear_dirty`）启用：与增量重烘配套，系统性修掉 auto-bake 增加暴露的漏点。
+- [x] 「帧末统一复位」（`as_clear_dirty`）启用：`Stage_render` 与 `ASC_window_render` 在 Present 后（渲染完成、
+  snapshot/save 前）调用 `as_clear_dirty(stage)`，把**所有**对象的 `_render_dirty`/脏矩形清 0（缓存分支消费后已清、
+  live 子树从未被清的那部分也一并清），下一帧从零累积脏。配套修掉 auto-bake 增加暴露的漏点：**根（stage）不再
+  auto-bake**（auto-bake 触发加 `o->parent != NULL`）——否则根烘焙后，任何子对象写点冒泡到根都会把整个窗口
+  tear-down + re-bake，正是阶段四十七「为了 90×20 小块重绘整帧 2000×1360」的代价本阶段要消除的。
 - **验收**：
-  - FPS 计数器场景（`TODO.md` 阶段四十七的 90×20 小块）：重绘像素面积从「整帧」降到「小块」，用
-    `ASC_BAKE_TRACE` / 重绘面积计数器断言。
-  - `showRedrawRegions` 从「接受但无覆盖层」（现 `emit.ts:40320`）升级为「真画出脏矩形」——这是 AIR 的
-    调试覆盖层，正好拿来做脏矩形的像素级回归 oracle。
-  - 像素钉子：滚动列表只重绘滚动内容，固定 header 一帧不动（`BitmapData.draw` 前后签名比对）。
+  - [x] FPS 计数器场景（`TODO.md` 阶段四十七的 90×20 小块）：`examples/fps-counter.as` 静止大背景 auto-bake 只烘一次、
+    之后 blit，每帧变化的小块走 live；`ASC_BAKE_TRACE=1` 观察 bake_on/bake_rebuild（只出现一次）而非每帧整帧重烘。
+  - [x] `showRedrawRegions` 从「接受但无覆盖层」升级为「真画出脏矩形」：`as_render_cached` 记录刚重绘的矩形
+    （`redrawn` + `rl/rt/rr/rb`），在 blit 后画 1px stroke 轮廓（`ASC_show_redraw_regions`/`as_show_redraw_regions`）；
+    `examples/show-redraw-regions.as` 钉「整边界重建描整个边界、增量重烘只描脏矩形」的像素。
+  - [x] 像素钉子：滚动列表只重绘滚动内容，固定 header 一帧不动：`examples/scroll-header-pin.as` 固定 header 在列表
+    容器之外，滚动只改 `list.scrollRect`（脏只冒泡 list 及其祖先），`BitmapData.draw` 前后采样 header 逐点不变、
+    滚动窗内容随位移变化。
 
 ### 阶段 D（可选，独立增强）：DisplayList 记录 + replay
 
@@ -339,6 +348,7 @@ if (边界 && 命中快照) {
 
 - [`skia.md`](skia.md) §6.10~§6.14：auto-bake / cacheAsBitmap / 帧指纹 / 单图元折叠的完整实测。
 - [`gc.md`](gc.md) §6：增量 GC 的每帧预算与写屏障（与本设计正交的另一条性能线）。
-- `src/emit.ts`：`as_render_fp`（`29022`）、`as_render_cached`（`29293`）、`as_render_object`（`29559`）、
-  `as_render_object_content`（`29839`）、`ASC_window_render`（`30736`）、`Stage_render`（`30174`）。
+- `src/emit.ts`：`as_mark_dirty`/`as_mark_dirty_rect`/`as_clear_dirty`、`as_render_states`、`as_render_cached`
+  （rebuild/patch/full retained repaint + showRedrawRegions 轮廓）、`as_render_object`（auto-bake 触发含根排除）、
+  `as_render_object_content`、`ASC_window_render`、`Stage_render`（帧末复位）。
 - `TODO.md` 阶段四十七（`947-948`）：脏矩形 invalidate 管线的原始记录。

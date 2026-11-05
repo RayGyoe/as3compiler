@@ -29372,6 +29372,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.indent++;
     this.line('double bl = 0.0, bt = 0.0, br = 0.0, bb = 0.0;');
+    this.line('double rl = 0.0, rt = 0.0, rr = 0.0, rb = 0.0;');
+    this.line('int redrawn = 0;');
     this.line('if (!as_render_bounds(o, &bl, &bt, &br, &bb)) {');
     this.indent++;
     this.line('as_render_live(canvas, o);');
@@ -29521,6 +29523,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->_cache_w = (double)pw; o->_cache_h = (double)ph;');
     this.line('o->_cache_phx = bpx; o->_cache_phy = bpy;');
     this.line('o->_cache_valid = 1;');
+    this.line('redrawn = 1; rl = bl; rt = bt; rr = br; rb = bb;');
     this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
     this.indent--;
     this.line('}');
@@ -29555,6 +29558,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
     this.line('as_final_register(o, o->_cache_image);');
+    this.line('redrawn = 1; rl = dl; rt = dt; rr = dr; rb = db;');
     this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
     this.indent--;
     this.line('}');
@@ -29578,6 +29582,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
     this.line('as_final_register(o, o->_cache_image);');
+    this.line('redrawn = 1; rl = bl; rt = bt; rr = br; rb = bb;');
     this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
     this.indent--;
     this.line('}');
@@ -29604,6 +29609,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('double bl_bx = 1.0, bl_by = 1.0; as_skia_canvas_total_scale(canvas, &bl_bx, &bl_by);');
     this.line('int bl_smooth = (fabs(bl_bx - sx) > 0.001 || fabs(bl_by - sy) > 0.001) ? 1 : 0;');
     this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy, bl_smooth);');
+    this.indent--;
+    this.line('}');
+    this.line('if (redrawn && ASC_show_redraw_regions) {');
+    this.indent++;
+    this.line('void* rrp = as_skia_paint_stroke((unsigned)(long long)ASC_show_redraw_regions_color, 1.0, 1.0);');
+    this.line('as_skia_canvas_draw_rect(canvas, rl, rt, rr - rl, rb - rt, rrp);');
+    this.line('as_skia_paint_delete(rrp);');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -29859,7 +29871,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (docs/zh-cn/repaint-boundary.md §4.4). Objects without deterministic bounds
     // (empty containers) stay live. It runs before the cache decision so the flag
     // set here is visible to the branch below.
-    this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {');
+    //
+    // The root (stage) is excluded: baking the ROOT turns every descendant change
+    // into a whole-frame tear-down + re-bake (a child's write bubbles to the root),
+    // which is exactly the "repaint the whole 2000x1360 frame for a 90x20 FPS
+    // counter" cost this stage exists to remove. Only non-root still subtrees bake;
+    // the root stays live and composes its baked children.
+    this.line('if (!ASC_no_auto_bake && o->parent != NULL && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
     this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); }');
@@ -30374,6 +30392,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('ASC_caret_pass = 1;');
     this.line('as_render_object(canvas, (DisplayObject*)_this);');
     this.line('ASC_caret_pass = 0;');
+    // Stage C: end-of-frame reset so the next frame accumulates dirty from zero.
+    // Without this, live (non-cached) subtrees keep _render_dirty set across
+    // frames and auto-bake never fires (the cache branch clears on consume, live
+    // does not).
+    this.line('as_clear_dirty((DisplayObject*)_this);');
     this.line('as_skia_surface_save_png(surface, path);');
     this.line('as_skia_surface_delete(surface);');
     this.indent--;
@@ -31077,9 +31100,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
     this.line('#endif');
     this.line('w->render_epoch = ASC_dirty_epoch; w->render_s3d_serial = ASC_stage3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
-    // Stage C (incremental re-bake) will switch to end-of-frame clearing via
-    // as_clear_dirty here; until the dirty rectangle is consumed, clearing stays at
-    // consume time in the cache branch and this reset is left disabled.
+    // Stage C: end-of-frame reset (see as_clear_dirty). The cache branch still
+    // clears on consume (that is what makes incremental re-bake correct); this
+    // clears the LIVE subtrees the cache branch never touches, so auto-bake can
+    // fire on them next frame.
+    this.line('as_clear_dirty((DisplayObject*)w->stage);');
     this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _p3 = as_now_ms(); if (_p3 - _p0 >= 4.0) fprintf(stderr, "t=%.0f pass paint acquire=%.2f draw=%.2f flush=%.2f live=%d cached=%d\\n", as_now_ms(), _p1 - _p0, _p2 - _p1, _p3 - _p2, as_dbg_live_n, as_dbg_cached_n); }');
     this.line('return 1;');
     this.indent--;
@@ -40554,11 +40579,12 @@ void FileStream_writeObject(void* _this, as_value v) {
       // (like parseInt) so frame counters can time themselves without importing it.
       case 'getTimer': return { code: 'as_getTimer()', type: { kind: 'int' } };
       // flash.display.showRedrawRegions(enable:Boolean, color:uint = 0xFF0000):void --
-      // AIR's debug overlay that outlines each redrawn region. This render walk has
-      // no AIR-style region list to outline (it repaints the tree, and the dirty-rect
-      // path is a different notion), so the call is accepted and remembered, and the
-      // first enabling call reports that no overlay is painted. Both arguments are
-      // still evaluated (AIR evaluates them), so a call with a side effect behaves.
+      // AIR's debug overlay that outlines each redrawn region. Stage C (dirty-rect
+      // incremental re-bake) now has a real region to outline: as_render_cached paints
+      // a 1px stroke around the rect it just repainted (rebuild = whole boundary,
+      // bake_patch = the dirty rect), so the call sets the recorded flag and the next
+      // repaint draws it. Both arguments are still evaluated (AIR evaluates them), so
+      // a call with a side effect behaves.
       case 'showRedrawRegions': {
         const on = this.condExpr(e0!);
         const col = args.length >= 2 ? this.toNumberExpr(this.emitExpr(args[1])) : '16711680.0';
