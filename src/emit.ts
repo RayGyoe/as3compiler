@@ -3,6 +3,8 @@
 
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
+import { FILE_DIALOG_RUNTIME } from './file-dialog.ts';
+import { NATIVE_DRAG_HEAD, NATIVE_DRAG_BODY } from './native-drag.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
 import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation, stmtCompletesNormally } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
@@ -354,6 +356,8 @@ const E4X_CTX_CALLS = new Set([
 // (bytesAvailable is 0 and readUTFBytes hands back "", exactly what a process
 // that has produced no output yet looks like).
 const SHELL_CTOR_EXTRA = new Map<string, string[]>([
+  ['NativeDragOptions', ['o->allowCopy = true; o->allowMove = true; o->allowLink = true;']],
+  ['NativeDragEvent', ['o->stageX = localX; o->stageY = localY;']],
   ['NativeProcess', [
     'o->standardInput = ByteArray_new();',
     'o->standardOutput = ByteArray_new();',
@@ -3133,6 +3137,7 @@ export class Emitter {
     // NativeMenu.display / ContextMenu.display bodies that call it are emitted long
     // before that, as is the right-click path's popup trigger.
     this.line('static void as_menu_popup_stage(as_array* items, void* menu, void* mouseTarget, void* owner, int win, double sx, double sy, int fromPress);');
+    this.cblock(NATIVE_DRAG_HEAD);
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type);');
     this.line('static int as_stage_window_id(Stage* st);');
     this.line('static void as_menu_popup_pump(void);');
@@ -4383,6 +4388,8 @@ export class Emitter {
       // half with the type/bubbles/cancelable the caller passed.
       const sup = info.superClass ? this.symbols.getClass(info.superClass) : undefined;
       const supArgs = (sup?.constructor.params ?? []).map((sp) => {
+        if (name === 'NativeDragEvent' && sp.name === 'ctrlKey') return 'controlKey';
+        if (name === 'NativeDragEvent' && sp.name === 'relatedObject') return '(Object*)relatedObject';
         const mine = info.constructor.params.find((p) => p.name === sp.name);
         return mine !== undefined ? this.cIdent(mine.name) : this.shellLiteral(sp.defaultValue);
       });
@@ -4428,6 +4435,10 @@ export class Emitter {
       // backend (findInterfaces is the first: see emitNetworkInfoFindInterfaces).
       for (const [mname, m] of info.methods) {
         if (m.owner !== name) continue;
+        if (name === 'NativeDragEvent' && mname === 'clone') {
+          this.line('Event* NativeDragEvent_clone(void* self) { NativeDragEvent* o = (NativeDragEvent*)self; NativeDragEvent* copy = NativeDragEvent_new(o->_type, o->_bubbles, o->_cancelable, o->localX, o->localY, (InteractiveObject*)o->relatedObject, o->clipboard, o->allowedActions, o->dropAction, o->controlKey, o->altKey, o->shiftKey, o->commandKey); copy->stageX = o->stageX; copy->stageY = o->stageY; return (Event*)copy; }');
+          continue;
+        }
         if (name === 'NetworkInfo' && mname === 'findInterfaces') { this.emitNetworkInfoFindInterfaces(); continue; }
         this.emitShellStub(`${name}_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, m.returnType, `${label}.${mname}`);
       }
@@ -4441,14 +4452,17 @@ export class Emitter {
       }
       for (const [mname, m] of info.staticMethods) {
         if (m.owner !== name) continue;
+        if (name === 'NativeDragManager') continue;
         this.emitShellStub(`${name}_${mname}_static`, this.shellArgs(m.params, info.importAlias, true), m.returnType, `${label}.${mname}`);
       }
       for (const [mname, m] of info.staticSetters ?? []) {
         if (m.owner !== name) continue;
+        if (name === 'NativeDragManager') continue;
         this.emitShellStub(`${name}_set_${mname}_static`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, { kind: 'void' }, `${label}.${mname}`);
       }
       for (const [mname, m] of info.staticGetters ?? []) {
         if (m.owner !== name) continue;
+        if (name === 'NativeDragManager') continue;
         // A static getter returning the class it lives on is the documented
         // singleton (`NativeApplication.nativeApplication`, `Clipboard.
         // generalClipboard`, `NetworkInfo.networkInfo`): hand back one shared
@@ -10727,6 +10741,7 @@ void Clipboard_ctor(Clipboard* o) {
   o->_fmts = as_array_new();
   o->_vals = as_array_new();
   o->_hdl = as_array_new();
+  o->_dragState = 0; o->_dragLocal = false;
 }
 
 Clipboard* Clipboard_new(void) {
@@ -10749,6 +10764,7 @@ Clipboard* Clipboard_get_generalClipboard_static(void* _this) {
 // not recorded itself. AIR's own order is the OS's; the content is what matters.
 as_array* Clipboard_get_formats(void* _this) {
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 0);
   as_array* a = as_array_new();
   if (o == NULL) return a;
   for (int i = 0; i < o->_fmts->length; i++) as_array_push(a, o->_fmts->data[i]);
@@ -10765,10 +10781,11 @@ as_array* Clipboard_get_formats(void* _this) {
 
 // File promises are a macOS-only OS feature this build does not implement on any
 // backend, so the honest answer is false everywhere (docs/zh-cn/desktop.md 7.10).
-bool Clipboard_get_supportsFilePromise(void* _this) { (void)_this; return false; }
+bool Clipboard_get_supportsFilePromise(void* _this) { as_native_drag_clip_access((Clipboard*)_this, 0); return false; }
 
 bool Clipboard_hasFormat(void* _this, char* format) {
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 0);
   if (o == NULL || format == NULL) return false;
   // The operating system answers first for generalClipboard: another application
   // may have replaced the clipboard since our own write, and AIR reads through to
@@ -10780,6 +10797,7 @@ bool Clipboard_hasFormat(void* _this, char* format) {
 
 as_value Clipboard_getData(void* _this, char* format, char* transferMode) {
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 1);
   if (o == NULL || format == NULL) return as_v_null();
   const char* tm = transferMode != NULL ? transferMode : "originalPreferred";
   bool clone_only = strcmp(tm, "cloneOnly") == 0;
@@ -10812,6 +10830,7 @@ as_value Clipboard_getData(void* _this, char* format, char* transferMode) {
 bool Clipboard_setData(void* _this, char* format, as_value data, bool serializable) {
   (void)serializable;  // registered deviation: no serialized clone is produced
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 2);
   if (o == NULL) return false;
   // Clipboard.html: TypeError when format or data is null. The text is the AVM2
   // wording for a null parameter (#2007), the same one this runtime already uses.
@@ -10857,6 +10876,7 @@ bool Clipboard_setData(void* _this, char* format, as_value data, bool serializab
 bool Clipboard_setDataHandler(void* _this, char* format, as_fn handler, bool serializable) {
   (void)serializable;  // registered deviation: no serialized clone is produced
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 2);
   if (o == NULL) return false;
   // Clipboard.html: TypeError when format or handler is null (#2007 wording).
   if (format == NULL) {
@@ -10873,6 +10893,7 @@ bool Clipboard_setDataHandler(void* _this, char* format, as_fn handler, bool ser
 
 void Clipboard_clearData(void* _this, char* format) {
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 2);
   if (o == NULL || format == NULL) return;
   int kind = as_clip_kind(format);
   int i = as_clip_index(o, format);
@@ -10882,6 +10903,7 @@ void Clipboard_clearData(void* _this, char* format) {
 
 void Clipboard_clear(void* _this) {
   Clipboard* o = (Clipboard*)_this;
+  as_native_drag_clip_access(o, 2);
   if (o == NULL) return;
   as_clip_wipe(o);
   if (as_clip_is_os(o)) sk_clipboard_clear();
@@ -12555,6 +12577,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('EventDispatcher* d = (EventDispatcher*)current;');
     this.line('evt->_currentTarget = (Object*)current;');
+    this.line('as_native_drag_retarget(evt, current);');
     this.line('if (d->listeners == NULL) return false;');
     this.line('as_value v = as_listeners_get(d->listeners, evt->_type, capture);');
     this.line('if (v.tag == 6) return as_disp_arr((as_array*)v.ptr, evt);');
@@ -12574,6 +12597,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('evt->_eventPhase = 2;');
     this.line('evt->_currentTarget = (Object*)target;');
+    this.line('as_native_drag_retarget(evt, target);');
     this.line('EventDispatcher* d = (EventDispatcher*)target;');
     this.line('if (d->listeners == NULL) return false;');
     // AT_TARGET consults the NON-capture list only. AIR's capture phase walks root
@@ -19406,8 +19430,8 @@ void File_moveToAsync(void* _this, FileReference* newFile, bool overwrite) {
   if (o->_nativePath == NULL) { as_file_throw(2037); return NULL; }
   return NULL;
 }`);
-    // data: only a FileReference LOAD fills this, and File never loads -- measured
-    // null, and null without an exception even on a File with no path.
+    // data is shared with FileReference.load; a File can load its own native path.
+    // It remains null until the successful COMPLETE publication.
     this.line('ByteArray* File_get_data(void* _this) { return (ByteArray*)((File*)_this)->_data; }');
     // icon: an Icon whose bitmaps array is EMPTY. Extracting the artwork is
     // LaunchServices' job and this build has no such integration, so the object is
@@ -19496,6 +19520,7 @@ bool File_get_isPackage(void* _this) { File* o = (File*)_this; if (!as_file_has_
     this.cblock(`void FileReference_ctor(FileReference* o) {
   EventDispatcher_ctor((EventDispatcher*)o, NULL);
   o->_data = NULL;
+  o->_selectedPath = NULL;
   o->_name = NULL;
   o->_type = NULL;
   o->_ext = NULL;
@@ -19528,7 +19553,7 @@ char* FileReference_get_extension(void* _this) {
 }
 char* FileReference_get_creator(void* _this) {
   FileReference* o = (FileReference*)_this;
-  if (o->_creator == NULL) { as_file_throw(2037); return NULL; }
+  if (o->_name == NULL) { as_file_throw(2037); return NULL; }
   return o->_creator;
 }
 double FileReference_get_size(void* _this) {
@@ -19547,16 +19572,9 @@ Date* FileReference_get_modificationDate(void* _this) {
   return o->_mdate;
 }
 ByteArray* FileReference_get_data(void* _this) { return (ByteArray*)((FileReference*)_this)->_data; }
-bool FileReference_browse(void* _this, as_array* typeFilter) {
-  (void)_this; (void)typeFilter;
-  as_shell_unsupported((char*)"flash.net.FileReference.browse (no native file dialog in this build)");
-  return false;
-}
-void FileReference_cancel(void* _this) { (void)_this; }`);
+`);
     this.line('void FileReference_download(void* _this, URLRequest* request, char* defaultFileName) { (void)_this; (void)request; (void)defaultFileName; as_shell_unsupported((char*)"flash.net.FileReference.download (no HTTP download backend in this build)"); }');
-    this.line('void FileReference_load(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.net.FileReference.load (no native file dialog in this build)"); }');
     this.line('void FileReference_requestPermission(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.net.FileReference.requestPermission (no native file dialog in this build)"); }');
-    this.line('void FileReference_save(void* _this, Object* data, char* defaultFileName) { (void)_this; (void)data; (void)defaultFileName; as_shell_unsupported((char*)"flash.net.FileReference.save (no native file dialog in this build)"); }');
     this.line('void FileReference_upload(void* _this, URLRequest* request, char* uploadDataFieldName, bool testUpload) { (void)_this; (void)request; (void)uploadDataFieldName; (void)testUpload; as_shell_unsupported((char*)"flash.net.FileReference.upload (no HTTP upload backend in this build)"); }');
     this.line('void FileReference_uploadUnencoded(void* _this, URLRequest* request) { (void)_this; (void)request; as_shell_unsupported((char*)"flash.net.FileReference.uploadUnencoded (no HTTP upload backend in this build)"); }');
     // ---- flash.net.FileReferenceList -----------------------------------------
@@ -19578,11 +19596,8 @@ FileReferenceList* FileReferenceList_new(void) {
   return o;
 }
 as_array* FileReferenceList_get_fileList(void* _this) { return ((FileReferenceList*)_this)->_fileList; }
-bool FileReferenceList_browse(void* _this, as_array* typeFilter) {
-  (void)_this; (void)typeFilter;
-  as_shell_unsupported((char*)"flash.net.FileReferenceList.browse (no native file dialog in this build)");
-  return false;
-}`);
+`);
+    this.cblock(FILE_DIALOG_RUNTIME);
     // ---- flash.filesystem.StorageVolume ---------------------------------------
     // Constructed only by AIR itself (a volume-change event carries one); the
     // constructor is public in the SDK and its six arguments are in the order
@@ -20063,7 +20078,7 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     // nothing is dispatched. The other async members have already completed by the
     // time they return, so for them -- and for a cancel() with nothing pending --
     // this stays a no-op, exactly as adl leaves it.
-    this.line('void File_cancel(void* _this) { as_async_cancel((void*)_this); }');
+    this.line('void File_cancel(void* _this) { as_dialog_cancel((void*)_this); }');
     this.line('void File_deleteDirectoryAsync(void* _this, bool recursive) {');
     this.indent++;
     this.line('File__submitOp((File*)_this, recursive ? 2 : 1);');
@@ -20072,10 +20087,6 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     // No backend here: a native file dialog / the OS shell. These report
     // themselves once (stderr) instead of silently returning, so a flow that
     // depends on one is visibly stalled rather than mysteriously empty.
-    this.line('void File_browseForDirectory(void* _this, char* title) { (void)_this; (void)title; as_shell_unsupported((char*)"flash.filesystem.File.browseForDirectory"); }');
-    this.line('void File_browseForOpen(void* _this, char* title, as_array* typeFilter) { (void)_this; (void)title; (void)typeFilter; as_shell_unsupported((char*)"flash.filesystem.File.browseForOpen"); }');
-    this.line('void File_browseForOpenMultiple(void* _this, char* title, as_array* typeFilter) { (void)_this; (void)title; (void)typeFilter; as_shell_unsupported((char*)"flash.filesystem.File.browseForOpenMultiple"); }');
-    this.line('void File_browseForSave(void* _this, char* title) { (void)_this; (void)title; as_shell_unsupported((char*)"flash.filesystem.File.browseForSave"); }');
     this.line('void File_openWithDefaultApplication(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.filesystem.File.openWithDefaultApplication"); }');
     // File.upload(request, fieldName, testUpload): POST the file's contents as
     // multipart/form-data. There is no HTTP request backend in this build, so the
@@ -28439,7 +28450,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and window-sweep entry points plant the same buffer (ASC_window_on_*), which
     // is why this one checks the flag first instead of assuming it is free.
     this.line('int _fguard = 0;');
-    this.line("if (as_frame_guard == 0) { if (AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; } _fguard = 1; as_frame_guard = 1; }");
+    this.line("if (as_frame_guard == 0) { if (AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; } _fguard = 1; as_frame_guard = 1; }");
     // Frame-boundary GC safe point: all user frame callbacks have returned, so
     // only permanent roots (static fields, stage, event registry, timers) are
     // live. Each frame advances the incremental mark/sweep by a fixed budget
@@ -30631,6 +30642,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} ASCWin;');
     this.line('static ASCWin ASC_wins[ASC_MAX_WINDOWS];');
     this.line('static ASCWin* ASC_w(int id) { return (id >= 0 && id < ASC_MAX_WINDOWS) ? &ASC_wins[id] : NULL; }');
+    this.cblock(NATIVE_DRAG_BODY);
     this.line('');
     // ---- NativeWindow events ----
     // AIR's window events come from the platform, not from the call that caused
@@ -31686,7 +31698,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     // SDL reports mouse coordinates in logical *window* points, so they must be
     // mapped back through the align offset and the content scale before they mean
@@ -31803,7 +31815,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return;');
     this.indent--;
     this.line('}');
+    this.line('as_nd_mouse_window = id; as_nd_mouse_depth = (!strcmp(type, "mouseDown") || (!strcmp(type, "mouseMove") && ASC_mouse_down)) ? 1 : 0;');
     this.line('Stage_dispatchMouse((void*)w->stage, sx, sy, (char*)type);');
+    this.line('as_nd_mouse_depth = 0; as_nd_mouse_window = -1;');
     // The pointer shape is sampled AFTER the dispatch so a listener that sets
     // Mouse.cursor (or toggles selectable) is reflected on the very same event.
     // The pointer shape is sampled AFTER the dispatch so a listener that sets
@@ -31819,7 +31833,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_wheel(int id, double x, double y, double delta) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -31835,7 +31849,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_key(int id, const char* type, int keyCode, int charCode, int mod) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -31925,7 +31939,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_frame(int id) {')
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -33504,6 +33518,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // runtime's allocation-failure hook before any AS3 code can allocate through
     // it; see as_oom_from_cxx in the preamble.
     this.line('as_oom_hook_install();');
+    this.line('as_native_drag_init();');
     // Install the AMF3 codec's generated hooks (class member tables, registry
     // lookup, Date/ByteArray bridges) before any AS3 code runs.
     this.line('as_amf_wire();');

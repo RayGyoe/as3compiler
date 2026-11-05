@@ -34,6 +34,10 @@
 #include <cstdint>
 #include <cstring>
 #include <SDL2/SDL_syswm.h>
+#ifdef ASC_USE_NATIVE_DRAG
+#include "native_drag.h"
+extern "C" void* sk_window_native_handle(int);
+#endif
 // SDL_GetWindowBordersSize is NOT implemented by the Cocoa driver in the SDL we
 // vendor (it answers "That operation is not supported"), so the truth comes from
 // the NSWindow itself: AIR's NativeWindow.bounds is the OUTER frame rectangle, and
@@ -934,6 +938,9 @@ static double sk_pump_frame(void) {
   for (int i = 0; i < SK_MAX_WINDOWS; i++) {
     WinCtx* c = &g_wins[i];
     if (!c->used || c->destroy_pending) continue;
+#ifdef ASC_USE_NATIVE_DRAG
+    sk_drag_attach(i, sk_window_native_handle(i));
+#endif
     int rres = do_resize(c);
     if (rres > 0) c->dirty = 1;
     // A hidden window still keeps its stage alive (NativeWindow.activate() is what
@@ -1042,6 +1049,9 @@ static void sk_service_destroy(void) {
   for (int i = 0; i < SK_MAX_WINDOWS; i++) {
     WinCtx* c = &g_wins[i];
     if (!c->used || !c->destroy_pending) continue;
+#ifdef ASC_USE_NATIVE_DRAG
+    sk_drag_detach(i);
+#endif
     SDL_DelEventWatch(live_resize_watch, c);
     if (c->tex != NULL) SDL_DestroyTexture(c->tex);
     if (c->ren != NULL) SDL_DestroyRenderer(c->ren);

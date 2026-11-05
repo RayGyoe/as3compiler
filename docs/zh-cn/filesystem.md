@@ -1,5 +1,7 @@
 # 文件系统（`flash.filesystem`）实测口径 —— 废纸篓、卷容量与软链谓词
 
+> 原生交互更新：macOS 窗口构建已接入文件对话框和 FileReference 读写；下文“无对话框后端”的旧记录属于历史状态。当前支持与限制见 [原生文件交互](desktop-file-interaction.md)。
+
 > 本文记录 **`File.moveToTrash()` / `File.moveToTrashAsync()` / `File.spaceAvailable` /
 > `File.isSymbolicLink`** 四条成员
 > 的**实测语义**与实现选择（阶段二百四十三，v0.4.207；`isSymbolicLink` 为阶段二百六十二）。它们是 macOS 清理工具 demo 的前置能力

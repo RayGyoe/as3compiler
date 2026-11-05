@@ -173,7 +173,7 @@ function checkSurface(): string[] {
   check('fileList is read-only (no setter is emitted)',
     !c.includes('FileReferenceList_set_fileList'));
   check('browse() reports itself instead of pretending a cancelled dialog',
-    c.includes('flash.net.FileReferenceList.browse (no native file dialog in this build)'));
+    c.includes('native file dialog (no platform backend or no UI thread)'));
 
   // ---- FileListEvent's measured 4-argument constructor ---------------------
   check('FileListEvent_new takes (type, bubbles, cancelable, files)',

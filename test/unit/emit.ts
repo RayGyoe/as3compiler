@@ -1706,7 +1706,7 @@ function checkEmitListenerSnapshot(): string[] {
     disp.indexOf('as_disp_depth++;') < disp.indexOf('as_disp_depth--;') &&
     disp.indexOf('as_disp_depth--;') < disp.indexOf('return !event->cancelled;'));
   check('the frame guard resets the depth after a longjmp',
-    c.includes('as_frame_guard = 0; as_disp_depth = 0; return;'));
+    c.includes('as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return;'));
 
   console.log(`     [listener-snap] ${ok} check(s) passed`);
   return bad;
@@ -3624,7 +3624,7 @@ function checkEmitDirListingAsync(): string[] {
   // 4. cancel() cancels, and a second call while one is in flight throws #2037.
   //    Both are what make this member's async-ness observable to a caller.
   check('cancel() marks the in-flight job dead',
-    emitSrc.includes('void File_cancel(void* _this) {') && emitSrc.includes('as_async_cancel((void*)_this);'));
+    c.includes('void File_cancel(void* _this) {') && c.includes('as_dialog_cancel((void*)_this);') && c.includes('as_async_cancel(obj);'));
   check('the in-flight guard is what raises #2037',
     emitSrc.includes('as_async_dir_pending((void*)o)')
     && pre.includes('static int as_async_dir_pending(void* obj)'));

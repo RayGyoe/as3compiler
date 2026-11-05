@@ -7871,6 +7871,8 @@ static void gc_scan(gc_header* h) {
 // (The event registry and stage live in generated code and are marked by
 // gc_mark_user_roots.) Both walks are defined further down with their tables.
 static void as_async_mark_roots(void);
+static void as_file_dialog_mark_roots(void);
+static void as_native_drag_mark_roots(void);
 static void as_sock_mark_roots(void);
 static void as_audio_mark_roots(void);
 // Native-extension roots: the AS3 ExtensionContext objects a live FREContext
@@ -7892,6 +7894,8 @@ static void gc_mark_internal_roots(void) {
         if (as_mcs[i].alive) gc_mark_ptr(as_mcs[i].obj);
     }
     as_async_mark_roots();
+    as_file_dialog_mark_roots();
+    as_native_drag_mark_roots();
     as_sock_mark_roots();
     as_audio_mark_roots();
     as_fre_mark_ctx_roots();
@@ -11534,6 +11538,7 @@ static void as_gradient_linearrgb_report(void) {
 // later, a second call while one is in flight throws #2037, and cancel() drops the
 // event without undoing the work.
 #define AS_JOB_FS_OP      11
+#define AS_JOB_FILE_WRITE 12
 
 #define AS_JOB_QUEUED 0
 #define AS_JOB_RUNNING 1
@@ -12570,6 +12575,15 @@ static int as_file_op_run(const char* path, int op);
 
 static void as_job_run(as_job* j) {
     switch (j->kind) {
+        case AS_JOB_FILE_WRITE: {
+            if (j->error) break;
+            FILE* f = j->path ? fopen(j->path, "wb") : NULL;
+            if (!f) { j->error = AS_JOB_ERR_IO; break; }
+            size_t n = j->len ? fwrite(j->bytes, 1, j->len, f) : 0;
+            int closed = fclose(f);
+            if (n != j->len || closed != 0) j->error = AS_JOB_ERR_IO;
+            break;
+        }
         case AS_JOB_READ_TEXT:
         case AS_JOB_READ_BYTES: {
             j->bytes = as_job_read_file(j->path, &j->len, &j->total);
@@ -12985,6 +12999,21 @@ static void as_async_submit_bytes(int kind, void* obj, void (*finish)(void*), co
         }
     }
     if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); }
+}
+
+// Snapshot a save payload before publishing: workers never retain GC memory.
+static int as_async_submit_file_write(void* obj, void (*finish)(void*), const char* path, const void* data, size_t len) {
+    as_job* j = as_job_alloc(AS_JOB_FILE_WRITE, obj, finish);
+    if (!j) return 0;
+    j->path = as_job_strdup(path); j->len = len; j->total = (unsigned)len;
+    if (len) {
+        unsigned char* copy = (unsigned char*)malloc(len);
+        if (!copy) j->error = AS_JOB_ERR_IO;
+        else { memcpy(copy, data, len); j->bytes = copy; }
+    }
+    if (!j->path) j->error = AS_JOB_ERR_IO;
+    if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); return 0; }
+    return 1;
 }
 
 // Submit an HTTP job. Every input is copied out of the GC heap NOW, on the AS3
@@ -13907,6 +13936,7 @@ static void as_sock_mark_roots(void) {
 // Up to 16 passes, because a thunk may publish a job that is already finished on
 // the inline targets, so a whole load chain still completes within one tick.
 // Returns the number of thunks run.
+static int as_file_dialog_tick(void);
 static int as_sock_dispatch(void);    // defined with the AS3 Socket section (needs Socket_new)
 
 static int as_async_tick_with(int sock_wait_ms) {
@@ -13916,6 +13946,7 @@ static int as_async_tick_with(int sock_wait_ms) {
     // same jobs twice.
     if (as_async_in_tick) return 0;
     as_async_in_tick = 1;
+    int dialog_events = as_file_dialog_tick();
 
     // Sockets first: a connect that completed, or bytes that arrived, since the
     // last frame dispatch in THIS frame — the same promise the job path makes.
@@ -14014,7 +14045,7 @@ static int as_async_tick_with(int sock_wait_ms) {
     }
 
     as_async_in_tick = 0;
-    return finished + sock_events;
+    return finished + sock_events + dialog_events;
 }
 
 // The frame boundary's entry point: never blocks.

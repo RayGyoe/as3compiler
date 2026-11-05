@@ -1168,7 +1168,12 @@ export function featureNames(features: readonly string[]): string[] {
 // the enabled features. One helper, like perfFlags, so no command builder can
 // take a different feature set than the others.
 export function effectiveDefines(cfg: BuildConfig): string[] {
-  return [...cfg.defines, ...featureDefines(cfg.features)];
+  const defs = [...cfg.defines, ...featureDefines(cfg.features)];
+  if (cfg.target === 'native' && process.platform === 'darwin' &&
+      cfg.sources.some(s => /(^|[/\\])window_glue\.cc$/.test(s)) && !defs.includes('ASC_USE_FILE_DIALOG=1'))
+    defs.push('ASC_USE_FILE_DIALOG=1');
+  if (cfg.target === 'native' && process.platform === 'darwin' && cfg.sources.some(s => /(^|[/\\])window_glue\.cc$/.test(s)) && !defs.includes('ASC_USE_NATIVE_DRAG=1')) defs.push('ASC_USE_NATIVE_DRAG=1');
+  return defs;
 }
 
 // The MSVC target triple for a Windows native build. clang on Windows must name
@@ -1642,6 +1647,7 @@ function copyIcuData(src: string, dst: string): void {
 // Build the full argv for the C compiler. Pure data -> string[] so the caller
 // can print it (--dry) or run it.
 export function buildCompileCommand(cfg: BuildConfig, cPath: string, outPath: string): string[] {
+  cfg = withNativeDesktopBackends(cfg);
   const cc = cfg.target === 'wasm' ? wasiCc() : cfg.cCompiler;
   const args: string[] = [];
 
@@ -1876,7 +1882,28 @@ function objectPathFor(cfg: BuildConfig, src: string, suffix: string): string {
 // C++ separately and link with the C++ driver so libstdc++ is pulled in. The
 // generated .c uses C99 compound literals that C++ does not accept, so it must
 // stay on the C compiler — only the glue layer and final link go through c++.
+// Native dialogs share the SDL window profile, including hand-written manifests.
+// Derive the companion from that window glue, never from this machine's cwd.
+export function withNativeDesktopBackends(cfg: BuildConfig): BuildConfig {
+  if (cfg.target !== 'native' || (process.platform !== 'darwin' && process.platform !== 'win32')) return cfg;
+  const window = cfg.sources.find(s => /(^|[/\\])window_glue\.cc$/.test(s));
+  if (!window) return cfg;
+  // Windows' existing filesystem runtime uses ACP paths. These UTF-8 backends
+  // must remain opt-in until that boundary is migrated and Windows is validated.
+  const names = process.platform === 'darwin' ? ['file_dialog_macos.mm', 'native_drag_macos.mm'] : [
+    ...(cfg.defines.includes('ASC_USE_FILE_DIALOG=1') ? ['file_dialog_win.cc'] : []),
+    ...(cfg.defines.includes('ASC_USE_NATIVE_DRAG=1') ? ['native_drag_win.cc'] : []),
+  ];
+  if (!names.length) return cfg;
+  const sources = names.map(s => join(dirname(window), s));
+  for (const source of sources) if (!existsSync(source)) throw new Error(`Native desktop backend missing: ${source}`);
+  return { ...cfg, sources: [...cfg.sources, ...sources.filter(s => !cfg.sources.includes(s))],
+    frameworks: process.platform !== 'darwin' || cfg.frameworks.includes('Cocoa') ? cfg.frameworks : [...cfg.frameworks, 'Cocoa'],
+    linkLibs: process.platform !== 'win32' ? cfg.linkLibs : [...new Set([...cfg.linkLibs, 'ole32', 'shell32', 'uuid'])] };
+}
+
 export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: string): string[][] {
+  cfg = withNativeDesktopBackends(cfg);
   const cppFiles = cfg.sources.filter(isCppSource);
   if (cppFiles.length === 0) {
     return [buildCompileCommand(cfg, cPath, outPath)];

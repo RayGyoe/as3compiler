@@ -25,7 +25,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { nonWindowsVendorKey, wasmToolchainError, webToolchainError, emccPath, windowsTargetTriple, ICU_DATA_NAME, type BuildConfig } from './build.ts';
 import { aneHostDirName, aneHostLibName, anePlatformForBuild } from './ane.ts';
 
@@ -359,6 +359,21 @@ export const CHECKS: Check[] = [
           'Rebuild, or run `as-aot doctor --fix` to redeploy it.',
           true,
         );
+    },
+  },
+
+  {
+    id: 'vendor.file-dialog',
+    title: 'Native desktop interaction backends',
+    kind: 'hard',
+    applies: (c) => isNative(c) && (process.platform === 'darwin' || (process.platform === 'win32' && c.cfg.defines.some(d => d === 'ASC_USE_FILE_DIALOG=1' || d === 'ASC_USE_NATIVE_DRAG=1'))) && opensWindow(c),
+    run: (ctx) => {
+      const window = ctx.cfg.sources.find(s => /(^|[/\\])window_glue\.cc$/.test(s));
+      const folder = window ? dirname(window) : ctx.vendorDir;
+      if (!folder) return skip(NO_TREE);
+      const files = ['file_dialog.h', 'native_drag.h', ...(process.platform === 'darwin' ? ['file_dialog_macos.mm', 'native_drag_macos.mm'] : ['file_dialog_win.cc', 'native_drag_win.cc'])].map(f => join(folder, f));
+      const missing = files.filter(f => !existsSync(f));
+      return missing.length ? fail(`missing ${missing.join(', ')}`, 'Restore the native file-dialog files beside window_glue.cc from the compiler checkout.') : ok(files.join(' + '));
     },
   },
 

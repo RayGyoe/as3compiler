@@ -38,6 +38,8 @@ import './unit/embed.ts';
 import './unit/file-url.ts';
 import './unit/file-ops.ts';
 import './unit/file-stream.ts';
+import './unit/file-dialog.ts';
+import './unit/native-drag.ts';
 import './unit/audio-example.ts';
 import './unit/reach.ts';
 import './unit/doctor.ts';

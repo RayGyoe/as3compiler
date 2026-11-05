@@ -3705,6 +3705,7 @@ export class SymbolTable {
     this.classMap.set('FileReference', {
       fields: new Map([
         ['_data', frField('FileReference', baT)],
+        ['_selectedPath', frField('FileReference', { kind: 'string' })],
         ['_name', frField('FileReference', { kind: 'string' })],
         ['_type', frField('FileReference', { kind: 'string' })],
         ['_ext', frField('FileReference', { kind: 'string' })],
@@ -3728,7 +3729,7 @@ export class SymbolTable {
         ['load', frMeth('FileReference', { kind: 'void' }, [])],
         ['requestPermission', frMeth('FileReference', { kind: 'void' }, [])],
         ['save', frMeth('FileReference', { kind: 'void' }, [
-          { name: 'data', type: 'Object', defaultValue: null, isRest: false },
+          { name: 'data', type: 'any', defaultValue: null, isRest: false },
           { name: 'defaultFileName', type: 'String', defaultValue: { kind: 'Null' }, isRest: false },
         ])],
         ['upload', frMeth('FileReference', { kind: 'void' }, [
@@ -4919,20 +4920,21 @@ export class SymbolTable {
       [['LOCATION_CHANGE', 'locationChange']],
       [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), { name: 'location', type: 'String', defaultValue: { kind: 'Str', value: '' }, isRest: false }],
       [['clone', shObj('Event'), []]]);
-    // flash.events.NativeDragEvent: OS file drag-and-drop onto the app. AIR
-    // defines BOTH the flash-level DRAG_* pair-set and the native NATIVE_DRAG_*
-    // ones (a drag from the desktop raises the latter); the project listens for
-    // NATIVE_DRAG_ENTER / NATIVE_DRAG_DROP (upLoadView.as).
-    shell('NativeDragEvent', 'flash.events::NativeDragEvent', 'Event',
-      [['action', { kind: 'string' }], ['allowedActions', { kind: 'string' }], ['clipboard', shObj('Clipboard')],
-       ['dragInitiator', shObj('InteractiveObject')], ['dragSource', shObj('Object')],
-       ['localX', { kind: 'number' }], ['localY', { kind: 'number' }]],
-      [['DRAG_COMPLETE', 'dragComplete'], ['DRAG_DROP', 'dragDrop'], ['DRAG_ENTER', 'dragEnter'],
-       ['DRAG_EXIT', 'dragExit'], ['DRAG_OVER', 'dragOver'], ['DRAG_START', 'dragStart'],
-       ['NATIVE_DRAG_DROP', 'nativeDragDrop'], ['NATIVE_DRAG_ENTER', 'nativeDragEnter']],
-      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false),
-       shNumP('localX', 0), shNumP('localY', 0), shNullP('relatedObject', 'Object'),
-       shNullP('dragInitiator', 'InteractiveObject'), shNullP('dragSource', 'Object'), shNullP('clipboard', 'Clipboard')],
+    // AIR SDK 51.4.1 describeType + constructor probe (desktop interaction M0).
+    shell('NativeDragOptions', 'flash.desktop::NativeDragOptions', 'Object',
+      [['allowCopy', { kind: 'bool' }], ['allowMove', { kind: 'bool' }], ['allowLink', { kind: 'bool' }]], [], [],
+      [['toString', { kind: 'string' }, []]]);
+    constClass('NativeDragActions', { COPY: 'copy', MOVE: 'move', LINK: 'link', NONE: 'none' });
+    shell('NativeDragEvent', 'flash.events::NativeDragEvent', 'MouseEvent',
+      [['allowedActions', shObj('NativeDragOptions')], ['clipboard', shObj('Clipboard')],
+       ['dropAction', { kind: 'string' }], ['controlKey', { kind: 'bool' }], ['commandKey', { kind: 'bool' }]],
+      [['NATIVE_DRAG_COMPLETE', 'nativeDragComplete'], ['NATIVE_DRAG_DROP', 'nativeDragDrop'],
+       ['NATIVE_DRAG_ENTER', 'nativeDragEnter'], ['NATIVE_DRAG_EXIT', 'nativeDragExit'],
+       ['NATIVE_DRAG_OVER', 'nativeDragOver'], ['NATIVE_DRAG_START', 'nativeDragStart'], ['NATIVE_DRAG_UPDATE', 'nativeDragUpdate']],
+      [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', true),
+       shNumP('localX', NaN), shNumP('localY', NaN), shNullP('relatedObject', 'InteractiveObject'),
+       shNullP('clipboard', 'Clipboard'), shNullP('allowedActions', 'NativeDragOptions'), shNullP('dropAction', 'String'),
+       shBoolP('controlKey', false), shBoolP('altKey', false), shBoolP('shiftKey', false), shBoolP('commandKey', false)],
       [['clone', shObj('Event'), []]]);
     // flash.events.SampleDataEvent: the microphone/sound sample callback.
     shell('SampleDataEvent', 'flash.events::SampleDataEvent', 'Event',
@@ -5301,7 +5303,7 @@ export class SymbolTable {
     // The C bodies are hand-written in emit.ts (emitClipboardClass) because the
     // platform half is a real translation, not a stub: see
     // docs/zh-cn/desktop.md 7.10 for the format/type table and the deviations.
-    const clf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'public', owner: 'Clipboard', isStatic: false, isConst: false });
+    const clf = (t: CType): FieldInfo => ({ type: t, init: null, visibility: 'private', owner: 'Clipboard', isStatic: false, isConst: false });
     const clget = (ret: CType): MethodInfo => ({ returnType: ret, params: [], owner: 'Clipboard', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
     const clm = (ret: CType, params: Param[]): MethodInfo => ({ returnType: ret, params, owner: 'Clipboard', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false });
     this.classMap.set('Clipboard', {
@@ -5309,6 +5311,8 @@ export class SymbolTable {
         ['_fmts', clf({ kind: 'array' })],
         ['_vals', clf({ kind: 'array' })],
         ['_hdl', clf({ kind: 'array' })],
+        ['_dragState', { ...clf({kind: 'int'}), visibility: 'private' }],
+        ['_dragLocal', { ...clf({kind: 'bool'}), visibility: 'private' }],
       ]),
       methods: new Map([
         ['clear', clm({ kind: 'void' }, [])],
@@ -5346,20 +5350,14 @@ export class SymbolTable {
       // classes whose C constructor is hand-written (ByteArray, Sprite, ...).
       reflectFqn: 'flash.desktop::Clipboard',
     });
-    // flash.desktop.NativeDragManager: AIR declares acceptDragDrop/doDrag as
-    // STATIC methods and dropAction/isSupported as static read-only properties
-    // (they were registered in the instance-method slot by mistake, which made a
-    // real call site -- upLoadView.onDragIn -- fail with "undefined static method
-    // 'acceptDragDrop'"). allowedActions is typed Object here because AIR's
-    // NativeDragOptions class is not modelled; nothing in this project uses it.
-    shell('NativeDragManager', 'flash.desktop::NativeDragManager', 'Object',
-      [], [], [],
-      [],
+    // Backends remain explicitly unsupported until native drag sessions land.
+    shell('NativeDragManager', 'flash.desktop::NativeDragManager', 'Object', [], [], [], [],
       [['acceptDragDrop', { kind: 'void' }, [shReq('target', 'InteractiveObject')]],
        ['doDrag', { kind: 'void' }, [shReq('dragInitiator', 'InteractiveObject'), shReq('clipboard', 'Clipboard'),
-         shNullP('dragImage', 'BitmapData'), shNullP('offset', 'Point'), shNullP('allowedActions', 'Object'),
-         { name: 'transferMode', type: 'String', defaultValue: { kind: 'Str', value: 'copy' }, isRest: false }]]],
-      [['dropAction', { kind: 'string' }]], ['isSupported']);
+         shNullP('dragImage', 'BitmapData'), shNullP('offset', 'Point'), shNullP('allowedActions', 'NativeDragOptions')]]],
+      [['dropAction', { kind: 'string' }], ['dragInitiator', shObj('InteractiveObject')], ['isDragging', { kind: 'bool' }], ['isSupported', { kind: 'bool' }]]);
+    this.classMap.get('NativeDragManager')!.staticSetters = new Map([['dropAction',
+      { ...shMethod('NativeDragManager', { kind: 'void' }, [shReq('value', 'String')], true), isSetter: true }]]);
     shell('ClipboardFormats', 'flash.desktop::ClipboardFormats', 'Object',
       [],
       [['FILE_LIST_FORMAT', 'fileList'], ['TEXT_FORMAT', 'text'], ['HTML_FORMAT', 'html'],
@@ -8684,6 +8682,7 @@ export class SymbolTable {
       ClipboardFormats: 'flash.desktop::ClipboardFormats',
       Clipboard: 'flash.desktop::Clipboard',
       NativeDragManager: 'flash.desktop::NativeDragManager',
+      NativeDragOptions: 'flash.desktop::NativeDragOptions', NativeDragActions: 'flash.desktop::NativeDragActions',
       ServerSocketConnectEvent: 'flash.events::ServerSocketConnectEvent',
       SecurityErrorEvent: 'flash.events::SecurityErrorEvent',
       // flash.net / flash.media / flash.filters / flash.display3D

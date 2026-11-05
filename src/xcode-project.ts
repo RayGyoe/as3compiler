@@ -15,7 +15,7 @@
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import type { BuildConfig } from './build.ts';
-import { platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines, exportDynamicFlags, writeIcuAssembly } from './build.ts';
+import { withNativeDesktopBackends, platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines, exportDynamicFlags, writeIcuAssembly } from './build.ts';
 import { parsePlist, serializePlist, asDict, asArray, scalarText, dictEntry, type PlistValue } from './pbxproj.ts';
 
 // A .xcodeproj is a directory containing project.pbxproj plus an optional
@@ -55,6 +55,7 @@ export function generateXcodeProject(
   // self-contained (Xcode builds it long after this process exits) and the source tree
   // keeps only the tracked input. `writeIcuAssembly` writes nothing and answers false
   // for text-free / non-native builds, so only text apps gain a file.
+  cfgIn = withNativeDesktopBackends(cfgIn);
   const asmPath = join(outDir, 'icudtl_flutter.s');
   const cfg: BuildConfig = writeIcuAssembly(cfgIn, asmPath)
     ? { ...cfgIn, sources: [...cfgIn.sources, asmPath] }

@@ -192,7 +192,7 @@ function checkFrameErrorRecovery(): string[] {
   // threw unwound a dispatchEvent that could not decrement it itself (as_disp_arr
   // picks its snapshot buffer by depth, so a stale value would corrupt later walks).
   check('...and clears the guard (and the dispatch depth) on the recovery path',
-    body.includes('as_frame_guard = 0; as_disp_depth = 0; return;'));
+    body.includes('as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return;'));
   check('the frame releases the buffer when it returns normally',
     body.includes('if (_fguard) as_frame_guard = 0;'));
   // One plant per ENTRY POINT, and none inside the event machinery: a setjmp in

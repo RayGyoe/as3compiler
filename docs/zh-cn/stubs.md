@@ -1,5 +1,7 @@
 # 空替代（shell）清单
 
+> 文件交互更新：`File.browseFor*`、`FileReference.browse/load/save`、`FileReferenceList.browse` 在 macOS 原生窗口构建已有后端，见 [当前实现](desktop-file-interaction.md)。macOS 拖放和 Windows Shell/OLE 后端代码已接入，但 Windows 因 ACP/UTF-8 路径边界尚未迁移而默认关闭，且未编译/未真机验证；macOS 外部投递验收仍未完成；HTTP 上传下载仍有桩。
+
 > 阶段二百九十三盘点。回答一个问题：**为了让 `talkmedmeeting` 应用编译通过，我们注册了
 > 多少「只有 API 形状、没有后端」的类？** 每个类现在到底给得出什么、给不出什么，一次写清。
 >
@@ -49,7 +51,7 @@
 | `PNGEncoderOptions` | `flash.display` | 2 | `fastCompression`（默认 `false`） | 同上（WebP 亦然） |
 | `InvokeEvent` | `flash.events` | 1 | `INVOKE` 常量、`arguments`/`currentDirectory`/`reason` | 没有「用文档启动」的入口，事件不会来 |
 | `LocationChangeEvent` | `flash.events` | 1 | `LOCATION_CHANGE` 常量、`location` 字段 | 依赖 `StageWebView`，见 2.2 |
-| `NativeDragEvent` | `flash.events` | 1 | 8 个常量（含项目真正监听的 `NATIVE_DRAG_ENTER`/`NATIVE_DRAG_DROP`）、7 个字段 | 没有 OS 拖放源，事件不会来 |
+| `NativeDragEvent` | `flash.events` | 1 | 8 个常量（含项目真正监听的 `NATIVE_DRAG_ENTER`/`NATIVE_DRAG_DROP`）、7 个字段 | 已接原生拖放会话，平台验收状态见 desktop-file-interaction.md |
 | `NativeProcessExitEvent` | `flash.events` | 8 | `EXIT` 常量、`exitCode`/`process` | 没有子进程，事件不会来 |
 | `NativeWindowBoundsEvent` | `flash.events` | 4 | `MOVE`/`MOVING`/`RESIZE`/`RESIZING`、`beforeBounds`/`afterBounds` | **窗口真会派发这两个事件**（`NativeWindow` 是真的），只是本类实例由窗口层构造，字段来自真实几何 |
 | `NativeWindowDisplayStateEvent` | `flash.events` | 0 | `DISPLAY_STATE_CHANGING`/`DISPLAY_STATE_CHANGE`、两字段 | 同上（当前无调用方） |
@@ -69,7 +71,7 @@
 | `NativeProcess` | `flash.desktop` | 10 | `isSupported=false`；`new` 得到实例，`running=false`、`processID=0`，三个管道是**空 ByteArray**（`bytesAvailable` 0）；`start()` 空转并报明 | 进程创建 + 三条管道 + `exit` 事件回灌 |
 | `NativeProcessStartupInfo` | `flash.desktop` | 13 | 7 个字段真赋值；`arguments` 空 Vector、`executable=null` | 无（数据类，配合上一行） |
 | `StageWebView` | `flash.media` | 3 | `isSupported=false`；实例可建，`location`/`title`/`viewPort` 全 `null`，`loadURL()` 报明 | 内嵌浏览器（WebView2 / WKWebView） |
-| `NativeDragManager` | `flash.desktop` | 1 | `isSupported=false`、`dropAction=null`（报明）；`doDrag`/`acceptDragDrop` 空转 | OS 拖放源 + 拖放目标注册 |
+| `NativeDragManager` | `flash.desktop` | 1 | 原生窗口后端接入 `doDrag`/`acceptDragDrop`/动作与会话状态；无后端 isSupported=false | Windows 未验证；macOS 外部投递矩阵待验收 |
 | `Microphone` | `flash.media` | 4 | `isSupported=false`、`names` 空数组（报明）、`getMicrophone()` 返回 `null`（报明） | 音频采集 |
 | `LocalConnection` | `flash.net` | 4 | `isSupported=false`；`send`/`connect`/`close` 空转 | AIR 本身**没有**这个传输（Flash Player 特性），库只拿它当「我是不是在本地」的探针 ⇒ 保持空壳是**正确**答案 |
 

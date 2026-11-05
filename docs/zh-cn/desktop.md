@@ -1,5 +1,7 @@
 # 桌面集成（`flash.desktop` 图标族 + `flash.display.NativeMenu`）实测口径
 
+> 文件选择器、原生拖放及 Windows 未验证项见 [文件交互状态](desktop-file-interaction.md)。该状态页区分代码实现与系统验收。
+
 > 本文记录 **`Icon` / `InteractiveIcon` / `DockIcon` / `SystemTrayIcon`**、
 > **`NativeApplication.icon` / `menu` / `autoExit` / 五个能力位**，以及 **`flash.display.NativeMenu` /
 > `NativeMenuItem`** 的**实测语义**与实现选择（阶段二百五十五，v0.4.218 → v0.4.219）。
