@@ -381,7 +381,7 @@ function checkBakeResolution(): string[] {
     emitted.includes('if (!g->_clip && g->_max_sw > 0.0) { double half = g->_max_sw * 0.5; *l -= half; *t -= half; *r += half; *b += half; }') &&
     // both call sites that feed a bake/filter box: Shape, and a Sprite/MovieClip's
     // own graphics inside a container's union
-    emitted.includes('if (as_is(o, &Shape_vt)) return as_paint_bound(o, l, t, r, b);') &&
+    emitted.includes('if (as_is(o, &Shape_vt) || as_is(o, &MorphShape_vt) || as_is(o, &StaticText_vt)) return as_paint_bound(o, l, t, r, b);') &&
     emitted.includes('if (as_paint_bound(o, l, t, r, b)) found = 1;') &&
     !emitted.includes('if (as_is(o, &Shape_vt)) return as_graphics_bound(o, l, t, r, b);') &&
     !emitted.includes('if (as_graphics_bound(o, l, t, r, b)) found = 1;'));
@@ -1891,7 +1891,7 @@ function checkAlphaFold(): string[] {
   check('...and never folds a TextField (counted as 2)',
     fn.includes('if (as_is((void*)o, &TextField_vt)) return 2;'));
   check('...and assumes an unknown leaf paints through a path the fold cannot reach',
-    fn.includes('if (!as_is((void*)o, &Shape_vt) && !as_is((void*)o, &Sprite_vt)) return 2;'));
+    fn.includes('if (!as_is((void*)o, &Shape_vt) && !as_is((void*)o, &Sprite_vt) && !as_is((void*)o, &MorphShape_vt) && !as_is((void*)o, &StaticText_vt)) return 2;'));
 
   // 2. The renderer wires it to the SAME condition as the layer (see the
   //    AlphaLayerBalance pins) and restores the multiplier on that path.
@@ -2266,7 +2266,7 @@ function checkSwcMorphEmit(): string[] {
   check('the dispatcher knows the character',
     c.includes('case 70: as_swc_morph_ratio(o, as_swc_morph_70, ratio); break;'));
   check('the factory starts a morph at ratio 0',
-    c.includes('case 70: { Shape* s = Shape_new(); as_swc_morph_70(s->graphics, 0.0); return (DisplayObject*)s; }'));
+    c.includes('case 70: { MorphShape* s = as_MorphShape_create(); as_swc_morph_70(s->_graphics, 0.0); return (DisplayObject*)s; }'));
   // The frame-1 builder is also the REWIND path (as_swc_tl_rewind -> as_swc_bind)
   // and it reuses the object that is already at that depth -- without this reset
   // a rewind kept the last frame's geometry (measured: rect.x stayed -4.95).
@@ -2276,10 +2276,10 @@ function checkSwcMorphEmit(): string[] {
     c.includes('as_swc_morph_apply(f2_0, 32768);'));
 
   // ---- the note tells the truth about the one deliberate deviation ----
-  check('the notes report the baked morphs and name the MorphShape -> Shape deviation',
-    bake.notes.some((n) => /MorphShape/.test(n) && /class name does not/.test(n)));
+  check('successful morph baking is informational, with no type-identity warning',
+    (bake.info ?? []).some((n) => /MorphShape/.test(n)) && !bake.notes.some((n) => /class name does not/.test(n)));
   check('the notes report the animated ratios',
-    bake.notes.some((n) => /carry a morph Ratio/.test(n)));
+    (bake.info ?? []).some((n) => /carry a morph Ratio/.test(n)));
 
   return bad;
 }

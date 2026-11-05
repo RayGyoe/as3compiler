@@ -1003,6 +1003,9 @@ async function main(): Promise<void> {
     // express (a filter kind we do not render, a blend mode with no equivalent).
     // AIR applies these, so they are named rather than silently rendered as if
     // the SWF had not asked for them (swc.md §9.2 F4).
+    if (opts.doctorVerbose) for (const message of swcBake.info ?? []) {
+      console.info(`SWC: ${message}`);
+    }
     for (const note of swcBake.notes) {
       console.warn(`warning: ${note} (docs/zh-cn/swc.md)`);
     }

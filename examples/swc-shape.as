@@ -151,7 +151,7 @@ var fi2:Sprite = new (getDefinitionByName("fileitemskin") as Class)() as Sprite;
 check(fi2.numChildren == 5, "fileitemskin must have AIR's 5 children");
 var nested:Sprite = fi2.getChildAt(2) as Sprite;
 check(nested != null && nested.numChildren == 4, "元件77_265 must keep AIR's 4 children (incl. the morph mask)");
-check(nested.getChildAt(1) is Shape, "the morph placeholder must be a Shape (AIR: flash.display::MorphShape)");
+check(nested.getChildAt(1) is MorphShape && !(nested.getChildAt(1) is Shape), "the morph child has AIR MorphShape identity");
 
 var lg2:Sprite = new (getDefinitionByName("loginskin") as Class)() as Sprite;
 check(lg2.numChildren == 9, "loginskin must have AIR's 9 children (the clipDepth mask object is a child)");

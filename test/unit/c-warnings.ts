@@ -13,7 +13,7 @@
 // -Wall is deliberately NOT used: the runtime preamble has its own -Wall-only
 // noise (-Wframe-address, -Wmissing-braces in the C89 struct initialisers), which
 // no default build ever reports and which is not this project's contract.
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +25,14 @@ import { registerGroup } from '../harness.ts';
 // source (not several) so the compile is one process: the group runs in the
 // examples' timing budget, not the unit budget.
 const PROBE = `
+var field:TextField = new TextField();
+field.autoSize = "left";
+field.blendMode = "layer";
+field.opaqueBackground = 123;
+field.x = 1, field.y = 2;
+var mode:String = (field.autoSize = "center");
+var background:* = (field.opaqueBackground = 456);
+trace(mode, background, field.x, field.y);
 var arr:Array = [1, 2, 3];
 var n:int = 1;
 var idx:int = 0;
@@ -115,15 +123,18 @@ function checkGeneratedCWarnings(): string[] {
     const p = join(dir, 'warn.c');
     writeFileSync(p, c);
     // Default warning set, exactly like a real build (`clang -O2`).
-    const out = (() => {
-      try {
-        execFileSync(cc, ['-fsyntax-only', p], { stdio: 'pipe', encoding: 'utf8' });
-        return '';
-      } catch (e) {
-        const err = e as { stderr?: string; stdout?: string };
-        return `${err.stdout ?? ''}${err.stderr ?? ''}`;
-      }
-    })();
+    const result = spawnSync(cc, ['-fsyntax-only', p], { encoding: 'utf8' });
+    const out = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+    check('the generated C passes syntax checking', result.status === 0, out);
+    const exe = join(dir, 'warn-probe');
+    const linked = spawnSync(cc, [p, '-O2', '-lm', '-lz', ...(process.platform === 'darwin' ? ['-liconv'] : []), '-o', exe], { encoding: 'utf8' });
+    check('the warning probe links', linked.status === 0, linked.stderr ?? '');
+    if (linked.status === 0) {
+      const run = spawnSync(exe, [], { encoding: 'utf8' });
+      check('dirty-field assignment values and comma effects are preserved',
+        run.status === 0 && run.stdout.startsWith('center 456 1 2\n'),
+        `${run.stdout ?? ''}${run.stderr ?? ''}`);
+    }
     const warnings = out.split('\n').filter((l) => l.includes('warning:'));
     check('the generated C compiles with zero default-set warnings', warnings.length === 0,
       warnings.slice(0, 6).join('\n      '));

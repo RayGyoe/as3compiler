@@ -1,5 +1,17 @@
 # SWC Resource Extraction and Embedding
 
+## Static text and authored display types (2026-11-05)
+
+This update supersedes the older empty-DefineText and Shape-for-MorphShape limitations below. DefineText (11) and DefineText2 (33) now bake embedded DefineFont2/DefineFont3 outlines, retaining quadratic curves, signed glyph advances, record styles, alpha and TextMatrix. Font units are 1024/20480 respectively; no host font shaping is involved. CodeTable supplies the read-only StaticText.text value.
+
+Static text creates flash.text::StaticText and morphs create flash.display::MorphShape. Both directly extend DisplayObject; neither is a Shape or TextField. Direct AS3 construction throws ArgumentError #2012. Existing geometry, timeline Ratio updates and display bounds remain in use.
+
+Successful SWC bake statistics now appear only with -v/--verbose. Real fidelity gaps remain warnings. Dynamic TextField embedded-font registration, legacy DefineFont/DefineFontInfo, DefineFont4 static outlines and the documented morph-mask stencil difference remain outside this change. Unsupported static fonts fail explicitly.
+
+Verification: node --test test/unit/swc-static-text.ts test/unit/render.ts and examples/swc-morph.as.
+
+AIR SDK 51.4.1 reference for the same synthetic SWF: flash.text::StaticText, is StaticText/Shape/TextField = true/false/false, text = 中中中, bounds = (0,0,80,50), pixel samples = 80ff0000 / ff0000ff / 0; AOT matches.
+
 > This document answers one question: **when a pure-AS project packs resources such as images into an SWC,
 > how does the AOT compiler get those resources out and display them in the UI**.
 > The core conclusion up front: an SWC is a ZIP archive, but the resources **are not standalone files inside
@@ -81,6 +93,7 @@
 | Timeline | `FrameLabel`×36 (11 of the multi-frame clips carry `_up/_over/_down`), `PlaceObject2`×403 + `PlaceObject3`×18, `RemoveObject2`×4 |
 
 ---
+
 
 ## 1. Why This Requirement Exists: SWC Is the Resource Carrier in Pure-AS Projects
 

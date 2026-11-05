@@ -62,19 +62,17 @@ export interface SwcBitmap {
 }
 
 /**
- * A text character (`DefineText` tag 11 / `DefineEditText` tag 37).
- *
- * The baker does NOT decode glyphs or the initial string (swc.md §3.3: text
- * rendering is out of scope for the resource baker). It still reads the character's
- * own RECT, because AIR instantiates these characters as real `TextField`s and the
- * display list must therefore carry a child at that index with that box
- * (item ②, measured in temp/childfx: `staticskin` has 19 children of which 18 are
- * TextFields, `fileitemskin` c1 is an EMPTY TextField 409.8x20.4).
+ * A text character: editable/dynamic text (37) or authored static text (11/33).
+ * Static text retains embedded outlines, per-glyph advances and TextMatrix;
+ * DefineEditText retains its initial string and TextFormat.
  */
 export interface SwcText {
   id: number;
   /** The defining tag: 37 = `DefineEditText`, 11 = `DefineText` (static glyph run). */
   tag: number;
+  /** Static glyph outlines transformed into the character's twips space. */
+  staticShape?: SwcShape;
+  staticText?: string;
   /** The character's box in its own space (DefineText's `TextBounds`, DefineEditText's `Bounds`). */
   bounds: SwcRect;
   /**
@@ -97,8 +95,7 @@ export interface SwcText {
    * blank (talkmed's footer line, its agreement paragraph, every button caption).
    *
    * When the `html` flag is set this is markup, exactly as AIR treats it.
-   * Always NULL for tag 11, whose glyph runs are not decoded (they need the
-   * embedded font's CodeTable).
+   * Static text uses staticText and staticShape instead.
    */
   text: string | null;
   /** `DefineEditText`: HasFont's FontID, resolved through the library's font table. */
@@ -720,7 +717,7 @@ export interface SwcMorphStyleLayer {
 /**
  * A parsed DefineMorphShape (tag 46) / DefineMorphShape2 (tag 84).
  *
- * AIR instantiates these as `MorphShape`, a Shape subclass whose geometry is the
+ * AIR instantiates these as `MorphShape`, a direct DisplayObject subclass whose geometry is the
  * ratio blend of the two stored shapes (measured: fileitemskin c2 has 4 children
  * in AIR, one of them a MorphShape, and 270 PlaceObject records in this library
  * animate that ratio). The bake turns each one into two full shapes so the
@@ -1033,8 +1030,8 @@ const SWF_TEXT_ALIGNS = ['left', 'right', 'center', 'justify'];
  * label a skin shipped rendered blank.
  *
  * Tag 11 stores glyph runs against its embedded font's CodeTable (glyph index ->
- * character code). Only 3 of talkmed's 341 characters are tag 11; they stay a
- * reported gap rather than baked wrong.
+ * character code), explicit advances and an embedded outline per glyph. Those
+ * outlines are transformed here; they never go through host-font shaping.
  *
  * Flag bits are the SWF's UI16, little-endian, exactly as the spec lists them:
  *   0x8000 HasText      0x4000 WordWrap     0x2000 Multiline   0x1000 Password
@@ -1042,7 +1039,7 @@ const SWF_TEXT_ALIGNS = ['left', 'right', 'center', 'justify'];
  *   0x0080 HasFontClass 0x0040 AutoSize     0x0020 HasLayout     0x0010 NoSelect
  *   0x0008 Border       0x0004 WasStatic    0x0002 HTML          0x0001 UseOutlines
  */
-function parseSwfText(body: Buffer, start: number, length: number, code: number, fonts: Map<number, string>): SwcText {
+function parseSwfText(body: Buffer, start: number, length: number, code: number, fonts: Map<number, string>, outlines: Map<number, SwfFont>): SwcText {
   const r = new SwfReader(body, start + 2, start + length);
   const id = body.readUInt16LE(start);
   const bounds = readSwfRect(r);
@@ -1053,7 +1050,58 @@ function parseSwfText(body: Buffer, start: number, length: number, code: number,
     multiline: false, wordWrap: false, password: false, readOnly: false,
     selectable: true, border: false, html: false, hasLayout: false, maxLength: null,
   };
-  if (code !== 37) return out; // DefineText: only the RECT is read (see the header note)
+  if (code !== 37) {
+    const matrix = readSwfMatrix(r);
+    const glyphBits = r.u8(), advanceBits = r.u8();
+    const shape: SwcShape = { id, version: 3, bounds, winding: 'evenOdd', layers: [], subpaths: [] };
+    let font: SwfFont | undefined, height = 0, x = 0, y = 0, rgba = 0xff000000;
+    let text = '';
+    for (;;) {
+      const flags = r.u8();
+      if (flags === 0) break;
+      if (!(flags & 0x80) || (flags & 0x70)) throw new Error(`SWC: invalid text record in character #${id}`);
+      if (flags & 8) {
+        const fontId = r.u16();
+        font = outlines.get(fontId);
+        if (!font) throw new Error(`SWC: static text #${id} references unsupported/missing font #${fontId}`);
+      }
+      if (flags & 4) rgba = readSwfColor(r, code === 33);
+      if (flags & 1) x = r.i16();
+      if (flags & 2) y = r.i16();
+      if (flags & 8) height = r.u16();
+      const count = r.u8();
+      if (!font && count) throw new Error(`SWC: static text #${id} has glyphs without a font`);
+      for (let i = 0; i < count; i++) {
+        // Each glyph is its own fill: overlapping glyphs must compose, not XOR
+        // each other's contours through the even-odd fill rule.
+        const layer = shape.layers.length;
+        shape.layers.push({ fills: [{ type: -1 }, { type: 0, rgba }], lines: [{ width: 0 }] });
+        const index = r.ub(glyphBits), advance = r.sb(advanceBits);
+        const glyph = font!.glyph(index);
+        const scale = height / font!.units;
+        const point = (p: SwcEdge): SwcEdge => {
+          const tx = x + p.x * scale, ty = y + p.y * scale;
+          const q: SwcEdge = { x: matrix[0] * tx + matrix[2] * ty + matrix[4], y: matrix[1] * tx + matrix[3] * ty + matrix[5] };
+          if (p.cx !== undefined) {
+            const cx = x + p.cx * scale, cy = y + p.cy! * scale;
+            q.cx = matrix[0] * cx + matrix[2] * cy + matrix[4];
+            q.cy = matrix[1] * cx + matrix[3] * cy + matrix[5];
+          }
+          return q;
+        };
+        for (const path of glyph.subpaths) shape.subpaths.push({ ...path, layer, start: point(path.start), pts: path.pts.map(point) });
+        const char = font!.codes[index];
+        if (char === undefined) throw new Error(`SWC: static text #${id} glyph #${index} has no character code`);
+        text += String.fromCharCode(char);
+        x += advance;
+      }
+      r.align();
+    }
+    if (r.remainingBytes() !== 0) throw new Error(`SWC: static text #${id} did not consume its tag`);
+    out.staticShape = shape;
+    out.staticText = text;
+    return out;
+  }
   // The flags are 16 individual 1-bit fields, and SWF writes them as ONE MSB-first
   // bit word -- i.e. the first byte holds HasText..HasMaxLength and the second holds
   // HasFont..UseOutlines. Reading it as a little-endian UI16 swaps the halves and
@@ -1114,6 +1162,46 @@ function parseSwfFontName(body: Buffer, start: number, length: number, code: num
   // Flash writes FontNameLen including the terminating NUL (hence the trailing
   // \0 in the raw bytes), so trim it rather than carrying it into the family name.
   return { id, name: n === 0 ? '' : r.str8(n).replace(/\0+$/, '') };
+}
+
+/** Embedded outlines are read lazily: most fonts belong only to dynamic text. */
+interface SwfFont {
+  units: number;
+  codes: number[];
+  glyph(index: number): SwcShape;
+}
+function parseSwfFont(body: Buffer, tag: SwfTag): SwfFont {
+  const r = new SwfReader(body, tag.start, tag.start + tag.length);
+  r.u16();
+  const flags = r.u8();
+  r.u8();
+  r.skipBytes(r.u8());
+  const count = r.u16();
+  if (count === 0) return { units: tag.code === 75 ? 20480 : 1024, codes: [], glyph(index) { throw new Error(`SWC: glyph #${index} references an empty embedded font`); } };
+  const base = tag.start + r.pos / 8;
+  const wide = (flags & 8) !== 0;
+  const offsets = Array.from({ length: count }, () => wide ? r.u32() : r.u16());
+  const codeOffset = wide ? r.u32() : r.u16();
+  const tableEnd = tag.start + r.pos / 8;
+  if (base + codeOffset < tableEnd || base + codeOffset > tag.start + tag.length)
+    throw new Error(`SWC: invalid embedded font CodeTable offset: id=${body.readUInt16LE(tag.start)} count=${count} flags=${flags} base=${base} offset=${codeOffset} end=${tag.start + tag.length} tableEnd=${tableEnd}`);
+  const cr = new SwfReader(body, base + codeOffset, tag.start + tag.length);
+  const codes = Array.from({ length: count }, () => (flags & 4) ? cr.u16() : cr.u8());
+  const cache = new Map<number, SwcShape>();
+  return {
+    units: tag.code === 75 ? 20480 : 1024, codes,
+    glyph(index) {
+      if (index >= count) throw new Error(`SWC: glyph index ${index} exceeds embedded font glyph count ${count}`);
+      const cached = cache.get(index);
+      if (cached) return cached;
+      const start = base + offsets[index], end = base + (offsets[index + 1] ?? codeOffset);
+      if (start < tableEnd || end < start || end > base + codeOffset)
+        throw new Error('SWC: invalid embedded font glyph offsets');
+      const shape = parseSwfShape(body, { code: 2, start, length: end - start }, true);
+      cache.set(index, shape);
+      return shape;
+    },
+  };
 }
 
 /** MATRIX: variable-width scale/rotate fields then a twips translation. */
@@ -1343,18 +1431,21 @@ function readSwfShapeStyles(r: SwfReader, version: number): SwfStyleTable {
 }
 
 /** Parse one `DefineShape*` tag into subpaths + style tables (swc.md §3.4④). */
-function parseSwfShape(body: Buffer, tag: SwfTag): SwcShape {
+function parseSwfShape(body: Buffer, tag: SwfTag, glyph = false): SwcShape {
   const version = (tag.code === 2 ? 1 : tag.code === 22 ? 2 : tag.code === 32 ? 3 : 4) as 1 | 2 | 3 | 4;
   const r = new SwfReader(body, tag.start, tag.start + tag.length);
-  const id = r.u16();
-  const bounds = readSwfRect(r);
+  const id = glyph ? 0 : r.u16();
+  const bounds = glyph ? { xmin: 0, xmax: 0, ymin: 0, ymax: 0 } : readSwfRect(r);
   let winding: 'evenOdd' | 'nonZero' = 'evenOdd';
   if (version >= 4) {
     readSwfRect(r); // EdgeBounds
     const flags = r.u8(); // bit0 UsesFillWindingRule, bit1/2 scaling strokes
     if ((flags & 1) !== 0) winding = 'nonZero';
   }
-  const styles = readSwfShapeStyles(r, version);
+  const glyphBits = glyph ? r.u8() : 0;
+  const styles = glyph
+    ? { fills: [{ type: -1 }, { type: 0, rgba: 0xff000000 }], lines: [{ width: 0 }], numFillBits: glyphBits >> 4, numLineBits: glyphBits & 15 }
+    : readSwfShapeStyles(r, version);
   const layers: SwcStyleLayer[] = [{ fills: styles.fills, lines: styles.lines }];
   let numFillBits = styles.numFillBits;
   let numLineBits = styles.numLineBits;
@@ -1429,6 +1520,7 @@ function parseSwfShape(body: Buffer, tag: SwfTag): SwcShape {
     if (stateFill1) fill1 = r.ub(numFillBits);
     if (stateLine) line = r.ub(numLineBits);
     if (newStyles) {
+      if (glyph) throw new Error("SWC: font glyph contains a NewStyles record");
       r.align();
       const ns = readSwfShapeStyles(r, version);
       // Replace, never append (Ruffle's converter rebinds the style list here):
@@ -2176,14 +2268,15 @@ function textAuto(id: number): boolean {
 const TEXT_AUTOSIZE = new Map<number, boolean>();
 
 export interface SwcBakeText {
+  shape?: SwcBakeShape;
+  plainText?: string;
   /** RECT origin in the character's own px (added to the placement translation). */
   ox: number;
   oy: number;
   w: number;
   h: number;
   /**
-   * The decoded `DefineEditText` payload; `null` for a `DefineText` (tag 11) glyph
-   * run, which the baker does not decode. When present the emitter stamps the
+   * The decoded `DefineEditText` payload; static text uses `shape` instead. When present the emitter stamps the
    * instantiated TextField so it renders what AIR renders: `text` is the initial
    * string (or HTML markup when `html`), and the rest is the TextFormat/layout.
    */
@@ -2357,6 +2450,7 @@ export interface SwcBake {
    * CLI prints them loudly. Always present, empty when there is nothing to say.
    */
   notes: readonly string[];
+  info?: readonly string[];
 }
 
 /** One needed character kind the baker passes over, with how many placements use it. */
@@ -2472,10 +2566,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       continue;
     }
     if (ch.kind === 'text') {
-      // Text characters ARE built, as empty TextField placeholders (item ②): AIR
-      // reports them as children with a real box, and a missing child shifts every
-      // later index (`minfo` ours 2 vs adl 6). Their glyphs/initial text stay a
-      // documented gap, announced through `notes` below -- never silently dropped.
+      // Both static outlines and editable initial text are baked below.
       continue;
     }
     if (ch.kind === 'other') {
@@ -2836,9 +2927,10 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       characters.push({
         id, kind: 'text',
         text: {
-          ox: px(b.xmin), oy: px(b.ymin), w: px(b.xmax - b.xmin), h: px(b.ymax - b.ymin),
-          // Only tag 37 has a payload to stamp; tag 11 stays an empty box (its
-          // glyph runs need the embedded font's CodeTable).
+          shape: text.staticShape ? bakeShape(text.staticShape) : undefined,
+          plainText: text.staticText,
+          ox: text.tag === 37 ? px(b.xmin) : 0, oy: text.tag === 37 ? px(b.ymin) : 0, w: px(b.xmax - b.xmin), h: px(b.ymax - b.ymin),
+          // Dynamic/editable text uses a TextField; static text uses outlines.
           edit: text.tag === 37
             ? {
               text: text.text,
@@ -2920,6 +3012,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
   // each of these is a real fidelity gap and must be named, never swallowed
   // (swc.md §9.2 F4).
   const notes: string[] = [];
+  const info: string[] = [];
   const skippedFilterKinds = new Map<number, number>();
   const unmappedBlends = new Map<number, number>();
   for (const sp of lib.sprites) {
@@ -2957,31 +3050,18 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
       (n, c) => n + (c.morph?.groups ?? []).reduce((k, g) => k + g.paths.reduce((j, p) => j + p.pts.length, 0), 0),
       0
     );
-    notes.push(
-      `${morphChars.length} DefineMorphShape/DefineMorphShape2 character(s) are baked as morphing Shapes ` +
-      `(${morphEdges} morphing edge(s)): AIR builds a MorphShape whose geometry is the ratio blend of the two ` +
-      `stored shapes, and the emitted builder interpolates geometry and paint from PlaceObject2 Ratio ` +
-      `(swc.md §3.4⑦). AIR reports those children as MorphShape; this backend builds a Shape, the closest ` +
-      `construct it has, so the pixels match while the class name does not`
-    );
+    info.push(`${morphChars.length} MorphShape character(s) baked with ${morphEdges} morphing edge(s); geometry and paint interpolate from PlaceObject Ratio`);
   }
   const textChars = characters.filter((c) => c.kind === 'text');
   if (textChars.length > 0) {
     const editText = textChars.filter((c) => c.text?.edit !== undefined);
     const withText = editText.filter((c) => (c.text?.edit?.text ?? null) !== null).length;
-    const glyphRuns = textChars.length - editText.length;
+    const staticText = textChars.filter((c) => c.text?.shape !== undefined).length;
+    info.push(`${editText.length} DefineEditText character(s) baked as TextFields (${withText} have initial text); ${staticText} DefineText/DefineText2 character(s) baked as StaticText with embedded glyph outlines`);
+    const missing = textChars.length - editText.length - staticText;
+    if (missing) notes.push(`${missing} static text character(s) have no decoded glyph outlines`);
     const autoSized = textChars.filter((c) => textAuto(c.id)).length;
-    notes.push(
-      `${textChars.length} text character(s) are baked as TextFields: ` +
-      `${editText.length} DefineEditText (tag 37) carry their decoded InitialText + TextFormat ` +
-      `(${withText} have a non-empty string), ${glyphRuns} DefineText (tag 11) still bake as an EMPTY box ` +
-      `because their glyph runs need the embedded font's CodeTable, which this baker does not decode ` +
-      `(swc.md §3.3 / §10)` +
-      (autoSized > 0
-        ? `; ${autoSized} of them have DefineEditText's AutoSize flag set, so AIR fits their box to those glyphs ` +
-          `and the width/height it reports differ from the RECT`
-        : '')
-    );
+    if (autoSized) notes.push(`${autoSized} DefineEditText character(s) carry AutoSize; text layout can differ from AIR`);
   }
   const timelineSprites = characters.filter((c) => c.kind === 'sprite' && (c.totalFrames ?? 1) > 1);
   if (timelineSprites.length > 0) {
@@ -2992,7 +3072,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
     // them, so this note reports how many of these clips actually have one to run
     // rather than claiming they cannot run (they used to be out of scope).
     const scripted = timelineSprites.filter((c) => lib.scripts.has(c.id)).length;
-    notes.push(
+    info.push(
       `${timelineSprites.length} baked DefineSprite character(s) have a multi-frame timeline (totalFrames > 1): ` +
       `${animated} of them change their display list after frame 1 and ${labelled} carry FrameLabel records. ` +
       `The timeline itself is baked (gotoAndStop/gotoAndPlay/nextFrame/prevFrame/play and currentLabels work), ` +
@@ -3003,7 +3083,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
   }
   for (const n of frameNotes) notes.push(n);
   if (ratioOps > 0) {
-    notes.push(
+    info.push(
       `${ratioOps} PlaceObject record(s) carry a morph Ratio; the timeline re-morphs the shape at that depth ` +
       `on each of those frames (swc.md §3.4⑦)`
     );
@@ -3013,7 +3093,7 @@ export function swcBakePlan(lib: SwcLibrary, specs: readonly SwcResourceSpec[], 
   const unsupported: SwcBakeUnsupported[] = [...unsupportedIds.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([id, kind]) => ({ id, kind, uses: uses.get(id) ?? 0 }));
-  return { characters, bitmaps, classOf, chars: classChars, unsupported, notes };
+  return { characters, bitmaps, classOf, chars: classChars, unsupported, notes, info };
 }
 
 /** Human names for the non-buildable character tags, so a diagnostic can say
@@ -3042,20 +3122,13 @@ const CHARACTER_TAG_KINDS: Record<number, SwcCharacterKind> = {
   39: 'sprite',
   // Bitmaps: Lossless(20), JPEG2(21), JPEG3(35), Lossless2(36), JPEG4(90).
   20: 'bitmap', 21: 'bitmap', 35: 'bitmap', 36: 'bitmap', 90: 'bitmap',
-  // Text characters: DefineText(11) / DefineEditText(37). AIR instantiates these as
-  // real TextFields, so the baker builds an empty `TextField` placeholder at the
-  // character's own RECT (item ②) rather than dropping the child.
-  11: 'text', 37: 'text',
-  // Morph shapes: DefineMorphShape(46) / DefMorphShape2(84). AIR instantiates these
-  // as `MorphShape` (a Shape subclass) — measured, temp/childfx: fileitemskin c2 has
-  // 4 children in AIR of which c1 is a MorphShape, we had 3. The two geometries and
-  // their interpolation are NOT decoded (swc.md §10), so the placeholder is an EMPTY
-  // Shape: the tree shape (count + index order) matches AIR while the artwork stays
-  // reported as a gap through `notes`.
+  // StaticText outlines (11/33) and editable TextFields (37).
+  11: 'text', 33: 'text', 37: 'text',
+  // MorphShape is a direct DisplayObject leaf, driven by timeline Ratio records.
   46: 'morph', 84: 'morph',
   // Everything else a skin can carry and we parse past: fonts/binary.
   // Classified only so the reference graph can verify ids.
-  6: 'other', 10: 'other', 33: 'other',
+  6: 'other', 10: 'other',
   48: 'other', 75: 'other', 87: 'other', 88: 'other',
 };
 
@@ -3383,6 +3456,7 @@ export function extractSwc(path: string): SwcLibrary {
   const buttons: SwcButton[] = [];
   const texts: SwcText[] = [];
   const fonts = new Map<number, string>();
+  const outlines = new Map<number, SwfFont>();
   const scalingGrids = new Map<number, SwcRect>();
   const characters = new Map<number, SwcCharacter>();
   // Fonts first: a DefineEditText names its face by FontID, so the table has to be
@@ -3392,6 +3466,7 @@ export function extractSwc(path: string): SwcLibrary {
     if (t.code === 48 || t.code === 75 || t.code === 91) {
       const f = parseSwfFontName(body, t.start, t.length, t.code);
       if (!fonts.has(f.id)) fonts.set(f.id, f.name);
+      if (t.code === 48 || t.code === 75) outlines.set(f.id, parseSwfFont(body, t));
     }
   }
   for (const t of tags) {
@@ -3402,8 +3477,8 @@ export function extractSwc(path: string): SwcLibrary {
       characters.set(id, { id, kind, tag: t.code });
       // Text characters carry the character's RECT right after the id, and tag 37
       // (DefineEditText) carries the whole TextField after it -- see parseSwfText.
-      if (t.code === 11 || t.code === 37) {
-        const text = parseSwfText(body, t.start, t.length, t.code, fonts);
+      if (t.code === 11 || t.code === 33 || t.code === 37) {
+        const text = parseSwfText(body, t.start, t.length, t.code, fonts, outlines);
         texts.push(text);
         TEXT_AUTOSIZE.set(id, text.autoSize);
       }

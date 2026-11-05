@@ -23,6 +23,9 @@
 
 import flash.display.DisplayObject;
 import flash.display.MovieClip;
+import flash.display.MorphShape;
+import flash.display.Shape;
+import flash.utils.getQualifiedClassName;
 import flash.geom.Rectangle;
 import flash.utils.getDefinitionByName;
 
@@ -43,6 +46,8 @@ var frames:Array = [1, 2, 25, 50, 75, 99];
 for each (var f:int in frames) {
   clip.gotoAndStop(f);
   var m:DisplayObject = clip.getChildAt(1);
+  check(m is MorphShape && !(m is Shape), "morph identity and direct DisplayObject inheritance");
+  check(getQualifiedClassName(m) == "flash.display::MorphShape", "morph qualified name");
   near(m.width, 92.9, "F" + f + ": the display box keeps the START width");
   near(m.height, 41.65, "F" + f + ": the display box keeps the START height");
   var r:Rectangle = m.getRect(clip);

@@ -6466,6 +6466,17 @@ export class SymbolTable {
       isFinal: false,
       implements: [],
     });
+    // Authored-only leaves: neither is a Shape or InteractiveObject in AIR.
+    for (const name of ['MorphShape', 'StaticText']) {
+      const field = (type: CType): FieldInfo => ({ type, init: null, visibility: 'private', owner: name, isStatic: false, isConst: false });
+      this.classMap.set(name, {
+        fields: new Map([['_graphics', field({ kind: 'object', className: 'Graphics' })],
+          ...(name === 'StaticText' ? [['_text', field({ kind: 'string' })] as [string, FieldInfo]] : [])]),
+        methods: new Map(), staticFields: new Map(), staticMethods: new Map(),
+        getters: name === 'StaticText' ? new Map([['text', { returnType: { kind: 'string' }, params: [], visibility: 'public', owner: name, isStatic: false, isFinal: true, isGetter: true, isSetter: false }]]) : new Map(),
+        setters: new Map(), constructor: { params: [] }, superClass: 'DisplayObject', isFinal: true, implements: [],
+      });
+    }
     // Bitmap draws a BitmapData; BitmapData holds raw RGBA pixels (getPixel/
     // setPixel) plus an optional decoded SkImage (loaded via the non-standard
     // loadFile hook) used by render().
@@ -8567,6 +8578,7 @@ export class SymbolTable {
       DefinitionError: 'DefinitionError', EvalError: 'EvalError', URIError: 'URIError',
       // flash.display
       Sprite: 'flash.display::Sprite', Shape: 'flash.display::Shape',
+      MorphShape: 'flash.display::MorphShape', StaticText: 'flash.text::StaticText',
       MovieClip: 'flash.display::MovieClip', Bitmap: 'flash.display::Bitmap',
       BitmapData: 'flash.display::BitmapData', Loader: 'flash.display::Loader',
       LoaderInfo: 'flash.display::LoaderInfo', DisplayObject: 'flash.display::DisplayObject',

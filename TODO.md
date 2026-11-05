@@ -19596,6 +19596,39 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 无冻结/崩溃，但更长的交互验证仍待窗口 GUI 场景。增量重烘（bake_patch）仍只对显式 cacheAsBitmap 成立；auto-bake
 脏仍是掉烘落到 live（非增量），FPS 降幅来自「根不烘 + 静止子树 blit」而非 auto-bake 的矩形级重绘。
 
+### 阶段三百七十三：SWC 静态文本烘焙 + StaticText/MorphShape 类型（v0.4.336 → v0.4.337）
+
+**起点**：`DefineText`（11）/`DefineText2`（33）此前只读 RECT、实例化为空 `TextField`（swc.md §3.3 记为「报告的缺口」），
+`MorphShape` 用 `Shape` 代替。本阶段把静态文本从嵌入字体按字形轮廓烘焙成真实矢量路径，并新增
+`flash.text::StaticText` / `flash.display::MorphShape` 两个「仅 authored、不可 AS3 构造」的 `DisplayObject` 叶类型。
+
+**逐项**：
+1. **`src/swc.ts` 静态文本烘焙**：`parseSwfText` 对 tag 11/33 完整解析 `TextMatrix`、`glyphBits/advanceBits` 与文字记录
+   （fontId/颜色含 alpha/height/x/y/带符号 advance）；`parseSwfFont` 惰性读取 `DefineFont2/3` 的内嵌轮廓（1024/20480 字体
+   单位），逐字形按 `height/units` 缩放 + 二次曲线 + 逐字位置烘焙成 `SwcShape`；每个字形独立 fill 层（重叠字形合成而非
+   even-odd 互吃）。CodeTable 只读用于 `StaticText.text`；引用未支持字体会显式报错，不烘焙假字形。
+2. **`src/symbols.ts` + `src/emit.ts` 新增类型**：`MorphShape`（`flash.display::MorphShape`）、`StaticText`
+   （`flash.text::StaticText`）均**直接继承 `DisplayObject`**（不是 Shape/TextField/InteractiveObject），`final`，私有
+   `_graphics`；`StaticText` 另有私有 `_text` 与 `text` getter。AS3 直接 `new` 抛 `ArgumentError #2012`。`as_graphics_of`
+   补两个分支接入绘制/命中/边界/遮罩/GC 现有路径。
+3. **`src/index.ts`**：`-v/--verbose` 输出 `swcBake.info` 成功烘焙统计（morph/静态/动态文字、多帧剪辑、Ratio）。
+4. **测试**：新增 `test/unit/swc-static-text.ts` 两用例——(a) 用合成 SWF（宽/窄 offset、RGB/RGBA、多继承样式记录）做字形
+   坐标/alpha/字体尺度/负 advance/曲线控制点 oracle；(b) 端到端：`StaticText` 类型名/只读 text/边界/`BitmapData.draw` 逐像素
+   （`80ff0000`/`ff0000ff`/`0`）+ 直接构造 `StaticText`/`MorphShape` 抛 `#2012`。`c-warnings.ts`/`render.ts` 同步修正
+   MorphShape 由 Shape 改为 DisplayObject 后的旧钉子。
+5. **示例**：`swc-morph.as` 检查逐帧形变类型与边界，`swc-shape.as` 更新。
+6. **双语文档 swc.md**：新增「当前静态文字与类型支持（2026-11-05）」小节，替换「DefineText 为空框」「MorphShape 用 Shape
+   代替」的历史描述。
+
+**验收**：
+- 全量 `node test.ts`：**tests 623 / pass 623 / fail 0**（新增 `swc-static-text.ts` 2 用例）。
+- AIR SDK 51.4.1 同一合成 SWF 对照：`flash.text::StaticText`、`is StaticText/Shape/TextField = true/false/false`、
+  文字 `中中中`、边界 `(0,0,80,50)`、采样像素 `80ff0000 / ff0000ff / 0`；AOT 均一致。
+
+**如实报明**：`DefineFont`/`DefineFontInfo`（老式字体）与 `DefineFont4` 的静态轮廓不在本次范围；静态文本引用未支持字体
+明确报错。SWC 内嵌字体对动态文本的字体注册仍沿用既有路径。morph 遮罩 stencil 随 Ratio 更新与 AIR 的差异（swc.md §9.2
+F12）仍保留。
+
 ### 阶段三百七十：RepaintBoundary 阶段 C 第二步 —— 彻底移除每帧指纹哈希（v0.4.333 → v0.4.334）
 
 **起点**：阶段三百六十九落地脏矩形基础设施（写了不读），但每帧整树指纹哈希 `as_render_fp` 仍保留——它服务

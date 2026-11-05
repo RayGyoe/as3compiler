@@ -9177,6 +9177,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     }
     for (const ch of bake.characters) {
       if (ch.kind === 'shape' && ch.shape !== undefined) this.emitSwcShapeBuilder(ch.shape);
+      if (ch.kind === 'text' && ch.text?.shape) this.emitSwcShapeBuilder(ch.text.shape);
     }
     const morphChars = bake.characters.filter((c) => c.kind === 'morph' && c.morph !== undefined);
     this.swcMorphIds = new Set(morphChars.map((c) => c.id));
@@ -10432,19 +10433,22 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
           : `BitmapData_adoptEncodedAlpha(bd, ${b.bytesSymbol}, (size_t)${b.encoded.length}, ${b.alphaSymbol}, ${b.width}, ${b.height})`;
         this.line(`case ${ch.id}: { BitmapData* bd = BitmapData_new(0, 0, true, 0u); ${adopt}; return (DisplayObject*)Bitmap_new(bd, (char*)"auto", false); }`);
       } else if (ch.kind === 'morph') {
-        // AIR's class here is MorphShape (a Shape subclass). We have no MorphShape
-        // class, so the instance reports "Shape" — a registered-class-name gap that
-        // `notes` states. The GEOMETRY is real now: built at ratio 0, which is the
-        // ratio an instance starts at, and rebuilt by every PlaceObject2 Ratio.
-        this.line(`case ${ch.id}: { Shape* s = Shape_new(); as_swc_morph_${ch.id}(s->graphics, 0.0); return (DisplayObject*)s; }`);
+        // Authored-only DisplayObject leaf, built at ratio zero and updated by
+        // the timeline through its private graphics surface.
+        this.line(`case ${ch.id}: { MorphShape* s = as_MorphShape_create(); as_swc_morph_${ch.id}(s->_graphics, 0.0); return (DisplayObject*)s; }`);
       } else if (ch.kind === 'text') {
-        // AIR instantiates DefineText/DefineEditText as TextFields, sized by the
-        // character's own RECT. For DefineEditText the WHOLE field is stamped here:
+        // Static text is an authored-only leaf with embedded outlines. Editable
+        // text is a TextField sized by its RECT, with its whole payload stamped:
         // the InitialText (or its HTML), the TextFormat (face/size/colour/leading/
         // alignment/margins) and the flags. Before this the field was created EMPTY
         // and every label a skin shipped rendered blank -- talkmed's agreement
         // paragraph, its footer line and its button captions were simply absent.
         const t = ch.text as NonNullable<typeof ch.text>;
+        if (t.shape) {
+          const text = cStringLiteral(Buffer.from(t.plainText ?? '', 'utf8'));
+          this.line(`case ${ch.id}: { StaticText* s = as_StaticText_create(); s->_text = (char*)${text}; as_swc_shape_${ch.id}(s->_graphics); return (DisplayObject*)s; }`);
+          continue;
+        }
         const e = t.edit;
         const steps: string[] = [
           'TextField* t = TextField_new();',
@@ -22645,6 +22649,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('Shape* Shape_new(void) { Shape* o = (Shape*)gc_alloc(GCT_CLASS, sizeof(Shape)); o->vtable = &Shape_vt; Shape_ctor(o); return o; }');
+    for (const name of ['MorphShape', 'StaticText']) {
+      this.line(`static ${name}* as_${name}_create(void) { ${name}* o = (${name}*)gc_alloc(GCT_CLASS, sizeof(${name})); o->vtable = &${name}_vt; DisplayObject_ctor((DisplayObject*)o); o->_graphics = Graphics_new(); o->_graphics->_owner = (DisplayObject*)o; return o; }`);
+      this.line(`${name}* ${name}_new(void) { as_throw(ArgumentError_new((char*)"Error #2012: ${name}$ class cannot be instantiated.", 2012)); return NULL; }`);
+    }
+    this.line('char* StaticText_get_text(void* self) { return ((StaticText*)self)->_text; }');
     // Sprite/MovieClip expose the same drawing API as Shape but without paying for
     // a Graphics on every container: the getter materialises it on first access
     // (stage 94·5). MovieClip inherits this through the Sprite vtable.
@@ -28480,6 +28489,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static Graphics* as_graphics_of(DisplayObject* o) {');
     this.indent++;
     this.line('if (as_is((void*)o, &Shape_vt)) return ((Shape*)o)->graphics;');
+    this.line('if (as_is((void*)o, &MorphShape_vt)) return ((MorphShape*)o)->_graphics;');
+    this.line('if (as_is((void*)o, &StaticText_vt)) return ((StaticText*)o)->_graphics;');
     this.line('if (as_is((void*)o, &Sprite_vt)) return ((Sprite*)o)->_graphics;');
     this.line('return NULL;');
     this.indent--;
@@ -28839,7 +28850,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static int as_render_bounds(DisplayObject* o, double* l, double* t, double* r, double* b) {');
     this.indent++;
-    this.line('if (as_is(o, &Shape_vt)) return as_paint_bound(o, l, t, r, b);');
+    this.line('if (as_is(o, &Shape_vt) || as_is(o, &MorphShape_vt) || as_is(o, &StaticText_vt)) return as_paint_bound(o, l, t, r, b);');
     this.line('if (as_is(o, &SimpleButton_vt)) {');
     this.indent++;
     this.line('DisplayObject* st = as_sbtn_state(o);');
@@ -29681,7 +29692,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (as_is((void*)o, &SimpleButton_vt)) return 1;');
     // Whitelist: anything else (Video, BitmapData-less Bitmap, a native overlay) is
     // assumed to paint through a path the fold does not reach.
-    this.line('if (!as_is((void*)o, &Shape_vt) && !as_is((void*)o, &Sprite_vt)) return 2;');
+    this.line('if (!as_is((void*)o, &Shape_vt) && !as_is((void*)o, &Sprite_vt) && !as_is((void*)o, &MorphShape_vt) && !as_is((void*)o, &StaticText_vt)) return 2;');
     this.line('int n = 0;');
     this.line('Graphics* g = as_graphics_of(o);');
     this.line('if (g != NULL) {');
@@ -30035,9 +30046,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('');
     this.line('static void as_render_object_content(void* canvas, DisplayObject* o) {');
     this.indent++;
-    this.line('if (as_is(o, &Shape_vt)) {');
+    this.line('if (as_is(o, &Shape_vt) || as_is(o, &MorphShape_vt) || as_is(o, &StaticText_vt)) {');
     this.indent++;
-    this.line('Graphics* g = ((Shape*)o)->graphics;');
+    this.line('Graphics* g = as_graphics_of(o);');
     // A baked shape may carry a ShapeBounds clip (see the Graphics `_clip` field).
     this.line('if (g->_clip) { as_skia_canvas_save(canvas); as_skia_canvas_clip_rect(canvas, g->_clx, g->_cly, g->_clw, g->_clh); }');
     this.line('as_graphics_paint(canvas, g);');
@@ -36392,11 +36403,12 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'Comma': {
         // C's comma operator is a sequence point with left-to-right evaluation, so
         // it matches ES3 §11.14 exactly: `a` runs (its value discarded), then `b`
-        // is the value. The left operand is wrapped in `(void)` when it compiled to
-        // a store whose result is not a value (e.g. a setter call).
+        // is the value. The left operand is always wrapped in `(void)` as
+        // a discarded expression. Explicitly discard every left value, including
+        // scalar render-input stores whose trailing field read is otherwise unused.
         const l = this.emitExpr(expr.left);
         const r = this.emitExpr(expr.right);
-        return { code: `(${l.discard ? `(void)(${l.code})` : l.code}, ${r.code})`, type: r.type };
+        return { code: `((void)(${l.code}), ${r.code})`, type: r.type };
       }
 
       case 'Descendants': {
@@ -38145,7 +38157,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           // opaqueBackground is a boxed as_value) still needs its write barrier, so
           // the dirty mark is sequenced AFTER the barrier-bearing store. Re-reading
           // the field for the expression value is side-effect free.
-          if (doDirtyRecv !== null) return { code: `(${store}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
+          if (doDirtyRecv !== null) return { code: `((void)(${store}), as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
           return { code: store, type: t.type, discard: true };
         }
       }
@@ -38163,7 +38175,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (heapField2) {
       const store = this.gcWriteAssign(t.code, t.type, code);
       if (store) {
-        if (doDirtyRecv !== null) return { code: `(${store}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
+        if (doDirtyRecv !== null) return { code: `((void)(${store}), as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
         return { code: store, type: t.type, discard: true };
       }
     }

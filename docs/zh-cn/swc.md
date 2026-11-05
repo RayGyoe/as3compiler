@@ -1,5 +1,18 @@
 # SWC 资源提取与嵌入方案
 
+## 当前静态文字与类型支持（2026-11-05）
+
+本节更新此前“DefineText 为空框”“MorphShape 用 Shape 代替”的历史描述：
+
+- `DefineText`（11）/`DefineText2`（33）读取文字记录、字体索引、颜色（含 alpha）、基线、带符号 advance 与 `TextMatrix`。`DefineFont2`/`DefineFont3` 的内嵌轮廓按 1024/20480 字体单位缩放，二次曲线与逐字位置直接烘焙成路径；不使用系统字体重新排版。CodeTable 用于只读 `StaticText.text`。
+- 静态文字以 `flash.text::StaticText` 创建；形变以 `flash.display::MorphShape` 创建。二者均直接继承 `DisplayObject`，不是 `Shape`/`TextField`，AS3 直接构造抛 `ArgumentError #2012`。绘制、命中、边界、遮罩与 GC 通过各自私有图形字段接入现有路径。
+- `DefineEditText` 继续使用 TextField 和既有 TextFormat 路径。SWC 内嵌字体对动态文本的字体注册、老式 `DefineFont`/`DefineFontInfo`、`DefineFont4` 的静态轮廓不在本次支持范围；静态文本引用未支持字体会明确报错，不烘焙假字形。
+- 形变、静态/动态文字、多帧剪辑和 Ratio 的成功烘焙统计仅在 `-v` / `--verbose` 输出；实际兼容性缺口仍输出 warning。既有 morph 遮罩 stencil 随 Ratio 更新与 AIR 的差异仍保留，见 §9.2 F12。
+
+验证：`node --test test/unit/swc-static-text.ts test/unit/render.ts`。静态文字探针覆盖两种字体尺度、宽/窄 offset、RGB/RGBA、多个继承样式记录、负 advance、曲线控制点、类型与只读文本及原生像素；`examples/swc-morph.as` 检查逐帧形变类型及边界。
+
+AIR SDK 51.4.1 同一合成 SWF 对照：`flash.text::StaticText`，`is StaticText/Shape/TextField = true/false/false`，文字 `中中中`，边界 `(0,0,80,50)`，三个采样像素 `80ff0000 / ff0000ff / 0`；AOT 均一致。
+
 > 本文回答一个问题：**纯 AS 项目把图片等资源打进 SWC，AOT 编译器怎么把这些资源取出来、显示到 UI 上**。
 > 核心结论先行：SWC 是 ZIP 归档，但资源**不是 ZIP 里的独立文件**，而是被 mxmlc 编译进 `library.swf`，
 > 以 SWF 二进制 tag 形式存放（位图 → `DefineBitsLossless2`/`DefineBitsJPEG2`，经 `SymbolClass` 映射到类名）。
@@ -65,6 +78,7 @@
 | 时间轴 | `FrameLabel`×36（其中 11 个多帧剪辑带 `_up/_over/_down`）、`PlaceObject2`×403 + `PlaceObject3`×18、`RemoveObject2`×4 |
 
 ---
+
 
 ## 1. 为什么这个需求存在：纯 AS 项目里 SWC 是资源载体
 
