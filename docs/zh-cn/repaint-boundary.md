@@ -205,13 +205,10 @@ if (边界 && 命中快照) {
 | auto-bake 触发 | 静置 3 帧才烘 | **改为** 写时脏标记（脏了就烘，静止即烘，无静置延迟） |
 | 渲染输入全集（防漏清单） | `as_render_fp` 的哈希字段 | **保留为「写点注入清单」的来源**，但不再每帧执行 |
 
-**迁移策略（防回归）**：阶段 B **先并行、后切换**。新增脏标记与现有指纹**并存**一段时间：
-- 脏标记置位的写点，同时也让 `as_render_fp` 保持原样运行（不删指纹代码）；
-- 用断言/探针验证「指纹变 ⇔ 脏标记置位」在全部示例上**同真同假**；
-- 全量回归绿后，再让 `_cache_flag` 的失效切换到脏标记，auto-bake 最后切换；
-- 最终**保留** `as_render_fp` 的字段枚举作为「写点注入清单」的源文档，删除每帧执行。
-
-这样把「漏标记」的风险从「画面冻结」降级为「阶段 B 期间可被指纹兜底发现」。
+**迁移策略（防回归，已完成切换）**：阶段 B **先并行、后切换**——新增脏标记与现有指纹并存一段时间，用
+`DIRTY_MISS` 探针验证「指纹变 ⇔ 脏标记置位」在全部示例上同真同假；清零后，`_cache_flag` 失效与 auto-bake
+触发都切到写时脏标记，`as_render_fp` 的掉烘逻辑删除。`as_render_fp` 的每帧整树哈希**仍保留**，只服务窗口
+Present-skip 键与 DIRTY_MISS 诊断；彻底移除每帧哈希（改用全局脏 epoch 判「本帧是否有脏」）留待阶段 C。
 
 `BitmapData` 的 `_px_ver`/`_uid` 版本计数器（现已被指纹读取）在脏标记方案里**语义不变**——它仍然是
 「BitmapData 内容变了」的权威信号，只是从「被指纹每帧读」改成「写时直接置脏其所有显示实例」。这一步是
@@ -234,11 +231,13 @@ if (边界 && 命中快照) {
 
 ### 阶段 B：写时脏标记 + 边界级失效（核心）
 
-> **实施状态（阶段三百六十七）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
+> **实施状态（阶段三百六十八）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
 > 帧、Graphics、Transform、Bitmap/BitmapData 反向引用、TextField、Stage）+ 7 类运行时内部状态（焦点、选择/caret、
 > IME 组合、caret 闪烁、filter 字段、Stage3D、SimpleButton hover）+ 动态字段写（`as_dyn_set`）钩子标脏，并修复
-> `as_mark_dirty` 短路 bug、autoSize 漏标脏、嵌套 cacheAsBitmap 不穿透、动态字段写漏标脏（第二~五轮复验）。
-> 指纹兑底仍在（并行阶段）。真机 `DIRTY_MISS` 已清零。切换未做——见 TODO.md 阶段三百六十七的「如实报明」。
+> `as_mark_dirty` 短路 bug、autoSize 漏标脏、嵌套 cacheAsBitmap 不穿透、动态字段写漏标脏。真机 `DIRTY_MISS` 已清零，
+> **切换已完成**：失效改由 `_render_dirty` 驱动（`as_render_fp` 不再掉烘，只保留窗口 Present-skip 键 + DIRTY_MISS
+> 诊断）；auto-bake 触发由「静置 3 帧」改为「无脏即烘」；缓存分支区分显式 `cacheAsBitmap`（脏→当帧重烘）与
+> auto-bake（脏→退出边界、落到 live，静止当帧重烘）。
 
 - [x] `DisplayObject` 增 `_render_dirty` 字段与 `as_is_boundary` 判定（§4.2）。
 - [x] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
@@ -247,20 +246,22 @@ if (边界 && 命中快照) {
       结构、`MovieClip` 帧推进、`Graphics` 绘制命令（经 `_owner`）、`Transform.matrix/colorTransform`（经 `_owner`）、
       `Bitmap.bitmapData`/`smoothing`、`BitmapData` 13 个 mutator（经 `_refs` 反向引用）、`TextField` 文本/格式/颜色/滚动
       写点、`Stage.color/align/scaleMode`、动态字段写（`as_dyn_set` → `as_disp_dirty_hook`）。
-- [x] `as_render_object` 缓存分支改为「脏则重烘、不脏则 blit」，去静置延迟（§4.4 阶段 B）。
-      （当前与指纹掉烘并存：脏则清脏 + `_cache_valid=0` 当帧重烘，指纹兑底发现漏点。）
-- [~] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。
-- [~] **并行验证**：脏标记与指纹同真同假（§4.5 迁移策略），全量 `node test.ts` 绿后才切换。
-      探针已就位（`ASC_DIRTY_TRACE` + `DIRTY_MISS`：掉烘时指纹变而 `_render_dirty==0` 即报漏写点）。
+- [x] `as_render_object` 缓存分支：显式 `cacheAsBitmap` 脏→掉烘+当帧重烘；auto-bake 脏→退出边界+落到
+      filters/content live，无脏即烘（§4.4 阶段 B，去静置延迟）。
+- [x] `as_render_fp` 移除掉烘：`_auto_fp` 仍保留（窗口 Present-skip 键 + DIRTY_MISS 诊断），`_auto_still`
+      静置计数与 `ASC_AUTO_BAKE_FRAMES` 宏删除。
+- [x] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。
+- [x] **并行验证 → 切换**：脏标记与指纹同真同假（§4.5 迁移策略），全量 `node test.ts` 绿后才切换。
+      探针已就位（`ASC_DIRTY_TRACE` + `DIRTY_MISS`：指纹变而 `_render_dirty==0` 即报漏写点，切换后仅诊断不兑底）。
       首轮跑出**大量 `DIRTY_MISS`**，定位「指纹输入 ≠ AS3 写点」，补齐 7 类内部状态写点；第二轮复验仍未清零，
       进一步定位 `as_mark_dirty` 的 `!o->_render_dirty` 短路 bug（非边界子对象跨帧保持脏、祖先边界同帧被清，
       下一帧冒泡被跳过），改为全链冒泡；第三轮复验定位 autoSize 漏标脏；第四轮（dump 子树）定位嵌套
       cacheAsBitmap 标脏不穿透；第五轮（dump 增强到全指纹字段）定位 Starling Juggler 动态写 alpha 漏标脏，
-      加 `as_disp_dirty_hook` 钩子后真机 `DIRTY_MISS` 清零。
+      加 `as_disp_dirty_hook` 钩子后真机 `DIRTY_MISS` 清零；第六轮切换后真机 `DIRTY_MISS` 仍 0、无崩溃。
 - **验收**：
   - `temp/` 探针：`x` 连写两次 → 第二次（写时脏已置）当帧重烘，无静置 3 帧延迟（`ASC_BAKE_TRACE` 时间戳）。
   - 单件绘制斜率不再因「掉烘空转」而抖动（§6.14 的 hover 场景 A/B）。
-  - 新增 `test/unit/render.ts` 源级钉：脏标记字段存在、`as_is_boundary`、注入点覆盖清单、帧末复位。
+  - `test/unit/render.ts` 源级钉：脏标记字段、`as_is_boundary`、注入点覆盖清单、缓存分支区分显式/auto、指纹不再掉烘。
 
 ### 阶段 C：边界内脏矩形/脏子树增量重绘（最难，收益最大）
 

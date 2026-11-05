@@ -297,7 +297,7 @@ function checkDisplayGeometry(): string[] {
     && !matrixBody.includes('o->_scroll_rect') && !matrixBody.includes('p->_scroll_rect'));
   const renderAt = c.indexOf('static void as_render_object(void* canvas, DisplayObject* o) {');
   const snapshotAt = c.indexOf('o->_scroll_render_x = o->_scroll_rect != NULL ? o->_scroll_rect->x : 0.0;', renderAt);
-  const cacheAt = c.indexOf('} else if ((o->_cache_flag || o->_auto_baked)', renderAt);
+  const cacheAt = c.indexOf('int use_cache = 0;', renderAt);
   check('the renderer snapshots both scroll axes before any cached-paint branch',
     snapshotAt > renderAt && cacheAt > snapshotAt
     && c.slice(snapshotAt, cacheAt).includes('o->_scroll_render_y = o->_scroll_rect != NULL ? o->_scroll_rect->y : 0.0;'));

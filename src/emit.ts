@@ -1997,14 +1997,14 @@ export class Emitter {
           this.line('double _cache_phy;');
           this.line('int _cache_valid;');
           // Incremental-redraw state (auto cacheAsBitmap): _auto_fp is the
-          // subtree content fingerprint from the last frame (see
-          // as_render_fingerprint), _auto_still counts consecutive frames with an
-          // unchanged fingerprint, and _auto_baked marks the subtree as currently
-          // baked into _cache_image. A static subtree that stays unchanged for
-          // ASC_AUTO_BAKE_FRAMES frames is baked automatically — no manual
-          // cacheAsBitmap toggle — and re-baked the instant the fingerprint moves.
+          // subtree content fingerprint from the last frame (still kept for the
+          // window Present-skip key and the DIRTY_MISS diagnostic), and
+          // _auto_baked marks the subtree as currently baked into _cache_image.
+          // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): a
+          // still subtree is baked the instant it is NOT render-dirty — the old
+          // _auto_still settle counter (ASC_AUTO_BAKE_FRAMES frames) is gone, and
+          // invalidation is write-driven (_render_dirty), not fingerprint-driven.
           this.line('uint32_t _auto_fp;');
-          this.line('int _auto_still;');
           this.line('int _auto_baked;');
            this.line('int _dbg_fp_changes;');
           // Write-time dirty flag (RepaintBoundary stage B, docs/zh-cn/repaint-boundary.md):
@@ -12922,7 +12922,6 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
     this.line('o->_cache_valid = 0;');
     this.line('o->_auto_fp = 0;');
-    this.line('o->_auto_still = 0;');
     this.line('o->_auto_baked = 0;');
     this.line('o->_render_dirty = 0;');
     this.line('o->_clip_src = NULL;');
@@ -22793,9 +22792,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_disp_chain_scale(DisplayObject* o, double* ox, double* oy);');
     this.line('static void as_render_object(void* canvas, DisplayObject* o);');
     // BitmapData.draw is a rendering PATH of its own (阶段二百八十二). The window
-    // paint and Stage.render both call as_render_fp() before drawing, and that walk
-    // is the ONLY thing that ever drops a stale bake: it writes _auto_fp/_auto_still,
-    // clears _auto_baked/_cache_valid, and starts an auto-bake. draw() rasterizes
+    // paint and Stage.render both call as_render_fp() before drawing. RepaintBoundary
+    // stage B switch: that walk no longer DROPS a stale bake — invalidation is
+    // write-driven (_render_dirty, consumed by as_render_object's cache branch) —
+    // but it still updates _auto_fp (the window Present-skip key and the DIRTY_MISS
+    // diagnostic) and starts an auto-bake on a still subtree. draw() rasterizes
     // through the SAME as_render_object/as_render_cached but used to skip the walk,
     // so a subtree that is only ever seen through draw() stayed frozen at the frame
     // in which it first baked (and an auto-bake could not even start there).
@@ -29033,15 +29034,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     // recursive *content fingerprint* of the subtree: the object's transform +
     // its type-specific content (Shape path generation id + paints, Bitmap image,
     // TextField text/format) + its filters + the recursive fingerprints of its
-    // children. A subtree whose fingerprint is unchanged for ASC_AUTO_BAKE_FRAMES
-    // consecutive frames is treated as static and auto-baked into _cache_image
-    // (reusing the cacheAsBitmap path), so subsequent frames emit a single
-    // drawImage instead of re-walking the subtree. The instant the fingerprint
-    // moves the bake is dropped and the normal path resumes. This is the render-
-    // side equivalent of a dirty flag and mirrors cacheAsBitmap's semantics:
-    // while baked, intra-subtree changes are not tracked until the fingerprint
-    // differs (which any visible change does).
-    this.line('#define ASC_AUTO_BAKE_FRAMES 3');
+    // children. RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md):
+    // the fingerprint no longer drives auto-bake — a write-time dirty flag does.
+    // This walk is kept for two jobs only: the window Present-skip key and the
+    // DIRTY_MISS diagnostic (a fingerprint move with _render_dirty still 0 flags
+    // a write point the marker missed).
     // Upper bound on a cacheAsBitmap/auto-bake surface, in pixels. The bake is
     // sized to the destination resolution so the blit stays 1:1 (see
     // as_render_cached); this keeps a heavily scaled object from asking for a
@@ -29538,45 +29535,35 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
-    // Update the auto-bake state from this frame's fingerprint. Unchanged =>
-    // count a still frame; changed => reset and, if we were baked, drop the bake
-    // (invalidate the cache so the normal path resumes). When the still counter
-    // exactly reaches the threshold and the object has deterministic bounds, mark
-    // it auto-baked; objects without bounds (empty containers) reset so they only
-    // retry the bounds probe every ASC_AUTO_BAKE_FRAMES frames, not every frame.
-    //
-    // A moved fingerprint drops the bake for an EXPLICIT cacheAsBitmap too
-    // (`_cache_flag`), not just for an auto-bake. AIR's cache is not a snapshot:
-    // the player regenerates the bitmap when the object or its children change,
-    // and it is the only invalidation the AS3 side cannot see. Ours used to be
-    // driven by the setter alone, so an explicitly cached subtree froze at
-    // whatever it looked like when `cacheAsBitmap = true` ran -- measured on the
-    // meeting client, whose buttons/labels/thumbnails/rows all opt in through
-    // `cacheAsBitmapAndMatrix()` and then change their text and bitmaps.
-    this.line('if (h == o->_auto_fp) { o->_auto_still++; }');
-    this.line('else {');
+    // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): the
+    // fingerprint no longer drives invalidation. A write-time dirty flag
+    // (_render_dirty) is the single source of truth for dropping a bake, consumed
+    // by as_render_object's cache branch. The walk still hashes every node each
+    // frame for the window Present-skip key and for the DIRTY_MISS diagnostic:
+    // a fingerprint that moved while _render_dirty stayed 0 is a write point the
+    // marker still does not cover (reported, not silently papered over).
+    this.line('if (h != o->_auto_fp) {');
     this.indent++;
-    this.line('o->_auto_fp = h; o->_auto_still = 0;');
+    this.line('o->_auto_fp = h;');
     this.line('if (ASC_fp_trace > 0) o->_dbg_fp_changes++;');
-    this.line('if (o->_auto_baked || o->_cache_flag) {');
-    this.indent++;
-    this.line('if (ASC_bake_trace && o->_cache_valid) fprintf(stderr, "t=%.0f bake_drop o=%p w=%.0f h=%.0f draw=%d\\n", as_now_ms(), (void*)o, o->_cache_w, o->_cache_h, ASC_draw_path);');
-    this.line('if (ASC_dirty_trace > 0 && o->_cache_valid && !o->_render_dirty) {');
+    this.line('if (ASC_dirty_trace > 0 && (o->_auto_baked || o->_cache_flag) && o->_cache_valid && !o->_render_dirty) {');
     this.indent++;
     this.line('const char* dm_tx = (as_is(o, &TextField_vt) && ((TextField*)o)->text != NULL) ? ((TextField*)o)->text : "-";');
     this.line('fprintf(stderr, "DIRTY_MISS o=%p cls=%s auto=%d cache=%d tx=%s: fp changed but _render_dirty was 0\\n", (void*)o, as_cls_of((void*)o), o->_auto_baked, o->_cache_flag, dm_tx);');
     this.line('if (o->_cache_flag && as_dirty_dump_n < 2) { as_dirty_dump_n++; as_dirty_dump(o, 0); }');
     this.indent--;
     this.line('}');
-    this.line('o->_auto_baked = 0; o->_cache_valid = 0;');
     this.indent--;
     this.line('}');
-    this.indent--;
-    this.line('}');
-    this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && o->_auto_still == ASC_AUTO_BAKE_FRAMES && !as_single_primitive(o)) {');
+    // Auto-bake trigger: a still (not render-dirty) subtree bakes this frame.
+    // No ASC_AUTO_BAKE_FRAMES settle delay — a subtree that just stopped changing
+    // re-bakes immediately instead of idling 3 live frames (docs/zh-cn/
+    // repaint-boundary.md §4.4). Objects without deterministic bounds (empty
+    // containers) stay live; the render pass itself handles the bake.
+    this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {');
     this.indent++;
     this.line('double bl, bt, br, bb;');
-    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); } else o->_auto_still = 0;');
+    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); }');
     this.indent--;
     this.line('}');
     this.line('return h;');
@@ -29620,9 +29607,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // surface whose origin sits on a half device pixel has the whole image rounded
     // to an integer one -- while the content inside was rasterized against the
     // UNROUNDED origin. The bake therefore lands up to one device pixel away from
-    // the live rendering of the very same subtree, and because a fingerprint change
-    // drops the bake for ASC_AUTO_BAKE_FRAMES frames, every roll-over / press / edit
-    // pops the content by that pixel and pops it back when the bake re-engages.
+    // the live rendering of the very same subtree, and because a render-input write
+    // re-bakes the subtree, every roll-over / press / edit pops the content by that
+    // pixel and pops it back when the bake re-engages (previously this lasted
+    // ASC_AUTO_BAKE_FRAMES live frames before the settle counter re-baked).
     // Measured on a real app's home card with the window layer capture (temp/hover):
     // the roll-over renders the card's title band as an exact 1 px translation of
     // itself (best-fit residual 0.00 at (dx,dy)=(1,1)) for exactly 3 frames, and
@@ -29679,9 +29667,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_bake_scale2(canvas, lw, lh, &sx, &sy);');
     // An AUTO-bake that the caps had to shrink is WORSE than not baking, and it
     // flickers: the blit magnifies a downscaled surface, so the object renders
-    // soft while baked and sharp while live -- and any content change drops the
-    // bake for ASC_AUTO_BAKE_FRAMES frames, i.e. the object flips between the two
-    // at the change rate. Measured on the meeting client (ASC_BAKE_TRACE,
+    // soft while baked and sharp while live -- and any content change re-bakes
+    // the subtree (previously it dropped the bake for ASC_AUTO_BAKE_FRAMES live
+    // frames), i.e. the object flips between the two at the change rate. Measured on the meeting client (ASC_BAKE_TRACE,
     // temp/applog): the file-preview container (1280x720) is painted at a
     // destination scale of 2.76562, but AS_BAKE_MAX_PIXELS caps its surface at
     // 2.08333 (px 2667x1500), so the blit magnifies by 1.33 and the slide inside
@@ -30025,13 +30013,33 @@ void FileStream_writeObject(void* _this, as_value v) {
     // composition preview moves) every frame, and the explicit cacheAsBitmap path
     // only re-bakes on size/flag change -- so it would freeze the caret. Render it
     // live instead (阶段一百三十五).
-    this.line('} else if ((o->_cache_flag || o->_auto_baked) && !(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)) {');
+    this.line('} else {');
     this.indent++;
-    // RepaintBoundary stage B: a write-time dirty flag re-bakes this frame (no
-    // ASC_AUTO_BAKE_FRAMES settle delay). The fingerprint path in as_render_fp is
-    // kept as a fallback, so a write point the marker does not yet cover still
-    // invalidates through the fingerprint (slower, never freezes). Consumed here.
-    this.line('if (o->_render_dirty) { o->_render_dirty = 0; o->_cache_valid = 0; }');
+    // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): the
+    // write-time dirty flag is the ONLY thing that drops a bake. An explicit
+    // cacheAsBitmap (_cache_flag) re-bakes THIS frame (AIR regenerates the bitmap
+    // on change, no settle delay); an auto-bake (_auto_baked) tears the boundary
+    // down and falls through to the live filters/content path so a
+    // continuously-changing subtree does not re-bake every frame — it re-bakes the
+    // instant it is still again (as_render_fp triggers _auto_baked on !dirty).
+    this.line('int use_cache = 0;');
+    this.line('if ((o->_cache_flag || o->_auto_baked) && !(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)) {');
+    this.indent++;
+    this.line('if (o->_render_dirty) {');
+    this.indent++;
+    this.line('o->_render_dirty = 0;');
+    this.line('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }');
+    this.line('else { o->_auto_baked = 0; o->_cache_valid = 0; }');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('use_cache = 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('if (use_cache) {');
+    this.indent++;
     this.line('as_render_cached(canvas, o);');
     this.indent--;
     this.line('} else if (o->filters != NULL && o->filters->length > 0) {');
@@ -30055,6 +30063,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} else {');
     this.indent++;
     this.line('as_render_object_content(canvas, o);');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('if (scroll_on) as_skia_canvas_restore(canvas);');

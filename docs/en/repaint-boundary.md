@@ -227,15 +227,12 @@ setting** (O(1) on write, O(dirty) on read). They are not equivalent replacement
 | auto-bake trigger | sit still 3 frames then bake | **switch to** write-time dirty marking (bake on change, no sit-still latency) |
 | Render-input full set (miss-prevention list) | `as_render_fp` hashed fields | **keep as the source** of the write-point injection list, but no longer execute per frame |
 
-**Migration strategy (regression guard)**: stage B runs **parallel first, switch later**. New dirty marking
-coexists with the existing fingerprint for a while:
-- write points that set dirty also leave `as_render_fp` running unchanged (don't delete fingerprint code yet);
-- use asserts/probes to verify "fingerprint changed ⇔ dirty set" holds **true-iff-true** across all examples;
-- after full `node test.ts` is green, switch `_cache_flag` invalidation to dirty marking, auto-bake last;
-- finally **keep** `as_render_fp`'s field enumeration as the source document for the write-point injection list,
-  and delete the per-frame execution.
-
-This degrades the "missed mark" risk from "frozen frame" to "fingerprint catches it during stage B".
+**Migration strategy (regression guard, switch now done)**: stage B ran **parallel first, switch later**. New
+marking coexisted with the existing fingerprint, and the `DIRTY_MISS` probe verified "fingerprint changed ⇔ dirty
+set" true-iff-true across all examples; once zero, `_cache_flag` invalidation and the auto-bake trigger both moved
+to write-time dirty marking and `as_render_fp`'s drop-bake was deleted. The per-frame whole-tree hash is **still
+kept** — it only serves the window Present-skip key and the `DIRTY_MISS` diagnostic; removing it entirely (a global
+dirty epoch instead of re-hashing all fields) is deferred to stage C.
 
 `BitmapData`'s `_px_ver`/`_uid` version counters (currently read by the fingerprint) keep their **semantics**
 under dirty marking — they remain the authoritative "BitmapData content changed" signal, only changing from
@@ -261,13 +258,16 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 
 ### Stage B: write-time dirty marking + boundary-level invalidation (core)
 
-> **Implementation status (stage three-sixty-seven)**: write points now cover every render input (DisplayObject
+> **Implementation status (stage three-sixty-eight)**: write points now cover every render input (DisplayObject
 > fields/accessors, container structure, MovieClip frames, Graphics, Transform, Bitmap/BitmapData reverse edges,
 > TextField, Stage) plus seven runtime-internal states (focus, selection/caret, IME composition, caret blink,
 > filter fields, Stage3D, SimpleButton hover) plus dynamic field writes (`as_dyn_set` hook), and fixes for the
 > `as_mark_dirty` short-circuit bug, autoSize missed marking, nested-cacheAsBitmap non-bubbling, and dynamic
-> field-write missed marking (second–fifth re-runs). The fingerprint fallback is still present (parallel phase);
-> real-app `DIRTY_MISS` is now zero. The switch is not yet done — see TODO.md stage three-sixty-seven.
+> field-write missed marking. Real-app `DIRTY_MISS` is zero and **the switch is done**: invalidation is now
+> `_render_dirty`-driven (`as_render_fp` no longer drops the bake — it only feeds the window Present-skip key and
+> the `DIRTY_MISS` diagnostic); the auto-bake trigger moved from a 3-frame sit-still to “still = not dirty”, and the
+> cache branch distinguishes explicit `cacheAsBitmap` (dirty → re-bake this frame) from auto-bake (dirty → tear the
+> boundary down, still → re-bake).
 
 - [x] Add `_render_dirty` field and `as_is_boundary` predicate to `DisplayObject` (§4.2).
 - [x] Following `as_render_fp`'s field list, inject `as_mark_dirty(o)` + upward propagation into every render-input
@@ -277,27 +277,30 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
   `Transform.matrix/colorTransform` (via `_owner`), `Bitmap.bitmapData`/`smoothing`, `BitmapData`'s 13 mutators
   (via `_refs` reverse edges), `TextField` text/format/colour/scroll write points, `Stage.color/align/scaleMode`,
   and dynamic field writes (`as_dyn_set` → `as_disp_dirty_hook`).
-- [x] Change `as_render_object`'s cache branch to "re-bake if dirty, else blit", removing the sit-still latency
-  (§4.4 stage B). (Currently coexists with the fingerprint drop: dirty → clear + `_cache_valid=0` same-frame re-bake;
-  the fingerprint fallback catches any missed write point.)
-- [~] `_render_dirty` reset (§4.4) — implemented as **clear-on-consume** (cleared right before the cache branch
+- [x] Change `as_render_object`'s cache branch: an explicit `cacheAsBitmap` re-bakes on `_render_dirty` (drop +
+  same-frame re-bake), an auto-bake tears the boundary down and falls through to the live filters/content path;
+  no sit-still latency (§4.4 stage B).
+- [x] Remove the drop-bake from `as_render_fp`: `_auto_fp` stays (window Present-skip key + `DIRTY_MISS`
+  diagnostic), the `_auto_still` settle counter and `ASC_AUTO_BAKE_FRAMES` macro are deleted.
+- [x] `_render_dirty` reset (§4.4) — implemented as **clear-on-consume** (cleared right before the cache branch
   re-bakes), not a unified end-of-frame reset.
-- [~] **Parallel verification**: dirty-marking ≡ fingerprint true-iff-true (§4.5); switch only after full
-  `node test.ts` green. The probe is in place (`ASC_DIRTY_TRACE` + `DIRTY_MISS`: a fingerprint drop with
-  `_render_dirty==0` reports a missed write point). The first TalkMED run produced **many `DIRTY_MISS`** and located
-  them as "fingerprint inputs ≠ AS3 write points" — seven runtime-internal-state write points were then added; the
-  second re-run still reported misses, further located as the `as_mark_dirty` `!o->_render_dirty` short-circuit bug
-  (a non-boundary child stays dirty across frames while an ancestor boundary is cleared that frame, so the next
-  frame's bubble is skipped) — now fixed to walk the full chain; the third re-run located the autoSize missed mark;
-  the fourth (subtree dump) located nested cacheAsBitmap non-bubbling; the fifth (dump enhanced to all fingerprint
-  fields) located Starling Juggler's dynamic alpha write — fixed via `as_disp_dirty_hook`, after which real-app
-  `DIRTY_MISS` is zero.
+- [x] **Parallel verification → switch**: dirty-marking ≡ fingerprint true-iff-true (§4.5); switch only after full
+  `node test.ts` green. The probe is in place (`ASC_DIRTY_TRACE` + `DIRTY_MISS`: a fingerprint move with
+  `_render_dirty==0` reports a missed write point; after the switch it is diagnostic only, no fallback). The first
+  TalkMED run produced **many `DIRTY_MISS`** and located them as "fingerprint inputs ≠ AS3 write points" — seven
+  runtime-internal-state write points were then added; the second re-run still reported misses, further located as
+  the `as_mark_dirty` `!o->_render_dirty` short-circuit bug (a non-boundary child stays dirty across frames while
+  an ancestor boundary is cleared that frame, so the next frame's bubble is skipped) — now fixed to walk the full
+  chain; the third re-run located the autoSize missed mark; the fourth (subtree dump) located nested cacheAsBitmap
+  non-bubbling; the fifth (dump enhanced to all fingerprint fields) located Starling Juggler's dynamic alpha write
+  — fixed via `as_disp_dirty_hook`, after which real-app `DIRTY_MISS` is zero; the sixth post-switch run is still
+  `DIRTY_MISS` zero with no crash.
 - **Acceptance**:
   - `temp/` probe: writing `x` twice → second write (dirty already set) re-bakes same frame, no 3-frame sit-still
     (via `ASC_BAKE_TRACE` timestamps).
   - Per-item draw slope stops jittering from drop-bake idling (§6.14 hover A/B).
-  - New `test/unit/render.ts` source pins: dirty field exists, `as_is_boundary`, injection-point coverage list,
-    end-of-frame reset.
+  - `test/unit/render.ts` source pins: dirty field exists, `as_is_boundary`, injection-point coverage list,
+    cache branch distinguishes explicit vs auto, fingerprint no longer drops the bake.
 
 ### Stage C: intra-boundary dirty-rect/subtree incremental repaint (hardest, highest payoff)
 

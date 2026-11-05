@@ -19518,6 +19518,35 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
 （关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
+### 阶段三百六十八：RepaintBoundary 阶段 B 切换 —— 失效改由写时脏标记驱动（v0.4.331 → v0.4.332）
+
+**起点**：阶段三百六十七补齐全部写点后，真机 TalkMED `DIRTY_MISS` 清零，等价性验证达标。此时脏标记仍是
+「影子路径」——`as_render_fp` 每帧指纹掉烘完整保留，脏标记对行为无影响。本阶段执行 `docs/zh-cn/repaint-boundary.md`
+§4.5 的「切换」：让失效与 auto-bake 触发都由写时脏标记驱动，指纹降级为诊断。
+
+**逐项**：
+1. **`as_render_fp` 移除掉烘**：删除「指纹变 → `_auto_baked=0; _cache_valid=0`」整段。`_auto_fp` 仍保留
+   （窗口 Present-skip 键 + DIRTY_MISS 诊断），`_auto_still` 静置计数与 `ASC_AUTO_BAKE_FRAMES` 宏删除。
+2. **auto-bake 触发去静置延迟**：触发条件由 `_auto_still == ASC_AUTO_BAKE_FRAMES` 改为 `!_render_dirty`
+   （无脏即烘），删除静置 3 帧空转（文档 §4.4）。
+3. **缓存分支区分显式/auto**：`as_render_object` 缓存分支改为 `int use_cache` 决策——显式 `_cache_flag` 脏→
+   掉烘 + `use_cache=1` 当帧重烘（对齐 AIR：作者要求的缓存永不退出）；auto-bake 脏→ `_auto_baked=0` +
+   `use_cache=0` 退出边界、落到 filters/content live（避免持续变化子树每帧重烘），静止后 `as_render_fp`
+   当帧重烘。
+4. **DIRTY_MISS 降级为纯诊断**：`as_render_fp` 里 DIRTY_MISS 仍打印「指纹变而 `_render_dirty==0`」，但
+   不再兜底掉烘——切换后漏写点会导致冻结（脏标记方案的风险），诊断仅用于定位。
+5. **`ASC_draw_path` 保留**：BitmapData.draw 路径标记仍声明/设置，但 `bake_drop` trace 删除（指纹不再掉烘）。
+
+**验收**：
+- 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
+- `unit: render/RepaintBoundary` 保持 **39 钉**；`scrollrectbake` 13 钉、`display/DisplayGeometry` 同步更新
+  （缓存分支定位从 `} else if ((o->_cache_flag || o->_auto_baked)` 改为 `int use_cache = 0;`）。
+- 真机 TalkMED 复验：`ASC_DIRTY_TRACE=1` 运行 90s，`DIRTY_MISS` 计数 **0**，无崩溃。
+
+**如实报明**：切换完成，但**每帧整树指纹哈希仍保留**——它服务于窗口 Present-skip 键（`w->render_fp ==
+_window_fp`）与 DIRTY_MISS 诊断。彻底移除每帧哈希（改用全局脏 epoch 判「本帧是否有脏」）留待阶段 C。
+阶段 C（边界内脏矩形/脏子树增量重绘）仍未开始。
+
 ### 阶段三百六十七：RepaintBoundary 等价性验证 —— 补齐运行时内部状态与动态字段写漏写点（v0.4.329 → v0.4.331）
 
 **起点**：阶段三百六十六声称「写点已覆盖全部渲染输入」，但 TalkMED Meeting 真机跑 `ASC_DIRTY_TRACE=1` 暴露

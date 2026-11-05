@@ -1381,20 +1381,24 @@ function checkScrollRectBakeInvalidation(): string[] {
   check('as_render_cached bakes the CONTENT only (clip/translate stay outside the bake)',
     cache.includes('as_render_object_content(c2, o)') && !cache.includes('clip_rect(canvas, 0.0, 0.0, o->_scroll_rect'));
 
-  // 阶段二百八十一: the guard now also covers an EXPLICIT cacheAsBitmap, so a
-  // cached subtree expires on content change the way AIR's does. It used to be
-  // driven by the setter alone (set cacheAsBitmap once, freeze forever), which
-  // is the meeting client's cacheAsBitmapAndMatrix() path.
+  // 阶段二百八十一: an EXPLICIT cacheAsBitmap expires on content change the way
+  // AIR's does -- not frozen at whatever it looked like when the setter ran (the
+  // meeting client's cacheAsBitmapAndMatrix() path).
   //
-  // 阶段二百八十二: the branch also carries an `ASC_BAKE_TRACE` `bake_drop` line
-  // now, so the guard and the two clears are matched as one slice instead of one
-  // literal run (a trace has to be able to say WHERE a frozen bake lives).
-  const guardAt = c.indexOf('if (o->_auto_baked || o->_cache_flag) {');
+  // RepaintBoundary stage B switch: that invalidation is now WRITE-driven. The
+  // fingerprint walk (as_render_fp) no longer drops the bake; the cache branch in
+  // as_render_object consumes _render_dirty instead -- an explicit cacheAsBitmap
+  // re-bakes this frame, an auto-bake tears the boundary down and falls through
+  // to the live filters/content path.
+  const guardAt = c.indexOf('int use_cache = 0;');
   const guard = guardAt < 0 ? '' : c.slice(guardAt, guardAt + 800);
-  check('a moved fingerprint drops the bake',
-    guardAt >= 0 && guard.includes('o->_auto_baked = 0; o->_cache_valid = 0;'));
-  check('...including an explicit cacheAsBitmap, not just an auto-bake',
-    guardAt >= 0 && (guard.match(/o->_auto_baked = 0; o->_cache_valid = 0;/g) || []).length === 1);
+  check('a render-input write drops the bake via _render_dirty (not the fingerprint)',
+    guardAt >= 0
+    && guard.includes('o->_render_dirty = 0;')
+    && guard.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
+    && guard.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+  check('the fingerprint walk no longer drops the bake (diagnostic only)',
+    !fp.includes('o->_auto_baked = 0; o->_cache_valid = 0;'));
 
   // 阶段二百八十一: BitmapData identity. Without it a Bitmap whose bitmapData is
   // swapped to another bitmap built the same way hashes identically (image ==
@@ -1429,10 +1433,10 @@ function checkScrollRectBakeInvalidation(): string[] {
   check('...and before the source transform is zeroed for the raster, so both paths hash the same fields',
     draw.indexOf('as_render_fp(sdo);') >= 0
     && draw.indexOf('as_render_fp(sdo);') < draw.indexOf('sdo->x = 0.0;'));
-  check('...and the path is flagged so ASC_BAKE_TRACE can tell draw from the window pass',
+  check('...and the draw path is flagged (ASC_draw_path) for future trace use',
     c.includes('static int ASC_draw_path = 0;') && draw.includes('ASC_draw_path = 1;'));
-  check('...with a bake_drop trace line naming the path',
-    fp.includes('bake_drop') && fp.includes('ASC_draw_path'));
+  // RepaintBoundary stage B switch: the fingerprint no longer emits a bake_drop
+  // trace (invalidation is write-driven, not fingerprint-driven).
 
   console.log(`[scrollrectbake] ${ok} scrollRect bake-invalidation checks passed`);
   return bad;
@@ -2604,7 +2608,11 @@ function checkRepaintBoundary(): string[] {
   check('as_mark_dirty is forward-declared for user-code call sites',
     emitted.includes('static void as_mark_dirty(DisplayObject* o);'));
   check('the cache branch re-bakes on _render_dirty',
-    emitted.includes('if (o->_render_dirty) { o->_render_dirty = 0; o->_cache_valid = 0; }'));
+    emitted.includes('int use_cache = 0;')
+    && emitted.includes('if (o->_render_dirty) {')
+    && emitted.includes('o->_render_dirty = 0;')
+    && emitted.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
+    && emitted.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
   check('the field-write tail appends as_mark_dirty after a render-input store',
     emitSource.includes('as_mark_dirty((DisplayObject*)${doDirtyRecv})'));
   check('the render-input set lists the nine plain geometry/colour fields',
