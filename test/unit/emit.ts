@@ -446,9 +446,9 @@ function checkEmitDynamicSlotCoercion(): string[] {
 
   // 4. A dynamic write into a typed FIELD (vtable reflection) coerces.
   check('as_dyn_set writes a double field with as_v_to_number',
-    pre.includes('case 1: *(double*)(base + props[i].offset) = as_v_to_number(v); return;'));
+    pre.includes('case 1: *(double*)(base + props[i].offset) = as_v_to_number(v);'));
   check('as_dyn_set writes a bool field with as_v_truthy',
-    pre.includes('case 2: *(bool*)(base + props[i].offset) = as_v_truthy(v); return;'));
+    pre.includes('case 2: *(bool*)(base + props[i].offset) = as_v_truthy(v);'));
   check('as_dyn_set writes an int field with as_v_to_int',
     pre.includes('case 4: *(int*)(base + props[i].offset) = as_v_to_int(v); return;'));
   check('as_dyn_set writes a uint field with as_v_to_uint',
@@ -1743,7 +1743,8 @@ function checkRuntimeDynSetAccessorFirst(): string[] {
   check('a setter hit invokes the accessor and returns at once',
     /if \(strcmp\(setters\[i\]\.name, key\) == 0\) \{ setters\[i\]\.fn\(obj, &v, 1\); return; \}/.test(body));
   check('a field hit still returns after the coercing store (accessor is not re-scanned)',
-    body.indexOf('props[i].name') >= 0 && body.indexOf('as_v_to_number(v); return;') > propScan);
+    body.indexOf('props[i].name') >= 0 && body.indexOf('as_v_to_number(v);') > propScan
+    && body.indexOf('return;', body.indexOf('as_v_to_number(v);')) > body.indexOf('as_v_to_number(v);'));
 
   // 2. 只有一处 setter 调用点：修前的实现是「先遍历所有层查字段，循环外再查一遍
   //    setter」，那等于让**远端层**的字段压过**近端层**的访问器，也会漏掉副作用。

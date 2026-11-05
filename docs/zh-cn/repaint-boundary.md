@@ -160,6 +160,13 @@ double _dirty_l, _dirty_t, _dirty_r, _dirty_b;  // 失效矩形（对象自身�
 3. **间接输入**：`BitmapData` 的写（已有 `_px_ver` 版本计数器，可把它读作「脏」，见 §4.5）、
    `Matrix`/`ColorTransform` 字段写（`transform.matrix` / `transform.colorTransform` 的逐字段 setter）、
    SWC 时间轴帧切换。
+4. **动态字段写（`as_dyn_set`）**：`obj[key] = v` 走 vtable 反射，对 DisplayObject 的渲染输入字段
+   （`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground/transform`）是**直接写字段**
+   （`case 1/2/3/7/11`），既不走 accessor setter，也不走 emitAssign 字段写尾——Starling Juggler tween 就是
+   通过 Object 类型 target 驱动 alpha 的，这是真机最后一批 `DIRTY_MISS` 的根因。修复：RUNTIME_PREAMBLE 声明
+   `as_disp_dirty_hook`，`as_dyn_set` 在 case 1/2/3/7/11 字段写后触发；render preamble 的
+   `as_disp_dirty_impl` 用 `as_is(obj,&DisplayObject_vt)` 判定接收者后 `as_mark_dirty`，`main` 里
+   `as_disp_dirty_wire()` 安装。钩子用 `as_is` 判定，避免对 DropShadowFilter 等同名 `alpha` 字段误标脏。
 
 **关键工程约束**：脏标记必须覆盖**全部**写点。漏一处 = 该对象永不失效 = 边界缓存冻结（和现有「指纹漏算 →
 画面冻结」是同一类 bug，`skia.md` §6.10/§6.14 里已有多处实测教训）。这是阶段 B 最大的工作量，也是最大的
@@ -229,8 +236,9 @@ if (边界 && 命中快照) {
 
 > **实施状态（阶段三百六十七）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
 > 帧、Graphics、Transform、Bitmap/BitmapData 反向引用、TextField、Stage）+ 7 类运行时内部状态（焦点、选择/caret、
-> IME 组合、caret 闪烁、filter 字段、Stage3D、SimpleButton hover）+ 修复 `as_mark_dirty` 短路 bug（第二/三轮复验）。
-> 指纹兑底仍在（并行阶段）。切换未做——见 TODO.md 阶段三百六十七的「如实报明」。
+> IME 组合、caret 闪烁、filter 字段、Stage3D、SimpleButton hover）+ 动态字段写（`as_dyn_set`）钩子标脏，并修复
+> `as_mark_dirty` 短路 bug、autoSize 漏标脏、嵌套 cacheAsBitmap 不穿透、动态字段写漏标脏（第二~五轮复验）。
+> 指纹兑底仍在（并行阶段）。真机 `DIRTY_MISS` 已清零。切换未做——见 TODO.md 阶段三百六十七的「如实报明」。
 
 - [x] `DisplayObject` 增 `_render_dirty` 字段与 `as_is_boundary` 判定（§4.2）。
 - [x] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
@@ -238,7 +246,7 @@ if (边界 && 命中快照) {
       `width`/`height`/`scale9Grid`/`filters`/`mask`/`scrollRect`/`cacheAsBitmap` accessor、`addChild`/`removeChild`
       结构、`MovieClip` 帧推进、`Graphics` 绘制命令（经 `_owner`）、`Transform.matrix/colorTransform`（经 `_owner`）、
       `Bitmap.bitmapData`/`smoothing`、`BitmapData` 13 个 mutator（经 `_refs` 反向引用）、`TextField` 文本/格式/颜色/滚动
-      写点、`Stage.color/align/scaleMode`。
+      写点、`Stage.color/align/scaleMode`、动态字段写（`as_dyn_set` → `as_disp_dirty_hook`）。
 - [x] `as_render_object` 缓存分支改为「脏则重烘、不脏则 blit」，去静置延迟（§4.4 阶段 B）。
       （当前与指纹掉烘并存：脏则清脏 + `_cache_valid=0` 当帧重烘，指纹兑底发现漏点。）
 - [~] `_render_dirty` 复位（§4.4）—— 实现为**消费时清脏**（缓存分支重烘前清），非帧末统一复位。
@@ -246,7 +254,9 @@ if (边界 && 命中快照) {
       探针已就位（`ASC_DIRTY_TRACE` + `DIRTY_MISS`：掉烘时指纹变而 `_render_dirty==0` 即报漏写点）。
       首轮跑出**大量 `DIRTY_MISS`**，定位「指纹输入 ≠ AS3 写点」，补齐 7 类内部状态写点；第二轮复验仍未清零，
       进一步定位 `as_mark_dirty` 的 `!o->_render_dirty` 短路 bug（非边界子对象跨帧保持脏、祖先边界同帧被清，
-      下一帧冒泡被跳过），改为全链冒泡。第三轮复验待窗口环境执行。
+      下一帧冒泡被跳过），改为全链冒泡；第三轮复验定位 autoSize 漏标脏；第四轮（dump 子树）定位嵌套
+      cacheAsBitmap 标脏不穿透；第五轮（dump 增强到全指纹字段）定位 Starling Juggler 动态写 alpha 漏标脏，
+      加 `as_disp_dirty_hook` 钩子后真机 `DIRTY_MISS` 清零。
 - **验收**：
   - `temp/` 探针：`x` 连写两次 → 第二次（写时脏已置）当帧重烘，无静置 3 帧延迟（`ASC_BAKE_TRACE` 时间戳）。
   - 单件绘制斜率不再因「掉烘空转」而抖动（§6.14 的 hover 场景 A/B）。

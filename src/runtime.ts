@@ -2165,6 +2165,17 @@ static void (*as_vec_set_hook)(void* ptr, const char* key, as_value v) = NULL;
 static bool (*as_vec_has_hook)(void* ptr, const char* key) = NULL;
 static as_value (*as_vec_call_hook)(void* ptr, const char* name, as_value* args, int argc) = NULL;
 
+// DisplayObject render-dirty hook: a DYNAMIC write (obj[key] = v) into a
+// DisplayObject field -- x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/
+// opaqueBackground/transform -- bypasses the emitAssign dirty write point, so
+// as_dyn_set calls this hook after a plain field store and the generated
+// as_disp_dirty_wire() installs the impl (which marks the DisplayObject dirty).
+// Starling's Juggler tween drives alpha/x/y through an Object-typed target, so
+// this is the only way those writes reach as_mark_dirty. Kept as a hook (like
+// as_vec_*_hook) because the impl lives in the render preamble, where
+// DisplayObject_vt is finally defined.
+static void (*as_disp_dirty_hook)(void* obj) = NULL;
+
 // ByteArray's index form (stage 102). ByteArray is a SEALED class, so an any-typed
 // receiver would normally hit the property tables and end in #1069/#1056, but AIR
 // gives ByteArray an array-access form on both paths -- measured on adl 51.4.1
@@ -6232,9 +6243,9 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
                         // (the raw unboxers read .num, which is 0 for a String
                         // tag -- adl 51.4.1, temp/pkgA/coerce2.body.as:
                         // dyn.tabIndex = "7" stores 7).
-                        case 1: *(double*)(base + props[i].offset) = as_v_to_number(v); return;
-                        case 2: *(bool*)(base + props[i].offset) = as_v_truthy(v); return;
-                        case 3: *(char**)(base + props[i].offset) = as_coerce_str(v); gc_write_barrier((void*)*(char**)(base + props[i].offset)); return;
+                        case 1: *(double*)(base + props[i].offset) = as_v_to_number(v); if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj); return;
+                        case 2: *(bool*)(base + props[i].offset) = as_v_truthy(v); if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj); return;
+                        case 3: *(char**)(base + props[i].offset) = as_coerce_str(v); gc_write_barrier((void*)*(char**)(base + props[i].offset)); if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj); return;
                         // 13: DisplayObject.name -- same string storage, but AIR
                         // validates it against null/undefined (TypeError #2007)
                         // instead of storing null (adl 51.4.1,
@@ -6251,9 +6262,9 @@ static void as_dyn_set(void* obj, const char* key, as_value v) {
                         // double) into the pointer slot -- a wild pointer that
                         // later reads and gc_scan would walk.
                         case 10: { void* p = as_v_req_array(v, "Array"); *(void**)(base + props[i].offset) = p; gc_write_barrier(p); return; }
-                        case 11: { void* p = as_v_req_inst(v, props[i].vt, props[i].fqn); *(void**)(base + props[i].offset) = p; gc_write_barrier(p); return; }
+                        case 11: { void* p = as_v_req_inst(v, props[i].vt, props[i].fqn); *(void**)(base + props[i].offset) = p; gc_write_barrier(p); if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj); return; }
                         case 12: { void* p = as_value_to_obj(v); *(void**)(base + props[i].offset) = p; gc_write_barrier(p); return; }
-                        case 7: *(as_value*)(base + props[i].offset) = v; gc_write_barrier_value(v); return;
+                        case 7: *(as_value*)(base + props[i].offset) = v; gc_write_barrier_value(v); if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj); return;
                         // 64-bit enhancement fields: the incoming boxed value
                         // COERCES (a String parses, a Number truncates) and no
                         // write barrier is needed -- an int64 field holds no

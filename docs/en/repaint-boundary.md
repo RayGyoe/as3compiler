@@ -178,6 +178,14 @@ Three categories of write points (list sourced from `as_render_fp`'s field enume
 3. **Indirect inputs**: `BitmapData` writes (already have the `_px_ver` version counter, which can be read as
    "dirty", §4.5), `Matrix`/`ColorTransform` field writes (`transform.matrix`/`transform.colorTransform` per-field
    setters), SWC timeline frame switches.
+4. **Dynamic field writes (`as_dyn_set`)**: `obj[key] = v` goes through vtable reflection, and for DisplayObject's
+   render-input fields (`x/y/rotation/scaleX/scaleY/alpha/visible/blendMode/opaqueBackground/transform`) it is a
+   **plain field store** (`case 1/2/3/7/11`) that bypasses both the accessor setter and the emitAssign write tail —
+   Starling's Juggler tween drives alpha this way through an Object-typed target, which was the root cause of the
+   final `DIRTY_MISS` on the real app. Fix: RUNTIME_PREAMBLE declares `as_disp_dirty_hook`; `as_dyn_set` fires it
+   after a case 1/2/3/7/11 store; the render preamble's `as_disp_dirty_impl` checks `as_is(obj,&DisplayObject_vt)`
+   then `as_mark_dirty`s, and `main` installs it via `as_disp_dirty_wire()`. The `as_is` guard avoids wrongly
+   marking same-named fields like `DropShadowFilter.alpha`.
 
 **Key engineering constraint**: dirty marking must cover **all** write points. One miss = that object never
 invalidates = boundary cache freezes (same bug class as "fingerprint miss → frozen frame"; `skia.md`
@@ -256,9 +264,10 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 > **Implementation status (stage three-sixty-seven)**: write points now cover every render input (DisplayObject
 > fields/accessors, container structure, MovieClip frames, Graphics, Transform, Bitmap/BitmapData reverse edges,
 > TextField, Stage) plus seven runtime-internal states (focus, selection/caret, IME composition, caret blink,
-> filter fields, Stage3D, SimpleButton hover) plus the `as_mark_dirty` short-circuit bug fix (second/third re-run).
-> The fingerprint fallback is still present (parallel phase). The switch is not yet done — see TODO.md stage
-> three-sixty-seven.
+> filter fields, Stage3D, SimpleButton hover) plus dynamic field writes (`as_dyn_set` hook), and fixes for the
+> `as_mark_dirty` short-circuit bug, autoSize missed marking, nested-cacheAsBitmap non-bubbling, and dynamic
+> field-write missed marking (second–fifth re-runs). The fingerprint fallback is still present (parallel phase);
+> real-app `DIRTY_MISS` is now zero. The switch is not yet done — see TODO.md stage three-sixty-seven.
 
 - [x] Add `_render_dirty` field and `as_is_boundary` predicate to `DisplayObject` (§4.2).
 - [x] Following `as_render_fp`'s field list, inject `as_mark_dirty(o)` + upward propagation into every render-input
@@ -266,7 +275,8 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
   `opaqueBackground`) + `width`/`height`/`scale9Grid`/`filters`/`mask`/`scrollRect`/`cacheAsBitmap` accessors,
   `addChild`/`removeChild` structure, `MovieClip` frame advance, `Graphics` draw commands (via `_owner`),
   `Transform.matrix/colorTransform` (via `_owner`), `Bitmap.bitmapData`/`smoothing`, `BitmapData`'s 13 mutators
-  (via `_refs` reverse edges), `TextField` text/format/colour/scroll write points, and `Stage.color/align/scaleMode`.
+  (via `_refs` reverse edges), `TextField` text/format/colour/scroll write points, `Stage.color/align/scaleMode`,
+  and dynamic field writes (`as_dyn_set` → `as_disp_dirty_hook`).
 - [x] Change `as_render_object`'s cache branch to "re-bake if dirty, else blit", removing the sit-still latency
   (§4.4 stage B). (Currently coexists with the fingerprint drop: dirty → clear + `_cache_valid=0` same-frame re-bake;
   the fingerprint fallback catches any missed write point.)
@@ -278,7 +288,10 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
   them as "fingerprint inputs ≠ AS3 write points" — seven runtime-internal-state write points were then added; the
   second re-run still reported misses, further located as the `as_mark_dirty` `!o->_render_dirty` short-circuit bug
   (a non-boundary child stays dirty across frames while an ancestor boundary is cleared that frame, so the next
-  frame's bubble is skipped) — now fixed to walk the full chain. The third re-run still needs a windowed Skia run.
+  frame's bubble is skipped) — now fixed to walk the full chain; the third re-run located the autoSize missed mark;
+  the fourth (subtree dump) located nested cacheAsBitmap non-bubbling; the fifth (dump enhanced to all fingerprint
+  fields) located Starling Juggler's dynamic alpha write — fixed via `as_disp_dirty_hook`, after which real-app
+  `DIRTY_MISS` is zero.
 - **Acceptance**:
   - `temp/` probe: writing `x` twice → second write (dirty already set) re-bakes same frame, no 3-frame sit-still
     (via `ASC_BAKE_TRACE` timestamps).

@@ -19518,7 +19518,7 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
 （关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
-### 阶段三百六十七：RepaintBoundary 等价性验证 —— 补齐运行时内部状态漏写点（v0.4.329 → v0.4.330）
+### 阶段三百六十七：RepaintBoundary 等价性验证 —— 补齐运行时内部状态与动态字段写漏写点（v0.4.329 → v0.4.331）
 
 **起点**：阶段三百六十六声称「写点已覆盖全部渲染输入」，但 TalkMED Meeting 真机跑 `ASC_DIRTY_TRACE=1` 暴露
 **大量 `DIRTY_MISS`**（指纹变而 `_render_dirty==0`）。根因：`as_render_fp` 的指纹输入不止「AS3 写点」，还包括
@@ -19556,16 +19556,27 @@ filter 字段。这些不是 AS3 字段写/accessor，不能靠 `emitAssign` 覆
     的 Sprite 在两次 dump 里都 `dirty=1`，其余子对象 dirty 已清）。改为 `as_mark_dirty` **一直冒泡到根**
     （去掉 `if (o->_cache_flag) break`）：非边界祖先的 flag 无人消费，穿透是安全的；嵌套 cacheAsBitmap 的
     父层快照了子层位图，子层重烘后父层必须重烘，穿透才是正确失效传播。
+11. **动态字段写漏标脏（第五轮复验定位，根本性）**：日期弹窗 `Sprite cache=1` 每帧 `DIRTY_MISS` 不清零，
+    增强 `as_dirty_dump`（打印几何/矩阵/Graphics 路径代/滤镜数/TextField 默认 TextFormat/BitmapData uid）后，
+    两次 dump 唯一差异是根 Sprite 的 `alpha` 每帧变（淡入动画）。根因：TalkMED 用 Starling Juggler tween 驱动
+    alpha，它通过 Object 类型 target 走 `as_dyn_set`（`obj["alpha"]=v`）动态写 `DisplayObject.alpha` 字段，
+    而非 `emitAssign` 字段写尾；`as_dyn_set` 的 props 字段写 switch（case 1 直接写 double 字段）从不标脏，
+    绕过全部写点。修复：RUNTIME_PREAMBLE 加 `as_disp_dirty_hook` 钩子，`as_dyn_set` 在 case 1/2/3/7/11
+    字段写后触发；render preamble 加 `as_disp_dirty_impl`（`as_is(obj,&DisplayObject_vt)` 则标脏）+
+    `as_disp_dirty_wire`，main 里安装。钩子用 `as_is` 判定接收者是 DisplayObject，避免 DropShadowFilter 等
+    同名 `alpha` 字段误标脏。真机复验：日期弹窗 `DIRTY_MISS` 清零。
 
 **验收**：
 - 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
-- `unit: render/RepaintBoundary` 由 25 钉扩展到 **37 钉**（新增 7 类内部状态 + 等价性探针 + 全链冒泡钉子 +
-  autoSize 标脏钉子 + 嵌套 cacheAsBitmap 穿透钉子）。
-- 同步放宽 `text-input/Caret` 的 `as_tf_extend_caret` 正则（520→800 字符，函数体因标脏变长）。
+- `unit: render/RepaintBoundary` 由 25 钉扩展到 **39 钉**（新增 7 类内部状态 + 等价性探针 + 全链冒泡钉子 +
+  autoSize 标脏钉子 + 嵌套 cacheAsBitmap 穿透钉子 + dump 全字段打印钉子 + 动态字段写钩子钉子）。
+- 同步放宽 `text-input/Caret` 的 `as_tf_extend_caret` 正则（520→800 字符，函数体因标脏变长）；
+  同步修正 `runtime/DynSetAccessorFirst` 与 `runtime/DynSetCoercion` 对 as_dyn_set case 1/2 结构变化（钩子调用）。
 
 **如实报明**：仍是**并行阶段**，指纹兜底完整保留。第二轮复验定位 `as_mark_dirty` 短路 bug，第三轮复验定位
-autoSize 漏标脏，第四轮（dump 子树字段 `txt/runs/fw/fh/as`）定位嵌套 cacheAsBitmap 标脏不穿透，均已修复。
-下一步仍待真机复验确认 `DIRTY_MISS` 清零；阶段 B 切换与阶段 C 仍未开始。
+autoSize 漏标脏，第四轮（dump 子树字段 `txt/runs/fw/fh/as`）定位嵌套 cacheAsBitmap 标脏不穿透，第五轮
+（dump 增强到全指纹字段）定位 Starling Juggler 动态写 alpha 漏标脏，均已修复。真机复验 `DIRTY_MISS` 已清零；
+阶段 B 切换与阶段 C 仍未开始。
 
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 

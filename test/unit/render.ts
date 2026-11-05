@@ -2587,6 +2587,7 @@ function checkRepaintBoundary(): string[] {
 
   const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
   const symSource = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const runtimeSource = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
 
   check('DisplayObject struct declares the _render_dirty field', emitted.includes('int _render_dirty;'));
@@ -2657,6 +2658,18 @@ function checkRepaintBoundary(): string[] {
     emitted.includes('static int ASC_dirty_trace = -1;')
     && emitted.includes('getenv("ASC_DIRTY_TRACE")')
     && emitted.includes('DIRTY_MISS'));
+  check('dirty-miss dump prints every fingerprint input (geometry/matrix/Graphics/filter/TextField fmt/BitmapData)',
+    emitted.includes('x=%.3g y=%.3g a=%.3g v=%d s=%.3g,%.3g r=%.3g bm=%p gp=%u fl=%d')
+    && emitted.includes('m=%.3g,%.3g,%.3g,%.3g,%.3g,%.3g')
+    && emitted.includes('dtf=%p ds=%.3g dc=%.0f insf=%p is=%.3g ic=%.0f')
+    && emitted.includes('bdu=%u bdsm=%d'));
+  check('dynamic field write (as_dyn_set) marks DisplayObject render-dirty via the disp hook',
+    runtimeSource.includes('static void (*as_disp_dirty_hook)(void* obj) = NULL;')
+    && runtimeSource.includes('if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj);')
+    && emitted.includes('static void as_disp_dirty_impl(void* obj) {')
+    && emitted.includes('if (as_is(obj, &DisplayObject_vt)) as_mark_dirty((DisplayObject*)obj);')
+    && emitted.includes('as_disp_dirty_hook = as_disp_dirty_impl;')
+    && emitted.includes('as_disp_dirty_wire();'));
 
   // ---- Stage B write points: runtime internal state (焦点/IME/caret/hover) ----
   check('focus change marks both ends render-dirty',

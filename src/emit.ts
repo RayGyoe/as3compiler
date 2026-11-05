@@ -29195,6 +29195,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
+    // Dynamic-write render-dirty hook (installed by as_disp_dirty_wire below, see
+    // the as_disp_dirty_hook declaration in RUNTIME_PREAMBLE). as_dyn_set fires it
+    // after a plain field store into a DisplayObject render-input field; here the
+    // receiver is finally known to be a DisplayObject (DisplayObject_vt is in
+    // scope), so we mark it dirty. This closes the last DIRTY_MISS source on the
+    // real app: Starling's Juggler tween drives alpha through an Object-typed
+    // target, reaching as_dyn_set instead of the emitAssign field-write point.
+    this.line('static void as_disp_dirty_impl(void* obj) {');
+    this.indent++;
+    this.line('if (as_is(obj, &DisplayObject_vt)) as_mark_dirty((DisplayObject*)obj);');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_disp_dirty_wire(void) {');
+    this.indent++;
+    this.line('as_disp_dirty_hook = as_disp_dirty_impl;');
+    this.indent--;
+    this.line('}');
     // ASC_DIRTY_TRACE diagnostic: dump the subtree of a cacheAsBitmap object that
     // reported DIRTY_MISS, so the changing leaf (playing MovieClip / live BitmapData /
     // blinking TextField) can be located. Depth/width-capped; only the first few
@@ -29207,16 +29224,35 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int ply = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->_playing : 0;');
     this.line('unsigned int pxv = (as_is(o, &Bitmap_vt) && ((Bitmap*)o)->bitmapData != NULL) ? ((Bitmap*)o)->bitmapData->_px_ver : 0u;');
     this.line('int fcs = (as_is(o, &TextField_vt) && as_focus_obj == o) ? 1 : 0;');
+    // Every fingerprint input that has no write point is printed here, so two
+    // consecutive dumps can be diffed to find the per-frame mover: geometry,
+    // matrix, Graphics path generation, filter count, TextField default format
+    // (TextFormat fields are NOT covered by a dirty write point), BitmapData
+    // version/uid. All were missing before, so a changing leaf whose txt/runs/fw
+    // stayed equal was invisible.
+    this.line('Matrix* fm = (o->transform != NULL) ? o->transform->matrix : NULL;');
+    this.line('Graphics* fg = as_graphics_of(o);');
+    this.line('unsigned gp = (fg != NULL && fg->path != NULL) ? as_skia_path_generation_id(fg->path) : 0u;');
+    this.line('int flen = (o->filters != NULL) ? o->filters->length : 0;');
+    this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d x=%.3g y=%.3g a=%.3g v=%d s=%.3g,%.3g r=%.3g bm=%p gp=%u fl=%d", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs, o->x, o->y, o->alpha, o->visible, o->scaleX, o->scaleY, o->rotation, (void*)o->blendMode, gp, flen);');
+    this.line('if (fm != NULL) fprintf(stderr, " m=%.3g,%.3g,%.3g,%.3g,%.3g,%.3g", fm->a, fm->b, fm->c, fm->d, fm->tx, fm->ty);');
     this.line('if (as_is(o, &TextField_vt)) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)o;');
-    this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d txt=%p runs=%p fw=%.6g fh=%.6g as=%s\\n", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs, (void*)tf->text, (void*)tf->_runs, tf->_fieldWidth, tf->_fieldHeight, tf->autoSize != NULL ? tf->autoSize : "-");');
+    this.line('double ds = (tf->_dtf != NULL) ? as_v_num_val(tf->_dtf->size) : 0.0;');
+    this.line('double dc = (tf->_dtf != NULL) ? as_v_num_val(tf->_dtf->color) : 0.0;');
+    this.line('double is = (tf->_insFmt != NULL) ? as_v_num_val(tf->_insFmt->size) : 0.0;');
+    this.line('double ic = (tf->_insFmt != NULL) ? as_v_num_val(tf->_insFmt->color) : 0.0;');
+    this.line('fprintf(stderr, " txt=%p runs=%p fw=%.6g fh=%.6g as=%s dtf=%p ds=%.3g dc=%.0f insf=%p is=%.3g ic=%.0f", (void*)tf->text, (void*)tf->_runs, tf->_fieldWidth, tf->_fieldHeight, tf->autoSize != NULL ? tf->autoSize : "-", (void*)tf->_dtf, ds, dc, (void*)tf->_insFmt, is, ic);');
     this.indent--;
-    this.line('} else {');
+    this.line('} else if (as_is(o, &Bitmap_vt)) {');
     this.indent++;
-    this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d\\n", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs);');
+    this.line('Bitmap* b = (Bitmap*)o;');
+    this.line('unsigned bdu = (b->bitmapData != NULL) ? b->bitmapData->_uid : 0u;');
+    this.line('fprintf(stderr, " bdu=%u bdsm=%d", bdu, b->smoothing);');
     this.indent--;
     this.line('}');
+    this.line('fprintf(stderr, "\\n");');
     this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
     this.indent++;
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
@@ -33452,6 +33488,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // ... and the `class X extends Array` backing-array hook (a `*` receiver's
     // elements/length/named properties).
     this.line('as_arrback_wire();');
+    // ... and the DisplayObject render-dirty hook for dynamic field writes (see
+    // as_disp_dirty_hook in RUNTIME_PREAMBLE and as_disp_dirty_impl above).
+    this.line('as_disp_dirty_wire();');
     // Static fields initialize lazily on first access (see emitStaticInits), so
     // main() only runs module-level variable initializers and top-level
     // statements; the demo bootstrap's static reads trigger each class's cinit.
