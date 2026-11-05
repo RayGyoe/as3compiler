@@ -58,6 +58,13 @@
 #include <string>
 #include <cstring> // strcmp: the AS3 BlendMode name -> SkBlendMode table
 #include <cmath>   // rint: the scrollRect window's ties-to-even quantization
+// YUV direct render (E20, --features yuv420): SkImages::TextureFromYUVAPixmaps
+// uploads I420 planes as a GPU texture. This Ganesh header is the only GPU-API
+// surface the file needs — the function takes an opaque GrRecordingContext*, so
+// it is backend-neutral (Metal / D3D12 / WGL / WebGL2 each feed it their own).
+#include "include/core/SkYUVAInfo.h"
+#include "include/core/SkYUVAPixmaps.h"
+#include "include/gpu/ganesh/SkImageGanesh.h"
 // E1 (opt-in, native-only): the SVG rasterizer needs the stream adapter and the
 // svg module. Both are guarded by ASC_USE_SVG -- see the forward declarations in
 // the bitmap/image section for why this is an opt-in enhancement.
@@ -513,6 +520,13 @@ static int sk_gr_init(void) {
   g_gr_context = GrDirectContexts::MakeGL(std::move(iface));
   return g_gr_context != nullptr ? 1 : 0;
 }
+
+// The process-wide WebGL2 GrDirectContext, exposed for YUV direct render
+// (BitmapData.setYuv420): the YUV path only needs a GrRecordingContext* to call
+// TextureFromYUVAPixmaps, so every GPU backend hands its context over through an
+// identically-shaped getter (sk_gr_get_context / sk_metal_get_context /
+// sk_d3d_get_context / sk_gl_get_context).
+void* sk_gr_get_context(void) { return g_gr_context.get(); }
 
 void* sk_surface_gpu_new(int width, int height) {
   // Size the canvas backing store BEFORE requesting the WebGL2 context: the GL
@@ -1381,6 +1395,31 @@ void* sk_image_from_argb(const void* px, int w, int h) {
   if (px == nullptr || w <= 0 || h <= 0) return nullptr;
   SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
   sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(SkPixmap(info, px, (size_t)w * 4));
+  return image.release();  // caller owns one ref (or NULL on failure)
+}
+
+// YUV direct render (E20, --features yuv420): turn a compact I420 plane triple
+// (Y | U | V, no row padding, total w*h*3/2 bytes) into a GPU texture whose
+// shader converts to RGB during draw. The conversion uses BT.601 limited (video)
+// range — Y in [16,235], U/V in [16,240] — the same range AIR's ANE video
+// pipeline feeds. Backend-neutral: it only needs a GrRecordingContext*, which
+// every GPU backend supplies through its own getter; the CPU raster backend has
+// no context and never calls this (the runtime warns + renders black instead).
+void* sk_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, int w, int h) {
+  if (ctx == nullptr || y == nullptr || u == nullptr || v == nullptr) return nullptr;
+  if (w <= 0 || h <= 0 || (w & 1) || (h & 1)) return nullptr;  // I420 needs even dims
+  SkYUVAInfo info(SkISize::Make(w, h),
+                  SkYUVAInfo::PlaneConfig::kY_U_V,
+                  SkYUVAInfo::Subsampling::k420,
+                  kRec601_Limited_SkYUVColorSpace);
+  SkPixmap planes[SkYUVAInfo::kMaxPlanes];
+  planes[0] = SkPixmap(SkImageInfo::Make(w, h, kGray_8_SkColorType, kOpaque_SkAlphaType), y, (size_t)w);
+  planes[1] = SkPixmap(SkImageInfo::Make(w / 2, h / 2, kGray_8_SkColorType, kOpaque_SkAlphaType), u, (size_t)(w / 2));
+  planes[2] = SkPixmap(SkImageInfo::Make(w / 2, h / 2, kGray_8_SkColorType, kOpaque_SkAlphaType), v, (size_t)(w / 2));
+  SkYUVAPixmaps pixmaps = SkYUVAPixmaps::FromExternalPixmaps(info, planes);
+  if (!pixmaps.isValid()) return nullptr;
+  auto image = SkImages::TextureFromYUVAPixmaps(
+      static_cast<GrRecordingContext*>(ctx), pixmaps);
   return image.release();  // caller owns one ref (or NULL on failure)
 }
 

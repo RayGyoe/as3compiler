@@ -2247,7 +2247,7 @@ function checkRuntimeUnwindStackPerThread(): string[] {
     pre.includes('AS3 out of memory: exception stack') && pre.includes('exit(1);'));
   check('as_jmp_pop cannot go negative', pre.includes('if (as_jmp_depth > 0) as_jmp_depth--;'));
   check('throw still unwinds to the innermost frame',
-    (pre.match(/longjmp\(\*as_jmp_stack\[as_jmp_depth - 1\], 1\);/g) || []).length === 2);
+    (pre.match(/AS_LONGJMP\(\*as_jmp_stack\[as_jmp_depth - 1\], 1\);/g) || []).length === 2);
 
   // 4. The rest of the unwinding state -- the frame-boundary guard and the
   //    pending throw -- is per-thread for the same reason: a worker thread must
@@ -2573,7 +2573,7 @@ function checkEntryPointRecovery(): string[] {
     check(`${name} is the function the glue is handed`, body !== '');
     check(`${name}: plants the recovery buffer in its own frame`,
       body.includes('int planted = (as_frame_guard == 0);')
-      && body.includes('if (planted && setjmp(as_frame_jmp) != 0)'));
+      && body.includes('if (planted && AS_SETJMP(as_frame_jmp) != 0)'));
     check(`${name}: takes the guard`, body.includes('as_frame_guard = 1;'));
     check(`${name}: still runs the dispatch itself`, body.includes(dispatch));
     // Every return must release the guard: either the recovery line itself, or an
@@ -3399,7 +3399,10 @@ function checkEmitFreeFunctionNameReservation(): string[] {
   // cannot fix them — the preamble's `#undef` block does. Pinned at source level
   // because the block is `#if defined(_WIN32)`-guarded and this suite runs on
   // macOS; `examples/ident-free-fn.as` carries the runtime half on Windows.
-  const undef = /#if defined\(_WIN32\)([\s\S]*?)#endif/.exec(RUNTIME_PREAMBLE);
+  // The guard must be `_WIN32` ALONE: a combined guard (`#if defined(_WIN32) ||
+  // defined(__wasi__)`) is a different block, and matching it by prefix picked up
+  // whichever such block came first in the preamble.
+  const undef = /#if defined\(_WIN32\)[ \t]*\r?\n([\s\S]*?)#endif/.exec(RUNTIME_PREAMBLE);
   const block = undef ? undef[1] : '';
   check('the preamble has a _WIN32 #undef block for object-like host macros', block.includes('#undef _timezone'));
   check('it covers the measured `small` case', block.includes('#undef small'));
@@ -4669,5 +4672,68 @@ function checkWithClosureCapture(): string[] {
   return bad;
 }
 registerGroup('unit: emit/WithClosureCapture', checkWithClosureCapture);
+
+// E20 / 阶段三百七十四: BitmapData.setYuv420 (--features yuv420). The method is
+// an AIR-superset enhancement, so the pins are two-sided: a default build must not
+// carry the member (its absence is what keeps the symbol surface AIR-identical),
+// and a `yuv420` build must carry the whole read->store->render chain without
+// leaking it back into the default artifact.
+function checkEmitYuv420(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [yuv420] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [yuv420] ${label}`); }
+  };
+
+  const srcCall = `
+    class Y {
+      function f():void {
+        var bd:BitmapData = new BitmapData(4, 4, false, 0);
+        var ba:ByteArray = new ByteArray();
+        bd.setYuv420(new Rectangle(0, 0, 4, 4), ba);
+      }
+    }
+  `;
+  const srcPlain = 'class Y { function f():void { var bd:BitmapData = new BitmapData(4, 4, false, 0); } }';
+  const gen = (features: readonly string[]): string =>
+    generateC(parse(srcPlain), [], [], undefined, [], undefined, undefined, [], features).c;
+
+  // (1) DEFAULT: the member must not exist (AIR's BitmapData has no setYuv420).
+  check('a default build rejects setYuv420 as no-member', (() => {
+    try { generateC(parse(srcCall)); return false; }
+    catch (e) { return String(e).includes('setYuv420'); }
+  })());
+  const plain = gen([]);
+  check('the internal _yuv_data field exists in every build', plain.includes('_yuv_data'));
+  check('a default build emits no BitmapData_setYuv420 body', !plain.includes('BitmapData_setYuv420'));
+  check('a default build emits no YUV render branch in as_bmd_live_image',
+    !plain.includes('if (bd->_yuv_data != NULL) {'));
+
+  // (2) FEATURE ON: the member, its storage and the render branch all appear.
+  const on = generateC(parse(srcCall), [], [], undefined, [], undefined, undefined, [], ['yuv420']).c;
+  check('--features yuv420 emits the BitmapData_setYuv420 body',
+    on.includes('void BitmapData_setYuv420(void* _this, Rectangle* rect, ByteArray* ba) {'));
+  check('the body refuses a partial rect (I420 planes are full-frame only)',
+    on.includes('Error #2004: BitmapData.setYuv420 only supports a rect covering the whole bitmap.'));
+  check('the body refuses odd dimensions (I420 needs even w/h)',
+    on.includes('(bd->width & 1) || (bd->height & 1)'));
+  check('a short buffer keeps the copied bytes and throws EOFError #2030',
+    on.includes('as_throw_eof()') && on.includes('ba->position += (int)avail'));
+  check('the YUV planes are written as one compact w*h*3/2 buffer',
+    on.includes('bd->width * (long long)bd->height * 3LL / 2LL'));
+  check('as_bmd_live_image checks _yuv_data before the ARGB path',
+    on.includes('if (bd->_yuv_data != NULL) {'));
+  check('the YUV branch asks the active GPU backend for a context',
+    on.includes('void* ctx = as_skia_gr_context();'));
+  check('...and warns once + renders black when there is none',
+    on.includes('as_yuv_cpu_warn()'));
+  check('the three planes are handed to the glue as Y / U / V offsets',
+    on.includes('as_skia_image_from_yuv(ctx, bd->_yuv_data,'));
+
+  console.log(`     [yuv420] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/Yuv420', checkEmitYuv420);
 
 

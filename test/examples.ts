@@ -331,6 +331,19 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // E6 native shader passthrough: the feature switch plus the manifest that links
   // vendor/shader_compiler.cc and the two cross-compilers.
   'native-shader-probe.as': ['--features', 'native-shader', '--manifest', join(dir, 'native-shader-probe.build.json')],
+  // E20 setYuv420: the method only exists under the switch, so the probe names it.
+  // It asserts the byte-read contract (cursor / short-buffer #2030 / odd-size #2004 /
+  // partial-rect #2004 / no-overlap) which is pure CPU and runs headless; the GPU
+  // direct-render half is covered by yuv420.build.json (Skia) rather than this unit.
+  'yuv420-probe.as': ['--features', 'yuv420'],
+  // E20 setYuv420 render side: the same switch + the Skia raster manifest. The
+  // probe above pins the byte-read contract headless; this one proves the Skia
+  // link (sk_image_from_yuv / TextureFromYUVAPixmaps) and the CPU backend's
+  // loud-black fallback — draw is red before setYuv420 and black after, which a
+  // pure-C build cannot produce (its draw is a no-op, so the positive control
+  // fails). GPU direct render is manual (--air-app + renderMode=gpu), see
+  // docs/zh-cn/yuv-direct-render.md.
+  'yuv420-render.as': ['--features', 'yuv420', '--manifest', join(dir, 'yuv420.build.json')],
   // [Embed]: an embedded image is decoded through Skia and an embedded mp3 through
   // the audio seam, so the example links both backends. It is about the AS3
   // contract of the generated classes (Kind, Class-value identity, decoded
@@ -628,6 +641,48 @@ async function runExample(label: string, args: string[], out: string, env?: Reco
 // e.g. `node --test --test-name-pattern=dyn-prop test/examples.ts`. The wrapper
 // suite only adds a `describe` level to the report; the case names are unchanged,
 // so `--test-name-pattern` still matches them directly.
+
+// Examples whose AS3 code uses a FIXED path under the user's home directory as
+// scratch space, so two of them running at once fight over the same directory.
+//
+// Measured 2026-11-05 in a full `node test.ts` at jobs=8: `file-ops.as` died with
+// `Uncaught exception: Error #3003: File or directory does not exist.` because it
+// starts with `if (work.exists) work.deleteDirectory(true); work.createDirectory();`
+// on `~/work` while `file-listing-async.as` (which also resolves `~/work`) was
+// reading it. It passes on its own and in the three-file group; only the full
+// suite's interleaving hits it -- the classic flake, now with a named cause.
+//
+// They are NOT made unique per run: the examples double as adl-oracle transcripts
+// whose paths are part of the measured behaviour. They get their own serial lane
+// instead, which is also the right home for any future example that touches host
+// state outside temp/regress-out.
+const HOST_STATE_FILES = new Set([
+  'file-ops.as',
+  'file-listing-async.as',
+  'file-symlink.as',
+  // move-to-trash.as creates a uniquely named dir but then trashes files under
+  // ~/.Trash, which a concurrent trash-listing example could observe mid-flight.
+  'move-to-trash.as',
+]);
+
+function registerFileExample(name: string): void {
+  const required = EXAMPLE_REQUIRES[name];
+  const out = scratchOut(name);
+  test(`example: ${name}`, async (t) => {
+    if (SYMLINK_NEEDS_FIXTURE.has(name) && symlinkSkipReason !== null) {
+      console.log(`SKIP  ${name} (${symlinkSkipReason})`);
+      t.skip(symlinkSkipReason);
+      return;
+    }
+    if (required && !existsSync(required)) {
+      console.log(`SKIP  ${name} (needs ${resolve(required)}, not present)`);
+      t.skip(`needs ${resolve(required)}, not present`);
+      return;
+    }
+    await runExample(name, [join(dir, name), ...(EXAMPLE_ARGS[name] ?? [])], out, EXAMPLE_ENV[name]);
+  });
+}
+
 describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
   for (const e of entries) {
     if (SKIP_DIRS.has(e.name)) continue;
@@ -672,22 +727,19 @@ describe(`examples (jobs=${JOBS})`, { concurrency: JOBS }, () => {
           `[no-src-litter] ${e.name}/ wrote into its own source dir: ${after.filter((n) => !before.includes(n)).join(', ')}`);
       });
     } else if (e.name.endsWith('.as') && !SKIP_FILES.has(e.name)) {
-      const required = EXAMPLE_REQUIRES[e.name];
-      const out = scratchOut(e.name);
-      test(`example: ${e.name}`, async (t) => {
-        if (SYMLINK_NEEDS_FIXTURE.has(e.name) && symlinkSkipReason !== null) {
-          console.log(`SKIP  ${e.name} (${symlinkSkipReason})`);
-          t.skip(symlinkSkipReason);
-          return;
-        }
-        if (required && !existsSync(required)) {
-          console.log(`SKIP  ${e.name} (needs ${resolve(required)}, not present)`);
-          t.skip(`needs ${resolve(required)}, not present`);
-          return;
-        }
-        await runExample(e.name, [join(dir, e.name), ...(EXAMPLE_ARGS[e.name] ?? [])], out, EXAMPLE_ENV[e.name]);
-      });
+      // Host-state examples run in the serial lane below, never here.
+      if (HOST_STATE_FILES.has(e.name)) continue;
+      registerFileExample(e.name);
     }
+  }
+});
+
+// The serial lane. Top-level suites run one after another, so nothing here
+// overlaps the pool above -- which is the whole point.
+describe('examples (host-state, serial)', { concurrency: 1 }, () => {
+  for (const name of HOST_STATE_FILES) {
+    if (!existsSync(join(dir, name)) || SKIP_FILES.has(name)) continue;
+    registerFileExample(name);
   }
 });
 

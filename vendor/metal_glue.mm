@@ -94,6 +94,11 @@ static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static sk_sp<GrDirectContext> g_context = nullptr;
 
+// The process-wide Metal GrDirectContext, exposed for YUV direct render
+// (BitmapData.setYuv420): TextureFromYUVAPixmaps only needs a GrRecordingContext*,
+// and Metal is process-wide (not per-window), so a single getter suffices.
+void* sk_metal_get_context(void) { return g_context.get(); }
+
 // The one MTLCommandQueue every GPU producer in the process shares, created on
 // first use and deliberately never released (process lifetime).
 //

@@ -688,6 +688,11 @@ __declspec(dllexport) extern "C" ID3D12CommandQueue* sk_d3d_shared_queue(void) {
 
 extern "C" {
 
+// The process-wide D3D12 GrDirectContext, exposed for YUV direct render
+// (BitmapData.setYuv420): TextureFromYUVAPixmaps only needs a GrRecordingContext*,
+// and D3D12 is process-wide (not per-window), so a single getter suffices.
+void* sk_d3d_get_context(void) { return g_context.get(); }
+
 // Bind a window's HWND to the shared backend: create the flip-model swapchain,
 // wrap its back buffers as SkSurfaces and set up the frame fence. `native_handle`
 // is the HWND (window_glue.cc fetched it from SDL, it is the one thing the

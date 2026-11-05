@@ -491,7 +491,7 @@ function checkFeatures(): string[] {
   // Every enhancement macro, not just svg: the E3/E4 default-deny pair works by
   // the ABSENCE of its macro, so a default build that leaked one would silently
   // stop matching adl (BMP/WebP/ICO/DNG would decode when AIR says #2124).
-  const ALL_MACROS = ['ASC_USE_SVG=1', 'ASC_ALLOW_EXTRA_FORMATS=1', 'ASC_ALLOW_RAW_FORMATS=1'];
+  const ALL_MACROS = ['ASC_USE_SVG=1', 'ASC_ALLOW_EXTRA_FORMATS=1', 'ASC_ALLOW_RAW_FORMATS=1', 'ASC_USE_YUV420=1'];
   check('the default config enables no enhancement',
     effectiveDefines(dflt).every((d) => !ALL_MACROS.includes(d)));
   check('a default native command carries no enhancement macro',
@@ -531,7 +531,7 @@ function checkFeatures(): string[] {
     catch (e) { return String(e).includes("unknown feature 'lottie'") && String(e).includes(knownFeatures().join(', ')); }
   })());
   check('only implemented channels are offered as features',
-    knownFeatures().join(',') === 'formats,native-shader,raw,svg,tray');
+    knownFeatures().join(',') === 'formats,native-shader,raw,svg,tray,yuv420');
 
   // (3b-bis) E6 / 阶段三百五十三: `native-shader`. Two claims, both about the DEFAULT
   // direction -- the switch is opt-in, and it is native-only because the archives it
@@ -711,6 +711,22 @@ function checkFeatures(): string[] {
     !String(runAir().__out).includes('ASC_USE_SVG=1'));
   check('an unknown feature fails the build (nonzero exit)',
     runAir('--features', 'lottie').__failed === true);
+
+  // (3d) E20 / 阶段三百七十四: `yuv420` — BitmapData.setYuv420(rect, bytes) and
+  // the GPU direct-render path behind it. The default/isomorphic claim is the same
+  // as every switch: without the macro the method and its YUV branch must not exist,
+  // and with it the macro must reach the builders. Unlike svg/tray there is no
+  // backend refusal: native and wasm both carry the method (the GPU-vs-CPU render
+  // difference is a runtime backend fact, not a compile-target refusal).
+  const withYuv420: BuildConfig = { ...dflt, features: ['yuv420'] };
+  check('feature yuv420 resolves to its macro',
+    effectiveDefines(withYuv420).includes('ASC_USE_YUV420=1'));
+  check('a default build defines no yuv420 macro',
+    !effectiveDefines(dflt).some((d) => d.startsWith('ASC_USE_YUV420')));
+  check('yuv420 is accepted on both native and wasm', (() => {
+    try { validateFeatures(['yuv420'], 'native'); validateFeatures(['yuv420'], 'wasm'); return true; }
+    catch { return false; }
+  })());
 
   if (ok > 0) console.log(`[features] ${ok} enhancement-switch checks passed`);
   return bad;

@@ -10190,6 +10190,25 @@ extern void* sk_image_from_bytes(const void* data, size_t len);
 // Runtime pixel buffer (straight 0xAARRGGBB uint32 words) -> SkImage copy; the
 // channel-order/alpha reasoning lives in skia_glue.cc next to the read-back.
 extern void* sk_image_from_argb(const void* px, int w, int h);
+#ifdef ASC_USE_YUV420
+// YUV direct render (E20): the C++ glue turns I420 planes into a GPU texture
+// (SkImages::TextureFromYUVAPixmaps, BT.601 video range). The context getters are
+// per-backend and only linked for the backend that defines the matching macro; see
+// the as_skia_gr_context wrapper for the dispatch.
+extern void* sk_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, int w, int h);
+#ifdef ASC_RENDER_GPU
+extern void* sk_gr_get_context(void);
+#endif
+#ifdef ASC_RENDER_METAL
+extern void* sk_metal_get_context(void);
+#endif
+#ifdef ASC_RENDER_D3D
+extern void* sk_d3d_get_context(void);
+#endif
+#ifdef ASC_RENDER_GL
+extern void* sk_gl_get_context(void);
+#endif
+#endif
 extern void* sk_image_decode_argb(const char* path, int* width, int* height);
 extern void* sk_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height);
 // Read a surface back into the runtime's straight-ARGB (0xAARRGGBB) uint32 buffer.
@@ -10381,6 +10400,34 @@ static inline void as_skia_paint_set_stroke_params(void* p, int cap, int join, d
 static inline void as_skia_paint_set_color_matrix(void* p, const float* m20) { sk_paint_set_color_matrix(p, m20); }
 static inline void* as_skia_image_from_file(const char* path) { return sk_image_from_file(path); }
 static inline void* as_skia_image_from_argb(const void* px, int w, int h) { return sk_image_from_argb(px, w, h); }
+#ifdef ASC_USE_YUV420
+// YUV direct render (E20): hand I420 planes to the glue as a GPU texture. The
+// context is whatever the active GPU backend exposes (Metal / D3D12 / WGL /
+// WebGL2); a build without one — CPU raster or pure-C — gets NULL, so the caller
+// falls back to one warning + black rather than a wrong colour.
+static inline void* as_skia_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, int w, int h) {
+    return sk_image_from_yuv(ctx, y, u, v, w, h);
+}
+static inline void* as_skia_gr_context(void) {
+#ifdef ASC_RENDER_GPU
+    return sk_gr_get_context();
+#elif defined(ASC_RENDER_METAL)
+    return sk_metal_get_context();
+#elif defined(ASC_RENDER_D3D)
+    return sk_d3d_get_context();
+#elif defined(ASC_RENDER_GL)
+    return sk_gl_get_context();
+#else
+    return NULL;
+#endif
+}
+static void as_yuv_cpu_warn(void) {
+    static int warned = 0;
+    if (warned) return;
+    warned = 1;
+    fprintf(stderr, "warning: BitmapData.setYuv420 needs a GPU backend (ASC_RENDER_WINGPU / ASC_RENDER_GPU); rendering black\\n");
+}
+#endif
 // SkImage view of an image already in memory (Loader.load of an http(s)://
 // URL). A file view is impossible there: the payload was never a file, so it
 // must not be re-opened by name, or the display-list Bitmap would render
@@ -11234,6 +11281,19 @@ static inline void as_skia_paint_set_stroke_params(void* p, int cap, int join, d
 static inline void as_skia_paint_set_color_matrix(void* p, const float* m20) { (void)p; (void)m20; }
 static inline void* as_skia_image_from_file(const char* path) { (void)path; return NULL; }
 static inline void* as_skia_image_from_argb(const void* px, int w, int h) { (void)px; (void)w; (void)h; return NULL; }
+#ifdef ASC_USE_YUV420
+// Pure-C build has no Skia and no GPU context: YUV direct render cannot produce an
+// image, so the caller (as_bmd_live_image) warns once and renders black — the same
+// loud-but-safe fallback as the CPU-raster+Skia build.
+static inline void* as_skia_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, int w, int h) { (void)ctx; (void)y; (void)u; (void)v; (void)w; (void)h; return NULL; }
+static inline void* as_skia_gr_context(void) { return NULL; }
+static void as_yuv_cpu_warn(void) {
+    static int warned = 0;
+    if (warned) return;
+    warned = 1;
+    fprintf(stderr, "warning: BitmapData.setYuv420 needs a GPU backend (ASC_RENDER_WINGPU / ASC_RENDER_GPU); rendering black\\n");
+}
+#endif
 static inline void* as_skia_image_from_bytes(const void* data, size_t len) { (void)data; (void)len; return NULL; }
 static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { (void)path; (void)width; (void)height; return NULL; }
 static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { (void)data; (void)len; (void)width; (void)height; return NULL; }

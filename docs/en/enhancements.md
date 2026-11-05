@@ -78,7 +78,7 @@ macro directly:
 
 **Only channels that are truly implemented end-to-end are registered as names.** Registering an unimplemented
 switch is worse than not providing one — it gives the user something that "looks enabled but is not actually
-compiled in". So four are currently registered: `svg` (E1), `formats` (E3), `raw` (E4), `tray` (E19); E2
+compiled in". So six are currently registered: `svg` (E1), `formats` (E3), `raw` (E4), `native-shader` (E6), `tray` (E19), `yuv420` (E20); E2
 (Lottie) will be registered once implemented. The table below lists the currently effective names and macros (`--help` and the
 error text both list them):
 
@@ -87,12 +87,14 @@ error text both list them):
 | `svg` | `ASC_USE_SVG=1` | native | E1: `Loader` decodes SVG (web has no svg/sksg/expat archives) |
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | native / wasm | E3: extra image formats WebP / BMP / ICO |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | native | E4: camera RAW / DNG (web has no piex/dng_sdk archives) |
+| `native-shader` | `ASC_USE_NATIVE_SHADER=1` | native / wasm | E6: GLSL ES 3.00 raw shader passthrough (native cross-compiles MSL/HLSL, wasm hands it to WebGL2 verbatim) |
 | `tray` | `ASC_USE_TRAY=1` | native (**and the host must be macOS**) | E19: `SystemTrayIcon` behind a real `NSStatusItem` (AIR has no system tray on macOS at all) |
+| `yuv420` | `ASC_USE_YUV420=1` | native / wasm | E20: `BitmapData.setYuv420` YUV direct render (GPU texture direct render, CPU warns + black) |
 
 **The window GPU backend is not an enhancement and is not in this table**: `--gpu-backend`
 ([`compile.md`](compile.md) §3.4.6) changes *which native API draws the same semantics*; it changes no API
 behavior and unlocks no capability AIR refuses, so it does not fall under §1.2. It is an **independent switch**:
-`--features gl` reports `unknown feature 'gl' (known: formats, native-shader, raw, svg, tray)`.
+`--features gl` reports `unknown feature 'gl' (known: formats, native-shader, raw, svg, tray, yuv420)`.
 
 **Default refusal (stage ninety-four · twenty-five)**: the E3/E4 channels were previously "usable with zero
 code" — our Skia already carries those codecs, so the **default output was wider than AIR**: AIR reports
@@ -130,9 +132,9 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 
 ## 3. Enhancement backlog
 
-> **8 items completed**: E1 SVG (native half), E3 multi-format decoding, E4 RAW/DNG (native half), E9 64-bit
+> **9 items completed**: E1 SVG (native half), E3 multi-format decoding, E4 RAW/DNG (native half), E9 64-bit
 > integers, E13 LTO/PGO, E16 refresh-rate query, E18 exit-with-status (`System.exit`), E19 the macOS menu-bar
-> status item (`SystemTrayIcon`).
+> status item (`SystemTrayIcon`), E20 `BitmapData.setYuv420` YUV direct render (opt-in `--features yuv420`).
 >
 > **One item is in progress**: **E6 raw shader passthrough** — the path (author GLSL ES 3.00 → glslang →
 > SPIR-V → MSL → pipeline → draw → pixels) is verified on device, M3's three capability faces (float RT /
@@ -170,6 +172,7 @@ be `Error #2124: Loaded file is an unknown type.`, so "supporting SVG" is an enh
 | E15 | **Readable C as a first-class deliverable** (embeddable in a host project / hand-auditable) | ✗ | **already promised** (README: "keep the `.c` for readability") | both ends | already have |
 | E16 | **Display refresh-rate query** (`VsyncStateChangeAvailabilityEvent.refreshRate`) | ✗ **no refresh-rate query API at all** (measured: `adl 51.4.1` dispatches `vSyncStateChangeAvailability` once with only a read-only `available=false`) | ✅ **implemented**: the event gains a read-only `refreshRate:Number` (the constructor's 5th, **optional** parameter, default `0`); dispatched once at the first known frame after startup, and again each time the window lands on a display of a different rate | both ends (**web/offscreen has no counterpart ⇒ honestly does not dispatch**, no faking `0`) | **done** |
 | E19 | **macOS menu-bar status item** (`flash.desktop.SystemTrayIcon` behind a real `NSStatusItem`) | ✗ **does not exist on this platform**: measured on `adl 51.4.1` / macOS, `NativeApplication.supportsSystemTrayIcon` is `false` and `new SystemTrayIcon()` throws `#2012` | ✅ **implemented, opt-in named switch `--features tray`**: the default build still reports `supportsSystemTrayIcon=false` + `#2012` (verbatim AIR); with the switch on the same AS3 gets a real status item, a click dispatches `ScreenMouseEvent` (`click`/`rightClick` with screen coordinates and modifiers), and `menu` rides the same tag channel as the app/Dock menus (see §4.11) | native / macOS host | **done (opt-in)** |
+| E20 | **BitmapData YUV direct render** (`setYuv420(rect, inputByteArray)`) | ✗ (AIR's `BitmapData` has no such method: a video frame can only go through ANE-side libyuv `I420ToARGB` → ARGB → `setPixels`, one extra conversion + two whole-frame copies on the CPU) | ✅ **implemented, opt-in named switch `--features yuv420` (= `ASC_USE_YUV420=1`)**: I420 planar + BT.601 video range, even full-frame read-in (short buffer `EOFError #2030`, odd/partial rect `ArgumentError #2004`, no-overlap silent); GPU backends (Metal / D3D12 / WGL / WebGL2) render via `SkImages::TextureFromYUVAPixmaps`, **the CPU backend warns once + renders black** (loud, not silent). Byte-read contract in `examples/yuv420-probe.as`, CPU black + Skia link in `examples/yuv420-render.as` (GPU on-device colour check needs `--air-app` + `renderMode=gpu`, see [`yuv-direct-render.md`](yuv-direct-render.md) §acceptance) | native / wasm (GPU direct render, CPU falls back to black) | done |
 
 ---
 

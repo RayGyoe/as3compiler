@@ -19910,6 +19910,88 @@ ANE 那一趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70），不是瓶颈。
    `ANEVideoRootView._fps` 硬编码 24 且 `ENTER_FRAME` 计数被注释掉，导致 `ANEVideo.Render` 对 30fps 流按
    `floor(30/24)+1=2` 跳一帧（⇒ 15fps）；`OpenGLVideo.TARGET_INTERVAL = 33` 把 MIX_GPU 路径硬压到 30fps。
 
+### 阶段三百七十五：`setjmp` 从热路径上摘掉（Darwin 上它是系统调用）+ ANE 状态队列加上界（v0.4.338 → v0.4.339）
+
+**起点**：「AOT 的 `FREDispatchStatusEventAsync` 性能有瓶颈吗？」—— 通读 `src/fre.ts:1253` 后先否掉了
+这个前提（每事件 ~91 ns，只有每帧上千条才成问题），但复刻测量时撞出一件与 FRE 无关、影响面更大
+的事：**Darwin 的 `setjmp` 会保存/恢复信号屏蔽字，那是一次 `sigprocmask` 系统调用**。
+
+**一、为什么一直没被发现**：Linux glibc 与 MSVC 的 `setjmp` 都不碰屏蔽字，所以只有 macOS 上
+这一条最慢，而且它慢在「正确性看不出来」的地方。`man 3 setjmp` 明写 `setjmp/longjmp` 保存屏蔽字、
+`_setjmp/_longjmp` 只存寄存器与栈。实测（`temp/frebench/sj4.c`，200 万次）：
+
+| 入口 | 每次成本 |
+|---|---|
+| `setjmp` | **225.8 ns** |
+| `sigsetjmp(env,1)`（保存屏蔽字） | 222.8 ns |
+| `sigsetjmp(env,0)` | 2.5 ns |
+| `_setjmp` | **2.4 ns** |
+
+命中两处热路径：`FREDispatchStatusEventAsync` 的消费侧（`as_fre_status_impl` 每条事件一次）与
+`ExtensionContext.call`（`as_ext_call` 每次调用一次）。全运行时都没有需要恢复屏蔽字的 handler，
+所以那一半是纯成本。
+
+**二、一处必须先证明才能改的**：`gc_mark_stack` 用 `setjmp(jb)` **只为把 callee-saved 寄存器落到栈上**
+（供保守扫描），从不从它 `longjmp` 回来。若 `_setjmp` 保存的寄存器更少，GC 会静默漏根。
+`temp/frebench/jb.c` 把 x19/x20/x28 灌入已知值后比对两种 `jmp_buf` 的前 14 字：**逐字相同**，故可换。
+
+**三、改动**
+
+1. `src/runtime.ts` 新增 `AS_SETJMP`/`AS_LONGJMP` 宏：POSIX 走 `_setjmp`/`_longjmp`；Windows 与
+   `__EMSCRIPTEN__`/`__wasi__`（两者都用 musl，本就不存屏蔽字）走原配对 —— 不为零收益引入 BSD 扩展。
+   **宏必须成对使用**（`_setjmp` 只能被 `_longjmp` 续），这条是本次唯一容易踩的坑。
+2. 全部 19 处调用点改走宏：`runtime.ts` 5（含 `gc_mark_stack` 的纯 spill 与 `as_throw`/`as_throw_val`
+   的 4 处 `longjmp`）、`fre.ts` 5、`emit.ts` 9（生成的 `try/catch` 与 6 个窗口入口）。
+3. **ANE 状态队列加上界**：`as_fre_ctx` 增 `status_len`，上限 `AS_FRE_STATUS_MAX = 1024`（**每 context**，
+   避免一个吵闹的扩展开 starving 别人）。满则丢弃 + `stderr` 报告（按 `as_shell_unsupported` 的 5 次封顶，
+   免得每秒 60 行），返回 **`FRE_OK`** 而非 `FRE_INSUFFICIENT_MEMORY` —— 我们不是没内存，是选择丢弃，
+   而失败码会诱使扩展重试，那正是把队列填满的行为。`as_fre_pump` 排空时把计数归零，上界跟的是**活队列**。
+   动机是「无界队列 + 恢复时一帧内重放全部积压」：AIR 的契约不设上界，这个上界是我们的。
+
+**四、验收**
+
+- 全量：**单元 324/324 绿、示例 305/305 绿**（本轮 `node test.ts` 跑到 1500 s 被工具 deadline 打断，
+  但**示例层已全部跑完且全绿**；剩下的单元尾部改由 `node --test test/unit/*.ts` 跑完，324/324）。
+- 新增钉子 `unit: runtime/SetjmpPair`（14 条）与 `unit: fre/StatusQueue`（11 条）：钉宏的两分支、
+  禁用裸 `setjmp`/`longjmp`、pairing、`gc_mark_stack` 的 spill 用途、上界在锁内判、丢弄后释放、告警封顶、
+  排空重置。这两类回退在 pass/fail 上**完全不可见**（差 220 ns 或丢事件），所以必须钉在单元层。
+- 同时修掉 6 条被本次改动打破的**既有**钉子（`reflect.ts` 3、`emit.ts` 2、`numeric.ts` 1），
+  以及 `emit/FreeFunctionNameReservation` 里那条 `/#if defined\(_WIN32\)([\s\S]*?)#endif/` —— 它按**前缀**匹配，
+  被新增的联合条件块（`#if defined(_WIN32) || ...`）骗走了，改为要求守卫行**就是** `_WIN32` 单独一个。
+- **顺带修掉一个并发缺陷**（本轮之前自己引入的 `jobs=8` 暴露）：`file-ops.as` 在全量里挂
+  `Uncaught exception: Error #3003`，原因是它与 `file-listing-async.as` 共用 `~/work` 这个**固定**路径，
+  一边 `deleteDirectory(true)` 一边读。三个用 `~/work`/`~/fx` 的示例与 `move-to-trash.as` 改到
+  独立的**串行车道**（`describe('examples (host-state, serial)', { concurrency: 1 })`），
+  其余 ~190 个照旧并行；`unit: testinfra/ExampleDriver` 加两条钉子（车道存在 + 覆盖全部固定路径示例）。
+
+**如实报明**：本轮**没有**重开「测试门禁不稳定」那行 —— `file-ops` 这条已经有确定根因并修掉，
+但那是**示例共用路径**，不等于当年那三个单元层偶发红也一定有解。
+
+### 阶段三百七十六：`BitmapData.setYuv420` YUV 直渲（E20，`--features yuv420`）（v0.4.339 → v0.4.340）
+
+**起点**：E20 增强——AIR 的 `BitmapData` 没有 `setYuv420`，视频帧只能 ANE 侧 libyuv `I420ToARGB` 再
+`setPixels`（CPU 上多一次转换 + 两次整帧拷贝）。设计见 [`docs/zh-cn/yuv-direct-render.md`](docs/zh-cn/yuv-direct-render.md)。
+
+**一、语义**：`setYuv420(rect, inputByteArray)` 存一段紧凑 I420 平面帧（Y `w*h` | U `w*h/4` | V `w*h/4`，
+共 `w*h*3/2` 字节，无 stride/endian），BT.601 视频范围。**偶数整帧** rect 读入并推进游标；**短包**保留已写
+字节再抛 `EOFError #2030`；**奇数尺寸 / 部分 rect** 抛 `ArgumentError #2004`（U/V 2×2 子采样要求偶数、子矩形
+无歧义平面布局）；**无重叠**静默（对齐 `setPixels`）。渲染侧 `_yuv_data` 优先于 ARGB pixels。
+
+**二、实现（Stage A/B/C）**：`symbols.ts` 注册方法 + `_yuv_data` 字段（`hasFeature('yuv420')` 门控，默认
+构建无成员、与 AIR 逐字同形）；`emit.ts` 的 `as_bmd_live_image` 加 YUV 分支；四个后端各导 context getter
+（Metal `sk_metal_get_context` / D3D12 `sk_d3d_get_context` / WGL `sk_gl_get_context` / WebGL2
+`sk_gr_get_context`）+ `skia_glue.cc` 的 `sk_image_from_yuv`（`SkImages::TextureFromYUVAPixmaps`，
+`kRec601_Limited_SkYUVColorSpace`）；`runtime.ts` 按后端宏分派 `as_skia_gr_context`，无 context 时
+`as_yuv_cpu_warn`（按 BitmapData 去重一次）+ 黑屏。
+
+**三、验收**：单元钉子 `unit: build/Features`（`yuv420` → `ASC_USE_YUV420=1`、默认无宏、native/wasm 可接受）
+与 `unit: emit/Yuv420`（默认无成员、feature 开时方法体/字段/YUV 分支齐全）；端到端 `examples/yuv420-probe.as`
+（字节读入契约，纯 C 可跑）与 `examples/yuv420-render.as`（Skia 链接 + CPU 黑屏 + 正对照红色）。
+
+**如实报明**：GPU 直渲的 BT.601 颜色正确性**尚未真机逐像素比对**——需 `--air-app` + `renderMode=gpu` 窗口
+产物（Metal）与 WebGL2 浏览器页面验证；CPU 黑屏与字节读入契约已端到端落地，纯 C 无 raster 后端时
+`setYuv420` 不触发渲染，不能据此证明 GPU 直渲等价（见 yuv-direct-render.md §7）。
+
 ### 遗留待开发
 > **2026-11-05 追加（阶段三百七十四：`setPixels` 的每帧成本与裁剪语义）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表 **90 → 91** 行。本阶段修净的两条（逐格循环的每帧成本、越界矩形的裁剪语义）都是「`adl` 跑得对我们跑不出/跑错」，同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记的 1 行**是同一轮 oracle 量到、与本改动无关的既存分歧：`transparent=false` 的位图 adl 在 `getPixel32`/`getPixels` 输出时强制 alpha=`0xFF`，我们保留源字 alpha。**顺带记一笔口径**：这一轮用户猜的是「ANE 用 ByteArray 再 set 回去」，实测结论相反（那趟 memcpy 我们比 adl 快），真凶是我们自己的 `setPixels`；今后遇到「视频/摄像头掉帧」类反馈，先按「纯拷贝基准 vs 目标原语」分档量，而不是从链路形状推断。
 > **2026-11-04 追加（阶段三百六十三：`NetworkInfo.findInterfaces()` 真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。这一项此前登记在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) 的「真能力缺口」表里（不在本表），本阶段把它做成真实枚举后，那张表从 8 行降到 6 行。按 §1.5 它本来是「`adl` 跑得对、我们跑不出」的**遗留缺陷**，且同阶段修净 ⇒ 不入表。**教训值得单独记一笔**：空 Vector 不会让任何断言变红（shell 只打一行 `not implemented`），但应用会因此在 `if (mac.length == 0)` 处**换一条执行路径**，于是在没有窗口、没有帧守卫的构造函数里撞成 `exit(1)`——「编译成功、启动即死」这类反馈，第一件事是看**日志里最后一条 `not implemented`** 有没有被当成控制流输入。
@@ -20240,7 +20322,7 @@ ANE 那一趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70），不是瓶颈。
 > **2026-10-30 追加（阶段三百三十三：`extends Array`/`Dictionary`/`Date` 在 AIR 侧的限制）**：**新登记 1 行**。`temp/gprobe7` 双端实测（同一份 `.as` 同时喂 `mxmlc`+`adl` 与我们的 AOT）：`class X extends Array` 里任何动态写抛 `ReferenceError #1056: Cannot create property 0 on MyArr`、`class X extends Dictionary` 同样（`Cannot create property k on MyDict`）、`class X extends Date` 带参 `super(y, m, d)` 抛 `#1107 The ABC data is corrupt, attempt to read out of bounds` —— 即 **AIR 自己的子类化是坏的**，这属于「`adl` 本来就报错」⇒ 按 §1.5 是**增强**，不是欠账。我们这边三种子类都照常工作（已量：`arr` 长度/下标、`dict` 键读写、`date.getFullYear()` 全部正确），按增强规矩默认产物**不比 AIR 更宽松**这一条不适用（我们只是不主动复制 AIR 的 bug），故**记为已具备、不引入开关**，示例 `examples/builtin-class.as` 第 14 节刻意不对这三类作运行期断言（只在注释里点名），避免把「AIR 跑不通」写成「我们的契约」。
 >
 > **与「遗留待开发」的区别**：上表是**欠账**（AIR 有、我们没有，或我们有但不忠实——`adl` 一跑就知道差在哪）；本表是**增益**（AIR **本来就报错、或压根不存在**，我们做出来才算增强）。判据与五条入库标准见 [`docs/zh-cn/enhancements.md`](docs/zh-cn/enhancements.md) §1/§2；原则亦见 [`docs/zh-cn/as3-semantics.md`](docs/zh-cn/as3-semantics.md) §4。
-> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224；2026-11-02 原生着色器直通转「进行中」，v0.4.316）**：下表 **18 项**，已完成 **8 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64、显示器刷新率查询、带状态码退出、macOS 菜单栏状态项——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**进行中** 1 项（原生着色器直通：通路、M3 能力面、M4 WebGL2 直通均已真机验收并跑通 FFT 海洋与 Ultra-Water 全量对齐，只剩 M5 D3D12/HLSL 与深度纹理的比较采样，见阶段三百五十三/三百五十五/三百五十八）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **5 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`/`tray`/`native-shader`），登记未实现的开关等于「看着开了、实际没编进去」——`formats`/`native-shader` 还能改变符号表（类是否存在），其余只加宏。
+> **状态（2026-10-05 复核，v0.4.61；2026-10-22 加入 E17，v0.4.202；2026-10-22 E10 实测后转入「不排期」；2026-10-23 加入 `System.exit` 与 macOS 状态项，v0.4.224；2026-11-02 原生着色器直通转「进行中」，v0.4.316）**：下表 **19 项**，已完成 **9 项**（WebP/BMP/ICO 解码、LTO/PGO、SVG native 半、相机 RAW/DNG、64 位整数 int64/uint64、显示器刷新率查询、带状态码退出、macOS 菜单栏状态项、`BitmapData.setYuv420` YUV 直渲——均已端到端落地，其中前四者为**具名开关 + 默认拒绝**）、**进行中** 1 项（原生着色器直通：通路、M3 能力面、M4 WebGL2 直通均已真机验收并跑通 FFT 海洋与 Ultra-Water 全量对齐，只剩 M5 D3D12/HLSL 与深度纹理的比较采样，见阶段三百五十三/三百五十五/三百五十八）、**已有** 3 项、**已实测不排期** 1 项（E10，见 [`enhancements.md`](docs/zh-cn/enhancements.md) §4.9）、未排期 **5 项**。增强的开启方式统一为**具名开关** `--features`（见阶段八十九·六十七与 [`enhancements.md`](docs/zh-cn/enhancements.md) §1.4）；只登记已端到端实现的开关（`svg`/`formats`/`raw`/`tray`/`native-shader`/`yuv420`），登记未实现的开关等于「看着开了、实际没编进去」——`formats`/`native-shader` 还能改变符号表（类是否存在），其余只加宏。
 
 | 增强项 | AIR 现状 | 目标端 | 成本 | 状态 |
 |--------|---------|--------|------|------|
@@ -20262,6 +20344,7 @@ ANE 那一趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70），不是瓶颈。
 | **带状态码的退出**（`flash.system.System.exit(code:uint)`） | ✗ **明确不支持**：AIR 运行时抛 `IllegalOperationError #2018 The System.exit() method is not supported.`（`adl 51.4.1` 未打包实测） | ✅ **已实现**：记下 `code` 后走与 `NativeApplication.exit()` 同一条收尾路径，`main` 以它为**进程状态码**返回；WASI 侧同样生效 | 两端 | **已完成（阶段二百四十五）** |
 | **macOS 菜单栏状态项**（`SystemTrayIcon` 背后是真 `NSStatusItem`） | ✗ **本平台没有**：`adl 51.4.1`/macOS 的 `NativeApplication.supportsSystemTrayIcon` 为 `false`、`new SystemTrayIcon()` 抛 `#2012` | ✅ **已实现、opt-in**（具名开关 `--features tray`，仅 native + macOS 宿主）：默认仍是 `false` + `#2012`（与 AIR 逐字同形）；开了之后点击派发 `ScreenMouseEvent`（`click`/`rightClick` + 屏幕坐标 + 修饰键），`menu` 走与 App/Dock 菜单同一条 tag 通道 | native / macOS 宿主 | **已完成（阶段二百六十）** |
 | **无 GPU 后端时 `Context3D.profile` 报 `baselineExtended`** | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：`requestContext3D("software", "baselineExtended"|"enhanced")` 异步抛 `ErrorEvent #3702: Context3D not available.`，拿到上下文那一档也 `createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048（`adl 51.4.1` 实测，`temp/adlprof/run-caps.js`） | 未链接 Stage3D 后端（纯 C 状态机）时仍建上下文、报 `baselineExtended`、按 4096 校验：纹理只存在于 CPU 状态机里，4096 不占显存。**不静默**——`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | — | **已有（刻意保留，非开关）** |
+| **`BitmapData.setYuv420` YUV 直渲**（I420 planar → GPU 直渲） | ✗ AIR 的 `BitmapData` 无 `setYuv420`（视频帧只能 ANE 侧 libyuv `I420ToARGB` 再 `setPixels`） | ✅ **已实现、opt-in**（具名开关 `--features yuv420` → `ASC_USE_YUV420=1`）：GPU 后端（Metal/D3D12/WGL/WebGL2）走 `SkImages::TextureFromYUVAPixmaps` 直渲；CPU 后端保留数据但渲染告警 + 黑屏。默认构建无成员、与 AIR 逐字同形 | native + wasm（GPU 后端直渲；CPU 后端黑屏） | — | **已完成（阶段三百七十六）** |
 
 ---
 

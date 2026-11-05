@@ -6552,6 +6552,12 @@ export class SymbolTable {
         // reclaims the Bitmap↔BitmapData cycle as a whole once the display tree no
         // longer reaches it (a removed Bitmap is also unbound by removeChild).
         ['_refs', bdf({ kind: 'array' })],
+        // Compact I420 planar YUV buffer (Y[w*h] | U[w*h/4] | V[w*h/4]), written by
+        // setYuv420 (--features yuv420, ASC_USE_YUV420) and mutually exclusive with
+        // `pixels`: any ordinary mutator writing `pixels` releases `_yuv_data`. GC-heap
+        // GCT_BYTES, like `pixels`. The field always exists (internal state, not part of
+        // the AS3-visible surface), so a default build's symbol table stays AIR-identical.
+        ['_yuv_data', bdf({ kind: 'null' })],
       ]),
       methods: new Map([
         ['getPixel', bdm({ kind: 'uint' }, [
@@ -6681,6 +6687,14 @@ export class SymbolTable {
           { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
           { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ])],
+        // setYuv420(rect, inputByteArray) — E20 enhancement (--features yuv420).
+        // Present only when the switch is on so a default build's symbol table is
+        // byte-for-byte AIR (AIR's BitmapData has no such member). Stores compact
+        // I420 planar YUV, rendered as a GPU texture by as_bmd_live_image.
+        ...(this.hasFeature('yuv420') ? [['setYuv420', bdm({ kind: 'void' }, [
+          { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
+          { name: 'inputByteArray', type: 'ByteArray', defaultValue: null, isRest: false },
+        ])]] : []),
       ]),
       staticFields: new Map(),
       staticMethods: new Map(),

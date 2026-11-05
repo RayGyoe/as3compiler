@@ -1076,6 +1076,20 @@ const FEATURES: Readonly<Record<string, {
     targets: ['native', 'wasm'],
     why: '',
   },
+  // `yuv420` (E20): BitmapData.setYuv420(rect, inputByteArray) — store compact I420
+  // planar YUV (Y | U | V, total w*h*3/2 bytes) and render it as a GPU texture via
+  // SkImages::TextureFromYUVAPixmaps (BT.601 video range). The method is the
+  // enhancement (AIR's BitmapData has no such member), so without the macro the
+  // symbol surface is byte-for-byte AIR. GPU backends (Metal / D3D12 / WGL /
+  // WebGL2) render directly; the CPU backend keeps the method but renders black
+  // with one warning (loud, not silent — §1.5). Both targets because the method
+  // exists on native and wasm alike; the GPU-vs-CPU render difference is a runtime
+  // backend fact, not a compile-target refusal.
+  'yuv420': {
+    macro: 'ASC_USE_YUV420=1',
+    targets: ['native', 'wasm'],
+    why: '',
+  },
 };
 
 // Resolve feature names to their macros, failing loudly on anything unknown.

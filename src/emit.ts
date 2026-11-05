@@ -22680,6 +22680,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->width = width; o->height = height; o->transparent = transparent;');
     this.line('o->image = NULL; o->pixels = NULL;');
     this.line('o->_live_image = NULL; o->_px_ver = 0; o->_live_ver = 0;');
+    this.line('o->_yuv_data = NULL;');
     this.line('o->_uid = ++as_bd_uid_next;');
     this.line('if (width > 0 && height > 0) {');
     this.indent++;
@@ -22720,6 +22721,24 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void* as_bmd_live_image(BitmapData* bd) {');
     this.indent++;
     this.line('if (bd == NULL || bd->pixels == NULL || bd->width <= 0 || bd->height <= 0) return NULL;');
+    if (this.symbols.features.includes('yuv420')) {
+      this.line('// YUV direct render (--features yuv420): a setYuv420 frame supersedes the');
+      this.line('// ARGB pixels. GPU backends build a YUV texture (as_skia_image_from_yuv); a');
+      this.line('// build without one warns once and returns NULL (black), never a wrong colour.');
+      this.line('if (bd->_yuv_data != NULL) {');
+      this.indent++;
+      this.line('if (bd->_live_image != NULL && bd->_live_ver == bd->_px_ver) return bd->_live_image;');
+      this.line('if (bd->_live_ver == bd->_px_ver) return NULL;');
+      this.line('if (bd->_live_image != NULL) { as_final_release(bd, bd->_live_image); as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
+      this.line('void* ctx = as_skia_gr_context();');
+      this.line('if (ctx == NULL) { as_yuv_cpu_warn(); bd->_live_ver = bd->_px_ver; return NULL; }');
+      this.line('bd->_live_image = as_skia_image_from_yuv(ctx, bd->_yuv_data, (const unsigned char*)bd->_yuv_data + (size_t)bd->width * (size_t)bd->height, (const unsigned char*)bd->_yuv_data + (size_t)bd->width * (size_t)bd->height * 5u / 4u, bd->width, bd->height);');
+      this.line('as_final_register(bd, bd->_live_image);');
+      this.line('bd->_live_ver = bd->_px_ver;');
+      this.line('return bd->_live_image;');
+      this.indent--;
+      this.line('}');
+    }
     this.line('if (bd->_live_image != NULL && bd->_live_ver == bd->_px_ver) return bd->_live_image;');
     this.line('if (bd->_live_image != NULL) { as_final_release(bd, bd->_live_image); as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
     this.line('bd->_live_image = as_skia_image_from_argb(bd->pixels, bd->width, bd->height);');
@@ -23299,6 +23318,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // on the GC heap now (free() on it would corrupt the GC's free list). AIR
     // releases the memory immediately; here the next collection reclaims it.
     this.line('bd->pixels = NULL;');
+    // `_yuv_data` (if any) is also a GC-heap GCT_BYTES buffer: drop the pointer,
+    // let the collector reclaim it. A later ordinary mutator re-allocates pixels
+    // and the YUV view is gone (mutually exclusive with `pixels`).
+    this.line('bd->_yuv_data = NULL;');
     this.line('if (bd->image != NULL) { as_final_release(bd, bd->image); as_skia_image_delete(bd->image); bd->image = NULL; }');
     this.line('if (bd->_live_image != NULL) { as_final_release(bd, bd->_live_image); as_skia_image_delete(bd->_live_image); bd->_live_image = NULL; }');
     this.line('as_bd_mark_dirty(bd);');
@@ -23400,6 +23423,59 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} }');
     this.indent--;
     this.line('}');
+    // setYuv420(rect, inputByteArray) — E20 enhancement (--features yuv420). Stores
+    // a compact I420 planar frame (Y[w*h] | U[w*h/4] | V[w*h/4], total w*h*3/2
+    // bytes) read off the ByteArray cursor. Unlike setPixels there is no endianness:
+    // the three planes are single-byte streams, copied verbatim. The render path
+    // turns them into a GPU YUV texture (SkImages::TextureFromYUVAPixmaps, BT.601
+    // video range) — see as_bmd_live_image — and the CPU backend renders black with
+    // one warning.
+    //
+    // Rect semantics: the U/V planes are 2x2 subsampled, so a PARTIAL rect has no
+    // unambiguous plane layout. The real caller is an ANE video frame (always the
+    // whole bitmap), so we support exactly the full-frame rect (an overhanging rect
+    // clips down to it) and refuse anything smaller loudly (ArgumentError #2004)
+    // rather than guessing a layout. A short buffer keeps the bytes already copied
+    // and throws EOFError #2030 — the same setPixels contract (temp/gdsetpixels/).
+    if (this.symbols.features.includes('yuv420')) {
+      this.line('void BitmapData_setYuv420(void* _this, Rectangle* rect, ByteArray* ba) {');
+      this.indent++;
+      this.line('BitmapData* bd = (BitmapData*)_this;');
+      this.line('if (bd == NULL || rect == NULL || ba == NULL) return;');
+      this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
+      this.line('int w = (int)rect->width, h = (int)rect->height;');
+      this.line('int cx0 = x0 > 0 ? x0 : 0;');
+      this.line('int cy0 = y0 > 0 ? y0 : 0;');
+      this.line('int cx1 = x0 + w; if (cx1 > bd->width) cx1 = bd->width;');
+      this.line('int cy1 = y0 + h; if (cy1 > bd->height) cy1 = bd->height;');
+      this.line('if (cx0 >= cx1 || cy0 >= cy1) return;');
+      this.line('if (cx0 != 0 || cy0 != 0 || cx1 != bd->width || cy1 != bd->height) {');
+      this.line('as_throw(ArgumentError_new((char*)"Error #2004: BitmapData.setYuv420 only supports a rect covering the whole bitmap.", 2004));');
+      this.line('}');
+      this.line('if ((bd->width & 1) || (bd->height & 1)) {');
+      this.line('as_throw(ArgumentError_new((char*)"Error #2004: BitmapData.setYuv420 requires even width and height.", 2004));');
+      this.line('}');
+      this.line('as_bd_mark_dirty(bd);');
+      this.line('long long need = (long long)bd->width * (long long)bd->height * 3LL / 2LL;');
+      this.line('if (bd->_yuv_data == NULL) {');
+      this.indent++;
+      this.line('bd->_yuv_data = (void*)gc_alloc(GCT_BYTES, (size_t)need);');
+      this.line('gc_write_barrier(bd->_yuv_data);');
+      this.indent--;
+      this.line('}');
+      this.line('if (ba->data == NULL) { as_throw_eof(); return; }');
+      this.line('long long avail = (long long)ba->length - (long long)ba->position;');
+      this.line('if (avail > need) avail = need;');
+      this.line('if (avail > 0) {');
+      this.indent++;
+      this.line('memcpy(bd->_yuv_data, (const unsigned char*)ba->data + ba->position, (size_t)avail);');
+      this.line('ba->position += (int)avail;');
+      this.indent--;
+      this.line('}');
+      this.line('if (avail < need) { as_throw_eof(); return; }');
+      this.indent--;
+      this.line('}');
+    }
     // copyPixels: blit a source rectangle into this bitmap at destPoint.
     this.line('void BitmapData_copyPixels(void* _this, BitmapData* src, Rectangle* srcRect, Point* dest, BitmapData* alphaBmp, Point* alphaPt, bool mergeAlpha) {');
     this.indent++;

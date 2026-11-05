@@ -251,6 +251,21 @@ static int gl_build_surface(GLWin* w) {
 
 extern "C" {
 
+// The GrDirectContext that owns the window whose GL context is CURRENT, exposed
+// for YUV direct render (BitmapData.setYuv420). GL is the one backend with a
+// context PER WINDOW (Skia requires one per GL context), so the getter must ask
+// which slot's HGLRC is current rather than hand back a process-wide singleton.
+// That is unambiguous: sk_gpu_begin_frame bound exactly one of them for this
+// frame and nothing rebinds inside a frame.
+void* sk_gl_get_context(void) {
+  for (int i = 0; i < SK_GL_MAX_WINDOWS; ++i) {
+    if (g_gl[i].used && wglGetCurrentContext() == g_gl[i].hglrc) {
+      return g_gl[i].ctx.get();
+    }
+  }
+  return nullptr;
+}
+
 // Bind a window's HWND to a fresh GL context and GrDirectContext. `native_handle`
 // is the HWND (window_glue.cc fetched it from SDL). Returns 1 on success; on
 // failure the caller refuses the window rather than showing one nothing can draw

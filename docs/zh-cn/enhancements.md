@@ -65,19 +65,21 @@ as-aot app.as --air-app app.xml --features svg     # 等于 -D ASC_USE_SVG=1
 | 集合语义 | 只能追加 | `--features` **替换**整个集合（`-D` 才是追加），故「只留 X」可表达；`--features none` 清空 |
 
 **只有真正端到端实现过的通道才会登记为名字**。登记一个没实现的开关，等于给用户一个「看着开了、
-实际没编进去」的东西——比不提供开关更坏。故当前登记四个：`svg`（E1）、`formats`（E3）、`raw`（E4）、
-`tray`（E19）；E2（Lottie）实现后才登记。下表是当前生效的名字与宏（`--help` 与报错文案都列它）：
+实际没编进去」的东西——比不提供开关更坏。故当前登记六个：`svg`（E1）、`formats`（E3）、`raw`（E4）、`native-shader`（E6）、`tray`（E19）、`yuv420`（E20）；
+E2（Lottie）实现后才登记。下表是当前生效的名字与宏（`--help` 与报错文案都列它）：
 
 | 名字 | 宏 | 可用的编译目标 | 开的通道 |
 |---|---|---|---|
 | `svg` | `ASC_USE_SVG=1` | native | E1：`Loader` 解码 SVG（web 无 svg/sksg/expat 归档） |
 | `formats` | `ASC_ALLOW_EXTRA_FORMATS=1` | native / wasm | E3：额外图片格式 WebP / BMP / ICO |
 | `raw` | `ASC_ALLOW_RAW_FORMATS=1` | native | E4：相机 RAW / DNG（web 无 piex/dng_sdk 归档） |
+| `native-shader` | `ASC_USE_NATIVE_SHADER=1` | native / wasm | E6：GLSL ES 3.00 原生着色器直通（native 交叉编译 MSL/HLSL、wasm 直交 WebGL2） |
 | `tray` | `ASC_USE_TRAY=1` | native（**且宿主须为 macOS**） | E19：`SystemTrayIcon` 背后是真 `NSStatusItem`（AIR 在 macOS 上根本没有托盘） |
+| `yuv420` | `ASC_USE_YUV420=1` | native / wasm | E20：`BitmapData.setYuv420` YUV 直渲（GPU 纹理直渲，CPU 警告黑屏） |
 
 **窗口 GPU 后端不是增强，也不在这张表里**：`--gpu-backend`（[`compile.md`](compile.md) §3.4.6）换的是
 「同一套语义画在哪套原生 API 上」，不改变任何 API 行为、不解锁任何 AIR 拒绝的能力，因此不落在 §1.2 的
-判定范围内。它是**独立开关**：`--features gl` 会报 `unknown feature 'gl' (known: formats, native-shader, raw, svg, tray)`。
+判定范围内。它是**独立开关**：`--features gl` 会报 `unknown feature 'gl' (known: formats, native-shader, raw, svg, tray, yuv420)`。
 
 **默认拒绝（阶段九十四·二十五）**：E3/E4 的通道此前是「零代码可用」——我们的 Skia 本来就带这些
 codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `#2124`，我们却解出来了。这违反
@@ -110,7 +112,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 
 ## 3. 增强待做清单
 
-> **已完成 8 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）、E19 macOS 菜单栏状态项（`SystemTrayIcon`）。
+> **已完成 9 项**：E1 SVG（native 半）、E3 多格式解码、E4 RAW/DNG（native 半）、E9 64 位整数、E13 LTO/PGO、E16 刷新率查询、E18 带状态码退出（`System.exit`）、E19 macOS 菜单栏状态项（`SystemTrayIcon`）、E20 `BitmapData.setYuv420` YUV 直渲（opt-in `--features yuv420`）。
 > **进行中 1 项**：**E6 原生着色器直通**——通路（作者 GLSL ES 3.00 → glslang → SPIR-V → MSL →
 > 管线 → draw → 像素）已真机验收，M3 的浮点 RT / MRT 读回 / 深度纹理三项也已补验，**M4 Web 直通已落地**
 > （wasm 直接吃 ES 3.00 源，五个 demo 真浏览器自检绿）；**仍未做** M5 D3D12/HLSL 与深度纹理的
@@ -149,6 +151,7 @@ codec，于是**默认产物比 AIR 宽**：AIR 对 BMP/WebP/ICO/DNG 一律报 `
 | E17 | **无 GPU 后端时的 `Context3D.profile`**（纯 C 状态机报 `baselineExtended`） | ✗ AIR 的 `software` 渲染模式**锁死 `baseline`**：请求 `baselineExtended`/`enhanced` 异步抛 `#3702`，`createTexture(4096)` 报 `#3683 (max is 2048x2048)`、`maxBackBuffer` 只有 2048×2048 | ✅ **现状即增强**：未链接 Stage3D 后端时仍建上下文、报 `baselineExtended`、按 4096 校验（纹理只在 CPU 里，不占显存）；`driverInfo` 如实报 `"Software (state machine)"` | 两端（纯 C，无胶水依赖） | **已有（刻意保留，非开关）** |
 | E18 | **带状态码的退出**（`flash.system.System.exit(code:uint)`） | ✗ **明确不支持**：`mxmlc` 认得这个签名，但 AIR **运行时**抛 `IllegalOperationError #2018`（`The System.exit() method is not supported.`，`adl 51.4.1` 未打包实测，见 `TODO.md` 阶段一百二十五）；AIR 里**没有任何**带状态码的退出 API（`NativeApplication.exit()` 无参） | ✅ **已实现（阶段二百四十五）**：记下 `code` 后走**与 `NativeApplication.exit()` 同一条**收尾路径（`as_window_request_exit()`），`main` 以它为**进程状态码**返回；`System` 的未知成员改报 `System has no member 'X'`（此前误报 `undefined variable 'System'`）。见 §4.10 | 两端（native：状态码即进程状态；WASI：crt 用 `main` 返回值 `__wasi_proc_exit`，实测 `WASI_EXIT=7`） | **已完成** |
 | E19 | **macOS 菜单栏状态项**（`flash.desktop.SystemTrayIcon` 背后是真 `NSStatusItem`） | ✗ **这台机器上压根没有**：实测 `adl 51.4.1` / macOS 的 `NativeApplication.supportsSystemTrayIcon` 为 `false`，`new SystemTrayIcon()` 抛 `#2012` | ✅ **已实现、opt-in 具名开关 `--features tray`**：默认构建照旧 `supportsSystemTrayIcon=false` + `#2012`（与 AIR 逐字同形）；开开关后同一段 AS3 拿到一个真状态项，点击派发 `ScreenMouseEvent`（`click`/`rightClick`，带屏幕坐标与修饰键），`menu` 走与 App/Dock 菜单同一条 tag 通道（见 §4.11） | native / macOS 宿主 | **已完成（opt-in）** |
+| E20 | **BitmapData YUV 直渲**（`setYuv420(rect, inputByteArray)`） | ✗（AIR 的 `BitmapData` 无此方法：视频帧只能 ANE 侧 libyuv `I420ToARGB` 转 ARGB 再 `setPixels`，CPU 上多一次转换 + 两次整帧拷贝） | ✅ **已实现、opt-in 具名开关 `--features yuv420`（= `ASC_USE_YUV420=1`）**：I420 planar + BT.601 视频范围，偶数整帧读入（短包 `EOFError #2030`、奇数/部分 rect `ArgumentError #2004`、无重叠静默）；GPU 后端（Metal / D3D12 / WGL / WebGL2）走 `SkImages::TextureFromYUVAPixmaps` 直渲，**CPU 后端警告一次 + 黑屏**（响亮不静默）。字节读入契约见 `examples/yuv420-probe.as`，CPU 黑屏 + Skia 链接见 `examples/yuv420-render.as`（GPU 真机验色需 `--air-app` + `renderMode=gpu`，见 [`yuv-direct-render.md`](yuv-direct-render.md) §验收） | native / wasm（GPU 直渲，CPU 退化黑屏） | 已完成 |
 
 ---
 
