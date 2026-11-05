@@ -969,6 +969,50 @@ sumA = alpha 之和）：
 链 Skia）+ `unit: render/DrawRootAspect`（8 钉：保存 / 强制 / 还原三处都存在、顺序正确、指纹在强制**之前**、
 `as_render_object` 仍跳过不可见对象）。三个语义变异（只强制 visible、只强制 alpha、漏还原 alpha）全红。
 
+### 6.18 `BitmapData.setPixels` 是每帧的视频热路径，不是便利函数（阶段三百七十四，一个「两路 1080p 拉不满 60」）
+
+talkmed meeting 的会议窗口同时播本地 1080p 采集 + 远端画面，帧率在 44～60 之间抖、CPU 稳定 18%。
+链路是 `TRTC frame → ANE memcpy 进 ByteArray → setPixels → 合成`，很容易把它归咎成「ANE 多拷了一趟」，
+但实测不是：同一份源码两端同跑（`temp/vidcopy/`，一帧 1080p = 1920×1080×4 = 8.3MB）：
+
+| 主线程每帧 | adl 51.3.2 | AOT 修前 | AOT 修后 |
+|---|---|---|---|
+| `ByteArray.writeBytes`（8.3MB 纯拷贝基准） | 0.70 | 0.75 | 0.75 |
+| **`setPixels`（整幅，littleEndian）** | **1.50** | **7.20** | **0.80** |
+| `setPixels`（整幅，bigEndian） | 1.75 | 7.13 | 1.10 |
+| `setPixels`（半宽） | 0.60 | 3.43 | 0.20 |
+| **`setPixels` + `draw`（真实每帧链）** | **2.33** | **7.83** | **1.60** |
+
+结论摆明了：ANE 那趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70）；**慢的是我们自己的 `setPixels`**，
+因为它是逐格的一次「四个字节分别取出 → 位运算拼字 → 写回」循环。1080p 是 207 万格，每格十来个周期，
+单路视频每帧白烧 5.4ms；30fps 下就是 16% 的单核。
+
+修法是把「裁剪后的矩形每行都连续」这件事用上（`src/emit.ts`）：
+
+- **先裁剪再读**。`cx0/cy0/cx1/cy1` 夹到 `bd->width/height`，无重叠直接返回。这不只是优化，
+  它同时修掉一条语义错误（见 `as3-semantics.md` §3.11）。
+- **大块拷贝**。`ba` 剩余 ≥ `cw*ch*4` 时逐行走 `memcpy`（littleEndian）或逐字 `bswap`（bigEndian）。
+  为什么 littleEndian 能直接 `memcpy`：旧循环构造的字是 `src[3]<<24|src[2]<<16|src[1]<<8|src[0]`，
+  写进小端的 `unsigned` 数组后内存里正好是 `src[0..3]` 原样——每一字节都不翻转。
+  而 littleEndian 正是真实调用形状：ANE 的帧来自 libyuv `I420ToARGB`（内存 B,G,R,A），
+  `ANEVideo.as` 在调用前显式写 `VideoByteArray.endian = Endian.LITTLE_ENDIAN`。
+- **短包回落**。`avail < need` 仍然走原来的逐格循环，保留「先填能填的、再抛 #2030」
+  （`examples/bitmap-setpixels-eof.as` 钉住）。
+
+**验证方式**：`temp/vidcopy/` 里 19 个 case 让 adl 与 AOT 各跑一遍，比**游标位置**与**像素 hash**
+（逐点 `getPixel32` 折叠，避开 alpha 分歧——见下）。覆盖整幅/子矩形/单列/单行/负原点/右侧越界/
+跨边界/两种短包/零宽零高/四种完全界外/边角像素/1080p 整幅，**19/19 逐字节相同**。
+
+**如实报明**：`transparent=false` 的位图，AIR 在 `getPixel32`/`getPixels` 输出时把 alpha 强制成 `0xFF`，
+我们保留源字里的 alpha（`temp/vidcopy/` 的 DUMP 直接可见：adl `FF030201` vs AOT `04030201`）。
+这是本次改动之前就存在的分歧，与 `setPixels` 无关（逐格路径给出同样的值），因此 oracle 掩掉了 alpha 通道；
+真实 ANE 帧的 alpha 恒为 255，所以画面不受影响，但它是**待修**的一条，已入 `TODO.md` 遗留表。
+
+回归：`examples/bitmap-setpixels-clip.as`（7 组：越界只读重叠、负原点、完全界外无操作、零尺寸、
+越界+短包、bulk 与逐格 `setPixel32` 逐点等价、子矩形行内不串）+ `unit: render/BitmapLivePixels`
+新增 8 钉（裁剪先于游标、无重叠静默返回、逐格循环走裁剪后尺寸、bulk 条件、LE 走 memcpy、BE 走 bswap、
+短包回落顺序）。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

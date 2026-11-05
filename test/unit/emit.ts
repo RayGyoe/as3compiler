@@ -2374,8 +2374,36 @@ function checkRenderBitmapLivePixels(): string[] {
     sp.includes('ba->position + 4 > ba->length'));
   check('setPixels raises EOFError #2030 on a shortfall',
     sp.includes('{ as_throw_eof(); return; }'));
-  check('setPixels advances the cursor before the bitmap bounds clip',
-    sp.indexOf('ba->position += 4;') < sp.indexOf('px >= bd->width'));
+  // 1c. Clipping happens BEFORE the cursor moves. AIR consumes a word only for
+  //     cells that land inside the bitmap: rect(60,44,10,10) on a 64x48 bitmap
+  //     leaves the cursor at 16 words (the 4x4 overlap), rect(-3,-3,10,10) at 49
+  //     (the 7x7 overlap), and a rect with no overlap at all is a silent no-op
+  //     rather than an EOFError (adl 51.3.2, temp/vidcopy -- 19 oracle cases).
+  //     The old code advanced the cursor for clipped cells too, so an overhanging
+  //     rect read the wrong slice of the frame AND threw on a frame adl accepts.
+  check('setPixels clips the rect before touching the array',
+    sp.includes('int cx0 = x0 > 0 ? x0 : 0;') &&
+    sp.indexOf('int cx0 = x0 > 0 ? x0 : 0;') < sp.indexOf('ba->position += 4;'));
+  check('a rect with no overlap is a silent no-op',
+    sp.includes('if (cx0 >= cx1 || cy0 >= cy1) return;'));
+  check('the per-cell loop walks the CLIPPED rect',
+    sp.includes('for (int y = 0; y < ch; y++) { for (int x = 0; x < cw; x++) {'));
+  // 1d. Bulk path. Every row of the clipped rect is contiguous, so the whole
+  //     copy is row-wise instead of per-cell. This is not an optimisation detail:
+  //     ANEVideo pushes a 1080p frame through here per camera stream per frame,
+  //     where the per-cell loop measured 7.2 ms/frame against adl's 1.8 and the
+  //     row copy measures 0.8 (temp/vidcopy). littleEndian is the real call shape
+  //     and is byte-for-byte the source, so it degenerates to memcpy; bigEndian
+  //     is the same rows with each word byte-swapped. Anything the bulk path
+  //     cannot serve (short array) falls through to the exact loop above.
+  check('setPixels takes a bulk copy path',
+    sp.includes('(long long)ba->length - (long long)ba->position >= need'));
+  check('the bulk path is a row-wise memcpy in littleEndian',
+    sp.includes('if (le) { memcpy(d, s, rowBytes); }'));
+  check('the bulk path byte-swaps each word in bigEndian',
+    sp.includes('(v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24)'));
+  check('a short array still falls through to the per-cell EOFError path',
+    sp.indexOf('>= need') < sp.indexOf('ba->position + 4 > ba->length'));
 
   // 2. Every pixel mutator invalidates the cached view, or the screen freezes.
   const mutators = [

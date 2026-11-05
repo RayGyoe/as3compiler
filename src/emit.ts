@@ -23338,15 +23338,61 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int x0 = (int)rect->x, y0 = (int)rect->y;');
     this.line('int w = (int)rect->width, h = (int)rect->height;');
     this.line('int le = ba->endian != NULL && strcmp(ba->endian, "littleEndian") == 0;');
+    // Clip the rect to the bitmap BEFORE anything reads the array. AIR consumes
+    // a ByteArray word only for cells that land inside the bitmap -- measured on
+    // adl 51.3.2 (temp/vidcopy): rect(60,44,10,10) on a 64x48 bitmap leaves the
+    // cursor at 16 words (the 4x4 overlap), rect(-3,-3,10,10) at 49 (the 7x7
+    // overlap), and a rect with no overlap at all is a silent no-op rather than
+    // an EOFError. The old code advanced the cursor for clipped cells too, so an
+    // overhanging rect both read the wrong slice of the frame and threw #2030 on
+    // a frame that adl accepts.
+    this.line('int cx0 = x0 > 0 ? x0 : 0;');
+    this.line('int cy0 = y0 > 0 ? y0 : 0;');
+    this.line('int cx1 = x0 + w; if (cx1 > bd->width) cx1 = bd->width;');
+    this.line('int cy1 = y0 + h; if (cy1 > bd->height) cy1 = bd->height;');
+    this.line('if (cx0 >= cx1 || cy0 >= cy1) return;');
+    this.line('int cw = cx1 - cx0, ch = cy1 - cy0;');
     this.line('as_bd_mark_dirty(bd);');
-    this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
-    this.line('// One word per rect cell (in rect order) off the array cursor; a short');
-    this.line('// array keeps the cells already filled and throws #2030 right here.');
+    // Bulk path. Every destination row of the clipped rect is contiguous and the
+    // source advances exactly 4 bytes per cell, so the whole thing is a row-wise
+    // copy instead of a per-cell loop. This is the per-frame cost of every camera
+    // stream in the meeting client: ANEVideo calls setPixels(rect = whole bitmap)
+    // at up to 30 fps per stream on a 1080p buffer, and the per-cell loop measured
+    // 7.2 ms/frame against adl's 1.8 (temp/vidcopy). LE is the real call shape --
+    // libyuv I420ToARGB output with endian set to littleEndian right before the
+    // call -- and there the word the old loop built is byte-for-byte the source
+    // bytes, so it degenerates to memcpy. BE fills the same rows with each source
+    // word byte-swapped. A short array falls through to the exact loop below so
+    // the partially-filled cells and the EOFError #2030 stay where they were.
+    this.line('if (ba->data != NULL) {');
+    this.indent++;
+    this.line('long long need = (long long)cw * (long long)ch * 4LL;');
+    this.line('if ((long long)ba->length - (long long)ba->position >= need) {');
+    this.indent++;
+    this.line('const unsigned char* sp = (const unsigned char*)ba->data + ba->position;');
+    this.line('unsigned char* dp = (unsigned char*)bd->pixels;');
+    this.line('size_t rowBytes = (size_t)cw * 4u;');
+    this.line('for (int y = 0; y < ch; y++) {');
+    this.indent++;
+    this.line('unsigned char* d = dp + (((size_t)(cy0 + y) * (size_t)bd->width) + (size_t)cx0) * 4u;');
+    this.line('const unsigned char* s = sp + (size_t)y * rowBytes;');
+    this.line('if (le) { memcpy(d, s, rowBytes); }');
+    this.line('else { unsigned* dw = (unsigned*)d; for (int x = 0; x < cw; x++) { unsigned v; memcpy(&v, s + (size_t)x * 4u, 4u); dw[x] = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); } }');
+    this.indent--;
+    this.line('}');
+    this.line('ba->position += (int)need;');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('for (int y = 0; y < ch; y++) { for (int x = 0; x < cw; x++) {');
+    this.line('// One word per IN-BOUNDS cell (in clipped-rect order) off the array');
+    this.line('// cursor; a short array keeps the cells already filled and throws #2030.');
     this.line('if (ba->data == NULL || ba->position < 0 || ba->position + 4 > ba->length) { as_throw_eof(); return; }');
     this.line('unsigned char* src = (unsigned char*)ba->data + ba->position;');
     this.line('ba->position += 4;');
-    this.line('int px = x0 + x, py = y0 + y;');
-    this.line('if (px < 0 || py < 0 || px >= bd->width || py >= bd->height) continue;');
+    this.line('int px = cx0 + x, py = cy0 + y;');
     this.line('unsigned a, r, g, b;');
     this.line('if (le) { a = src[3]; r = src[2]; g = src[1]; b = src[0]; }');
     this.line('else { a = src[0]; r = src[1]; g = src[2]; b = src[3]; }');

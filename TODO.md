@@ -19832,7 +19832,86 @@ autoSize 漏标脏，第四轮（dump 子树字段 `txt/runs/fw/fh/as`）定位�
 **如实报明**：警告归零是**这一份产物、这一版 clang**（Apple clang 21）的读数；其他编译器（MSVC、`emcc`）
 的诊断集不同，不宣称「什么编译器都零警告」。`-Wall` 下运行时前导仍有 C89 初始化器噪声，本轮未处理。
 
+### 阶段三百七十四：`BitmapData.setPixels` 从逐格循环改成大块拷贝，顺带修正矩形裁剪语义（v0.4.337 → v0.4.338）
+
+**起点**：用户报「两路视频（本地 1080p + 手机画面）帧率都跑不满 60fps，CPU 占用也不低」，并怀疑是「ANE 用
+ByteArray 再 set 回去」的拷贝开销。先把链路和耗时拆开量，再决定改哪里 —— 结论和猜想不一样。
+
+链路：`TRTC 回调 → (libyuv I420ToARGB) → ANE memcpy 进 AS3 ByteArray → setPixels → 合成`。用
+`temp/vidcopy/`（同一份 AS3 两声端跑，一帧 1080p = 8.3MB）逐段计时，结果见表。
+
+**一、实测：慢的不是 ANE 的拷贝，是我们自己的 `setPixels`**
+
+| 主线程每帧 | adl 51.3.2 | AOT 修前 | AOT 修后 |
+|---|---|---|---|
+| `ByteArray.writeBytes`（8.3MB 纯拷贝基准） | 0.70 | 0.75 | 0.75 |
+| **`setPixels`（整幅，littleEndian）** | **1.50** | **7.20** | **0.80** |
+| `setPixels`（整幅，bigEndian） | 1.75 | 7.13 | 1.10 |
+| `setPixels`（半宽） | 0.60 | 3.43 | 0.20 |
+| **`setPixels` + `draw`（真实每帧链）** | **2.33** | **7.83** | **1.60** |
+
+ANE 那一趟 memcpy 我们反而比 AIR 快（0.75 vs 0.70），不是瓶颈。瓶颈是 `BitmapData_setPixels` 的逐格循环：
+1080p 是 207 万格，每格一次边界检查 + 四字节分别取出 + 位运算拼字 + 写回，约 3.5ns/格 ⇒ 7.2ms/帧。
+单路 30fps 就是 16% 的单核。
+
+**二、三处改动（`src/emit.ts`）**
+
+1. **先裁剪再读**。`cx0/cy0/cx1/cy1` 夹到 `bd->width/height`，无重叠直接 `return`。
+2. **大块拷贝**。`ba` 剩余 ≥ `cw*ch*4` 时逐行走 `memcpy`（littleEndian）或逐字字节交换（bigEndian）。
+   littleEndian 能直接 `memcpy` 的理由：旧循环构造的字是 `src[3]<<24|src[2]<<16|src[1]<<8|src[0]`，写进
+   小端 `unsigned` 数组后内存里正是 `src[0..3]` 原样 —— 一字节都不翻转。而 littleEndian 正是真实调用
+   形状：libyuv `I420ToARGB` 输出内存 B,G,R,A，`ANEVideo.as` 在调用前显式写 `Endian.LITTLE_ENDIAN`。
+3. **短包回落**。`avail < need` 仍走原逐格循环，「先填能填的、再抛 `EOFError #2030`」一字未动
+   （`examples/bitmap-setpixels-eof.as` 继续钉住）。
+
+**三、顺带修掉的语义错（裁剪本身是 bug，不只是优化）**
+
+旧实现「矩形里每个格子都推进游标，越界格子跳过写入」。adl 实测（`temp/vidcopy/`，64×48 位图）：
+
+| rect | 重叠 | adl 消耗的字 | 修前我们 |
+|---|---|---|---|
+| `(60,44,10,10)` | 4×4 | **16** | 100 |
+| `(-3,-3,10,10)` | 7×7 | **49** | 100 |
+| `(63,47,2,2)` | 1×1 | **1** | 4 |
+| `(100,100,10,10)` | 无 | **0，不抛** | 0，不抛（巧合对上） |
+
+也就是 adl 先把矩形裁到位图内、再按裁剪后的矩形行优先读字节。我们多读的那部分让整帧字节**错位**
+（越界矩形写入的画面是斜/花的），且会在 adl 接受的帧上抛 `#2030`。真实应用传的是
+`videoBitmapData.rect`（永不越界）所以线上未暴露，但只要有人传「可见区域」就会踩。
+
+**四、验证：adl 与 AOT 同源码 19 个 case 逐字节比对**
+
+`temp/vidcopy/` 的 oracle 段对每种 rect 形态各跑一遍，比**游标位置**与**像素 hash**（逐点 `getPixel32`
+折叠，掩掉 alpha —— 见「如实报明」）。覆盖：整幅/子矩形/单列/单行/负原点/右侧越界/下方越界/
+跨边界/两种短包/零宽/零高/四种完全界外/边角像素/1080p 整幅。**19/19 位置与像素全部相同**。
+
+**五、回归**
+
+- `examples/bitmap-setpixels-clip.as`（新，7 组：越界只读重叠、负原点、完全界外无操作、零尺寸、
+  越界+短包、bulk 与逐格 `setPixel32` 逐点等价、子矩形行内不串）；断言值全部先由 adl 跑同一段
+  逻辑打印确认，不是手算。
+- `unit: render/BitmapLivePixels`：删 1 条（「游标在越界裁剪之前前进」，与 adl 相反）并新增 8 条
+  （裁剪先于游标、无重叠静默返回、逐格循环走裁剪后尺寸、bulk 条件、LE 走 memcpy、BE 走 bswap、
+  短包回落顺序）。`unit: emit/*` 62/62 绿。
+- `examples` 里 bitmap 一族 9/9 绿（含 `bitmap-setpixels-endian.as`、`bitmap-setpixels-eof.as`）。
+- 全量 `node --test test/unit/*.ts`：**321 项 / 316 pass / 5 fail**，5 红全部是既存环境问题
+  （`inline/{HotPath,WriteBarrier,StackCanary}` 与 `emit/NoWarnings` 缺 `zlib.h`；`SWC StaticText` 因生成的 C
+  里 `getenv` 触发 MSVC 弃用警告）。已用 `git stash` 单独回退本阶段改动复核过 `SWC StaticText`：**没有本改动也红**。
+
+**如实报明**：
+1. `transparent=false` 的位图，adl 在 `getPixel32`/`getPixels` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的
+   alpha（`temp/vidcopy/` 的 DUMP 直接可见：adl `FF030201` vs AOT `04030201`）。这是本改动**之前**就存在的分歧
+   （逐格路径给出同样的值），不影响本轮正确性判断，但会让「非透明位图 + 非 255 alpha」的画面在 AOT 下
+   变半透明。真实 ANE 帧 alpha 恒为 255 所以线上不受影响。**已入遗留表**。
+2. 本轮只修了「主线程每帧成本」。**每帧固定开销**（`as_render_fp` 整树遍历、`as_bmd_live_image` 每帧重建 SkImage）
+   未动：`frame_setpixels_draw_le` 修后 1.60ms 已优于 adl 的 2.33ms，但 `draw_bmd_to_bmd` 单看是 0.825ms vs adl 0.30ms，
+   差的那 0.5ms 在合成侧，留给后面的阶段。
+3. **应用层的两个限帧点不在编译器范围**，但它们是「跑不满 60fps」的直接嫌疑，已在对话里如实指出：
+   `ANEVideoRootView._fps` 硬编码 24 且 `ENTER_FRAME` 计数被注释掉，导致 `ANEVideo.Render` 对 30fps 流按
+   `floor(30/24)+1=2` 跳一帧（⇒ 15fps）；`OpenGLVideo.TARGET_INTERVAL = 33` 把 MIX_GPU 路径硬压到 30fps。
+
 ### 遗留待开发
+> **2026-11-05 追加（阶段三百七十四：`setPixels` 的每帧成本与裁剪语义）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 主表 **90 → 91** 行。本阶段修净的两条（逐格循环的每帧成本、越界矩形的裁剪语义）都是「`adl` 跑得对我们跑不出/跑错」，同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**新登记的 1 行**是同一轮 oracle 量到、与本改动无关的既存分歧：`transparent=false` 的位图 adl 在 `getPixel32`/`getPixels` 输出时强制 alpha=`0xFF`，我们保留源字 alpha。**顺带记一笔口径**：这一轮用户猜的是「ANE 用 ByteArray 再 set 回去」，实测结论相反（那趟 memcpy 我们比 adl 快），真凶是我们自己的 `setPixels`；今后遇到「视频/摄像头掉帧」类反馈，先按「纯拷贝基准 vs 目标原语」分档量，而不是从链路形状推断。
 > **2026-11-04 追加（阶段三百六十三：`NetworkInfo.findInterfaces()` 真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。这一项此前登记在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) 的「真能力缺口」表里（不在本表），本阶段把它做成真实枚举后，那张表从 8 行降到 6 行。按 §1.5 它本来是「`adl` 跑得对、我们跑不出」的**遗留缺陷**，且同阶段修净 ⇒ 不入表。**教训值得单独记一笔**：空 Vector 不会让任何断言变红（shell 只打一行 `not implemented`），但应用会因此在 `if (mac.length == 0)` 处**换一条执行路径**，于是在没有窗口、没有帧守卫的构造函数里撞成 `exit(1)`——「编译成功、启动即死」这类反馈，第一件事是看**日志里最后一条 `not implemented`** 有没有被当成控制流输入。
 > **2026-11-03 追加（阶段三百六十一：`draw()` 忽略被画对象自己的 `visible`/`alpha`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒ 主表项数不变。本阶段修净的是 `adl` 跑得对、我们跑不出画面的一条实错（「高级礼物」不报错也不出图），同阶段落地，按表头「已完成项一经落地即从本表移出」不入表。**口径提醒**：这类缺陷**任何断言都不会红**——它不抛异常、不打日志，示例套件里也没有程序会把「自己设为 invisible 再 draw 自己」当作正常用法；它是靠「用户说动画没出来」反推出来、再用同源探针量出来的。今后凡是「应用层看不见结果但没有报错」的反馈，第一件事就是把该路径的每个渲染/读取原语拿 adl 逐项对照，而不是继续查应用代码。
 > **2026-11-03 追加（记账勘误；不占阶段号、不升版本号）**：两件事都是**记录与事实不符**，不动一行代码。
@@ -20150,6 +20229,7 @@ autoSize 漏标脏，第四轮（dump 子树字段 `txt/runs/fw/fh/as`）定位�
 | **`DisplayObject.mask` 的非矢量遮罩只有包围盒精度**（`Bitmap`/`TextField` 当遮罩时 AIR 按**像素**模板裁剪，我们退回它的包围盒并 `as_shell_unsupported` 报一次；纯描边遮罩的描边带、遮罩自带 `filters`/`blendMode` 的呈现同样只取几何） | 未开始（2026-10-29 阶段三百一十八 落地二值模板时登记；本阶段把矢量遮罩（含子件并集、离屏遮罩、别的容器）逐条对齐了 adl，这三档 adl 侧未实测、实现上也还没接） | `docs/zh-cn/skia.md` §6.15 的实测表是已对齐的九条；缺的三档分别是「遮罩是 `Bitmap`/`TextField`」「遮罩只有描边」「遮罩自身带滤镜/混合」 | 先按 §6.15 的探针套路（`temp/mask/MaskProbe*.as`）补测这三档的 adl 口径，再把 `as_mask_ink` 的路径收集扩到像素模板（`SkImage` → `SkShader` 裁剪或 `saveLayer` + `kDstIn`），并把报明换成真实现 |
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 | `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | **部分完成**（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
+| **`transparent=false` 的 `BitmapData`：adl 在 `getPixel32()`/`getPixels()` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的 alpha** | 未开始（2026-11-05 阶段三百七十四 的像素 oracle 量到） | `temp/vidcopy/` 的 DUMP 直接可见：同一份 `setPixels` 输入，adl 读回 `FF030201`、AOT 读回 `04030201`（低三字节相同）。这是本轮改动**之前**就存在的分歧——逐格循环与新的 bulk 路径给出同一个值，所以不是修 `setPixels` 引入的。影响面：`transparent=false` 的位图如果被写进非 255 的 alpha（ANE 帧的 alpha 恒为 255，所以 meeting 客户端的摄像头预览不受影响），AOT 下会整块半透明、AIR 下不透明。`examples/bitmap-setpixels-endian.as` 用的是 `transparent=false` 但源 alpha 恰好 255，所以既有钉子没有暴露它。 | 两条路选一条：① 在**写入侧**强制（`setPixels`/`setPixel32`/`fillRect`/`copyPixels`/`draw` 等所有入口，`!transparent` 时把 alpha 压成 255）；② 在**读取侧**强制（`getPixel32`/`getPixels` 时屏蔽）。AIR 到底是哪一侧还没测——这决定 `BitmapData` 内部是否允许存在带 alpha 的像素（会连带影响 `draw()` 的合成与 `Bitmap.bitmapData` 上屏）。**动手前先补一组双端探针**：`transparent=false` 位图 `setPixel32(0,0,0x80FF0000)` 之后，(a) `getPixel32` 读回什么、(b) `BitmapData.draw` 到另一张图上得到什么、(c) 作为 `Bitmap` 上屏后采样到什么。三处一致才敢选侧。 |
 
 
 

@@ -571,6 +571,9 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   `littleEndian` = 内存 `B,G,R,A`，真应用 ANE 摄像头帧正是后者），以及「`new BitmapData` + `setPixels` 填出来的位图在显示列表里
   必须真的画出像素、改像素后跟着变」（纯 C 构建用 `TextField` 探针判断有无光栅后端，无则跳过显示列表段；需
   `examples/bitmap-setpixels-endian.build.json` 链 Skia）
+- `examples/bitmap-setpixels-clip.as` — `BitmapData.setPixels` 的**矩形裁剪**与**大块拷贝**（阶段三百七十四）：
+  矩形越界时 AIR 只按**落在位图内的格子**消耗字节（`64x48` 上的 `rect(60,44,10,10)` 只读 16 个字、完全界外静默无操作），
+  同时验证整幅/子矩形走的 bulk 路径与逐格 `setPixel32` 逐点等价（1080p 一帧从 7.2ms 降到 0.8ms，`adl` 1.5ms）
 - `examples/stage83.as` — Stage3D 对齐加固（CubeTexture/RectangleTexture、render-to-texture 像素断言、实例化绘制）
 - `examples/vertex-texture.as` — AGAL4 顶点纹理取值（VTF）：三翻译器的顶点 sampler 声明、`tex`/`tld` 的 stage/version 门控（#3622/#3803/#3805/#3757，与 `adl` 逐字一致）、Metal 真机上 2x2 纹理的纹素映射/NEAREST-LINEAR/CLAMP-REPEAT/逐顶点插值；随附 `vertex-texture.build.json`（与 `stage83.as` 一样是手工验收）
 - `examples/s3d-upload-bounds.as` — 六个上传入口的边界契约（实测对齐 `adl`：`data == null` →
