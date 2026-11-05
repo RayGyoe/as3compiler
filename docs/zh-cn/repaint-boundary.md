@@ -231,13 +231,17 @@ Present-skip 键与 DIRTY_MISS 诊断；彻底移除每帧哈希（改用全局�
 
 ### 阶段 B：写时脏标记 + 边界级失效（核心）
 
-> **实施状态（阶段三百六十八）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
+> **实施状态（阶段三百六十九）**：写点已覆盖全部渲染输入（DisplayObject 字段/accessor、容器结构、MovieClip
 > 帧、Graphics、Transform、Bitmap/BitmapData 反向引用、TextField、Stage）+ 7 类运行时内部状态（焦点、选择/caret、
 > IME 组合、caret 闪烁、filter 字段、Stage3D、SimpleButton hover）+ 动态字段写（`as_dyn_set`）钩子标脏，并修复
 > `as_mark_dirty` 短路 bug、autoSize 漏标脏、嵌套 cacheAsBitmap 不穿透、动态字段写漏标脏。真机 `DIRTY_MISS` 已清零，
 > **切换已完成**：失效改由 `_render_dirty` 驱动（`as_render_fp` 不再掉烘，只保留窗口 Present-skip 键 + DIRTY_MISS
 > 诊断）；auto-bake 触发由「静置 3 帧」改为「无脏即烘」；缓存分支区分显式 `cacheAsBitmap`（脏→当帧重烘）与
 > auto-bake（脏→退出边界、落到 live，静止当帧重烘）。
+> **阶段 C 第一步（脏矩形基础设施）已落地**：`DisplayObject` 增 `_dirty_full/_dirty_l/t/r/b` 字段；`as_mark_dirty`
+> 升级为整对象脏（置 `_dirty_full`）；新增 `as_dirty_merge`（防非有限矩形）与 `as_mark_dirty_rect`（合并 + 复用
+> `as_bounds_xform` 上溯变换）；新增 `as_clear_dirty` 递归清脏（**本次未启用**）。脏矩形**写了不读**，增量重烘留待
+> 下一步。
 
 - [x] `DisplayObject` 增 `_render_dirty` 字段与 `as_is_boundary` 判定（§4.2）。
 - [x] 按 `as_render_fp` 的字段枚举清单，在所有渲染输入写点注入 `as_mark_dirty(o)` + 向上传播（§4.3）。
@@ -265,10 +269,13 @@ Present-skip 键与 DIRTY_MISS 诊断；彻底移除每帧哈希（改用全局�
 
 ### 阶段 C：边界内脏矩形/脏子树增量重绘（最难，收益最大）
 
-- [ ] `DisplayObject` 增 `_dirty_l/t/r/b`（§4.2）。
-- [ ] 写点注入时**合并**脏矩形：`leaf._dirty` 与父级 `_dirty` 的并集沿链合并（父的脏矩形覆盖所有脏后代）。
+- [x] `DisplayObject` 增 `_dirty_l/t/r/b` + `_dirty_full`（§4.2）。
+- [x] 脏矩形合并/上溯：`as_dirty_merge`（防非有限矩形）+ `as_mark_dirty_rect`（合并 + 复用 `as_bounds_xform`
+      上溯变换到父坐标）；`as_mark_dirty` 置整对象脏（`_dirty_full=1`）。（注：写点目前仍走 `as_mark_dirty`
+      整对象脏，尚未改用 `as_mark_dirty_rect` 携带精确矩形——那需要各写点知道受影响区域的局部坐标。）
 - [ ] 边界重绘走**脏区域裁剪**：`save` + `clipRect(_dirty_*)` 后只重画脏矩形内的内容，其余 blit 旧快照；
   或（脏子树方案）只重画脏的那棵子树、其余子树 blit。
+- [ ] 「帧末统一复位」（`as_clear_dirty`）启用：与增量重烘配套，系统性修掉 auto-bake 增加暴露的漏点。
 - **验收**：
   - FPS 计数器场景（`TODO.md` 阶段四十七的 90×20 小块）：重绘像素面积从「整帧」降到「小块」，用
     `ASC_BAKE_TRACE` / 重绘面积计数器断言。

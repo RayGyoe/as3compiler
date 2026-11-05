@@ -1394,7 +1394,7 @@ function checkScrollRectBakeInvalidation(): string[] {
   const guard = guardAt < 0 ? '' : c.slice(guardAt, guardAt + 800);
   check('a render-input write drops the bake via _render_dirty (not the fingerprint)',
     guardAt >= 0
-    && guard.includes('o->_render_dirty = 0;')
+    && guard.includes('if (o->_render_dirty) {')
     && guard.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
     && guard.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
   check('the fingerprint walk no longer drops the bake (diagnostic only)',
@@ -2607,12 +2607,46 @@ function checkRepaintBoundary(): string[] {
     !emitted.includes('while (o != NULL && !o->_render_dirty) {') && emitted.includes('while (o != NULL) {'));
   check('as_mark_dirty is forward-declared for user-code call sites',
     emitted.includes('static void as_mark_dirty(DisplayObject* o);'));
-  check('the cache branch re-bakes on _render_dirty',
+  check('the cache branch re-bakes on _render_dirty (consume-time clear)',
     emitted.includes('int use_cache = 0;')
     && emitted.includes('if (o->_render_dirty) {')
     && emitted.includes('o->_render_dirty = 0;')
     && emitted.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
     && emitted.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+  // ---- Stage C: dirty rectangle (docs/zh-cn/repaint-boundary.md §4.2/§4.3) ----
+  check('DisplayObject declares the dirty-rectangle fields',
+    emitted.includes('int _dirty_full;')
+    && emitted.includes('double _dirty_l;')
+    && emitted.includes('double _dirty_t;')
+    && emitted.includes('double _dirty_r;')
+    && emitted.includes('double _dirty_b;'));
+  check('DisplayObject_ctor zeroes the dirty rectangle',
+    emitted.includes('o->_dirty_full = 0;')
+    && emitted.includes('o->_dirty_l = 0.0;')
+    && emitted.includes('o->_dirty_t = 0.0;')
+    && emitted.includes('o->_dirty_r = -1.0;')
+    && emitted.includes('o->_dirty_b = -1.0;'));
+  check('as_mark_dirty promotes to a whole-object dirty (unbounded rectangle)',
+    emitted.includes('o->_render_dirty = 1;')
+    && emitted.includes('o->_dirty_full = 1;'));
+  check('as_dirty_merge is defined and guards against a non-finite rectangle',
+    emitted.includes('static void as_dirty_merge(DisplayObject* o, double l, double t, double r, double b) {')
+    && emitted.includes('if (o->_dirty_full) return;')
+    && emitted.includes('!(l > -1e300) || !(t > -1e300)'));
+  check('as_mark_dirty_rect merges then transforms the rect up the parent chain',
+    emitted.includes('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b) {')
+    && emitted.includes('as_dirty_merge(o, l, t, r, b);')
+    && emitted.includes('as_bounds_xform(&l, &t, &r, &b, o->x, o->y, o->rotation, o->scaleX, o->scaleY'));
+  check('as_mark_dirty_rect is forward-declared',
+    emitted.includes('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b);'));
+  check('as_clear_dirty clears the flag and rectangle and recurses into children',
+    emitted.includes('static void as_clear_dirty(DisplayObject* o) {')
+    && emitted.includes('o->_render_dirty = 0;')
+    && emitted.includes('o->_dirty_full = 0;')
+    && emitted.includes('as_clear_dirty((DisplayObject*)as_v_obj_val(c->children->data[i]));'));
+  // Stage C (incremental re-bake) will call as_clear_dirty once after the paint;
+  // until the dirty rectangle is consumed, clearing stays at consume time in the
+  // cache branch and this end-of-frame reset stays disabled.
   check('the field-write tail appends as_mark_dirty after a render-input store',
     emitSource.includes('as_mark_dirty((DisplayObject*)${doDirtyRecv})'));
   check('the render-input set lists the nine plain geometry/colour fields',

@@ -19518,6 +19518,38 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
 （关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
+### 阶段三百六十九：RepaintBoundary 阶段 C 第一步 —— 脏矩形基础设施（v0.4.332 → v0.4.333）
+
+**起点**：阶段三百六十八切换后，失效与 auto-bake 触发均由写时 `_render_dirty` 驱动，每帧整树指纹哈希仍保留
+（窗口 Present-skip 键 + DIRTY_MISS 诊断）。本阶段铺「脏矩形增量重绘」的底：先落地脏矩形字段、合并与上溯
+变换（纯加法，写了不读），为阶段 C 后续的「边界内增量重烘」提供数据结构。
+
+**逐项**：
+1. **脏矩形字段**：`DisplayObject` 新增 `int _dirty_full;` 与 `double _dirty_l/_dirty_t/_dirty_r/_dirty_b;`；
+   ctor 初始化为 `_dirty_full=0`、`_dirty_l/t=0.0`、`_dirty_r/b=-1.0`（-1 表示空矩形）。
+2. **`as_mark_dirty` 升级为整对象脏**：除 `_render_dirty=1` 外再置 `_dirty_full=1`，沿祖先链冒泡。
+3. **`as_dirty_merge`**：合并脏矩形；防御非有限坐标（`!(l>-1e300) || !(t>-1e300) || ... || l>r || t>b` 时退化为
+   `_dirty_full=1`）。
+4. **`as_mark_dirty_rect`**：合并局部脏矩形后，复用 `as_bounds_xform` 上溯变换到父坐标，逐级冒泡；前置声明。
+5. **`as_clear_dirty`**：递归清 `_render_dirty` 与脏矩形（**本次未启用**，留待增量重烘阶段）。
+
+**关键决策 —— 「帧末统一复位」暂缓**：
+尝试把缓存分支的「消费时清脏」改为「帧末统一 `as_clear_dirty` 复位」（增量重烘的正确前提）。但真机 TalkMED
+复验发现：非边界祖先帧末清脏后 `!_render_dirty` 判定成立、auto-bake 大幅增加，暴露了「auto-bake Shape 指纹变而
+`_render_dirty==0`」的 `DIRTY_MISS`（连续 4 次）——这是此前被「消费时清脏下 auto-bake 几乎不触发」掩盖的既有漏点。
+回退为「消费时清脏」后 `DIRTY_MISS` 恢复 **0**。结论：「帧末统一复位」必须与「增量重烘 + 系统性修漏点」一起做，
+不能单独落地。
+
+**验收**：
+- 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
+- `unit: render/RepaintBoundary` 保持 **46 钉**（脏矩形字段/ctor/`as_mark_dirty` 整对象脏/`as_dirty_merge`/
+  `as_mark_dirty_rect` 上溯变换/`as_clear_dirty` 递归清）。
+- 真机 TalkMED 复验：`ASC_DIRTY_TRACE=1` 运行 90s，`DIRTY_MISS` 计数 **0**，无崩溃。
+
+**如实报明**：脏矩形字段已写入（`as_mark_dirty` 置 `_dirty_full`），但**尚未被读**——增量重烘未实现。
+**尚未完成**：① 边界内增量重烘（读 `_dirty_*` 做脏区域裁剪重绘）；② 「帧末统一复位」启用（与增量重烘配套）；
+③ 移除每帧整树指纹哈希（改全局脏 epoch 判 Present-skip）；④ `showRedrawRegions` oracle。
+
 ### 阶段三百六十八：RepaintBoundary 阶段 B 切换 —— 失效改由写时脏标记驱动（v0.4.331 → v0.4.332）
 
 **起点**：阶段三百六十七补齐全部写点后，真机 TalkMED `DIRTY_MISS` 清零，等价性验证达标。此时脏标记仍是

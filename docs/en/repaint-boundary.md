@@ -258,7 +258,7 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 
 ### Stage B: write-time dirty marking + boundary-level invalidation (core)
 
-> **Implementation status (stage three-sixty-eight)**: write points now cover every render input (DisplayObject
+> **Implementation status (stage three-sixty-nine)**: write points now cover every render input (DisplayObject
 > fields/accessors, container structure, MovieClip frames, Graphics, Transform, Bitmap/BitmapData reverse edges,
 > TextField, Stage) plus seven runtime-internal states (focus, selection/caret, IME composition, caret blink,
 > filter fields, Stage3D, SimpleButton hover) plus dynamic field writes (`as_dyn_set` hook), and fixes for the
@@ -268,6 +268,11 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 > the `DIRTY_MISS` diagnostic); the auto-bake trigger moved from a 3-frame sit-still to “still = not dirty”, and the
 > cache branch distinguishes explicit `cacheAsBitmap` (dirty → re-bake this frame) from auto-bake (dirty → tear the
 > boundary down, still → re-bake).
+> **Stage C step one (dirty-rect infrastructure) is landed**: `DisplayObject` gains `_dirty_full/_dirty_l/t/r/b`;
+> `as_mark_dirty` is upgraded to whole-object dirty (sets `_dirty_full`); new `as_dirty_merge` (guards non-finite
+> rects) and `as_mark_dirty_rect` (merge + `as_bounds_xform` upward transform) are added; `as_clear_dirty` recurses
+> to clear the flag and rect (**not yet enabled**). The rectangle is **written but not read** — incremental re-bake
+> is the next step.
 
 - [x] Add `_render_dirty` field and `as_is_boundary` predicate to `DisplayObject` (§4.2).
 - [x] Following `as_render_fp`'s field list, inject `as_mark_dirty(o)` + upward propagation into every render-input
@@ -304,12 +309,16 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 
 ### Stage C: intra-boundary dirty-rect/subtree incremental repaint (hardest, highest payoff)
 
-- [ ] Add `_dirty_l/t/r/b` to `DisplayObject` (§4.2).
-- [ ] Write-point injection **merges** dirty rects: `leaf._dirty` ∪ parent `_dirty` bubbles along the chain (a
-  parent's dirty rect covers all dirty descendants).
+- [x] Add `_dirty_l/t/r/b` + `_dirty_full` to `DisplayObject` (§4.2).
+- [x] Dirty-rect merge/bubble: `as_dirty_merge` (guards non-finite rects) + `as_mark_dirty_rect` (merge + reuse
+  `as_bounds_xform` upward transform to parent coords); `as_mark_dirty` sets whole-object dirty (`_dirty_full=1`).
+  (Note: write points still call `as_mark_dirty` whole-object dirty — they have not switched to `as_mark_dirty_rect`
+  with a precise rect, which needs each write point to know the affected region's local coords.)
 - [ ] Boundary redraw uses **dirty-region clipping**: `save` + `clipRect(_dirty_*)` then redraw only the content
   inside the dirty rect, blit the old snapshot elsewhere; or (dirty-subtree variant) redraw only the dirty
   subtree, blit the rest.
+- [ ] Enable the end-of-frame reset (`as_clear_dirty`) together with incremental re-bake, systematically fixing the
+  missed write points exposed by the increased auto-bake.
 - **Acceptance**:
   - FPS counter scene (`TODO.md` stage forty-seven's 90×20 region): redrawn pixel area drops from whole-frame to
     small-region, asserted via `ASC_BAKE_TRACE` / a redraw-area counter.

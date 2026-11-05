@@ -2012,6 +2012,18 @@ export class Emitter {
           // cacheAsBitmap boundary. Consumed by as_render_object's cache branch.
           // C-runtime only (not AS3-visible); a plain int, so no GC write barrier.
           this.line('int _render_dirty;');
+          // RepaintBoundary stage C (docs/zh-cn/repaint-boundary.md §4.2): the
+          // dirty RECTANGLE in the object's own local space. _dirty_full == 1
+          // means the whole object is dirty (the stage B conservative case — an
+          // unbounded rectangle); otherwise _dirty_l/t/r/b is a finite AABB
+          // accumulated from the dirty subtree (l<=r, t<=b). _dirty_l > _dirty_r
+          // means no finite rectangle has been merged yet. Cleared together with
+          // _render_dirty at end of frame. C-runtime only (not AS3-visible).
+          this.line('int _dirty_full;');
+          this.line('double _dirty_l;');
+          this.line('double _dirty_t;');
+          this.line('double _dirty_r;');
+          this.line('double _dirty_b;');
           // The clipDepth stencil needs no field here: the masked object points at
           // the mask SIBLING through `_clip_src` (declared in the DisplayObject
           // symbol table, so the GC marks it) and the path is rebuilt per frame.
@@ -3063,6 +3075,7 @@ export class Emitter {
     // declaration is the single source; the render preamble only defines them.
     this.line('static int as_is_boundary(DisplayObject* o);');
     this.line('static void as_mark_dirty(DisplayObject* o);');
+    this.line('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b);');
     this.line('static void as_bd_bind(BitmapData* bd, Bitmap* b);');
     this.line('static void as_bd_unbind(BitmapData* bd, Bitmap* b);');
     this.line('static void as_bd_mark_dirty(BitmapData* bd);');
@@ -12924,6 +12937,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_auto_fp = 0;');
     this.line('o->_auto_baked = 0;');
     this.line('o->_render_dirty = 0;');
+    this.line('o->_dirty_full = 0;');
+    this.line('o->_dirty_l = 0.0;');
+    this.line('o->_dirty_t = 0.0;');
+    this.line('o->_dirty_r = -1.0;');
+    this.line('o->_dirty_b = -1.0;');
     this.line('o->_clip_src = NULL;');
     this.line('o->_s9_on = 0;');
     this.line('o->_s9_apply = 0;');
@@ -29187,7 +29205,66 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('while (o != NULL) {');
     this.indent++;
     this.line('o->_render_dirty = 1;');
+    // Stage C: a whole-object invalidation is an unbounded rectangle (the stage B
+    // conservative case). as_mark_dirty_rect below narrows it to a finite AABB.
+    this.line('o->_dirty_full = 1;');
     this.line('o = (DisplayObject*)o->parent;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // RepaintBoundary stage C (docs/zh-cn/repaint-boundary.md §4.2/§4.3): merge a
+    // finite dirty AABB (in o's own local space) into o's accumulator, then walk up
+    // the chain, transforming the rect into each parent's local space via
+    // as_bounds_xform (matrix -> scale -> rotate -> translate, the same transform
+    // as_render_bounds uses, so a rotated/scaled child yields a conservative
+    // axis-aligned box). A rect that is not finite/sane promotes the object to
+    // _dirty_full (unbounded) — never a wrong-but-small clip.
+    this.line('static void as_dirty_merge(DisplayObject* o, double l, double t, double r, double b) {');
+    this.indent++;
+    this.line('o->_render_dirty = 1;');
+    this.line('if (o->_dirty_full) return;');
+    this.line('if (!(l > -1e300) || !(t > -1e300) || !(r < 1e300) || !(b < 1e300) || l > r || t > b) { o->_dirty_full = 1; return; }');
+    this.line('if (o->_dirty_l > o->_dirty_r) { o->_dirty_l = l; o->_dirty_t = t; o->_dirty_r = r; o->_dirty_b = b; }');
+    this.line('else {');
+    this.indent++;
+    this.line('if (l < o->_dirty_l) o->_dirty_l = l;');
+    this.line('if (t < o->_dirty_t) o->_dirty_t = t;');
+    this.line('if (r > o->_dirty_r) o->_dirty_r = r;');
+    this.line('if (b > o->_dirty_b) o->_dirty_b = b;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b) {');
+    this.indent++;
+    this.line('while (o != NULL) {');
+    this.indent++;
+    this.line('as_dirty_merge(o, l, t, r, b);');
+    this.line('as_bounds_xform(&l, &t, &r, &b, o->x, o->y, o->rotation, o->scaleX, o->scaleY, (o->transform != NULL) ? o->transform->matrix : NULL);');
+    this.line('o = (DisplayObject*)o->parent;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    // RepaintBoundary stage C: clear the dirty flag AND the dirty rectangle for the
+    // whole tree at end of frame. This is the incremental-re-bake companion to the
+    // cache branch's current clear-on-consume: once the dirty RECTANGLE is consumed
+    // (incremental re-bake), the cache branch stops clearing _render_dirty on
+    // consume and this runs once per painted frame (after Present) instead, so the
+    // next frame accumulates dirty from zero. It is DEFINED but NOT YET CALLED —
+    // enabling it before incremental re-bake would only widen auto-bake and expose
+    // missed write points (measured on TalkMED, DIRTY_MISS 0 → non-zero).
+    this.line('static void as_clear_dirty(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('o->_render_dirty = 0;');
+    this.line('o->_dirty_full = 0;');
+    this.line('o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
+    this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children != NULL) for (int i = 0; i < c->children->length; i++) as_clear_dirty((DisplayObject*)as_v_obj_val(c->children->data[i]));');
     this.indent--;
     this.line('}');
     this.indent--;
@@ -30027,6 +30104,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('if (o->_render_dirty) {');
     this.indent++;
+    // Clear at CONSUME time (not end-of-frame): a boundary object's flag must not
+    // survive its own re-bake, or an idle boundary keeps invalidating. Stage C will
+    // switch to end-of-frame clearing (as_clear_dirty) once the dirty RECTANGLE is
+    // consumed by incremental re-baking; until then the rectangle fields are written
+    // but not yet read.
     this.line('o->_render_dirty = 0;');
     this.line('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }');
     this.line('else { o->_auto_baked = 0; o->_cache_valid = 0; }');
@@ -31221,6 +31303,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
     this.line('#endif');
     this.line('w->render_fp = _window_fp; w->render_s3d_serial = ASC_stage3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
+    // Stage C (incremental re-bake) will switch to end-of-frame clearing via
+    // as_clear_dirty here; until the dirty rectangle is consumed, clearing stays at
+    // consume time in the cache branch and this reset is left disabled.
     this.line('if (getenv("ASC_PASS_TRACE") != NULL) { double _p3 = as_now_ms(); if (_p3 - _p0 >= 4.0) fprintf(stderr, "t=%.0f pass paint acquire=%.2f draw=%.2f flush=%.2f live=%d cached=%d\\n", as_now_ms(), _p1 - _p0, _p2 - _p1, _p3 - _p2, as_dbg_live_n, as_dbg_cached_n); }');
     this.line('return 1;');
     this.indent--;
