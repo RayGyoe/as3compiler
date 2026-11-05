@@ -2418,9 +2418,11 @@ function checkRenderBitmapLivePixels(): string[] {
     body('static void* as_bmd_visible_image(BitmapData* bd) {')
       .includes('if (bd->image != NULL && bd->_px_ver == 0) return bd->image;'));
 
-  // 4. The cacheAsBitmap fingerprint must include the pixel version, or an
-  //    auto-baked video view bakes once and never updates again.
-  check('the auto-bake fingerprint hashes _px_ver', c.includes('h = as_fp_u32(h, bd->_px_ver);'));
+  // 4. Stage C: the pixel version is still the live-image cache key, but a
+  //    mutation is now WRITE-driven (as_bd_mark_dirty bumps _px_ver and marks
+  //    every referring Bitmap). That write point is pinned in render/RepaintBoundary.
+  check('no fingerprint residue remains (_px_ver invalidation is write-driven)',
+    !c.includes('as_fp_u32'));
 
   console.log(`     [bmd-live] ${ok} BitmapData live-pixel check(s) passed`);
   return bad;

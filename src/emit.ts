@@ -1996,17 +1996,15 @@ export class Emitter {
           this.line('double _cache_phx;');
           this.line('double _cache_phy;');
           this.line('int _cache_valid;');
-          // Incremental-redraw state (auto cacheAsBitmap): _auto_fp is the
-          // subtree content fingerprint from the last frame (still kept for the
-          // window Present-skip key and the DIRTY_MISS diagnostic), and
-          // _auto_baked marks the subtree as currently baked into _cache_image.
-          // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): a
-          // still subtree is baked the instant it is NOT render-dirty — the old
-          // _auto_still settle counter (ASC_AUTO_BAKE_FRAMES frames) is gone, and
-          // invalidation is write-driven (_render_dirty), not fingerprint-driven.
-          this.line('uint32_t _auto_fp;');
+          // Incremental-redraw state (auto cacheAsBitmap): _auto_baked marks the
+          // subtree as currently baked into _cache_image. RepaintBoundary stage B
+          // switch (docs/zh-cn/repaint-boundary.md): a still subtree is baked the
+          // instant it is NOT render-dirty — the old _auto_still settle counter
+          // (ASC_AUTO_BAKE_FRAMES frames) is gone, and invalidation is write-driven
+          // (_render_dirty), not fingerprint-driven. Stage C removed the _auto_fp
+          // fingerprint field entirely: the window Present-skip key is now the
+          // global ASC_dirty_epoch, not a per-node hash.
           this.line('int _auto_baked;');
-           this.line('int _dbg_fp_changes;');
           // Write-time dirty flag (RepaintBoundary stage B, docs/zh-cn/repaint-boundary.md):
           // set by every write to a render input, bubbled up to the nearest
           // cacheAsBitmap boundary. Consumed by as_render_object's cache branch.
@@ -12934,7 +12932,6 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_cache_image = NULL;');
     this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
     this.line('o->_cache_valid = 0;');
-    this.line('o->_auto_fp = 0;');
     this.line('o->_auto_baked = 0;');
     this.line('o->_render_dirty = 0;');
     this.line('o->_dirty_full = 0;');
@@ -22809,23 +22806,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_render_object_content(void* canvas, DisplayObject* o);');
     this.line('static void as_disp_chain_scale(DisplayObject* o, double* ox, double* oy);');
     this.line('static void as_render_object(void* canvas, DisplayObject* o);');
-    // BitmapData.draw is a rendering PATH of its own (阶段二百八十二). The window
-    // paint and Stage.render both call as_render_fp() before drawing. RepaintBoundary
-    // stage B switch: that walk no longer DROPS a stale bake — invalidation is
-    // write-driven (_render_dirty, consumed by as_render_object's cache branch) —
-    // but it still updates _auto_fp (the window Present-skip key and the DIRTY_MISS
-    // diagnostic) and starts an auto-bake on a still subtree. draw() rasterizes
-    // through the SAME as_render_object/as_render_cached but used to skip the walk,
-    // so a subtree that is only ever seen through draw() stayed frozen at the frame
-    // in which it first baked (and an auto-bake could not even start there).
-    // Measured, examples/bake-draw-cache.as: an off-stage Sprite with
-    // `cacheAsBitmap = true`, `bd.draw(sprite)`, then `bmp.bitmapData = <new bd>`
-    // -- the second draw still read the FIRST bitmap (0xff0000). The meeting client
-    // hits exactly this: FilePreviewView.drawTimeEvent() rasterizes skinView.view
-    // (a ViewControl, i.e. cacheAsBitmap via cacheAsBitmapAndMatrix()) into a
-    // 1280x720 BitmapData at 10 fps and shows that BitmapData on screen, so the
-    // slide the presenter sees is the DRAW path's output, not the window pass.
-    this.line('static uint32_t as_render_fp(DisplayObject* o);');
+    // BitmapData.draw is a rendering PATH of its own (阶段二百八十二). Stage C
+    // removed the per-frame fingerprint, so invalidation is purely write-driven
+    // (_render_dirty, consumed by as_render_object's cache branch) and there is no
+    // hash to refresh before draw() rasterizes. draw() renders through the SAME
+    // as_render_object/as_render_cached, so an explicit cacheAsBitmap subtree is
+    // re-baked by its dirty flag on either path.
+    this.line('static void as_render_states(DisplayObject* o);');
     this.line('static int ASC_draw_path = 0;');
     this.line('static void as_tf_apply_autosize(TextField* tf);');
     // BitmapData.draw() composites the source OVER the destination (SourceOver): it
@@ -22972,12 +22959,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // rootLayer.visible = false and blits it with bitmapData.draw -- produced a
     // completely blank gift animation.
     this.line('DisplayObject* sdo = (DisplayObject*)src;');
-    // Refresh the fingerprint BEFORE the source transform is zeroed for the
-    // raster: the hash covers the object's own x/y/rotation/scale plus its whole
-    // subtree, and the window pass hashes the same fields. Doing it afterwards
-    // would hash the temporary identity transform, so the two paths would never
-    // agree on the value and each would drop the other's bake every frame.
-    this.line('as_render_fp(sdo);');
+    // Stage C: the per-frame fingerprint is gone, so there is no key to refresh
+    // here; invalidation is write-driven (_render_dirty). as_render_object settles
+    // MovieClip button states itself, and SimpleButton reads its state live in
+    // as_render_object_content.
     this.line('double sx_kx = sdo->x, sx_ky = sdo->y, sx_kr = sdo->rotation, sx_ksx = sdo->scaleX, sx_ksy = sdo->scaleY;');
     this.line('bool sx_kv = sdo->visible; double sx_ka = sdo->alpha;');
     this.line('Matrix* sx_km = (sdo->transform != NULL) ? sdo->transform->matrix : NULL;');
@@ -28244,20 +28229,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static int as_bake_stat_nodes = 0, as_bake_stat_valid_nodes = 0;');
     this.line('static double as_bake_stat_max_w = 0.0, as_bake_stat_max_h = 0.0;');
     this.line('static void* as_bake_stat_max_o = NULL;');
-    this.line('static int ASC_fp_trace = -1;');
-    this.line('static int ASC_dirty_trace = -1;');
     this.line('static void as_bake_stat_walk(DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL) return;');
-    this.line('if (ASC_fp_trace > 0 && o->_dbg_fp_changes > 0) {');
-    this.indent++;
-    this.line('as_vtable_header* vt = (as_vtable_header*)((as_object_header*)o)->vtable;');
-    this.line('const char* cn = (vt != NULL && vt->fqn != NULL) ? vt->fqn : ((vt != NULL && vt->name != NULL) ? vt->name : "?");');
-    this.line('const char* tx = as_is(o, &TextField_vt) && ((TextField*)o)->text != NULL ? ((TextField*)o)->text : "-";');
-    this.line('fprintf(stderr, "FPCHG n=%d o=%p cls=%s text=%.80s\\n", o->_dbg_fp_changes, (void*)o, cn, tx);');
-    this.line('o->_dbg_fp_changes = 0;');
-    this.indent--;
-    this.line('}');
     this.line('if (o->_cache_image != NULL && o->_cache_w > 0.0 && o->_cache_h > 0.0) {');
     this.indent++;
     this.line('uint64_t px = (uint64_t)(o->_cache_w * o->_cache_h); as_bake_stat_pixels += px; as_bake_stat_nodes++;');
@@ -29045,18 +29019,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('');
-    // ---- incremental redraw: auto cacheAsBitmap (dirty-free fingerprint) ----
+    // ---- incremental redraw: auto cacheAsBitmap (write-driven dirty flag) ----
     // DisplayObject x/y/rotation/scaleX/scaleY/alpha/visible are plain fields
-    // (written directly by generated code, no setter), so they cannot be cheaply
-    // intercepted. Instead of a push dirty flag we compute, each frame, a
-    // recursive *content fingerprint* of the subtree: the object's transform +
-    // its type-specific content (Shape path generation id + paints, Bitmap image,
-    // TextField text/format) + its filters + the recursive fingerprints of its
-    // children. RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md):
-    // the fingerprint no longer drives auto-bake — a write-time dirty flag does.
-    // This walk is kept for two jobs only: the window Present-skip key and the
-    // DIRTY_MISS diagnostic (a fingerprint move with _render_dirty still 0 flags
-    // a write point the marker missed).
+    // (written directly by generated code, no setter), so the write points inject
+    // as_mark_dirty on every render-input assignment. RepaintBoundary stage B
+    // switched invalidation from a per-frame content fingerprint to that
+    // write-driven flag; stage C then removed the fingerprint entirely (the window
+    // Present-skip key is the global ASC_dirty_epoch, and the DIRTY_MISS diagnostic
+    // is gone). as_render_states still walks the tree once per frame to settle
+    // MovieClip/SimpleButton states.
     // Upper bound on a cacheAsBitmap/auto-bake surface, in pixels. The bake is
     // sized to the destination resolution so the blit stays 1:1 (see
     // as_render_cached); this keeps a heavily scaled object from asking for a
@@ -29132,54 +29103,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('  if (area > AS_BAKE_MAX_PIXELS) f *= sqrt(AS_BAKE_MAX_PIXELS / area);');
     this.line('  *sx = dt_x * f; *sy = dt_y * f;');
     this.line('}');
-    this.line('');
-    this.line('static inline uint32_t as_fp_u32(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }');
-    this.line('static inline uint32_t as_fp_i32(uint32_t h, int v) { return (h ^ (uint32_t)v) * 16777619u; }');
-    this.line('static inline uint32_t as_fp_ptr(uint32_t h, const void* p) { return (h ^ (uint32_t)(uintptr_t)p) * 16777619u; }');
-    // Content-sensitive string hash for fingerprint inputs whose buffer is reused
-    // across edits (the IME composition preview: freed and re-malloc\'d on every
-    // keystroke, so a same-length replacement can land on the same address and a
-    // pointer-only hash would replay the stale bake).
-    this.line('static inline uint32_t as_fp_str(uint32_t h, const char* s) {');
-    this.indent++;
-    this.line('if (s == NULL) return as_fp_u32(h, 0u);');
-    this.line('for (const unsigned char* p = (const unsigned char*)s; *p != 0; p++) h = as_fp_u32(h, (uint32_t)*p);');
-    this.line('return as_fp_u32(h, 0u);');
-    this.indent--;
-    this.line('}');
-    this.line('static inline uint32_t as_fp_bool(uint32_t h, bool v) { return (h ^ (v ? 1u : 0u)) * 16777619u; }');
-    this.line('static inline uint32_t as_fp_dbl(uint32_t h, double v) {');
-    this.indent++;
-    this.line('uint64_t b; memcpy(&b, &v, sizeof b);');
-    this.line('h = as_fp_u32(h, (uint32_t)b); h = as_fp_u32(h, (uint32_t)(b >> 32));');
-    this.line('return h;');
-    this.indent--;
-    this.line('}');
-    this.line('static uint32_t as_fp_num_value(uint32_t h, as_value v) { h = as_fp_u32(h, v.tag); return as_fp_dbl(h, as_v_num_val(v)); }');
-    this.line('static uint32_t as_fp_bool_value(uint32_t h, as_value v) { h = as_fp_u32(h, v.tag); return as_fp_bool(h, as_v_bool_val(v)); }');
-    this.line('static uint32_t as_textformat_fp(uint32_t h, TextFormat* f) {');
-    this.indent++;
-    this.line('if (f == NULL) return as_fp_u32(h, 0u);');
-    this.line('h = as_fp_str(h, f->font); h = as_fp_num_value(h, f->size); h = as_fp_num_value(h, f->color);');
-    this.line('h = as_fp_bool_value(h, f->bold); h = as_fp_bool_value(h, f->italic); h = as_fp_bool_value(h, f->underline);');
-    this.line('h = as_fp_num_value(h, f->leading); h = as_fp_bool_value(h, f->kerning); h = as_fp_num_value(h, f->letterSpacing);');
-    this.line('h = as_fp_num_value(h, f->leftMargin); h = as_fp_num_value(h, f->rightMargin); h = as_fp_num_value(h, f->indent);');
-    this.line('h = as_fp_num_value(h, f->blockIndent); h = as_fp_bool_value(h, f->bullet);');
-    this.line('h = as_fp_str(h, f->align); h = as_fp_str(h, f->display); h = as_fp_str(h, f->url); h = as_fp_str(h, f->target);');
-    this.line('as_array* ts = (as_array*)as_v_obj_val(f->tabStops);');
-    this.line('if (ts != NULL) { h = as_fp_i32(h, ts->length); for (int i = 0; i < ts->length; i++) h = as_fp_num_value(h, ts->data[i]); }');
-    this.line('return h;');
-    this.indent--;
-    this.line('}');
-    this.line('static uint32_t as_render_fp(DisplayObject* o);');
-    this.line('static DisplayObject* as_fp_mask_stack[32];');
-    this.line('static int as_fp_mask_depth = 0;');
+    this.line('static void as_render_states(DisplayObject* o);');
     this.line('static int as_single_primitive(DisplayObject* o);');
     // RepaintBoundary (docs/zh-cn/repaint-boundary.md): a cacheAsBitmap object is a
     // repaint boundary -- the subtree bakes into a standalone bitmap and the parent
     // only blits it, so invalidation stops here. Stage B keeps the existing
     // fingerprint path in parallel; this predicate is consumed once the cache branch
     // reads _render_dirty.
+    // Global dirty epoch: bumped once per write-time invalidation (as_mark_dirty).
+    // The window Present-skip compares its last-presented epoch against this counter
+    // instead of hashing the whole tree every frame (stage C: removing the
+    // per-frame fingerprint). A monotonically increasing counter is the O(1)
+    // equivalent of "did anything get marked dirty this frame".
+    this.line('static uint64_t ASC_dirty_epoch = 0;');
     this.line('static int as_is_boundary(DisplayObject* o) { return o != NULL && o->_cache_flag; }');
     // Write-time invalidation: mark o and every ancestor up to the root dirty.
     // O(depth) on write, O(1) to test at render time.
@@ -29195,13 +29131,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     // cacheAsBitmap (a cached child inside a cached parent) snapshots the child's
     // bitmap into the parent's bake; when the child re-bakes, the parent's cached
     // image is stale and must re-bake too. Stopping at the child boundary leaves
-    // the parent's _render_dirty = 0 while its fingerprint (which folds THROUGH
-    // the child subtree, see as_render_fp) still moves -- the date-picker DIRTY_MISS
+    // the parent's _render_dirty = 0 while the child's pixels changed (the old
+    // per-frame fingerprint folded THROUGH the child subtree) -- the
+    // date-picker DIRTY_MISS
     // storm in 阶段三百六十七 (DateCell's cached highlight Sprite inside the cached
     // popup). Bubbling to the root is safe: non-boundary ancestors just keep a flag
     // that nothing consumes. This is what the old short-circuit bug missed.
     this.line('static void as_mark_dirty(DisplayObject* o) {');
     this.indent++;
+    this.line('ASC_dirty_epoch++;');
     this.line('while (o != NULL) {');
     this.indent++;
     this.line('o->_render_dirty = 1;');
@@ -29286,55 +29224,6 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_disp_dirty_hook = as_disp_dirty_impl;');
     this.indent--;
     this.line('}');
-    // ASC_DIRTY_TRACE diagnostic: dump the subtree of a cacheAsBitmap object that
-    // reported DIRTY_MISS, so the changing leaf (playing MovieClip / live BitmapData /
-    // blinking TextField) can be located. Depth/width-capped; only the first few
-    // explicit-cache misses dump, to avoid flooding the log.
-    this.line('static int as_dirty_dump_n = 0;');
-    this.line('static void as_dirty_dump(DisplayObject* o, int depth) {');
-    this.indent++;
-    this.line('if (o == NULL || depth > 6) return;');
-    this.line('int cur = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->currentFrame : -1;');
-    this.line('int ply = as_is(o, &MovieClip_vt) ? ((MovieClip*)o)->_playing : 0;');
-    this.line('unsigned int pxv = (as_is(o, &Bitmap_vt) && ((Bitmap*)o)->bitmapData != NULL) ? ((Bitmap*)o)->bitmapData->_px_ver : 0u;');
-    this.line('int fcs = (as_is(o, &TextField_vt) && as_focus_obj == o) ? 1 : 0;');
-    // Every fingerprint input that has no write point is printed here, so two
-    // consecutive dumps can be diffed to find the per-frame mover: geometry,
-    // matrix, Graphics path generation, filter count, TextField default format
-    // (TextFormat fields are NOT covered by a dirty write point), BitmapData
-    // version/uid. All were missing before, so a changing leaf whose txt/runs/fw
-    // stayed equal was invisible.
-    this.line('Matrix* fm = (o->transform != NULL) ? o->transform->matrix : NULL;');
-    this.line('Graphics* fg = as_graphics_of(o);');
-    this.line('unsigned gp = (fg != NULL && fg->path != NULL) ? as_skia_path_generation_id(fg->path) : 0u;');
-    this.line('int flen = (o->filters != NULL) ? o->filters->length : 0;');
-    this.line('fprintf(stderr, "  %*s%s cur=%d ply=%d pxv=%u dirty=%d fcs=%d x=%.3g y=%.3g a=%.3g v=%d s=%.3g,%.3g r=%.3g bm=%p gp=%u fl=%d", depth * 2, "", as_cls_of((void*)o), cur, ply, pxv, o->_render_dirty, fcs, o->x, o->y, o->alpha, o->visible, o->scaleX, o->scaleY, o->rotation, (void*)o->blendMode, gp, flen);');
-    this.line('if (fm != NULL) fprintf(stderr, " m=%.3g,%.3g,%.3g,%.3g,%.3g,%.3g", fm->a, fm->b, fm->c, fm->d, fm->tx, fm->ty);');
-    this.line('if (as_is(o, &TextField_vt)) {');
-    this.indent++;
-    this.line('TextField* tf = (TextField*)o;');
-    this.line('double ds = (tf->_dtf != NULL) ? as_v_num_val(tf->_dtf->size) : 0.0;');
-    this.line('double dc = (tf->_dtf != NULL) ? as_v_num_val(tf->_dtf->color) : 0.0;');
-    this.line('double is = (tf->_insFmt != NULL) ? as_v_num_val(tf->_insFmt->size) : 0.0;');
-    this.line('double ic = (tf->_insFmt != NULL) ? as_v_num_val(tf->_insFmt->color) : 0.0;');
-    this.line('fprintf(stderr, " txt=%p runs=%p fw=%.6g fh=%.6g as=%s dtf=%p ds=%.3g dc=%.0f insf=%p is=%.3g ic=%.0f", (void*)tf->text, (void*)tf->_runs, tf->_fieldWidth, tf->_fieldHeight, tf->autoSize != NULL ? tf->autoSize : "-", (void*)tf->_dtf, ds, dc, (void*)tf->_insFmt, is, ic);');
-    this.indent--;
-    this.line('} else if (as_is(o, &Bitmap_vt)) {');
-    this.indent++;
-    this.line('Bitmap* b = (Bitmap*)o;');
-    this.line('unsigned bdu = (b->bitmapData != NULL) ? b->bitmapData->_uid : 0u;');
-    this.line('fprintf(stderr, " bdu=%u bdsm=%d", bdu, b->smoothing);');
-    this.indent--;
-    this.line('}');
-    this.line('fprintf(stderr, "\\n");');
-    this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
-    this.indent++;
-    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
-    this.line('if (c->children != NULL) for (int i = 0; i < c->children->length && i < 12; i++) as_dirty_dump((DisplayObject*)as_v_obj_val(c->children->data[i]), depth + 1);');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
     // BitmapData → Bitmap reverse edges (docs/zh-cn/repaint-boundary.md §BitmapData).
     // The mark-sweep GC reclaims the Bitmap↔BitmapData cycle as a whole once the
     // display tree stops reaching it, and removeChild unbinds a removed Bitmap, so
@@ -29385,221 +29274,22 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static int ASC_no_auto_bake = -1;');
     this.line('static int ASC_bake_trace = -1;');
     this.line('static double ASC_auto_bake_cap = 1000000.0;');
-    this.line('static uint32_t as_render_fp(DisplayObject* o) {');
+    this.line('static void as_render_states(DisplayObject* o) {');
     this.indent++;
-    this.line('uint32_t h = 2166136261u;');
-    this.line('if (o == NULL) return h;');
-    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; ASC_fp_trace = getenv("ASC_FP_TRACE") != NULL ? 1 : 0; ASC_dirty_trace = getenv("ASC_DIRTY_TRACE") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
-    // MovieClip button states are settled HERE as well as in as_render_object, and
+    this.line('if (o == NULL) return;');
+    // MovieClip button states settle HERE as well as in as_render_object, and
     // this pass is the one that matters when an ANCESTOR is auto-baked: a baked
     // ancestor paints its cached image and never walks its descendants, so the
-    // card's own as_render_object (and the state move in it) never ran -- the
-    // timeline stayed on _up and the hover feedback was invisible (measured: the
-    // app's home cards, 306 px of change limited to the debug overlay, against
-    // adl's 15524 px on the card). The fingerprint walk does reach every node every
-    // frame, so settling here both moves the playhead and makes the frame part of
-    // the hash below, which drops the stale bake in this very frame.
+    // card's own as_render_object (and the state move in it) never ran. The
+    // states walk reaches every node every frame, so settling here moves the
+    // playhead (and as_mark_dirty bumps the dirty epoch, dropping the stale bake
+    // in this very frame).
     this.line('if (as_is(o, &MovieClip_vt)) as_mc_button_state(o);');
-    this.line('h = as_fp_dbl(h, o->x); h = as_fp_dbl(h, o->y);');
-    this.line('h = as_fp_dbl(h, o->rotation); h = as_fp_dbl(h, o->scaleX); h = as_fp_dbl(h, o->scaleY);');
-    this.line('h = as_fp_dbl(h, o->alpha); h = as_fp_bool(h, o->visible);');
-    this.line('h = as_fp_bool(h, o->_s9_on); h = as_fp_bool(h, o->_s9_apply);');
-    this.line('if (o->_s9_on) { h = as_fp_dbl(h, o->_s9x); h = as_fp_dbl(h, o->_s9y); h = as_fp_dbl(h, o->_s9w); h = as_fp_dbl(h, o->_s9h); }');
-    // The stage clear and content transform happen OUTSIDE as_render_object, so
-    // they cannot rely on a descendant changing the key.
-    this.line('if (as_is(o, &Stage_vt)) {');
-    this.indent++;
-    this.line('Stage* fps = (Stage*)o;');
-    this.line('h = as_fp_u32(h, fps->stage_color); h = as_fp_str(h, fps->scale_mode); h = as_fp_str(h, fps->align);');
-    this.line('if (fps->stage3ds != NULL) { h = as_fp_i32(h, fps->stage3ds->length); for (int i = 0; i < fps->stage3ds->length; i++) { Stage3D* s3 = fps->stage3ds->data[i]; h = as_fp_dbl(h, s3->x); h = as_fp_dbl(h, s3->y); h = as_fp_bool(h, s3->visible); } }');
-    this.indent--;
-    this.line('}');
-    // The timeline frame of a MovieClip is an input of its render exactly like
-    // scrollRect below: a frame move REPLACES children, but a move between two
-    // frames whose children happen to hash the same (or, more commonly, a move
-    // whose only difference is a child that keeps its geometry) must still
-    // invalidate the bake. Without this the MovieClip button states
-    // (as_mc_button_state) navigated to _over/_down and the pixels never moved:
-    // the fingerprint stayed equal, so the cached up-state image was replayed
-    // (measured on the app's home cards -- hover showed a 306 px diff limited to
-    // the debug overlay, against adl's 15524 px on the card).
-    this.line('if (as_is(o, &MovieClip_vt)) h = as_fp_i32(h, ((MovieClip*)o)->currentFrame);');
-    // DisplayObject.scrollRect is an input of the PARENT's render, not just of this
-    // object's own: the clip+translate in as_render_object runs outside the cached
-    // image (as_render_cached bakes as_render_object_content only), so a baked
-    // ANCESTOR freezes the scrolled child at whatever offset existed when it baked.
-    // Without this hash a scroll then neither moves the child nor ever invalidates
-    // that ancestor: the app's home tab row kept painting the frame in which the
-    // drag started (菜单回弹 D34 -- the bounce arithmetic ran, scrollX went
-    // 0->105->0, yet the pixels never moved, measured with ASC_NO_AUTO_BAKE=1 as
-    // the A/B: with auto-bake off the same drag scrolls and springs back).
-    // scrollRect.x/y/width/height are all live here: the accessor stores a private
-    // copy per assignment, so this reads exactly what the app last assigned.
-    this.line('if (o->_scroll_rect != NULL) { h = as_fp_dbl(h, o->_scroll_rect->x); h = as_fp_dbl(h, o->_scroll_rect->y); h = as_fp_dbl(h, o->_scroll_rect->width); h = as_fp_dbl(h, o->_scroll_rect->height); }');
-    this.line('if (o->transform != NULL && o->transform->matrix != NULL) {');
-    this.indent++;
-    this.line('Matrix* m = o->transform->matrix;');
-    this.line('h = as_fp_dbl(h, m->a); h = as_fp_dbl(h, m->b); h = as_fp_dbl(h, m->c);');
-    this.line('h = as_fp_dbl(h, m->d); h = as_fp_dbl(h, m->tx); h = as_fp_dbl(h, m->ty);');
-    this.indent--;
-    this.line('}');
-    this.line('h = as_fp_str(h, o->blendMode);');
-    this.line('h = as_fp_bool(h, as_v_is_number(o->opaqueBackground));');
-    this.line('if (as_v_is_number(o->opaqueBackground)) h = as_fp_dbl(h, as_v_num_val(o->opaqueBackground));');
-    this.line('ColorTransform* fpct = (o->transform != NULL) ? o->transform->colorTransform : NULL;');
-    this.line('if (fpct != NULL) {');
-    this.indent++;
-    this.line('h = as_fp_dbl(h, fpct->redMultiplier); h = as_fp_dbl(h, fpct->greenMultiplier); h = as_fp_dbl(h, fpct->blueMultiplier); h = as_fp_dbl(h, fpct->alphaMultiplier);');
-    this.line('h = as_fp_dbl(h, fpct->redOffset); h = as_fp_dbl(h, fpct->greenOffset); h = as_fp_dbl(h, fpct->blueOffset); h = as_fp_dbl(h, fpct->alphaOffset);');
-    this.indent--;
-    this.line('}');
-    this.line('Graphics* g = as_graphics_of(o);');
-    // Any object that owns a Graphics (Shape, or a Sprite/MovieClip that drew in
-    // itself) hashes its drawing; the chain below still only covers Bitmap and
-    // TextField, which are mutually exclusive with it.
-    // Each draw group carries its own path and paints, so a group edit that leaves
-    // the point count and the current paint untouched must still invalidate the
-    // bake: hash every group, not just the one being built.
-    this.line('if (g != NULL) {');
-    this.indent++;
-    this.line('for (as_gdraw* d = (as_gdraw*)g->draws; d != NULL; d = d->next) {');
-    this.indent++;
-    this.line('if (d->path != NULL) h = as_fp_u32(h, as_skia_path_generation_id(d->path));');
-    this.line('h = as_fp_ptr(h, d->fill); h = as_fp_ptr(h, d->stroke);');
-    this.line('h = as_fp_dbl(h, d->stroke_width);');
-    this.indent--;
-    this.line('}');
-    this.line('if (g->path != NULL) h = as_fp_u32(h, as_skia_path_generation_id(g->path));');
-    this.line('h = as_fp_ptr(h, g->fill); h = as_fp_ptr(h, g->stroke);');
-    this.indent--;
-    this.line('}');
     this.line('if (as_is(o, &SimpleButton_vt)) {');
     this.indent++;
     this.line('DisplayObject* st = as_sbtn_state(o);');
     this.line('if (((SimpleButton*)o)->_sbtn_prev != st) { ((SimpleButton*)o)->_sbtn_prev = st; as_mark_dirty(o); }');
-    this.line('h = as_fp_ptr(h, st); if (st != NULL) h = as_fp_u32(h, as_render_fp(st));');
-    this.indent--;
-    this.line('}');
-    this.line('if (as_is(o, &Bitmap_vt)) {');
-    this.indent++;
-    this.line('h = as_fp_bool(h, ((Bitmap*)o)->smoothing);');
-    this.line('BitmapData* bd = ((Bitmap*)o)->bitmapData;');
-    this.line('if (bd != NULL) h = as_fp_ptr(h, bd->image);');
-    // A Bitmap painted from its LIVE pixels (a bitmap built by `new BitmapData`,
-    // or a decoded one whose pixels were rewritten since) must re-bake when those
-    // pixels change: `image` stays NULL/constant on that path, so the version
-    // counter is the only input that moves. Without it a cacheAsBitmap video view
-    // froze on its first frame.
-    //
-    // The version counter alone is NOT enough, because it is per-BitmapData:
-    // swapping WHICH bitmap is displayed (`bitmap.bitmapData = next` in a slide
-    // viewer, the ImageLoader path in the meeting client) replaces the object,
-    // and the replacement starts life exactly like the old one -- image == NULL,
-    // _px_ver == 1 after its single draw(). Hashing the instance id closes that
-    // hole: `_uid` is unique per BitmapData and never recycled, so a change of
-    // which bitmap is on screen always moves the hash.
-    this.line('if (bd != NULL) { h = as_fp_u32(h, bd->_px_ver); h = as_fp_u32(h, bd->_uid); }');
-    this.indent--;
-    this.line('} else if (as_is(o, &TextField_vt)) {');
-    this.indent++;
-    this.line('TextField* tf = (TextField*)o;');
-    this.line('h = as_fp_ptr(h, tf->text); h = as_fp_ptr(h, tf->_dtf); h = as_fp_ptr(h, tf->_insFmt);');
-    this.line('h = as_textformat_fp(h, as_tf_base_fmt(tf));');
-    this.line('h = as_fp_dbl(h, tf->_fieldWidth); h = as_fp_dbl(h, tf->_fieldHeight);');
-    this.line('h = as_fp_bool(h, tf->background); h = as_fp_u32(h, tf->backgroundColor);');
-    // border/borderColor must be fingerprinted too: a plain field write bumps no
-    // fingerprint of its own, so a still bordered field would keep blitting its
-    // auto-baked image after `border` flips (or the colour changes).
-    this.line('h = as_fp_bool(h, tf->border); h = as_fp_u32(h, tf->borderColor);');
-    this.line('h = as_fp_i32(h, tf->scrollV);');
-    this.line('h = as_fp_bool(h, tf->multiline); h = as_fp_bool(h, tf->wordWrap);');
-    // Every remaining input the TextField render branch (as_render_object_content)
-    // and the paragraph cache (as_tf_paragraph) read must be fingerprinted. They
-    // are written by AS3 through setters/helpers that do NOT bump the fingerprint
-    // by themselves, so omitting one leaves the auto-bake stale and the field
-    // keeps drawing its previous pixels: the selection highlight only appeared
-    // after a scroll (scrollV finally moved the hash), scrollH panning, a
-    // `selectable`-text colour change and a horizontalAlign/autoSize toggle were
-    // equally invisible until something else forced a repaint (阶段八十九·九十七).
-    this.line('h = as_fp_ptr(h, tf->autoSize); h = as_fp_u32(h, tf->textColor);');
-    this.line('h = as_fp_i32(h, tf->_sel_begin); h = as_fp_i32(h, tf->_sel_end);');
-    this.line('h = as_fp_i32(h, tf->_scroll_h);');
-    // IME composition state: the in-progress string is drawn at the caret, yet it
-    // leaves text/caret/selection untouched -- so without it in the key the field
-    // kept replaying its bake and the preview never showed up. Measured in
-    // temp/imeprobe: composing "shu" after "ab\u4f60\u597d" (no other input moved)
-    // drew nothing until the focus moved. The caret and the password mask are
-    // fingerprinted for the same reason: both change what this branch paints
-    // (preview x position, masked layout string) without touching anything above.
-    this.line('h = as_fp_str(h, tf->_comp);');
-    this.line('h = as_fp_i32(h, tf->_sel_caret);');
-    this.line('h = as_fp_bool(h, as_focus_obj == (void*)tf);');
-    // The blink PHASE, and only while THIS field owns the caret. The caret is painted
-    // into whatever snapshot is current, so a window with nothing else moving
-    // auto-bakes its stage after a few idle frames and then keeps blitting that
-    // snapshot with the bar burnt in: MEASURED temp/imelive, 14 CopyFromScreen frames
-    // over 1.5 s byte-identical while the field was focused, and the very same build
-    // blinked as soon as one other object changed every frame and kept the stage out
-    // of the bake. With the phase in the key the bake drops on each flip, the field
-    // renders live (a focused TextField never comes from a bake) and the bar blinks.
-    this.line('if (as_focus_obj == (void*)tf && tf->selectable && as_tf_is_input(tf)) h = as_fp_i32(h, as_tf_caret_on());');
-    this.line('h = as_fp_bool(h, tf->displayAsPassword);');
-    this.line('h = as_fp_bool(h, tf->selectable); h = as_fp_str(h, tf->type);');
-    // Rich-text run table identity + size (a setTextFormat/htmlText rebuild replaces
-    // the array; in-place mutation of a run's TextFormat is still cached).
-    this.line('h = as_fp_ptr(h, tf->_runs);');
-    this.line('if (tf->_runs != NULL) {');
-    this.indent++;
-    this.line('h = as_fp_i32(h, tf->_runs->length);');
-    this.line('for (int i = 0; i < tf->_runs->length / 3; i++) {');
-    this.indent++;
-    this.line('h = as_fp_i32(h, as_v_int_val(tf->_runs->data[i * 3])); h = as_fp_i32(h, as_v_int_val(tf->_runs->data[i * 3 + 1]));');
-    this.line('h = as_textformat_fp(h, (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]));');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
-    this.line('if (o->filters != NULL) {');
-    this.indent++;
-    this.line('h = as_fp_i32(h, o->filters->length);');
-    this.line('for (int i = 0; i < o->filters->length; i++) {');
-    this.indent++;
-    this.line('void* f = as_v_obj_val(o->filters->data[i]);');
-    this.line('if (as_is(f, &BlurFilter_vt)) {');
-    this.indent++;
-    this.line('h = as_fp_dbl(h, ((BlurFilter*)f)->blurX); h = as_fp_dbl(h, ((BlurFilter*)f)->blurY);');
-    this.line('h = as_fp_i32(h, ((BlurFilter*)f)->quality);');
-    this.indent--;
-    this.line('} else if (as_is(f, &DropShadowFilter_vt)) {');
-    this.indent++;
-    this.line('DropShadowFilter* ds = (DropShadowFilter*)f;');
-    this.line('h = as_fp_dbl(h, ds->distance); h = as_fp_dbl(h, ds->angle); h = as_fp_u32(h, ds->color);');
-    this.line('h = as_fp_dbl(h, ds->alpha); h = as_fp_dbl(h, ds->blurX); h = as_fp_dbl(h, ds->blurY);');
-    this.line('h = as_fp_dbl(h, ds->strength); h = as_fp_i32(h, ds->quality);');
-    this.line('h = as_fp_bool(h, ds->inner); h = as_fp_bool(h, ds->knockout); h = as_fp_bool(h, ds->hideObject); h = as_fp_bool(h, ds->_shadow_only);');
-    this.indent--;
-    this.line('} else if (as_is(f, &GlowFilter_vt)) {');
-    this.indent++;
-    this.line('GlowFilter* gf = (GlowFilter*)f;');
-    this.line('h = as_fp_u32(h, gf->color); h = as_fp_dbl(h, gf->alpha); h = as_fp_dbl(h, gf->blurX);');
-    this.line('h = as_fp_dbl(h, gf->blurY); h = as_fp_dbl(h, gf->strength); h = as_fp_i32(h, gf->quality);');
-    this.line('h = as_fp_bool(h, gf->inner); h = as_fp_bool(h, gf->knockout); h = as_fp_bool(h, gf->_shadow_only);');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
-    this.line('DisplayObject* fp_masks[2]; fp_masks[0] = o->_clip_src; fp_masks[1] = o->_mask_ref;');
-    this.line('for (int i = 0; i < 2; i++) {');
-    this.indent++;
-    this.line('DisplayObject* m = fp_masks[i];');
-    this.line('if (m == NULL || m->parent != NULL) continue;');
-    this.line('int seen = 0; for (int j = 0; j < as_fp_mask_depth; j++) if (as_fp_mask_stack[j] == m) seen = 1;');
-    this.line('if (seen || as_fp_mask_depth >= 32) { h = as_fp_ptr(h, m); continue; }');
-    this.line('as_fp_mask_stack[as_fp_mask_depth++] = m; h = as_fp_u32(h, as_render_fp(m)); as_fp_mask_depth--;');
+    this.line('if (st != NULL) as_render_states(st);');
     this.indent--;
     this.line('}');
     this.line('if (as_is(o, &DisplayObjectContainer_vt)) {');
@@ -29607,43 +29297,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
     this.line('if (c->children != NULL) {');
     this.indent++;
-    this.line('for (int i = 0; i < c->children->length; i++) h = as_fp_u32(h, as_render_fp((DisplayObject*)as_v_obj_val(c->children->data[i])));');
+    this.line('for (int i = 0; i < c->children->length; i++) as_render_states((DisplayObject*)as_v_obj_val(c->children->data[i]));');
     this.indent--;
     this.line('}');
     this.indent--;
     this.line('}');
-    // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): the
-    // fingerprint no longer drives invalidation. A write-time dirty flag
-    // (_render_dirty) is the single source of truth for dropping a bake, consumed
-    // by as_render_object's cache branch. The walk still hashes every node each
-    // frame for the window Present-skip key and for the DIRTY_MISS diagnostic:
-    // a fingerprint that moved while _render_dirty stayed 0 is a write point the
-    // marker still does not cover (reported, not silently papered over).
-    this.line('if (h != o->_auto_fp) {');
-    this.indent++;
-    this.line('o->_auto_fp = h;');
-    this.line('if (ASC_fp_trace > 0) o->_dbg_fp_changes++;');
-    this.line('if (ASC_dirty_trace > 0 && (o->_auto_baked || o->_cache_flag) && o->_cache_valid && !o->_render_dirty) {');
-    this.indent++;
-    this.line('const char* dm_tx = (as_is(o, &TextField_vt) && ((TextField*)o)->text != NULL) ? ((TextField*)o)->text : "-";');
-    this.line('fprintf(stderr, "DIRTY_MISS o=%p cls=%s auto=%d cache=%d tx=%s: fp changed but _render_dirty was 0\\n", (void*)o, as_cls_of((void*)o), o->_auto_baked, o->_cache_flag, dm_tx);');
-    this.line('if (o->_cache_flag && as_dirty_dump_n < 2) { as_dirty_dump_n++; as_dirty_dump(o, 0); }');
-    this.indent--;
-    this.line('}');
-    this.indent--;
-    this.line('}');
-    // Auto-bake trigger: a still (not render-dirty) subtree bakes this frame.
-    // No ASC_AUTO_BAKE_FRAMES settle delay — a subtree that just stopped changing
-    // re-bakes immediately instead of idling 3 live frames (docs/zh-cn/
-    // repaint-boundary.md §4.4). Objects without deterministic bounds (empty
-    // containers) stay live; the render pass itself handles the bake.
-    this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {');
-    this.indent++;
-    this.line('double bl, bt, br, bb;');
-    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); }');
-    this.indent--;
-    this.line('}');
-    this.line('return h;');
     this.indent--;
     this.line('}');
     this.line('');
@@ -29896,7 +29554,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     // worth taking? A bake turns N draws into one blit, so N == 1 can only lose --
     // and on a GPU canvas it measurably does. Measured (output/perf/chat, 192 rows,
     // process CPU/frame): panel_bmp_192 2.92 -> 1.01 (bake refused) and
-    // panel_shape_192 3.13 -> 1.94. as_render_fp therefore refuses to auto-bake
+    // panel_shape_192 3.13 -> 1.94. The auto-bake trigger (as_render_object)
+    // therefore refuses to auto-bake
     // these; an EXPLICIT cacheAsBitmap is still honoured, because that is the
     // application's own request.
     this.line('static int as_draw_count(DisplayObject* o) {');
@@ -29935,6 +29594,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_render_object(void* canvas, DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL || !o->visible) return;');
+    // Environment probes hoisted out of the per-object loops (getenv is a linear
+    // scan of the environment block). as_render_object is the entry every render
+    // path reaches (window, Stage.render, BitmapData.draw), so the probes init
+    // here once per process (the -1 sentinel) instead of once per object per frame.
+    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
     // MovieClip button states settle BEFORE anything is measured or painted, so the
     // bounds, the nine-slice slice and the pixels all see the state the pointer
     // implies (as_mc_button_state is a no-op unless the clip is a buttonMode).
@@ -30092,13 +29756,24 @@ void FileStream_writeObject(void* _this, as_value v) {
     // live instead (阶段一百三十五).
     this.line('} else {');
     this.indent++;
+    // Auto-bake trigger (stage C: moved here from the old fingerprint walk). A still (not
+    // render-dirty) subtree bakes this frame; no ASC_AUTO_BAKE_FRAMES settle delay
+    // (docs/zh-cn/repaint-boundary.md §4.4). Objects without deterministic bounds
+    // (empty containers) stay live. It runs before the cache decision so the flag
+    // set here is visible to the branch below.
+    this.line('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {');
+    this.indent++;
+    this.line('double bl, bt, br, bb;');
+    this.line('if (as_render_bounds(o, &bl, &bt, &br, &bb)) { o->_auto_baked = 1; if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_on o=%p bl=%.4f bt=%.4f w=%.4f h=%.4f\\n", as_now_ms(), (void*)o, bl, bt, br - bl, bb - bt); }');
+    this.indent--;
+    this.line('}');
     // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): the
     // write-time dirty flag is the ONLY thing that drops a bake. An explicit
     // cacheAsBitmap (_cache_flag) re-bakes THIS frame (AIR regenerates the bitmap
     // on change, no settle delay); an auto-bake (_auto_baked) tears the boundary
     // down and falls through to the live filters/content path so a
     // continuously-changing subtree does not re-bake every frame — it re-bakes the
-    // instant it is still again (as_render_fp triggers _auto_baked on !dirty).
+    // instant it is still again (the trigger above sets _auto_baked on !dirty).
     this.line('int use_cache = 0;');
     this.line('if ((o->_cache_flag || o->_auto_baked) && !(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)) {');
     this.indent++;
@@ -30596,7 +30271,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // twin of the window paint; a test that only calls dispatchMouse keeps the
     // target that event stored).
     this.line('as_mouse_refresh_target((DisplayObject*)_this);');
-    this.line('as_render_fp((DisplayObject*)_this);');
+    this.line('as_render_states((DisplayObject*)_this);');
     // Stage.render is this runtime's SCREENSHOT hook (AIR has no such API): include
     // the caret overlay so the PNG shows what the window shows. BitmapData.draw and
     // cacheAsBitmap bakes deliberately do NOT (they match adl, see ASC_caret_pass).
@@ -30650,7 +30325,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void* surface;');
     // Last presented content. ENTER_FRAME still runs at full rate; an unchanged
     // window only skips the redundant raster + Present, never AS3/timers/input.
-    this.line('uint32_t render_fp;');
+    this.line('uint64_t render_epoch;');
     this.line('uint64_t render_s3d_serial;');
     this.line('uint64_t render_gpu_generation;');
     this.line('uint64_t render_window_generation;');
@@ -31170,8 +30845,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('if (as_dbg_frame_n == 1) as_bake_stat_report(st, id);');
-    this.line('uint32_t _window_fp = as_render_fp((DisplayObject*)st);');
-    this.line('if (as_dbg_frame_n == 1 && ASC_fp_trace > 0) fprintf(stderr, "WKEY win=%d valid=%d old=%08x new=%08x stagefp=%08x\\n", id, w->render_valid, w->render_fp, _window_fp, ((DisplayObject*)st)->_auto_fp);');
+    // Stage C: settle MovieClip/SimpleButton states before the Present-skip decision
+    // (a state move calls as_mark_dirty, which bumps the dirty epoch). The window
+    // Present-skip key is the global dirty epoch, not a per-frame tree hash.
+    this.line('as_render_states((DisplayObject*)st);');
     this.line('uint64_t _gpu_generation = 0;');
     this.line('uint64_t _window_generation = 0;');
     this.line('#ifdef ASC_RENDER_WINGPU');
@@ -31182,13 +30859,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#endif');
     this.line('if (w->render_valid) {');
     this.indent++;
-    this.line('if (w->render_fp != _window_fp) as_dbg_key_fp_n++;');
+    this.line('if (w->render_epoch != ASC_dirty_epoch) as_dbg_key_fp_n++;');
     this.line('if (w->render_s3d_serial != ASC_stage3d_serial) as_dbg_key_s3d_n++;');
     this.line('if (w->render_gpu_generation != _gpu_generation) as_dbg_key_gpu_n++;');
     this.line('if (w->render_window_generation != _window_generation) as_dbg_key_window_n++;');
     this.indent--;
     this.line('}');
-    this.line('if (w->render_valid && w->render_fp == _window_fp && w->render_s3d_serial == ASC_stage3d_serial && w->render_gpu_generation == _gpu_generation && w->render_window_generation == _window_generation && getenv("ASC_NO_PRESENT_SKIP") == NULL) { as_dbg_present_skip_n++; return 0; }');
+    this.line('if (w->render_valid && w->render_epoch == ASC_dirty_epoch && w->render_s3d_serial == ASC_stage3d_serial && w->render_gpu_generation == _gpu_generation && w->render_window_generation == _window_generation && getenv("ASC_NO_PRESENT_SKIP") == NULL) { as_dbg_present_skip_n++; return 0; }');
     // Any early return below must retry next frame, never accept a half-new state.
     this.line('w->render_valid = 0;');
     this.line('void* canvas = NULL;');
@@ -31292,8 +30969,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#endif');
     this.line('ASC_render_scale = w->scale;');
     // Window composition pass: the caret overlay is drawn only here (see the
-    // ASC_caret_pass note). as_render_fp above does NOT set it, so the fingerprint
-    // (and therefore any bake) never sees a caret.
+    // ASC_caret_pass note). as_render_states above does NOT set it, so any bake
+    // (which renders through as_render_object_content without the caret pass)
+    // never sees a caret.
     this.line('ASC_caret_pass = 1;');
     this.line('as_render_object(canvas, (DisplayObject*)st);');
     this.line('ASC_caret_pass = 0;');
@@ -31302,7 +30980,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
     this.line('#endif');
-    this.line('w->render_fp = _window_fp; w->render_s3d_serial = ASC_stage3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
+    this.line('w->render_epoch = ASC_dirty_epoch; w->render_s3d_serial = ASC_stage3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
     // Stage C (incremental re-bake) will switch to end-of-frame clearing via
     // as_clear_dirty here; until the dirty rectangle is consumed, clearing stays at
     // consume time in the cache branch and this reset is left disabled.
@@ -33537,8 +33215,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     // The invalidation an extension's write needs. `_px_ver` is exactly what every
     // AS3 mutator bumps (setPixel32, fillRect, setPixels, draw, ...): as_bmd_live_image
-    // rebuilds its SkImage when the version moves, and as_render_fp hashes it, so one
-    // increment both refreshes the pixels and breaks any cached frame.
+    // rebuilds its SkImage when the version moves, and the version bump also marks
+    // every referring Bitmap dirty (as_bd_mark_dirty), so one increment both
+    // refreshes the pixels and breaks any cached frame.
     this.line('static void as_fre_bmd_dirty_impl(void* p) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)p;');

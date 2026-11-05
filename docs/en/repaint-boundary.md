@@ -222,17 +222,18 @@ setting** (O(1) on write, O(dirty) on read). They are not equivalent replacement
 
 | Use | Current | New |
 |---|---|---|
-| Window-level "skip Present when unchanged" | `render_fp` (whole-tree hash) | **keep** `render_fp`, but its input can be "dirty this frame?" instead of "re-hash every field" |
+| Window-level "skip Present when unchanged" | `render_fp` (whole-tree hash) | **switch to** a global dirty epoch (`ASC_dirty_epoch`), bumped on write, O(1) "dirty this frame?" test |
 | cacheAsBitmap invalidation | fingerprint change → drop bake | **switch to** write-time dirty marking (AIR-aligned) |
 | auto-bake trigger | sit still 3 frames then bake | **switch to** write-time dirty marking (bake on change, no sit-still latency) |
 | Render-input full set (miss-prevention list) | `as_render_fp` hashed fields | **keep as the source** of the write-point injection list, but no longer execute per frame |
 
-**Migration strategy (regression guard, switch now done)**: stage B ran **parallel first, switch later**. New
+**Migration strategy (regression guard, switch + removal now done)**: stage B ran **parallel first, switch later**. New
 marking coexisted with the existing fingerprint, and the `DIRTY_MISS` probe verified "fingerprint changed ⇔ dirty
 set" true-iff-true across all examples; once zero, `_cache_flag` invalidation and the auto-bake trigger both moved
-to write-time dirty marking and `as_render_fp`'s drop-bake was deleted. The per-frame whole-tree hash is **still
-kept** — it only serves the window Present-skip key and the `DIRTY_MISS` diagnostic; removing it entirely (a global
-dirty epoch instead of re-hashing all fields) is deferred to stage C.
+to write-time dirty marking and `as_render_fp`'s drop-bake was deleted. Stage C step two **removed the per-frame
+whole-tree hash entirely**: the window Present-skip key changed from `w->render_fp == _window_fp` to the global
+`ASC_dirty_epoch` (bumped on write); `as_render_fp` became `as_render_states` (settles MovieClip/SimpleButton state
+only, no hashing); `_auto_fp` / fingerprint helpers / `DIRTY_MISS` diagnostic were deleted.
 
 `BitmapData`'s `_px_ver`/`_uid` version counters (currently read by the fingerprint) keep their **semantics**
 under dirty marking — they remain the authoritative "BitmapData content changed" signal, only changing from
@@ -268,6 +269,10 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 > the `DIRTY_MISS` diagnostic); the auto-bake trigger moved from a 3-frame sit-still to “still = not dirty”, and the
 > cache branch distinguishes explicit `cacheAsBitmap` (dirty → re-bake this frame) from auto-bake (dirty → tear the
 > boundary down, still → re-bake).
+> **Stage C step two (remove the per-frame fingerprint hash) is landed**: `as_render_fp` is deleted and replaced by
+> `as_render_states` (settles MovieClip/SimpleButton state only); the window Present-skip key became the global
+> `ASC_dirty_epoch` (bumped on write); `_auto_fp` / fingerprint helpers / `DIRTY_MISS` / `ASC_DIRTY_TRACE` are all
+> deleted; the auto-bake trigger moved into `as_render_object` before the cache decision.
 > **Stage C step one (dirty-rect infrastructure) is landed**: `DisplayObject` gains `_dirty_full/_dirty_l/t/r/b`;
 > `as_mark_dirty` is upgraded to whole-object dirty (sets `_dirty_full`); new `as_dirty_merge` (guards non-finite
 > rects) and `as_mark_dirty_rect` (merge + `as_bounds_xform` upward transform) are added; `as_clear_dirty` recurses
@@ -309,6 +314,9 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 
 ### Stage C: intra-boundary dirty-rect/subtree incremental repaint (hardest, highest payoff)
 
+- [x] **Remove the per-frame fingerprint hash**: `as_render_fp` deleted → `as_render_states` (settles
+  MovieClip/SimpleButton state only); window Present-skip key became the global `ASC_dirty_epoch` (bumped on write);
+  deleted `_auto_fp` / fingerprint helpers / `DIRTY_MISS` / `ASC_DIRTY_TRACE`.
 - [x] Add `_dirty_l/t/r/b` + `_dirty_full` to `DisplayObject` (§4.2).
 - [x] Dirty-rect merge/bubble: `as_dirty_merge` (guards non-finite rects) + `as_mark_dirty_rect` (merge + reuse
   `as_bounds_xform` upward transform to parent coords); `as_mark_dirty` sets whole-object dirty (`_dirty_full=1`).

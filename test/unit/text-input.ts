@@ -486,10 +486,11 @@ function checkTextInput(): string[] {
   check('the renderer paints the composition at the caret with an underline',
     /if \(tf->_comp != NULL && tf->_comp\[0\] != 0\)/.test(c) &&
     /tf->_comp != NULL && tf->_comp\[0\] != 0[\s\S]{0,1200}?as_skia_canvas_draw_rect\(canvas, px, py/.test(c));
-  check('the composition state is part of the invalidation fingerprint',
-    /h = as_fp_str\(h, tf->_comp\);/.test(c) && c.includes('static inline uint32_t as_fp_str(uint32_t h, const char* s)'));
-  check('the caret and the password mask are fingerprinted for the same reason',
-    /h = as_fp_i32\(h, tf->_sel_caret\);/.test(c) && /h = as_fp_bool\(h, tf->displayAsPassword\);/.test(c));
+  check('the composition/caret/password invalidation is write-driven, not a fingerprint',
+    !c.includes('static uint32_t as_render_fp')
+    && !c.includes('as_fp_str')
+    && !c.includes('as_fp_i32')
+    && !c.includes('as_fp_bool'));
   check('Skia range queries receive UTF-16 indices, not our byte offsets',
     c.includes('static int as_tf_utf16_index(TextField* tf, int byteIndex)') &&
     /as_skia_textlayout_caret_rect\(para, as_tf_utf16_index\(tf, as_tf_caret\(tf\)\)/.test(c) &&
@@ -552,8 +553,9 @@ function checkTextSelection(): string[] {
     && c.includes('*b = tf->_fieldHeight + (tf->border ? 1.0 : 0.0);')
     && c.includes('sw = (int)ceil(tf->_fieldWidth * rs) + (tf->border ? 1 : 0);')
     && c.includes('sh = (int)ceil(tf->_fieldHeight * rs) + (tf->border ? 1 : 0);'));
-  check('the auto-bake fingerprint covers the border',
-    c.includes('h = as_fp_bool(h, tf->border); h = as_fp_u32(h, tf->borderColor);'));
+  check('the border is a render-input write point (fingerprint is gone in stage C)',
+    !c.includes('as_fp_bool')
+    && c.includes('void TextField_set_borderColor(void* _this, unsigned int value) { ((TextField*)_this)->borderColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }'));
 
   // 拖选：C2 依据单次合成拖拽写成的「仅 type=input 生效」已被 Ed5 实推翻，
   // 门控只剩 selectable；半开区间 [begin,end) 的「点在选择区内」按实测实现。
@@ -629,14 +631,13 @@ function checkCaret(): string[] {
   check('the caret width is one DEVICE pixel (scale divided out), like the border',
     /double kw = ASC_render_scale \/ ksx;/.test(c));
   // (4) the window compose pass switches it on; Stage.render (the screenshot hook)
-  // does too; the fingerprint and every bake never do.
+  // does too; the fingerprint is gone (stage C) and every bake never does.
   check('ASC_window_render enables the caret pass around the display list only',
     /ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)st\);\n\s*ASC_caret_pass = 0;/.test(c));
-  check('Stage.render (screenshot hook) enables the caret pass',
-    /as_render_fp\(\(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 0;/.test(c));
-  const fp = c.match(/static uint32_t as_render_fp\(DisplayObject\* o\) \{[\s\S]*?\n\}/);
-  check('the fingerprint never depends on the caret pass (a bake must not capture a caret)',
-    fp !== null && !/ASC_caret_pass/.test(fp[0]));
+  check('Stage.render (screenshot hook) settles states then enables the caret pass',
+    /as_render_states\(\(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 1;\n\s*as_render_object\(canvas, \(DisplayObject\*\)_this\);\n\s*ASC_caret_pass = 0;/.test(c));
+  check('no fingerprint residue remains (a bake can never capture a caret)',
+    !c.includes('static uint32_t as_render_fp'));
   // (5) a focused TextField renders live, never from a bake (the caret blinks).
   check('a focused TextField is never served from a bake',
     c.includes('!(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)'));

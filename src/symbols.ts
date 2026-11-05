@@ -2408,7 +2408,7 @@ export class SymbolTable {
         ['overState', sbf({ kind: 'object', className: 'DisplayObject' })],
         ['downState', sbf({ kind: 'object', className: 'DisplayObject' })],
         ['hitTestState', sbf({ kind: 'object', className: 'DisplayObject' })],
-        // Last settled state (set in as_render_fp); a hover/press flip marks the
+        // Last settled state (set in as_render_states); a hover/press flip marks the
         // button render-dirty since its state is read-time computed, not written.
         ['_sbtn_prev', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'SimpleButton', isStatic: false, isConst: false }],
       ]),

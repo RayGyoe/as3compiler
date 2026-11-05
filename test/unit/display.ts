@@ -204,11 +204,10 @@ function checkDisplayGeometry(): string[] {
   check('the pen position carries across a flush so a mid-path style change keeps the segment',
     c.includes('if (g->_cur_open) as_skia_path_move_to(g->path, g->_lastx, g->_lasty);')
     && c.includes('static void as_gpen(Graphics* g, double x, double y) {'));
-  check('render, hit test and the bake fingerprint all walk the group list',
+  check('render and hit test both walk the group list (the fingerprint that also walked it is gone in stage C)',
     c.includes('for (as_gdraw* d = (as_gdraw*)g->draws; d != NULL; d = d->next) {')
     && c.includes('static void as_graphics_paint(void* canvas, Graphics* g) {')
-    && c.includes('d->fill != NULL && as_skia_path_contains(d->path, lx, ly)')
-    && c.includes('h = as_fp_dbl(h, d->stroke_width);'));
+    && c.includes('d->fill != NULL && as_skia_path_contains(d->path, lx, ly)'));
   check('clear() releases the group list (the only owner of the malloc nodes)',
     c.includes('as_gdraw* next = d->next;') && c.includes('free(d);'));
   check('bounds read the CPU box, never Skia',
@@ -229,7 +228,7 @@ function checkDisplayGeometry(): string[] {
     && c.includes('if (as_is((void*)o, &Sprite_vt)) return ((Sprite*)o)->_graphics;'));
   check('a container draws its own graphics under its children',
     /DisplayObjectContainer\* c = \(DisplayObjectContainer\*\)o;[\s\S]{0,700}?Graphics\* sg = as_graphics_of\(o\);[\s\S]{0,400}?for \(int i = 0; i < c->children->length; i\+\+\) as_render_object/.test(c));
-  check('the auto-bake fingerprint covers Sprite/MovieClip graphics too',
+  check('Sprite/MovieClip graphics render through as_graphics_of (a render input)',
     c.includes('Graphics* g = as_graphics_of(o);'));
 
   // 命中测试：舞台坐标 -> 逐层折算局部坐标 -> 按内容包围盒判定。
@@ -387,18 +386,13 @@ function checkTransformMatrix(): string[] {
   check('a valued transform.matrix write is hoisted, never nested as a void operand',
     !c.includes('(Matrix*)(DisplayObject_set_transform_matrix') && !c.includes(' = DisplayObject_set_transform_matrix'));
 
-  // (4) Repaint fingerprint: the TextField branch of as_render_fp must include the
-  // selection range and the scroll offset (and the layout inputs that were already
-  // stale-prone), or a drag-selection is invisible until something else repaints.
-  const fpStart = c.indexOf('static uint32_t as_render_fp(DisplayObject* o) {');
-  const fp = fpStart < 0 ? '' : c.slice(fpStart, c.indexOf('\nstatic ', fpStart + 10));
-  check('the TextField fingerprint covers the selection range and scroll offset',
-    ['tf->_sel_begin', 'tf->_sel_end', 'tf->_scroll_h'].every((f) => fp.includes(f)));
-  check('...and the run list, so a text change invalidates it', fp.includes('tf->_runs'));
-  check('...and the layout inputs (align / autoSize / textColor)',
-    fp.includes('as_textformat_fp(h, as_tf_base_fmt(tf))')
-    && c.includes('as_fp_str(h, f->align)')
-    && ['tf->autoSize', 'tf->textColor'].every((f) => fp.includes(f)));
+  // (4) Stage C: the TextField selection/scroll/text/layout inputs are still
+  // render inputs, but invalidation is now WRITE-driven (selection/scrollH/text/
+  // setTextFormat setters mark dirty). Those write points are pinned in
+  // render/RepaintBoundary; here we only assert no fingerprint residue remains.
+  check('the TextField fingerprint is gone (selection/scroll invalidation is write-driven)',
+    !c.includes('static uint32_t as_render_fp')
+    && !c.includes('as_textformat_fp'));
 
   // (5) Cursor: the glue seam must exist on every backend, the sampler must run
   // after the mouse dispatch (a listener may set Mouse.cursor or toggle
@@ -1071,13 +1065,13 @@ function checkMcButtonState(): string[] {
   check('the private latch field is declared on InteractiveObject (not a GC-rooted pointer)',
     symbolsSource.includes("['_btn_press_gen', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'InteractiveObject'"));
 
-  // ④ 两处结算点：绘制 pass + 指纹 pass（祖先被自动烘培时只有后者会走到子件）
+  // ④ 两处结算点：绘制 pass + 状态结算 pass（祖先被自动烘培时只有后者会走到子件）
   check('the state settles in the paint pass',
     emitSource.includes("if (as_is((void*)o, &MovieClip_vt)) as_mc_button_state(o);"));
-  check('the state settles in the fingerprint pass (baked-ancestor path)',
+  check('the state settles in as_render_states (baked-ancestor path)',
     emitSource.includes("if (as_is(o, &MovieClip_vt)) as_mc_button_state(o);"));
-  check('the fingerprint carries the timeline frame (so a stale bake drops)',
-    emitSource.includes('if (as_is(o, &MovieClip_vt)) h = as_fp_i32(h, ((MovieClip*)o)->currentFrame);'));
+  check('a timeline frame change marks the MovieClip dirty (write-driven, not a fingerprint)',
+    emitSource.includes('if (f != o->currentFrame) as_mark_dirty((DisplayObject*)o);'));
 
   // ⑤ 每帧刷新拾取目标（鼠标停着不动时也要跟着显示列表变）+ 两个入口都要刷新，
   // 且用的是**正在绘制那个 stage** 自己的坐标

@@ -19518,6 +19518,42 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
 （关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
+### 阶段三百七十：RepaintBoundary 阶段 C 第二步 —— 彻底移除每帧指纹哈希（v0.4.333 → v0.4.334）
+
+**起点**：阶段三百六十九落地脏矩形基础设施（写了不读），但每帧整树指纹哈希 `as_render_fp` 仍保留——它服务
+窗口 Present-skip 键（`w->render_fp == _window_fp`）与 `DIRTY_MISS` 诊断。本阶段彻底删除这条每帧 O(树) 的哈希路径，
+把「本帧是否有脏」改为全局单调 epoch 判据。
+
+**逐项**：
+1. **全局脏 epoch**：新增 `static uint64_t ASC_dirty_epoch = 0;`，`as_mark_dirty` 每次调用先 `ASC_dirty_epoch++`。
+   写点仍然把 `_render_dirty`/`_dirty_full` 沿祖先链置位，但「本帧是否有任何写」由 epoch 单调性 O(1) 判读。
+2. **Present-skip 键从指纹哈希改为 epoch**：`ASCWin.render_fp`（`uint32_t`）改为 `render_epoch`（`uint64_t`）；
+   `ASC_window_render` 的命中判据从 `w->render_fp == _window_fp` 改为 `w->render_epoch == ASC_dirty_epoch`（与
+   `render_s3d_serial`/`render_gpu_generation`/`render_window_generation` 并列）。
+3. **`as_render_fp` 删除，替换为 `as_render_states`**：新函数每帧仍走一遍树，但只结算 MovieClip/SimpleButton 状态
+   （状态变化经 `as_mark_dirty` bump epoch），不再计算任何哈希。`Stage_render` 的 `as_render_fp((DisplayObject*)_this)`
+   改为 `as_render_states((DisplayObject*)_this)`。
+4. **auto-bake 触发迁到 `as_render_object`**：原来 `as_render_fp` 里的静置探测改为 cache 决策前的显式触发——
+   `!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)`
+   时 `o->_auto_baked=1`（无脏即烘，无静置延迟）。
+5. **删除指纹哈希产物**：`DisplayObject` 移除 `_auto_fp`/`_dbg_fp_changes` 字段；删除 9 个指纹 helper
+   （`as_fp_u32/i32/ptr/str/bool/dbl` + `as_fp_num_value` + `as_fp_bool_value` + `as_textformat_fp`）；删除
+   `as_dirty_dump`/`DIRTY_MISS`/`ASC_DIRTY_TRACE`/`ASC_FP_TRACE` 诊断；`BitmapData.draw` 不再刷新指纹。
+6. **测试钉子同步**：`render/PresentSkip`、`render/ScrollRectBake`、`display/McButtonState`/`DisplayGeometry`/
+   `TransformMatrix`、`text-input/TextInput`/`TextSelection`/`Caret`、`emit/BitmapLivePixels` 的「指纹覆盖」钉子全部
+   替换为「写点覆盖」或「无指纹残留」钉子。
+
+**验收**：
+- 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
+- `unit: render/RepaintBoundary` 保持 **46 钉**，新增「无指纹残留」「Present-skip 用 epoch」「`as_render_states` 结算」
+  「auto-bake 在 cache 决策前触发」四钉（其余旧「指纹覆盖」钉归并/替换）。
+- `examples/autobake.as --run` 通过（5 帧、突变子树重绘、静止后重烘、complete）。
+- 真机 TalkMED 复验：重建 AOT 后运行，无崩溃、无旧符号残留。
+
+**如实报明**：指纹哈希已彻底移除，Present-skip 与失效完全由写时脏标记 + 全局 epoch 驱动。脏矩形字段仍「写了不读」
+（增量重烘未实现），`as_clear_dirty` 帧末复位仍未启用。
+**尚未完成**：① 边界内增量重烘（读 `_dirty_*` 做脏区域裁剪重绘）；② 「帧末统一复位」启用；③ `showRedrawRegions` oracle。
+
 ### 阶段三百六十九：RepaintBoundary 阶段 C 第一步 —— 脏矩形基础设施（v0.4.332 → v0.4.333）
 
 **起点**：阶段三百六十八切换后，失效与 auto-bake 触发均由写时 `_render_dirty` 驱动，每帧整树指纹哈希仍保留

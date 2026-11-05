@@ -1364,16 +1364,9 @@ function checkScrollRectBakeInvalidation(): string[] {
   ].join('\n');
   const c = generateC(parse(src)).c;
 
-  const fpStart = c.indexOf('static uint32_t as_render_fp(DisplayObject* o) {');
-  const fpEnd = fpStart < 0 ? -1 : c.indexOf('\nstatic ', fpStart + 10);
-  const fp = fpStart < 0 || fpEnd < 0 ? '' : c.slice(fpStart, fpEnd);
-  check('as_render_fp hashes the scrollRect rectangle', fp.includes('if (o->_scroll_rect != NULL)'));
-  check('...all four fields, so a pure -x/-y scroll moves the hash',
-    ['o->_scroll_rect->x', 'o->_scroll_rect->y', 'o->_scroll_rect->width', 'o->_scroll_rect->height']
-      .every((f) => fp.includes(f)));
-  check('...and it is hashed before the children loop, so ancestors see it',
-    fp.indexOf('o->_scroll_rect') >= 0
-    && fp.indexOf('o->_scroll_rect') < fp.indexOf('as_render_fp((DisplayObject*)as_v_obj_val(c->children->data[i]))'));
+  check('scrollRect setter marks the object dirty (stage C: write-driven, no fingerprint)',
+    c.includes('void DisplayObject_set_scrollRect(void* _this, Rectangle* value) {')
+    && c.includes('as_mark_dirty(o);'));
 
   const cacheStart = c.indexOf('static void as_render_cached(void* canvas, DisplayObject* o) {');
   const cacheEnd = cacheStart < 0 ? -1 : c.indexOf('\nstatic ', cacheStart + 10);
@@ -1397,17 +1390,20 @@ function checkScrollRectBakeInvalidation(): string[] {
     && guard.includes('if (o->_render_dirty) {')
     && guard.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
     && guard.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
-  check('the fingerprint walk no longer drops the bake (diagnostic only)',
-    !fp.includes('o->_auto_baked = 0; o->_cache_valid = 0;'));
+  check('no fingerprint residue remains (the walk was removed in stage C)',
+    !c.includes('as_render_fp'));
 
   // 阶段二百八十一: BitmapData identity. Without it a Bitmap whose bitmapData is
   // swapped to another bitmap built the same way hashes identically (image ==
   // NULL, _px_ver == 1 both times) and a baked ancestor replays the old picture.
+  // Stage C: the identity is no longer a fingerprint input; a mutator now marks
+  // every referring Bitmap dirty via the _refs reverse edges.
   check('BitmapData carries a per-instance id', c.includes('unsigned int _uid;'));
   check('...assigned from a monotonic counter in the constructor',
     c.includes('static unsigned as_bd_uid_next = 0;') && c.includes('o->_uid = ++as_bd_uid_next;'));
-  check('as_render_fp hashes the BitmapData identity, not just its version',
-    fp.includes('h = as_fp_u32(h, bd->_uid)'));
+  check('a BitmapData mutator marks every referring Bitmap dirty (not a fingerprint)',
+    c.includes('static void as_bd_mark_dirty(BitmapData* bd) {')
+    && c.includes('as_mark_dirty((DisplayObject*)b);'));
 
   // 阶段二百八十二: BitmapData.draw is a rendering PATH of its own. The window pass
   // and Stage.render both refresh the fingerprint before drawing, and that walk is
@@ -1425,14 +1421,8 @@ function checkScrollRectBakeInvalidation(): string[] {
   // enough that the slice cannot reach the next definition (the generated C is
   // one file, and every runtime helper is a top-level definition).
   const draw = drawStart < 0 ? '' : c.slice(drawStart, drawStart + 12000);
-  check('BitmapData.draw refreshes the fingerprint of a DisplayObject source',
-    draw.includes('as_render_fp(sdo);'));
-  check('...declared before it, since the definition comes much later in the file',
-    c.indexOf('static uint32_t as_render_fp(DisplayObject* o);') >= 0
-    && c.indexOf('static uint32_t as_render_fp(DisplayObject* o);') < drawStart);
-  check('...and before the source transform is zeroed for the raster, so both paths hash the same fields',
-    draw.indexOf('as_render_fp(sdo);') >= 0
-    && draw.indexOf('as_render_fp(sdo);') < draw.indexOf('sdo->x = 0.0;'));
+  check('BitmapData.draw no longer refreshes a fingerprint (stage C removed it)',
+    !draw.includes('as_render_fp(sdo);'));
   check('...and the draw path is flagged (ASC_draw_path) for future trace use',
     c.includes('static int ASC_draw_path = 0;') && draw.includes('ASC_draw_path = 1;'));
   // RepaintBoundary stage B switch: the fingerprint no longer emits a bake_drop
@@ -1559,11 +1549,11 @@ function checkPresentSkip(): string[] {
   const c = generateC(parse('var n:int = 1;\n')).c;
   const at = c.indexOf('static int ASC_window_render(int id) {');
   const body = at < 0 ? '' : c.slice(at, c.indexOf('\n}', at));
-  check('the content key is computed before drawable acquisition',
-    body.indexOf('uint32_t _window_fp = as_render_fp') >= 0
-    && body.indexOf('uint32_t _window_fp = as_render_fp') < body.indexOf('as_skia_gpu_begin_frame'));
-  check('a hit requires a previously completed frame and every generation to match',
-    body.includes('w->render_valid && w->render_fp == _window_fp')
+  check('as_render_states settles states before drawable acquisition',
+    body.indexOf('as_render_states((DisplayObject*)st)') >= 0
+    && body.indexOf('as_render_states((DisplayObject*)st)') < body.indexOf('as_skia_gpu_begin_frame'));
+  check('a hit requires a previously completed frame and every generation to match (dirty epoch + serials)',
+    body.includes('w->render_valid && w->render_epoch == ASC_dirty_epoch')
     && body.includes('w->render_s3d_serial == ASC_stage3d_serial')
     && body.includes('w->render_gpu_generation == _gpu_generation')
     && body.includes('w->render_window_generation == _window_generation'));
@@ -1577,33 +1567,15 @@ function checkPresentSkip(): string[] {
     body.includes('#ifdef ASC_USE_WINDOW') && body.includes('#ifdef ASC_RENDER_WINGPU')
     && body.includes('uint64_t _window_generation = 0;'));
 
-  const fs = c.indexOf('static uint32_t as_render_fp(DisplayObject* o) {');
-  const fp = fs < 0 ? '' : c.slice(fs, c.indexOf('\nstatic ', fs + 10));
-  check('the fingerprint covers blend mode, opaque background and all colour-transform channels',
-    fp.includes('as_fp_str(h, o->blendMode)') && fp.includes('as_v_is_number(o->opaqueBackground)')
-    && ['redMultiplier', 'greenMultiplier', 'blueMultiplier', 'alphaMultiplier', 'redOffset', 'greenOffset', 'blueOffset', 'alphaOffset']
-      .every((f) => fp.includes('fpct->' + f)));
-  check('the fingerprint covers Bitmap sampling and SimpleButton state pixels',
-    fp.includes('as_fp_bool(h, ((Bitmap*)o)->smoothing)') && fp.includes('DisplayObject* st = as_sbtn_state(o);')
-    && fp.includes('as_render_fp(st)'));
-  const textInputs = fp.includes('as_focus_obj == (void*)tf')
-    && fp.includes('as_textformat_fp(h, as_tf_base_fmt(tf))')
-    && fp.includes('tf->_runs->data[i * 3 + 1]')
-    && fp.includes('as_textformat_fp(h, (TextFormat*)as_v_obj_val')
-    && fp.includes('tf->selectable') && fp.includes('as_fp_str(h, tf->type)');
-  check('TextField focus, base/run formats and run boundaries are pixel inputs', textInputs);
-  const tfAt = c.indexOf('static uint32_t as_textformat_fp');
-  const tf = tfAt < 0 ? '' : c.slice(tfAt, c.indexOf('\nstatic ', tfAt + 10));
-  check('every TextFormat layout/style field is hashed by value, including null tags and tab stops',
-    ['size', 'color', 'leading', 'letterSpacing', 'leftMargin', 'rightMargin', 'indent', 'blockIndent']
-      .every((f) => tf.includes('as_fp_num_value(h, f->' + f + ')'))
-    && ['bold', 'italic', 'underline', 'kerning', 'bullet'].every((f) => tf.includes('as_fp_bool_value(h, f->' + f + ')'))
-    && tf.includes('as_fp_str(h, f->display)') && tf.includes('ts->data[i]'));
-  check('stage clear/content transforms and scale9 grids are window pixel inputs',
-    fp.includes('as_fp_u32(h, fps->stage_color)') && fp.includes('as_fp_str(h, fps->scale_mode)')
-    && fp.includes('as_fp_str(h, fps->align)') && fp.includes('o->_s9x') && fp.includes('o->_s9h'));
-  check('off-list masks are fingerprinted with a cycle guard',
-    fp.includes('as_fp_mask_stack') && fp.includes('m->parent != NULL') && fp.includes('if (seen || as_fp_mask_depth >= 32)'));
+  check('the fingerprint walk is gone: as_render_states settles states, no as_fp_* residue',
+    !c.includes('static uint32_t as_render_fp')
+    && !c.includes('as_fp_u32')
+    && !c.includes('as_textformat_fp')
+    && !c.includes('as_fp_mask_stack'));
+  check('as_render_states settles SimpleButton state pixels',
+    c.includes('static void as_render_states(DisplayObject* o) {')
+    && c.includes('if (as_is(o, &SimpleButton_vt)) {')
+    && c.includes('DisplayObject* st = as_sbtn_state(o);'));
   check('Stage3D present advances the compositor serial',
     /void Context3D_present[\s\S]*?ASC_stage3d_serial\+\+;/.test(c));
 
@@ -2541,7 +2513,6 @@ function checkDrawRootAspect(): string[] {
   const force = 'sdo->visible = true; sdo->alpha = 1.0;';
   const restore = 'sdo->visible = sx_kv; sdo->alpha = sx_ka;';
   const raster = 'as_render_object(canvas, sdo);';
-  const fp = 'as_render_fp(sdo);';
 
   check('the root appearance is saved', c.includes(save));
   check('...forced to visible+opaque for the raster', c.includes(force));
@@ -2550,10 +2521,11 @@ function checkDrawRootAspect(): string[] {
     c.indexOf(force) >= 0 && c.indexOf(force) < c.indexOf(raster));
   check('the restore happens after the raster pass',
     c.indexOf(restore) > c.indexOf(raster));
-  // The fingerprint the window pass also computes must hash the REAL appearance,
-  // otherwise the two paths disagree and each drops the other's bake every frame.
-  check('the fingerprint is taken before the appearance is clobbered',
-    c.indexOf(fp) >= 0 && c.indexOf(fp) < c.indexOf(force));
+  // Stage C removed the per-frame fingerprint: invalidation is write-driven
+  // (_render_dirty), so there is no hash to refresh before draw() clobbers the
+  // transform. draw() renders through as_render_object, which reads the dirty flag.
+  check('draw() no longer refreshes a fingerprint (stage C removed it)',
+    !c.includes('as_render_fp(sdo);'));
 
   // The descendant rule this fix must NOT change: as_render_object still skips an
   // invisible object, which is what makes an invisible CHILD vanish (ADL: 0 ink).
@@ -2696,15 +2668,28 @@ function checkRepaintBoundary(): string[] {
     emitSource.includes("const stageRenderDirty = new Set(['color', 'align', 'scaleMode']);")
     && emitted.includes('void Stage_set_scaleMode(void* _this, char* value) {')
     && emitted.includes('as_mark_dirty((DisplayObject*)_this);'));
-  check('equivalence probe (ASC_DIRTY_TRACE) flags a fingerprint drop the dirty marker missed',
-    emitted.includes('static int ASC_dirty_trace = -1;')
-    && emitted.includes('getenv("ASC_DIRTY_TRACE")')
-    && emitted.includes('DIRTY_MISS'));
-  check('dirty-miss dump prints every fingerprint input (geometry/matrix/Graphics/filter/TextField fmt/BitmapData)',
-    emitted.includes('x=%.3g y=%.3g a=%.3g v=%d s=%.3g,%.3g r=%.3g bm=%p gp=%u fl=%d')
-    && emitted.includes('m=%.3g,%.3g,%.3g,%.3g,%.3g,%.3g')
-    && emitted.includes('dtf=%p ds=%.3g dc=%.0f insf=%p is=%.3g ic=%.0f')
-    && emitted.includes('bdu=%u bdsm=%d'));
+  check('stage C removed the fingerprint: no as_render_fp / _auto_fp / DIRTY_MISS / as_dirty_dump residue',
+    !emitted.includes('as_render_fp')
+    && !emitted.includes('_auto_fp')
+    && !emitted.includes('DIRTY_MISS')
+    && !emitted.includes('ASC_dirty_trace')
+    && !emitted.includes('ASC_fp_trace')
+    && !emitted.includes('as_dirty_dump')
+    && !emitted.includes('as_fp_u32'));
+  check('window Present-skip keys on the global dirty epoch, not a tree hash',
+    emitted.includes('static uint64_t ASC_dirty_epoch = 0;')
+    && emitted.includes('ASC_dirty_epoch++;')
+    && emitted.includes('uint64_t render_epoch;')
+    && emitted.includes('if (w->render_valid && w->render_epoch == ASC_dirty_epoch')
+    && emitted.includes('w->render_epoch = ASC_dirty_epoch;'));
+  check('as_render_states settles MovieClip/SimpleButton states (the fingerprint walk is gone)',
+    emitted.includes('static void as_render_states(DisplayObject* o) {')
+    && emitted.includes('if (as_is(o, &MovieClip_vt)) as_mc_button_state(o);')
+    && emitted.includes('if (as_is(o, &SimpleButton_vt)) {')
+    && emitted.includes('as_render_states((DisplayObject*)as_v_obj_val(c->children->data[i]));'));
+  check('auto-bake triggers in as_render_object before the cache decision',
+    emitted.includes('if (!ASC_no_auto_bake && o->visible && !o->_cache_flag && !o->_auto_baked && !o->_render_dirty && !as_single_primitive(o)) {')
+    && emitted.includes('int use_cache = 0;'));
   check('dynamic field write (as_dyn_set) marks DisplayObject render-dirty via the disp hook',
     runtimeSource.includes('static void (*as_disp_dirty_hook)(void* obj) = NULL;')
     && runtimeSource.includes('if (as_disp_dirty_hook != NULL) as_disp_dirty_hook(obj);')

@@ -200,15 +200,16 @@ if (边界 && 命中快照) {
 
 | 用途 | 现方案 | 新方案 |
 |---|---|---|
-| 窗口级「整帧没变跳过 Present」 | `render_fp`（整树哈希） | **保留** `render_fp`，但它的输入可以是「本帧是否有脏」而非「重新哈希全部字段」 |
+| 窗口级「整帧没变跳过 Present」 | `render_fp`（整树哈希） | **改为** 全局脏 epoch（`ASC_dirty_epoch`），写时 `++`，O(1) 判「本帧是否有脏」 |
 | cacheAsBitmap 失效 | 指纹变 → 掉烘 | **改为** 写时脏标记（对齐 AIR） |
 | auto-bake 触发 | 静置 3 帧才烘 | **改为** 写时脏标记（脏了就烘，静止即烘，无静置延迟） |
 | 渲染输入全集（防漏清单） | `as_render_fp` 的哈希字段 | **保留为「写点注入清单」的来源**，但不再每帧执行 |
 
-**迁移策略（防回归，已完成切换）**：阶段 B **先并行、后切换**——新增脏标记与现有指纹并存一段时间，用
-`DIRTY_MISS` 探针验证「指纹变 ⇔ 脏标记置位」在全部示例上同真同假；清零后，`_cache_flag` 失效与 auto-bake
-触发都切到写时脏标记，`as_render_fp` 的掉烘逻辑删除。`as_render_fp` 的每帧整树哈希**仍保留**，只服务窗口
-Present-skip 键与 DIRTY_MISS 诊断；彻底移除每帧哈希（改用全局脏 epoch 判「本帧是否有脏」）留待阶段 C。
+**迁移策略（防回归，已完成切换 + 彻底移除）**：阶段 B **先并行、后切换**——新增脏标记与现有指纹并存一段时间，
+用 `DIRTY_MISS` 探针验证「指纹变 ⇔ 脏标记置位」在全部示例上同真同假；清零后，`_cache_flag` 失效与 auto-bake
+触发都切到写时脏标记，`as_render_fp` 的掉烘逻辑删除。阶段 C 第二步**彻底移除每帧整树哈希**：窗口 Present-skip
+键从 `w->render_fp == _window_fp` 改为全局 `ASC_dirty_epoch` 单调计数（写时 `++`）；`as_render_fp` 替换为
+`as_render_states`（每帧只结算 MovieClip/SimpleButton 状态，不哈希）；`_auto_fp`/指纹 helper/`DIRTY_MISS` 诊断一并删除。
 
 `BitmapData` 的 `_px_ver`/`_uid` 版本计数器（现已被指纹读取）在脏标记方案里**语义不变**——它仍然是
 「BitmapData 内容变了」的权威信号，只是从「被指纹每帧读」改成「写时直接置脏其所有显示实例」。这一步是
@@ -238,6 +239,9 @@ Present-skip 键与 DIRTY_MISS 诊断；彻底移除每帧哈希（改用全局�
 > **切换已完成**：失效改由 `_render_dirty` 驱动（`as_render_fp` 不再掉烘，只保留窗口 Present-skip 键 + DIRTY_MISS
 > 诊断）；auto-bake 触发由「静置 3 帧」改为「无脏即烘」；缓存分支区分显式 `cacheAsBitmap`（脏→当帧重烘）与
 > auto-bake（脏→退出边界、落到 live，静止当帧重烘）。
+> **阶段 C 第二步（移除每帧指纹哈希）已落地**：`as_render_fp` 彻底删除，替换为 `as_render_states`（每帧只结算
+> MovieClip/SimpleButton 状态）；窗口 Present-skip 键改为全局 `ASC_dirty_epoch`（写时 `++`）；`_auto_fp`/指纹 helper/
+> `DIRTY_MISS`/`ASC_DIRTY_TRACE` 诊断全部删除；auto-bake 触发迁到 `as_render_object` cache 决策前。
 > **阶段 C 第一步（脏矩形基础设施）已落地**：`DisplayObject` 增 `_dirty_full/_dirty_l/t/r/b` 字段；`as_mark_dirty`
 > 升级为整对象脏（置 `_dirty_full`）；新增 `as_dirty_merge`（防非有限矩形）与 `as_mark_dirty_rect`（合并 + 复用
 > `as_bounds_xform` 上溯变换）；新增 `as_clear_dirty` 递归清脏（**本次未启用**）。脏矩形**写了不读**，增量重烘留待
@@ -269,6 +273,8 @@ Present-skip 键与 DIRTY_MISS 诊断；彻底移除每帧哈希（改用全局�
 
 ### 阶段 C：边界内脏矩形/脏子树增量重绘（最难，收益最大）
 
+- [x] **彻底移除每帧指纹哈希**：`as_render_fp` 删除 → `as_render_states`（只结算 MovieClip/SimpleButton 状态）；
+      窗口 Present-skip 键改全局 `ASC_dirty_epoch`（写时 `++`）；删 `_auto_fp`/指纹 helper/`DIRTY_MISS`/`ASC_DIRTY_TRACE`。
 - [x] `DisplayObject` 增 `_dirty_l/t/r/b` + `_dirty_full`（§4.2）。
 - [x] 脏矩形合并/上溯：`as_dirty_merge`（防非有限矩形）+ `as_mark_dirty_rect`（合并 + 复用 `as_bounds_xform`
       上溯变换到父坐标）；`as_mark_dirty` 置整对象脏（`_dirty_full=1`）。（注：写点目前仍走 `as_mark_dirty`
