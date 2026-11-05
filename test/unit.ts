@@ -46,6 +46,7 @@ import './unit/native-shader.ts';
 import './unit/npm-package.ts';
 import './unit/cli.ts';
 import './unit/fre.ts';
+import './unit/setjmp.ts';
 import './unit/fqn-static.ts';
 import './unit/testinfra.ts';
 import './unit/async-workers.ts';

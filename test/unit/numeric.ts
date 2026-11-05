@@ -110,7 +110,7 @@ function checkNoreturn(): string[] {
   // The specifier must stay TRUE: both terminating paths have to be present, or
   // _Noreturn would be undefined behaviour rather than a fact.
   check('the specifier is true: the body only exits or longjmps',
-    preamble.includes('longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);') &&
+    preamble.includes('AS_LONGJMP(*as_jmp_stack[as_jmp_depth - 1], 1);') &&
     preamble.includes('fflush(stderr);') &&
     preamble.includes('exit(1);'));
   // The guard must route its null path through as_throw (possibly wrapped by

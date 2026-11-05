@@ -321,7 +321,11 @@ and clicking Back crashes").
   call chain.
 - `setjmp` first spills callee-saved registers to the stack (so locals alive only in registers can be scanned
   too), then they are read word by word with `sizeof(void*)` alignment via `memcpy` and taken as roots by
-  value.
+  value. **This one runs `AS_SETJMP` (stage 375)**: it only uses the spill side effect and never `longjmp`s
+  back, while Darwin's `setjmp` also saves the signal mask = one `sigprocmask` syscall (225.8 ns vs
+  2.4 ns), so every mark cycle was paying for nothing. The register slots of both `jmp_buf` variants were
+  compared byte by byte before switching (`temp/frebench/jb.c`): x19/x20/x28 are written **identically**, so
+  the conservative scan cannot miss a root.
 - **Only accept words that can plausibly be objects** (`gc_is_object()`): the address falls within a GC
   segment + the header's `type` is a legal value + `color` is legal + `size` is plausible. Unqualified bytes
   (integers, floats, interior pointers in the middle) are skipped.

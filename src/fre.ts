@@ -408,10 +408,27 @@ typedef struct as_fre_ctx {
     // drained by as_fre_pump at a frame boundary (or right after a call). The
     // strings are strdup'd: the queue must not hold a pointer into an AS3 string,
     // which the GC could reclaim out from under a worker thread.
+    //
+    // status_len bounds the queue. Nothing in AIR's contract bounds it, and an
+    // extension that dispatches per packet (or per audio sample) from its own
+    // thread outruns a main thread sitting in a long frame: the list then grows
+    // without limit and as_fre_pump replays the whole backlog inside ONE frame.
+    // A bound turns that into a reported drop instead of an OOM or a stall.
     as_fre_status* status_head;
     as_fre_status* status_tail;
+    int         status_len;        // pending events, maintained under AS_FRE_Q_LOCK
     struct as_fre_ctx* next;
 } as_fre_ctx;
+
+// Per context, not global: one noisy extension must not starve another's
+// notifications. 1024 is far above any real status stream (connect/disconnect,
+// hotplug, error) and far below a memory problem -- a queued event is ~40 bytes
+// plus its two strings, so the whole cap is tens of KB.
+#define AS_FRE_STATUS_MAX 1024
+// House style for a bounded number of loud reports (see as_shell_unsupported's
+// 5-strike rule): a permanently overflowing extension would otherwise print at
+// frame rate.
+static int as_fre_status_drop_warns = 0;
 
 static as_fre_ctx* as_fre_ctxs = NULL;
 
@@ -440,6 +457,7 @@ static void as_fre_pump(void) {
         as_fre_status* s = c->status_head;
         c->status_head = NULL;
         c->status_tail = NULL;
+        c->status_len = 0;
         AS_FRE_Q_UNLOCK();
         while (s != NULL) {
             as_fre_status* n = s->next;
@@ -740,7 +758,7 @@ static FREResult FRENewObject(const uint8_t* className, uint32_t argc, FREObject
         for (uint32_t i = 0; i < argc; i++) argv2[i] = as_fre_unbox(argv[i]);
     }
     jmp_buf jb;
-    if (setjmp(jb) == 0) {
+    if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_value r = as_dyn_new_args((as_class*)cls.ptr, (int)argc, argv2);
         as_jmp_pop();
@@ -767,7 +785,7 @@ static FREResult FREGetObjectProperty(FREObject object, const uint8_t* propertyN
     if (object == NULL || v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;
     if (v.tag != 4 || v.ptr == NULL) return FRE_TYPE_MISMATCH;
     jmp_buf jb;
-    if (setjmp(jb) == 0) {
+    if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_value r = as_dyn_get(v.ptr, (const char*)propertyName);
         as_jmp_pop();
@@ -789,7 +807,7 @@ static FREResult FRESetObjectProperty(FREObject object, const uint8_t* propertyN
     if (object == NULL || v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;
     if (v.tag != 4 || v.ptr == NULL) return FRE_TYPE_MISMATCH;
     jmp_buf jb;
-    if (setjmp(jb) == 0) {
+    if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_dyn_set(v.ptr, (const char*)propertyName, as_fre_unbox(propertyValue));
         as_jmp_pop();
@@ -813,7 +831,7 @@ static FREResult FRECallObjectMethod(FREObject object, const uint8_t* methodName
         for (uint32_t i = 0; i < argc; i++) argv2[i] = as_fre_unbox(argv[i]);
     }
     jmp_buf jb;
-    if (setjmp(jb) == 0) {
+    if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_value r = as_dyn_call(v.ptr, (const char*)methodName, argv2, (int)argc);
         as_jmp_pop();
@@ -1269,8 +1287,26 @@ static FREResult FREDispatchStatusEventAsync(FREContext ctx, const uint8_t* code
     memcpy(s->level, level, ll + 1);
     as_fre_qcs_init();
     AS_FRE_Q_LOCK();
+    if (c->status_len >= AS_FRE_STATUS_MAX) {
+        int warn = as_fre_status_drop_warns < 5;
+        if (warn) as_fre_status_drop_warns++;
+        AS_FRE_Q_UNLOCK();
+        free(s->code); free(s->level); free(s);
+        // FRE_OK, not FRE_INSUFFICIENT_MEMORY: we do have memory, we chose to drop,
+        // and a failure code would invite the extension to retry -- which is the
+        // behaviour that filled the queue. The drop is reported instead, so it is
+        // loud rather than silent (AGENTS.md section 1.5).
+        if (warn) {
+            fprintf(stderr, "[as3-aot] ANE StatusEvent queue full (%d pending): event dropped. "
+                            "An extension dispatching faster than the AS3 thread drains is a design error.\\n",
+                    AS_FRE_STATUS_MAX);
+            fflush(stderr);
+        }
+        return FRE_OK;
+    }
     if (c->status_tail == NULL) c->status_head = s; else c->status_tail->next = s;
     c->status_tail = s;
+    c->status_len++;
     AS_FRE_Q_UNLOCK();
     return FRE_OK;
 }
@@ -1580,7 +1616,7 @@ static as_value as_ext_call(void* ctxp, const char* fn, as_value* args, int argc
     }
     as_value result = as_v_null();
     jmp_buf jb;
-    if (setjmp(jb) == 0) {
+    if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         FREObject r = c->funcs[fi].function((FREContext)c, c->funcs[fi].functionData, (uint32_t)argc, argv);
         as_jmp_pop();

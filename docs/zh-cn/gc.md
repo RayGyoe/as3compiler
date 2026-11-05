@@ -261,7 +261,10 @@ void Foo_method(Foo* this, as_value a) {
   `main()` 的**首行**发出该宏，宏把当前局部变量的地址写进 `gc_stack_top`，因此锚点在 `main` 的
   栈帧上，扫描窗口覆盖整条活着的调用链。
 - `setjmp` 先落盘 callee-saved 寄存器（只有寄存器活的局部因此也能被扫到），随后按
-  `sizeof(void*)` 对齐逐字 `memcpy` 取出，按值当根。
+  `sizeof(void*)` 对齐逐字 `memcpy` 取出，按值当根。**它跑的是 `AS_SETJMP`（阶段三百七十五）**：
+  这里只用它的「溢写」副作用、从不 `longjmp` 回来，而 Darwin 的 `setjmp` 会存信号屏蔽字 = 一次
+  `sigprocmask` 系统调用（225.8 ns vs 2.4 ns），每轮标记都付一次纯属浪费。换之前先逐字节比过两种
+  `jmp_buf` 的寄存器槽（`temp/frebench/jb.c`）：x19/x20/x28 写入**完全相同**，所以保守扫描不会漏根。
 - **只接受谈得上对象的字**（`gc_is_object()`）：地址落在 GC 段内 + 头里的 `type` 取值合法 +
   `color` 合法 + `size` 合理。不合格的字节（整数、浮点、中间的内部指针）直接跳过。
 - **对象头合法性靠 magic tag**：`GCT_*` 常量全部偏移 `GCT_TAG_BASE 0x47430000`（`"GC"`），

@@ -174,9 +174,9 @@ function checkFrameErrorRecovery(): string[] {
   check('...and a guard saying whether a frame owns it, per thread',
     RUNTIME_PREAMBLE.includes('static ASC_TLS int as_frame_guard = 0;'));
   check('an uncaught error longjmps to the frame instead of exiting',
-    RUNTIME_PREAMBLE.includes('longjmp(as_frame_jmp, 1)'));
+    RUNTIME_PREAMBLE.includes('AS_LONGJMP(as_frame_jmp, 1)'));
   check('...from both throw entry points (value and boxed)',
-    RUNTIME_PREAMBLE.split('longjmp(as_frame_jmp, 1)').length - 1 === 2);
+    RUNTIME_PREAMBLE.split('AS_LONGJMP(as_frame_jmp, 1)').length - 1 === 2);
   check('the non-GUI path still exits, so --run semantics are untouched',
     RUNTIME_PREAMBLE.includes('exit(1);'));
 
@@ -185,9 +185,9 @@ function checkFrameErrorRecovery(): string[] {
   const at = c.indexOf(head);
   check('the frame dispatcher is emitted', at >= 0);
   const body = at >= 0 ? c.slice(at, c.indexOf('\n}', at)) : '';
-  check('the outermost frame plants the buffer', body.includes('setjmp(as_frame_jmp)'));
+  check('the outermost frame plants the buffer', body.includes('AS_SETJMP(as_frame_jmp)'));
   check('...only when no frame is already active',
-    /if \(as_frame_guard == 0\) \{\s*if \(setjmp\(as_frame_jmp\) != 0\)/.test(body));
+    /if \(as_frame_guard == 0\) \{\s*if \(AS_SETJMP\(as_frame_jmp\) != 0\)/.test(body));
   // The recovery path also restores the dispatch nesting depth: a listener that
   // threw unwound a dispatchEvent that could not decrement it itself (as_disp_arr
   // picks its snapshot buffer by depth, so a stale value would corrupt later walks).
@@ -202,9 +202,9 @@ function checkFrameErrorRecovery(): string[] {
   // key, frame clock, resize, close -- every callback the native layer can call
   // back into AS3 through).
   check('the buffer is planted once per entry point, not per dispatch',
-    c.split('setjmp(as_frame_jmp)').length - 1 === 7);
+    c.split('AS_SETJMP(as_frame_jmp)').length - 1 === 7);
   check('...and never inside the event-dispatch machinery',
-    !/static void as_dispatchEvent[\s\S]{0,4000}setjmp\(as_frame_jmp\)/.test(c));
+    !/static void as_dispatchEvent[\s\S]{0,4000}AS_SETJMP\(as_frame_jmp\)/.test(c));
 
   console.log(`[frameguard] ${ok} frame-error recovery checks passed`);
   return bad;

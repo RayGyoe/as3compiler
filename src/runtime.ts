@@ -14,6 +14,22 @@ export const RUNTIME_PREAMBLE = `#include <stdio.h>
 #include <math.h>
 #include <ctype.h>
 #include <setjmp.h>
+// setjmp()/longjmp() save and restore the signal mask on Darwin, which costs one
+// sigprocmask syscall: measured 223 ns against _setjmp's 2.4 ns (temp/frebench/sj4.c).
+// Nothing here installs a handler whose mask would need restoring, so the mask half
+// is pure cost. Windows' setjmp never touched the mask and emscripten/wasi (musl)
+// do not either, so those keep the plain pair rather than depend on a BSD extension
+// for no gain. The two must be used as a PAIR: a buffer saved by _setjmp is resumed
+// by _longjmp. Verified on arm64 Darwin that _setjmp spills the same callee-saved
+// registers as setjmp (temp/frebench/jb.c), which is what lets gc_mark_stack keep
+// using it purely for the register spill (it never longjmps out of that frame).
+#if defined(_WIN32) || defined(__EMSCRIPTEN__) || defined(__wasi__)
+#define AS_SETJMP(e)     setjmp(e)
+#define AS_LONGJMP(e, v) longjmp(e, v)
+#else
+#define AS_SETJMP(e)     _setjmp(e)
+#define AS_LONGJMP(e, v) _longjmp(e, v)
+#endif
 #include <time.h>
 // dlfcn.h (and Dl_info/dladdr below) is POSIX; wasi-libc ships the header but
 // not the Apple/POSIX symbol-probe API, and Windows has no dlfcn.h at all, so
@@ -7305,12 +7321,12 @@ static _Noreturn void as_throw_val(as_value v) {
         if (as_frame_guard != 0) {
             as_report_uncaught(m);
             as_frame_guard = 0;
-            longjmp(as_frame_jmp, 1);
+            AS_LONGJMP(as_frame_jmp, 1);
         }
         as_report_uncaught(m);
         exit(1);
     }
-    longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);
+    AS_LONGJMP(*as_jmp_stack[as_jmp_depth - 1], 1);
 }
 // _Noreturn (C11) is not decoration. clang only inlines a guard helper when it
 // can prove the error path terminates; without the specifier the throw path is
@@ -7329,12 +7345,12 @@ static _Noreturn void as_throw(void* e) {
         if (as_frame_guard != 0) {
             as_report_uncaught(as_error_message(e));
             as_frame_guard = 0;
-            longjmp(as_frame_jmp, 1);
+            AS_LONGJMP(as_frame_jmp, 1);
         }
         as_report_uncaught(as_error_message(e));
         exit(1);
     }
-    longjmp(*as_jmp_stack[as_jmp_depth - 1], 1);
+    AS_LONGJMP(*as_jmp_stack[as_jmp_depth - 1], 1);
 }
 
 // ---------- GC mark / sweep / collect (incremental, GC-4) ----------
@@ -7943,7 +7959,9 @@ static bool gc_is_object(void* p) {
 static void gc_mark_stack(void) {
     if (gc_stack_top == NULL) return;   // no recorded frame (no emitted main)
     jmp_buf jb;
-    setjmp(jb);   // spill callee-saved registers onto the stack so they are scanned
+    // Purely a register spill, never resumed -- so the cheaper, mask-free save is
+    // exactly right here (it saves the same registers: temp/frebench/jb.c).
+    AS_SETJMP(jb);
     char* lo = (char*)(((uintptr_t)&jb + sizeof(void*) - 1) & ~(uintptr_t)(sizeof(void*) - 1));
     for (char* p = lo; p < gc_stack_top; p += sizeof(void*)) {
         void* w;

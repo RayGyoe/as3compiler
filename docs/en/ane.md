@@ -142,6 +142,25 @@ turn "input AIR rejects" into "input we accept", which is a divergence in the wr
   `setjmp`/`as_jmp_stack` and rethrown to the caller as an AS3 exception (AIR's `thrownException`
   semantics). Measured: a native-side `FRESetObjectProperty` on a sealed object gives the AS3 side the
   `prim=3 sealed=4` classification result.
+* **The status-event queue is bounded, and drops when full (stage 375)**: before enqueueing,
+  `FREDispatchStatusEventAsync` checks `ctx->status_len >= AS_FRE_STATUS_MAX` (**1024 per context**,
+  not one global pool — one chatty extension must not evict another's events). When full it frees the
+  already-`strdup`ed code/level, prints once to `stderr` (capped at 5 lines, the old
+  `as_shell_unsupported` rule, so it cannot flood at 60 Hz) and returns **`FRE_OK`**. That return value
+  is deliberate: we are not "out of memory", we are **choosing to drop**, and
+  `FRE_INSUFFICIENT_MEMORY` would invite the extension to retry immediately — which is the very
+  behaviour that fills the queue. `as_fre_pump` zeroes the count when it drains, so the bound tracks
+  the **live queue**, not a lifetime total. The cost, stated plainly: dropped events are **not**
+  re-delivered, so `addEventListener(StatusEvent.STATUS)` sees fewer of them. That beats the
+  alternative failure mode — an unbounded queue pumping thousands of events inside one `ENTER_FRAME`,
+  where the recovery itself is the stutter.
+* **Does every `setjmp` cost 220 ns? On Darwin it does (stage 375)**: the consumer side of
+  `FREDispatchStatusEventAsync` and the entry of `ExtensionContext.call` each `setjmp` once. On its own
+  that is the magnitude — but **only on Darwin**, where `setjmp` also saves the signal mask = one
+  `sigprocmask` syscall (measured 225.8 ns vs 2.4 ns for `_setjmp`); Linux and Windows never touch it.
+  Generated code therefore goes through the `AS_SETJMP`/`AS_LONGJMP` macros: POSIX uses
+  `_setjmp`/`_longjmp`, Windows and wasm (musl) keep the plain pair. **The two halves must be paired** —
+  mixing them is undefined behaviour.
 
 ### 3.3 Face C: extension loading
 

@@ -441,3 +441,59 @@ function checkFreBitmapDataAcquire(): string[] {
   return failed;
 }
 registerGroup('unit: fre/BitmapDataAcquire', checkFreBitmapDataAcquire);
+
+// The status queue is the one FRE structure a worker thread writes and the AS3
+// thread drains, and its unbounded form had two failure modes nothing else could
+// see: an extension dispatching per packet grows the list without limit while the
+// main thread sits in a long frame, and as_fre_pump then replays the whole backlog
+// inside ONE frame (a stall proportional to how far behind the main thread fell).
+// AIR's contract bounds neither, so the bound is ours.
+//
+// Why this is a unit check and not an example: the drop only happens after 1024
+// queued events, which no fixture produces, and the rest is a return-code and a
+// counter -- invisible to any program that must succeed.
+function checkFreStatusQueue(): string[] {
+  const failed: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) console.log('PASS  [frequeue] ' + label);
+    else { failed.push(label); console.log('FAIL  [frequeue] ' + label); }
+  };
+
+  const dispatch = funcBody(FRE_BODY, 'static FREResult FREDispatchStatusEventAsync(');
+  const pump = funcBody(FRE_BODY, 'static void as_fre_pump(void) {');
+
+  check('both functions are found', dispatch !== '' && pump !== '');
+  check('the bound exists and is per context, not global',
+    FRE_BODY.includes('#define AS_FRE_STATUS_MAX 1024')
+    && FRE_BODY.includes('int         status_len;'));
+  check('the producer maintains the counter under the queue lock',
+    /AS_FRE_Q_LOCK\(\);[\s\S]*status_len\+\+;[\s\S]*AS_FRE_Q_UNLOCK\(\);/.test(dispatch));
+  // Ordering matters: the full check must happen while the lock is held, or two
+  // worker threads both pass it and the bound is off by however many raced.
+  check('the full-queue check happens inside the critical section',
+    /AS_FRE_Q_LOCK\(\);\s*\n\s*if \(c->status_len >= AS_FRE_STATUS_MAX\) \{/.test(dispatch));
+  check('a dropped event frees the strings it already copied',
+    /AS_FRE_Q_UNLOCK\(\);\s*\n\s*free\(s->code\); free\(s->level\); free\(s\);/.test(dispatch));
+  // Loud, per AGENTS.md 1.5, but bounded: 60 warnings a second would bury the
+  // message. This mirrors as_shell_unsupported's 5-strike rule.
+  check('the drop reports itself on stderr',
+    dispatch.includes('ANE StatusEvent queue full')
+    && dispatch.includes('fflush(stderr);'));
+  check('...and the report is rate-limited',
+    dispatch.includes('as_fre_status_drop_warns < 5')
+    && FRE_BODY.includes('static int as_fre_status_drop_warns = 0;'));
+  // FRE_OK deliberately: a failure code would invite the extension to retry,
+  // which is the behaviour that filled the queue in the first place.
+  check('...and answers FRE_OK rather than a retryable code',
+    /free\(s\);[\s\S]{0,1600}return FRE_OK;\s*\n\s*\}/.test(dispatch));
+  check('the pump resets the counter so the bound reflects the live queue',
+    /AS_FRE_Q_LOCK\(\);[\s\S]*?c->status_len = 0;[\s\S]*?AS_FRE_Q_UNLOCK\(\);/.test(pump));
+  // The counter must not survive as a field nothing reads: both sides have to be
+  // present or the queue is either unbounded or permanently full.
+  check('the counter has both a producer and a consumer',
+    dispatch.includes('c->status_len++') && pump.includes('c->status_len = 0'));
+
+  if (failed.length !== 0) console.log('     [frequeue] ' + failed.length + ' check(s) failed');
+  return failed;
+}
+registerGroup('unit: fre/StatusQueue', checkFreStatusQueue);

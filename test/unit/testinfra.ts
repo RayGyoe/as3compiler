@@ -40,6 +40,29 @@ function checkExampleDriverConcurrency(): string[] {
   // being concurrency-induced gets re-run against the exact pre-change order.
   check('the job count is overridable via ASC_TEST_JOBS (1 = original serial order)',
     src.includes('ASC_TEST_JOBS'));
+  // Concurrency is only safe for examples that keep their host state inside
+  // `temp/regress-out/`. Three of them use a FIXED `~/work` / `~/fx` scratch dir
+  // and one trashes files under `~/.Trash` -- run in the same pool, one deletes a
+  // directory another is reading, and the victim dies with `#3003 File or
+  // directory does not exist` (measured 2026-11-05: file-ops.as vs
+  // file-listing-async.as, full run only). The lane split is what makes the pool
+  // correct, and it is invisible in a green run: drop the `continue` and the loss
+  // is one flaky example every few runs.
+  check('examples sharing fixed host paths are kept out of the concurrent pool',
+    /if \(HOST_STATE_FILES\.has\(e\.name\)\) continue;/.test(src)
+    && /describe\('examples \(host-state, serial\)', \{ concurrency: 1 \}/.test(src));
+  check('...and the host-state set covers every example that resolves a fixed home path',
+    (() => {
+      const dir = join(root, 'examples');
+      const users = readdirSync(dir)
+        .filter((f) => f.endsWith('.as'))
+        .filter((f) => {
+          const s = readFileSync(join(dir, f), 'utf8');
+          // `resolvePath("<literal>")` on the user directory == a shared, fixed path.
+          return /userDirectory\.resolvePath\(["'][A-Za-z_]/.test(s);
+        });
+      return users.every((f) => src.includes(`'${f}'`));
+    })());
   if (ok > 0) console.log(`[testinfra] ${ok} example-driver concurrency checks passed`);
   return bad;
 }

@@ -28363,7 +28363,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and window-sweep entry points plant the same buffer (ASC_window_on_*), which
     // is why this one checks the flag first instead of assuming it is free.
     this.line('int _fguard = 0;');
-    this.line('if (as_frame_guard == 0) { if (setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; } _fguard = 1; as_frame_guard = 1; }');
+    this.line("if (as_frame_guard == 0) { if (AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; } _fguard = 1; as_frame_guard = 1; }");
     // Frame-boundary GC safe point: all user frame callbacks have returned, so
     // only permanent roots (static fields, stage, event registry, timers) are
     // live. Each frame advances the incremental mark/sweep by a fixed budget
@@ -31610,7 +31610,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
     this.line('as_frame_guard = 1;');
     // SDL reports mouse coordinates in logical *window* points, so they must be
     // mapped back through the align offset and the content scale before they mean
@@ -31743,7 +31743,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_wheel(int id, double x, double y, double delta) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -31759,7 +31759,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_key(int id, const char* type, int keyCode, int charCode, int mod) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -31849,7 +31849,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_frame(int id) {')
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -31921,7 +31921,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // callback hands back NULL, and by then this function has already freed it and
     // installed the replacement in w->surface. `w` is assigned before setjmp and
     // never after, so longjmp cannot clobber it.
-    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return (w != NULL) ? w->surface : NULL; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return (w != NULL) ? w->surface : NULL; }');
     this.line('as_frame_guard = 1;');
     this.line('if (w == NULL || lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('if (scale <= 0.0) scale = 1.0;');
@@ -31998,7 +31998,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int planted = (as_frame_guard == 0);');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
-    this.line('if (planted && setjmp(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
     this.line('as_frame_guard = 1;');
     this.line('w->closed = 1;');
     this.line('if (w->surface != NULL) { as_skia_surface_delete(w->surface); w->surface = NULL; w->canvas = NULL; }');
@@ -33345,7 +33345,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // A listener that throws must not unwind through the extension's C frames
     // (FREDispatchStatusEventAsync) or through the frame loop; the throw is
     // reported like any other uncaught error in an event handler.
-    this.line('if (setjmp(jb) != 0) {');
+    this.line('if (AS_SETJMP(jb) != 0) {');
     this.indent++;
     this.line('as_jmp_pop();');
     this.line('as_value m = as_exception_boxed ? as_exception_v : as_v_obj(as_exception);');
@@ -35200,7 +35200,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('{');
     this.indent++;
     this.line(`jmp_buf ${env};`);
-    this.line(`int ${ret} = setjmp(${env});`);
+    this.line(`int ${ret} = AS_SETJMP(${env});`);
     this.line(`if (${ret} == 0) {`);
     this.indent++;
     this.line(`as_jmp_push(&${env});`);

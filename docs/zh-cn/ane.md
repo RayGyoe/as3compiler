@@ -118,6 +118,20 @@ D 面为什么单列：它不是「漏了」，是**分两半决定**——句�
 * **扩展抛出的 AS3 异常跨边界传播**：用 `setjmp`/`as_jmp_stack` 接住，转成 AS3 异常抛给
   调用者（AIR 的 `thrownException` 语义）。实测：原生侧对一个 sealed 对象 `FRESetObjectProperty`
   → AS3 侧拿到 `prim=3 sealed=4` 的分类结果。
+* **状态事件队列有上界，满了就丢（阶段三百七十五）**：`FREDispatchStatusEventAsync` 入队前判
+  `ctx->status_len >= AS_FRE_STATUS_MAX`（**每 context 1024 条**，不是一个全局池——一个吵闹的扩展
+  不该把别人的事件挤掉），满则释放已 `strdup` 的 code/level、往 `stderr` 报一次（按
+  `as_shell_unsupported` 的老规矩封顶 5 条，免得每秒刷屏）、返回 **`FRE_OK`**。返回 `FRE_OK` 是刻意的：
+  我们不是「没内存」，是**选择丢弃**，而 `FRE_INSUFFICIENT_MEMORY` 会诱使扩展立刻重试，那正是把队列
+  填满的行为。`as_fre_pump` 排空时把计数归零 ⇒ 上界跟的是**活队列**，不是历史累计。
+  代价也如实说：被丢的事件**不会补发**，`addEventListener(StatusEvent.STATUS)` 少收几条。
+  这比另一种失败形态好——无界队列在下一次 `ENTER_FRAME` 里一次性 pump 出几千条，恢复过程本身
+  就变成卡顿。
+* **每次 `setjmp` 都要 220 ns？在 Darwin 上是（阶段三百七十五）**：`FREDispatchStatusEventAsync`
+  的消费侧与 `ExtensionContext.call` 的入口各要 `setjmp` 一次。单看是这个量级，但**前提是 Darwin**：
+  那里 `setjmp` 会存信号屏蔽字 = 一次 `sigprocmask` 系统调用（实测 225.8 ns vs `_setjmp` 2.4 ns），
+  Linux/Windows 都不碰。所以生成代码统一走 `AS_SETJMP`/`AS_LONGJMP` 宏：POSIX 用 `_setjmp/_longjmp`，
+  Windows 与 wasm（musl）用原配对。**两半必须成对**，混用是未定义行为。
 
 ### 3.3 C 面：扩展加载
 
