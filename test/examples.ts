@@ -484,6 +484,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // aneHostSkipReason). Its --air-app twin is examples/ane-app/, whose own case is
   // registered below the pool.
   'ane/': ['--manifest', join(dir, 'ane', 'ane.build.json')],
+  // cache-patch.as（阶段三百七十一 · RepaintBoundary 阶段 C 第三步）钉的是**边界内增量重烘**：
+  // cacheAsBitmap 边界第一次 render 全量 rebuild（bake_rebuild），随后同一 bounds 内追加一个
+  // drawRect 只带精确脏矩形，第二次 render 必须走 bake_patch（保留 raster surface 局部重绘）
+  // 而不是整边界 rebuild。判据是像素（中心先蓝后红），故与 bake-bitmap-swap.as 一样链 Skia。
+  'cache-patch.as': ['--manifest', join(dir, 'cache-patch.build.json')],
 };
 // Examples that need an input file absent from the tree. Skipped loudly so the
 // suite never reports coverage it did not exercise.

@@ -320,11 +320,17 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 - [x] Add `_dirty_l/t/r/b` + `_dirty_full` to `DisplayObject` (§4.2).
 - [x] Dirty-rect merge/bubble: `as_dirty_merge` (guards non-finite rects) + `as_mark_dirty_rect` (merge + reuse
   `as_bounds_xform` upward transform to parent coords); `as_mark_dirty` sets whole-object dirty (`_dirty_full=1`).
-  (Note: write points still call `as_mark_dirty` whole-object dirty — they have not switched to `as_mark_dirty_rect`
-  with a precise rect, which needs each write point to know the affected region's local coords.)
-- [ ] Boundary redraw uses **dirty-region clipping**: `save` + `clipRect(_dirty_*)` then redraw only the content
-  inside the dirty rect, blit the old snapshot elsewhere; or (dirty-subtree variant) redraw only the dirty
-  subtree, blit the rest.
+  **Precise-rect write points landed**: closed shapes (`drawRect`/`drawCircle`/`drawEllipse`) carry a precise rect
+  via `as_gpath_mark_rect` (including the `_max_sw` stroke spread), and `as_gflush` uses the accumulated bounds
+  (no longer whole-object dirty); open paths (`moveTo`/`lineTo`/`curveTo` …) and the nine plain fields still use
+  `as_mark_dirty` whole-object dirty (their bounds are unknowable at write time).
+- [x] **Intra-boundary incremental re-bake (bake_patch)**: when a boundary is dirty with `_dirty_full==0` and no
+  filter, `as_render_cached` repaints only the dirty rect into the retained raster surface (`_cache_surface`, released
+  and re-registered on rebuild, with a finalizer that distinguishes SkImage/SkSurface by kind): `save` +
+  `clipRect(_dirty_*)` + `clearRect(_dirty_*)` + local repaint + re-snapshot. `_dirty_full` or a filter repaints the
+  whole retained surface (`reset` + clear + repaint); size/phase change still rebuilds (bake_rebuild). An explicit
+  `cacheAsBitmap` no longer clears `_render_dirty`/`_cache_valid` in `as_render_object` — that is deferred to
+  `as_render_cached`, which clears on consume; an auto-bake still tears down to live.
 - [ ] Enable the end-of-frame reset (`as_clear_dirty`) together with incremental re-bake, systematically fixing the
   missed write points exposed by the increased auto-bake.
 - **Acceptance**:

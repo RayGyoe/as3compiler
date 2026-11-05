@@ -1388,8 +1388,8 @@ function checkScrollRectBakeInvalidation(): string[] {
   check('a render-input write drops the bake via _render_dirty (not the fingerprint)',
     guardAt >= 0
     && guard.includes('if (o->_render_dirty) {')
-    && guard.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
-    && guard.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+    && guard.includes('if (o->_cache_flag) { use_cache = 1; }')
+    && guard.includes('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }'));
   check('no fingerprint residue remains (the walk was removed in stage C)',
     !c.includes('as_render_fp'));
 
@@ -2579,12 +2579,11 @@ function checkRepaintBoundary(): string[] {
     !emitted.includes('while (o != NULL && !o->_render_dirty) {') && emitted.includes('while (o != NULL) {'));
   check('as_mark_dirty is forward-declared for user-code call sites',
     emitted.includes('static void as_mark_dirty(DisplayObject* o);'));
-  check('the cache branch re-bakes on _render_dirty (consume-time clear)',
+  check('the cache branch re-bakes on _render_dirty (deferred to as_render_cached)',
     emitted.includes('int use_cache = 0;')
     && emitted.includes('if (o->_render_dirty) {')
-    && emitted.includes('o->_render_dirty = 0;')
-    && emitted.includes('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }')
-    && emitted.includes('else { o->_auto_baked = 0; o->_cache_valid = 0; }'));
+    && emitted.includes('if (o->_cache_flag) { use_cache = 1; }')
+    && emitted.includes('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }'));
   // ---- Stage C: dirty rectangle (docs/zh-cn/repaint-boundary.md §4.2/§4.3) ----
   check('DisplayObject declares the dirty-rectangle fields',
     emitted.includes('int _dirty_full;')
@@ -2616,6 +2615,28 @@ function checkRepaintBoundary(): string[] {
     && emitted.includes('o->_render_dirty = 0;')
     && emitted.includes('o->_dirty_full = 0;')
     && emitted.includes('as_clear_dirty((DisplayObject*)as_v_obj_val(c->children->data[i]));'));
+  // ---- Stage C step 3/4: retained surface + incremental re-bake (§4.4) ----
+  check('DisplayObject declares the retained bake surface',
+    emitted.includes('void* _cache_surface;'));
+  check('as_render_cached retains the raster surface and registers a surface finalizer',
+    emitted.includes('o->_cache_surface = surface;')
+    && emitted.includes('as_final_register_surface(o, surface);'));
+  check('a rebuild releases both the image and the retained surface',
+    emitted.includes('if (o->_cache_surface != NULL) { as_final_release(o, o->_cache_surface); as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }'));
+  check('an explicit cacheAsBitmap defers the dirty flag to as_render_cached (no consume-time clear)',
+    emitted.includes('if (o->_cache_flag) { use_cache = 1; }')
+    && emitted.includes('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }'));
+  check('a finite dirty rect repaints in place (bake_patch) instead of rebuilding',
+    emitted.includes('else if (o->_render_dirty && !o->_dirty_full && (o->filters == NULL || o->filters->length == 0) && o->_cache_surface != NULL) {')
+    && emitted.includes('as_skia_canvas_clip_rect(c2, dl, dt, dr - dl, db - dt);')
+    && emitted.includes('as_skia_canvas_clear_rect(c2, dl, dt, dr - dl, db - dt);')
+    && emitted.includes('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);'));
+  check('a _dirty_full (or filtered) boundary repaints the whole retained surface',
+    emitted.includes('else if (o->_render_dirty && o->_cache_surface != NULL) {')
+    && emitted.includes('as_skia_canvas_reset(c2);'));
+  check('as_gflush invalidates the precise accumulated bounds, not the whole object',
+    emitted.includes('static void as_gflush(Graphics* g) {')
+    && emitted.includes('as_mark_dirty_rect(g->_owner, g->_bl - half, g->_bt - half, g->_br + half, g->_bb + half);'));
   // Stage C (incremental re-bake) will call as_clear_dirty once after the paint;
   // until the dirty rectangle is consumed, clearing stays at consume time in the
   // cache branch and this end-of-frame reset stays disabled.

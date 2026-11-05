@@ -187,7 +187,7 @@ function checkDisplayGeometry(): string[] {
   // CPU 侧路径包围盒：纯 C（无 Skia）构建也必须能测几何。
   check('every path mutation maintains a CPU-side bounds box',
     c.includes('static void as_gpath_pt(Graphics* g, double x, double y) {')
-    && c.includes('void Graphics_lineTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_line_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }')
+    && c.includes('void Graphics_lineTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_line_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); as_gpath_mark(g); }')
     && c.includes('as_skia_path_add_rect(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x, y);'));
 
   // E（阶段九十五）：Graphics 从「单路径 + 单组画笔」升级为「有序绘制组」。

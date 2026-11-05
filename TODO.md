@@ -19518,6 +19518,45 @@ Bitmap/BitmapData、TextField、Stage 的全部渲染输入写点；BitmapData �
 但 GUI 场景需在带 Skia 后端的真机/窗口环境跑（当前只验证了 autobake/cacheasbitmap 两个示例）；② 阶段 B 切换未做
 （关闭指纹掉烘、仅靠 `_render_dirty`）；③ 阶段 C（边界内脏矩形合并、脏区域裁剪重绘、`showRedrawRegions` oracle）未开始。
 
+### 阶段三百七十一：RepaintBoundary 阶段 C 第三步 —— 边界内增量重烘（v0.4.334 → v0.4.335）
+
+**起点**：阶段三百七十彻底移除每帧指纹哈希后，失效与 Present-skip 完全由写时脏标记 + 全局 epoch 驱动；脏矩形字段
+（`_dirty_full/_dirty_l/t/r/b`）在阶段三百六十九落地后仍「写了不读」。本阶段把它们用起来：显式 `cacheAsBitmap` 边界
+脏且矩形有限时，只重绘脏矩形覆盖的像素，其余 blit 旧快照。
+
+**逐项**：
+1. **retained raster surface**：`DisplayObject` 增 `void* _cache_surface`（ctor 置 NULL）；`as_render_cached` 整边界重建
+   后把 surface 挂到 `_cache_surface` 并 `as_final_register_surface` 注册；重建/`cacheAsBitmap=false` 时与 `_cache_image`
+   同步释放。finalizer 从「只删 SkImage」改为按 kind 分派：`ASC_final_kind[]`（0=SkImage, 1=SkSurface），
+   `as_final_register_kind`/`as_final_register_surface` 注册，`as_final_on_free` 按 kind 调 `as_skia_surface_delete` 或
+   `as_skia_image_delete`。
+2. **`sk_canvas_clear_rect`**：glue 新增 `SkPaint{kClear}` + `drawRect` 只擦脏矩形（`clear()` 会清整个 surface）；
+   runtime 补 extern 声明 + Skia inline + 无-Skia stub。
+3. **Graphics 精确矩形写点**：闭合形状（`drawRect`/`drawCircle`/`drawEllipse`）经 `as_gpath_mark_rect` 携带精确矩形
+   （含 `_max_sw` 描边外扩），`as_gflush` 改用累计 bounds 做 `as_mark_dirty_rect`（不再整对象脏——否则一个
+   `beginFill`/`endFill` 对就会把 drawRect 的精确矩形退化成 `_dirty_full`）；开放路径（`moveTo`/`lineTo`/`curveTo` 等）
+   与 9 个直接字段仍走 `as_mark_dirty` 整对象脏。
+4. **`as_render_cached` 增量重烘**：cache 决策里显式 `cacheAsBitmap` 脏不再清 `_render_dirty`/`_cache_valid`（改为
+   `use_cache=1` 交给 `as_render_cached`），auto-bake 脏仍掉烘落到 live。`as_render_cached` 新增两条消费分支：
+   - 脏且 `_dirty_full==0` 且无 filter：`save` + `clipRect(_dirty_*)` + `clearRect(_dirty_*)` + 局部重画 + 重新
+     snapshot（`bake_patch`），保留 surface 其余像素不动；
+   - `_dirty_full` 或有 filter：复用 surface 整重烘（`reset` + clear + 重设 scale/translate + 重画 + 重新 snapshot）；
+   - 尺寸/相位变化仍走整边界重建（`bake_rebuild`，新建 surface）。消费后清脏（`_render_dirty=0` + 脏矩形复位）。
+5. **测试与示例**：`unit: render/RepaintBoundary` 新增 retained-surface/finalizer-kind/`bake_patch`/`as_gflush` 精确矩形
+   等钉子；`display/DisplayGeometry` 的 Graphics 钉子同步 `as_gpath_mark`。新增 `examples/cache-patch.as` +
+   `cache-patch.build.json`：边界首次 render 整重建（蓝），同 bounds 追加 drawRect 后第二次 render 走 `bake_patch`
+   （中心变红），像素断言 + `ASC_BAKE_TRACE` 里依次出现 `bake_rebuild`/`bake_patch`。
+
+**验收**：
+- `npm run test:unit`：**tests 319 / pass 319 / fail 0**。
+- 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**（含新增 `cache-patch.as` 端到端用例）。
+- `examples/cache-patch.as --manifest examples/cache-patch.build.json --run`：输出 `incremental re-bake verified`，
+  `ASC_BAKE_TRACE=1` 依次出现 `bake_rebuild`（lw=120 lh=90）与 `bake_patch`（dl=0 dt=0 dr=120 db=90）。
+
+**如实报明**：增量重烘只对「边界脏 + 矩形有限 + 无 filter」成立；整对象脏（`_dirty_full`，含 9 个直接字段与开放路径
+图形）、带 filter、尺寸/相位变化仍整边界重烘。「帧末统一复位」（`as_clear_dirty`）仍未启用——它需与增量重烘配套并
+系统性修掉 auto-bake 增加暴露的漏点；`showRedrawRegions` 仍只接受无覆盖层。
+
 ### 阶段三百七十：RepaintBoundary 阶段 C 第二步 —— 彻底移除每帧指纹哈希（v0.4.333 → v0.4.334）
 
 **起点**：阶段三百六十九落地脏矩形基础设施（写了不读），但每帧整树指纹哈希 `as_render_fp` 仍保留——它服务

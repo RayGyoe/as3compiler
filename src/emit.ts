@@ -1995,6 +1995,12 @@ export class Emitter {
           // this and paints live instead of reusing a mis-phased image.
           this.line('double _cache_phx;');
           this.line('double _cache_phy;');
+          // The retained offscreen raster surface behind _cache_image. Stage C
+          // incremental re-bake (docs/zh-cn/repaint-boundary.md §4.4) keeps it
+          // alive between frames so a dirty RECTANGLE can be clipped and repainted
+          // in place instead of rebuilding the whole surface. NULL until the first
+          // full bake; the finalizer releases it together with _cache_image.
+          this.line('void* _cache_surface;');
           this.line('int _cache_valid;');
           // Incremental-redraw state (auto cacheAsBitmap): _auto_baked marks the
           // subtree as currently baked into _cache_image. RepaintBoundary stage B
@@ -12931,6 +12937,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_mask_object = false;');
     this.line('o->_cache_image = NULL;');
     this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
+    this.line('o->_cache_surface = NULL;');
     this.line('o->_cache_valid = 0;');
     this.line('o->_auto_baked = 0;');
     this.line('o->_render_dirty = 0;');
@@ -13099,6 +13106,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (o->parent != NULL) as_mark_dirty((DisplayObject*)o->parent);');
     this.line('o->_cache_flag = value;');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('if (o->_cache_surface != NULL) { as_final_release(o, o->_cache_surface); as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }');
     this.line('o->_cache_valid = 0;');
     this.indent--;
     this.line('}');
@@ -22142,12 +22150,31 @@ void FileStream_writeObject(void* _this, as_value v) {
     // so geometry survives a PURE-C build and width/height never touch Skia.
     this.line('static void as_gpath_pt(Graphics* g, double x, double y) {');
     this.indent++;
-    this.line('if (g->_owner != NULL) as_mark_dirty(g->_owner);');
+    // Stage C step 3: bounds bookkeeping no longer marks dirty here. Geometry is
+    // marked by the caller: path-building ops (moveTo/lineTo/curveTo, drawPath) use
+    // as_gpath_mark (whole-object, their accumulated bounds are not a reliable
+    // AABB), while self-contained closed shapes (drawRect/drawCircle/...) use
+    // as_gpath_mark_rect (precise rect + stroke spread). SWC bake helpers call this
+    // during construction when _owner is NULL, so they need no mark at all.
     this.line('if (!g->_has_b) { g->_bl = x; g->_bt = y; g->_br = x; g->_bb = y; g->_has_b = 1; return; }');
     this.line('if (x < g->_bl) g->_bl = x;');
     this.line('if (y < g->_bt) g->_bt = y;');
     this.line('if (x > g->_br) g->_br = x;');
     this.line('if (y > g->_bb) g->_bb = y;');
+    this.indent--;
+    this.line('}');
+    // Whole-object invalidation for path-building ops (their accumulated bounds
+    // carry no dependable AABB, so they fall back to _dirty_full).
+    this.line('static void as_gpath_mark(Graphics* g) { if (g->_owner != NULL) as_mark_dirty(g->_owner); }');
+    // Precise invalidation for a self-contained closed shape: the declared extent
+    // plus half the widest stroke ever set, so a centred stroke's outside half is
+    // not clipped by the incremental re-bake's clip rect (_max_sw is the
+    // stroke-inclusive spread as_paint_bound already uses for bake bounds).
+    this.line('static void as_gpath_mark_rect(Graphics* g, double l, double t, double r, double b) {');
+    this.indent++;
+    this.line('if (g->_owner == NULL) return;');
+    this.line('double half = g->_max_sw * 0.5;');
+    this.line('as_mark_dirty_rect(g->_owner, l - half, t - half, r + half, b + half);');
     this.indent--;
     this.line('}');
     // Exact bounds of a quadratic / cubic arc (G26). AIR reports width/height from the
@@ -22203,7 +22230,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void as_gflush(Graphics* g) {');
     this.indent++;
     this.line('if (!g->_cur_has) return;');
-    this.line('if (g->_owner != NULL) as_mark_dirty(g->_owner);');
+    // A flush only closes the current group (an internal representation change):
+    // it does not alter the already-drawn bounds, so invalidate the precise
+    // accumulated bounds instead of the whole object -- otherwise a beginFill/
+    // endFill pair would demote a drawRect's precise rect to _dirty_full and
+    // defeat incremental re-bake (stage C step 3).
+    this.line('if (g->_owner != NULL) { if (g->_has_b) { double half = g->_max_sw * 0.5; as_mark_dirty_rect(g->_owner, g->_bl - half, g->_bt - half, g->_br + half, g->_bb + half); } else as_mark_dirty(g->_owner); }');
     this.line('as_gdraw* d = (as_gdraw*)malloc(sizeof(as_gdraw));');
     this.line('if (d == NULL) return;');
     this.line('d->path = g->path; d->fill = g->fill; d->stroke = g->stroke;');
@@ -22270,16 +22302,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return o;');
     this.indent--;
     this.line('}');
-    this.line('void Graphics_moveTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_move_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
-    this.line('void Graphics_lineTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_line_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); }');
+    this.line('void Graphics_moveTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_move_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); as_gpath_mark(g); }');
+    this.line('void Graphics_lineTo(void* _this, double x, double y) { Graphics* g = (Graphics*)_this; as_skia_path_line_to(g->path, x, y); as_gpath_pt(g, x, y); as_gpen(g, x, y); as_gpath_mark(g); }');
     // The CPU-side box takes the CURVE extrema, not the control points (see
     // as_gpath_quad): AIR answers 80x25 for a curve whose control sits at y=0 over a
     // chord at y=50.
-    this.line('void Graphics_curveTo(void* _this, double cx, double cy, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_quad_to(g->path, cx, cy, ax, ay); as_gpath_quad(g, g->_lastx, g->_lasty, cx, cy, ax, ay); as_gpen(g, ax, ay); }');
+    this.line('void Graphics_curveTo(void* _this, double cx, double cy, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_quad_to(g->path, cx, cy, ax, ay); as_gpath_quad(g, g->_lastx, g->_lasty, cx, cy, ax, ay); as_gpen(g, ax, ay); as_gpath_mark(g); }');
     // Same rule as curveTo with the second control point added (G26): the extrema of
     // the cubic join the box, so a control hull that sticks out does not inflate
     // width/height -- and a pure-C build (every Skia stub inert) agrees with AIR.
-    this.line('void Graphics_cubicCurveTo(void* _this, double c1x, double c1y, double c2x, double c2y, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_cubic_to(g->path, c1x, c1y, c2x, c2y, ax, ay); as_gpath_cubic(g, g->_lastx, g->_lasty, c1x, c1y, c2x, c2y, ax, ay); as_gpen(g, ax, ay); }');
+    this.line('void Graphics_cubicCurveTo(void* _this, double c1x, double c1y, double c2x, double c2y, double ax, double ay) { Graphics* g = (Graphics*)_this; as_skia_path_cubic_to(g->path, c1x, c1y, c2x, c2y, ax, ay); as_gpath_cubic(g, g->_lastx, g->_lasty, c1x, c1y, c2x, c2y, ax, ay); as_gpen(g, ax, ay); as_gpath_mark(g); }');
     this.line('void Graphics_beginFill(void* _this, unsigned color, double alpha) {');
     this.indent++;
     this.line('Graphics* g = (Graphics*)_this;');
@@ -22390,7 +22422,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_paint_set_linear_gradient(g->fill, x0, y0, x1, y1, c0, a0, c1, a1);');
     this.indent--;
     this.line('}');
-    this.line('void Graphics_drawRect(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; as_skia_path_add_rect(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x, y); }');
+    this.line('void Graphics_drawRect(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; as_skia_path_add_rect(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x, y); as_gpath_mark_rect(g, x, y, x + w, y + h); }');
     // drawRoundRect(x, y, w, h, ellipseWidth, ellipseHeight): AIR's rounded rect.
     // Every branch below is measured on adl 51.4.1 (temp/g16g19g20/ab-round.cjs +
     // RoundArgs.as: 10 geometry cases x 40 rows, plus the argument matrix):
@@ -22436,14 +22468,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the pen rests where the top edge starts.
     this.line('as_gpath_rect(g, x, y, w, h);');
     this.line('as_gclosed(g, x + rx, y);');
+    this.line('as_gpath_mark_rect(g, x, y, x + w, y + h);');
     this.indent--;
     this.line('}');
-    this.line('void Graphics_drawCircle(void* _this, double x, double y, double r) { Graphics* g = (Graphics*)_this; as_skia_path_add_circle(g->path, x, y, r); as_gpath_rect(g, x - r, y - r, 2.0 * r, 2.0 * r); as_gclosed(g, x - r, y); }');
+    this.line('void Graphics_drawCircle(void* _this, double x, double y, double r) { Graphics* g = (Graphics*)_this; as_skia_path_add_circle(g->path, x, y, r); as_gpath_rect(g, x - r, y - r, 2.0 * r, 2.0 * r); as_gclosed(g, x - r, y); as_gpath_mark_rect(g, x - r, y - r, x + r, y + r); }');
     // drawEllipse(x, y, width, height): the oval inscribed in that rectangle (AIR,
     // Flash Player 10+). A negative width/height mirrors the rectangle, which for a
     // symmetric oval is the same outline, so the size is normalized the way AIR's
     // drawRect bounds are (the mirrored rect is the shape's bounding box either way).
-    this.line('void Graphics_drawEllipse(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; if (w < 0) { x += w; w = -w; } if (h < 0) { y += h; h = -h; } as_skia_path_add_oval(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x + w * 0.5, y); }');
+    this.line('void Graphics_drawEllipse(void* _this, double x, double y, double w, double h) { Graphics* g = (Graphics*)_this; if (w < 0) { x += w; w = -w; } if (h < 0) { y += h; h = -h; } as_skia_path_add_oval(g->path, x, y, w, h); as_gpath_rect(g, x, y, w, h); as_gclosed(g, x + w * 0.5, y); as_gpath_mark_rect(g, x, y, x + w, y + h); }');
     // drawTriangles: builds one closed sub-path per triangle (like drawRect adds a
     // closed sub-path), so the fill/stroke in effect is applied by as_gflush exactly
     // as it is for the other shape methods. `vertices` is a flat x,y pair list; an
@@ -22486,6 +22519,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_gclosed(g, cx, cy);');
     this.indent--;
     this.line('}');
+    // Multi-triangle union is not a single dependable AABB, so mark whole-object
+    // (as_gpath_mark) after the loop rather than one precise rect per triangle.
+    this.line('as_gpath_mark(g);');
     this.indent--;
     this.line('}');
     // drawPath(commands:Vector.<int>, data:Vector.<Number>, winding:String).
@@ -22568,6 +22604,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} else break;  // unknown OR wide command: keep what is built, drop the rest');
     this.indent--;
     this.line('}');
+    // drawPath builds arbitrary path geometry (no single dependable AABB), so it
+    // falls back to whole-object invalidation after the command loop.
+    this.line('as_gpath_mark(g);');
     this.indent--;
     this.line('}');
     this.line('void Graphics_clear(void* _this) {');
@@ -29176,6 +29215,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b) {');
     this.indent++;
+    // Present-skip is keyed on ASC_dirty_epoch (stage C step 2), so a precise-rect
+    // invalidation must bump it exactly like as_mark_dirty does, or a rect-only
+    // change would leave the window's render_epoch stale and skip the Present.
+    this.line('ASC_dirty_epoch++;');
     this.line('while (o != NULL) {');
     this.indent++;
     this.line('as_dirty_merge(o, l, t, r, b);');
@@ -29449,6 +29492,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('{ double _otx = 0.0, _oty = 0.0; as_skia_canvas_total_translate(canvas, &_otx, &_oty); if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_rebuild o=%p bl=%.4f bt=%.4f lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f bxo=%.5f byo=%.5f otx=%.5f oty=%.5f bpx=%.5f bpy=%.5f\\n", as_now_ms(), (void*)o, bl, bt, lw, lh, pw, ph, sx, sy, bxo, byo, _otx, _oty, bpx, bpy); }');
     this.line('if (ASC_bake_trace) { double _tx = 0.0, _ty = 0.0; as_skia_canvas_total_scale(canvas, &_tx, &_ty); double _ex = (_tx > 0.0) ? fabs((double)pw / ((double)lw * _tx) - 1.0) : 0.0; if (_ex > 0.002 || _tx != _ty) fprintf(stderr, "t=%.0f bake_anis o=%p lw=%d lh=%d pw=%d ph=%d sx=%.5f sy=%.5f ctx=%.5f cty=%.5f ex=%.5f\\n", as_now_ms(), (void*)o, lw, lh, pw, ph, sx, sy, _tx, _ty, _ex); }');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('if (o->_cache_surface != NULL) { as_final_release(o, o->_cache_surface); as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }');
     this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
     this.line('if (surface != NULL) {');
     this.indent++;
@@ -29468,12 +29512,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(surface);');
     // A baked object that leaves the stage has its Snapshot collected with it;
-    // the finalizer is what returns the surface memory to the allocator.
+    // the finalizer is what returns the surface memory to the allocator. Stage C
+    // incremental re-bake retains the raster surface (registered separately) so a
+    // dirty rect can be repainted in place next frame.
     this.line('as_final_register(o, o->_cache_image);');
-    this.line('as_skia_surface_delete(surface);');
+    this.line('o->_cache_surface = surface;');
+    this.line('as_final_register_surface(o, surface);');
     this.line('o->_cache_w = (double)pw; o->_cache_h = (double)ph;');
     this.line('o->_cache_phx = bpx; o->_cache_phy = bpy;');
     this.line('o->_cache_valid = 1;');
+    this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
     this.indent--;
     this.line('}');
     // A bake surface that cannot be created (too large, out of memory) must not paint
@@ -29481,6 +29529,56 @@ void FileStream_writeObject(void* _this, as_value v) {
     // which is the uncached rendering this cache is supposed to be indistinguishable
     // from. Reachable in practice through the 32768px span limit above.
     this.line('else as_render_live(canvas, o);');
+    this.indent--;
+    this.line('}');
+    // Stage C incremental re-bake (docs/zh-cn/repaint-boundary.md §4.4): a dirty
+    // boundary with a FINITE rect and no filter repaints only that rect into the
+    // retained surface. The canvas still carries scale(sx,sy)*translate(-bxo,-byo),
+    // so the object-local dirty rect clips in exactly those coordinates; kClear
+    // erases the rect, then the subtree repaints under the clip, leaving the rest.
+    this.line('else if (o->_render_dirty && !o->_dirty_full && (o->filters == NULL || o->filters->length == 0) && o->_cache_surface != NULL) {');
+    this.indent++;
+    this.line('double dl = o->_dirty_l, dt = o->_dirty_t, dr = o->_dirty_r, db = o->_dirty_b;');
+    this.line('if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_patch o=%p dl=%.3f dt=%.3f dr=%.3f db=%.3f lw=%d lh=%d\\n", as_now_ms(), (void*)o, dl, dt, dr, db, lw, lh);');
+    this.line('void* c2 = as_skia_surface_canvas(o->_cache_surface);');
+    this.line('as_skia_canvas_save(c2);');
+    this.line('as_skia_canvas_clip_rect(c2, dl, dt, dr - dl, db - dt);');
+    this.line('as_skia_canvas_clear_rect(c2, dl, dt, dr - dl, db - dt);');
+    this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;');
+    this.line('ASC_alpha_mul = 1.0;');
+    this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
+    this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sx;');
+    this.line('if (ASC_bake_ctm_y <= 0.0) ASC_bake_ctm_y = sy;');
+    this.line('as_render_object_content(c2, o);');
+    this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
+    this.line('as_skia_canvas_restore(c2);');
+    this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
+    this.line('as_final_register(o, o->_cache_image);');
+    this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
+    this.indent--;
+    this.line('}');
+    // Dirty with _dirty_full (unbounded) or a filter: repaint the WHOLE retained
+    // surface (same picture as a rebuild, but without re-allocating the surface).
+    this.line('else if (o->_render_dirty && o->_cache_surface != NULL) {');
+    this.indent++;
+    this.line('void* c2 = as_skia_surface_canvas(o->_cache_surface);');
+    this.line('as_skia_canvas_reset(c2);');
+    this.line('as_skia_canvas_clear_transparent(c2);');
+    this.line('as_skia_canvas_scale(c2, sx, sy);');
+    this.line('as_skia_canvas_translate(c2, -bxo, -byo);');
+    this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;');
+    this.line('ASC_alpha_mul = 1.0;');
+    this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
+    this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sx;');
+    this.line('if (ASC_bake_ctm_y <= 0.0) ASC_bake_ctm_y = sy;');
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(c2, o, o->filters, o->filters->length - 1);');
+    this.line('else as_render_object_content(c2, o);');
+    this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
+    this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
+    this.line('as_final_register(o, o->_cache_image);');
+    this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
     this.indent--;
     this.line('}');
     this.line('if (o->_cache_image != NULL) {');
@@ -29779,14 +29877,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('if (o->_render_dirty) {');
     this.indent++;
-    // Clear at CONSUME time (not end-of-frame): a boundary object's flag must not
-    // survive its own re-bake, or an idle boundary keeps invalidating. Stage C will
-    // switch to end-of-frame clearing (as_clear_dirty) once the dirty RECTANGLE is
-    // consumed by incremental re-baking; until then the rectangle fields are written
-    // but not yet read.
-    this.line('o->_render_dirty = 0;');
-    this.line('if (o->_cache_flag) { o->_cache_valid = 0; use_cache = 1; }');
-    this.line('else { o->_auto_baked = 0; o->_cache_valid = 0; }');
+    // Stage C: an explicit cacheAsBitmap keeps _cache_valid AND _render_dirty so
+    // as_render_cached can pick incremental (finite rect) vs whole repaint, then
+    // clears on consume. An auto-bake tears down and falls through to live (the
+    // still subtree re-bakes the instant it is no longer dirty).
+    this.line('if (o->_cache_flag) { use_cache = 1; }');
+    this.line('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }');
     this.indent--;
     this.line('} else {');
     this.indent++;

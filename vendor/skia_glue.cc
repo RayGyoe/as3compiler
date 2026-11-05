@@ -677,6 +677,16 @@ void sk_canvas_clear_transparent(void* canvas) {
   ((SkCanvas*)canvas)->clear(SK_ColorTRANSPARENT);
 }
 
+// Clear a RECTANGLE to fully transparent (RepaintBoundary stage C incremental
+// re-bake). Skia's clear() clears the whole canvas; a kClear-blend drawRect
+// erases just the dirty rect, leaving the rest of the retained bake surface intact.
+void sk_canvas_clear_rect(void* canvas, double x, double y, double w, double h) {
+  SkPaint p;
+  p.setBlendMode(SkBlendMode::kClear);
+  p.setAntiAlias(false);
+  ((SkCanvas*)canvas)->drawRect(SkRect::MakeXYWH((SkScalar)x, (SkScalar)y, (SkScalar)w, (SkScalar)h), p);
+}
+
 void sk_canvas_save(void* canvas)   { ((SkCanvas*)canvas)->save(); }
 void sk_canvas_restore(void* canvas){ ((SkCanvas*)canvas)->restore(); }
 // Frame-start hygiene for a canvas that outlives one frame (the cached GPU back-buffer

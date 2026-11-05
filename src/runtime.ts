@@ -8001,10 +8001,12 @@ static void gc_mark_drain(void) {
 #define ASC_FINAL_SLOTS 4096
 static void* ASC_final_owner[ASC_FINAL_SLOTS];
 static void* ASC_final_res[ASC_FINAL_SLOTS];
+static int ASC_final_kind[ASC_FINAL_SLOTS];  // 0 = SkImage, 1 = SkSurface
 static int ASC_final_used = 0;
 static int ASC_final_released_n = 0;
 static void as_skia_image_delete(void* img);
-static void as_final_register(void* owner, void* res) {
+static void as_skia_surface_delete(void* s);
+static void as_final_register_kind(void* owner, void* res, int kind) {
     if (owner == NULL || res == NULL) return;
     if (ASC_final_used >= ASC_FINAL_SLOTS) {
         static int warned = 0;
@@ -8013,8 +8015,11 @@ static void as_final_register(void* owner, void* res) {
     }
     ASC_final_owner[ASC_final_used] = owner;
     ASC_final_res[ASC_final_used] = res;
+    ASC_final_kind[ASC_final_used] = kind;
     ASC_final_used++;
 }
+static void as_final_register(void* owner, void* res) { as_final_register_kind(owner, res, 0); }
+static void as_final_register_surface(void* owner, void* res) { as_final_register_kind(owner, res, 1); }
 // Release ONE resource of an owner (a rebuild replaces an image): the caller has
 // already deleted it, this only forgets the registration so the owner's death
 // does not delete it a second time.
@@ -8023,6 +8028,7 @@ static void as_final_release(void* owner, void* res) {
         if (ASC_final_owner[i] == owner && (res == NULL || ASC_final_res[i] == res)) {
             ASC_final_owner[i] = ASC_final_owner[ASC_final_used - 1];
             ASC_final_res[i] = ASC_final_res[ASC_final_used - 1];
+            ASC_final_kind[i] = ASC_final_kind[ASC_final_used - 1];
             ASC_final_used--;
             return;
         }
@@ -8042,10 +8048,12 @@ static void as_final_on_free(void* owner) {
     for (int i = 0; i < ASC_final_used; ) {
         if (ASC_final_owner[i] == owner) {
             void* res = ASC_final_res[i];
+            int kind = ASC_final_kind[i];
             ASC_final_owner[i] = ASC_final_owner[ASC_final_used - 1];
             ASC_final_res[i] = ASC_final_res[ASC_final_used - 1];
+            ASC_final_kind[i] = ASC_final_kind[ASC_final_used - 1];
             ASC_final_used--;
-            as_skia_image_delete(res);
+            if (kind == 1) as_skia_surface_delete(res); else as_skia_image_delete(res);
             ASC_final_released_n++;
         } else {
             i++;
@@ -10102,6 +10110,7 @@ extern void* sk_surface_make_snapshot(void* surface);
 extern void sk_surface_delete(void* surface);
 extern void sk_canvas_clear(void* canvas, unsigned rgb);
 extern void sk_canvas_clear_transparent(void* canvas);
+extern void sk_canvas_clear_rect(void* canvas, double x, double y, double w, double h);
 extern void sk_canvas_save(void* canvas);
 extern void sk_canvas_restore(void* canvas);
 extern void sk_canvas_reset(void* canvas);
@@ -10292,6 +10301,7 @@ static inline void as_clipboard_set_text(const char* t) { sk_clipboard_set_text(
 static inline int as_clipboard_get_text(char* buf, int cap) { return sk_clipboard_get_text(buf, cap); }
 static inline void as_skia_canvas_clear(void* c, unsigned rgb) { sk_canvas_clear(c, rgb); }
 static inline void as_skia_canvas_clear_transparent(void* c) { sk_canvas_clear_transparent(c); }
+static inline void as_skia_canvas_clear_rect(void* c, double x, double y, double w, double h) { sk_canvas_clear_rect(c, x, y, w, h); }
 static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) {
     if (ASC_alpha_mul < 1.0) { sk_canvas_draw_rect_mul(c, x, y, w, h, p, ASC_alpha_mul); return; }
     sk_canvas_draw_rect(c, x, y, w, h, p);
@@ -11153,6 +11163,7 @@ static inline void as_skia_paint_set_style_stroke(void* p) { (void)p; }
 static inline void as_skia_paint_set_stroke_width(void* p, double w) { (void)p; (void)w; }
 static inline void as_skia_canvas_clear(void* c, unsigned rgb) { (void)c; (void)rgb; }
 static inline void as_skia_canvas_clear_transparent(void* c) { (void)c; }
+static inline void as_skia_canvas_clear_rect(void* c, double x, double y, double w, double h) { (void)c; (void)x; (void)y; (void)w; (void)h; }
 static double ASC_alpha_mul = 1.0;   // see the Skia block: folded single-primitive alpha
 static inline void as_skia_canvas_draw_rect(void* c, double x, double y, double w, double h, void* p) { (void)c; (void)x; (void)y; (void)w; (void)h; (void)p; }
 // No-Skia builds have no canvas to measure: report 1 (a 1:1 transform), which

@@ -277,10 +277,16 @@ if (边界 && 命中快照) {
       窗口 Present-skip 键改全局 `ASC_dirty_epoch`（写时 `++`）；删 `_auto_fp`/指纹 helper/`DIRTY_MISS`/`ASC_DIRTY_TRACE`。
 - [x] `DisplayObject` 增 `_dirty_l/t/r/b` + `_dirty_full`（§4.2）。
 - [x] 脏矩形合并/上溯：`as_dirty_merge`（防非有限矩形）+ `as_mark_dirty_rect`（合并 + 复用 `as_bounds_xform`
-      上溯变换到父坐标）；`as_mark_dirty` 置整对象脏（`_dirty_full=1`）。（注：写点目前仍走 `as_mark_dirty`
-      整对象脏，尚未改用 `as_mark_dirty_rect` 携带精确矩形——那需要各写点知道受影响区域的局部坐标。）
-- [ ] 边界重绘走**脏区域裁剪**：`save` + `clipRect(_dirty_*)` 后只重画脏矩形内的内容，其余 blit 旧快照；
-  或（脏子树方案）只重画脏的那棵子树、其余子树 blit。
+      上溯变换到父坐标）；`as_mark_dirty` 置整对象脏（`_dirty_full=1`）。**精确矩形写点已落地**：闭合形状
+      （`drawRect`/`drawCircle`/`drawEllipse`）经 `as_gpath_mark_rect` 携带精确矩形（含 `_max_sw` 描边外扩），
+      `as_gflush` 用累计 bounds 做精确矩形（不再整对象脏）；开放路径（`moveTo`/`lineTo`/`curveTo` 等）与
+      9 个直接字段仍走 `as_mark_dirty` 整对象脏（其 bounds 无法在写点时刻定）。
+- [x] **边界内增量重烘（bake_patch）**：`as_render_cached` 在边界脏且 `_dirty_full==0` 且无 filter 时，用保留的
+      raster surface（`_cache_surface`，重建时同步释放/替换 + finalizer 按 kind 区分 SkImage/SkSurface）做
+      `save` + `clipRect(_dirty_*)` + `clearRect(_dirty_*)` + 局部重画 + 重新 snapshot；`_dirty_full` 或有 filter
+      则复用 surface 整重烘（`reset` + clear + 重画）；尺寸/相位变化仍走整边界重建（bake_rebuild）。显式
+      `cacheAsBitmap` 脏不再在 `as_render_object` 里清 `_render_dirty`/`_cache_valid`，改为交给 `as_render_cached`
+      消费后清脏；auto-bake 脏仍掉烘落到 live。
 - [ ] 「帧末统一复位」（`as_clear_dirty`）启用：与增量重烘配套，系统性修掉 auto-bake 增加暴露的漏点。
 - **验收**：
   - FPS 计数器场景（`TODO.md` 阶段四十七的 90×20 小块）：重绘像素面积从「整帧」降到「小块」，用
