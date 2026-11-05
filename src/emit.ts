@@ -29166,8 +29166,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     // fingerprint path in parallel; this predicate is consumed once the cache branch
     // reads _render_dirty.
     this.line('static int as_is_boundary(DisplayObject* o) { return o != NULL && o->_cache_flag; }');
-    // Write-time invalidation: mark o and every ancestor up to the nearest
-    // cacheAsBitmap boundary dirty. O(depth) on write, O(1) to test at render time.
+    // Write-time invalidation: mark o and every ancestor up to the root dirty.
+    // O(depth) on write, O(1) to test at render time.
     //
     // Do NOT short-circuit on !o->_render_dirty. A non-boundary child's flag can
     // stay set across frames (the bake path paints content, it does not re-walk the
@@ -29175,12 +29175,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and cleared that same frame. If that same child changes again next frame, the
     // short-circuit would skip the ancestor and leave the boundary stale -- the
     // DIRTY_MISS storm in 阶段三百六十七 等价性验证. Always walk the full chain.
+    //
+    // Do NOT stop at the first cacheAsBitmap ancestor either. A NESTED
+    // cacheAsBitmap (a cached child inside a cached parent) snapshots the child's
+    // bitmap into the parent's bake; when the child re-bakes, the parent's cached
+    // image is stale and must re-bake too. Stopping at the child boundary leaves
+    // the parent's _render_dirty = 0 while its fingerprint (which folds THROUGH
+    // the child subtree, see as_render_fp) still moves -- the date-picker DIRTY_MISS
+    // storm in 阶段三百六十七 (DateCell's cached highlight Sprite inside the cached
+    // popup). Bubbling to the root is safe: non-boundary ancestors just keep a flag
+    // that nothing consumes. This is what the old short-circuit bug missed.
     this.line('static void as_mark_dirty(DisplayObject* o) {');
     this.indent++;
     this.line('while (o != NULL) {');
     this.indent++;
     this.line('o->_render_dirty = 1;');
-    this.line('if (o->_cache_flag) break;');
     this.line('o = (DisplayObject*)o->parent;');
     this.indent--;
     this.line('}');

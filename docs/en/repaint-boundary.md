@@ -147,19 +147,24 @@ Boundary determination reuses existing semantics:
 Add an inline predicate `as_is_boundary(o)` = `_cache_flag || _auto_baked` (in stage B only `_cache_flag` is a
 stable boundary; `_auto_baked` degrades back to non-boundary on drop-bake, see §6 risk 3).
 
-### 4.3 Invalidation propagation (write-time marking + upward bubbling)
+### 4.3 Invalidation propagation (write-time marking + bubbling to the root)
 
 **Core invariant**: any write that can change render output must mark **itself** and **every ancestor up to the
-nearest boundary** dirty. Stop at the boundary — the boundary isolates invalidation; the parent only sees the
-boundary's bitmap and does not need to know which leaf changed inside.
+root** dirty. **It must bubble to the root, not stop at an inner cacheAsBitmap boundary** — two reasons:
+1. `as_render_fp`'s fingerprint folds **through** an inner boundary into its subtree (§3); if marking stops at the
+   inner boundary, the outer fingerprint moves while `_render_dirty==0`, producing a continuous `DIRTY_MISS`;
+2. a nested cacheAsBitmap parent snapshots the child's bitmap, so when the child re-bakes the parent must re-bake
+   too, or the parent blits a stale image.
+Non-boundary ancestors never read `_render_dirty` (only the cache branch does), so bubbling through is both safe
+and necessary.
 
 ```
 write leaf.x = 10
   → leaf._render_dirty = 1
-  → walk up the parent chain:
+  → walk up the parent chain to the root:
       for each ancestor a:
         a._render_dirty = 1
-        if a is a boundary (_cache_flag) → stop (the boundary itself is dirty, parent untouched)
+        (no longer stop at _cache_flag: bubble through inner boundaries until parent == NULL)
 ```
 
 Three categories of write points (list sourced from `as_render_fp`'s field enumeration, §3):

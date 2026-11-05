@@ -19545,15 +19545,27 @@ filter 字段。这些不是 AS3 字段写/accessor，不能靠 `emitAssign` 覆
    不重走子树，无人清它），而祖先边界同帧被消费清脏。子对象下一帧再变时，短路跳过了冒泡，边界
    `_render_dirty` 保持 0，`DIRTY_MISS` 持续报（最典型是 cacheAsBitmap Sprite 里播放中的 MovieClip，
    同一指针重复上百次）。改为 `while (o != NULL)` 每次都完整冒泡到边界，冒泡 O(depth) 可接受。
+9. **autoSize 重推导尺寸漏标脏（第四轮复验定位）**：`as_tf_apply_autosize` 是 autoSize 字段重推导
+   `_fieldWidth`/`_fieldHeight` 的地方，它直接写字段（不走 `as_do_set_width/height`）且不标脏，而这两个字段
+   是 `as_render_fp` 指纹输入（fold `as_fp_dbl(tf->_fieldWidth/_fieldHeight)`）⇒ 指纹变而 `_render_dirty==0`。
+   改为「值变化时才写 + `as_mark_dirty`」。
+10. **嵌套 cacheAsBitmap 标脏不穿透（dump 子树定位，根本性）**：`as_mark_dirty` 遇到第一个
+    `_cache_flag` 就 `break`，但 `as_render_fp` 的指纹 fold **会穿透内层 cache 边界**递归到子树。日期弹窗的
+    DateCell 选中高亮 Sprite 是内层 cacheAsBitmap，它的子树每帧变→内层被标脏重烘，但冒泡停在它自己，外层
+    cacheAsBitmap 弹窗的 `_render_dirty` 保持 0，而外层指纹仍每帧变 ⇒ 持续 `DIRTY_MISS`（dump 显示 DateCell
+    的 Sprite 在两次 dump 里都 `dirty=1`，其余子对象 dirty 已清）。改为 `as_mark_dirty` **一直冒泡到根**
+    （去掉 `if (o->_cache_flag) break`）：非边界祖先的 flag 无人消费，穿透是安全的；嵌套 cacheAsBitmap 的
+    父层快照了子层位图，子层重烘后父层必须重烘，穿透才是正确失效传播。
 
 **验收**：
 - 全量 `node test.ts`：**tests 617 / pass 617 / fail 0**。
-- `unit: render/RepaintBoundary` 由 25 钉扩展到 **36 钉**（新增 7 类内部状态 + 等价性探针 + 全链冒泡钉子）。
+- `unit: render/RepaintBoundary` 由 25 钉扩展到 **37 钉**（新增 7 类内部状态 + 等价性探针 + 全链冒泡钉子 +
+  autoSize 标脏钉子 + 嵌套 cacheAsBitmap 穿透钉子）。
 - 同步放宽 `text-input/Caret` 的 `as_tf_extend_caret` 正则（520→800 字符，函数体因标脏变长）。
 
-**如实报明**：仍是**并行阶段**，指纹兜底完整保留。第二轮复验（重新编译跑 `ASC_DIRTY_TRACE`）发现
-`DIRTY_MISS` 仍未清零，进一步定位为 `as_mark_dirty` 的 `!o->_render_dirty` 短路 bug（见逐项 8），已修复。
-第三轮复验待用户执行，确认修复后无剩余 `DIRTY_MISS`。阶段 B 切换与阶段 C 仍未开始。
+**如实报明**：仍是**并行阶段**，指纹兜底完整保留。第二轮复验定位 `as_mark_dirty` 短路 bug，第三轮复验定位
+autoSize 漏标脏，第四轮（dump 子树字段 `txt/runs/fw/fh/as`）定位嵌套 cacheAsBitmap 标脏不穿透，均已修复。
+下一步仍待真机复验确认 `DIRTY_MISS` 清零；阶段 B 切换与阶段 C 仍未开始。
 
 ### 阶段三百六十四：生成 C 的默认警告集归零 —— 「编译器能不能把这些警告修掉？」（v0.4.326 → v0.4.327）
 
