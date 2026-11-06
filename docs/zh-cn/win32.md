@@ -727,6 +727,45 @@ Windows 侧**额外的链接项是零**：三个后端全走 `LoadLibrary/GetPro
 live-resize watch 语义**一行未动**（拖动期间动画照常）。对照实验证明 **flip 模型本身不是问题**：
 `temp/dragtrace/gputest.cc`（纯 Win32 + D3D12 flip、2 缓冲、每帧 clear+Present）拖动 p50 = **4.9 ms**，
 同程序走 D3D11 bitblt 是 4.5 ms ⇒ 只有「2 缓冲 **且** 帧在模态循环里跑」这个组合才会卡。
+### 3.8.1 拖动期间的重绘竞争：每帧 Present 挤占模态循环的消息泵（阶段三百七十九）
+
+**症状**：§3.8 的 acquire 停顿修好之后（`SK_D3D_NUM_FRAMES = 3`），**界面每帧都在改内容**时
+（本项目实测：调试 FPS 面板每帧重写 `htmlText`），拖动标题栏仍「跟手慢半拍」；同一窗口
+**内容静止**时移动完全顺滑。
+
+**测量口径**：窄带录屏（`gdigrab` + `-vsync 0`，只抓窗口左边界所在的 40 像素高条带），
+逐帧取「最长亮像素段」的起点当左边界，看相邻帧位移。全屏 `gdigrab` 会因合成器去重
+（`dup=` 帧）把 60 fps 混叠成 ~14 fps，**不能用于这个结论**。
+
+| 目标（1100×900，debug 构建） | 逐帧位移 | 停顿 | >90 px 跳变 |
+|---|---|---|---|
+| 修复前 | `… 305:727 306:727 307:769 … 309:887 310:887 311:919 312:927 313:927 …` | 3 次 | 3 次（86/86/120 px） |
+| 修复后 | `299:481 300:447 301:567 302:599 …` 每帧 32–42 px | 1 次（收尾） | 1 次（起始帧） |
+| 同尺寸 release（内容静止） | 每帧 32–43 px | 0 | 0 |
+
+**机理**：Windows 的标题栏拖动跑在 `DefWindowProc` 的**模态移动循环**里，而我们的帧由
+`SDL_AddEventWatch(live_resize_watch)` 在**同一个线程**的 `MOVED` 事件里推进。窗口越大、单帧工作越重，
+这一帧就越可能占满移动循环自己的消息泵 ⇒ **窗口位置更新被丢**，屏幕上就是「两帧走一步」。
+它与 §3.8 是两个独立瓶颈：acquire 已不等待，但 present 本身仍要一整个帧预算。
+
+**修复**：`vendor/window_glue.cc` 新增 `sk_window_in_move_loop()`，用 `GetGUIThreadInfo` +
+`GUI_INMOVESIZE` 读 OS 自己的模态循环标志（`GetProcAddress` 动态解析，不新增导入面），再比较
+`hwndMoveSize` 的当前尺寸与上次调用：**尺寸不变才算纯移动**。`src/emit.ts` 的 `ASC_window_render`
+在入口据此直接返回 0（`#ifdef ASC_USE_WINDOW` 保护，离屏构建不引用它；`vendor/web_glue.cc`
+给出返回 0 的同名 stub 保持链接一致）。
+
+- **只对纯移动生效**：缩放会改 stage 尺寸，内容必须继续跟随，尺寸一变立刻恢复重绘。
+- **进入循环的首帧也按移动处理**：`last_hwnd` 初值为空、首帧尺寸无从比较，按「缩放」处理会重绘一次，
+  正好卡住第一次位移（实测残留的 120 px 跳变即来自此）。缩放的下一帧尺寸就会变，自然回到重绘路径。
+
+**证据**：修复后同一 harness 全程 32–42 px 均匀步进；`ASC_PASS_TRACE` 在 5.5 s 的按住+拖动窗口里
+**零次** `pass paint`（修复前每帧一条）。静止窗口的 `presentskip` 语义不变。
+
+**钉子**：`test/unit/platform.ts` 的 `platform/MoveLoopPaint` 八项源级断言（跳过点位于其它 paint 步骤之前、
+在 `#ifdef ASC_USE_WINDOW` 内、后端读 OS 标志、缩放被排除、首帧算移动、web stub 在），
+外加 `build/DocumentedLinkSets` 用**离屏清单自己的 defines** 编译一次生成的 C——少了 `#ifdef`
+保护那条会在这里红。
+
 ### 3.9 拖右下角缩放**挂死**：`ResizeBuffers` 打乱了 fence 账本（阶段一百七十七·一）
 
 **症状**：用户报「右下角拉窗口 resize 直接崩溃」。实测**不是崩溃，是永久挂起** —— 窗口停在某个中间尺寸，

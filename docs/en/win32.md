@@ -765,6 +765,51 @@ file) changes, so Metal/WASM are unaffected by construction. A minimal control (
 raw Win32 + D3D12 flip, 2 buffers, clear+Present per frame) drags at 4.9 ms and its D3D11 bitblt variant at
 4.5 ms, so the flip model itself is not the problem — only "2 buffers AND frames running inside the modal
 loop" is.
+### 3.8.1 Repainting During a Move Loop: a Per-Frame Present Starves the Modal Loop's Pump (stage 379)
+
+**Symptom**: with the §3.8 acquire stall fixed (`SK_D3D_NUM_FRAMES = 3`), dragging the title bar still
+felt "half a beat late" whenever the UI rewrote itself every frame (measured here: the debug FPS overlay
+re-assigning `htmlText` per frame), while the same window with **static content** travelled perfectly smoothly.
+
+**Measurement**: a narrow-band screen recording (`gdigrab` + `-vsync 0`, only the 40-pixel strip holding the
+window's left edge), taking the start of the longest bright run as that edge per frame. A full-screen
+`gdigrab` de-duplicates compositor frames (`dup=`), aliasing 60 fps down to ~14 fps — unusable for this.
+
+| Target (1100×900, debug build) | Per-frame left edge | Stalls | Jumps > 90 px |
+|---|---|---|---|
+| Before | `… 305:727 306:727 307:769 … 309:887 310:887 311:919 312:927 313:927 …` | 3 | 3 (86/86/120 px) |
+| After | `299:481 300:447 301:567 302:599 …`, 32–42 px per frame | 1 (trailing) | 1 (entry frame) |
+| Same size, release, static content | 32–43 px per frame | 0 | 0 |
+
+**Mechanism**: a Windows title-bar drag runs inside `DefWindowProc`'s **modal move loop**, while our frames
+are driven from the `MOVED` event on the **same thread** by `SDL_AddEventWatch(live_resize_watch)`. The
+larger the window and the heavier the frame, the more likely that frame fills the move loop's own message
+pump ⇒ **window-position updates get dropped**, which reads as "two frames per step". It is a second,
+independent bottleneck from §3.8: acquire no longer waits, but the present itself still needs a full frame
+budget.
+
+**Fix**: `vendor/window_glue.cc` gains `sk_window_in_move_loop()`, reading the OS's own modal-loop flag
+(`GetGUIThreadInfo` + `GUI_INMOVESIZE`, resolved through `GetProcAddress` so no import is added) and
+comparing `hwndMoveSize`'s current size with the previous call: **only an unchanged size counts as a pure
+move**. `ASC_window_render` in `src/emit.ts` returns 0 right at the entry when that holds (guarded by
+`#ifdef ASC_USE_WINDOW`, so the offscreen build never references it; `vendor/web_glue.cc` carries a
+return-0 stub for link parity).
+
+- **Pure moves only**: a resize changes the stage size and the content must keep following, so any size
+  change resumes painting immediately.
+- **The entry frame counts as a move too**: `last_hwnd` starts empty, so the first frame has no size to
+  compare against; treating it as a resize repainted exactly once, which stalled the first displacement
+  (that is the residual 120 px jump). A real resize changes size on the next frame and falls back into the
+  painting path by itself.
+
+**Evidence**: the same harness now advances 32–42 px per frame throughout; `ASC_PASS_TRACE` records **zero**
+`pass paint` lines across a 5.5 s hold-plus-drag window (one per frame before the fix). The `presentskip`
+semantics of a static window are unchanged.
+
+**Pins**: eight source-level assertions in `platform/MoveLoopPaint` (`test/unit/platform.ts`), plus
+`build/DocumentedLinkSets` compiling the generated C under the **offscreen** manifest's own defines — dropping
+the `#ifdef` guard turns that one red.
+
 ### 3.9 Resizing by the Bottom-Right Corner **Wedges**: `ResizeBuffers` Corrupted the Fence Ledger (stage one-hundred-seventy-seven · one)
 
 **Symptom**: reported as "dragging the bottom-right corner to resize crashes it". It is **not a crash — it is a

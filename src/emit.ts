@@ -31122,6 +31122,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w == NULL) return 0;');
     this.line('Stage* st = w->stage;');
     this.line('if (st == NULL) return 0;');
+    // The OS moves a dragged window inside DefWindowProc's modal loop, and this
+    // frame driver keeps running through it. Repainting there cannot be seen (the
+    // whole window is travelling) but costs a full frame, and on a large window
+    // that starves the loop's own message pump: measured on a 1100x900 window, a
+    // per-frame repaint (an app FPS overlay rewriting htmlText each frame) dropped
+    // a window-position update every 2-3 frames, while the same window with static
+    // content moved on every frame. Skipping is safe because the dirty epoch keeps
+    // advancing on its own: whatever changed during the drag repaints on the first
+    // frame after the drop. Resizes are excluded by the backend (they change the
+    // stage size, so the content must keep following).
+    this.line('#ifdef ASC_USE_WINDOW');
+    this.line('if (as_window_in_move_loop()) return 0;');
+    this.line('#endif');
     // Fingerprint BEFORE acquiring a drawable. A static window must not pay for
     // a swapchain acquire, a full clear, or a vsync-blocking Present. The same
     // fingerprint already covers display-tree pixels; Stage3D and GPU recovery

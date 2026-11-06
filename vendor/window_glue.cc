@@ -1018,6 +1018,52 @@ static int SDLCALL live_resize_watch(void* userdata, SDL_Event* e) {
   return 1;
 }
 
+// Windows performs a title-bar drag inside DefWindowProc's modal move loop while
+// the app keeps ticking frames. Repainting through it only competes with that
+// loop for the frame budget. Only a PURE MOVE is reported: a resize changes the
+// stage size, so the content has to keep following the window.
+int sk_window_in_move_loop(void) {
+#ifdef _WIN32
+  typedef BOOL (WINAPI* GetGUIThreadInfoFn)(DWORD, GUITHREADINFO*);
+  static GetGUIThreadInfoFn fn = NULL;
+  static int tried = 0;
+  static HWND last_hwnd = NULL;
+  static int last_w = 0, last_h = 0;
+  if (!tried) {
+    tried = 1;
+    // Resolved dynamically rather than linked by name: keeps the import surface
+    // of this translation unit unchanged.
+    fn = (GetGUIThreadInfoFn)(void*)GetProcAddress(GetModuleHandleA("user32.dll"), "GetGUIThreadInfo");
+  }
+  if (fn == NULL) return 0;
+  GUITHREADINFO gi;
+  memset(&gi, 0, sizeof(gi));
+  gi.cbSize = (DWORD)sizeof(gi);
+  if (!fn(GetCurrentThreadId(), &gi)) return 0;
+  if ((gi.flags & GUI_INMOVESIZE) == 0) {
+    last_hwnd = NULL;
+    return 0;
+  }
+  HWND hwnd = gi.hwndMoveSize;
+  if (hwnd == NULL) return 0;
+  RECT r;
+  if (!GetWindowRect(hwnd, &r)) return 0;
+  const int w = (int)(r.right - r.left), h = (int)(r.bottom - r.top);
+  // Same size as the previous frame of this loop => the user is moving, not sizing.
+  // The FIRST frame of a loop is assumed to be a move as well: a sizing drag
+  // changes the size on the very next frame (which repaints), while repainting on
+  // entry is what used to stall the drag start exactly once.
+  const int entering = (hwnd != last_hwnd);
+  const int moving_only = entering ? 1 : (w == last_w && h == last_h);
+  last_hwnd = hwnd;
+  last_w = w;
+  last_h = h;
+  return moving_only;
+#else
+  return 0;
+#endif
+}
+
 // Refresh rate (Hz) of the display a given window occupies, or of the primary
 // display when it has no window yet. Returns 0 when it cannot be determined (the
 // caller falls back to a compiler-side default). Queried live because a

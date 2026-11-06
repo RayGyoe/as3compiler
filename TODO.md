@@ -20059,6 +20059,32 @@ trace）。**编译器侧变化检测独立验证**：临时还原 asaotui 侧�
 全量 `node test.ts` **636/636**；`test/unit/render.ts` 加钉「Graphics_clear 精确脏矩形」「render-input
 标量写点变化检测」。
 
+### 阶段三百七十九：拖动期间跳过重绘 —— 模态移动循环的消息泵不再被每帧 Present 挤占（v0.4.343 → v0.4.344）
+
+**起点**：用户在真机上指出「按住窗口 5 秒再拖，明显感觉窗口是滞后再跟上来的」。§3.8 修的是 flip 交换链
+acquire 停顿（`SK_D3D_NUM_FRAMES 2→3`，acquire 已 0.00 ms），但该修复之后**界面每帧都会改内容**
+（本项目实测：`Config.DEBUG=true` 时 FPS 面板每帧重写 `htmlText`）的拖动仍不跟手。
+
+**定位**：窄带录屏逐帧取窗口左边界（`gdigrab` + `-vsync 0`，**不是**全屏 gdigrab——它会被合成器去重
+混叠成 ~14 fps）。大窗口 debug 构建：窗口位置**每 2–3 帧停一帧**（`305:727 306:727`、`309:887 310:887`、
+`312:927 313:927`）并伴随 3 次 86/86/120 px 跳变；同尺寸 release、内容静止时全程 32–43 px 均匀。
+机理：拖动跑在 `DefWindowProc` 的模态移动循环里，我们的帧由 `live_resize_watch` 在**同一线程**推进，
+单帧越重越容易占满移动循环的消息泵 ⇒ 位置更新被丢。
+
+**修复**（三处）：
+1. `vendor/window_glue.cc`：`sk_window_in_move_loop()` —— `GetGUIThreadInfo` + `GUI_INMOVESIZE`（动态
+   `GetProcAddress`，不新增导入），再比较 `hwndMoveSize` 尺寸：**尺寸不变才算纯移动**，缩放返回 0。
+2. `src/runtime.ts`：同一声明块内加 `extern int sk_window_in_move_loop(void);` + `as_window_in_move_loop()`。
+3. `src/emit.ts`：`ASC_window_render` 入口 `#ifdef ASC_USE_WINDOW` 下 `if (as_window_in_move_loop()) return 0;`。
+
+**首帧**：`last_hwnd` 初值为空 ⇒ 首帧按「缩放」重绘一次，正好卡住第一次位移（残留的 120 px 跳变）。
+修为进入循环的首帧也算移动；真缩放下一帧尺寸就变，自动回到重绘。
+
+**验证**：修复后同一 harness 每帧 32–42 px；`ASC_PASS_TRACE` 在 5.5 s 按住+拖动窗口内零次 `pass paint`。
+
+**钉子**：`platform/MoveLoopPaint`（8 项）；`build/DocumentedLinkSets` 用离屏清单 defines 编译兜底
+（少 `#ifdef` 保护即红）；mutation 实测（删调用点 → 2 项红）。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

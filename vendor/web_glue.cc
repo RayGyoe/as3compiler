@@ -350,6 +350,8 @@ int sk_window_get_stage_full_size(int* w, int* h) {
 // would not help — the AS3-side deadline pacer has no way to express "every Nth
 // vsync", which is the only pacing a compositor honors.
 double sk_window_get_display_refresh(int win) { (void)win; return 0.0; }
+// No native move loop in the browser: the page compositor owns the drag.
+int sk_window_in_move_loop(void) { return 0; }
 uint64_t sk_window_redraw_generation(int win) { (void)win; return g_redraw_generation; }
 
 // ---------- display enumeration (flash.display.Screen) ----------

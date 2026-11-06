@@ -10930,6 +10930,16 @@ extern double sk_window_get_display_refresh(int win);
 // display tree because the previously presented pixels are not a retained cache.
 extern uint64_t sk_window_redraw_generation(int win);
 static inline uint64_t as_window_redraw_generation(int win) { return sk_window_redraw_generation(win); }
+// True while the OS owns a MODAL MOVE loop on this window (the user is dragging
+// the title bar). Painting during that loop buys nothing -- the window itself is
+// what travels and the content is not being read -- but it costs a whole frame,
+// and on a large window that is enough to starve the loop's own message pump:
+// measured on a 1100x900 window, a per-frame repaint dropped a window-position
+// update every 2-3 frames, while static content streamed smoothly at 60 Hz.
+// Only a PURE MOVE is reported; a resize changes the stage size and must keep
+// painting, so the backend answers 0 for it.
+extern int sk_window_in_move_loop(void);
+static inline int as_window_in_move_loop(void) { return sk_window_in_move_loop(); }
 // Display enumeration for flash.display.Screen: the number of attached displays,
 // and per display its full rectangle (bounds) plus its usable area (visibleBounds,
 // menu bar / Dock excluded). These are two different quantities on the same
