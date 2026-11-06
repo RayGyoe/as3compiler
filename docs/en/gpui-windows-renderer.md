@@ -5,25 +5,40 @@
 > Windows backend (Win32 + SDL2 + Skia D3D12, see [`win32.md`](win32.md)); it does **not** argue for
 > copying GPUI — see §10 for why.
 >
-> **Subjects (two crates, not one repository)**:
-> - `gpui-pre-windows 0.3.11` — Zed's `crates/gpui_windows` snapshot, metadata records `zed@f816e1f`.
->   This is the **primary evidence source**.
-> - `gpui-fast-windows 0.1.13` — longbridge's `gpui-fast` fork of Zed's GPUI; the Windows additions are in §9.
->   **Every behavioural difference from upstream is marked.**
+> **Subjects (two sources; their line numbers are not interchangeable)**:
+> - `gpui-pre-windows 0.3.11` — a crates.io snapshot of Zed's `crates/gpui_windows`, metadata records
+>   `zed@f816e1f`. **The evidence behind §2–§8.**
+> - **`gpui-fast`** — longbridge's fork of Zed's GPUI (an experiment in Retained Mode). **The evidence behind
+>   §9**, whose full source is on this machine at `asaotui/gpui-fast-src/`, main branch `046a859`
+>   (2026-11-06, `fast: forget released entities in a spliced view's dependencies (#106)`), based on zed
+>   `7960b2a7` (see its `UPSTREAM`). The previous §9 read the `gpui-fast-windows 0.1.13` crates.io package
+>   instead; **those paths and line numbers are dead**, and §9 has been rewritten from the fork itself.
 >
-> How the sources were obtained (unpacked under `temp/gpui/`, a scratch directory that is not committed):
+> How the sources were obtained:
 >
 > ```sh
+> # §2–§8: the Windows backend snapshot (unpacked under temp/gpui/, scratch, not committed)
 > git clone --depth 1 https://github.com/longbridge/gpui-kit.git temp/gpui/gpui-kit
 > curl -sL -o gpui-pre-windows.crate \
 >   https://crates.io/api/v1/crates/gpui-pre-windows/0.3.11/download   # plus three other crates
+>
+> # §9: the gpui-fast main branch (inside the asaotui workspace, .gitignore'd; same command as
+> # asaotui/README "preparation after cloning")
+> git clone --depth 1 --filter=blob:none --sparse \
+>   https://github.com/longbridge/gpui-fast.git asaotui/gpui-fast-src
+> cd asaotui/gpui-fast-src
+> git sparse-checkout set crates/gpui crates/gpui_windows crates/gpui_platform docs
 > ```
 >
-> **Line-number convention**: every `file:line` below is relative to
-> `gpui-pre-windows-0.3.11/src/` unless it carries a `gpui/` prefix, which means the upstream core crate
-> `gpui-pre-0.3.11/src/`. The line numbers are valid only for that snapshot — it is pinned
-> (`Cargo.toml` requires the exact `=0.3.11`, see the comment in `gpui-kit/Cargo.toml`), so they can be
-> re-checked.
+> **Line-number convention**: every `file:line` in §2–§8 is relative to `gpui-pre-windows-0.3.11/src/`
+> (a `gpui/` prefix means the upstream core crate `gpui-pre-0.3.11/src/`). It is valid only for that pinned
+> snapshot (`Cargo.toml` requires the exact `=0.3.11`), and **that snapshot is no longer in the workspace, so
+> those numbers are no longer evidence you can check on the spot** — the conclusions still stand, but
+> re-checking them means unpacking the snapshot again with the first command above. **Every `file:line` in
+> §9 is relative to `asaotui/gpui-fast-src/crates/`** and can be grepped today; §11 lists the commands and
+> the expected hits. The same Windows code sits dozens of lines apart in the two sources (e.g.
+> `Present(0, DXGI_PRESENT(0))` is `directx_renderer.rs:245` in the 0.1.13 snapshot and `:258` on the fork) —
+> **do not mix their line numbers**.
 >
 > **Division of labour with [`rust-text-backend.md`](rust-text-backend.md) §13**: that section covers **how the
 > text stack is split** (who shapes, who enumerates fonts, who rasterizes; it targets the older `gpui 0.2.2` /
@@ -44,6 +59,7 @@
 | How are vectors drawn? | Triangulated → the **whole batch in one** pass into a 4×MSAA intermediate target → resolved → composited back as sprites | `directx_renderer.rs:615-720` |
 | How are transparent windows done? | `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition` + a DComp visual; alpha is left to DWM | `window.rs:516`, `directx_renderer.rs:1298` |
 | Frame pacing? | A dedicated thread calls `DwmFlush()` to ride the compositor clock, then `RedrawWindow`; `Present(0,0)` **does not block** | `vsync.rs`, `platform.rs:446`, `directx_renderer.rs:245` |
+| Why is it fast? | Upstream's answer is "batch more, issue fewer draw calls"; `gpui-fast`'s is "**an entire frame can do nothing**" — retained views, retained layout nodes, scroll-layer tiles. Frame cost tracks **how much of the window changed**, not how much is on screen | §9 |
 | What is "120 FPS"? | Upstream docs explicitly demote it to a **frame-budget statement** (8.33 ms per frame on a 120 Hz panel), not "rebuild 120 times a second" | `gpui-kit/website/docs/fps.md:28` |
 | What is portable to us? | ① the **DirectComposition** transparency/composition chain (it fills our unimplemented `<transparent>` on Windows); ② the vsync-thread / non-blocking-Present **decoupling idea**; ③ the structural rule that text and vectors must be batched. **Not** its hand-written pipeline | §10 |
 
@@ -394,28 +410,216 @@ absorbed by DWM compositing, plus a possible extra frame of latency).
 
 ---
 
-## 9. The `gpui-fast` fork: a second acceleration layer
+## 9. `gpui-fast`: retained views, scroll layers, and demand-driven Windows frames
 
-longbridge's fork confines its own code to one submodule (`src/fast/`) and adds only "one forwarding line" to
-upstream files so that upstream merges stay cheap. Windows-specific additions (**unrelated to D2D, and
-unrelated to the platform — mac/Linux/web have counterparts**):
+> **This section is a rewrite.** The previous version read only the **packaged** `gpui-fast-windows 0.1.13`,
+> which showed seven unrelated Windows optimisations. The fork's main branch
+> (`asaotui/gpui-fast-src`, `046a859`) is a different order of thing: a **Retained Mode** (retained views +
+> retained layout nodes) plus **scroll layers** (tile compositing), with the D3D11 work as the tail end.
+> Everything below was re-checked against that source; the line-number convention is in the header.
 
-| Optimisation | Upstream behaviour | fast behaviour | Source |
+### 9.1 How it coexists with upstream (this decides how much we can copy)
+
+The fork holds itself to two rules (`README.md`): **the API does not change** (code written for upstream GPUI
+compiles untouched), and **upstream files only gain hooks**. `script/check-upstream` enforces the second
+mechanically: a hunk adding more than **8** lines, a file adding more than **40**, or added lines that do not
+call into `fast/` all fail (exceptions are listed, each with its reason, in `script/upstream-allowlist`).
+`docs/architecture.md` records 30 upstream files differing at the time of writing; the 20 in
+`crates/gpui/src` differ by **+609 / −776 lines** — **more removed than added**, because several method bodies
+were replaced by a one-line forward.
+
+Where the code lives (**the previous version got this wrong**):
+
+| Location | Contents | Size (measured here) |
+|---|---|---|
+| `crates/gpui/src/fast/` | all engine-side logic: retained subtrees, dependency recording, layout nodes, text carry, scroll layers, rounded clips, multi-surface composition | 25 modules in `mod.rs` + `tests/`; 73 files / **1.7 MB** |
+| `crates/gpui_windows/src/fast/` | the Windows platform side: demand-driven frames, device recovery, bind dedup, cross-frame buffers, rounded masks, DComp composition | **14** files |
+| other upstream files | a field, a one-line call, a forwarded method body | as above |
+
+(The 0.1.13 package **copies** `src/fast/` into every crate; the main branch keeps one `fast/` per crate. So
+the old sentence "the fork confines its own code to one submodule `src/fast/`" reads, on the main branch, as
+"each crate has its own `fast/`".)
+
+One judgement (still true, but it understated the scope): **upstream solves "what to draw" and "how to
+batch"; fast solves "when to draw" and "whether a frame can do nothing at all".** Bind dedup is only the
+smallest piece outside "do nothing".
+
+### 9.2 Retained views: can a frame do nothing?
+
+A frame walks the tree three times: `request_layout` (render views, ask for layout), `prepaint` (lay out and
+place), `paint` (turn into the scene). Upstream does all three from scratch. fast treats **every view**
+(`Entity<V: Render>` or `AnyView`, not only explicitly cached ones) as a retained subtree: while nothing it
+depends on changed and it is drawn where it was, it is **not rendered, laid out, prepainted or painted** — its
+primitives, hitboxes, listeners and dispatch nodes are copied from the last frame (`fast/retained.rs`, 83 KB;
+"did it change?" lives in `fast/dependencies.rs`, 1326 lines).
+
+The criterion is **recorded dependencies**, much wider than "who notified me":
+
+| Dependency | How it is recorded |
+|---|---|
+| entities read | every access during render/layout/prepaint/paint, whether or not it was `observe`d |
+| globals read | a generation stamp per global; merely asking whether one is set (`has_global`) depends on that alone, writing the value does not count |
+| `ListState` / `ScrollHandle` | both carry versions, so moving them counts even when nobody notifies |
+| window input state | reads of `mouse_position()` / `modifiers()` / `capslock()` are recorded the same way |
+| where it is drawn | bounds, content mask, text style, hover/interaction state |
+
+Two semantics are spelled out in the source: ① an **update without a notification** (as every `cx.subscribe`
+handler does to its subscriber) counts as a change only for views drawn inside a view notified since the last
+frame; ② state the application reads outside GPUI (`Rc<RefCell<..>>`, the clock, a cached
+`window.modifiers()`) **must be followed by the application's own `cx.notify()`** — that is the one contract
+gap in the mechanism, and it is stated in the README's "Using it" rather than hidden.
+
+**Why not keep a persistent tree of view nodes** (`docs/architecture.md` §Why not a persistent tree): identity
+already exists (`GlobalElementId` for element state, per-frame index ranges for reused output), and taffy is
+already a persistent node store with a per-node layout cache. A second parallel tree would duplicate that
+identity and force a restructure of the window drawing code, which is exactly the constraint the fork refuses
+to break.
+
+Runtime switch: `GPUI_VIEW_RETENTION=0` draws every frame from scratch, to rule retention in or out.
+
+### 9.3 Retained layout nodes and text
+
+- **Layout keys** (`fast/layout_key.rs`): a **path hash** from the root (`LAYOUT_ROOT_SEED` @`:61`), switching
+to `ElementId` where an element moves among its siblings; `root_index` keeps window roots, prompts, drags and
+tooltips in separate trees; prepaint adds its own salt (`:66`).
+- **Did the style change**: a **64-bit fingerprint**. Release trusts it; debug **compares every field in
+full** precisely to catch a field the fingerprint misses (`docs/architecture.md` §Costs). That is a useful
+mirror for `PaintKit.measureField`: with 11 fields, compare them all; a fingerprint only pays once the style
+grows, and it must keep a debug-mode full compare.
+- **Text** (`fast/text.rs`): shaped line layouts are carried across frames (unchanged width reuses them); recent
+glyphs are kept per generation (`RECENT_GLYPHS_PER_GENERATION` @`:808`).
+- **Number shaping** (`fast/number_shaping.rs`): a number is its digits side by side, each digit's glyph and
+advance adjusted by the kerning between neighbours, so per font+size the platform shapes single characters and
+character pairs once and the rest is assembled in-process (character set is only `0123456789.,+-%$KMBT`).
+The first **32** numbers and one in every **256** after that are shaped by the platform as well
+(`CHECKED_FIRST` @`:37`, `CHECKED_EVERY` @`:38`); a font and size where the two disagree falls back to the
+platform for good. **This speaks directly to our streaming numbers, which are new strings every frame.**
+- **Path cache** `path_cache.rs`: 2048 entries / 16 MB (`:23`, `:29`). **Bounds grid** `bounds_tree.rs`: 64 px
+cells (`:19`), at most 256 per axis. **Glyph origin quantisation** `glyphs.rs`: a whole-pixel scroll moves a
+glyph by exactly that much.
+
+### 9.4 Scroll layers: the case retained views cannot cover
+
+A retained view replays only **where it was**. Once a container scrolls, every view inside it has moved, so
+every one is rebuilt; in GPUI Kit's component gallery that was about **60 %** of a scrolled frame. Copying the
+output elsewhere is not a fix: the output holds window coordinates everywhere (primitives, hitboxes, bounds
+captured by listeners, element state), and whatever was outside the viewport last frame **was never painted**.
+
+So it does what UIKit, Flutter and Chrome do (`fast/layers/`, 17 files, ~340 KB): the container's content is painted once
+into a layer, rasterized into tiles, and a frame where only the offset changed composites the tiles at the new
+offset. Each frame, each container takes one of three paths (`layers/policy.rs`):
+
+| Path | When | What happens |
+|---|---|---|
+| **Composite** | only the offset changed and the viewport is still inside the painted region | content is not rendered/prepainted/painted; non-scene records are carried, hitboxes translated; the tiles over the viewport enter the scene as sprites |
+| **Repaint** | the content changed, or the scroll reached the edge of the painted region | repaint into the layer's own scene over the viewport plus **2** viewports of overscan per scrolled side; **tiles are hashed and only changed ones re-rasterized** |
+| **Bypass** | the layer cannot guarantee the result (see "the same pixels" below) | draw exactly as today |
+
+Constants, all read from source: `TILE_SIZE = 512` (`layers/paint.rs:42`), `OVERSCAN_VIEWPORTS = 2`
+(`paint.rs:862`), a **64 MB** tile budget (`policy.rs:55`), a layer only after **2** consecutive scrolled
+frames (`PROMOTE_AFTER_SCROLLED_FRAMES` @`:40`), demotion when content changed on **≥8** of the last 16
+frames (@`:43`), re-promotion after **60** stable frames (@`:46`), dropped after **120** frames without
+compositing or on resize/scale (@`:53`).
+
+The tile hash is the hinge of the design (`layers/tiles.rs`): it covers the primitives **that reach the
+tile** (a shadow's blur and a transformed sprite included), in drawing order, moved into the tile's space;
+content masks and layer bounds are hashed **clipped to the tile**, because hashed whole they move in content
+space with the offset and would dirty every tile.
+
+**The "same pixels" price list** (`docs/architecture.md` §The same pixels) — this is the real cost of adding
+layers to an existing renderer:
+
+- **Background**: subpixel text must know what it sits on, so a layer is used only when the viewport lies on
+  one **opaque, solid-colour quad**, whose colour is baked into every tile; a gradient, a translucent window
+  or a rounded corner inside the viewport means Bypass.
+- **Pixel grid**: scroll offsets are snapped to device pixels (with or without layers), so both paths place
+  content on the same grid.
+- **Culling**: while a layer paints, the container culls against the **painted region**, not the viewport.
+- **Paths never go into tiles**: a path's antialiasing depends on how pixels pair in 2×2 quads, so an odd
+  pixel shift differs by one level; paths are drawn over the tiles when nothing covers them, else Bypass.
+
+**The renderer contract** (`layers/scene.rs`, the only public extension): the core hands renderers two things —
+① each visible tile is an **ordinary polychrome sprite** whose texture id lies in a range no atlas allocates
+(`LAYER_TILE_TEXTURE_BASE = 0xF000_0000` @`:26`), so ordering, clipping and batching stay the scene's job;
+② `Scene.layers` with each layer's content scene, generation and dirty tiles. The renderer keeps tile textures,
+re-rasterizes the dirty ones (`LayerFrame::tile_scene`), binds a tile's texture when it meets its sprite, and
+**nothing flows back to the core**. `COMPILED` (`layers/mod.rs:32`) is true only on Linux (wgpu), macOS
+(Metal) and Windows (D3D11).
+
+### 9.5 The Windows side: `crates/gpui_windows/src/fast/`
+
+| File | What it does | The point |
+|---|---|---|
+| `frame_schedule.rs` (323 lines) | **demand-driven frames** | `FrameRequest{pending: AtomicBool}` + `FrameWake{mutex, condvar}`; `take_request()` decides whether this window draws this frame; the worker thread rides `DwmFlush` and **redraws only the windows that asked** |
+| `device_wake.rs` (93 lines) | waits for device removal without polling | `RegisterWaitForSingleObject` on the D3D11 removal event wakes the scheduler through a condvar |
+| `device_recovery.rs` (164 lines) | the two field crashes | upstream treats any failed resize as a lost device and panics when the rebuild fails again. fast splits them: `E_OUTOFMEMORY` ⇒ **retry the resize next frame** (the device is fine); `DXGI_ERROR_DEVICE_RESET` ⇒ ask the platform for **new** devices, at most **5** times (`MAX_FAILED_RECOVERIES` @`:23`); with no devices it **skips drawing** instead of unwrapping |
+| `draw_state.rs` (131 lines) | bind dedup | remembers shader/blend/topology/SRV/sampler/constant buffer and binds only changes; **`forget()` at the start of every frame**, because DirectWrite rasterization sets its own state on the same context |
+| `frame.rs` (442 lines) | cross-frame buffers | path vertices and sprites live in `FrameState` (alongside globals, the `TileCache` and `rounded_masks`); with a graphics debugger attached it still runs upstream's loop, keeping each batch's label |
+| `rounded_clip.rs` (272 lines) | mask-free rounded scopes | the curved padding-edge geometry goes into an `D3D11_USAGE_IMMUTABLE` `R32G32B32A32_FLOAT` texture and is evaluated in the colour shader; **no mask render target and no extra pass** |
+| `composition.rs` (24 KB) + engine `fast/composition.rs` (2379 lines) | multiple surfaces | a window can present several ordered surfaces, with a native view (WebView2 / WKWebView / subsurface) between GPUI's base and overlay; on D3D11 each surface gets its own swap chain and visual under the DComp root. Two surfaces by default (`DEFAULT_SURFACES = 2` @`:760`) and opt-in via `enable_window_composition` |
+| `native_tests.rs` (20 KB) | real-window regression | one case per process (`GPUI_NATIVE_CASE=paint_race\|input_restore\|recovery`, `GPUI_NATIVE_DCOMP=0\|1`), asserted with `SendInput` and `GetUpdateRect`; recovery also needs an explicit `GPUI_TEST_ALLOW_GPU_RESET=1` |
+
+The renderer itself (upstream file, logic unchanged) can be checked: `BUFFER_COUNT = 3`
+(`directx_renderer.rs:1713`), `CreateSwapChainForComposition` with `FLIP_SEQUENTIAL` (`:1339`/`:1335`),
+`Present(0, DXGI_PRESENT(0))` (`:258`, **non-blocking**), `WS_EX_NOREDIRECTIONBITMAP` (`window.rs:520`), and
+the vsync thread's `DwmFlush()` (`vsync.rs:37`).
+
+### 9.6 How correctness is proven (the most copyable part)
+
+Retained UI fails by "one dependency was not recorded, so something that should have been rebuilt was not",
+which point tests cannot catch. The answer is **two arms driven through the same random history**:
+
+- **The oracle** (`fast/tests/oracle.rs`, 1070 lines): two windows run the same random history of changes, one
+  incremental and one that **forgets everything before every frame**. Every frame the **complete scene** must
+  match (quads, shadows, underlines, monochrome/subpixel/polychrome sprites, paths; every hitbox's bounds,
+  content mask and behaviour). It also asserts the incremental window **actually reused** layout nodes and
+  subtrees, so it cannot pass by never retaining.
+- **The layer oracle** (`fast/tests/layers_oracle.rs`): random wheel scrolls (fractional deltas and fractional
+  scales included), programmatic scrolls, hovers, clicks, key presses and content changes; every frame it
+  compares the scenes with each layer's tiles **expanded into primitives** against the arm without layers, plus
+  hit tests at random points and the positions listeners observed.
+- **Renderer pixel tests**: tile rasterization/compositing compared byte for byte with the same content drawn
+  directly, on a real device, per platform in CI.
+- **`gpui_perf --headless --verify`**: the same scenario run in lockstep with retention on and off, comparing
+  quads, text, icons, images and underlines each frame (paths and shadows are the oracle's job).
+- Runtime switches: `GPUI_VIEW_RETENTION=0`, `GPUI_SCROLL_LAYERS=0`.
+
+What this proves is "for these sequences of state changes, the retained output equals the from-scratch
+output". It cannot prove anything about state an application reads outside GPUI, which the README says
+outright. That boundary is drawn cleanly enough to copy into our own gate design.
+
+### 9.7 Numbers, costs, and two places where their docs lag the code
+
+**Retained views** (Linux release, headless, `retained_bench`, 60 panels × 64 labels each):
+
+| Panels notified per frame | From scratch | Retained | Source |
 |---|---|---|---|
-| **Demand-driven frames** | Every vsync **unconditionally** invalidates all visible windows, so the UI thread must wake and traverse `WndProc` | A `FrameRequest` latch: no request, no invalidation, no UI-thread wake | `fast/frame_schedule.rs:118` |
-| **Bind deduplication** | Each batch re-binds pipeline/sampler/texture/constant buffer from scratch | `DrawState` remembers current bindings and skips repeats | `fast/draw_state.rs` |
-| **Reused path buffers** | Each batch allocates new `Vec`s for vertices and sprites | Vertex/sprite buffers persist across frames | `fast/frame.rs` |
-| **Scroll-layer tile cache** | Scrolling repaints the whole layer | Tiles are cached and only changed tiles recomposited | `fast/layers/` |
-| **Mask-free rounded scopes** | — | Corner geometry is written into one **immutable** texture and evaluated in the colour shader; no mask render target | `fast/rounded_clip.rs` |
-| **Multi-surface composition** | One swap chain and one visual per window | Every GPUI surface (including WebView2 native surfaces) gets its own swap chain and visual, ordered under the DComp tree root; native surfaces use a rectangular clip plus opacity to hide | `fast/composition.rs` |
-| **Threaded submission** | The vsync thread only invalidates | Promoted to a worker with device recovery; frame requests wake it via a condvar | `fast/frame_schedule.rs` |
+| 0 | 10.43 ms | **0.25 ms** (−98%) | `README.md` |
+| 1 | 11.58 ms | 1.35 ms (−88%) | `README.md` |
+| 6 | 13.06 ms | 3.86 ms (−70%) | `README.md` |
+| 60 (all) | 18.25 ms | 14.57 ms (−20%) | `README.md` |
 
-The fork also accelerates the **engine** (retained scene, incremental layout, `layout_key`, `path_cache`,
-`line_break`, … under `gpui-fast/src/fast/`), which is orthogonal to the platform backend.
+`docs/architecture.md` §Results has **another set of absolute numbers for the same experiment**
+(3.31→0.19, 6.72→0.71, 7.27→1.46, 10.33→7.38 ms): identical percentages, different magnitude — clearly two
+runs on different machines or days. **Quote them with their source and never splice the two into one table.**
 
-One judgement: **upstream has already solved "what to draw" and "how to batch"; fast solves "when to draw" and
-"redundant binding"**. The latter is relevant to us — does our `sk_pump_frame` re-set pipeline state on every
-frame? Worth one measurement.
+**Scroll layers** (`gpui_perf --headless`, real wheel events, retained views on in both columns): a page of 24
+sections of buttons 0.618 → **0.068 ms** (−89 %); the same page drawn by the scrolling view itself 0.599 →
+0.226 ms (−62 %). GPUI Kit's component gallery scrolling the Button story at 145 Hz: 27–28 % of a core with
+retained views alone, **18–20 %** with scroll layers (1.53–1.63 ms → 0.92–1.02 ms per frame).
+
+**Costs (quote them together with the gains)**: hooks cost +**0.85 %** instructions on average (+2.7 % worst
+case); a frame that repaints a layer paints **5 viewports** of content (5–6.5 ms against 0.6 ms without
+layers), once per two viewports scrolled; tiles are capped at 64 MB; every retained subtree keeps a record per
+frame and taffy keeps its nodes.
+
+**Two inconsistencies (measured here, recorded as found):**
+
+1. `crates/gpui/src/fast/layers/lists.rs:78` is `LIST_LAYERS = true`, while `docs/architecture.md` §Lists still
+   says list layers are off. **The code wins**: list layers are on (per-row records, overscan, hover decided
+   during prepaint so only rows whose hover changed are rebuilt). Which is a reminder for us: their own docs
+   drift, so `grep` the code before quoting a switch or a number.
+2. The two tables above disagree on absolute values (see above).
 
 ---
 
@@ -429,6 +633,12 @@ Current state is in [`win32.md`](win32.md): `CreateSwapChainForHwnd` (`FLIP_DISC
 | **Adopt** | The **DirectComposition** chain: `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition` (`PREMULTIPLIED`) + a visual at the root | It closes the gap recorded in row 24 of the `win32.md` checklist: **`<transparent>` is unimplemented on Windows**. The old idea (`WS_EX_LAYERED` + per-frame `UpdateLayeredWindow` alpha) needs a CPU readback or an extra D3D target, whereas DComp lets DWM composite on the GPU and additionally handles rounded windows (`DWMWA_WINDOW_CORNER_PREFERENCE`) and shadow edges. **This is the single most valuable item in this document for us** |
 | **Adopt (evaluate)** | Present decoupling: dedicated `DwmFlush` thread + `Present(0,0)` | Our `Present(1,0)` pins the UI thread to vblank; during drag/resize, `win32.md` §2.8 already shows frames can only be driven by the SDL event watch. Whether decoupling improves frame-time distribution needs measurement (the `ASC_GPU_STATS=1` instrumentation exists). Risks are tearing and one frame of latency, and AIR's `frameRate` semantics describe the **application's own cadence**, which need not be locked to the compositor — confirm `adl` behaviour before touching it |
 | **Adopt (cheap)** | Three back buffers | `win32.md` already records that `BufferCount=2` lets the compositor hold both buffers while moving a window, stalling submission. GPUI uses three |
+| **Adopt (new, cheapest of all)** | **An oracle-style regression**: run the same input through two arms (retained / forced to forget everything every frame), compare the complete result frame by frame, and assert that the retained arm **actually reused** | Our 37 CheckUi checks are **point tests**: they can only prove the path I thought of. The failure mode of retained UI is "a dependency was not recorded, so something that should have been rebuilt was not", which only a random history catches (§9.6). Concretely for asaotui: run one description tree through reconcile twice (once forced to rebuild everything) and compare the UiNode tree, rects and paint order; the retained arm must also assert it did not rebuild, or it passes by never retaining. `probes/frame` plus one env switch is enough |
+| **Adopt (robustness)** | `device_recovery`'s three rules: `E_OUTOFMEMORY` is not a lost device (retry the resize next frame), at most 5 rebuilds, **skip drawing rather than unwrap** when there are no devices | All three grew out of field crashes (§9.5). `win32.md` currently knows only `DXGI_ERROR_DEVICE_RESET`. **The action**: check whether our resize-failure branch also treats OOM as a lost device — that becomes a loop of "rebuild, allocate the same size, fail the same way" |
+| **Adopt (evaluate, most expensive)** | **Scroll layers** (tiles + three paths + the renderer contract) | The real answer to "list scrolling drops frames" **in the renderer**, but it is not "add a cache": solid background, paths excluded from tiles, offsets snapped to device pixels, culling against the painted region — four renderer contracts (§9.4). The kit side is already down to 1.0 ms of fixed cost per frame (`asaotui/STATUS.md` §3.21), so **what is left is the large-area repaint itself**, which is exactly this; but the landing zone is the `as3compiler` renderer (L1), not the kit |
+| **Note it (usable as-is)** | `number_shaping.rs`: a number = per-character glyph/advance plus neighbour-pair kerning, assembled in-process, with the first 32 and every 256th checked by the platform | Our streaming numbers (prices, countdowns, gift counters) are new strings every frame, so they are reshaped every frame. We have no ligatures to worry about, but **the platform cross-check cannot be skipped**, or kerning drift goes wrong silently |
+| **Note it** | Demand-driven frames: our equivalent is the `wantsPaint` gate plus the static-window skip of raster/Present; what it adds is "the UI thread sleeps entirely (`FrameRequest` + condvar) and wakes only when a frame is wanted" | Same direction, and neither lowers the logical frame rate. Theirs takes an idle window to near-zero CPU; our pixel comparison has to run the check first. Moving our gate down into the driver layer would need measurement of idle-frame CPU and `ASC_FRAME_STATS` p99 before it is worth anything |
+| **Do not adopt** | Bind dedup, the way `DrawState` does it | We never descend to the D3D11 binding layer; Skia's Ganesh owns that state and already merges adjacent batches with the same state. This only pays for someone with a hand-written primitive pipeline |
 | **Do not adopt** | The hand-written primitive pipeline (eight primitive kinds, instance buffers, structured buffers, custom AA) | Ganesh inside Skia already does batch merging, glyph atlases, analytic AA and SDF. Re-implementing would mean dismantling Skia. GPUI builds its own because it **carries no general-purpose 2D API obligation** and can afford exactly eight primitives |
 | **Do not adopt** | DirectWrite glyph rasterization **implementation detail** | Our text stack is already delegated to Skia (including glyph cache and atlas); a second implementation only buys a second calibration baseline. But two of its **constraints** are worth remembering: ① glyph bitmaps must be split into per-format atlases (grayscale vs 3×1 vs RGBA); ② the subpixel phase must be part of the cache key |
 | **Do not adopt** | Its GPU adapter selection policy | "Take the first usable adapter, no WARP fallback" lands on the iGPU on hybrid laptops; our enumerate-then-probe-with-`D3D12CreateDevice` selection in `win32.md` is more robust |
@@ -438,22 +648,41 @@ Current state is in [`win32.md`](win32.md): `CreateSwapChainForHwnd` (`FLIP_DISC
 
 ## 11. How to re-check
 
-No Zed build is needed to verify any claim here (that would require Windows + MSVC + the full Cargo graph);
-reading the sources is enough:
+Every claim in §9 can be checked **on this machine right now** (the source is in this workspace; no Rust build
+needed):
 
 ```sh
-cd temp/gpui/crates/gpui-pre-windows-0.3.11/src
+cd asaotui/gpui-fast-src        # 046a859; clone command in the header
 
-grep -rn 'D2D\|Direct2D' .                 # expected: no hits
-grep -n 'CreateSwapChainFor' directx_renderer.rs
-grep -n 'DrawInstanced' directx_renderer.rs      # expected: two sites, both (4, N)
-grep -n 'Present(' directx_renderer.rs           # expected: Present(0, DXGI_PRESENT(0))
-grep -n 'CreateAlphaTexture\|CreateGlyphRunAnalysis' direct_write.rs
-grep -n 'SUBPIXEL_VARIANTS' ../../gpui-pre-0.3.11/src/text_system.rs
-grep -n 'RDW_INVALIDATE' platform.rs      # unconditional invalidation every vsync (upstream)
-grep -n 'take_request' ../gpui-fast-windows-0.1.13/src/fast/frame_schedule.rs   # fast's latch
+# -- engine side: retention, scroll layers, text --
+grep -n 'pub(crate) const COMPILED'      crates/gpui/src/fast/layers/mod.rs            # expected :32, linux/macos/windows only
+grep -n 'TILE_SIZE: u32\|OVERSCAN_VIEWPORTS' crates/gpui/src/fast/layers/paint.rs      # expected 512 / 2.
+grep -n 'TILE_BUDGET_BYTES\|PROMOTE_AFTER\|DEMOTE_AFTER\|DROP_AFTER' crates/gpui/src/fast/layers/policy.rs
+grep -n 'LAYER_TILE_TEXTURE_BASE'        crates/gpui/src/fast/layers/scene.rs            # expected 0xF000_0000
+grep -n 'const LIST_LAYERS'              crates/gpui/src/fast/layers/lists.rs            # expected true (its architecture.md still says off)
+grep -n 'CHECKED_FIRST\|CHECKED_EVERY'    crates/gpui/src/fast/number_shaping.rs         # expected 32 / 256
+grep -n 'KEPT_BYTES'                     crates/gpui/src/fast/path_cache.rs              # expected 16 MiB
+
+# -- Windows side --
+grep -n 'take_request'                   crates/gpui_windows/src/fast/frame_schedule.rs
+grep -n 'MAX_FAILED_RECOVERIES'           crates/gpui_windows/src/fast/device_recovery.rs  # expected 5
+grep -n 'D3D11_USAGE_IMMUTABLE'           crates/gpui_windows/src/fast/rounded_clip.rs
+grep -n 'BUFFER_COUNT'                   crates/gpui_windows/src/directx_renderer.rs     # expected 3 (:1713)
+grep -n 'Present(0'                      crates/gpui_windows/src/directx_renderer.rs     # expected :258
+grep -n 'NOREDIRECTIONBITMAP'             crates/gpui_windows/src/window.rs               # expected :520
+grep -rn 'D2D\|Direct2D'                 crates/gpui_windows/src                          # expected: no hits
 ```
 
-To observe the behaviour on real hardware, the two smallest probes are: the difference in window transparency
+**The §2–§8 line numbers cannot be checked right now** (the `0.1.13` / `0.3.11` snapshots are no longer in the
+workspace): the conclusions stand, but checking them line by line means unpacking the snapshot again with the
+first command in the header.
+
+To check the "retained equals from-scratch" guarantee, no window is needed: `cargo test -p gpui
+fast::tests::oracle` (needs a Rust toolchain, which **we have not run** — every number in this document is
+taken from their `README.md` / `docs/architecture.md`, with the source marked; none of it is our own
+measurement).
+
+To observe behaviour on real hardware, the two smallest probes remain: the difference in window transparency
 and resizing with and without `GPUI_DISABLE_DIRECT_COMPOSITION=1`; and a single PIX capture to inspect
-batching (`ID3DUserDefinedAnnotation` labels appear as one event per batch).
+batching (`ID3DUserDefinedAnnotation` labels appear as one event per batch). Three runtime switches are worth
+knowing first: `GPUI_VIEW_RETENTION=0`, `GPUI_SCROLL_LAYERS=0`, `GPUI_NATIVE_CASE=paint_race|input_restore|recovery`.

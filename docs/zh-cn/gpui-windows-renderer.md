@@ -4,24 +4,36 @@
 > 用什么画、凭什么快」，供我们自己的 Windows 后端（Win32 + SDL2 + Skia D3D12，见 [`win32.md`](win32.md)）
 > 做取舍参照。**不主张复刻它**——理由见 §10。
 >
-> **调研对象（两个 crate，不是一个仓库）**：
-> - `gpui-pre-windows 0.3.11`——Zed 的 `crates/gpui_windows` 快照，元数据记 `zed@f816e1f`。
->   这是本文的**主要证据源**。
-> - `gpui-fast-windows 0.1.13`——longbridge 的 `gpui-fast` 分支（Zed GPUI 的 fork），
->   Windows 侧增补见 §9。**与上游行为不同处本文一律标注**。
+> **调研对象（两个来源，行号互不通用）**：
+> - `gpui-pre-windows 0.3.11`——Zed 的 `crates/gpui_windows` crates.io 快照，元数据记
+>   `zed@f816e1f`。**§2–§8 的证据源**。
+> - **`gpui-fast`**——longbridge 对 Zed GPUI 的 fork（Retained Mode 实验）。**§9 的证据源**，
+>   本机已有完整源码：`asaotui/gpui-fast-src/`，主干 `046a859`（2026-11-06，`fast: forget released
+>   entities in a spliced view's dependencies (#106)`），基于 zed `7960b2a7`（见其 `UPSTREAM`）。
+>   旧版 §9 用的是 crates.io 上 `gpui-fast-windows 0.1.13` 的打包快照，**路径与行号都已失效**，
+>   本版重写为对 fork 主干的源码级分析。
 >
-> 捕获方式（源码已解包在 `temp/gpui/`，属临时目录、不进仓库）：
+> 捕获方式：
 >
 > ```sh
+> # §2–§8：Windows 后端快照（解包在 temp/gpui/，临时目录、不进仓库）
 > git clone --depth 1 https://github.com/longbridge/gpui-kit.git temp/gpui/gpui-kit
 > curl -sL -o gpui-pre-windows.crate \
 >   https://crates.io/api/v1/crates/gpui-pre-windows/0.3.11/download   # + 另三个 crate
+>
+> # §9：gpui-fast 主干（进 asaotui 工作区，已 .gitignore；取回命令同 asaotui/README「克隆后的准备」）
+> git clone --depth 1 --filter=blob:none --sparse \
+>   https://github.com/longbridge/gpui-fast.git asaotui/gpui-fast-src
+> cd asaotui/gpui-fast-src
+> git sparse-checkout set crates/gpui crates/gpui_windows crates/gpui_platform docs
 > ```
 >
-> **行号口径**：下文 `file:line` 若无特别说明，一律相对
-> `gpui-pre-windows-0.3.11/src/`；`gpui/` 前缀者是上游主 crate `gpui-pre-0.3.11/src/`。
-> 行号只对上述快照有效——它是 pin 死的（`Cargo.toml` 用 `=0.3.11` 精确版本，见
-> `gpui-kit/Cargo.toml` 注释），所以可复核。
+> **行号口径**：§2–§8 的 `file:line` 相对 `gpui-pre-windows-0.3.11/src/`（`gpui/` 前缀者是上游主
+> crate `gpui-pre-0.3.11/src/`），只对该 pin 死的快照有效，且**其快照已不在工作区，这些行号不再是
+> 可当场复核的证据**（结论仍成立，要复核须先按上面第一段重新解包）。**§9 的 `file:line` 相对
+> `asaotui/gpui-fast-src/crates/`**，本机可当场 `grep` 复核，§11 给了逐条命令与期望命中。
+> 同一段 Windows 代码在两套源码里偏移几十行（例：`Present(0, DXGI_PRESENT(0))` 在 0.1.13 快照是
+> `directx_renderer.rs:245`，在 fork 主干是 `:258`）——**不要把两边的行号混用**。
 >
 > **与 [`rust-text-backend.md`](rust-text-backend.md) §13 的分工**：那一节谈的是**文本栈怎么切**
 > （整形/字体/光栅分别交给谁，对象是更早的 `gpui 0.2.2` / `zed@5447804`）；本文谈的是
@@ -41,6 +53,7 @@
 | 矢量怎么画？ | 三角化 → **整批一次**画进 4×MSAA 中间纹理 → resolve → 再当 sprite 贴上主目标 | `directx_renderer.rs:615-720` |
 | 透明窗怎么实现？ | `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition` + DComp visual，alpha 交给 DWM | `window.rs:516`、`directx_renderer.rs:1298` |
 | 帧节奏？ | 独立线程 `DwmFlush()` 对齐合成时钟后 `RedrawWindow`；`Present(0,0)` **不阻塞** | `vsync.rs`、`platform.rs:446`、`directx_renderer.rs:245` |
+| 凭什么「快」？ | 上游的答案是「压批、少 draw call」；`gpui-fast` 的答案是「**整帧可以什么都不做**」——保留视图 + 保留布局节点 + 滚动层 tile。帧耗时与「这一帧窗口里变了多少」成正比，而不与「屏幕上有多少东西」成正比 | §9 |
 | "120 FPS" 是什么？ | 官方文档明确降级为**帧预算话术**（120 Hz 屏上 8.33 ms/帧），不是"每秒重建 120 次" | `gpui-kit/website/docs/fps.md:28` |
 | 可移植给我们的是什么？ | ① DComp 这条**透明窗/合成链**（正对我们 `<transparent>` 在 Windows 未实现的缺口）；② vsync 线程与非阻塞 Present 的**解耦思路**；③ 「文字/矢量必须批化」的结构约束。**不是**它的自绘管线 | §10 |
 
@@ -365,26 +378,190 @@ comp_device.Commit()?;
 
 ---
 
-## 9. `gpui-fast` 分支：第二层加速
+## 9. `gpui-fast`：保留视图、滚动层，与 Windows 侧的按需帧
 
-longbridge 的 fork 只允许自己改一个子模块（`src/fast/`），上游文件只加"一行转发"，以便持续合并上游。
-Windows 侧新增（**与 D2D 无关，也与平台无关——mac/linux/web 各有对应实现**）：
+> **本节是重写。** 旧版只读了 `gpui-fast-windows 0.1.13` 的**打包快照**，看到的是 7 条互不相干的
+> Windows 优化；fork 主干（`asaotui/gpui-fast-src`，`046a859`）是另一量级的东西：
+> 一套 **Retained Mode**（保留视图 + 保留布局节点）+ 一套**滚动层**（tile 合成），
+> Windows 侧的 D3D11 优化只是收尾。以下全部对主干源码复核过，行号口径见文首。
 
-| 优化 | 上游行为 | fast 行为 | 出处 |
+### 9.1 它怎么和上游共存（这决定我们能抄多少）
+
+fork 自缚两条规则（`README.md`）：**API 不变**（为上游 GPUI 写的代码原样编过）；**上游代码只加 hook**。
+后者由 `script/check-upstream` 机械强制——一个 hunk 新增超过 **8** 行、一个文件超过 **40** 行、或新增行
+不调用 `fast/`，就判失败（例外逐条记在 `script/upstream-allowlist`）。`docs/architecture.md` 记录当时
+30 个上游文件有差异，其中 `crates/gpui/src` 的 20 个合计 **+609 / −776 行**——**删得比加得多**，因为若干
+方法体整体换成了「一行转发」。
+
+代码落点（**旧版写错了位置**）：
+
+| 位置 | 内容 | 体量（本机实测） |
+|---|---|---|
+| `crates/gpui/src/fast/` | 引擎侧全部逻辑：保留子树、依赖记录、布局节点、文本携带、滚动层、圆角裁剪、多 surface 合成 | `mod.rs` 列 25 个模块 + `tests/`；73 个文件 / **1.7 MB** |
+| `crates/gpui_windows/src/fast/` | Windows 平台侧：按需帧、设备恢复、绑定去重、跨帧缓冲、圆角 mask、DComp 合成 | **14** 个文件 |
+| 其余上游文件 | 只有字段、一行调用、方法体转发 | 见上 |
+
+（0.1.13 打包版把 `src/fast/` **复制进每个 crate**；主干按所在 crate 分置。所以旧版那句「fork 只允许
+自己改一个子模块 `src/fast/`」在主干上要读成「每个 crate 各有一个 `fast/`」。）
+
+一条判断（旧版这句仍成立，但覆盖面被低估）：**上游解决「画什么」和「怎么批」，fast 解决「什么时候画」
+和「哪一帧可以什么都不做」。**「重复绑定」只是「什么都不做」之外最小的一块。
+
+### 9.2 保留视图：一帧能不能什么都不做
+
+一帧走三趟：`request_layout`（渲染视图并索取布局）/ `prepaint`（算布局并摆元素）/ `paint`（转成场景
+交给 GPU）。上游每趟都从头做。fast 把**每一个视图**（`Entity<V: Render>` 或 `AnyView`，不必显式缓存）
+当「保留子树」：只要它没变、且画在同一位置，就**不 render、不 layout、不 prepaint、不 paint**，
+而是把上一帧的图元、hitbox、监听器、dispatch 节点原样搬过来（`fast/retained.rs` 83 KB、
+`fast/dependencies.rs` 1326 行负责「变没变」）。
+
+「变了」的判据是**依赖记录**，比「谁 notify 了我」宽得多：
+
+| 依赖 | 怎么记 |
+|---|---|
+| 读过的 entity | 渲染/布局/prepaint/paint 期间每一次访问都记（不要求 `observe`） |
+| 读过的 global | 每个 global 一个 generation 戳；只问「有没有设置」（`has_global`）只依赖那一点，写值不算变 |
+| `ListState` / `ScrollHandle` | 这两者自己带版本号，移动了就变——哪怕没人 notify |
+| 窗口输入态 | `mouse_position()` / `modifiers()` / `capslock()` 的读取一样入账 |
+| 画在哪 | bounds、content mask、text style、hover/交互态 |
+
+两条容易踩的语义，源码里明写：①「**没有 notify 的 update**」（如 `cx.subscribe` 的处理函数里更新自订阅
+者）只对「在被 notify 的视图内部绘制」的视图算变；②应用自己在 GPUI 之外读的状态（`Rc<RefCell<..>>`、
+时间、`window.modifiers()` 的缓存值）**必须自己 `cx.notify()`**——这一条被写进 README 的「Using it」，
+是这套机制唯一的契约缺口，也是它敢上生产的前提（明说，不静默）。
+
+**为什么不干脆留一棵持久视图树**（`docs/architecture.md` §Why not a persistent tree）：identity 已经存在
+（`GlobalElementId` 给元素状态、帧内 index range 给复用输出），taffy 本身就是一个带逐节点缓存的持久
+节点库；再造一棵并行树等于复制身份并要求重构 window 的绘制代码，直接和「易合并上游」这条约束对着干。
+
+运行时开关：`GPUI_VIEW_RETENTION=0` 每帧从头画，用来二选一「这是不是保留的锅」。
+
+### 9.3 保留布局节点与文本
+
+- **布局键**（`fast/layout_key.rs`）：从根往下的**路径 hash**（`LAYOUT_ROOT_SEED` @`:61`），元素在兄弟间
+  移动时改用 `ElementId`；`root_index` 让 window root / prompt / drag / tooltip 几棵独立的树不撞键；
+  prepaint 期另带一把 salt（`:66`）。
+- **style 变没变**：**64 位指纹**。release 信任指纹，debug **全量比每个字段**——专门用来抓「指纹漏了
+  某字段」（`docs/architecture.md` §Costs）。这一条对我们 `PaintKit.measureField` 是反向启发：字段只有
+  11 个时全比即可（也才 11 次比较），字段一多才值得提指纹，并且**必须**保留一个 debug 期全比。
+- **文本**（`fast/text.rs`）：已整形的行布局跨帧携带（宽度不变直接复用）；最近字形按 generation 记
+  （`RECENT_GLYPHS_PER_GENERATION` @`:808`）。
+- **数字整形**（`fast/number_shaping.rs`）：一个数字 = 逐字符 glyph+advance 加**相邻字符对的 kerning**，
+  所以每个 font+size 只需平台整一次「单字符」与「字符对」，之后自己拼（字符集只有
+  `0123456789.,+-%$KMBT`）。首 **32** 条与之后每 **256** 条仍交平台复核（`CHECKED_FIRST` @`:37`、
+  `CHECKED_EVERY` @`:38`），不一致就永久退回平台。**这条正对我们的「流水数字每帧都是新字符串」**。
+- **路径缓存** `path_cache.rs`：2048 条 / 16 MB（`:23`、`:29`）。**bounds 网格** `bounds_tree.rs`：
+  64 px 单元（`:19`）、每轴最多 256 格。**字形原点量化** `glyphs.rs`：整像素滚动正好平移整像素。
+
+### 9.4 滚动层：保留视图盖不住的那个缺口
+
+保留视图只在**原位**复用。滚动一发生，容器里每个视图的位置都变了 ⇒ 全部重建；在 GPUI Kit 的组件画廊
+里这约占一帧滚动成本的 **60%**。而「把输出搬个位置」不可行：输出里处处是窗口坐标（图元、hitbox、
+监听器捕获的 bounds、元素状态），且上一帧视口外的东西**根本没画**，无从复制。
+
+于是照 UIKit / Flutter / Chrome 做（`fast/layers/`，17 个文件约 340 KB）：容器的内容**画一次进 layer**，光栅化成
+tile，只有 offset 变的帧按新 offset 合成 tile。每帧对每个滚动容器选三条路之一（`layers/policy.rs`）：
+
+| 路 | 条件 | 发生什么 |
+|---|---|---|
+| **Composite** | 只有 offset 变，且视口仍在已画区域内 | 内容不 render/prepaint/paint；非场景记录整体搬过来，hitbox 平移；盖住视口的 tile 当 sprite 进场景 |
+| **Repaint** | 内容变了，或滚到了已画区域边界 | 重画「视口 + 每个滚动方向 2 个视口」进 layer 自己的场景；**逐 tile 求 hash，只重烘 hash 变的 tile** |
+| **Bypass** | 层无法保证结果（见下「同像素」） | 完全走今天这条路 |
+
+关键常量（全部实测自源码）：`TILE_SIZE = 512`（`layers/paint.rs:42`）、`OVERSCAN_VIEWPORTS = 2`
+（`paint.rs:862`）、tile 预算 **64 MB**（`policy.rs:55`）、连续滚 **2** 帧才给层
+（`PROMOTE_AFTER_SCROLLED_FRAMES` @`:40`）、最近 16 帧里 **≥8** 帧内容变就降级（@`:43`）、稳定
+**60** 帧后重提（@`:46`）、**120** 帧没被合成或窗口 resize/缩放就丢（@`:53`）。
+
+tile hash 的定义是整个设计的枢纽（`layers/tiles.rs`）：hash 覆盖**够得到这块 tile 的图元**（含阴影的
+blur、变换后的 sprite），按绘制序，搬到 tile 空间后计算；content mask 与 layer bounds 也**按 tile 裁剪
+后再 hash**——否则新 offset 下「已画区域」整体平移，会把每一块都判脏（源码注释原话）。
+
+**「必须同像素」的代价清单**（`docs/architecture.md` §The same pixels）——这才是把滚动层加进一个既有
+渲染器的真实成本：
+
+- **背景**：亚像素文字要知道自己压在什么上 ⇒ 只有视口整个落在**单色不透明 quad** 上才用层，把该颜色
+  **烘进每块 tile**；渐变、半透明窗口、视口内有圆角 ⇒ Bypass。
+- **像素网格**：滚动 offset 一律吸附到设备像素（有无层都一样），两条路才落同一网格。
+- **裁剪**：layer 绘制期按**已画区域**裁剪，不是视口——否则 overscan 里的内容不会被画出来。
+- **path 永不进 tile**：path 的 AA 取决于像素在 2×2 方阵里怎么配对，奇数像素位移会差一级灰度；
+  所以 path 只在「没东西盖住它」时直接画在 tile 之上，否则 Bypass。
+
+**渲染器契约**（`layers/scene.rs`，唯一对外的扩展）：核心只交两样东西——① 每块可见 tile 是**普通
+polychrome sprite**，纹理 id 落在 atlas 永不分配的区间（`LAYER_TILE_TEXTURE_BASE = 0xF000_0000` @`:26`），
+于是排序/裁剪/合批全归场景自己管；② `Scene.layers` 交出每层的 content scene、generation 与 dirty tiles。
+渲染器负责留纹理、按 dirty 重烘（`LayerFrame::tile_scene`）、遇到 tile sprite 时绑那一块的纹理，
+**没有任何东西回流到核心**。`layers/mod.rs:32` 的 `COMPILED` 只在这三个平台为真：Linux(wgpu)、
+macOS(Metal)、Windows(D3D11)。
+
+### 9.5 Windows 侧：`crates/gpui_windows/src/fast/`
+
+| 文件 | 做什么 | 要点 |
+|---|---|---|
+| `frame_schedule.rs`（323 行） | **按需帧** | `FrameRequest{pending: AtomicBool}` + `FrameWake{mutex, condvar}`；`take_request()` 决定本窗口这一帧画不画，worker 线程 `DwmFlush` 对齐合成时钟后**只重画请求过的窗口** |
+| `device_wake.rs`（93 行） | 不轮询地等设备丢失 | `RegisterWaitForSingleObject` 挂在 D3D11 设备移除事件上，醒来就 `notify` 调度线程 |
+| `device_recovery.rs`（164 行） | 现场崩溃的两条路 | 上游把任何 resize 失败都当「丢设备」、重建再失败就 panic。fast 分流：`E_OUTOFMEMORY` ⇒ **下帧重试 resize**（设备好的）；`DXGI_ERROR_DEVICE_RESET` ⇒ 向平台要**新**设备，最多 **5** 次（`MAX_FAILED_RECOVERIES` @`:23`）；都没有时**跳过绘制**，不 unwrap |
+| `draw_state.rs`（131 行） | 绑定去重 | 记 shader/blend/topology/SRV/sampler/常量缓冲，只绑变化；**每帧开头 `forget()`**，因为 DirectWrite 光栅化会在同一个 context 上改状态 |
+| `frame.rs`（442 行） | 跨帧缓冲 | path 顶点与 sprite 的 `Vec` 留在 `FrameState`（同处还有 globals、`TileCache`、`rounded_masks`）；有 PIX 附加时仍走上游循环，保住每批的 label |
+| `rounded_clip.rs`（272 行） | 圆角 scope 免 mask | 圆角 padding 边的几何写进 `D3D11_USAGE_IMMUTABLE` 的 `R32G32B32A32_FLOAT` 纹理，颜色 shader 直接求值；**不需要 mask render target、也不需要额外 pass** |
+| `composition.rs`（24 KB）+ 引擎侧 `fast/composition.rs`（2379 行） | 多 surface | 一个窗口可有多个有序 surface，原生视图（WebView2/WKWebView/子面）夹在 GPUI base 与 overlay 之间；D3D11 侧每个 surface 一条 swap chain + 一个 visual 挂 DComp 根下。默认两条 surface（`DEFAULT_SURFACES = 2` @`:760`），是 opt-in（`enable_window_composition`） |
+| `native_tests.rs`（20 KB） | 真窗口回归 | 一进程一 case（`GPUI_NATIVE_CASE=paint_race\|input_restore\|recovery`，`GPUI_NATIVE_DCOMP=0\|1`），用 `SendInput` + `GetUpdateRect` 断言；recovery 还要显式 `GPUI_TEST_ALLOW_GPU_RESET=1` |
+
+Windows 渲染器本体（上游文件，未改逻辑）的可复核事实：`BUFFER_COUNT = 3`
+（`directx_renderer.rs:1713`）、`CreateSwapChainForComposition` + `FLIP_SEQUENTIAL`（`:1339`/`:1335`）、
+`Present(0, DXGI_PRESENT(0))`（`:258`，**不阻塞**）、`WS_EX_NOREDIRECTIONBITMAP`
+（`window.rs:520`）、vsync 线程 `DwmFlush()`（`vsync.rs:37`）。
+
+### 9.6 正确性怎么证明（这一节最该抄）
+
+保留式 UI 的失效方式是「漏记一个依赖 ⇒ 该重建没重建」，定点测试抓不到。它的答案是**两条臂 + 同一部
+随机史**：
+
+- **oracle**（`fast/tests/oracle.rs`，1070 行）：两个窗口跑同一份随机变更历史，一个增量、一个**每帧
+  忘光**。每帧比**完整场景**（quad/阴影/下划线/三色 sprite/path + 每个 hitbox 的 bounds、content mask、
+  behavior）。还额外断言「增量那个**确实复用到了**」——否则它可以靠「什么都不保留」通过。
+- **layers oracle**（`fast/tests/layers_oracle.rs`）：随机滚轮（含小数 delta 与小数缩放）、程序滚动、
+  hover、点击、按键、内容变化；每帧把每层的 tile **展开成图元**再和「没有层」那臂比，另比随机点
+  hit test 与监听器观测到的坐标。
+- **渲染器像素门**：把 tile 的光栅化/合成结果与「直接画」在**真设备**上逐字节比（wgpu/Metal/D3D11 各自 CI）。
+- **`gpui_perf --headless --verify`**：同一场景开/关保留**锁步**跑，逐帧比 quad、文字、图标、图片、
+  下划线（不比 path 与阴影，那归 oracle）。
+- 运行时开关：`GPUI_VIEW_RETENTION=0`、`GPUI_SCROLL_LAYERS=0` 分别关掉两层。
+
+这套方法能证明的是「在这些状态变更序列上，保留输出 = 从头画的输出」；它**证明不了**应用在 GPUI 之外
+读的隐藏状态（README 明说）。这个边界划得很干净，值得照抄进我们的门禁设计。
+
+### 9.7 数据、代价，与两处「文档与代码不一致」
+
+**保留视图**（Linux release、headless、`retained_bench`，60 个面板 × 每面板 64 个标签）：
+
+| 每帧被 notify 的面板数 | 从头画 | 保留 | 出处 |
 |---|---|---|---|
-| **按需帧** | 每个 vsync **无条件** `RedrawWindow` 所有可见窗口，UI 线程必然被唤醒走一趟 WndProc | `FrameRequest` 门闩：没请求就不失效、不惊动 UI 线程 | `fast/frame_schedule.rs:118` |
-| **绑定去重** | 每个批**全量重绑**管线/采样器/纹理/常量缓冲 | `DrawState` 记录当前绑定，跳过重复设置 | `fast/draw_state.rs` |
-| **路径缓冲复用** | 每个批新建 `Vec` 收顶点与 sprite | 顶点/sprite 缓冲跨帧保留 | `fast/frame.rs` |
-| **滚动层 tile 缓存** | 滚动时整层重画 | 按 tile 缓存、只重合成变化的 tile | `fast/layers/` |
-| **圆角 scope 免 mask** | — | 圆角几何写进一张**不可变**纹理，颜色 shader 里直接求值，不需要 mask render target | `fast/rounded_clip.rs` |
-| **多 surface 合成** | 一个窗口一个交换链一个 visual | 每个 GPUI surface（含 WebView2 原生 surface）各一条交换链 + 一个 visual，按序挂在 DComp 树根下；原生 surface 用矩形裁剪 + opacity 隐藏 | `fast/composition.rs` |
-| **提交线程化** | vsync 线程只做失效 | 升级为带 device recovery 的 worker，帧请求走 condvar 唤醒 | `fast/frame_schedule.rs` |
+| 0 | 10.43 ms | **0.25 ms**（−98%） | `README.md` |
+| 1 | 11.58 ms | 1.35 ms（−88%） | `README.md` |
+| 6 | 13.06 ms | 3.86 ms（−70%） | `README.md` |
+| 60（全变） | 18.25 ms | 14.57 ms（−20%） | `README.md` |
 
-另外 fork 在**引擎侧**还做了 app 层加速（保留式 scene、增量布局、`layout_key`、`path_cache`、
-`line_break` 等，见 `gpui-fast/src/fast/`），这与平台后端正交。
+`docs/architecture.md` §Results 里有同一实验的**另一组绝对值**（3.31→0.19、6.72→0.71、7.27→1.46、
+10.33→7.38 ms），百分比一致、量级不同——**两处显然是不同机器/不同日期的两次跑**。转述时必须带出处，
+不要把它们拼成一张表。
 
-一条判断：**上游已经解决了"画什么"和"怎么批"，fast 解决的是"什么时候画"和"重复绑定"**。
-后者对我们有参照价值（我们的 `sk_pump_frame` 每次都要重新设管线状态吗？值得量一次）。
+**滚动层**（`gpui_perf --headless`，真实滚轮事件，两栏都开着保留视图）：24 节按钮的页面
+0.618 → **0.068 ms**（−89%）；同一页由滚动视图自己画 0.599 → 0.226 ms（−62%）。GPUI Kit 组件画廊滚
+Button story @145 Hz：只开保留视图占 27–28% 一个核，加滚动层 **18–20%**（每帧 1.53–1.63 ms →
+0.92–1.02 ms）。
+
+**代价（照抄时必须一起抄）**：hook 平均 +**0.85%** 指令数（最坏 +2.7%）；重画一帧 layer 要画 **5 个
+视口**（5–6.5 ms，对照无层 0.6 ms），每滚两屏发生一次；tile 上限 64 MB；每保留子树每帧一条记录 +
+taffy 节点常驻。
+
+**两处不一致（本机实测，照实记）**：
+
+1. `crates/gpui/src/fast/layers/lists.rs:78` 是 `LIST_LAYERS = true`，而 `docs/architecture.md` §Lists 仍
+   写「列表的层是关的」。**代码为准**：列表层已开（行级记录、overscan、prepaint 期预判 hover 只重建
+   hover 变了的行）。这正好提醒我们：它自己的文档会漂，引用数字/开关时先 `grep` 代码。
+2. 上面两张表的绝对值不一致（见上）。
+
 
 ---
 
@@ -398,6 +575,12 @@ Windows 侧新增（**与 D2D 无关，也与平台无关——mac/linux/web 各
 | **该借** | **DirectComposition 这条链**：`WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition`（`PREMULTIPLIED`）+ visual 挂根 | 它直接填掉我们 `win32.md` 核对表第 24 行那个缺口：**`<transparent>` 在 Windows 未实现**。旧思路（`WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow` alpha）要 CPU 回读或额外 D3D 目标，而 DComp 让 DWM 用 GPU 合成，且顺带解决圆角窗（`DWMWA_WINDOW_CORNER_PREFERENCE`）/阴影边界。**这是本文对我们最高价值的单点** |
 | **该借（需评估）** | Present 解耦：独立 `DwmFlush` 线程 + `Present(0,0)` | 我们 `Present(1,0)` 把 UI 线程锁在 vblank 上；拖动/resize 时 `win32.md` §2.8 已经证明帧只能靠 SDL event watch 驱动。解耦能否改善帧时间分布，需实测（`ASC_GPU_STATS=1` 现成口径）。风险是 tearing 与一帧延迟，而 AIR 的 `frameRate` 语义是**应用自己的节拍**，未必需要跟合成器锁死——这一点得先确认 `adl` 行为再动 |
 | **该借（轻）** | 3 个 back buffer | 我们 `win32.md` §2.x 已记录 `BufferCount=2` 在合成器搬窗时会同时扣住两个 buffer → 提交卡顿。gpui 用 3 |
+| **该借（新，本轮最便宜）** | **oracle 式回归**：同一份输入跑两条臂（保留 / 每帧强制全忘），逐帧比完整结果，并断言「保留臂确实复用到了」 | 我们的 CheckUi 37 项是**定点钉子**，只能证明「我想到的那条路对」；保留式 UI 真正的失效模式是「漏记一个依赖 ⇒ 该重建没重建」，只有随机史抓得到（§9.6）。落到 asaotui 上：同一棵描述树跑两遍 reconcile，比 UiNode 树形 / rect / 绘制序；主动臂还要断言「确实没重建」——否则会靠「全重建」通过。现成的 `probes/frame` 加一个 env 开关就能做 |
+| **该借（健壮性）** | `device_recovery` 的三条规则：`E_OUTOFMEMORY` ≠ 设备丢失（下帧重试 resize）、重建最多 5 次、无设备时**跳过绘制而不 unwrap** | 都是从现场崩溃里长出来的（§9.5）。我们 `win32.md` 目前只有 `DXGI_ERROR_DEVICE_RESET` 一条路。**具体动作**：核一遍我们的 resize 失败分支是不是也把 OOM 当丢设备——那会变成「重建 → 同样大小再 OOM」的死循环 |
+| **该借（评估，成本最高）** | **滚动层**（tile + 三条路 + 渲染器契约） | 这是「列表滚动掉帧」在**渲染层**的正解，但它不是「加个缓存」：单色背景、path 不进 tile、offset 吸附设备像素、裁剪按已画区域——四条全是渲染器契约（§9.4）。kit 侧的每帧固定成本已压到 1.0 ms（`asaotui/STATUS.md` §3.21），**剩下的大头就是「大面积重画」本身**，正好是它解的；但落点在 `as3compiler` 渲染层（L1），不在 kit |
+| **记一笔（可直接用）** | `number_shaping.rs`：一个数字 = 逐字符 glyph/advance + 相邻字符对 kerning，自己拼；首 32 条与之后每 256 条回平台复核 | 我们的流水数字（价格/倒计时/礼物计数）每帧都是新字符串 ⇒ 每帧重新整形。我们不涉 ligature，但**平台复核那一步不能省**，否则字距漂移会静默错 |
+| **记一笔** | 按需帧：我们的等价物是 `wantsPaint` 门 + 静态窗口跳 raster/Present；它多出来的一层是「UI 线程完全睡（`FrameRequest` + condvar），只在有人请求时醒」 | 两者同向且都不降逻辑帧率。它的版本在「窗口存在但没人要帧」时能把 CPU 降到近零，而我们的比较像素法得先跑一遍判定。是否要学它把门提到「驱动层」，得先实测 idle 帧 CPU 与 `ASC_FRAME_STATS` 的 p99，不是白拿 |
+| **不借** | `DrawState` 这种「绑定去重」 | 我们不下到 D3D11 绑定层，状态由 Skia Ganesh 管，同状态相邻批次它自己就会合并。这一条只有自己写 primitive 管线的人才能省到 |
 | **不借** | 自建 primitive 管线（8 类 primitive、实例缓冲、结构化缓冲、自写 AA） | Skia 已经在 Ganesh 里做了批合并、字形图集、analytic AA、SDF；复刻等于把 Skia 拆掉重写。gpui 之所以自建，是因为它**不背 Skia 那样的通用 2D API 义务**，可以只做 8 种图元 |
 | **不借** | DirectWrite 字形光栅化的**具体实现** | 我们的文本栈已经外包给 Skia（含字形缓存/图集），重复实现一套只会带来第二个校准口径。但它的**两个约束值得记**：① 字形位图必须按像素格式分图集（灰度 vs 3×1 vs RGBA）；② 亚像素相位必须进缓存键 |
 | **不借** | GPU adapter 选择策略 | 它"取第一个可用 adapter、无 WARP 回退"，在混合显卡机器上会落 iGPU——我们 `win32.md` 的枚举+D3D12 探针选型更稳 |
@@ -407,20 +590,37 @@ Windows 侧新增（**与 D2D 无关，也与平台无关——mac/linux/web 各
 
 ## 11. 复核方法
 
-想验证本文任何结论，不必构建 Zed（需要 Windows + MSVC + 完整 Cargo 依赖图），直接读源码即可：
+§9 的每一条都能在本机**当场**复核（源码已在本工作区，不必构建 Rust）：
 
 ```sh
-cd temp/gpui/crates/gpui-pre-windows-0.3.11/src
+cd asaotui/gpui-fast-src        # 046a859；取回命令见文首
 
-grep -rn 'D2D\|Direct2D' .                 # 期望：零命中
-grep -n 'CreateSwapChainFor' directx_renderer.rs
-grep -n 'DrawInstanced' directx_renderer.rs      # 期望：2 处，均 (4, N)
-grep -n 'Present(' directx_renderer.rs           # 期望：Present(0, DXGI_PRESENT(0))
-grep -n 'CreateAlphaTexture\|CreateGlyphRunAnalysis' direct_write.rs
-grep -n 'SUBPIXEL_VARIANTS' ../../gpui-pre-0.3.11/src/text_system.rs
-grep -n 'RDW_INVALIDATE' platform.rs      # 每 vsync 无条件失效（上游）
-grep -n 'take_request' ../gpui-fast-windows-0.1.13/src/fast/frame_schedule.rs   # fast 的门闩
+# —— 引擎侧：保留、滚动层、文本 ——
+grep -n 'pub(crate) const COMPILED'      crates/gpui/src/fast/layers/mod.rs            # 期望 :32，仅 linux/macos/windows
+grep -n 'TILE_SIZE: u32\|OVERSCAN_VIEWPORTS' crates/gpui/src/fast/layers/paint.rs      # 期望 512 / 2.
+grep -n 'TILE_BUDGET_BYTES\|PROMOTE_AFTER\|DEMOTE_AFTER\|DROP_AFTER' crates/gpui/src/fast/layers/policy.rs
+grep -n 'LAYER_TILE_TEXTURE_BASE'        crates/gpui/src/fast/layers/scene.rs            # 期望 0xF000_0000
+grep -n 'const LIST_LAYERS'              crates/gpui/src/fast/layers/lists.rs            # 期望 true（其 architecture.md 还写 off）
+grep -n 'CHECKED_FIRST\|CHECKED_EVERY'    crates/gpui/src/fast/number_shaping.rs         # 期望 32 / 256
+grep -n 'KEPT_BYTES'                     crates/gpui/src/fast/path_cache.rs              # 期望 16 MiB
+
+# —— Windows 侧 ——
+grep -n 'take_request'                   crates/gpui_windows/src/fast/frame_schedule.rs
+grep -n 'MAX_FAILED_RECOVERIES'           crates/gpui_windows/src/fast/device_recovery.rs  # 期望 5
+grep -n 'D3D11_USAGE_IMMUTABLE'           crates/gpui_windows/src/fast/rounded_clip.rs
+grep -n 'BUFFER_COUNT'                   crates/gpui_windows/src/directx_renderer.rs     # 期望 3（:1713）
+grep -n 'Present(0'                      crates/gpui_windows/src/directx_renderer.rs     # 期望 :258
+grep -n 'NOREDIRECTIONBITMAP'             crates/gpui_windows/src/window.rs               # 期望 :520
+grep -rn 'D2D\|Direct2D'                 crates/gpui_windows/src                          # 期望：零命中
 ```
 
-要真机看行为，最小的观察点是两条：`GPUI_DISABLE_DIRECT_COMPOSITION=1` 前后窗口透明/缩放表现差异；
-以及 PIX 抓一帧看批量（`ID3DUserDefinedAnnotation` 的 label 会显示成每批一个事件）。
+**§2–§8 的行号当前不可复核**（那份 `0.1.13` / `0.3.11` 快照已不在工作区）：结论仍然成立，但要逐行核对得
+先按文首第一段重新解包。
+
+想验证「保留 = 从头画」这套保证，不必开窗口：`cargo test -p gpui fast::tests::oracle`（需 Rust 工具链，
+本机**没跑**——本文的数字全部转自其 `README.md` / `docs/architecture.md`，已逐处标注出处，没有一条是
+我们自己测出来的）。
+
+要真机看行为，最小的观察点仍是两条：`GPUI_DISABLE_DIRECT_COMPOSITION=1` 前后窗口透明/缩放表现差异；
+以及 PIX 抓一帧看批量（`ID3DUserDefinedAnnotation` 的 label 会显示成每批一个事件）。另外三个运行时开关
+值得先知道：`GPUI_VIEW_RETENTION=0`、`GPUI_SCROLL_LAYERS=0`、`GPUI_NATIVE_CASE=paint_race|input_restore|recovery`。
