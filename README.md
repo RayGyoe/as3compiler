@@ -401,7 +401,7 @@ A 250K cap used less memory but raised GPU to 7.972%, so it was not chosen.
 A **pure translation no longer drops a snapshot**: an `x`/`y` write now invalidates only the ancestors
 (`as_mark_moved`), so a moved subtree keeps its bake and the next frame blits the existing raster. rotation,
 scale and alpha still invalidate the whole object (they change the bake's device resolution) and a sub-pixel
-move still paints live.
+move still paints live. A **sporadic content change no longer re-bakes the whole boundary** either: a dirty auto-bake repairs its retained surface in place (a finite dirty rect repaints just that rect), and only a subtree that is dirty on every render (animation, scrolling) falls back to live painting, so it does not pay an extra snapshot + blit per frame (stage 381; `ASC_BAKE_VERIFY=1` compares a repaired surface against a from-scratch rebuild and prints `bake_verify_bad` on any difference).
 
 Windows whose display-tree fingerprint, Stage3D serial, GPU generation and OS redraw generation are unchanged
 skip redundant rasterization and Present while `ENTER_FRAME`, timers and input continue normally.
@@ -498,6 +498,10 @@ for the full measurements and caveats.
 - `examples/cacheasbitmap.as` — `cacheAsBitmap` render verification (offscreen + manifest: a container subtree (rect + circle) rendered to a PNG once with `cacheAsBitmap` on and once off, byte-identical output; the bake is pixel-identical to direct recursive rendering), requires `examples/cacheasbitmap.build.json` to link Skia
 - `examples/autobake.as` — incremental-redraw auto cacheAsBitmap verification (offscreen + manifest: a static subtree rendered across several frames triggers fingerprint-driven auto-baking, f4/f5 pixel-identical to the direct f1; moving the subtree invalidates and re-bakes, moved/f8 identical and distinct from f1), requires `examples/autobake.build.json` to link Skia (off-screen, included in regression)
 - `examples/autobake-origin.as` — bake-origin alignment with the destination device-pixel grid (offscreen + manifest: an anti-aliased circle at a fractional origin `20.4`, the one shape where the cached blit used to land 1 physical pixel off the live render; identical before/after the fix on the snapped siblings), requires `examples/autobake-origin.build.json` to link Skia
+- `examples/autobake-patch.as` — an auto-bake boundary repairs its retained surface in place (offscreen + manifest: a
+  sporadic recolour of one small shape must leave the boundary pixel-identical to a from-scratch bake of the same
+  content, the same must hold through 5 frames of churn, and a recolour after the churn must still be exact),
+  requires `examples/autobake-patch.build.json` to link Skia
 - `examples/bakecrisp.as` — bake resolution and `BitmapData.draw` geometry behavior (aligned with `adl`)
 - `examples/bitmap-setpixels-endian.as` — `BitmapData.setPixels` interprets its 32-bit words through `ByteArray.endian`
   (`bigEndian` = `A,R,G,B` in memory, `littleEndian` = `B,G,R,A` -- the order a raw ANE camera frame arrives in), plus

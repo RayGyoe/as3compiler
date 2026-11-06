@@ -322,6 +322,21 @@ if (边界 && 命中快照) {
 > 每次小改动整块（354×841 = 0.67 Mpx）重烘；示例级 A/B 重建次数 12 → 10、重烘面积 15430 → 14260 px。详见
 > TODO.md 阶段三百八十；像素钉 `examples/autobake-move.as`，结构钉 `test/unit/render.ts` 的 `render/MovedBake`。
 
+> **阶段 C 收尾后补充（v0.4.346，阶段三百八十一）**：auto-bake 脏了不再「整块掉烘 → 活态 → 下一帧从零重烘」，
+> 而是**原地修复保留的 surface**（阶段 C 早就实现的 `bake_patch` / 整面重画两条路），只对**零散变更**开放：
+> `DisplayObject._cache_dirty_run` 记「连续多少次渲染都是脏的」，`== 1` 表示上一帧还是干净的 ⇒ 这次是零散变更，
+> 修一次；`>= 2` 表示每帧都在变（动画/滚动）⇒ 照旧退回活态，不为此每帧多付一次快照 + 贴回。干净的渲染把它清零。
+> 收益是「一次变更一次光栅化」：旧路径是「当帧活态光栅化 + 下一帧整块重建（重新分配 surface + 再光栅化 + 快照 +
+> 贴回）」，同一份内容画两遍还要分一次面。示例级 A/B（同一份 `examples/autobake-patch.as`，只换 emit.ts）：
+> `bake_rebuild` 47 → 5、`bake_patch` 0 → 7。
+>
+> 配套 **`ASC_BAKE_VERIFY=1` 自校验 oracle**（§4.5 想要的「两张臂比像素」的最小可用形态）：每次原地修复后，把同一
+> 状态从零重建到一张临时 surface 上，回读两份 ARGB 逐像素比，不一致就打 `bake_verify_bad o=… kind=patch npix=…`。
+> 原地修复的全部风险就是「漏一个写点 ⇒ 留下一块永久过期像素」，而任何只看「我改的那块」的门都发现不了它；这条
+> oracle 把「漏标记」从静默花屏变成一行 stderr。默认关闭（每次修复多付一次完整光栅化），只在验证时开。
+> 像素钉 `examples/autobake-patch.as`（零散改色、连续 5 帧改色、收尾后再改色，三种情形都必须与「同一内容整块新烘」
+> 逐像素相同），结构钉 `test/unit/render.ts` 的 `render/AutoBakePatch`。详见 TODO.md 阶段三百八十一。
+
 ### 阶段 D（可选，独立增强）：DisplayList 记录 + replay
 
 - [ ] 把边界的绘制命令录成 DisplayList（类似 `SkPicture`），静态内容只 replay + 平移，不重新生成绘制命令。

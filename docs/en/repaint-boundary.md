@@ -375,6 +375,28 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 > A/B: rebuilds 12 → 10, re-baked area 15430 → 14260 px. See TODO.md stage 380; pixel oracle
 > `examples/autobake-move.as`, structural pins `render/MovedBake` in `test/unit/render.ts`.
 
+> **Post-stage-C addition (v0.4.346, stage 381)**: a dirty auto-bake no longer tears itself down to live and
+> re-bakes from scratch on the next frame; it **repairs its retained surface in place** (the `bake_patch` /
+> whole-surface repaint branches stage C already had), and does so only for **sporadic** changes.
+> `DisplayObject._cache_dirty_run` counts consecutive dirty renders: `== 1` means the previous render was clean,
+> i.e. this is a one-off change and it is repaired once; `>= 2` means the subtree is changing every frame
+> (animation, scrolling) and still falls back to live exactly as before, rather than paying an extra snapshot +
+> blit per frame. A clean render resets the counter.
+>
+> The payoff is one rasterisation per change: the old path rasterised the subtree twice (live in the dirty
+> frame, then a full rebuild -- fresh surface allocation, raster, snapshot, blit -- on the next one). Example-level
+> A/B on the same `examples/autobake-patch.as`, only emit.ts swapped: `bake_rebuild` 47 → 5, `bake_patch` 0 → 7.
+>
+> It comes with the **`ASC_BAKE_VERIFY=1` oracle** (the smallest usable form of the "run two arms and compare
+> pixels" gate §4.5 asks for): after every in-place repair, rebuild the same state from scratch into a scratch
+> surface, read both ARGB rasters back and compare byte for byte; a mismatch prints
+> `bake_verify_bad o=… kind=patch npix=…`. The whole risk of in-place repair is one MISSED write point leaving a
+> permanently stale block, which no gate that only inspects the region it just changed can see; this turns that
+> silent corruption into one stderr line. Off by default (it costs a full extra raster per repair).
+> Pixel oracle `examples/autobake-patch.as` (sporadic recolour, 5 frames of churn, then a recolour again -- each
+> must be pixel-identical to a from-scratch bake of the same content); structural pins `render/AutoBakePatch` in
+> `test/unit/render.ts`. See TODO.md stage 381.
+
 ### Stage D (optional, independent enhancement): DisplayList recording + replay
 
 - [ ] Record a boundary's draw commands into a DisplayList (like `SkPicture`); static content only replays +

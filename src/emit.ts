@@ -2018,6 +2018,14 @@ export class Emitter {
           // full bake; the finalizer releases it together with _cache_image.
           this.line('void* _cache_surface;');
           this.line('int _cache_valid;');
+          // How many RENDERS IN A ROW this boundary arrived dirty (stage 381).
+          // A retained surface can be repaired in place, but only when the change
+          // is sporadic: a subtree that changes EVERY frame would pay a snapshot +
+          // blit per frame for a picture the live path already has, which is the
+          // trade RepaintBoundary stage B rejected. So run == 1 (the previous
+          // render was CLEAN) patches once, and the second consecutive dirty render
+          // drops to live exactly as before. Reset on every clean render.
+          this.line('int _cache_dirty_run;');
           // Incremental-redraw state (auto cacheAsBitmap): _auto_baked marks the
           // subtree as currently baked into _cache_image. RepaintBoundary stage B
           // switch (docs/zh-cn/repaint-boundary.md): a still subtree is baked the
@@ -3097,6 +3105,9 @@ export class Emitter {
     this.line('static void as_mark_dirty(DisplayObject* o);');
     this.line('static void as_mark_moved(DisplayObject* o);');
     this.line('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b);');
+    // Stage 381 verify oracle: declared here because as_render_cached (which calls
+    // it right after repairing a surface) is emitted before its definition.
+    this.line('static void as_bake_verify(DisplayObject* o, void* canvas, int pw, int ph, double sx, double sy, double bxo, double byo, const char* kind);');
     this.line('static void as_bd_bind(BitmapData* bd, Bitmap* b);');
     this.line('static void as_bd_unbind(BitmapData* bd, Bitmap* b);');
     this.line('static void as_bd_mark_dirty(BitmapData* bd);');
@@ -12980,6 +12991,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
     this.line('o->_cache_surface = NULL;');
     this.line('o->_cache_valid = 0;');
+    this.line('o->_cache_dirty_run = 0;');
     this.line('o->_auto_baked = 0;');
     this.line('o->_render_dirty = 0;');
     this.line('o->_dirty_full = 0;');
@@ -13149,6 +13161,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('if (o->_cache_surface != NULL) { as_final_release(o, o->_cache_surface); as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }');
     this.line('o->_cache_valid = 0;');
+    this.line('o->_cache_dirty_run = 0;');
     this.indent--;
     this.line('}');
     // width/height (stage 94·5): DERIVED from the content bounds, not slots.
@@ -29538,6 +29551,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // hoisted (same scene, same draws, same bake decisions).
     this.line('static int ASC_no_auto_bake = -1;');
     this.line('static int ASC_bake_trace = -1;');
+    this.line('static int ASC_bake_verify = -1;');
     this.line('static double ASC_auto_bake_cap = 1000000.0;');
     this.line('static void as_render_states(DisplayObject* o) {');
     this.indent++;
@@ -29779,6 +29793,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_restore(c2);');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
+    this.line('if (ASC_bake_verify > 0) as_bake_verify(o, canvas, pw, ph, sx, sy, bxo, byo, "patch");');
     this.line('as_final_register(o, o->_cache_image);');
     this.line('redrawn = 1; rl = dl; rt = dt; rr = dr; rb = db;');
     this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
@@ -29803,6 +29818,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
+    this.line('if (ASC_bake_verify > 0) as_bake_verify(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint");');
     this.line('as_final_register(o, o->_cache_image);');
     this.line('redrawn = 1; rl = bl; rt = bt; rr = br; rb = bb;');
     this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
@@ -29840,6 +29856,44 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_paint_delete(rrp);');
     this.indent--;
     this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('');
+    // ASC_BAKE_VERIFY=1 oracle (docs/zh-cn/repaint-boundary.md §4.5). Stage C/D
+    // repair a boundary IN PLACE: every pixel outside the dirty rect is kept on
+    // the assumption that the dirty marks cover every write. A missed write point
+    // breaks exactly that assumption and shows up as a permanently stale block --
+    // invisible to any gate that only looks at the region it just changed. So
+    // rebuild the same state from scratch into a scratch surface and compare the
+    // two rasters: any difference prints bake_verify_bad. Debug-only and opt-in
+    // (it costs one extra full raster per repaired boundary).
+    this.line('static void as_bake_verify(DisplayObject* o, void* canvas, int pw, int ph, double sx, double sy, double bxo, double byo, const char* kind) {');
+    this.indent++;
+    this.line('void* v = as_skia_surface_bake_new(pw, ph);');
+    this.line('if (v == NULL) return;');
+    this.line('void* vc = as_skia_surface_canvas(v);');
+    this.line('as_skia_canvas_clear_transparent(vc);');
+    this.line('as_skia_canvas_scale(vc, sx, sy);');
+    this.line('as_skia_canvas_translate(vc, -bxo, -byo);');
+    this.line('double keep_vx = ASC_bake_ctm_x, keep_vy = ASC_bake_ctm_y, keep_vam = ASC_alpha_mul;');
+    this.line('ASC_alpha_mul = 1.0;');
+    this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
+    this.line('if (ASC_bake_ctm_x <= 0.0) ASC_bake_ctm_x = sx;');
+    this.line('if (ASC_bake_ctm_y <= 0.0) ASC_bake_ctm_y = sy;');
+    this.line('if (o->filters != NULL && o->filters->length > 0) as_render_filtered(vc, o, o->filters, o->filters->length - 1);');
+    this.line('else as_render_object_content(vc, o);');
+    this.line('ASC_bake_ctm_x = keep_vx; ASC_bake_ctm_y = keep_vy; ASC_alpha_mul = keep_vam;');
+    this.line('uint32_t* va = (uint32_t*)malloc((size_t)pw * (size_t)ph * sizeof(uint32_t));');
+    this.line('uint32_t* vb = (uint32_t*)malloc((size_t)pw * (size_t)ph * sizeof(uint32_t));');
+    this.line('if (va != NULL && vb != NULL && as_skia_surface_read_argb(o->_cache_surface, va, pw, ph) && as_skia_surface_read_argb(v, vb, pw, ph)) {');
+    this.indent++;
+    this.line('int bad = 0;');
+    this.line('for (int i = 0; i < pw * ph; i++) if (va[i] != vb[i]) bad++;');
+    this.line('if (bad > 0) fprintf(stderr, "t=%.0f bake_verify_bad o=%p kind=%s npix=%d of=%d\\n", as_now_ms(), (void*)o, kind, bad, pw * ph);');
+    this.indent--;
+    this.line('}');
+    this.line('free(va); free(vb);');
+    this.line('as_skia_surface_delete(v);');
     this.indent--;
     this.line('}');
     this.line('');
@@ -29930,7 +29984,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // scan of the environment block). as_render_object is the entry every render
     // path reaches (window, Stage.render, BitmapData.draw), so the probes init
     // here once per process (the -1 sentinel) instead of once per object per frame.
-    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
+    this.line('if (ASC_no_auto_bake < 0) { ASC_no_auto_bake = getenv("ASC_NO_AUTO_BAKE") != NULL ? 1 : 0; ASC_bake_trace = getenv("ASC_BAKE_TRACE") != NULL ? 1 : 0; ASC_bake_verify = getenv("ASC_BAKE_VERIFY") != NULL ? 1 : 0; const char* abc = getenv("ASC_AUTO_BAKE_MAX_PIXELS"); ASC_auto_bake_cap = abc != NULL ? atof(abc) : 1000000.0; }');
     // MovieClip button states settle BEFORE anything is measured or painted, so the
     // bounds, the nine-slice slice and the pixels all see the state the pointer
     // implies (as_mc_button_state is a no-op unless the clip is a buttonMode).
@@ -30108,10 +30162,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // RepaintBoundary stage B switch (docs/zh-cn/repaint-boundary.md): the
     // write-time dirty flag is the ONLY thing that drops a bake. An explicit
     // cacheAsBitmap (_cache_flag) re-bakes THIS frame (AIR regenerates the bitmap
-    // on change, no settle delay); an auto-bake (_auto_baked) tears the boundary
-    // down and falls through to the live filters/content path so a
-    // continuously-changing subtree does not re-bake every frame — it re-bakes the
-    // instant it is still again (the trigger above sets _auto_baked on !dirty).
+    // on change, no settle delay); an auto-bake (_auto_baked) repairs its retained
+    // surface in place when the change is sporadic, and only a subtree that is
+    // dirty on EVERY render falls through to the live filters/content path (stage
+    // 381 -- see the branch below).
     this.line('int use_cache = 0;');
     this.line('if ((o->_cache_flag || o->_auto_baked) && !(as_is(o, &TextField_vt) && as_focus_obj == (void*)o)) {');
     this.indent++;
@@ -30119,13 +30173,22 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     // Stage C: an explicit cacheAsBitmap keeps _cache_valid AND _render_dirty so
     // as_render_cached can pick incremental (finite rect) vs whole repaint, then
-    // clears on consume. An auto-bake tears down and falls through to live (the
-    // still subtree re-bakes the instant it is no longer dirty).
+    // clears on consume.
+    //
+    // Stage 381: an AUTO-bake does the same for a SPORADIC change. Dropping the
+    // bake and re-baking from scratch used to cost two rasters of the subtree per
+    // change (one live frame, one rebuild) plus a fresh surface allocation;
+    // repairing the retained surface costs one. `_cache_dirty_run == 1` means the
+    // previous render of this object was CLEAN, i.e. this is not a per-frame
+    // animator -- those still fall through to live (run >= 2) exactly as before.
+    this.line('o->_cache_dirty_run++;');
     this.line('if (o->_cache_flag) { use_cache = 1; }');
+    this.line('else if (o->_cache_valid && o->_cache_surface != NULL && o->_cache_dirty_run == 1) { use_cache = 1; }');
     this.line('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }');
     this.indent--;
     this.line('} else {');
     this.indent++;
+    this.line('o->_cache_dirty_run = 0;');
     this.line('use_cache = 1;');
     this.indent--;
     this.line('}');

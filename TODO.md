@@ -20126,6 +20126,53 @@ acquire 停顿（`SK_D3D_NUM_FRAMES 2→3`，acquire 已 0.00 ms），但该修�
 要省掉这一层得上「层」语义（见 `docs/zh-cn/gpui-windows-renderer.md` §10）；② 亚像素位移不吸附到设备像素，
 **滚动若用分数偏移**仍然每帧走 live（下一步：offset 吸附）；③ 真机 25 秒周期的脏源仍未定位。
 
+### 阶段三百八十一：auto-bake 原地修复 —— 零散变更不再「掉烘 + 整块重烘」（v0.4.345 → v0.4.346）
+
+**起点**：阶段三百八十之后，真机日志里 `bake_patch` 仍恒为 0：auto-bake 边界一旦被写脏，阶段 B/C 的做法是
+**当帧整块失效**（`_render_dirty`/`_auto_baked`/`_cache_valid` 清零）落到活态，下一帧再从零重建表面
+（重新分配 surface + 整块重新光栅化 + 快照 + 贴回）。同一次内容变更因此**光栅化两遍子树**、还要分配一次面。
+阶段 C 早就实现了「保留 surface + 有限脏矩形 ⇒ 只重画那块」（`bake_patch`），但那条分支此前只有显式
+`cacheAsBitmap` 走得到。
+
+**修复**（`src/emit.ts`）：
+1. `DisplayObject` 增 `_cache_dirty_run`（int，C 运行时字段，非 AS3 可见）：记「连续多少次渲染都带着脏进来」。
+   干净的渲染把它清零 ⇒ `== 1` 就是「上一帧还是干净的」，即这次是零散变更。
+2. 缓存分支（`as_render_object`）：auto-bake 脏且 `_cache_valid && _cache_surface != NULL && _cache_dirty_run == 1`
+   ⇒ `use_cache = 1`，交给 `as_render_cached` 原地修复（有限矩形走 `bake_patch`，`_dirty_full`/filter 走整面重画）；
+   `_cache_dirty_run >= 2`（每帧都在变：动画/滚动）⇒ 照旧掉烘落 live，不为此每帧多付一次快照 + 贴回。
+   显式 `cacheAsBitmap` 完全不受影响（它本来就每帧重烘，是作者的请求）。
+3. 新增 `ASC_BAKE_VERIFY=1` 自校验 oracle（`as_bake_verify`）：每次原地修复后，把同一状态从零重建到一张临时
+   surface，回读两份 ARGB 逐像素比，不一致就打 `bake_verify_bad o=… kind=patch|repaint npix=…`。原地修复的
+   唯一真风险是「漏一个写点 ⇒ 留下一块永久过期像素」，而任何只看「刚改的那块」的门都发现不了它。
+
+**验证**：
+- 新示例 `examples/autobake-patch.as`（像素钉）：`card` 单点改色（追加小矩形 ⇒ 精确脏矩形）后，必须与「同一内容
+  每步新建一份、从零整块烘焙」的 `twin` **逐像素相同** —— 过期像素会让两者不等；覆盖零散改色、连续 5 帧改色
+  （模拟动画）、收尾后再改色三种情形，并断言改的确实是那盏灯（否则是不动内容的空断言）。
+- 同一示例 bake-trace A/B（同一份 `.as`、同一 manifest，只把 `src/emit.ts` 换回改动前，`temp/s381/ab-bake.cjs`）：
+  `bake_rebuild` **47 → 5**、`bake_patch` **0 → 7**；两臂的像素断言都通过（说明画面没变，变的只是画的次数）。
+- `ASC_BAKE_VERIFY=1` 跑同一示例：**零** `bake_verify_bad`（7 次原地修复的结果与从零重建逐像素一致）。
+- 烘焙示例族回归 13/13：`autobake-patch`/`autobake-move`/`autobake-origin`/`autobake-scrollrect`/`autobake`/
+  `bake-bitmap-swap`/`bake-draw-cache`/`bakecrisp`/`cache-patch`/`cacheasbitmap`/`fps-counter`/
+  `scroll-header-pin`/`show-redraw-regions`。
+- 单元钉 `render/AutoBakePatch`（16 项）：字段/初始化/失效复位、门控条件、`>= 2` 仍掉烘、干净渲染清零、
+  oracle 的前向声明 + 环境开关 + 两条调用点（patch/repaint，且重建分支不调用）、生成 C 里的实际形态。
+- **oracle 不是空门**（变异实测）：把自校验臂的 scratch canvas 平移 **1 个设备像素**后重编同一示例，
+  `ASC_BAKE_VERIFY=1` 打出 **14 行** `bake_verify_bad`（`npix=318/636`）—— 说明比对的两份光栅都真有内容、
+  比较确实逐像素（不是「两份全透明所以永远相等」）；真实代码 0 行。变异后 `src/emit.ts` sha256 复原。
+- asaotui 真实 widget 门：`ui-demo/run-check.cjs`（CheckUi **37 checks / 0 failures**）+ `tools/gates.cjs` 的
+  `chip 19 / form 41 / display 48 / nav 41 / navstack 16 / anim 14 / redraw 14` 全 PASS —— 改的是渲染层公共路径，
+  这是它与真实组件树对得上的证据。`G20` 仍是既有的链接环境项（manifest 缺 `${win:d3d12/dxgi/d3dcompiler}`）。
+
+- 全量回归 A/B（`node test.ts`，`git checkout -- src/emit.ts` 真跑改动前的臂）：**失败用例名集合完全相同**
+  （base 52 / cur 52，ADDED 0 / GONE 0；`tests 641 / pass 588 / fail 50`，50 与 52 的差是两条既是 suite 又是
+  case 的名字）。52 条全是既有的本机环境项：约 20 份 `examples/*.build.json` 缺 `${win:d3d12/dxgi/d3dcompiler}`
+  导致 lld-link 报 `undefined symbol: D3D12SerializeRootSignature / D3DCompile`，其余是本机缺 `cc`/`zlib.h`/locale。
+
+**未做（如实）**：① 真机尚未重编验证（`bin-aot` 的 exe 仍是 11-06 的构建，不含 379/380/381）——本阶段的
+收益数字全部来自示例级 A/B，**不是**真机数字；② `ASC_BAKE_VERIFY` 目前只在示例上跑过，真机跑一遍才知道
+「写点是否真的覆盖全」；③ 祖先边界仍整块重画（同阶段三百八十的 ①）；④ 滚动用分数偏移仍每帧落 live。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

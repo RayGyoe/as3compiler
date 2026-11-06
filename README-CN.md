@@ -257,7 +257,7 @@ GPU 画布上贴 CPU-raster 快照尤其贵）：`panel_bmp_192` **2.92 → 0.93
 活态绘制，显式 `cacheAsBitmap` 不受限。同一会议 10 秒中位数从无上限的 **0.088% CPU / 4.655% GPU /
 369.3MB Private** 变为 **0.105% / 3.743% / 254.4MB**；250K 虽更省内存但 GPU 升到 7.972%，故不采用。
 另外，**位移不再丢烘焙**：`x`/`y` 的写点只让**祖先**失效（`as_mark_moved`），被移动的子树保留快照、下一帧
-直接贴回旧位图；旋转/缩放/透明度仍整对象失效（它们改变烘焙的设备分辨率），亚像素位移仍走活态绘制。
+直接贴回旧位图；旋转/缩放/透明度仍整对象失效（它们改变烘焙的设备分辨率），亚像素位移仍走活态绘制。**零散的内容变更也不再整块重烘**：auto-bake 边界脏了优先原地修复保留的 surface（有限脏矩形只重画那块），只有「每帧都在变」的子树（动画/滚动）才退回活态绘制，避免每帧多付一次快照 + 贴回（阶段三百八十一；`ASC_BAKE_VERIFY=1` 会把修复后的表面与从零重建逐像素比对，不一致就打 `bake_verify_bad`）。
 显示树指纹、Stage3D 序号、GPU 与系统重绘代次都不变时跳过冗余光栅和 Present，逻辑帧、计时器、
 输入照常；`ASC_NO_PRESENT_SKIP=1` 与 `ASC_AUTO_BAKE_MAX_PIXELS=0` 提供同 exe A/B。动态 FPS 文本
 会让指纹正确失效，不会为命中而忽略它。完整口径见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6。
@@ -544,6 +544,8 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/stage67.as` — `DisplayObject.cacheAsBitmap`（默认 false、读写、继承、toggle 失效安全）
 - `examples/cacheasbitmap.as` — `cacheAsBitmap` 渲染验证（开关两态逐像素一致）
 - `examples/autobake.as` — 增量重绘自动 `cacheAsBitmap`（静止触发烘焙、移动失效重烘焙）
+- `examples/autobake-patch.as` — auto-bake 边界**原地修复**保留的表面（零散改色后必须与「同一内容从零整块烘焙」
+  逐像素相同；连续 5 帧改色后、以及收尾后再改色同样要精确）。需 `examples/autobake-patch.build.json` 链 Skia
 - `examples/autobake-origin.as` — 烘焙原点对齐设备像素栅格（抗锯齿圆在小数原点：修前与实时绘制差 1 物理像素、修后逐位相同；需 `examples/autobake-origin.build.json` 链 Skia）
 - `examples/bake-bitmap-swap.as` — 烘焙指纹必须认得「换了一张 `BitmapData`」（阶段二百八十一）：真机症状是
   幻灯片预览被自动烘焙后在某个分辨率下**翻页不再更新**，只有把窗口改回烘焙前那个尺寸才刷新。根因是

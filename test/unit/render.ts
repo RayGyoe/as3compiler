@@ -2865,3 +2865,76 @@ function checkMovedBake(): string[] {
   return bad;
 }
 registerGroup('unit: render/MovedBake', checkMovedBake);
+
+// ---- 阶段三百八十一: an auto-bake repairs its retained surface in place ----
+//
+// The behavioural oracle is examples/autobake-patch.as (pixels: after a SPORADIC change the
+// repaired boundary must be pixel-identical to a from-scratch bake of the same content, the same
+// holds through a 5-frame churn and after it, and the changed pixel really changes). Bake traces
+// on that same example, same AS3 input, only emit.ts swapped (temp/s381/ab-bake.cjs):
+// bake_rebuild 47 -> 5, bake_patch 0 -> 7, and ASC_BAKE_VERIFY=1 reports no bake_verify_bad.
+// These are the source-level invariants that keep that oracle meaningful.
+function checkAutoBakePatch(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [autopatch] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [autopatch] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+
+  // The field exists, starts clean, and is reset by an explicit invalidation too.
+  check('DisplayObject carries the consecutive-dirty counter',
+    emitted.includes('int _cache_dirty_run;'));
+  check('the ctor starts the counter at 0',
+    (emitted.match(/o->_cache_dirty_run = 0;/g) ?? []).length >= 2);
+  check('the cacheAsBitmap setter resets the counter (a rebuilt surface may patch next change)',
+    /o->_cache_valid = 0;\no->_cache_dirty_run = 0;/.test(emitted));
+
+  // The decision: count first, patch only on the FIRST dirty render after a clean one.
+  check('the dirty branch counts consecutive dirty renders',
+    emitted.includes('o->_cache_dirty_run++;'));
+  check('an explicit cacheAsBitmap is unaffected (still unconditional)',
+    emitted.includes('if (o->_cache_flag) { use_cache = 1; }'));
+  check('an auto-bake patches only when the previous render was clean AND a surface exists',
+    emitted.includes('else if (o->_cache_valid && o->_cache_surface != NULL && o->_cache_dirty_run == 1) { use_cache = 1; }'));
+  check('a per-frame animator still drops to live (the stage B behaviour is kept)',
+    emitted.includes('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }'));
+  check('a clean render resets the counter before reusing the cache',
+    emitted.includes('o->_cache_dirty_run = 0;\nuse_cache = 1;'));
+
+  // The verify oracle that makes a silent stale block impossible to miss.
+  check('the ASC_BAKE_VERIFY oracle is forward-declared',
+    emitted.includes('static void as_bake_verify(DisplayObject* o, void* canvas, int pw, int ph, double sx, double sy, double bxo, double byo, const char* kind);'));
+  check('the oracle is opt-in through the environment',
+    emitted.includes('static int ASC_bake_verify = -1;')
+    && emitted.includes('ASC_bake_verify = getenv("ASC_BAKE_VERIFY") != NULL ? 1 : 0;'));
+  check('the oracle rebuilds from scratch and compares the two rasters',
+    emitted.includes('static void as_bake_verify(DisplayObject* o, void* canvas, int pw, int ph, double sx, double sy, double bxo, double byo, const char* kind) {')
+    && emitted.includes('as_skia_surface_read_argb(o->_cache_surface, va, pw, ph)')
+    && emitted.includes('for (int i = 0; i < pw * ph; i++) if (va[i] != vb[i]) bad++;')
+    && emitted.includes('bake_verify_bad o=%p kind=%s npix=%d of=%d'));
+  check('both in-place repairs verify, the from-scratch rebuild does not',
+    (emitted.match(/if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "patch"\);/g) ?? []).length === 1
+    && (emitted.match(/if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint"\);/g) ?? []).length === 1
+    && emitted.split('as_bake_verify(o, canvas').length - 1 === 2);
+
+  // Source shape inside the generated C itself (not just the emitter's text).
+  const c = generateC(parse(
+    'import flash.display.Sprite;\nimport flash.display.Shape;\nvar s:Sprite = new Sprite();\n' +
+    'var p:Shape = new Shape();\np.graphics.beginFill(0xFF0000);\np.graphics.drawRect(0,0,4,4);\np.graphics.endFill();\ns.addChild(p);\n')).c;
+  check('the generated renderer counts consecutive dirty renders',
+    c.includes('o->_cache_dirty_run++;'));
+  check('the generated patch branch verifies its own repair',
+    /o->_cache_image = as_skia_surface_make_snapshot\(o->_cache_surface\);\n\s*if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "patch"\);/.test(c));
+  check('the whole-surface repaint verifies too',
+    /o->_cache_image = as_skia_surface_make_snapshot\(o->_cache_surface\);\n\s*if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint"\);/.test(c));
+  check('every oracle call site is guarded by the environment switch',
+    c.split('\n').filter((l) => l.includes('as_bake_verify(o, canvas')).every((l) => l.trimStart().startsWith('if (ASC_bake_verify > 0)')));
+
+  console.log(`[autopatch] ${ok} auto-bake repair checks passed`);
+  return bad;
+}
+registerGroup('unit: render/AutoBakePatch', checkAutoBakePatch);
