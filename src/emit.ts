@@ -31221,24 +31221,35 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Rasterize one window's tree into its current surface. The canvas transform is
     // device-scale -> align-offset -> content-scale, so AS3 code always draws in
     // logical stage coordinates while the pixels land 1:1 on a Retina drawable.
+    // -1 = not read yet. Lazily read so a normal run pays one branch per frame;
+    // see the skip rationale inside ASC_window_render.
+    this.line('static int ASC_move_skip = -1;');
     this.line('static int ASC_window_render(int id) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) return 0;');
     this.line('Stage* st = w->stage;');
     this.line('if (st == NULL) return 0;');
-    // The OS moves a dragged window inside DefWindowProc's modal loop, and this
-    // frame driver keeps running through it. Repainting there cannot be seen (the
-    // whole window is travelling) but costs a full frame, and on a large window
-    // that starves the loop's own message pump: measured on a 1100x900 window, a
-    // per-frame repaint (an app FPS overlay rewriting htmlText each frame) dropped
-    // a window-position update every 2-3 frames, while the same window with static
-    // content moved on every frame. Skipping is safe because the dirty epoch keeps
-    // advancing on its own: whatever changed during the drag repaints on the first
-    // frame after the drop. Resizes are excluded by the backend (they change the
-    // stage size, so the content must keep following).
+    // The OS moves a dragged window inside DefWindowProc's modal loop and this
+    // frame driver keeps running through it (the dragged window's SDL event watch
+    // calls sk_pump_frame on every MOVED event). Until 阶段三百八十二 this function
+    // returned 0 for the whole loop, which froze EVERY window's picture for as long
+    // as the drag lasted. That was wrong: AIR does not stop animating. Verified
+    // against adl on this machine (temp/wglprobe/air) — an ENTER_FRAME bar keeps
+    // advancing while its window's title bar is held — so a frozen picture is a
+    // defect, not an optimization.
+    //
+    // The cost the skip was buying is real but was seen on a d3d12 build whose FPS
+    // overlay rewrote htmlText every frame (a window-position update dropped every
+    // 2-3 frames on a 1100x900 window). Re-measured on BOTH backends — gl and
+    // d3d12, 300 shapes redrawn per frame, real mouse drag, temp/wglprobe/run.cjs —
+    // rendering through the loop keeps the window glued to the cursor exactly as
+    // the skip did (median 0 px / p95 0 px on both arms) while the picture stays
+    // alive. ASC_MOVE_SKIP=1 restores the old skip for a machine where a heavy
+    // frame would still starve the loop; it is a fallback, not the default.
     this.line('#ifdef ASC_USE_WINDOW');
-    this.line('if (as_window_in_move_loop()) return 0;');
+    this.line('if (ASC_move_skip < 0) ASC_move_skip = getenv("ASC_MOVE_SKIP") != NULL ? 1 : 0;');
+    this.line('if (ASC_move_skip && as_window_in_move_loop()) return 0;');
     this.line('#endif');
     // Fingerprint BEFORE acquiring a drawable. A static window must not pay for
     // a swapchain acquire, a full clear, or a vsync-blocking Present. The same

@@ -20173,6 +20173,57 @@ acquire 停顿（`SK_D3D_NUM_FRAMES 2→3`，acquire 已 0.00 ms），但该修�
 收益数字全部来自示例级 A/B，**不是**真机数字；② `ASC_BAKE_VERIFY` 目前只在示例上跑过，真机跑一遍才知道
 「写点是否真的覆盖全」；③ 祖先边界仍整块重画（同阶段三百八十的 ①）；④ 滚动用分数偏移仍每帧落 live。
 
+### 阶段三百八十二：拖动窗口不再停画面 —— 撤销阶段三百七十九 的「模态循环里不渲染」（v0.4.346 → v0.4.347）
+
+**用户反馈**：Windows 上（GL 后端）拖动或缩放窗口时**画面冻结**，而且**所有打开的窗口同时停**；进程仍在跑、
+松手立刻恢复。
+
+**定位**：`sk_window_in_move_loop()` 全仓只有 5 处（`vendor/web_glue.cc` stub、`vendor/window_glue.cc` 真实现、
+`src/runtime.ts` 的 extern + inline wrapper、`src/emit.ts` 生成 C）。冻结来自生成 C 里那一行
+`if (as_window_in_move_loop()) return 0;` —— 它是阶段三百七十九 为了「每帧 Present 挤占模态循环消息泵」加的
+**无条件早退**，与 GL/d3d12 后端无关（两条后端同样冻）。
+
+**撤销的理由（四条实测）**：
+1. **AIR 契约**：`adl`（`temp/wglprobe/air`，700×520 标准 chrome，同一根 `ENTER_FRAME` 白条）按住标题栏拖动时
+   白条**每帧照常前进** —— 截图序列 268 → 341 → 394 → 436 → 488 → 530 → 573 → 615 → 667，松手后继续。
+   冻结是**缺陷**，不是优化。
+2. **跨窗口**：判据问的是「本线程有没有在模态循环里」，所以拖**任一**窗口 ⇒ **所有**窗口停。两窗探针 A/B：
+   `ASC_MOVE_SKIP=1` 臂白恒 905 / 黄恒 155（两扇都定住），默认臂白 47→404 / 黄 238→654（两扇都在走）。
+3. **跳过没换来跟手**：gl 与 d3d12 各做双臂（300 个每帧 `clear()`+重画的矢量对象、真鼠标拖动 40 步、每步记光标
+   与窗口左边缘）：两条后端的跟手指标**逐项相同**（median 0 px / p95 0 px / max 12–18 px），而画面一冻一活
+   （GL 跳过臂白条恒 284 / 渲染臂 47→373；d3d12 恒 863 / 47→331）。
+4. **真应用同构**：`bin-aot/TalkMED Meeting.exe`（GL，25.7 MB）上改用「按住标题栏中点后**原地不动** 2.3 s」
+   （模态循环照样进入、窗口矩形恒定 ⇒ `pass paint` 条数就是纯重绘判据）：默认臂 hold 内 **54 条**（23.6/s），
+   `ASC_MOVE_SKIP=1` 臂 **0 条**；同一构建的 `ASC_FRAME_STATS` 段 `FRAME n=512 … max=18.00` 证明应用帧在两条臂上
+   都照常推进 ⇒ 用户看到的冻结是被这行挡在 Present 之前，不是应用停了动画。
+
+**现行为**：`ASC_window_render` 入口只剩
+`static int ASC_move_skip = -1;`（懒读一次）+ `#ifdef ASC_USE_WINDOW` 内的
+`if (ASC_move_skip < 0) ASC_move_skip = getenv("ASC_MOVE_SKIP") != NULL ? 1 : 0;` 与
+`if (ASC_move_skip && as_window_in_move_loop()) return 0;`。即**默认照常出帧**，`ASC_MOVE_SKIP=1` 是**退回开关**
+（某台机器上重帧真把跟手拖垮时用它回到 379，而不是重新引入全局冻结）。`sk_window_in_move_loop()` 本体一行未改：
+仍是 `GetGUIThreadInfo` + `GUI_INMOVESIZE` 动态解析、比较 `hwndMoveSize` 尺寸、**尺寸不变才算纯移动**、
+`entering` 首帧算移动（缩放因尺寸变化自然回落绘制路径）。
+
+**验证**：
+- 复现台 `temp/wglprobe/`：`probeheavy.as`（光窗口 + 300 个每帧重画的矢量三角）与 `probe.as`（双窗口）各配
+  GL / d3d12 两份 manifest；`drive.ps1` 走真 `SetCursorPos` + `mouse_event`（move / resize / **hold** 三种模式），
+  每步写 `trace.csv`（光标 x、窗口 left/top），`bars.cjs` 读截图里的白/黄条位置，`lag.cjs` 算 光标位移−窗口位移。
+- 三组 A/B（同一可执行文件，只切环境变量）：GL 重帧、d3d12 重帧、GL 轻帧 —— 跳过臂全部**冻结**，渲染臂全部**活**。
+- 双窗口 A/B 见上。缩放（resize）不受影响：`r01..r08` 白条 98→147→184→229→263→295→334→371 且窗口逐级缩小，
+  符合「尺寸一变立刻恢复重绘」。
+- 真机跟手：`lag.cjs` 读 571×1001 窗口的真拖动 ⇒ median 0 / p95 0 / max **6** px（比探针的 12–18 px 更好）。
+- 单元钉 `platform/MoveLoopPaint` 从「钉住跳过」**翻转为 11 项**：不再含无条件早退、`ASC_MOVE_SKIP` 缺省为 0、
+  opt-in 时门仍先于其它 paint 步骤、门在 `#ifdef ASC_USE_WINDOW` 内、`static int ASC_move_skip = -1;` 声明在
+  渲染入口之前、runtime extern+wrapper、`GUI_INMOVESIZE`、动态 `GetProcAddress`、缩放被排除、首帧算移动、web stub。
+- 文档：`docs/{zh-cn,en}/win32.md` §3.8.1 把 379 的形态标为「已被 382 撤销」并给出现行为 + 四条撤销理由 +
+  「拖动期是否出帧用画面证明，不用 `pass paint` 日志」的新验收口径；中英 README 各一段。
+
+**未做（如实）**：① 379 当初量到的「每帧 Present 挤占消息泵」在这台机器上**已不复现**（重帧双臂 max 12–18 px），
+但没有在多台机器/更大窗口上扫过，`ASC_MOVE_SKIP` 因此保留；② 拖动期的 `pass paint` 只统计 ≥4 ms 的帧，
+真机多数帧在 2–6 ms ⇒ **不能**用它的绝对条数反推帧率，只能做「有/无」的判据；③ 缩放（resize）期间的跟手与
+帧率仍沿用阶段一百七十七 的口径，本轮没有重测。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

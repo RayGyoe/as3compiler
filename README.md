@@ -409,6 +409,15 @@ skip redundant rasterization and Present while `ENTER_FRAME`, timers and input c
 correctly invalidates the key; it is never ignored to produce hits. See [`compile.md`](docs/en/compile.md) §3.4.6
 for the full measurements and caveats.
 
+**The picture no longer stalls while a window is dragged (stage 382)**: on Windows a title-bar drag runs inside
+`DefWindowProc`'s modal move loop, and stage 379 made `ASC_window_render` return 0 unconditionally whenever that
+loop was active. Measurement showed that is a defect rather than an optimization: the predicate asks "is this
+thread inside a modal loop", so dragging *any* window froze the picture in *every* open window; `adl` keeps
+`ENTER_FRAME` advancing through a drag (the same bar keeps moving). The renderer now paints as usual and only
+`ASC_MOVE_SKIP=1` restores the old behaviour; cursor-follow metrics (median / p95 / max) are identical between the
+two arms on the same binary, so what that skip bought was a **frozen picture**, not responsiveness. See
+[`win32.md`](docs/en/win32.md) §3.8.1 for the full evidence.
+
 ## Examples
 - `examples/hello.as` — expressions, string concatenation, `trace`, `if/else`
 - `examples/fib.as` — functions, `while`, `for`, recursion boundary

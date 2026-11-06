@@ -788,12 +788,49 @@ pump ⇒ **window-position updates get dropped**, which reads as "two frames per
 independent bottleneck from §3.8: acquire no longer waits, but the present itself still needs a full frame
 budget.
 
-**Fix**: `vendor/window_glue.cc` gains `sk_window_in_move_loop()`, reading the OS's own modal-loop flag
-(`GetGUIThreadInfo` + `GUI_INMOVESIZE`, resolved through `GetProcAddress` so no import is added) and
-comparing `hwndMoveSize`'s current size with the previous call: **only an unchanged size counts as a pure
-move**. `ASC_window_render` in `src/emit.ts` returns 0 right at the entry when that holds (guarded by
+**Fix (as landed in stage one-hundred-seventy-nine)**: `vendor/window_glue.cc` gains
+`sk_window_in_move_loop()`, reading the OS's own modal-loop flag (`GetGUIThreadInfo` +
+`GUI_INMOVESIZE`, resolved through `GetProcAddress` so no import is added) and comparing
+`hwndMoveSize`'s current size with the previous call: **only an unchanged size counts as a pure move**.
+`ASC_window_render` in `src/emit.ts` then returned 0 right at the entry **unconditionally** (guarded by
 `#ifdef ASC_USE_WINDOW`, so the offscreen build never references it; `vendor/web_glue.cc` carries a
-return-0 stub for link parity).
+return-0 stub for link parity). **That unconditional return was withdrawn in stage
+three-hundred-eighty-two** -- the current behaviour follows.
+
+**Current behaviour (from stage three-hundred-eighty-two)**: the app keeps painting through a title-bar
+drag. `ASC_window_render` now carries only `if (ASC_move_skip && as_window_in_move_loop()) return 0;`,
+where `ASC_move_skip` is read once from `ASC_MOVE_SKIP` and **defaults to 0 when the variable is
+absent** (i.e. no skip).
+
+- **Why it was withdrawn**: the freeze was **cross-window** -- `sk_window_in_move_loop()` answers "is
+  this thread inside a modal loop", so dragging *any* window stopped the picture in *every* open window.
+  AIR does not do that: measured against `adl` (`temp/wglprobe/air`, the same `ENTER_FRAME` bar), holding
+  the title bar keeps the bar advancing **every frame** (screenshot sequence 268 -> 341 -> 394 -> 436 ->
+  488 -> 530 -> 573 -> 615 -> 667) and it keeps going after release. The freeze was a **defect**, not an
+  optimization.
+- **Cost re-measured**: the 379 cost (a per-frame Present filling the message pump) was measured on a
+  d3d12 build whose FPS overlay rewrote `htmlText` every frame (a dropped position update every 2-3
+  frames on a 1100x900 window). On the same machine, **two arms on each of gl and d3d12** (300 vector
+  objects cleared and redrawn every frame, a real mouse drag of 40 steps recording cursor and window-left
+  each step, `temp/wglprobe/run.cjs`): the skip arm and the render arm have **identical** cursor
+  following (median 0 px / p95 0 px / max 12-18 px), while the picture differs completely -- skip arm
+  frozen at bar x = 905, render arm 47 -> 100 -> 142 -> 194 -> 247 -> 299 -> 352 -> 404. What the skip
+  bought on these builds was a frozen picture, not responsiveness.
+- **Two-window A/B** (same executable, one bar per window): the `ASC_MOVE_SKIP=1` arm freezes **both**
+  bars (white 905 / yellow 155), the default arm advances **both** (white 47 -> 404, yellow 238 -> 654).
+  That is the "all windows pause together" report and its fix, side by side.
+- **Real-app A/B (zero-displacement title-bar hold)**: the probe creates motion by dragging, which mixes
+  window movement with responsiveness; on the real app (`bin-aot/TalkMED Meeting.exe`, GL, 25.7 MB) we
+  instead hold the title-bar centre **without moving** for 2.3 s -- the modal move loop is entered all the
+  same while the window rectangle stays fixed, so the `pass paint` count from `ASC_PASS_TRACE` is a pure
+  "did it repaint" oracle: the default arm logged **54** lines inside the hold (23.6/s), the
+  `ASC_MOVE_SKIP=1` arm **0** over the same 2.3 s (and painting resumed the moment the button came up).
+  A separate `ASC_FRAME_STATS` run on the same build reports `FRAME n=512 ... p95=17.00 ... max=18.00`,
+  i.e. the application frames advance in both arms => the frozen picture users saw was this skip holding
+  the frame back before Present, not the app stopping its animation.
+- **Kept**: `sk_window_in_move_loop()` and `ASC_MOVE_SKIP=1` stay as a **fallback switch** -- if a heavy
+  frame on some machine does hurt following, that switch restores the 379 behaviour instead of
+  re-introducing a global freeze.
 
 - **Pure moves only**: a resize changes the stage size and the content must keep following, so any size
   change resumes painting immediately.
@@ -802,13 +839,22 @@ return-0 stub for link parity).
   (that is the residual 120 px jump). A real resize changes size on the next frame and falls back into the
   painting path by itself.
 
-**Evidence**: the same harness now advances 32–42 px per frame throughout; `ASC_PASS_TRACE` records **zero**
-`pass paint` lines across a 5.5 s hold-plus-drag window (one per frame before the fix). The `presentskip`
-semantics of a static window are unchanged.
+**Evidence**: after the 379 fix the same harness advanced 32-42 px per frame throughout; `ASC_PASS_TRACE`
+recorded **zero** `pass paint` lines across a 5.5 s hold-plus-drag window (one per frame before it). The
+`presentskip` semantics of a static window are unchanged.
 
-**Pins**: eight source-level assertions in `platform/MoveLoopPaint` (`test/unit/platform.ts`), plus
-`build/DocumentedLinkSets` compiling the generated C under the **offscreen** manifest's own defines — dropping
-the `#ifdef` guard turns that one red.
+**The acceptance probe changed after stage three-hundred-eighty-two**: `ASC_PASS_TRACE` *should* show
+`pass paint` during a drag now (nothing is skipped). Proving "frames really are being produced during
+the drag" is a picture question, not a log question -- screenshot the window during a real mouse drag and
+read the bar position (`temp/wglprobe/run.cjs` + `bars.cjs`). The following metrics of the same harness
+(median/p95/max) match the skip arm item by item, so "no skip" is not paid for with responsiveness.
+
+**Pins**: **eleven** source-level assertions in `platform/MoveLoopPaint` (`test/unit/platform.ts`) -- the
+current contract (no unconditional skip, `ASC_MOVE_SKIP` defaults to 0, the opted-in skip still precedes
+every other paint step, `static int ASC_move_skip = -1;` declared before the render entry) and the backend
+contract (inside `#ifdef ASC_USE_WINDOW`, reads the OS flag, resizes excluded, entry frame counts as a
+move, web stub present) -- plus `build/DocumentedLinkSets` compiling the generated C under the
+**offscreen** manifest's own defines; dropping the `#ifdef` guard turns that one red.
 
 ### 3.9 Resizing by the Bottom-Right Corner **Wedges**: `ResizeBuffers` Corrupted the Fence Ledger (stage one-hundred-seventy-seven · one)
 

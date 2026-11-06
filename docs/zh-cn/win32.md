@@ -748,23 +748,58 @@ live-resize watch 语义**一行未动**（拖动期间动画照常）。对照�
 这一帧就越可能占满移动循环自己的消息泵 ⇒ **窗口位置更新被丢**，屏幕上就是「两帧走一步」。
 它与 §3.8 是两个独立瓶颈：acquire 已不等待，但 present 本身仍要一整个帧预算。
 
-**修复**：`vendor/window_glue.cc` 新增 `sk_window_in_move_loop()`，用 `GetGUIThreadInfo` +
-`GUI_INMOVESIZE` 读 OS 自己的模态循环标志（`GetProcAddress` 动态解析，不新增导入面），再比较
-`hwndMoveSize` 的当前尺寸与上次调用：**尺寸不变才算纯移动**。`src/emit.ts` 的 `ASC_window_render`
-在入口据此直接返回 0（`#ifdef ASC_USE_WINDOW` 保护，离屏构建不引用它；`vendor/web_glue.cc`
-给出返回 0 的同名 stub 保持链接一致）。
+**修复（阶段三百七十九 的形态）**：`vendor/window_glue.cc` 新增 `sk_window_in_move_loop()`，用
+`GetGUIThreadInfo` + `GUI_INMOVESIZE` 读 OS 自己的模态循环标志（`GetProcAddress` 动态解析，
+不新增导入面），再比较 `hwndMoveSize` 的当前尺寸与上次调用：**尺寸不变才算纯移动**。当时
+`src/emit.ts` 的 `ASC_window_render` 在入口据此**无条件**返回 0（`#ifdef ASC_USE_WINDOW` 保护，
+离屏构建不引用它；`vendor/web_glue.cc` 给出返回 0 的同名 stub 保持链接一致）。**那条无条件返回
+已被阶段三百八十二 撤销** —— 现行为见下。
+
+**现行为（阶段三百八十二 起）**：拖动标题栏期间**照常出帧**。`ASC_window_render` 只剩下
+`if (ASC_move_skip && as_window_in_move_loop()) return 0;`，`ASC_move_skip` 从环境变量
+`ASC_MOVE_SKIP` 懒读一次，**不存在该变量时默认 0**（即不跳过）。
+
+- **为什么撤**：冻结是**跨窗口**的 —— `sk_window_in_move_loop()` 问的是「本线程有没有在模态循环里」，
+  于是拖动**任一**窗口时所有打开的窗口一起停画面。AIR 不这样：`adl` 实测（`temp/wglprobe/air`，
+  同一根 `ENTER_FRAME` 白条）按住标题栏拖动时白条**每帧照常前进**
+  （截图序列 268 → 341 → 394 → 436 → 488 → 530 → 573 → 615 → 667），松手后继续。
+  冻结是**缺陷**，不是优化。
+- **代价重测**：379 的代价（每帧 Present 挤占消息泵）是 d3d12 + 每帧重写 `htmlText` 的 FPS 面板
+  量到的（1100×900 上 2–3 帧丢一次位置更新）。同一台机器上按 **gl / d3d12 两种后端各做双臂**
+  （300 个每帧 `clear()`+重画的矢量对象、真鼠标拖动 40 步、每步记光标与窗口左边缘，
+  `temp/wglprobe/run.cjs`）：跳过臂与渲染臂的**跟手性完全相同**（median 0 px / p95 0 px /
+  max 12–18 px），而画面 —— 跳过臂白条恒在 905 px（冻住），渲染臂 47 → 100 → 142 → 194 → 247 →
+  299 → 352 → 404（活）。即：这条跳过在这些构建上买到的是「画面冻结」，不是「跟手」。
+- **多窗口 A/B**（同一可执行文件、两扇窗各一根条）：`ASC_MOVE_SKIP=1` 臂**两扇窗的条都定住**
+  （白 905 / 黄 155），默认臂**两扇都在走**（白 47→404、黄 238→654）。这才是「所有窗口同时暂停」
+  的现场与修复对照。
+- **真应用 A/B（零位移按住标题栏）**：探针靠拖动来造画面，位置变化与跟手两件事混在一起；在真应用
+  （`bin-aot/TalkMED Meeting.exe`，GL，25.7 MB）上改用「按住标题栏中点后**原地不动** 2.3 s」——
+  模态移动循环照样进入，窗口矩形恒定，于是 `ASC_PASS_TRACE` 的 `pass paint` 条数就是纯粹的
+  「有没有重绘」判据：默认臂 hold 内 **54 条**（23.6/s），`ASC_MOVE_SKIP=1` 臂 **0 条**（同样 2.3 s，
+  且松手后立刻恢复）。同一构建另跑 `ASC_FRAME_STATS` 的一段 `FRAME n=512 … p95=17.00 … max=18.00`
+  说明应用帧在两条臂上都照常推进 ⇒ 用户看到的「画面冻结」是被这条跳过挡在 Present 之前，
+  不是应用停了动画。
+- **保留**：`sk_window_in_move_loop()` 与 `ASC_MOVE_SKIP=1` 一起留作**退回开关** —— 若某台机器上
+  重帧仍把跟手拖垮，用它回到 379 的行为，而不是重新引入全局冻结。
 
 - **只对纯移动生效**：缩放会改 stage 尺寸，内容必须继续跟随，尺寸一变立刻恢复重绘。
 - **进入循环的首帧也按移动处理**：`last_hwnd` 初值为空、首帧尺寸无从比较，按「缩放」处理会重绘一次，
   正好卡住第一次位移（实测残留的 120 px 跳变即来自此）。缩放的下一帧尺寸就会变，自然回到重绘路径。
 
-**证据**：修复后同一 harness 全程 32–42 px 均匀步进；`ASC_PASS_TRACE` 在 5.5 s 的按住+拖动窗口里
+**证据**：379 修复后同一 harness 全程 32–42 px 均匀步进；`ASC_PASS_TRACE` 在 5.5 s 的按住+拖动窗口里
 **零次** `pass paint`（修复前每帧一条）。静止窗口的 `presentskip` 语义不变。
 
-**钉子**：`test/unit/platform.ts` 的 `platform/MoveLoopPaint` 八项源级断言（跳过点位于其它 paint 步骤之前、
-在 `#ifdef ASC_USE_WINDOW` 内、后端读 OS 标志、缩放被排除、首帧算移动、web stub 在），
-外加 `build/DocumentedLinkSets` 用**离屏清单自己的 defines** 编译一次生成的 C——少了 `#ifdef`
-保护那条会在这里红。
+**阶段三百八十二 之后的验收口径变了**：`ASC_PASS_TRACE` 在拖动期间**应当**出现 `pass paint`
+（不再跳过）；要证明「拖动期间确实在出帧」，用画面而不是日志 —— 真鼠标拖动中逐张截图比白条位置
+（`temp/wglprobe/run.cjs` + `bars.cjs`）。同一 harness 的跟手性指标（median/p95/max）与跳过臂
+逐项相同，所以「不跳过」不以跟手为代价。
+
+**钉子**：`test/unit/platform.ts` 的 `platform/MoveLoopPaint` **十一项**源级断言 —— 现行为（默认
+**不**跳过、`ASC_MOVE_SKIP` 缺省为 0、opt-in 时跳过点仍位于其它 paint 步骤之前、`static int
+ASC_move_skip = -1;` 声明在渲染入口之前）与后端契约（在 `#ifdef ASC_USE_WINDOW` 内、读 OS 标志、
+缩放被排除、首帧算移动、web stub 在），外加 `build/DocumentedLinkSets` 用**离屏清单自己的 defines**
+编译一次生成的 C——少了 `#ifdef` 保护那条会在这里红。
 
 ### 3.9 拖右下角缩放**挂死**：`ResizeBuffers` 打乱了 fence 账本（阶段一百七十七·一）
 

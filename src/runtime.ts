@@ -10931,11 +10931,11 @@ extern double sk_window_get_display_refresh(int win);
 extern uint64_t sk_window_redraw_generation(int win);
 static inline uint64_t as_window_redraw_generation(int win) { return sk_window_redraw_generation(win); }
 // True while the OS owns a MODAL MOVE loop on this window (the user is dragging
-// the title bar). Painting during that loop buys nothing -- the window itself is
-// what travels and the content is not being read -- but it costs a whole frame,
-// and on a large window that is enough to starve the loop's own message pump:
-// measured on a 1100x900 window, a per-frame repaint dropped a window-position
-// update every 2-3 frames, while static content streamed smoothly at 60 Hz.
+// the title bar) -- the app keeps rendering through it, because AIR does (see the
+// adl measurement in temp/wglprobe/air): freezing the picture during a drag was a
+// visible defect, not an optimization. The only consumer left is the ASC_MOVE_SKIP
+// fallback in ASC_window_render, which restores the old skip-frame behaviour for a
+// machine where a heavy frame starves the loop's message pump.
 // Only a PURE MOVE is reported; a resize changes the stage size and must keep
 // painting, so the backend answers 0 for it.
 extern int sk_window_in_move_loop(void);

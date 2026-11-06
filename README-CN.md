@@ -262,6 +262,13 @@ GPU 画布上贴 CPU-raster 快照尤其贵）：`panel_bmp_192` **2.92 → 0.93
 输入照常；`ASC_NO_PRESENT_SKIP=1` 与 `ASC_AUTO_BAKE_MAX_PIXELS=0` 提供同 exe A/B。动态 FPS 文本
 会让指纹正确失效，不会为命中而忽略它。完整口径见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6。
 
+**拖动窗口时画面不再停（阶段三百八十二）**：Windows 的标题栏拖动跑在 `DefWindowProc` 的模态移动循环里，
+阶段三百七十九曾据此在 `ASC_window_render` 入口**无条件**返回 0。实测这是缺陷而不是优化：那个判据问的是
+「本线程有没有在模态循环里」，于是拖动**任一**窗口时**所有**打开的窗口一起停画面；`adl` 实测 AIR 拖动时
+`ENTER_FRAME` 照常前进（同一根白条持续位移）。现已改为默认照常出帧，只有 `ASC_MOVE_SKIP=1` 才退回旧行为；
+真鼠标拖动的跟手指标（median / p95 / max）两条臂逐项相同 ⇒ 那条跳过买到的是**画面冻结**，不是跟手。
+口径与证据见 [`win32.md`](docs/zh-cn/win32.md) §3.8.1。
+
 **叶子类普通方法去虚化（阶段三百二十一）**：在封闭编译面内，静态接收者没有子类时，普通实例方法
 直接调用 nearest-wins 解析出的 `m.owner` 实现；继承自祖先的方法不会虚构 `Leaf_method`。显式调用、
 隐式 `this` 与 sealed `with` 已接入；基类多态、动态/接口/Proxy、private、访问器和方法值 thunk 保持原路径。

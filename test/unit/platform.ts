@@ -3317,15 +3317,16 @@ function checkNetworkInventory(): string[] {
 
 registerGroup('unit: platform/NetworkInventory', checkNetworkInventory);
 
-// ---- the paint skip for a window being dragged (title-bar move loop) ----
-// A drag runs inside DefWindowProc's MODAL move loop while this frame driver
-// keeps ticking. Repainting through it cannot be seen (the whole window is
-// travelling) but costs a full frame, and on a large window that starves the
-// loop's own message pump: measured on an 1100x900 window, a per-frame repaint
-// (an app FPS overlay rewriting htmlText every frame) dropped a window-position
-// update every 2-3 frames, while the same window with static content moved on
-// every frame. The render entry must bail out during a PURE MOVE -- and only
-// then: a resize changes the stage size, so the content has to keep following.
+// ---- painting while the OS owns a title-bar move loop ----
+// A drag runs inside DefWindowProc's MODAL move loop while this frame driver keeps
+// ticking, and the app has to keep painting through it: AIR does (verified against
+// adl -- an ENTER_FRAME bar keeps advancing while the title bar is held, see
+// temp/wglprobe/air). 阶段三百七十九 skipped the whole frame here, which froze
+// EVERY window's picture for as long as the drag lasted; 阶段三百八十二 put that
+// behind ASC_MOVE_SKIP=1 as a fallback, because the cost it was buying (a per-frame
+// Present filling the loop's own message pump on a very heavy frame) was
+// re-measured on both backends and no longer reproduces (cursor lag stays at
+// median 0 px / p95 0 px in both arms).
 function checkMoveLoopPaint(): string[] {
   const bad: string[] = [];
   let ok = 0;
@@ -3335,44 +3336,61 @@ function checkMoveLoopPaint(): string[] {
   };
 
   const c = generateC(parse(readFileSync(join(dir, 'hello.as'), 'utf8'))).c;
+  const gate = 'if (ASC_move_skip && as_window_in_move_loop()) return 0;';
   const skip = 'if (as_window_in_move_loop()) return 0;';
 
-  // (1) The skip exists, and it precedes every other paint step in the entry so
-  //     the frame really is free (a skip placed after the mouse refresh or the
-  //     caret blink would still pay for them).
-  check('the render entry skips a pure move before any other paint work',
-    c.includes(skip) && c.indexOf(skip) < c.indexOf('as_mouse_refresh_target((DisplayObject*)st);'));
+  // (1) The default must be "keep painting": the 379 form bails out with no
+  //     condition, and that is the freeze this stage removed.
+  check('the render entry does not bail out of a move unconditionally', !c.includes(skip));
 
-  // (2) ...guarded, because the declaration and the glue only exist in a windowed
+  // (2) What is left is a fallback, and the env read is what makes it opt-in.
+  check('the skip is opt-in: ASC_MOVE_SKIP present => 1, absent => 0',
+    c.includes('if (ASC_move_skip < 0) ASC_move_skip = getenv("ASC_MOVE_SKIP") != NULL ? 1 : 0;'));
+
+  // (3) When it IS opted into it must still precede every other paint step, so
+  //     the frame really is free (a gate placed after the mouse refresh or the
+  //     caret blink would still pay for them).
+  check('the opted-in skip sits before any other paint work',
+    c.includes(gate) && c.indexOf(gate) < c.indexOf('as_mouse_refresh_target((DisplayObject*)st);'));
+
+  // (4) ...guarded, because the declaration and the glue only exist in a windowed
   //     build. Without the guard the offscreen manifest fails to compile; that is
   //     pinned end-to-end by build/DocumentedLinkSets, this is the source-level
   //     half of the same invariant.
-  const before = c.slice(0, c.indexOf(skip));
-  check('the skip is inside #ifdef ASC_USE_WINDOW',
+  const before = c.slice(0, c.indexOf(gate));
+  check('the gate is inside #ifdef ASC_USE_WINDOW',
     before.lastIndexOf('#ifdef ASC_USE_WINDOW') > before.lastIndexOf('#endif'));
 
-  // (3) The query is declared in the window-only preamble block that owns the
+  // (5) The flag is a lazily read static, declared before the render entry (a
+  //     function-local read would re-read the environment every frame).
+  const decl = 'static int ASC_move_skip = -1;';
+  const fn = 'static int ASC_window_render(int id) {';
+  check('the flag is a lazily read static declared before the render entry',
+    c.includes(decl) && c.indexOf(decl) < c.indexOf(fn));
+
+  // (6) The query is declared in the window-only preamble block that owns the
   //     other sk_window_* seam functions.
   const rt = readNorm(join(root, 'src', 'runtime.ts'));
   check('the query is declared with the other window seam functions',
     rt.includes('extern int sk_window_in_move_loop(void);')
     && rt.includes('static inline int as_window_in_move_loop(void) { return sk_window_in_move_loop(); }'));
 
-  // (4) The native backend answers from the OS's own modal-loop flag, never from
+  // (7) The native backend answers from the OS's own modal-loop flag, never from
   //     a guess about mouse-button state or timers.
   const glue = readNorm(join(root, 'vendor', 'window_glue.cc'));
   check('the Windows backend reads the OS modal-loop flag', glue.includes('GUI_INMOVESIZE'));
   check('it resolves GetGUIThreadInfo dynamically (no new link import)',
     glue.includes('GetProcAddress(GetModuleHandleA("user32.dll"), "GetGUIThreadInfo")'));
 
-  // (5) A resize must NOT be frozen: only an unchanged size counts as a pure move.
+  // (8) A resize must NOT be reported as a move: it changes the stage size, so the
+  //     content has to keep following even in the opt-in arm.
   check('a resize is excluded (the size has to stay unchanged for a move)',
     glue.includes('w == last_w && h == last_h'));
-  check('the entry frame counts as a move, so the drag start does not stall',
+  check('the entry frame counts as a move, so the opt-in arm starts clean',
     glue.includes('const int entering = (hwnd != last_hwnd);')
     && glue.includes('const int moving_only = entering ? 1 : (w == last_w && h == last_h);'));
 
-  // (6) The browser backend has no native move loop, so it must still link.
+  // (9) The browser backend has no native move loop, so it must still link.
   const web = readNorm(join(root, 'vendor', 'web_glue.cc'));
   check('the browser backend stubs the query (link parity)',
     web.includes('int sk_window_in_move_loop(void) { return 0; }'));
