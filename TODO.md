@@ -20032,6 +20032,33 @@ clang -O2 把它折叠成无条件自跳（`b 0x...; b 0x...`）——macOS 上�
 修复为 `return stat(p, st);`，并在 `test/unit/file-ops.ts` 加钉「as_p_stat forwards to stat()
 on POSIX (never recurses into itself)」防回归。
 
+### 阶段三百七十八：`bake_patch` 真实触发路径修复 —— `Graphics_clear` 精确脏矩形 + render-input 标量写点变化检测（v0.4.342 → v0.4.343）
+
+**起点**：asaotui `compiler-gaps.md` 的 **G30**（`cacheAsBitmap` 子树内容变化走「完整重绘」而非
+`bake_patch`）实测定位到**两个**完整失效源头，都会把精确脏矩形重新放大成整对象脏（`_dirty_full`），
+使 Stage C 的增量重烘在真实 asaotui 交互里从不触发：
+
+**一、`Graphics_clear` 的整对象失效**：`Graphics_clear`（`emit.ts`）首句 `if (g->_owner != NULL)
+as_mark_dirty(g->_owner)` 把 owner 标 `_dirty_full=1`，抹掉随后 `drawRect` 的精确脏矩形。修复：在
+`_has_b`/`_bl/_bt/_br/_bb`/`_max_sw` 重置**之前**，用旧累积 bounds 走 `as_mark_dirty_rect`（含 `_max_sw`
+描边外扩）；空 graphics（`_has_b==0`）不标脏（比原 `as_mark_dirty` 更精确）。
+
+**二、render-input 标量写点无条件整对象失效**：asaotui `UiNode.paintSelf` 每帧无条件写
+`backing.alpha = 1.0`，而 render-input 字段写尾（`x/y/rotation/scaleX/scaleY/alpha/visible`）无条件
+`as_mark_dirty`。修复：**标量**字段（double/bool）写点加「值不变就不标脏」变化检测
+（`field != value ? (store + as_mark_dirty) : (void)0`）；RHS 有副作用时先 `hoistImpure` 到临时变量
+（单次求值，AS3 左到右）。**指针/boxed 字段（`blendMode`/`opaqueBackground`/`transform`）刻意保持
+无条件标脏**：`as_value` 结构体无 `!=`（编译错误）、`char*` 地址比较会触发 `-Wstring-compare` 且语义
+是地址相等而非值相等，故保守（宁多画，不冻结）。
+
+**三、asaotui 侧防御**：`UiNode.paintSelf` 的 `backing.alpha` 改为「值变了才写」，进一步减少无谓写点。
+
+**验收**：`ASC_BAKE_TRACE=1 ASC_NO_OPEN=1` 跑 `asaotui/probes/widgets/repaint-boundary`，改 `s1` 颜色后
+`stable` 出现 `bake_patch`（脏矩形 = `s1` 的 bounds `dl=10 dt=10 dr=270 db=30`），而非「完整重绘」（无
+trace）。**编译器侧变化检测独立验证**：临时还原 asaotui 侧后仍出 `bake_patch`（通用，不依赖 asaotui）。
+全量 `node test.ts` **636/636**；`test/unit/render.ts` 加钉「Graphics_clear 精确脏矩形」「render-input
+标量写点变化检测」。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

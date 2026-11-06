@@ -2637,6 +2637,13 @@ function checkRepaintBoundary(): string[] {
   check('as_gflush invalidates the precise accumulated bounds, not the whole object',
     emitted.includes('static void as_gflush(Graphics* g) {')
     && emitted.includes('as_mark_dirty_rect(g->_owner, g->_bl - half, g->_bt - half, g->_br + half, g->_bb + half);'));
+  // ---- G30: Graphics_clear precise invalidation (asaotui drawBox clear+redraw) ----
+  check('Graphics_clear invalidates the old accumulated bounds precisely, not the whole object',
+    emitted.includes('void Graphics_clear(void* _this) {')
+    && emitted.includes('if (g->_owner != NULL && g->_has_b) {')
+    && emitted.includes('as_mark_dirty_rect(g->_owner, g->_bl - half, g->_bt - half, g->_br + half, g->_bb + half);'));
+  check('Graphics_clear no longer fires an unconditional whole-object as_mark_dirty (empty graphics skips the mark)',
+    !/void Graphics_clear\(void\* _this\) \{\nGraphics\* g = \(Graphics\*\)_this;\nif \(g->_owner != NULL\) as_mark_dirty\(g->_owner\);/.test(emitted));
   // ---- Stage C: showRedrawRegions paints the dirty-rect oracle (§4.4) ----
   check('showRedrawRegions records the flag without an unsupported report',
     !runtimeSource.includes('does not paint region outlines')
@@ -2656,6 +2663,12 @@ function checkRepaintBoundary(): string[] {
     && emitted.includes('as_clear_dirty((DisplayObject*)w->stage);'));
   check('the field-write tail appends as_mark_dirty after a render-input store',
     emitSource.includes('as_mark_dirty((DisplayObject*)${doDirtyRecv})'));
+  // G30: the render-input store is change-detected -- an unchanged value (the
+  // common per-frame `backing.alpha = 1.0` re-write) skips the full dirty mark so
+  // a Graphics_clear precise dirty-rect is not widened back to a whole object.
+  check('the render-input store change-detects: unchanged value skips the dirty mark',
+    emitSource.includes('${t.code} != ${code} ?')
+    && emitSource.includes(': (void)0, ${t.code})'));
   check('the render-input set lists the nine plain geometry/colour fields',
     emitSource.includes("'x', 'y', 'rotation', 'scaleX', 'scaleY'")
     && emitSource.includes("'alpha', 'visible', 'blendMode', 'opaqueBackground'"));

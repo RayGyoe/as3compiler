@@ -351,6 +351,17 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
     `list.scrollRect` (dirty bubbles to the list and its ancestors), so a `BitmapData.draw` before/after sample shows
     the header byte-identical while the scroll window's content moves.
 
+> **Post-stage-C addition (v0.4.343, stage 378)**: the stage C incremental re-bake initially never fired in a real
+> asaotui interaction — `bake_patch` was re-widened back to `_dirty_full` by two whole-object invalidation sources:
+> ① `Graphics_clear` unconditionally calls `as_mark_dirty(g->_owner)` first (the first step of a `clear`+`drawRect`
+> recolour already erases the precise rect); ② asaotui `paintSelf` rewrites `backing.alpha` every frame, and the
+> render-input scalar field write tail marks whole-object dirty unconditionally. Fix: `Graphics_clear` uses the old
+> accumulated bounds as a precise dirty rect (empty graphics marks nothing); render-input **scalar** field stores
+> (double/bool) change-detect so an unchanged value skips the mark (impure RHS is hoisted first; pointer/boxed fields
+> stay unconditionally dirty); asaotui's `backing.alpha` writes only on change. Under `ASC_BAKE_TRACE=1`, recolouring
+> `s1` in `asaotui/probes/widgets/repaint-boundary` now makes `stable` emit `bake_patch` (dirty rect = `s1`'s bounds),
+> so the incremental re-bake benefit is actually exercised. See TODO.md stage 378.
+
 ### Stage D (optional, independent enhancement): DisplayList recording + replay
 
 - [ ] Record a boundary's draw commands into a DisplayList (like `SkPicture`); static content only replays +

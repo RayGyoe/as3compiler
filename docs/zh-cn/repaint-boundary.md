@@ -304,6 +304,15 @@ if (边界 && 命中快照) {
     容器之外，滚动只改 `list.scrollRect`（脏只冒泡 list 及其祖先），`BitmapData.draw` 前后采样 header 逐点不变、
     滚动窗内容随位移变化。
 
+> **阶段 C 收尾后补充（v0.4.343，阶段三百七十八）**：Stage C 的增量重烘在**真实 asaotui 交互**里最初从不触发——
+> `bake_patch` 被两个整对象失效源头重新放大成 `_dirty_full`：① `Graphics_clear` 首句无条件 `as_mark_dirty(g->_owner)`
+> （`clear`+`drawRect` 改色链路的第一步就把脏矩形抹掉）；② asaotui `paintSelf` 每帧无条件写 `backing.alpha`，
+> render-input 标量字段写尾无条件 `as_mark_dirty`。修复：`Graphics_clear` 改用旧累积 bounds 的精确脏矩形（空 graphics
+> 不标脏）；render-input **标量**字段（double/bool）写点加「值不变就不标脏」变化检测（RHS 副作用先 hoist，指针/boxed
+> 字段保持无条件标脏）；asaotui 侧 `backing.alpha` 改「值变了才写」。`ASC_BAKE_TRACE=1` 下
+> `asaotui/probes/widgets/repaint-boundary` 改 `s1` 颜色后 `stable` 出现 `bake_patch`（脏矩形 = `s1` 的 bounds），
+> 增量重烘收益真正生效。详见 TODO.md 阶段三百七十八。
+
 ### 阶段 D（可选，独立增强）：DisplayList 记录 + replay
 
 - [ ] 把边界的绘制命令录成 DisplayList（类似 `SkPicture`），静态内容只 replay + 平移，不重新生成绘制命令。

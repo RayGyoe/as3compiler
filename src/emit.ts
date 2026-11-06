@@ -22649,7 +22649,21 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void Graphics_clear(void* _this) {');
     this.indent++;
     this.line('Graphics* g = (Graphics*)_this;');
-    this.line('if (g->_owner != NULL) as_mark_dirty(g->_owner);');
+    // Stage C + G30: clear erases the OLD accumulated bounds, so invalidate that
+    // precise rect (plus the widest stroke's outside half) instead of the whole
+    // object -- otherwise the follow-up drawRect/drawRoundRect precise rect merges
+    // into an already-_dirty_full object and the enclosing cacheAsBitmap boundary
+    // falls back to a full re-bake (incremental bake_patch never fires). The old
+    // _has_b/_bl/_bt/_br/_bb/_max_sw are still live here (reset happens at the END
+    // of the function), so they describe exactly the content being erased. An empty
+    // graphics (_has_b=0) has nothing to erase: skip the mark entirely, which is
+    // strictly tighter than the old whole-object as_mark_dirty.
+    this.line('if (g->_owner != NULL && g->_has_b) {');
+    this.indent++;
+    this.line('double half = g->_max_sw * 0.5;');
+    this.line('as_mark_dirty_rect(g->_owner, g->_bl - half, g->_bt - half, g->_br + half, g->_bb + half);');
+    this.indent--;
+    this.line('}');
     // The group list is malloc'd (the SkPath/SkPaint handles it holds are owned by
     // the glue layer), so clear() is the one place they are released.
     this.line('as_gdraw* d = (as_gdraw*)g->draws;');
@@ -38291,6 +38305,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     const doDirtyRecv = this.lastDoDirtyRecv;
     this.lastDoNameTarget = false;
     this.lastDoDirtyRecv = null;
+    // A render-input store now change-detects: a store whose value already equals
+    // the field skips the dirty mark. The comparison and the store both read the
+    // RHS, so an impure RHS must run exactly once -- hoist it before emission.
+    if (doDirtyRecv !== null && !this.isPureExpr(expr.value)) this.hoistImpure(expr.value, true);
     const v = this.emitExpr(expr.value);
 
     if (expr.op === '=') {
@@ -38315,14 +38333,21 @@ void FileStream_writeObject(void* _this, as_value v) {
           // A render-input field that is ALSO a GC pointer (blendMode is a String,
           // opaqueBackground is a boxed as_value) still needs its write barrier, so
           // the dirty mark is sequenced AFTER the barrier-bearing store. Re-reading
-          // the field for the expression value is side-effect free.
+          // the field for the expression value is side-effect free. These are NOT
+          // change-detected: an as_value struct has no `!=`, and a `char*` `!=`
+          // against a fresh literal is only address-equal (and trips -Wstring-compare),
+          // so they stay conservatively whole-object dirty.
           if (doDirtyRecv !== null) return { code: `((void)(${store}), as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
           return { code: store, type: t.type, discard: true };
         }
       }
       // Render-input scalar field (x/rotation/alpha/visible, none of which is a GC
       // pointer): no barrier, so the dirty mark folds straight into the sequence.
-      if (doDirtyRecv !== null) return { code: `(${t.code} = ${code}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type };
+      // The store is change-detected: assigning the same value changes nothing on
+      // screen, so the (expensive full) dirty mark is skipped. `!=` on the scalar
+      // is exact and never misses a real change (NaN compares unequal, so it stays
+      // conservatively dirty).
+      if (doDirtyRecv !== null) return { code: `(${t.code} != ${code} ? (${t.code} = ${code}, as_mark_dirty((DisplayObject*)${doDirtyRecv})) : (void)0, ${t.code})`, type: t.type };
       return { code: `(${t.code} = ${code})`, type: t.type };
     }
 
