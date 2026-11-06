@@ -20025,6 +20025,13 @@ CP_UTF8。四个陷阱：`_wstat64i32` 结果 marshal、`GetLastError` 在 free 
 **顺带修净**：`gc_dbg_inuse_count()` 的 `%ld` → `%zu`（Windows 上宽度与值都不对）、`_CRT_SECURE_NO_WARNINGS`
 （`getenv`/`_wfopen` 的 MSVC 弃用告警刷屏）。
 
+**补修（v0.4.342）**：`as_p_stat` 的 POSIX 分支误写成 `return as_p_stat(p, st);`（递归调用自己），
+clang -O2 把它折叠成无条件自跳（`b 0x...; b 0x...`）——macOS 上任何走 `stat` seam 的调用
+（`FileStream.open`、`File.exists`、`getDirectoryListing` 等）都死循环。Windows 侧走
+`_wstat64i32` 不受影响，所以 Windows 真机验收全绿、示例套件全绿，只有 macOS 实机才现形。
+修复为 `return stat(p, st);`，并在 `test/unit/file-ops.ts` 加钉「as_p_stat forwards to stat()
+on POSIX (never recurses into itself)」防回归。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

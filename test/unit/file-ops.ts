@@ -147,6 +147,18 @@ function checkContract(): string[] {
   check('size answers 0 for anything that is not a regular file',
     c.includes('if (!S_ISREG(st.st_mode)) return 0.0;'));
 
+  // ---- path seam: as_p_stat must forward, never recurse ---------------------
+  // 阶段三百七十七 introduced as_p_stat as the Windows UTF-8 path seam. Its
+  // POSIX arm once read `return as_p_stat(p, st);` -- a self-recursive call that
+  // clang -O2 folds into an infinite loop (`b 0x...; b 0x...`), freezing every
+  // FileStream open / File.exists on macOS. Pin that the arm forwards to stat().
+  const rtSrc = readNorm(join(root, 'src', 'runtime.ts'));
+  const statBody = /static int as_p_stat\(const char\* p, struct stat\* st\) \{([\s\S]*?)\n\}/.exec(rtSrc);
+  check('as_p_stat forwards to stat() on POSIX (never recurses into itself)',
+    statBody !== null
+    && statBody[1].includes('return stat(p, st);')
+    && !statBody[1].includes('return as_p_stat(p, st);'));
+
   // ---- paths ---------------------------------------------------------------
   check('the constructor normalises what it stores',
     c.includes('o->_nativePath = (path != NULL) ? as_path_norm(path) : NULL;'));

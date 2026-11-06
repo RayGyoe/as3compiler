@@ -277,7 +277,7 @@ static int as_p_stat(const char* p, struct stat* st) {
   st->st_ctime = (time_t)tmp.st_ctime;
   return 0;
 #else
-  return as_p_stat(p, st);
+  return stat(p, st);
 #endif
 }
 static int as_p_remove(const char* p) {
