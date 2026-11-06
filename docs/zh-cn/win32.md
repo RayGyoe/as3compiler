@@ -1703,3 +1703,14 @@ WGL 契约只保证 OpenGL 1.1，而 Win7 全新装机（或没装 Guest Additio
   `D3D12_RESOURCE_STATE` 由 Stage3D 上下文提供（`s3d_get_render_target` 返回裸 `ID3D12Resource*`；
   合成临时 `retain()` 一份引用）。包装时必须 `retain()`，**不得**走 `gr_cp` 的裸指针构造器——见 §2.9。
 - 账目见 `TODO.md` 的 `### 遗留待开发`（本轮新登记 5 行）与阶段一百二十六 节。
+- **外部参照（调研，未落地）**：GPUI（Zed）的 Windows 后端用 **D3D11 + DXGI flip 交换链 + DirectComposition +
+  DirectWrite**（**不用 D2D**），并把整屏压成 8 类 primitive、每批一次 `DrawInstanced(4,N)`，文字走字形图集、
+  矢量整批进 4×MSAA 中间纹理。对我们最有用的一条是 **DComp 这条链**（`WS_EX_NOREDIRECTIONBITMAP` +
+  `CreateSwapChainForComposition` + visual）——它正好填掉上方核对表第 24 行那个缺口（`<transparent>` 在
+  Windows 未实现），比 `WS_EX_LAYERED` + 逐帧 alpha 的路子干净。详见
+  [`gpui-windows-renderer.md`](gpui-windows-renderer.md)。
+- **D3D11 vs D3D12（决策记录）**：Windows 侧为什么只有 D3D12（Skia m124 在 Windows 上只有这一条
+  Direct3D 后端；Stage3D 与合成必须共 device/queue）、我们为此手写了哪些 D3D11 免费给的机制（三缓冲槽 /
+  常量缓冲版本化 / 延迟释放 / PSO 排错 / 上传资源 / 设备丢失停帧）、以及什么条件下才值得回头加 D3D11
+  ——见 [`d3d11-vs-d3d12.md`](d3d11-vs-d3d12.md)。其中最该补的能力**不是 D3D11 而是软件光栅回退**
+  （虚拟机/RDP 里现在直接失败，最小改动是 D3D12 WARP 适配器，未验证）。

@@ -1696,3 +1696,17 @@ paints.
   `retain()` and **must not** go through `gr_cp`'s raw-pointer constructor — see §2.9.
 - The ledger is in `TODO.md`'s `### 遗留待开发` (5 rows registered this round) and the stage
   one-hundred-twenty-six section.
+- **External reference (research, not implemented)**: GPUI (Zed)'s Windows backend uses **D3D11 + a DXGI flip
+  swap chain + DirectComposition + DirectWrite** (**no D2D**), collapses a whole screen into eight primitive
+  kinds with one `DrawInstanced(4,N)` per batch, routes text through glyph atlases, and rasterizes vectors for
+  a whole batch into a 4×MSAA intermediate target. The single most useful item for us is the **DirectComposition
+  chain** (`WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition` + a visual): it closes the gap in row
+  24 of the checklist above (`<transparent>` is unimplemented on Windows) far more cleanly than
+  `WS_EX_LAYERED` plus per-frame alpha. See [`gpui-windows-renderer.md`](gpui-windows-renderer.md).
+- **D3D11 vs D3D12 (decision record)**: why the Windows side has only D3D12 (Skia m124 has that as its only
+  Direct3D backend on Windows, and Stage3D must share the compositor's device/queue), which mechanisms D3D11
+  would have given for free and we therefore hand-wrote (three frame slots, constant-buffer versioning,
+  deferred release, PSO triage, upload resource reuse, stop-the-frame on device loss), and under what
+  conditions D3D11 would be worth adding — see [`d3d11-vs-d3d12.md`](d3d11-vs-d3d12.md). The capability most
+  worth adding is **not** D3D11 but a **software-rasterizer fallback** (VMs and RDP currently fail outright;
+  the smallest fix is a D3D12 WARP adapter, unverified).
