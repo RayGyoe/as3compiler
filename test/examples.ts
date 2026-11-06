@@ -216,7 +216,11 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as
 // the pool as "example: audio/ (windowed: compile+link only)". Note this is NOT
 // the same as examples/audio.as (a top-level file, run normally): that one drives
 // synthesized PCM through loadPCMFromByteArray with no window at all.
-const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio']);
+// `yuv420-gpu` is a windowed GPU-verify demo (--air-app + renderMode=direct +
+// --features yuv420): the directory unit would compile Main.as WITHOUT the
+// yuv420 switch (undefined method 'setYuv420') and --run would open a Metal
+// window. Like air-native it is registered after the pool as compile+link only.
+const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio', 'yuv420-gpu']);
 // The shared AS3 library root (阶段二百五十四). air-native used to VENDOR its
 // third-party sources inside its own source root (examples/air-native/src/com,
 // 352 tracked files), which made a library part of one app and forced this file
@@ -778,6 +782,27 @@ test('example: air-native (--air-app + renderMode=direct: compile+link only)', a
     '--target', 'native', '-o', scratchOut('air-native-app')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  air-native (--air-app)');
+});
+
+// E20 GPU direct-render verify demo (--air-app + renderMode=direct + --features
+// yuv420). Its Main.as names BitmapData.setYuv420, which only exists under the
+// yuv420 switch, and --run would open a Metal window -- so, like air-native above,
+// this is compile+link only (the GPU colour verify itself is a manual run, see
+// examples/yuv420-gpu/README.md). Serial: it compiles Skia/SDL2/Metal glue from
+// source and links ~20 MB of static libraries.
+test('example: yuv420-gpu/ (--air-app + --features yuv420: compile+link only)', async (t) => {
+  const xml = join(dir, 'yuv420-gpu', 'app.xml');
+  const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(xml) || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  yuv420-gpu (--air-app: needs the native Skia/SDL2 vendor libs)');
+    t.skip('needs vendor/skia and vendor/sdl2');
+    return;
+  }
+  await runAsync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'Main',
+    '--features', 'yuv420',
+    '--target', 'native', '-o', scratchOut('yuv420-gpu-app')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  yuv420-gpu (--air-app + --features yuv420)');
 });
 
 test('example: native-window.as (windowed: compile+link only)', async (t) => {
