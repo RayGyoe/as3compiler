@@ -362,6 +362,19 @@ one `BitmapData` may be displayed by several `Bitmap`s, and writing it must dirt
 > `s1` in `asaotui/probes/widgets/repaint-boundary` now makes `stable` emit `bake_patch` (dirty rect = `s1`'s bounds),
 > so the incremental re-bake benefit is actually exercised. See TODO.md stage 378.
 
+> **Post-stage-C addition (v0.4.345, stage 380)**: `x`/`y` are render inputs, and their write sites used to
+> take the whole-object `as_mark_dirty` — so an auto-bake boundary dropped its bake in that frame and re-baked the
+> whole box on the next one. A pure translation does **not** change what the subtree contains (a bake lives in the
+> object's own local space: the surface carries `translate(-bxo,-byo)` and the blit applies the live CTM, so the
+> raster is exact at any offset), so `x`/`y` now route to `as_mark_moved`: only the **ancestor chain** is dirtied,
+> and the moved object keeps `_cache_valid`, so the next frame blits the existing raster. rotation/scale are NOT in
+> that set (they change the bake's device resolution, i.e. the raster must be redone); a `_mask_user` object falls
+> back to the whole-object path (a mask's position is an input to an object that need not be an ancestor); a
+> sub-pixel move is still caught by the device-phase check (`_cache_phx/_cache_phy`) and paints live. Real-app bake
+> trace: `bake_patch` was always 0 and every small change re-baked the whole 354×841 box (0.67 Mpx); example-level
+> A/B: rebuilds 12 → 10, re-baked area 15430 → 14260 px. See TODO.md stage 380; pixel oracle
+> `examples/autobake-move.as`, structural pins `render/MovedBake` in `test/unit/render.ts`.
+
 ### Stage D (optional, independent enhancement): DisplayList recording + replay
 
 - [ ] Record a boundary's draw commands into a DisplayList (like `SkPicture`); static content only replays +

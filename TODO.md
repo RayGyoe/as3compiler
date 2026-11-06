@@ -20085,6 +20085,47 @@ acquire 停顿（`SK_D3D_NUM_FRAMES 2→3`，acquire 已 0.00 ms），但该修�
 **钉子**：`platform/MoveLoopPaint`（8 项）；`build/DocumentedLinkSets` 用离屏清单 defines 编译兜底
 （少 `#ifdef` 保护即红）；mutation 实测（删调用点 → 2 项红）。
 
+### 阶段三百八十：位移不重烘 —— `x`/`y` 的写点不再丢掉被移动子树的烘焙（v0.4.344 → v0.4.345）
+
+**起点**：真机基线（`talkmed-meeting-windows` 的 AOT 构建，`ASC_BAKE_TRACE=1`，180 秒采集）显示
+`bake_patch` **恒为 0**、`bake_drop` 也为 0：中间 125 秒零事件（静止时 present-skip 生效），但每次小改动
+都落在 auto-bake 边界内 ⇒ **整块重烘**（一次爆发 9–10 个对象、2.0–3.1 Mpx；最大三块 354×841，各 0.67 Mpx），
+三块大约每 25 秒爆一次 —— 即用户感觉到的「偶发卡一下」。
+
+**根因**：`x`/`y` 属于 `DO_RENDER_DIRTY_FIELDS`，写点走 `as_mark_dirty`（整对象脏）⇒
+`as_render_cached` 的 auto-bake 分支当帧把烘焙丢掉（`_render_dirty`/`_auto_baked`/`_cache_valid` 清零）
+落到 live，下一帧脏干净了再整块重烘。而**位移并不改变子树内容**：烘焙位图活在对象自己的局部空间里
+（表面带 `translate(-bxo,-byo)`，贴回时套当前 CTM），任意整数偏移下都是精确的 —— 变的只是它在**祖先**
+位图里的位置。
+
+**修复**（`src/emit.ts`）：
+1. `DO_RENDER_DIRTY_FIELDS` 之外新增 `DO_MOVE_FIELDS = {x, y}`；成员/字段解析额外记录命中的**字段名**
+   （`lastDoDirtyField`，与 `lastDoDirtyRecv` 同一生命周期契约）。
+2. `emitAssign` 按命中字段选标脏函数：`x`/`y` → `as_mark_moved`；其余 render input（`rotation`/`scaleX`/
+   `scaleY`/`alpha`/`visible`/`blendMode`/`opaqueBackground`/filter/`Transform.matrix`）仍 `as_mark_dirty`。
+   **旋转/缩放刻意不入列**：它们改变烘焙的设备分辨率（`as_bake_scale2`），位图本身必须重做。
+3. `as_mark_moved`：`ASC_dirty_epoch++`，然后只把**祖先链**置 `_render_dirty`/`_dirty_full`（子对象在父的位图里
+   换了位置，父的内容确实变了），被移动对象保持 `_render_dirty = 0`/`_cache_valid = 1`；`_mask_user` 的对象
+   退回保守路径（遮罩的位置是**别的**对象的输入，且那个对象不一定是祖先）。
+4. 亚像素位移仍由 `as_render_cached` 的**设备相位检查**（`_cache_phx`/`_cache_phy`）兜住：相位变了走 live，
+   不重采样烘焙位图 —— 修前修后是同一张画面，只是不再「丢烘焙 → 活态重画 → 下帧整块重烘」绕一圈。
+
+**验证**：
+- 新示例 `examples/autobake-move.as`（像素钉）：被烘焙的卡片按整数像素搬走后，与「同一份内容一开始就画在
+  目标位置」的第 1 帧活态签名**逐像素一致**；老位置必须干净；搬回来必须还原；**位移之后的内容写入**
+  （补一个绿方块）必须真的画出来 —— 后两条防「贴回错偏移」与「只标祖先被误实现成什么都不标」。
+- 同一示例的 bake-trace A/B（同一份 `.as`，只把 `DO_MOVE_FIELDS` 置空重建）：`bake_rebuild` 12 → 10、
+  重烘面积 15430 → 14260 px，差值恰是卡片两次位移各 45×13。祖先（root 容器）两种情况下都照样重烘 ——
+  那才是屏幕上真正变了的部分。
+- 单元钉 `render/MovedBake`（13 项）：`as_mark_moved` 不置自身脏 / 走祖先链 / 提 epoch / 遮罩回落 /
+  集合恰为 `{x, y}` / 生成 C 里 `x`（含 `+=`）走 moved 而 `rotation`/`alpha`/`scaleX` 仍走 dirty /
+  `Transform.matrix` 仍整对象。
+- 单元全量：与改动前的基线**失败集合完全相同**（22 项，全是本机缺 `cc`/`zlib.h` 的环境项）。
+
+**未做（如实）**：① 祖先边界仍要整块重烘 —— 一张 354×841 的卡片在 root 位图里换了位置，root 必须重画；
+要省掉这一层得上「层」语义（见 `docs/zh-cn/gpui-windows-renderer.md` §10）；② 亚像素位移不吸附到设备像素，
+**滚动若用分数偏移**仍然每帧走 live（下一步：offset 吸附）；③ 真机 25 秒周期的脏源仍未定位。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

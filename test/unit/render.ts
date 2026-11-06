@@ -2661,8 +2661,12 @@ function checkRepaintBoundary(): string[] {
   check('as_clear_dirty runs end-of-frame in Stage_render and ASC_window_render',
     emitted.includes('as_clear_dirty((DisplayObject*)_this);')
     && emitted.includes('as_clear_dirty((DisplayObject*)w->stage);'));
-  check('the field-write tail appends as_mark_dirty after a render-input store',
-    emitSource.includes('as_mark_dirty((DisplayObject*)${doDirtyRecv})'));
+  // 阶段三百八十: the tail appends dirtyCall, which is as_mark_dirty for every render input
+  // EXCEPT the two translation fields (see render/MovedBake below).
+  check('the field-write tail appends the render-input dirty mark after the store',
+    emitSource.includes('${dirtyCall}((DisplayObject*)${doDirtyRecv})')
+    && emitSource.includes("? 'as_mark_moved'")
+    && emitSource.includes(": 'as_mark_dirty'"));
   // G30: the render-input store is change-detected -- an unchanged value (the
   // common per-frame `backing.alpha = 1.0` re-write) skips the full dirty mark so
   // a Graphics_clear precise dirty-rect is not widened back to a whole object.
@@ -2783,3 +2787,81 @@ function checkRepaintBoundary(): string[] {
   return bad;
 }
 registerGroup('unit: render/RepaintBoundary', checkRepaintBoundary);
+
+// ---- 阶段三百八十: a pure translation keeps the bake ----
+//
+// The behavioural oracle is examples/autobake-move.as (pixels: a baked card moved by WHOLE
+// pixels must equal the same content painted live at the destination, the old position must be
+// empty, moving back must restore the picture, and a CONTENT write after a move must still
+// repaint). Same example, bake traces: x/y writes rebuild the card 2x under the old
+// whole-object marker and 0x now (the ancestor container still rebuilds in both -- that is the
+// part that really changed on screen). These are the source-level invariants that keep the
+// oracle meaningful.
+function checkMovedBake(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [movedbake] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [movedbake] ${label}`); }
+  };
+
+  const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)].map((m) => m[1]).join('\n');
+
+  check('as_mark_moved is forward-declared next to as_mark_dirty',
+    emitted.includes('static void as_mark_moved(DisplayObject* o);'));
+  const start = emitted.indexOf('static void as_mark_moved(DisplayObject* o) {');
+  const end = start < 0 ? -1 : emitted.indexOf('\nstatic ', start + 10);
+  const body = start < 0 || end < 0 ? '' : emitted.slice(start, end);
+  check('as_mark_moved is defined', body.length > 0);
+  // The whole point: the moved object KEEPS its bake, so its own flag must stay clear. Setting
+  // it here would drop the cache branch into the live path and re-bake on the next clean frame --
+  // i.e. exactly the behaviour this helper exists to avoid.
+  check('as_mark_moved never dirties the moved object itself', !body.includes('o->_render_dirty = 1;'));
+  check('as_mark_moved dirties every ancestor (walking the parent chain)',
+    body.includes('for (DisplayObject* p = (DisplayObject*)o->parent; p != NULL; p = (DisplayObject*)p->parent) {')
+    && body.includes('p->_render_dirty = 1;')
+    && body.includes('p->_dirty_full = 1;'));
+  check('as_mark_moved still bumps the dirty epoch (the window has to repaint)',
+    body.includes('ASC_dirty_epoch++;'));
+  // A mask's position is an input to the object it stencils, which is not necessarily an
+  // ancestor -- that case must stay on the conservative whole-object path.
+  check('a moved mask falls back to as_mark_dirty',
+    body.includes('if (o->_mask_user) { as_mark_dirty(o); return; }'));
+  check('the move set is exactly {x, y} (rotation/scale change the bake resolution)',
+    emitSource.includes("private static readonly DO_MOVE_FIELDS: ReadonlySet<string> = new Set(['x', 'y']);"));
+  check('emitAssign routes the store through DO_MOVE_FIELDS',
+    emitSource.includes('Emitter.DO_MOVE_FIELDS.has(doDirtyField)'));
+  check('the member-write path records WHICH render input it hit',
+    emitSource.includes('this.lastDoDirtyField = expr.property;')
+    && emitSource.includes('this.lastDoDirtyField = name;'));
+  // A Transform / filter write goes through the _owner edge and is never a translation.
+  check('the Transform/filter path clears the move field',
+    (emitSource.match(/this\.lastDoDirtyField = null;/g) ?? []).length >= 2);
+
+  // Behavioural: which marker each store actually got in the generated C.
+  const c = generateC(parse(
+    'import flash.display.Sprite;\nimport flash.geom.Matrix;\nvar s:Sprite = new Sprite();\n' +
+    's.x = 10;\ns.y += 3;\ns.rotation = 5;\ns.alpha = 0.5;\ns.scaleX = 2;\n' +
+    'var m:Matrix = new Matrix(1, 0, 0, 1, 5, 0);\ns.transform.matrix = m;\n')).c;
+  const style = c.split('\n').filter((l) => l.includes('as_req_obj((void*)(g_s))') && /->(x|y|rotation|alpha|scaleX)\)/.test(l))
+    .map((l) => {
+      const field = /->(x|y|rotation|alpha|scaleX)\)/.exec(l)![1];
+      return { field, moved: l.includes('as_mark_moved('), dirty: l.includes('as_mark_dirty(') };
+    });
+  check('every x/y store (plain and compound) takes as_mark_moved in the generated C',
+    style.filter((s) => s.field === 'x' || s.field === 'y').length === 2
+    && style.filter((s) => s.field === 'x' || s.field === 'y').every((s) => s.moved && !s.dirty));
+  check('rotation/alpha/scaleX keep as_mark_dirty (no as_mark_moved leak)',
+    style.filter((s) => s.field !== 'x' && s.field !== 'y').length === 3
+    && style.filter((s) => s.field !== 'x' && s.field !== 'y').every((s) => !s.moved && s.dirty));
+  // A matrix can carry scale/rotation, so a Transform.matrix write must stay whole-object:
+  // DisplayObject_set_transform_matrix marks the owner itself.
+  check('a Transform.matrix write still marks the owner whole-object',
+    c.includes('void DisplayObject_set_transform_matrix(void* _this, Matrix* m) {')
+    && /void DisplayObject_set_transform_matrix\(void\* _this, Matrix\* m\) \{[\s\S]{0,160}?as_mark_dirty\(o\);/.test(c));
+
+  console.log(`[movedbake] ${ok} translation/bake checks passed`);
+  return bad;
+}
+registerGroup('unit: render/MovedBake', checkMovedBake);

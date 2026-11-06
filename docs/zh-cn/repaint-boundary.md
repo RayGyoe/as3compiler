@@ -313,6 +313,15 @@ if (边界 && 命中快照) {
 > `asaotui/probes/widgets/repaint-boundary` 改 `s1` 颜色后 `stable` 出现 `bake_patch`（脏矩形 = `s1` 的 bounds），
 > 增量重烘收益真正生效。详见 TODO.md 阶段三百七十八。
 
+> **阶段 C 收尾后补充（v0.4.345，阶段三百八十）**：`x`/`y` 属于 render input，写点此前一律走整对象
+> `as_mark_dirty` ⇒ auto-bake 边界当帧丢烘焙、下一帧整块重烘。位移**不改变子树内容**（烘焙位图活在对象自己的
+> 局部空间，表面带 `translate(-bxo,-byo)`、贴回套当前 CTM，任意整数偏移都精确），所以 `x`/`y` 改写走
+> `as_mark_moved`：只把**祖先链**置脏，被移动对象保留 `_cache_valid`，下一帧直接贴回旧位图。旋转/缩放**不在**
+> 其列（它们改变烘焙的设备分辨率，位图必须重做）；`_mask_user` 对象退回整对象（遮罩位置是别的对象的输入）；
+> 亚像素位移仍由设备相位检查（`_cache_phx/_cache_phy`）拦下走 live。真机 bake-trace：修复前 `bake_patch` 恒为 0、
+> 每次小改动整块（354×841 = 0.67 Mpx）重烘；示例级 A/B 重建次数 12 → 10、重烘面积 15430 → 14260 px。详见
+> TODO.md 阶段三百八十；像素钉 `examples/autobake-move.as`，结构钉 `test/unit/render.ts` 的 `render/MovedBake`。
+
 ### 阶段 D（可选，独立增强）：DisplayList 记录 + replay
 
 - [ ] 把边界的绘制命令录成 DisplayList（类似 `SkPicture`），静态内容只 replay + 平移，不重新生成绘制命令。

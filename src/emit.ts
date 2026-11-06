@@ -414,6 +414,14 @@ export class Emitter {
   // inputs). A field write on one of these marks the filter's `_owner` (the
   // DisplayObject it is attached to) render-dirty, mirroring Transform._owner.
   private static readonly FILTER_CLASSES: ReadonlySet<string> = new Set(['BlurFilter', 'DropShadowFilter', 'GlowFilter']);
+  // DisplayObject fields whose write TRANSLATES a subtree without changing what it
+  // contains. A bake lives in the object's own local space (the surface carries
+  // translate(-bxo,-byo) and the blit applies the live CTM), so the raster stays
+  // exact at any offset and the next frame can blit it instead of re-rasterizing:
+  // these two take as_mark_moved (ancestors only) instead of as_mark_dirty.
+  // rotation/scaleX/scaleY are deliberately NOT here: they change the bake's device
+  // resolution (as_bake_scale2), i.e. the raster itself has to be redone.
+  private static readonly DO_MOVE_FIELDS: ReadonlySet<string> = new Set(['x', 'y']);
   private static isRenderDirtyField(owner: string, name: string): boolean {
     const s = Emitter.DO_RENDER_DIRTY_FIELDS.get(owner);
     return s != null && s.has(name);
@@ -524,6 +532,10 @@ export class Emitter {
   // the read paths and consumed (then cleared) by the direct field-write tail, the
   // same lifetime contract as lastDoNameTarget.
   private lastDoDirtyRecv: string | null = null;
+  // RepaintBoundary: WHICH render-input field that resolve hit. Only the two
+  // translation fields take the "moved, content unchanged" mark (see
+  // DO_MOVE_FIELDS); everything else keeps the whole-object invalidate.
+  private lastDoDirtyField: string | null = null;
   private anonFuncs: { name: string; asName: string | null; params: Param[]; returnType: ASType; body: Block; captures: { name: string; type: CType }[]; cname: string | null; isStatic: boolean; depth: number; methodName: string | null }[] = [];
   // Free-variable pre-pass: the stack of `with` bodies currently being walked, by
   // the receiver's static type (the capture's env field type). An entry's INDEX is
@@ -3083,6 +3095,7 @@ export class Emitter {
     // declaration is the single source; the render preamble only defines them.
     this.line('static int as_is_boundary(DisplayObject* o);');
     this.line('static void as_mark_dirty(DisplayObject* o);');
+    this.line('static void as_mark_moved(DisplayObject* o);');
     this.line('static void as_mark_dirty_rect(DisplayObject* o, double l, double t, double r, double b);');
     this.line('static void as_bd_bind(BitmapData* bd, Bitmap* b);');
     this.line('static void as_bd_unbind(BitmapData* bd, Bitmap* b);');
@@ -29370,6 +29383,35 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.indent--;
     this.line('}');
+    // A pure TRANSLATION (x/y) does not change what the subtree CONTAINS: a bake
+    // lives in the object's own local space (the surface is translated by
+    // -bxo/-byo and the blit applies the live CTM), so the raster is still exact at
+    // any offset. Only the ANCESTORS' rasters go stale, because the child now sits
+    // somewhere else inside them -- they keep the whole-object invalidate while
+    // this object keeps its cache. Before this split a moving subtree dropped its
+    // bake on every frame, repainted live, and re-baked the whole boundary on the
+    // next clean frame (measured on the meeting client: a 354x841 card is
+    // 0.67 Mpx per re-bake, three of them per burst).
+    //
+    // The blit still checks the device-pixel PHASE (_cache_phx/_cache_phy in
+    // as_render_cached): a sub-pixel move falls back to live painting rather than
+    // resampling a bake -- same picture as before, but without the
+    // drop-then-re-bake round trip.
+    this.line('static void as_mark_moved(DisplayObject* o) {');
+    this.indent++;
+    this.line('ASC_dirty_epoch++;');
+    this.line('if (o == NULL) return;');
+    // A mask's position is an input to the object it stencils, and that object is
+    // not necessarily an ancestor: keep the conservative path for that case.
+    this.line('if (o->_mask_user) { as_mark_dirty(o); return; }');
+    this.line('for (DisplayObject* p = (DisplayObject*)o->parent; p != NULL; p = (DisplayObject*)p->parent) {');
+    this.indent++;
+    this.line('p->_render_dirty = 1;');
+    this.line('p->_dirty_full = 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     // RepaintBoundary stage C (docs/zh-cn/repaint-boundary.md §4.2/§4.3): merge a
     // finite dirty AABB (in o's own local space) into o's accumulator, then walk up
     // the chain, transforming the rect into each parent's local space via
@@ -36701,7 +36743,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         // Unqualified `name = null` inside a DisplayObject subclass is the same
         // property (AIR throws #2007 there too), so record it for the guard.
         if (f.owner === 'DisplayObject' && name === 'name') this.lastDoNameTarget = true;
-        if (Emitter.isRenderDirtyField(f.owner, name)) this.lastDoDirtyRecv = self;
+        if (Emitter.isRenderDirtyField(f.owner, name)) { this.lastDoDirtyRecv = self; this.lastDoDirtyField = name; }
         return { code: `${self}->${this.cIdent(f.cName ?? name)}`, type: f.type };
       }
       const sf = cinfo?.staticFields.get(name);
@@ -38313,11 +38355,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     // emitting the value may resolve other, unrelated fields.
     this.lastDoNameTarget = false;
     this.lastDoDirtyRecv = null;
+    this.lastDoDirtyField = null;
     const t = this.emitExpr(target);
     const doNameWrite = this.lastDoNameTarget;
     const doDirtyRecv = this.lastDoDirtyRecv;
+    const doDirtyField = this.lastDoDirtyField;
     this.lastDoNameTarget = false;
     this.lastDoDirtyRecv = null;
+    this.lastDoDirtyField = null;
+    // A pure translation keeps the object's own bake (see as_mark_moved); every
+    // other render input invalidates the object and its cached ancestors.
+    const dirtyCall = doDirtyField !== null && Emitter.DO_MOVE_FIELDS.has(doDirtyField)
+      ? 'as_mark_moved'
+      : 'as_mark_dirty';
     // A render-input store now change-detects: a store whose value already equals
     // the field skips the dirty mark. The comparison and the store both read the
     // RHS, so an impure RHS must run exactly once -- hoist it before emission.
@@ -38350,7 +38400,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           // change-detected: an as_value struct has no `!=`, and a `char*` `!=`
           // against a fresh literal is only address-equal (and trips -Wstring-compare),
           // so they stay conservatively whole-object dirty.
-          if (doDirtyRecv !== null) return { code: `((void)(${store}), as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
+          if (doDirtyRecv !== null) return { code: `((void)(${store}), ${dirtyCall}((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
           return { code: store, type: t.type, discard: true };
         }
       }
@@ -38360,7 +38410,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       // screen, so the (expensive full) dirty mark is skipped. `!=` on the scalar
       // is exact and never misses a real change (NaN compares unequal, so it stays
       // conservatively dirty).
-      if (doDirtyRecv !== null) return { code: `(${t.code} != ${code} ? (${t.code} = ${code}, as_mark_dirty((DisplayObject*)${doDirtyRecv})) : (void)0, ${t.code})`, type: t.type };
+      if (doDirtyRecv !== null) return { code: `(${t.code} != ${code} ? (${t.code} = ${code}, ${dirtyCall}((DisplayObject*)${doDirtyRecv})) : (void)0, ${t.code})`, type: t.type };
       return { code: `(${t.code} = ${code})`, type: t.type };
     }
 
@@ -38372,11 +38422,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     if (heapField2) {
       const store = this.gcWriteAssign(t.code, t.type, code);
       if (store) {
-        if (doDirtyRecv !== null) return { code: `((void)(${store}), as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
+        if (doDirtyRecv !== null) return { code: `((void)(${store}), ${dirtyCall}((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type, discard: true };
         return { code: store, type: t.type, discard: true };
       }
     }
-    if (doDirtyRecv !== null) return { code: `(${t.code} = ${code}, as_mark_dirty((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type };
+    if (doDirtyRecv !== null) return { code: `(${t.code} = ${code}, ${dirtyCall}((DisplayObject*)${doDirtyRecv}), ${t.code})`, type: t.type };
     return { code: `(${t.code} = ${code})`, type: t.type };
   }
 
@@ -39640,10 +39690,13 @@ void FileStream_writeObject(void* _this, as_value v) {
       // Transform reached through a local variable (`var t = o.transform`).
       if (obj.type.className === 'Transform' && (expr.property === 'colorTransform' || expr.property === 'matrix')) {
         this.lastDoDirtyRecv = `(${recv})->_owner`;
+        this.lastDoDirtyField = null;
       } else if (Emitter.FILTER_CLASSES.has(f.owner)) {
         this.lastDoDirtyRecv = `(${recv})->_owner`;
+        this.lastDoDirtyField = null;
       } else if (Emitter.isRenderDirtyField(f.owner, expr.property)) {
         this.lastDoDirtyRecv = recv;
+        this.lastDoDirtyField = expr.property;
       }
       return { code: `(${recv}->${this.cIdent(f.cName ?? expr.property)})`, type: f.type };
     }

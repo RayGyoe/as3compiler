@@ -398,6 +398,11 @@ resolution; explicit AS3 `cacheAsBitmap` is not capped. In the same D3D12 meetin
 changed from **0.088% CPU / 4.655% GPU / 369.3 MB Private** without a cap to **0.105% / 3.743% / 254.4 MB**.
 A 250K cap used less memory but raised GPU to 7.972%, so it was not chosen.
 
+A **pure translation no longer drops a snapshot**: an `x`/`y` write now invalidates only the ancestors
+(`as_mark_moved`), so a moved subtree keeps its bake and the next frame blits the existing raster. rotation,
+scale and alpha still invalidate the whole object (they change the bake's device resolution) and a sub-pixel
+move still paints live.
+
 Windows whose display-tree fingerprint, Stage3D serial, GPU generation and OS redraw generation are unchanged
 skip redundant rasterization and Present while `ENTER_FRAME`, timers and input continue normally.
 `ASC_NO_PRESENT_SKIP=1` and `ASC_AUTO_BAKE_MAX_PIXELS=0` provide same-binary A/B switches. Dynamic FPS text
