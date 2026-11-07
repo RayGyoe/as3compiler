@@ -20224,6 +20224,82 @@ acquire 停顿（`SK_D3D_NUM_FRAMES 2→3`，acquire 已 0.00 ms），但该修�
 真机多数帧在 2–6 ms ⇒ **不能**用它的绝对条数反推帧率，只能做「有/无」的判据；③ 缩放（resize）期间的跟手与
 帧率仍沿用阶段一百七十七 的口径，本轮没有重测。
 
+### 阶段三百八十三：原生内存账本与泄漏排查（finalizer 表扩容）
+
+**背景（用户报障，代码事实）**：真应用（`E:/Works/eDoctor/talkmed-meeting-windows`）跑几小时后进程私有内存持续上涨；
+每开关一次设置窗口都有一块内存不回收。用户要求「可能不止这一处，标记时请尽可能都找出」，所以本轮不是修一个点，
+而是**先把「我们自己的分配」变成可对账的数据**，再让数据指认责任路径。
+
+**做的第一件事是分清「哪一半在涨」**：GC 堆普查进入平台期后连续三次报表**完全相同**
+（`total=83275 n=13.1 MB`），同期进程私有内存已到 1050 MB ⇒ 增长不在 GC 堆，而在原生侧
+（Skia `SkSurface`/`SkImage`、GL 纹理、窗口后端），这批资源 GC 扫不到，只靠「owner 死了就 delete」的约定。
+
+**账本（`src/runtime.ts`，全部 env 门控，生产路径零开销）**：
+- `ASC_MEM_TRACE=1` 按资源族 + **按创建点 site** 双维度报表（`live/peak/n/d=`），帧安全点限频输出。
+- `AS_MEM_SITES` 8 → **14**：`surf_bake` 拆成 `s9`(8) / `textfield`(9) / `bitmapdata`(10) / `bake_do`(11) / `bake_verify`(12)；
+  五路 lifetime 完全不同（快照即删 / 自绘 / 长存 / 验证临时），不分开就无法指认责任路径。
+  新增 `as_skia_surface_bake_new_site(w,h,site)`，`as_skia_surface_bake_new` 默认走 11；`src/emit.ts` 四处改成带 site 调用。
+- **按地址去重**（`as_mem_track_site` 命中已有地址时从族与 site 两个维度全量扣旧值）：glibc/Skia 会复用地址，
+  不去重会出现 `tagged` 大于进程私有内存、`untagged` 为负的自相矛盾报表。
+- **尺寸只由创建点提供**：向已 delete 的 surface 追问 `width()` 会得到 `5.6e13 MB`；快照记 0 字节（与源共享像素，COW）。
+- `ASC_MEM_CLASSES=1` 类普查（遍历 GC 堆按 vtable fqn 计数，**按增量排序** —— 泄漏类往往很小，只有计数一直爬的才是问题）
+  + `ASC_MEM_CLASS_WANT=<substr>` 直达某个类（`Stage` 这类小对象永远进不了 top-12-by-growth）。
+- `ASC_MEM_FORCE_GC=1` 报表前跑完整 STW `gc_collect()`，区分「GC 没跑」与「跑不动」。
+
+**真凶 1（已修，代码事实）**：**finalizer 注册表固定 4096 槽，填满后静默丢弃所有新注册**。
+owner → C++ 资源的 delete 约定完全靠它，所以「4096 之后注册的资源永不释放」。
+实测 20 轮开关后 `surf_bake` 从 13 MB 涨到 **1860 MB / 5569 个**，私有内存 1442 MB，报表恒为 `final=4096/842`。
+修法：`ASC_FINAL_SLOTS 4096` → `#define ASC_FINAL_SLOTS_INIT 1024` + 三列（`owner`/`res`/`kind`）改指针 +
+`as_final_grow()` 倍增 `realloc`；增长失败只警告一次并降级为丢注册（不破坏已有表）。
+验证：`final=10183/2095` 不再卡 4096，斜率 10.78 → **8.47 MB/轮**。
+
+**真凶 2（定位完成，未在编译器侧修）**：自动烘焙 surface（site `bake_do`）是唯一在涨的创建点，
+其余 site 全 0（`s9`/`textfield`/`bitmapdata`/`bake_verify`）。三条反向证据：
+- `ASC_MEM_FORCE_GC` ⇒ 8.41、`ASC_NO_STACK_SCAN`（跳过保守栈扫描）⇒ 8.12 ⇒ **不是「GC 没跑」，也不是栈扫描假象**。
+- sweep 对账（`freed == white` 每行恒成立，剩余块 1825 → 51562）⇒ **清扫无丢块，漏的是可达对象**。
+- **`ASC_NO_AUTO_BAKE=1` 关掉自动烘焙 ⇒ `surf_bake` 落到 `n=1 / 0.34 MB`，斜率 8.46 → 3.3 MB/轮**，
+  且账本从此自洽（`tagged=1.9MB`、`untagged=191.5MB`，不再为负）⇒ **泄漏主体就是这条路径**。
+剩余 3.3 MB/轮落在 `untagged`（非 Skia 资源），是另一条尚未关闭的路径。
+
+**应用侧强候选（已定位，属被测应用代码而非编译器）**：`SetupViewWindow` 的两个 `static`
+（`viewSpirte` / `sutupWindow`）从不置 `null`，叠加 `SetupView` 向 `ANEQcloudRTC.getInstance()` /
+`TKEvents.globalEvent` / `stage` 注册、关闭时只摘掉 stage 的两个监听器（无 `destroy/close/dispose` 方法），
+构成「设置窗口关掉后整棵 SetView 树 + bake surface 永久存活」的直接机制。
+
+**反向引用探针（用完即删，本阶段留了下结论）**：实现过 `ASC_MEM_PROBE=<fqn|BAKE_OWNER>`（只比较不染色的
+`gc_mark_ptr` 探针 + 四段扫描：静态根槽 / 内部根表 / 堆对象 / 用户根，**显式跳过保守栈**以免自身栈帧的残留指针
+全报成 `ROOT`）+ 六层引用链回溯，实测拿到 `BAKE_OWNER → 12 个闭包 + homeskin.parent + Transform._owner +
+AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「孤儿判据」（`parent == NULL` 的 bake owner）
+在真应用里**一个都没有**：`removeChild` 正确清了 `child->parent`，带 surface 的 owner 全在显示列表上，
+所以泄漏不是「窗口对象被钉住」，而是**显示列表本身在每轮开关里新增节点**。
+
+**清理**：探针与对账（`ASC_MEM_PROBE`、`ASC_MEM_SWEEPDBG`、`ASC_NO_STACK_SCAN`）在结论落定后**全部移除**，
+只保留有长期价值的账本、类普查、强制回收；留下的每个开关都在 `test/unit/memledger.ts` 里有源级钉子。
+
+**顺带修净的两处（本阶段引入的回归，已复验）**：
+1. `as_skia_surface_bake_new_site` / `as_skia_surface_new_tagged` 缺**非 Skia stub** ⇒ 所有纯 C 程序
+   `call to undeclared function`，全量回归 300 项红。补 stub（`#define AS_MEM_SURF_WIN 1` + 两个 no-op）后恢复。
+2. **39 份 `examples/*.build.json` 缺 `${win:d3d12}` / `${win:dxgi}` / `${win:d3dcompiler}`**（既有遗留，
+   一直把全量回归压在红里）：`vendor/skia` 的 windows-x64 静态库编进了 D3D12 后端，
+   `GrD3DRootSignature`/`GrD3DPipelineStateBuilder` 引用 `D3D12SerializeRootSignature` 与 `D3DCompile`，
+   链接期必须给出导入库 —— 与 macOS 侧要 `-framework Metal` 是同一件事。36 份自动补、3 份手工（`ane-app` 用裸库名）。
+
+**验证（Windows 本机，`cc`/`c++` → clang 23.1.3）**：
+- 全量 `node test.ts`：**619 pass / 19 fail / 3 skipped**（641 项）。19 项失败的单位是 8 个示例，
+  全部可归因于环境或既有平台限制：`native-shader-probe`（缺 `vendor/shader` 预编译产物）、
+  `socket`（`bind(0)` 失败）、`stage94d`（`charset not supported on this backend: UTF-16LE`，Windows 已知限制）、
+  `stage64`（`file://` URL 与本机路径形态）、`htmltext-metrics`/`text-underline`（字体度量）、
+  `status-item`（修好 manifest 后仍红）、`with-fn-class-regexp`（codegen 未发射 `KC_cls`）。
+- 新增单元组 `memledger/Ledger`（12 项）与 `memledger/Finalizers`（10 项）：钉住 env 门控、按地址去重、
+  14 路 site 名、四个带标记的 bake 调用点互不重复且不复用默认值 11、两个非 Skia stub、
+  finalizer 表无固定上限且三列可 realloc、增长失败只警告。
+- 泄漏 A/B（同一可执行文件、只切环境变量、20 轮开关窗口，采 `PrivateMemorySize64`）：
+  `10.78 → 8.47`（扩容）→ `8.41`（强制回收）→ `8.12`（跳栈扫）→ **`3.3`（关自动烘焙）** MB/轮。
+
+**未做（如实）**：① 编译器侧尚未修「显示列表每轮新增节点」这条（真凶 2 只定位到路径，未定位到那一行
+`addChild`/`promote` 调用点）；② 剩余 3.3 MB/轮（`untagged`）没有继续二分；③ 应用侧 `SetupView` 的静态字段与监听器
+未在其仓库里改（属被测应用，需另开改动）；④ `ASC_MOVE_SKIP`、拖拽期帧率等阶段 382 口径不受影响，未重测。
+
 ### 遗留待开发
 
 > **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /

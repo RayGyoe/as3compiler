@@ -418,6 +418,19 @@ thread inside a modal loop", so dragging *any* window froze the picture in *ever
 two arms on the same binary, so what that skip bought was a **frozen picture**, not responsiveness. See
 [`win32.md`](docs/en/win32.md) §3.8.1 for the full evidence.
 
+**Native memory ledger (stage three hundred and eighty-three)**: when private bytes climb, first split the
+question in two — the class census plateaus (`total=83275 n=13.1 MB`, three identical reports) while private
+bytes reach 1050 MB, so the growth is native (Skia surfaces/images, GL textures), which no GC scan can see and
+which relies solely on "delete the resource when its owner dies". Three opt-in switches: `ASC_MEM_TRACE=1`
+reports per resource family **and per creation site** (`surf_bake` splits into
+`s9/textfield/bitmapdata/bake_do/bake_verify`, so `live/peak/n/d=` names the responsible path),
+`ASC_MEM_CLASSES=1` (+`ASC_MEM_CLASS_WANT=<substr>`) counts classes **by growth**, and `ASC_MEM_FORCE_GC=1`
+runs a full stop-the-world collection first (separating "GC never ran" from "GC cannot reclaim"). All three cost
+one `getenv` on the shipping path. A real defect was fixed alongside: the finalizer table was **a fixed 4096
+slots, silently dropping** later registrations, so every C++ resource registered past the cap was never released;
+the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now grows on demand. See
+[`gc.md`](docs/en/gc.md) §6.18 for the measurements.
+
 ## Examples
 - `examples/hello.as` — expressions, string concatenation, `trace`, `if/else`
 - `examples/fib.as` — functions, `while`, `for`, recursion boundary

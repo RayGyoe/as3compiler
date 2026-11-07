@@ -269,6 +269,16 @@ GPU 画布上贴 CPU-raster 快照尤其贵）：`panel_bmp_192` **2.92 → 0.93
 真鼠标拖动的跟手指标（median / p95 / max）两条臂逐项相同 ⇒ 那条跳过买到的是**画面冻结**，不是跟手。
 口径与证据见 [`win32.md`](docs/zh-cn/win32.md) §3.8.1。
 
+**原生内存账本（阶段三百八十三）**：进程私有内存上涨时先分清「哪一半在涨」——GC 堆普查进入平台期
+（`total=83275 n=13.1 MB` 连续三次报表相同）而私有内存已到 1050 MB ⇒ 增长在原生侧（Skia surface/image、
+GL 纹理），GC 扫不到，只靠「owner 死了就 delete」的约定。新增三个 opt-in 开关：`ASC_MEM_TRACE=1` 按资源族 +
+**按创建点**双维度报表（`surf_bake` 拆成 `s9/textfield/bitmapdata/bake_do/bake_verify` 五路，
+`live/peak/n/d=` 一眼看出哪一路在涨）、`ASC_MEM_CLASSES=1`（+`ASC_MEM_CLASS_WANT=<子串>`）按类**增量**普查、
+`ASC_MEM_FORCE_GC=1` 报表前跑完整 STW 回收（区分「GC 没跑」与「跑不动」）。三者在生产路径上零开销（一个
+`getenv`）。同时修掉一个真缺陷：finalizer 注册表原本**固定 4096 槽且填满后静默丢弃**新注册 ⇒「4096 之后注册的
+C++ 资源永不释放」，真应用 20 轮开关窗口后烘焙 surface 涨到 1.5 GB；现改为按需倍增。口径与实测见
+[`gc.md`](docs/zh-cn/gc.md) §6.18。
+
 **叶子类普通方法去虚化（阶段三百二十一）**：在封闭编译面内，静态接收者没有子类时，普通实例方法
 直接调用 nearest-wins 解析出的 `m.owner` 实现；继承自祖先的方法不会虚构 `Leaf_method`。显式调用、
 隐式 `this` 与 sealed `with` 已接入；基类多态、动态/接口/Proxy、private、访问器和方法值 thunk 保持原路径。

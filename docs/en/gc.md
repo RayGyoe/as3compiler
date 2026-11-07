@@ -944,6 +944,58 @@ The third row is the decisive one: after the garbage is swept back onto the free
 
 **Re-measured (2026-10-29, after rebasing onto the new base)**: the gap now blocks the benchmark itself -- the AOT arm of Bench3 gets killed by the external watchdog at `pt_4000` (`per=338 us/op`, `stalls=7`, `gapmax=1675 ms`), and **the pre-merge exe sitting in the same directory dies at the same phase in the same shape**, while `adl` completes the whole run at the same moment with `per=0.271 us/op` and 0 hang samples. In other words "AOT cannot even finish the benchmark" *is* this section's symptom, not a regression introduced here (readings: `temp/perf-b3/bench3-aot-merged-report.txt` vs `bench3-air-report-1029.txt`).
 
+### 6.18 The Native Memory Ledger and the Finalizer Table (stage three hundred and eighty-three)
+
+The GC heap explains AS3 objects, but the bulk of a desktop process's private memory lives
+outside it: Skia `SkSurface`/`SkImage`, GL/D3D textures and window-backend resources are plain
+`malloc`/`new` allocations that no GC scan can see. They rely on one explicit contract — "when the
+owner dies, delete the resource". One missed point and the symptom is stable GC heap with linearly
+growing private bytes.
+
+The ledger (`ASC_MEM_TRACE=1`) turns that contract into auditable data:
+
+| Facility | Environment variable | Purpose |
+|---|---|---|
+| Per-family ledger | `ASC_MEM_TRACE=1` | `live/peak/n/d=` per resource family and per creation site, rate-limited at frame safe points |
+| Creation-site accounting | same | `surf_bake` splits into `s9/textfield/bitmapdata/bake_do/bake_verify`; the five lifetimes differ completely, so sharing one bucket would hide the responsible path |
+| Class census | `ASC_MEM_CLASSES=1` | Walks the GC heap counting by vtable fqn, **ordered by growth** (leaking classes are usually small; only a climbing count is a signal); `ASC_MEM_CLASS_WANT=<substr>` jumps straight to one class |
+| Forced collection | `ASC_MEM_FORCE_GC=1` | Runs a full stop-the-world `gc_collect()` before reporting, separating "GC never ran" from "GC cannot reclaim" |
+
+Three invariants that must hold:
+
+1. **De-duplicate by address**. glibc and Skia both hand a just-freed address back out; without
+   de-duplication the same address is counted twice and the report contradicts itself (measured:
+   `tagged` exceeded process private bytes and `untagged` went negative). `as_mem_track_site()`
+   subtracts the old entry from both the family and the site buckets before registering the new one.
+2. **Sizes come from the creation site, never from Skia**. Reading `width()` on a deleted surface
+   yields numbers like `5.6e13 MB`; snapshots are recorded as 0 bytes because they share pixels
+   with the source surface (copy-on-write).
+3. **A full ledger keeps counting and never corrupts the table**. `AS_MEM_SLOTS` is table space,
+   not a semantic limit; on overflow it warns once and keeps the counters monotonic.
+
+The **finalizer table** (owner → C++ resource) enforces the contract: when an AS3 owner is
+reclaimed, `gc_sweep_step` calls `as_final_on_free()`, which deletes the paired surface/image.
+It used to be a **fixed 4096 slots** table that **silently dropped** every later registration once
+full — a virtual list or a window opened and closed a few hundred times produces tens of thousands
+of live resources, so everything registered after the cap was never released. Measured on the real
+app: after 20 open/close cycles `surf_bake` grew from 13 MB to 1.5 GB (5569 unreleased surfaces)
+with 1442 MB of private bytes. It now **grows by doubling** (`ASC_FINAL_SLOTS_INIT 1024`,
+`as_final_grow()` reallocating all three columns), degrading to a single warning and dropped
+registrations if growth fails — never a corrupted table.
+
+Diagnostic traces from stage three hundred and eighty-three (Windows GL build, real application,
+settings window opened and closed in a loop):
+
+- `final=4096/842` stuck exactly at 4096 ⇒ cap hit; after the fix `10183/2095`.
+- Slope per cycle: `10.78 → 8.47` (growth) `→ 8.41` (forced collection) `→ 8.12` (stack scan
+  skipped). None of the three removes the leak ⇒ the objects are **reachable**, so it is neither
+  "GC never ran" nor a conservative-stack artefact.
+- The class census plateaued at an identical `total=83275 n=13.1 MB` across three consecutive
+  reports while private bytes reached 1050 MB ⇒ the growth is purely native Skia, not the GC heap.
+  This comparison ("which half is growing?") is the standard first move.
+- With auto-baking disabled (`ASC_NO_AUTO_BAKE=1`) `surf_bake` drops to `n=1 / 0.34 MB` and the
+  slope falls from 8.46 to 3.3 MB/cycle ⇒ the auto-bake surface path is the main leak.
+
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |

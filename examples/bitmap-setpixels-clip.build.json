@@ -38,7 +38,10 @@
     "${win:user32}",
     "${win:gdi32}",
     "${win:ole32}",
-    "${win:advapi32}"
+    "${win:advapi32}",
+    "${win:d3d12}",
+    "${win:dxgi}",
+    "${win:d3dcompiler}"
   ],
   "link-paths": [
     "../vendor/skia/lib/${host}",

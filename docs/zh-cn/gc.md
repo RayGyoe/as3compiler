@@ -828,6 +828,48 @@ FRAME n=512 p50=17.00 p95=200.00 p99=3643.00 max=4642.00(worstgc=1.00) over8ms=5
 同形状**，同时刻 `adl` 臂跑完整轮、同一相位 `per=0.271 µs/次`、0 hang。换句话说，「AOT 连基准都跑不完」本身就是
 本节的现形，而不是新引入的回归（读数：`temp/perf-b3/bench3-aot-merged-report.txt` vs `bench3-air-report-1029.txt`）。
 
+### 6.18 原生内存账本与 finalizer 表（阶段三百八十三）
+
+GC 堆只解释「AS3 对象」，但进程私有内存的大头不在那里：Skia 的 `SkSurface`/`SkImage`、
+GL/D3D 纹理、窗口后端资源都直接走 `malloc`/`new`，GC 扫不到它们，只能靠「owner 死了就 delete」
+这条显式约定。约定一旦漏一处，表现就是「GC 堆稳定、私有内存线性上涨」。
+
+账本（`ASC_MEM_TRACE=1`）把这层约定变成可对账的数据：
+
+| 设施 | 环境变量 | 作用 |
+|---|---|---|
+| 按族账本 | `ASC_MEM_TRACE=1` | `live/peak/n/d=` 按资源族 + 按创建点 site 双维度报表，每帧安全点限频输出 |
+| 创建点分账 | 同上 | `surf_bake` 拆 `s9/textfield/bitmapdata/bake_do/bake_verify` 五路；五路 lifetime 完全不同，不分开就无法指认责任路径 |
+| 类型普查 | `ASC_MEM_CLASSES=1` | 遍历 GC 堆按 vtable fqn 分族计数，**按增量排序**（泄漏类往往很小，只有计数一直爬的才是问题）；`ASC_MEM_CLASS_WANT=<substr>` 直达某个类 |
+| 强制回收 | `ASC_MEM_FORCE_GC=1` | 报表前跑完整 STW `gc_collect()`，用来区分「GC 没跑」与「跑不动」 |
+
+三条必须守住的口径：
+
+1. **按地址去重**。glibc 与 Skia 都会复用刚 `free` 的地址；不去重会把同一地址多次计入 live，
+   报表立刻自相矛盾（实测出现过 `tagged` 大于进程私有内存、`untagged` 为负）。
+   `as_mem_track_site()` 命中已有地址时，先从 live/cnt 与 site 两个维度**全量扣掉**旧值再登记新值。
+2. **尺寸由创建点提供，绝不向 Skia 追问**。对已 delete 的 surface 读 `width()` 会得到
+   `5.6e13 MB` 这种数字；快照（`make_snapshot`）记 0 字节，因为它与源 surface 共享像素（COW）。
+3. **账本满时只增计数、不破坏表**。`AS_MEM_SLOTS` 是表空间上限，不是语义约束；满了警告一次，
+   计数照走，这样报表仍然单调可读。
+
+**finalizer 表**（owner → C++ 资源）是这套约定的执行者：AS3 owner 被 GC 回收时，
+`gc_sweep_step` 回调 `as_final_on_free()` 把对应 surface/image delete 掉。它原本是**固定 4096 槽**，
+表满后**静默丢弃**所有新注册 —— 一个虚拟列表或反复开关的窗口很容易堆出上万个活资源，
+于是「后来的资源永不释放」，实测 20 轮开关后 `surf_bake` 从 13 MB 涨到 1.5 GB（5569 个未释放 surface），
+进程私有内存 1442 MB。现在改为**按需倍增**（`ASC_FINAL_SLOTS_INIT 1024` 起步，
+`as_final_grow()` 三列同时 `realloc` 翻倍），失败只警告一次并降级为丢注册，不破坏已有表。
+
+诊断口径（阶段三百八十三实测，Windows GL 构建，真应用反复开关设置窗口）：
+
+- `final=4096/842` 恒停在 4096 ⇒ 命中表满；扩容后为 `10183/2095`。
+- 每轮斜率：`10.78 → 8.47`（扩容）`→ 8.41`（强制回收）`→ 8.12`（跳过保守栈扫描）。
+  三条都降不下来 ⇒ 漏的是**可达对象**，不是「GC 没跑」，也不是栈扫描假象。
+- 类普查平台期连续三次报表完全相同（`total=83275 n=13.1 MB`）而私有内存同期 1050 MB
+  ⇒ 增长纯属原生 Skia，不在 GC 堆。这条对照是「先分清是哪一半在涨」的标准动作。
+- 关掉自动烘焙（`ASC_NO_AUTO_BAKE=1`）后 `surf_bake` 落到 `n=1 / 0.34 MB`，
+  斜率从 8.46 降到 3.3 MB/轮 ⇒ 泄漏主体就是自动烘焙 surface 这条路径。
+
 ## 7. 与现有反射表的关系（复用，不重造）
 
 | 现有设施 | GC 用途 |

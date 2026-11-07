@@ -8374,20 +8374,40 @@ static void gc_mark_drain(void) {
 // registered under that address is released. Registration is keyed on the owner
 // ADDRESS and an entry is dropped the moment its resource is released, so this
 // table never dereferences a freed pointer -- it only compares addresses.
-#define ASC_FINAL_SLOTS 4096
-static void* ASC_final_owner[ASC_FINAL_SLOTS];
-static void* ASC_final_res[ASC_FINAL_SLOTS];
-static int ASC_final_kind[ASC_FINAL_SLOTS];  // 0 = SkImage, 1 = SkSurface
+// Capacity is a starting point, not a limit: see as_final_grow below. The tables
+// grow by doubling, so the cost is a realloc of pointer-sized columns every so
+// often and nothing per registration.
+#define ASC_FINAL_SLOTS_INIT 1024
+static void** ASC_final_owner = NULL;
+static void** ASC_final_res = NULL;
+static int*   ASC_final_kind = NULL;   // 0 = SkImage, 1 = SkSurface
+static int ASC_final_cap = 0;
 static int ASC_final_used = 0;
 static int ASC_final_released_n = 0;
 static void as_skia_image_delete(void* img);
 static void as_skia_surface_delete(void* s);
+// Doubling growth. The three columns are realloc'd together; a NULL from realloc
+// leaves the old tables intact, so the only failure mode is "cannot grow", which
+// is reported once and degrades to the old fixed-table behaviour (drop the
+// registration) instead of corrupting the table.
+static void as_final_grow(void) {
+    const int ncap = ASC_final_cap == 0 ? ASC_FINAL_SLOTS_INIT : ASC_final_cap * 2;
+    void** no = (void**)realloc(ASC_final_owner, (size_t)ncap * sizeof(void*));
+    void** nr = (void**)realloc(ASC_final_res, (size_t)ncap * sizeof(void*));
+    int* nk = (int*)realloc(ASC_final_kind, (size_t)ncap * sizeof(int));
+    if (no == NULL || nr == NULL || nk == NULL) {
+        static int warned2 = 0;
+        if (!warned2) { warned2 = 1; fprintf(stderr, "[as3-aot] finalizer table cannot grow past %d; C++ resources will leak\\n", ASC_final_cap); }
+        return;
+    }
+    ASC_final_owner = no; ASC_final_res = nr; ASC_final_kind = nk;
+    ASC_final_cap = ncap;
+}
 static void as_final_register_kind(void* owner, void* res, int kind) {
     if (owner == NULL || res == NULL) return;
-    if (ASC_final_used >= ASC_FINAL_SLOTS) {
-        static int warned = 0;
-        if (!warned) { warned = 1; fprintf(stderr, "[as3-aot] finalizer table full (%d); C++ resources will leak\\n", ASC_FINAL_SLOTS); }
-        return;
+    if (ASC_final_used >= ASC_final_cap) {
+        as_final_grow();
+        if (ASC_final_used >= ASC_final_cap) return;   // growth failed, already reported
     }
     ASC_final_owner[ASC_final_used] = owner;
     ASC_final_res[ASC_final_used] = res;
@@ -8437,6 +8457,284 @@ static void as_final_on_free(void* owner) {
     }
 }
 
+
+// ---------- native allocation ledger (stage 383) ----------
+//
+// The GC heap accounts for itself: gc_dbg_dump() prints bytes per GCT_* type
+// and System.totalMemory sums the heap. Skia surfaces/images, GPU textures and
+// driver buffers do not: they are malloc/operator-new allocations inside Skia or
+// the GPU driver. The meeting client proved the gap is real -- after two hours of
+// use the process held 1053 MB of private bytes while System.totalMemory reported
+// 32 MB -- so a leak hunt that only looks at the GC heap cannot see the leak at
+// all, and neither can a census that only counts objects.
+//
+// Every Skia resource created by the generated C is tracked here by POINTER,
+// which is what lets as_skia_surface_delete / as_skia_image_delete subtract the
+// bytes without the caller having to remember what it is deleting. Counters are
+// cheap (a linear-table insert/remove per resource, never per frame); the report
+// is opt-in via ASC_MEM_TRACE=1 and prints live/peak/count plus the delta since
+// the previous report, so "does it grow per open/close cycle" is one subtraction.
+typedef enum {
+    AS_MEM_SURF_WIN = 0,   // window stage surface (sk_surface_raster/gpu_new)
+    AS_MEM_SURF_BAKE,      // cacheAsBitmap / auto-bake retained surface
+    AS_MEM_SURF_OTHER,     // one-shot offscreen surfaces (texture ops, probes)
+    AS_MEM_IMG_SNAPSHOT,   // SkImage snapshots of a surface (bakes, dumps)
+    AS_MEM_IMG_BITMAP,     // SkImage views of BitmapData pixels
+    AS_MEM_IMG_OTHER,      // decoded files, SWC assets, Stage3D targets
+    AS_MEM_NOTE_MISC,      // anything the runtime notes by size, not by pointer
+    AS_MEM__N
+} as_mem_tag;
+static const char* AS_mem_name[AS_MEM__N] = {
+    "surf_window", "surf_bake", "surf_other", "img_snapshot", "img_bitmap",
+    "img_other", "note_misc"
+};
+static double AS_mem_live[AS_MEM__N];
+static double AS_mem_peak[AS_MEM__N];
+static double AS_mem_prev[AS_MEM__N];   // live at the previous report
+static long   AS_mem_cnt[AS_MEM__N];
+// Per-creation-site split inside each family. A family total says "images are
+// piling up"; the site says WHICH creator is responsible -- a BitmapData pixel
+// wrap (argb), a decoded file, a Loader byte stream, a decoded asset.
+#define AS_MEM_SITES 14
+// Site ids for the bake surfaces: the five as_skia_surface_bake_new call sites
+// have completely different lifetimes, so they must not share one bucket.
+#define AS_MEM_SITE_S9          8
+#define AS_MEM_SITE_TEXTFIELD   9
+#define AS_MEM_SITE_BITMAPDATA 10
+#define AS_MEM_SITE_BAKE_DO    11
+#define AS_MEM_SITE_BAKE_VERIFY 12
+static const char* AS_mem_site_name[AS_MEM_SITES] = {
+    "argb", "file", "bytes", "decode", "yuv", "surface", "snapshot", "other",
+    "s9", "textfield", "bitmapdata", "bake_do", "bake_verify", "?" };
+static double AS_mem_site_live[AS_MEM__N][AS_MEM_SITES];
+static double AS_mem_site_prev[AS_MEM__N][AS_MEM_SITES];
+static long   AS_mem_site_cnt[AS_MEM__N][AS_MEM_SITES];
+// pointer -> (tag, bytes). Linear like the finalizer table: live resources are
+// tens to low hundreds, this is never on a per-frame path.
+#define AS_MEM_SLOTS 8192
+static void*  AS_memp_ptr[AS_MEM_SLOTS];
+static double AS_memp_bytes[AS_MEM_SLOTS];
+static int    AS_memp_tag[AS_MEM_SLOTS];
+static int    AS_memp_site[AS_MEM_SLOTS];
+static int    AS_memp_used = 0;
+// Slot holding p, or -1. Address reuse is real: Skia hands the same address back
+// for the next image right after one is freed, so a stale entry for that address
+// would be reported as live forever and the ledger would drift up on its own.
+static int as_mem_find(void* p) {
+    for (int i = 0; i < AS_memp_used; i++) if (AS_memp_ptr[i] == p) return i;
+    return -1;
+}
+static double as_system_private_memory(void);   // defined with the System stats
+static void as_mem_track_site(void* p, double bytes, int tag, int site) {
+    if (p == NULL) return;
+    if (bytes < 0.0) bytes = 0.0;
+    if (tag < 0 || tag >= AS_MEM__N) tag = AS_MEM_NOTE_MISC;
+    if (site < 0 || site >= AS_MEM_SITES) site = AS_MEM_SITES - 1;
+    int dup = as_mem_find(p);   // same address, new resource: old entry is dead
+    if (dup >= 0) {
+        int dt = AS_memp_tag[dup], ds = AS_memp_site[dup];
+        AS_mem_live[dt] -= AS_memp_bytes[dup];
+        AS_mem_cnt[dt]--;
+        AS_mem_site_live[dt][ds] -= AS_memp_bytes[dup];
+        AS_mem_site_cnt[dt][ds]--;
+        AS_memp_used--;
+        AS_memp_ptr[dup] = AS_memp_ptr[AS_memp_used];
+        AS_memp_bytes[dup] = AS_memp_bytes[AS_memp_used];
+        AS_memp_tag[dup] = AS_memp_tag[AS_memp_used];
+        AS_memp_site[dup] = AS_memp_site[AS_memp_used];
+    }
+    if (AS_memp_used >= AS_MEM_SLOTS) {
+        static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[as3-aot] mem ledger full (%d); newer resources are untracked\\n", AS_MEM_SLOTS); }
+        AS_mem_live[tag] += bytes; AS_mem_cnt[tag]++;
+        AS_mem_site_live[tag][site] += bytes; AS_mem_site_cnt[tag][site]++;
+        return;
+    }
+    AS_memp_ptr[AS_memp_used] = p;
+    AS_memp_bytes[AS_memp_used] = bytes;
+    AS_memp_tag[AS_memp_used] = tag;
+    AS_memp_site[AS_memp_used] = site;
+    AS_memp_used++;
+    AS_mem_live[tag] += bytes; AS_mem_cnt[tag]++;
+    AS_mem_site_live[tag][site] += bytes; AS_mem_site_cnt[tag][site]++;
+    if (AS_mem_live[tag] > AS_mem_peak[tag]) AS_mem_peak[tag] = AS_mem_live[tag];
+}
+static void as_mem_track(void* p, double bytes, int tag) { as_mem_track_site(p, bytes, tag, AS_MEM_SITES - 1); }
+// Drop one tracked resource. A pointer we never tracked (or one already released)
+// is a no-op, which keeps the delete wrappers honest for resources created before
+// the ledger existed (statics, SWC assets bound at startup).
+static void as_mem_untrack(void* p) {
+    if (p == NULL) return;
+    for (int i = 0; i < AS_memp_used; i++) {
+        if (AS_memp_ptr[i] != p) continue;
+        int tag = AS_memp_tag[i];
+        int site = AS_memp_site[i];
+        AS_mem_live[tag] -= AS_memp_bytes[i];
+        AS_mem_cnt[tag]--;
+        AS_mem_site_live[tag][site] -= AS_memp_bytes[i];
+        AS_mem_site_cnt[tag][site]--;
+        AS_memp_used--;
+        AS_memp_ptr[i] = AS_memp_ptr[AS_memp_used];
+        AS_memp_bytes[i] = AS_memp_bytes[AS_memp_used];
+        AS_memp_tag[i] = AS_memp_tag[AS_memp_used];
+        AS_memp_site[i] = AS_memp_site[AS_memp_used];
+        return;
+    }
+}
+// Bytes of an image whose dimensions the CALLER knows. Never ask Skia: the same
+// pointer can already be deleted on a side path (as_skia_surface_save_png encodes
+// and frees its snapshot without going through the ledger), and reading width()
+// off a dead object reported 5.6e13 MB on the meeting client. A caller that truly
+// does not know the size (from_file / from_bytes decode it) passes 0: the entry
+// still counts the resource, it just charges no bytes.
+static void as_mem_track_image_sized(void* img, int tag, int site, int w, int h) {
+    as_mem_track_site(img, (w > 0 && h > 0) ? (double)w * (double)h * 4.0 : 0.0, tag, site);
+}
+// Report one line per family plus the totals the OS sees. untagged is the whole
+// point: private bytes minus the GC heap segments, the arena and every tracked
+// Skia resource. When it grows across cycles, the leak is somewhere this ledger
+// does not cover yet (driver buffers, a vendor library, plain malloc).
+// Alive counts for the permanent-root tables that grow on their own: a playing
+// MovieClip is only unregistered by stop(), and a timer only by clearTimeout.
+// If these climb with a window open/close loop, the closed window is still rooted.
+static int as_mc_alive_n(void) {
+    int n = 0;
+    for (int i = 0; i < as_mc_count; i++) if (as_mcs[i].alive) n++;
+    return n;
+}
+static int as_timer_alive_n(void) {
+    int n = 0;
+    for (int i = 0; i < as_timer_count; i++) if (as_timers[i].alive) n++;
+    return n;
+}
+// Per-class census over the GC heap. Sizes come from the block header (payload
+// bytes), so the grouping answers "which AS3 class is accumulating"; a class whose
+// byte column grows every cycle is the one holding the retained display tree.
+static int AS_mem_force_gc = 0;
+static int AS_mem_classes = 0;
+static const char* AS_mem_class_want = NULL;
+#define AS_MEM_CLASSES 96
+static const char* AS_cls_name[AS_MEM_CLASSES];
+static double AS_cls_bytes[AS_MEM_CLASSES];
+static double AS_cls_prev[AS_MEM_CLASSES];
+static long AS_cls_cnt[AS_MEM_CLASSES];
+static int AS_cls_used = 0;
+static int as_cls_slot(const char* name) {
+    for (int i = 0; i < AS_cls_used; i++) if (AS_cls_name[i] == name) return i;
+    if (AS_cls_used >= AS_MEM_CLASSES) return -1;
+    AS_cls_name[AS_cls_used] = name;
+    return AS_cls_used++;
+}
+static void as_mem_class_census(void) {
+    const double mb = 1048576.0;
+    double cur[AS_MEM_CLASSES];
+    long curn[AS_MEM_CLASSES];
+    for (int i = 0; i < AS_MEM_CLASSES; i++) { cur[i] = 0.0; curn[i] = 0; }
+    long total = 0;
+    double totalb = 0.0;
+    for (gc_header* h = gc_all; h != NULL; h = h->next) {
+        if (h->type != GCT_CLASS) continue;
+        as_object_header* o = (as_object_header*)((char*)h + sizeof(gc_header));
+        const char* fqn = NULL;
+        if (o->vtable != NULL) fqn = ((as_vtable_header*)o->vtable)->fqn;
+        if (fqn == NULL) fqn = "?";
+        const int s = as_cls_slot(fqn);
+        total++; totalb += (double)h->size;
+        if (s < 0) continue;
+        cur[s] += (double)h->size; curn[s]++;
+    }
+    fprintf(stderr, "mem classes total=%ld n=%.1fMB\\n", total, totalb / mb);
+    // ASC_MEM_CLASS_WANT filters the ranking: a leak candidate like Stage holds a
+    // few hundred bytes, so it never reaches a top-12 ranked by growth against
+    // thousands of TextFormats. Named classes are always printed in full.
+    if (AS_mem_class_want != NULL && AS_mem_class_want[0] != 0) {
+        for (int i = 0; i < AS_cls_used; i++) {
+            if (AS_cls_name[i] == NULL || strstr(AS_cls_name[i], AS_mem_class_want) == NULL) continue;
+            fprintf(stderr, "mem   cls %-40s n=%6ld %.2fMB d=%+.2fMB\\n",
+                    AS_cls_name[i], curn[i], cur[i] / mb, (cur[i] - AS_cls_prev[i]) / mb);
+            AS_cls_prev[i] = cur[i];
+        }
+        fflush(stderr);
+        return;   // filtered report: only what was asked for
+    }
+    // Top 12 by bytes, plus anything that moved since the last report (a class
+    // that shrank still matters: it proves the collector reaches it).
+    for (int k = 0; k < 12; k++) {
+        int best = -1;
+        for (int i = 0; i < AS_cls_used; i++) {
+            if (cur[i] <= 0.0) continue;
+            // Rank by GROWTH since the previous report, not by size: the leaking class
+            // is rarely the biggest one (a Stage is 400 bytes next to 4000 TextFormats),
+            // it is the one whose count keeps climbing.
+            const double di = cur[i] - AS_cls_prev[i];
+            const double db = (best < 0) ? 0.0 : (cur[best] - AS_cls_prev[best]);
+            if (best < 0 || di > db) best = i;
+        }
+        if (best < 0) break;
+        fprintf(stderr, "mem   cls %-32s n=%6ld %.2fMB d=%+.2fMB\\n",
+                AS_cls_name[best], curn[best], cur[best] / mb, (cur[best] - AS_cls_prev[best]) / mb);
+        AS_cls_prev[best] = cur[best];
+        cur[best] = 0.0;   // take it out of the running for the next rank
+    }
+    for (int i = 0; i < AS_cls_used; i++) if (AS_cls_prev[i] > 0.0 && cur[i] > 0.0) AS_cls_prev[i] = cur[i];
+    fflush(stderr);
+}
+static void as_mem_dump(const char* why) {
+    const double mb = 1048576.0;
+    double tagged = 0.0;
+    for (int i = 0; i < AS_MEM__N; i++) tagged += AS_mem_live[i];
+    const double priv = as_system_private_memory();
+    const double gcr = gc_heap_total_bytes();
+    const double arena = (double)as_arena_cap_bytes();
+    const double other = (double)as_heap_bytes;
+    fprintf(stderr,
+            "mem t=%.1fs why=%s | priv=%.1fMB gc=%.1f/%.1fMB arena=%.1f/%.1fMB tagged=%.1fMB untagged=%.1fMB final=%d/%d roots=%d mc=%d tmr=%d\\n",
+            as_now_ms() / 1000.0, why, priv / mb, gc_heap_used_bytes() / mb, gcr / mb,
+            (double)as_arena_used_bytes() / mb, arena / mb, tagged / mb,
+            (priv - gcr - arena - other - tagged) / mb, ASC_final_used, ASC_final_released_n,
+            gc_root_count, as_mc_alive_n(), as_timer_alive_n());
+    for (int i = 0; i < AS_MEM__N; i++) {
+        if (AS_mem_cnt[i] == 0 && AS_mem_peak[i] == 0.0) continue;
+        fprintf(stderr, "mem   %-13s live=%7.2fMB peak=%7.2fMB n=%ld d=%+7.2fMB\\n",
+                AS_mem_name[i], AS_mem_live[i] / mb, AS_mem_peak[i] / mb, AS_mem_cnt[i],
+                (AS_mem_live[i] - AS_mem_prev[i]) / mb);
+        AS_mem_prev[i] = AS_mem_live[i];
+        for (int s = 0; s < AS_MEM_SITES; s++) {
+            if (AS_mem_site_cnt[i][s] == 0) continue;
+            fprintf(stderr, "mem     %-13s %-8s live=%7.2fMB n=%ld d=%+7.2fMB\\n",
+                    AS_mem_name[i], AS_mem_site_name[s], AS_mem_site_live[i][s] / mb,
+                    AS_mem_site_cnt[i][s], (AS_mem_site_live[i][s] - AS_mem_site_prev[i][s]) / mb);
+            AS_mem_site_prev[i][s] = AS_mem_site_live[i][s];
+        }
+    }
+    if (AS_mem_classes) as_mem_class_census();
+    fflush(stderr);
+}
+// Frame safe point hook: opt-in, one report every 5 s. Ask for it with
+// ASC_MEM_TRACE=1; the per-family d= column is the leak signal (a loop that
+// opens and closes a window must show d=+0.00MB on every family).
+static int AS_mem_trace = -1;
+static double AS_mem_next_ms = 0.0;
+static void as_mem_tick(void) {
+    if (AS_mem_trace < 0) {
+        AS_mem_trace = getenv("ASC_MEM_TRACE") != NULL ? 1 : 0;
+        AS_mem_force_gc = getenv("ASC_MEM_FORCE_GC") != NULL ? 1 : 0;
+        AS_mem_classes = getenv("ASC_MEM_CLASSES") != NULL ? 1 : 0;
+        AS_mem_class_want = getenv("ASC_MEM_CLASS_WANT");
+        if (AS_mem_class_want != NULL) AS_mem_classes = 1;
+    }
+    if (!AS_mem_trace) return;
+    const double now = as_now_ms();
+    if (now < AS_mem_next_ms) return;
+    AS_mem_next_ms = now + 5000.0;
+    // ASC_MEM_FORCE_GC=1 is the discriminator between "not collected yet" and
+    // "cannot be collected": a full stop-the-world collection right before the
+    // report. Numbers that stay flat across cycles this way are genuinely rooted
+    // (something still references the owners); numbers that collapse mean the
+    // collector simply had not run.
+    if (AS_mem_force_gc) { gc_collect(); as_mem_dump("frame+gc"); }
+    else as_mem_dump("frame");
+}
 // Sweep a budget of the all-objects list: white objects return to the free-list,
 // black objects reset to white for the next cycle. Returns true when the walk is
 // complete. gc_all is stable during the walk because in-cycle allocations go to
@@ -10633,12 +10931,21 @@ static double ASC_alpha_mul = 1.0;
 // as_skia_* semantic wrappers: the entry points DisplayObject.render() drives.
 // They are static inline so they emit no symbol unless actually called, keeping
 // pure-C (ASC_USE_SKIA undefined) builds link-clean.
-static inline void* as_skia_surface_new(int w, int h) {
+// Every surface and image the generated C creates goes through one of these
+// wrappers, which is what makes the ledger complete without touching a single
+// call site: creation inserts the pointer, deletion removes it, and the bytes are
+// w*h*4 for a surface (its pixel buffer is the whole cost).
+static inline void* as_skia_surface_new_tagged(int w, int h, int tag) {
 #ifdef ASC_RENDER_GPU
-    return sk_surface_gpu_new(w, h);
+    void* s = sk_surface_gpu_new(w, h);
 #else
-    return sk_surface_raster_new(w, h);
+    void* s = sk_surface_raster_new(w, h);
 #endif
+    as_mem_track_site(s, (double)w * (double)h * 4.0, tag, 5);
+    return s;
+}
+static inline void* as_skia_surface_new(int w, int h) {
+    return as_skia_surface_new_tagged(w, h, AS_MEM_SURF_OTHER);
 }
 // Offscreen bake surface (cacheAsBitmap / auto-bake): ALWAYS a CPU raster surface,
 // independent of the window backend. Baking into the GPU FBO 0 (web) or a one-shot
@@ -10646,17 +10953,29 @@ static inline void* as_skia_surface_new(int w, int h) {
 // whose initial contents are undefined on GPU backends but must be cleared to
 // transparent. Raster surfaces always start zeroed, so this keeps the transparent
 // padding invariant (§ AGENTS.md: cacheAsBitmap stays CPU-raster regardless).
+static inline void* as_skia_surface_bake_new_site(int w, int h, int site) {
+    void* s = sk_surface_raster_new(w, h);
+    as_mem_track_site(s, (double)w * (double)h * 4.0, AS_MEM_SURF_BAKE, site);
+    return s;
+}
 static inline void* as_skia_surface_bake_new(int w, int h) {
-    return sk_surface_raster_new(w, h);
+    return as_skia_surface_bake_new_site(w, h, AS_MEM_SITE_BAKE_DO);
 }
 static inline void* as_skia_surface_canvas(void* s) { return sk_surface_canvas(s); }
-static inline void as_skia_surface_delete(void* s) { sk_surface_delete(s); }
-static inline void* as_skia_surface_make_snapshot(void* s) { return sk_surface_make_snapshot(s); }
+static inline void as_skia_surface_delete(void* s) { as_mem_untrack(s); sk_surface_delete(s); }
+static inline void* as_skia_surface_make_snapshot(void* s) {
+    void* img = sk_surface_make_snapshot(s);
+    // A snapshot shares the surface storage copy-on-write, so charging w*h*4 here
+    // would count the same pixels twice and make untagged negative. Count the
+    // resource, charge no bytes: the surface it came from already carries them.
+    as_mem_track_site(img, 0.0, AS_MEM_IMG_SNAPSHOT, 6);
+    return img;
+}
 static inline int as_skia_surface_peek_pixels(void* s, void** pixels, int* rowBytes) { return sk_surface_peek_pixels(s, pixels, rowBytes); }
-static inline void as_skia_image_delete(void* img) { sk_image_delete(img); }
+static inline void as_skia_image_delete(void* img) { as_mem_untrack(img); sk_image_delete(img); }
 static inline void as_skia_surface_save_png(void* s, const char* path) {
     void* img = sk_surface_make_snapshot(s);
-    if (img) { sk_image_encode_png(img, path); sk_image_delete(img); }
+    if (img) { sk_image_encode_png(img, path); as_skia_image_delete(img); }
 }
 static inline void* as_skia_paint_fill(unsigned rgb, double alpha) {
     void* p = sk_paint_new();
@@ -10756,15 +11075,26 @@ static inline void as_skia_paint_set_stroke_params(void* p, int cap, int join, d
 // A 4x5 AS3 ColorTransform as a Skia colour matrix, applied to a saveLayer paint
 // so the whole composited subtree is tinted once (swc.md §9 E).
 static inline void as_skia_paint_set_color_matrix(void* p, const float* m20) { sk_paint_set_color_matrix(p, m20); }
-static inline void* as_skia_image_from_file(const char* path) { return sk_image_from_file(path); }
-static inline void* as_skia_image_from_argb(const void* px, int w, int h) { return sk_image_from_argb(px, w, h); }
+static inline void* as_skia_image_from_file(const char* path) {
+    void* img = sk_image_from_file(path);
+    as_mem_track_image_sized(img, AS_MEM_IMG_BITMAP, 1, 0, 0);   // file
+    return img;
+}
+static inline void* as_skia_image_from_argb(const void* px, int w, int h) {
+    void* img = sk_image_from_argb(px, w, h);
+    as_mem_track_image_sized(img, AS_MEM_IMG_BITMAP, 0, w, h);   // argb
+    return img;
+}
 #ifdef ASC_USE_YUV420
 // YUV direct render (E20): hand I420 planes to the glue as a GPU texture. The
 // context is whatever the active GPU backend exposes (Metal / D3D12 / WGL /
 // WebGL2); a build without one — CPU raster or pure-C — gets NULL, so the caller
 // falls back to one warning + black rather than a wrong colour.
 static inline void* as_skia_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, int w, int h) {
-    return sk_image_from_yuv(ctx, y, u, v, w, h);
+    void* img = sk_image_from_yuv(ctx, y, u, v, w, h);
+    // I420 planes are w*h*1.5 bytes; the image wraps them, it does not copy.
+    as_mem_track(img, (w > 0 && h > 0) ? (double)w * (double)h * 1.5 : 0.0, AS_MEM_IMG_OTHER);
+    return img;
 }
 static inline void* as_skia_gr_context(void) {
 #ifdef ASC_RENDER_GPU
@@ -10790,9 +11120,27 @@ static void as_yuv_cpu_warn(void) {
 // URL). A file view is impossible there: the payload was never a file, so it
 // must not be re-opened by name, or the display-list Bitmap would render
 // nothing at all.
-static inline void* as_skia_image_from_bytes(const void* data, size_t len) { return sk_image_from_bytes(data, len); }
-static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) { return sk_image_decode_argb(path, width, height); }
-static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) { return sk_image_decode_bytes_argb(data, len, width, height); }
+static inline void* as_skia_image_from_bytes(const void* data, size_t len) {
+    void* img = sk_image_from_bytes(data, len);
+    as_mem_track_image_sized(img, AS_MEM_IMG_BITMAP, 2, 0, 0);   // bytes
+    return img;
+}
+static inline void* as_skia_image_decode_argb(const char* path, int* width, int* height) {
+    void* img = sk_image_decode_argb(path, width, height);
+    // NOT tracked, deliberately: sk_image_decode_*_argb hands back a malloc'd
+    // ARGB uint32 buffer (not an SkImage) and the caller frees it with free(),
+    // never through as_skia_image_delete -- an entry here could never be removed
+    // and the ledger reported 669 MB of "images" inside a 376 MB process.
+    return img;
+}
+static inline void* as_skia_image_decode_bytes_argb(const void* data, size_t len, int* width, int* height) {
+    void* img = sk_image_decode_bytes_argb(data, len, width, height);
+    // NOT tracked, deliberately: sk_image_decode_*_argb hands back a malloc'd
+    // ARGB uint32 buffer (not an SkImage) and the caller frees it with free(),
+    // never through as_skia_image_delete -- an entry here could never be removed
+    // and the ledger reported 669 MB of "images" inside a 376 MB process.
+    return img;
+}
 static inline int as_skia_surface_read_argb(void* s, uint32_t* dst, int w, int h) { return sk_surface_read_argb(s, dst, w, h); }
 static inline void as_skia_canvas_draw_image_rect(void* c, void* img, double dx, double dy, double dw, double dh, int smooth) {
     if (ASC_alpha_mul < 1.0) { sk_canvas_draw_image_rect_mul(c, img, dx, dy, dw, dh, smooth, ASC_alpha_mul); return; }
@@ -11577,7 +11925,12 @@ static inline int as_screen_color_depth(void) { return 32; }
 // Pure-C builds still emit the Graphics/Shape/Bitmap/TextField C definitions
 // (they are dead code unless the program uses those classes); these no-op
 // stubs let that code compile and link without a Skia toolchain.
+// Window surfaces are tagged so the leak ledger can tell a window-sized surface
+// from a bake one; the tag is a no-op without Skia (nothing to account for).
+#define AS_MEM_SURF_WIN 1
+static inline void* as_skia_surface_new_tagged(int w, int h, int tag) { (void)w; (void)h; (void)tag; return NULL; }
 static inline void* as_skia_surface_new(int w, int h) { (void)w; (void)h; return NULL; }
+static inline void* as_skia_surface_bake_new_site(int w, int h, int site) { (void)w; (void)h; (void)site; return NULL; }
 static inline void* as_skia_surface_bake_new(int w, int h) { (void)w; (void)h; return NULL; }
 static inline void* as_skia_surface_canvas(void* s) { (void)s; return NULL; }
 static inline void as_skia_surface_delete(void* s) { (void)s; }

@@ -10190,7 +10190,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('if (!o->_s9_valid || o->_s9_image == NULL || o->_s9_bw != (double)pw || o->_s9_bh != (double)ph) {');
     this.indent++;
     this.line('if (o->_s9_image != NULL) { as_skia_image_delete(o->_s9_image); o->_s9_image = NULL; }');
-    this.line('void* surface = as_skia_surface_bake_new(pw, ph);');
+    this.line('void* surface = as_skia_surface_bake_new_site(pw, ph, 8);');
     this.line('if (surface != NULL) {');
     this.indent++;
     this.line('void* c2 = as_skia_surface_canvas(surface);');
@@ -23039,7 +23039,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // width/s + 1 in source units -- measured on adl: ext = width*mat + 1.
     this.line('sw = (int)ceil(tf->_fieldWidth * rs) + (tf->border ? 1 : 0); if (sw < 1) sw = 1;');
     this.line('sh = (int)ceil(tf->_fieldHeight * rs) + (tf->border ? 1 : 0); if (sh < 1) sh = 1;');
-    this.line('void* surface = as_skia_surface_bake_new(sw, sh);');
+    this.line('void* surface = as_skia_surface_bake_new_site(sw, sh, 9);');
     this.line('if (surface == NULL) { ASC_render_scale = keep_render_scale; return; }');
     this.line('void* canvas = as_skia_surface_canvas(surface);');
     this.line('as_skia_canvas_clear_transparent(canvas);');
@@ -23067,7 +23067,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // silently drew nothing.
     this.line('sw = bd->width; sh = bd->height;');
     this.line('if (sw < 1 || sh < 1) { ASC_render_scale = keep_render_scale; return; }');
-    this.line('void* surface = as_skia_surface_bake_new(sw, sh);');
+    this.line('void* surface = as_skia_surface_bake_new_site(sw, sh, 10);');
     this.line('if (surface == NULL) { ASC_render_scale = keep_render_scale; return; }');
     this.line('void* canvas = as_skia_surface_canvas(surface);');
     this.line('as_skia_canvas_clear_transparent(canvas);');
@@ -28523,6 +28523,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // gc_step() also marks the collector frame-driven, which is what retires
     // gc_alloc's non-GUI allocation trigger (see gc_frame_driven in the preamble).
     this.line('gc_step();');
+    // Native-side ledger (ASC_MEM_TRACE=1): Skia surfaces/images and the process
+    // private bytes are invisible to the GC heap numbers, and that is exactly where
+    // the meeting client leaked. Opt-in, throttled to one report every 5 s.
+    this.line('as_mem_tick();');
     this.line('as_dbg_frame(as_now_ms() - asc_frame_t0);');
     // Status events a native extension queued from any thread, now that no AS3
     // frame is on the stack. ExtensionContext.call already pumped once on the way
@@ -29869,7 +29873,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (it costs one extra full raster per repaired boundary).
     this.line('static void as_bake_verify(DisplayObject* o, void* canvas, int pw, int ph, double sx, double sy, double bxo, double byo, const char* kind) {');
     this.indent++;
-    this.line('void* v = as_skia_surface_bake_new(pw, ph);');
+    this.line('void* v = as_skia_surface_bake_new_site(pw, ph, 12);');
     this.line('if (v == NULL) return;');
     this.line('void* vc = as_skia_surface_canvas(v);');
     this.line('as_skia_canvas_clear_transparent(vc);');
@@ -32205,7 +32209,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#endif');
     this.line('if (w->surface != NULL) as_skia_surface_delete(w->surface);');
     this.line('w->surface = NULL; w->canvas = NULL;');
-    this.line('void* s = as_skia_surface_new(pw, ph);');
+    this.line('void* s = as_skia_surface_new_tagged(pw, ph, AS_MEM_SURF_WIN);');
     this.line('if (s == NULL) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('w->surface = s;');
     this.line('w->canvas = as_skia_surface_canvas(s);');
