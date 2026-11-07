@@ -13340,6 +13340,24 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
     this.indent--;
     this.line('}');
+    // The pending table is file-scope static storage, which the GC's conservative
+    // stack scan never visits, so every slot has to be registered as a root or the
+    // object it names can be swept and its address handed to a later allocation.
+    // as_bake_release_one would then write _cache_* into whatever now lives at
+    // o+0x88..0xA8 -- measured: an ordinary 32-byte store that landed on a live
+    // block header four blocks away and broke the gc_all chain. as_final_has_owner
+    // cannot catch this on its own: it keys on the address, so a recycled slot whose
+    // address was reused by a new owner still answers yes. Registering the slots is
+    // also why the table must be cleared to NULL when it is emptied (below): a
+    // stale slot would otherwise pin that object for the life of the process.
+    this.line('static int AS_bake_pend_roots = 0;');
+    this.line('static void as_bake_pend_ensure_roots(void) {');
+    this.indent++;
+    this.line('if (AS_bake_pend_roots) return;');
+    this.line('AS_bake_pend_roots = 1;');
+    this.line('for (int i = 0; i < (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0])); i++) gc_root_register((void**)&AS_bake_pend[i]);');
+    this.indent--;
+    this.line('}');
     // A subtree that comes back on stage is not detached any more; drop it (and
     // its descendants) from the pending table instead of asking the sweep to read
     // a maybe-stale `parent` field next frame.
@@ -13348,6 +13366,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (o == NULL || AS_bake_pend_n == 0) return;');
     this.line('int keep = 0;');
     this.line('for (int i = 0; i < AS_bake_pend_n; i++) { if (AS_bake_pend[i] != o) AS_bake_pend[keep++] = AS_bake_pend[i]; }');
+    // Clear the vacated tail: those slots are registered GC roots now, so a stale
+    // pointer there would keep an object alive forever.
+    this.line('for (int i = keep; i < AS_bake_pend_n; i++) AS_bake_pend[i] = NULL;');
     this.line('AS_bake_pend_n = keep;');
     this.line('if (!as_is((void*)o, &DisplayObjectContainer_vt)) return;');
     this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
@@ -13359,13 +13380,14 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static int as_bake_rel_off = -1;');
     this.line('if (as_bake_rel_off < 0) as_bake_rel_off = getenv("ASC_NO_BAKE_RELEASE") != NULL ? 1 : 0;');
     this.line('if (as_bake_rel_off) return;');
+    this.line('as_bake_pend_ensure_roots();');
     this.indent++;
     this.line('if (o == NULL) return;');
     this.line('if (AS_bake_pend_n >= (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0]))) {');
     this.indent++;
 // Table full: reclaim everything we can right now. A slot whose owner is gone
 // or unknown is simply dropped -- that node is then released on its next removal.
-this.line('for (int i = 0; i < AS_bake_pend_n; i++) as_bake_release_one(AS_bake_pend[i]);');
+this.line('for (int i = 0; i < AS_bake_pend_n; i++) { DisplayObject* p = AS_bake_pend[i]; AS_bake_pend[i] = NULL; as_bake_release_one(p); }');
 this.line('AS_bake_pend_n = 0;');
     this.indent--;
     this.line('}');
@@ -13385,6 +13407,7 @@ this.line('AS_bake_pend_n = 0;');
     this.line('for (int i = 0; i < n; i++) {');
     this.indent++;
     this.line('DisplayObject* o = AS_bake_pend[i];');
+    this.line('AS_bake_pend[i] = NULL;');
     this.line('if (o == NULL) continue;');
     // No parent walk here: a pending slot may already be recycled, and the only
     // safe survival test is a table lookup. Coming back on stage is expressed by
