@@ -13286,6 +13286,80 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // Unbind every Bitmap in the removed subtree from its BitmapData._refs so a
     // detached Bitmap is not pinned by the reverse edge (docs/zh-cn/repaint-boundary.md
     // §BitmapData). Mirrors as_disp_stage_walk's container walk.
+    // ---- auto-bake cache eviction on leave-stage (stage 384) ----
+    //
+    // Auto-bake is OUR internal cache (AS3 has no equivalent of a retained
+    // Skia surface), so its lifetime must not be tied to the owner's GC
+    // lifetime: one pinned object then pins ~4*w*h bytes per baked node. That
+    // is exactly the meeting client's ~8 MB per settings-window cycle -- the
+    // detached setupskin subtree stays referenced by an extension singleton
+    // while its 49 raster caches wait for a GC that never comes. AIR has no
+    // such layer, which is why the same input does not grow there.
+    //
+    // The one-frame delay is deliberate: a virtual list removes and re-adds the
+    // same item every frame, and evicting on removal would re-bake it each time
+    // (stage 380 made that reuse cheap). Only a node still off-stage when the
+    // next frame starts is really gone.
+    this.line('static DisplayObject* AS_bake_pend[2048];');
+    this.line('static int AS_bake_pend_n = 0;');
+    this.line('static void as_bake_release_one(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('if (o->_cache_image != NULL) { as_final_release((void*)o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('if (o->_cache_surface != NULL) { as_final_release((void*)o, o->_cache_surface); as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }');
+    this.line('o->_cache_valid = 0;');
+    this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_bake_pend_push(DisplayObject* o) {');
+    this.line('static int as_bake_rel_off = -1;');
+    this.line('if (as_bake_rel_off < 0) as_bake_rel_off = getenv("ASC_NO_BAKE_RELEASE") != NULL ? 1 : 0;');
+    this.line('if (as_bake_rel_off) return;');
+    this.indent++;
+    this.line('if (o == NULL) return;');
+    this.line('if (AS_bake_pend_n >= (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0]))) {');
+    this.indent++;
+    // Table full: flush everything already off-stage, keep the rest. Dropping an
+    // entry only postpones that node's release to its next removal.
+    this.line('int keep = 0;');
+    this.line('for (int i = 0; i < AS_bake_pend_n; i++) {');
+    this.indent++;
+    this.line('DisplayObject* p = AS_bake_pend[i];');
+    this.line('if (p == NULL || !gc_in_heap((void*)p)) continue;');
+    this.line('if (as_on_stage(p)) { AS_bake_pend[keep++] = p; continue; }');
+    this.line('as_bake_release_one(p);');
+    this.indent--;
+    this.line('}');
+    this.line('AS_bake_pend_n = keep;');
+    this.indent--;
+    this.line('}');
+    this.line('if (AS_bake_pend_n >= (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0]))) return;');
+    this.line('AS_bake_pend[AS_bake_pend_n++] = o;');
+    this.line('if (!as_is((void*)o, &DisplayObjectContainer_vt)) return;');
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children == NULL) return;');
+    this.line('for (int i = 0; i < c->children->length; i++) as_bake_pend_push((DisplayObject*)as_v_obj_val(c->children->data[i]));');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_bake_pend_sweep(void) {');
+    this.indent++;
+    this.line('if (AS_bake_pend_n == 0) return;');
+    this.line('const int n = AS_bake_pend_n;');
+    this.line('AS_bake_pend_n = 0;');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('DisplayObject* o = AS_bake_pend[i];');
+    this.line('if (o == NULL) continue;');
+    // A collected owner leaves a dangling slot; the address may even be reused by
+    // a new node, in which case as_final_release simply finds nothing to release.
+    this.line('if (!gc_in_heap((void*)o)) continue;');
+    this.line('if (as_on_stage(o)) continue;   // re-added (virtual list): forget it');
+    this.line('as_bake_release_one(o);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+
     this.line('static void as_disp_unbind_bd(DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL) return;');
@@ -13383,6 +13457,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (child->parent == (Object*)_this) child->parent = NULL;');
     this.line('as_mark_dirty((DisplayObject*)c);');
     this.line('as_disp_unbind_bd(child);');
+    // Only a subtree that was actually on stage can become a retained orphan.
+    this.line('if (was_on_stage) as_bake_pend_push(child);');
     // G25 contract 1: a hovered subtree that leaves the list still gets its
     // mouseOut/rollOut, on the next beat, on the detached node.
     this.line('as_hover_on_remove((void*)_this, child);');
@@ -28523,6 +28599,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // gc_step() also marks the collector frame-driven, which is what retires
     // gc_alloc's non-GUI allocation trigger (see gc_frame_driven in the preamble).
     this.line('gc_step();');
+    // Detached subtrees from the previous frame that did not come back: their
+    // bake caches are ours to drop (see as_bake_pend_push above).
+    this.line('as_bake_pend_sweep();');
     // Native-side ledger (ASC_MEM_TRACE=1): Skia surfaces/images and the process
     // private bytes are invisible to the GC heap numbers, and that is exactly where
     // the meeting client leaked. Opt-in, throttled to one report every 5 s.
@@ -30658,6 +30737,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // so AIR's <requestedDisplayResolution>high gives a crisp PNG while AS3 code keeps
     // working in logical stage coordinates.
     this.line('void Stage_render(void* _this, double width, double height, char* path) {');
+    this.line('as_bake_pend_sweep();');
     this.indent++;
     this.line('Stage* st = (Stage*)_this;');
     this.line('int pw = (int)width, ph = (int)height;');

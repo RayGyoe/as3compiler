@@ -870,6 +870,55 @@ GL/D3D 纹理、窗口后端资源都直接走 `malloc`/`new`，GC 扫不到它�
 - 关掉自动烘焙（`ASC_NO_AUTO_BAKE=1`）后 `surf_bake` 落到 `n=1 / 0.34 MB`，
   斜率从 8.46 降到 3.3 MB/轮 ⇒ 泄漏主体就是自动烘焙 surface 这条路径。
 
+### 6.19 自动烘焙缓存的归还时机（阶段三百八十四）
+
+§6.17 把原生资源做成可对账的账本，§6.18 修掉了 finalizer 表的固定上限。本节讲**第三类**：
+我们自己造的缓存 —— 自动烘焙（auto-bake）为每个被判定可烘焙的节点持有一张
+`pw*ph*4` 字节的会话级 Skia surface（`_cache_surface`）与一张快照（`_cache_image`）。
+
+**问题**：这两样东西原先只在 owner 被 GC 回收时释放（`as_final_on_free`）。只要第三方
+（一个长命单例的监听器、一个静态字段、一个闭包）钉住那棵子树，GC 永不到来，每轮开关窗口
+就留下一整套 surface —— 真机实测 18 轮留下 18 个 `setupskin` 根、每个 49 个烘焙节点、
+每张 ≈160 KB ⇒ **7.8 MB/轮**。AIR 没有这一层缓存，所以同样的输入在 AIR 下不涨。
+
+**判据（这条要记住）**：「对象有没有离开显示列表」必须读 **C 结构字段** ——
+`as_disp_parent(o)`（`parent` 挂在 `EventDispatcher` 上）。用 AS3 props 表反查
+`gc_probe_field(o, "parent")` **恒失败**，会得到「零孤儿」这种反向结论。
+
+**机制**（`src/emit.ts`）：
+
+| 步骤 | 位置 | 语义 |
+|---|---|---|
+| 登记 | `DisplayObjectContainer_removeChild` | `if (was_on_stage) as_bake_pend_push(child);` 递归整棵子树进 `AS_bake_pend[2048]` |
+| 归还 | `as_bake_pend_sweep()` | 对每个条目：不在 GC 堆里 ⇒ 跳过；`as_on_stage(o)` ⇒ **丢弃条目**（虚拟列表复用）；否则 `as_bake_release_one(o)` |
+| 推进 | `Stage_dispatchFrame` + `Stage_render` | 两个帧入口各一次，所以窗口循环与 headless 截图钩子都覆盖 |
+| 置冷 | `as_bake_release_one` | 先 `as_final_release` 再 `as_skia_*_delete`，然后 `_cache_valid = 0` + 清 `_cache_w/_cache_h/_cache_phx/_cache_phy` ⇒ 下一帧走**已有的重建分支** |
+
+**为什么延迟一帧**：虚拟列表每帧 `removeChild` + `addChild` 同一项。离台即释放会把
+阶段 380/381 优化掉的复用路径打回「每帧重烘」。`sweep` 在**下一帧开头**才判定，回舞台的
+条目直接丢弃，所以只有真离台的子树付出一次重建。
+
+**为什么只有 `was_on_stage` 才入队**：从没上过舞台的对象在 `removeChild` 前就没有 surface，
+入队纯属浪费表项。
+
+**表满**：`AS_bake_pend[2048]` 满时先就地 flush（对已离台的立即归还、把仍在舞台的留下），
+再继续入队；实在放不下就跳过这一项 —— 代价只是「该节点等到下一次摘除再归还」，不会漏成永久泄漏。
+
+**A/B**：`ASC_NO_BAKE_RELEASE=1` 关掉整条通路（与 `ASC_NO_FINAL`、`ASC_NO_AUTO_BAKE` 同惯例）。
+`examples/bake-release-on-remove.as` 在同一二进制上做两态对照：
+
+| 臂 | 20 轮 RSS 增量 |
+|---|---|
+| 默认（归还） | +0.95 MB |
+| `ASC_NO_BAKE_RELEASE=1` | +28 MB（断言红） |
+
+**实测（真机）**：斜率 10.5 → **3.29 MB/轮**；`surf_bake` 从「每轮 +53、n=1016」变成
+**`n=33` 平台、`d=-7.08 MB`**；`bakeown`（带 surface 的 owner）869 → **33，orphan=0**。
+残余 3.3 MB/轮 与 `ASC_NO_AUTO_BAKE=1` 时同量，落在 `untagged` 栏，是另一条路径。
+
+**钉子**：`unit: render/BakeReleaseOnRemove`（12 项）钉生成 C 的形态 —— 释放顺序、置冷、
+子树递归、`was_on_stage` 门、回舞台不清、已回收槽跳过、两个帧入口、A/B 环、表满 flush、
+定义先于使用。
 ## 7. 与现有反射表的关系（复用，不重造）
 
 | 现有设施 | GC 用途 |

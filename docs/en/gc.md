@@ -996,6 +996,63 @@ settings window opened and closed in a loop):
 - With auto-baking disabled (`ASC_NO_AUTO_BAKE=1`) `surf_bake` drops to `n=1 / 0.34 MB` and the
   slope falls from 8.46 to 3.3 MB/cycle ⇒ the auto-bake surface path is the main leak.
 
+### 6.19 When the auto-bake cache gives its memory back (stage 384)
+
+§6.17 turned our native allocations into a ledger and §6.18 removed the finalizer table's fixed
+cap. This section covers a **third** category: the cache we build ourselves. Auto-bake retains,
+per eligible node, one `pw*ph*4`-byte Skia surface (`_cache_surface`) plus a snapshot
+(`_cache_image`).
+
+**The problem.** Both used to be released only when the owner was collected by the GC
+(`as_final_on_free`). As soon as anything else keeps that subtree alive — a listener on a
+long-lived singleton, a static field, a closure — the collector never gets to it, and every
+open/close cycle of a window leaves a whole set of surfaces behind. Measured on the meeting
+client: 18 cycles left 18 `setupskin` roots with 49 baked nodes each, ≈160 KB per surface
+⇒ **7.8 MB per cycle**. AIR has no such cache layer, so the same input does not grow there.
+
+**The predicate to remember.** "Has this object left the display list?" must be answered from the
+**C struct field** — `as_disp_parent(o)` (`parent` lives on `EventDispatcher`). Looking it up by
+AS3 props name — `gc_probe_field(o, "parent")` — **always fails** and yields the opposite
+conclusion ("zero orphans").
+
+**Mechanism** (`src/emit.ts`):
+
+| Step | Where | Semantics |
+|---|---|---|
+| Enqueue | `DisplayObjectContainer_removeChild` | `if (was_on_stage) as_bake_pend_push(child);` walks the whole subtree into `AS_bake_pend[2048]` |
+| Reclaim | `as_bake_pend_sweep()` | per entry: not in the GC heap ⇒ skip; `as_on_stage(o)` ⇒ **drop the entry** (virtual-list reuse); otherwise `as_bake_release_one(o)` |
+| Advance | `Stage_dispatchFrame` + `Stage_render` | one call each, so both the window loop and the headless screenshot hook are covered |
+| Go cold | `as_bake_release_one` | `as_final_release` first, then `as_skia_*_delete`; set `_cache_valid = 0` and clear `_cache_w/_cache_h/_cache_phx/_cache_phy` ⇒ the next frame takes the **existing rebuild branch** |
+
+**Why one frame of delay.** A virtual list removes and re-adds the same item every frame.
+Releasing on removal would undo the reuse that stage 380/381 made cheap. The sweep decides at the
+**start of the next frame**, and an entry that came back on stage is simply dropped, so only a
+genuinely detached subtree pays for a rebuild.
+
+**Why only `was_on_stage` subtrees are enqueued.** An object that never reached the stage had no
+surface before `removeChild`, so enqueuing it would only burn table slots.
+
+**Table full.** When `AS_bake_pend[2048]` fills, the push flushes in place (reclaim what is
+already off-stage, keep what came back), then continues; if it still does not fit, that node is
+skipped — the cost is "released on its next removal", never a permanent leak.
+
+**A/B.** `ASC_NO_BAKE_RELEASE=1` disables the whole path (same convention as `ASC_NO_FINAL` and
+`ASC_NO_AUTO_BAKE`). `examples/bake-release-on-remove.as` runs both arms on one binary:
+
+| Arm | RSS growth over 20 cycles |
+|---|---|
+| default (reclaim) | +0.95 MB |
+| `ASC_NO_BAKE_RELEASE=1` | +28 MB (assertion fails) |
+
+**Measured on the meeting client.** Slope 10.5 → **3.29 MB per cycle**; `surf_bake` went from
+"+53 per cycle, n=1016" to **`n=33` plateau, `d=-7.08 MB`**; `bakeown` (owners holding a surface)
+869 → **33, orphan=0**. The residual 3.3 MB per cycle matches the `ASC_NO_AUTO_BAKE=1` arm and
+sits in the `untagged` bucket — a different path.
+
+**Pins.** `unit: render/BakeReleaseOnRemove` (12 checks) pins the generated-C shape: release
+order, going cold, subtree recursion, the `was_on_stage` gate, keeping a node that came back,
+skipping already-collected slots, both frame entry points, the A/B switch, flush-on-full, and
+definition-before-use.
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |

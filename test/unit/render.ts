@@ -2938,3 +2938,58 @@ function checkAutoBakePatch(): string[] {
   return bad;
 }
 registerGroup('unit: render/AutoBakePatch', checkAutoBakePatch);
+
+// ---- BakeReleaseOnRemove: 自动烘焙缓存离开显示列表后一帧即归还（阶段三百八十四） ----
+//
+// 真机症状：设置窗口每轮开关进程私有内存 +10.5 MB，AIR 下不涨。根因是 auto-bake 的
+// surface 生命周期只绑在 owner 的 GC 生命周期上 —— 子树已被 removeChildren 摘离显示
+// 列表、但仍被别处引用时，那几十张 surface 永不归还。这组钉住生成 C 的形态：释放点、
+// 一帧延迟、回舞台不清、以及 A/B 环保留。
+function checkBakeReleaseOnRemove(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [bakerelease] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [bakerelease] ${label}`); }
+  };
+
+  const c = generateC(parse("import flash.display.Sprite;\nimport flash.display.Shape;\nvar s:Sprite = new Sprite();\nvar p:Shape = new Shape();\np.graphics.beginFill(0xFF0000);\np.graphics.drawRect(0,0,4,4);\np.graphics.endFill();\ns.addChild(p);\n")).c;
+  const removeFn = 'DisplayObject* DisplayObjectContainer_removeChild(void* _this, DisplayObject* child) {';
+  // 限定在释放函数体内：同一串 delete 在重建分支里也出现，全局 indexOf 会撞上别处。
+  const ro = c.slice(c.indexOf('static void as_bake_release_one(DisplayObject* o) {'),
+                     c.indexOf('static void as_bake_pend_push(DisplayObject* o) {'));
+
+  check('the release helper is defined before its first use',
+    c.includes('static void as_bake_release_one(DisplayObject* o) {') &&
+    c.indexOf('static void as_bake_release_one(DisplayObject* o) {') < c.indexOf(removeFn));
+  check('the image is unregistered before it is deleted',
+    ro.indexOf('as_final_release((void*)o, o->_cache_image)') > 0 &&
+    ro.indexOf('as_skia_image_delete(o->_cache_image)') > ro.indexOf('as_final_release((void*)o, o->_cache_image)'));
+  check('the surface is unregistered before it is deleted',
+    ro.indexOf('as_final_release((void*)o, o->_cache_surface)') > 0 &&
+    ro.indexOf('as_skia_surface_delete(o->_cache_surface)') > ro.indexOf('as_final_release((void*)o, o->_cache_surface)'));
+  check('releasing marks the node cold so the next frame rebuilds it',
+    c.includes('o->_cache_valid = 0;') &&
+    /o->_cache_w = 0\.0; o->_cache_h = 0\.0; o->_cache_phx = 0\.0; o->_cache_phy = 0\.0;/.test(c));
+  check('the pending walk covers the whole subtree (containers recurse)',
+    /as_bake_pend_push\(\(DisplayObject\*\)as_v_obj_val\(c->children->data\[i\]\)\)/.test(c));
+  check('removeChild enqueues only subtrees that were on stage',
+    c.includes('if (was_on_stage) as_bake_pend_push(child);'));
+  check('the enqueue happens after the BitmapData back-edge is cut',
+    c.indexOf('if (was_on_stage) as_bake_pend_push(child);') > c.indexOf('as_disp_unbind_bd(child);'));
+  check('the sweep keeps a node that came back on stage (virtual-list reuse)',
+    c.includes('if (as_on_stage(o)) continue;'));
+  check('the sweep skips slots whose owner was already collected',
+    c.includes('if (!gc_in_heap((void*)o)) continue;'));
+  check('both frame entry points advance the sweep (window frame + headless render)',
+    c.split('as_bake_pend_sweep();').length - 1 === 2);
+  check('the release path keeps an A/B switch like ASC_NO_FINAL',
+    c.includes('ASC_NO_BAKE_RELEASE'));
+  check('a full table flushes instead of silently dropping pending nodes',
+    c.includes('static DisplayObject* AS_bake_pend[2048];') &&
+    c.includes('if (AS_bake_pend_n >= (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0]))) {'));
+
+  console.log(`[bakerelease] ${ok} bake-release-on-remove checks passed`);
+  return bad;
+}
+registerGroup('unit: render/BakeReleaseOnRemove', checkBakeReleaseOnRemove);

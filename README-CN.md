@@ -269,6 +269,20 @@ GPU 画布上贴 CPU-raster 快照尤其贵）：`panel_bmp_192` **2.92 → 0.93
 真鼠标拖动的跟手指标（median / p95 / max）两条臂逐项相同 ⇒ 那条跳过买到的是**画面冻结**，不是跟手。
 口径与证据见 [`win32.md`](docs/zh-cn/win32.md) §3.8.1。
 
+**自动烘焙缓存离台即归还（阶段三百八十四）**：上一阶段把「涨的是哪一半」量出来了，这一轮把它修掉。
+真应用每开关一次设置窗口私有内存涨 10.5 MB、跑几小时到 1 GB，而**同一操作在 AIR 下不涨** —— 按
+§1.5 的判据这是遗留缺陷，只能在编译器侧修。根因：auto-bake 是我们自造的缓存，每个被烘焙的节点持有一张
+`pw*ph*4` 字节的 Skia surface，而它的生命周期**只绑在 owner 的 GC 生命周期**上。探针（按 finalizer 表里
+`kind==1` 的 owner 逐层走 `as_disp_parent`）实测 18 轮开关留下 **18 个 `setupskin` 孤儿根、每个 49 个烘焙
+节点、每张 ≈160 KB ⇒ 7.8 MB/轮**：子树已被 `removeChildren()` 摘离显示列表，但仍被别处引用，GC 永不到来。
+AIR 里这棵树同样被钉住，可它只是几 KB 的矢量对象。修法：`removeChild` 时把「移除前在舞台上」的子树登记
+进 `AS_bake_pend[2048]`，**下一帧开头**再判定 —— 仍在舞台外才 `as_final_release` + `as_skia_*_delete` 并置
+`_cache_valid = 0`（下一帧走已有重建分支）。延迟一帧是刻意的：虚拟列表每帧 remove+add 同一项，离台即释放
+会把阶段 380/381 优化掉的复用打回每帧重烘。实测斜率 **10.5 → 3.29 MB/轮**，`surf_bake` 从「每轮 +53、
+n=1016」变成 **n=33 平台、d=−7.08 MB**。A/B 开关 `ASC_NO_BAKE_RELEASE=1`（同 `ASC_NO_FINAL` 惯例），
+`examples/bake-release-on-remove.as` 两态对照 +28 MB / +0.95 MB。口径与实测见
+[`gc.md`](docs/zh-cn/gc.md) §6.19。
+
 **原生内存账本（阶段三百八十三）**：进程私有内存上涨时先分清「哪一半在涨」——GC 堆普查进入平台期
 （`total=83275 n=13.1 MB` 连续三次报表相同）而私有内存已到 1050 MB ⇒ 增长在原生侧（Skia surface/image、
 GL 纹理），GC 扫不到，只靠「owner 死了就 delete」的约定。新增三个 opt-in 开关：`ASC_MEM_TRACE=1` 按资源族 +

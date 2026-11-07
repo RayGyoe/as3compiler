@@ -418,6 +418,26 @@ thread inside a modal loop", so dragging *any* window froze the picture in *ever
 two arms on the same binary, so what that skip bought was a **frozen picture**, not responsiveness. See
 [`win32.md`](docs/en/win32.md) §3.8.1 for the full evidence.
 
+**Auto-bake cache reclaimed on leave-stage (stage three hundred and eighty-four)**: the previous
+stage measured which half was growing; this one fixes it. A settings-window open/close cycle added
+10.5 MB of private bytes and hours of that reached 1 GB, while **the same operation does not grow
+under AIR** — per §1.5 that makes it a leftover defect, fixable only on the compiler side. Root
+cause: auto-bake is a cache we invented, so each baked node holds one `pw*ph*4`-byte Skia surface,
+and its lifetime was tied **only** to the owner's GC lifetime. A probe that walks
+`as_disp_parent` over the `kind==1` owners in the finalizer table measured **18 detached
+`setupskin` roots after 18 cycles, 49 baked nodes each, ≈160 KB per surface ⇒ 7.8 MB per cycle**:
+the subtree had already been detached by `removeChildren()`, but something still referenced it, so
+the collector never came. Under AIR that same tree leaks too, but it is only a few KB of vector
+objects. The fix: `removeChild` enqueues the "was on stage" subtree into `AS_bake_pend[2048]`, and
+the **next frame's start** decides — only a node still off-stage gets `as_final_release` +
+`as_skia_*_delete` and `_cache_valid = 0` (the next frame takes the existing rebuild branch). The
+one-frame delay is deliberate: a virtual list removes and re-adds the same item every frame, so
+releasing on removal would undo the reuse stage 380/381 made cheap. Measured slope **10.5 →
+3.29 MB per cycle**, `surf_bake` went from "+53 per cycle, n=1016" to **n=33 plateau,
+d=−7.08 MB**. A/B switch `ASC_NO_BAKE_RELEASE=1` (same convention as `ASC_NO_FINAL`);
+`examples/bake-release-on-remove.as` compares +28 MB against +0.95 MB. See
+[`gc.md`](docs/en/gc.md) §6.19 for the measurements.
+
 **Native memory ledger (stage three hundred and eighty-three)**: when private bytes climb, first split the
 question in two — the class census plateaus (`total=83275 n=13.1 MB`, three identical reports) while private
 bytes reach 1050 MB, so the growth is native (Skia surfaces/images, GL textures), which no GC scan can see and

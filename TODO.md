@@ -20770,5 +20770,90 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 - 每个阶段完成后：**回归运行 `examples/` 下所有旧示例**，确保不破坏已有功能；更新 README；版本号按 patch 小版本递增（`v0.4.0 → v0.4.1 → v0.4.2 → …`，自 v0.4.0 起；此前为 v0.3.x），避免 minor 版本过早逼近 1.0.0。
 - 每个新特性必须配一个 `examples/*.as` 示例 + 断言式回归，否则视为未完成（AGENTS.md DoD）。
-- **阶段节的顺序是硬约束**：全部阶段节一律 `###` **平级**，且按**阶段号数值升序**排（子阶段紧随父阶段，如 `阶段一百七十七` → `阶段一百七十七·一` → `阶段一百七十八` → …）。**新阶段节追加到 `### 遗留待开发` 之前（= 末尾），不要插到某个「看起来该在这儿」的锚点上** —— 历史上有好几轮是插到固定锚点，插一次没事，插多了就形成逆序块（曾出现 `196→…→182` 整块逆序、`138`/`139` 对调、`178·九→·八→·七` 逆序）。`### Flappy-Starling…` 与 `### 下一阶段路线图…` 两个非阶段节是**其后那个阶段节的序言**，随它一起移动。
+- **阶段节的顺序是硬约束**：全部阶段节一律 `###` **平级**，且按**阶段号数值升序**排（子阶段紧随父阶段，如 `阶段一百七十七` → `阶段一百七十七·一` → `阶段一百七十八` → …）。**新阶段节追加到 `### 阶段三百八十四：自动烘焙缓存离开显示列表即归还
+
+**背景（用户报障，代码事实）**：同上一个阶段。真应用开关一次设置窗口，进程私有内存涨约 10.5 MB；
+跑几小时后到 1 GB。**同一操作在 AIR 下不涨**。按 §1.5 的判据 —— adl/AIR 能跑对我们跑不对 ⇒
+这是**遗留缺陷**，必须在编译器侧修，不是让应用去绕。
+
+**真凶（探针实测闭环）**：`auto-bake` 是**我们自造的缓存**（AS3 没有「保留一张 surface」这个概念），
+每个被烘焙的节点持有一张 `pw*ph*4` 字节的 Skia surface。它的生命周期原先只绑在
+「owner 被 GC 回收」上：
+
+- `ASC_MEM_FORCE_GC=1`（强制完整 STW 回收）后斜率仍是 8.4 MB/轮 ⇒ 不是 GC 没跑；
+- `ASC_NO_STACK_SCAN=1` 后 8.1 ⇒ 不是保守栈扫描的假象；
+- sweep 调试臂 `freed == white` 每行恒成立 ⇒ sweep 没丢块，漏的是**可达对象**；
+- finalizer 表对账 `reg=3130 relhit=612 relmiss=0 / used=2103`
+  ⇒ `3130 - 612 - 415 = 2103` 完全配平，**重建路径的「先注销旧的」全部命中**，
+  表本身不是泄漏源（4096 上限已在上一阶段修掉）；
+- 反向引用探针（按 finalizer 表里 `kind==1` 的 owner 逐层走 `as_disp_parent`）：
+  18 轮开关后 **18 个根的 fqn 都是 `setupskin`**，每个根带 49 个烘焙节点，
+  `108.26 MB / 673 surface ≈ 160 KB` ⇒ **49 × 160 KB ≈ 7.8 MB/轮**，与观测的 10.5 对得上。
+
+所以链条是：设置窗口关闭 → `stage.removeChild(viewSpirte)` → `Event.REMOVED` →
+`ViewControl.removeVisible` → `removeAt()` → `removeChildren()` **把整棵 `setupskin` 子树摘离显示列表**
+（探针看到的孤儿根）→ 但子树仍被别处引用，GC 永不到来 → 49 张 surface 永不归还。
+AIR 里这棵子树同样被钉住、同样泄漏，但那里它只是几 KB 的矢量对象；我们给它配了 49 张 160 KB 的
+surface，把「几 KB」放大成「7.8 MB」。
+
+**一处旧结论作废（写在前面，免得后人再踩）**：上一阶段用
+`gc_probe_field(owner, "parent")` 判断孤儿，结论是「零孤儿 ⇒ 对象被钉住」。这个探针**不可用**：
+`parent` 是 `EventDispatcher` 的 **C 结构字段**（`as_disp_parent` 读它），根本不在 AS3 props 表里，
+所以匹配恒失败。改用编译器自己的 `as_disp_parent()` 重测后，orphan 从「0」变成「869 个 owner 里
+19 个自己无父 + 每轮一个 `setupskin` 根无父」，方向完全不同。
+
+**应用侧核查结论（明确不做改动）**：`SetupView.as:1299` 的 `removeAt()` 已把
+`ANEQcloudRTC`（3 条）/`TKEvents.globalEvent`（1 条）/`stage`（2 条）/`socketTest`（3 条）
+全部摘掉；`:1307` 那条 `ANEAISegment` 的 `removeEventListener` 是**注释掉的**，看起来像漏，
+但它的注册块（`:969-973`）和处理器 `updateCamFrame`（`:977-998`）在应用源码里**整段也是注释的**，
+恢复那行会直接 `Codegen error: undefined variable 'updateCamFrame'`。
+`SetupViewWindow.viewSpirte` / `sutupWindow` 两个静态字段在 `removeStageView()` 里**已经置 null**。
+`ASC_MEM_CLASS_WANT=SetupView` 跑了 25 次 census 报表，**零个 SetupView 实例**。
+⇒ 应用侧这棵视图确实被回收了，问题只在「缓存的释放时机」，不在「谁忘了摘监听器」。
+
+**修法（`src/emit.ts`，三处）**：
+
+1. 新增 `as_bake_release_one(o)`：按「先 `as_final_release` 再 `as_skia_*_delete`」的顺序归还
+   `_cache_image` / `_cache_surface`，然后置 `_cache_valid = 0` 并清 `_cache_w/_cache_h/_cache_phx/_cache_phy`
+   —— 下一帧按**已有的重建分支**重烘，画面语义不变。
+2. 新增 `as_bake_pend_push(o)`（递归整棵子树）+ `as_bake_pend_sweep()`，在
+   `DisplayObjectContainer_removeChild` 里 `if (was_on_stage) as_bake_pend_push(child);`
+   （放在 `as_disp_unbind_bd(child);` 之后，语义上先断 BitmapData 反边再谈缓存）。
+3. 两个帧入口各推进一次：`Stage_dispatchFrame`（窗口帧）与 `Stage_render`（headless 截图钩子，
+   示例与测试走这条），所以纯 AS3 程序也能验证。
+
+**为什么延迟一帧，而不是离台立刻释放**：虚拟列表每帧 `removeChild` + `addChild` 同一项，
+立刻释放会导致每帧重烘（阶段 380/381 刚把这条复用路径优化到 8.3ms → 1.0ms）。
+`sweep` 里 `if (as_on_stage(o)) continue;` 就是这条判据：**下一帧仍在舞台外**才算真离台。
+只有 `was_on_stage` 的子树才会入队，离台对象不占表。
+
+**A/B 开关**：`ASC_NO_BAKE_RELEASE=1` 关掉这条通路（与 `ASC_NO_FINAL` / `ASC_NO_AUTO_BAKE` 同惯例），
+示例因此能在同一二进制上做两态对照。
+
+**实测**：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 真机 18 轮私有内存斜率 | 10.5 MB/轮 | **3.29 MB/轮** |
+| `surf_bake bake_do` | `n=1016`，每轮 +53 | **`n=33` 平台，`d=-7.08 MB`** |
+| `bakeown`（带 surface 的 owner） | 869，每轮 +49 | **33，orphan=0** |
+| `examples/bake-release-on-remove.as` 20 轮 | +28 MB（`ASC_NO_BAKE_RELEASE=1`） | **+0.95 MB** |
+
+**残余 3.3 MB/轮 是另一条路径**：它与上一阶段关掉自动烘焙（`ASC_NO_AUTO_BAKE=1`）时的
+**3.3 MB/轮完全一致**，且都落在 `untagged`（非 Skia）那一栏 —— 与本轮改动无关，需要另开一轮定位。
+
+**钉子**：`test/unit/render.ts` 新增 `unit: render/BakeReleaseOnRemove`（12 项，钉生成 C 的形态：
+释放顺序、置冷、子树递归、只在 `was_on_stage` 入队、回舞台不清、已回收槽跳过、两个帧入口、
+A/B 环保留、表满时 flush 而不是静默丢弃、定义先于使用）；
+`examples/bake-release-on-remove.as`（20 轮 + 两轮 churn + 像素正确性 + 后端自检）。
+
+**回归**：`node test.ts` → **645 tests / 623 pass / 19 fail / 3 skipped**（上一阶段 643/621/19/3；
+新增 2 项全绿，19 个失败与上一阶段**同一批**，已用 `git stash` 暂存本阶段改动复跑
+`inline/HotPath`、`platform/NativeWindow`、`desktop/file dialog` 三组确认：失败原因是
+`zlib.h file not found`，属 Windows 缺 zlib 开发头的既有环境限制）。
+
+**教训**：① 判「对象有没有离台」必须读 C 结构字段（`as_disp_parent`），不能用 AS3 props 名反查；
+② 「弧儿率为 0」这类否定结论要先看探针本身是否恒假；③ 内部缓存的生命周期不能寄生在
+「GC 会来」这个假设上 —— 只要有第三方钉住对象，缓存就变成无上限的泄漏。
+### 遗留待开发` 之前（= 末尾），不要插到某个「看起来该在这儿」的锚点上** —— 历史上有好几轮是插到固定锚点，插一次没事，插多了就形成逆序块（曾出现 `196→…→182` 整块逆序、`138`/`139` 对调、`178·九→·八→·七` 逆序）。`### Flappy-Starling…` 与 `### 下一阶段路线图…` 两个非阶段节是**其后那个阶段节的序言**，随它一起移动。
 - 实现任何新特性前，先查 [AS3 语言参考](https://airsdk.dev/reference/actionscript/3.0/) 的真实语义，尤其注意 AS3 与 C 的语义差异（`/` 恒 Number、字符串装箱、`Number` 默认 NaN 等），把差异写进注释再编码。
