@@ -982,12 +982,17 @@ Fault offset:   0x00bd9110   ← 落在 bd910f 那条 4 字节指令的第 2 字
 
 | 关注点 | 落点 |
 |---|---|
-| 方法值识别 | `as_closure.is_method`，只由三个 `__bound` thunk 生成点（`as_fn_make_method`）置 1 |
+| 方法值识别 | `as_closure.is_method` 由 `as_fn_make_method` 置 1：三个 `__bound` thunk（实例方法值），加类静态方法引用（同类裸名 / `Class.name` / `obj.Class.name` 三种拼法）、模块级自由函数值、包级内建函数值 —— 共九处 |
 | 弱退化 | `addEventListener` 里 `weak = useWeakReference && !listener->is_method` |
 | 记录 | 新 GC 类型 `GCT_LENTRY`：`{ as_fn fn; int priority; unsigned char weak; }` |
 | 标记 | `gc_scan` 的 `case GCT_LENTRY` 里 `if (!e->weak) gc_mark_ptr(e->fn);` |
 | 死亡判定 | 弱闭包**地址集合**（`as_weak_*`）：sweep 时 `as_weak_on_free` 标 freed，分配时 `as_weak_revive` 处理地址复用 |
 | 分派 | `as_disp_arr` 先 `fn == NULL` 跳过，再 `as_weak_dead` 比较地址，命中即关闭槽 |
+
+**为什么静态方法和模块级函数也算「方法值」**：AIR 不回收的不只是 `obj.method`，而是所有类级成员函数、模块级 `function` 与包级内建函数 —— 它们都由全局结构强持有。只标 `__bound` 会漏掉 `TweenLite` 那种
+`addEventListener(Event.ENTER_FRAME, updateAll, false, 0, true)`（`updateAll` 是同类静态方法）：闭包被当地弱引用回收，Tween 引擎停摆，整个应用 UI 停止刷新。反过来，**匿名/具名函数表达式仍必须可回收**
+（`as_fn_make(...__call, NULL, arity)` 的 `FunctionExpr` 与嵌套闭包 cell 两处不改），那才是 AIR 会回收的
+nested inner function。`examples/weak-listener.as` 的 H/I/J 三项钉住这条分界。
 
 **为什么死亡判定用独立地址集合而不是「读对象头」**：被回收的块地址仍然落在 GC 段内，
 `gc_in_heap()` 恒真；而 deref 一个已回收指针可能读到复用该地址的新对象头。阶段三百八十四的崩溃

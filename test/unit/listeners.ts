@@ -55,6 +55,22 @@ registerGroup('listeners', () => {
   check('there are exactly three method-value sites', boundMethod === 3);
   check('plain closures stay non-method', runtime.includes('f->is_method = 0;'));
 
+  // Static methods, module-level functions and builtin values are class-level
+  // member functions in AIR's sense: never collected. A miss here is not a
+  // cosmetic difference -- TweenLite registers its static updateAll with
+  // useWeakReference=true, and collecting that closure froze every tween and
+  // with them the whole application UI.
+  const staticSites = (emit.match(/as_fn_make_method\(\$\{sm\.owner\}_/g) || []).length;
+  check('class static method values are non-collectable', staticSites === 4);
+  check('module-level free function values are non-collectable',
+    emit.includes('as_fn_make_method(${this.freeCName(name)}__call, NULL'));
+  check('builtin function values are non-collectable',
+    emit.includes('as_fn_make_method(${name}__call, NULL, ${bArity}'));
+  check('function expressions stay collectable',
+    emit.includes('as_fn_make(${name}__call, NULL, ${arity})'));
+  check('nested closure cells stay collectable',
+    emit.includes('as_fn_make(${m}__call, (void*)e,'));
+
   // --- GC side ------------------------------------------------------------
   check('as_lentry carries priority and the weak bit',
     runtime.includes('} as_lentry;') && runtime.includes('int priority;') && runtime.includes('unsigned char weak;'));

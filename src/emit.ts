@@ -35280,7 +35280,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) return null;
       // The same Function VALUE the dotted `KC.sm` spelling produces: calling it
       // (in the body) goes through the ordinary as_fn machinery (temp/with3/ C3).
-      return { code: `as_fn_make(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+      return { code: `as_fn_make_method(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
     }
     const sf = cinfo.staticFields.get(name);
     if (sf !== undefined) {
@@ -36984,7 +36984,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
           throw new CodegenError(`static method '${name}' is not accessible here`);
         }
-        return { code: `as_fn_make(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+        return { code: `as_fn_make_method(${sm.owner}_${name}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
       }
     }
     // File-level (top-level) names: AS3's scope chain inside a method is
@@ -37009,7 +37009,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     }
     // A free function used as a value (var f:Function = foo).
     const func = this.symbols.getFunc(name);
-    if (func) return { code: `as_fn_make(${this.freeCName(name)}__call, NULL, ${this.requiredArity(func.params)})`, type: { kind: 'function' } };
+    if (func) return { code: `as_fn_make_method(${this.freeCName(name)}__call, NULL, ${this.requiredArity(func.params)})`, type: { kind: 'function' } };
     // A recursive nested function references its own name (`setTimeout(fn, 1)`);
     // that resolves to a closure over the CURRENT env, not a rebuilt env (which
     // would recurse forever). Only relevant while emitting that function's body.
@@ -37094,7 +37094,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // declared name -- local, class member, module var, free function, nested
     // function, class -- has already had its chance to win.
     const bArity = Emitter.BUILTIN_FN_VALUES.get(name);
-    if (bArity !== undefined) return { code: `as_fn_make(${name}__call, NULL, ${bArity})`, type: { kind: 'function' } };
+    if (bArity !== undefined) return { code: `as_fn_make_method(${name}__call, NULL, ${bArity})`, type: { kind: 'function' } };
     // A bare identifier that resolves nowhere, inside an INSTANCE method of a
     // DYNAMIC class, is `this.<name>` at runtime: AS3 resolves an unqualified name
     // against the instance's own properties, and a dynamic instance's property
@@ -39620,7 +39620,7 @@ void FileStream_writeObject(void* _this, as_value v) {
             throw new CodegenError(`static method '${memberName}' is not accessible here`);
           }
           if (split === chain.length - 1) {
-            return { code: `as_fn_make(${sm.owner}_${memberName}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+            return { code: `as_fn_make_method(${sm.owner}_${memberName}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
           }
           break;
         }
@@ -39692,7 +39692,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           if (!this.symbols.isAccessible(sm.visibility, sm.owner, this.currentClass)) {
             throw new CodegenError(`static method '${expr.property}' is not accessible here`);
           }
-          return { code: `as_fn_make(${sm.owner}_${expr.property}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
+          return { code: `as_fn_make_method(${sm.owner}_${expr.property}__call, NULL, ${this.requiredArity(sm.params)})`, type: { kind: 'function' } };
         }
         if (as3Gap('static field', `${cname}.${expr.property} [in ${this.currentClass}.${this.currentMethod}]`)) return { code: 'as_v_null()', type: { kind: 'any' } };
         throw new CodegenError(`undefined static field '${expr.property}' on class '${cname}'`);

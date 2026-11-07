@@ -3390,8 +3390,10 @@ function checkEmitFreeFunctionNameReservation(): string[] {
     c.includes('static double log__(double x) {'));
   check('the call site is renamed',
     c.includes('log__(((double)(5)))') && c.includes('_log(((double)(2)))'));
+  // Module-level functions are never collected by AIR, so the value goes through
+  // as_fn_make_method (stage 385); the thunk name must still be the renamed symbol.
   check('the Function-value thunk is renamed (`__call` names the same symbol)',
-    c.includes('log____call') && c.includes('as_fn_make(log____call'));
+    c.includes('log____call') && c.includes('as_fn_make_method(log____call'));
 
   // `main` keeps its bespoke rename (user-main.as is the end-to-end pin).
   check('a user `main()` still becomes `asc_user_main`',

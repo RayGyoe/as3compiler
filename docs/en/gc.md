@@ -1125,12 +1125,22 @@ So the implementation reproduces that **asymmetry**, not a blanket weakness:
 
 | Concern | Where |
 |---|---|
-| Method-value detection | `as_closure.is_method`, set only by the three `__bound` thunk sites (`as_fn_make_method`) |
+| Method-value detection | `as_closure.is_method`, set to 1 by `as_fn_make_method`: the three `__bound` thunk sites (instance method values), plus class static method references (bare name in the same class, `Class.name`, `obj.Class.name`), module-level free function values and package-level builtin function values -- nine sites in total |
 | Weak downgrade | `weak = useWeakReference && !listener->is_method` in `addEventListener` |
 | Record | new GC type `GCT_LENTRY`: `{ as_fn fn; int priority; unsigned char weak; }` |
 | Marking | `case GCT_LENTRY` in `gc_scan` does `if (!e->weak) gc_mark_ptr(e->fn);` |
 | Death test | a set of weak closure **addresses** (`as_weak_*`): the sweep marks them freed, allocation revives a reused address |
 | Dispatch | `as_disp_arr` skips `fn == NULL`, then compares addresses via `as_weak_dead` and closes the slot on a hit |
+
+**Why static methods and module-level functions also count as method values**: what AIR does not collect is
+not just `obj.method` but every class-level member function, module-level `function` and package-level builtin --
+all of them are strongly held by global structures. Marking only `__bound` misses the `TweenLite` shape
+`addEventListener(Event.ENTER_FRAME, updateAll, false, 0, true)` (`updateAll` is a static method of the same
+class): the closure was collected as a weak reference, the tween engine stopped and the whole application UI
+stopped refreshing. Conversely, **anonymous and named function expressions must stay collectable** (the
+`FunctionExpr` site and the nested-closure cell site keep plain `as_fn_make`) -- those are the nested inner
+functions AIR does collect. Items H/I/J of `examples/weak-listener.as` pin this boundary.
+
 
 **Why the death test is a separate address set instead of reading the object header**: a freed block
 address still lies inside the GC segments, so `gc_in_heap()` is always true, and dereferencing a freed

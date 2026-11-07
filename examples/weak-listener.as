@@ -145,5 +145,49 @@ for (var g:int = 0; g < 3; g++) {
 }
 check("G closed weak slot stays silent", log.join(","), "");
 
+// --- H: a weak registration of a STATIC method still runs ----------------
+//
+// This is the shape that broke the real app: TweenLite does
+//   addEventListener(Event.ENTER_FRAME, updateAll, false, 0, true)
+// where updateAll is a static method of the same class. AIR never collects a
+// class-level member function, so the tween engine keeps ticking; treating that
+// closure as weakly-held collected it on the first GC and every Tween -- and with
+// them the whole UI refresh -- stopped.
+class StaticDriver {
+  public static var hits:int = 0;
+  public static function onTick(e:Event):void { hits++; }
+  public static function install(d:EventDispatcher):void {
+    d.addEventListener("e", onTick, false, 0, true);   // bare name, same class
+  }
+}
+var dH:EventDispatcher = new EventDispatcher();
+StaticDriver.install(dH);
+churn();
+System.gc();
+StaticDriver.hits = 0;
+dH.dispatchEvent(new Event("e"));
+check("H weak static method (bare name) still runs", String(StaticDriver.hits), "1");
+
+// --- I: the dotted spelling of the same thing ----------------------------
+var dI:EventDispatcher = new EventDispatcher();
+dI.addEventListener("e", StaticDriver.onTick, false, 0, true);
+churn();
+System.gc();
+StaticDriver.hits = 0;
+dI.dispatchEvent(new Event("e"));
+check("I weak static method (Class.name) still runs", String(StaticDriver.hits), "1");
+
+// --- J: a module-level free function registered weakly still runs --------
+// AIR holds top-level functions through the global object, so they are not
+// collectable either; only nested inner functions are.
+function freeHandler(e:Event):void { rec("free"); }
+var dJ:EventDispatcher = new EventDispatcher();
+dJ.addEventListener("e", freeHandler, false, 0, true);
+churn();
+System.gc();
+reset();
+dJ.dispatchEvent(new Event("e"));
+check("J weak module-level function still runs", log.join(","), "free");
+
 if (defecit.length > 0) throw new Error(defecit.join("\n"));
 trace("weak_listener: all assertions passed");
