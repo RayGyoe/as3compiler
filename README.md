@@ -632,6 +632,7 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
 - `examples/textline.as` — `TextField.getLineMetrics` / `TextLineMetrics`
 - `examples/htmltext-metrics.as` — `TextField.getLineText`, `htmlText` block line heights, a stylesheet rule's `leading`, and "a trailing empty line adds no `textHeight`" (needs a text backend for the height half)
 - `examples/textwidth-trailing.as` — `textWidth`/`getLineMetrics` **include** trailing blanks (relational assertions; self-skips without a text backend)
+- `examples/text-letterspacing.as` — `TextFormat.letterSpacing` **reaches the shaper** (stage 386, G32): `Δwidth = characters × letterSpacing` (SkParagraph adds it per cluster, same pixel unit); re-filling the text after an edit gives the new layout (relational assertions; self-skips without a text backend)
 - `examples/text-edit-api.as` — `replaceText`/`replaceSelectedText` range+selection contract, assigning `.text` resets the caret/selection to 0, `setSelection(0,0)` collapses
 - `examples/textformat-merge.as` — `TextFormat`'s "unset means keep" per-field merge, the copy-returning getter, insert-time binding
 - `examples/bytearray-index.as` — the full semantics of the `ByteArray` index form

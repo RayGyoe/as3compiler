@@ -437,6 +437,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 对**行尾空白**的口径（adl 含尾空格，Skia 的 getLongestLine 不含），全是 Skia 文本后端下的
   // 关系式；纯 C 构建下 textWidth 恒 0，示例自行 skip。同样共用这份 Skia 清单。
   'textwidth-trailing.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // text-letterspacing.as (阶段三百八十六 · G32): TextFormat.letterSpacing must reach the
+  // shaper -- Δwidth = characters × letterSpacing -- and the paragraph cache must follow
+  // the format. Needs the same Skia text backend as the metric examples above.
+  'text-letterspacing.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
   // text-edit-api.as（阶段三百三十七）钉 replaceText/replaceSelectedText 的区间与
   // 选区口径、赋 .text 重置光标、setSelection(0,0) 收缩；与字体无关，无特殊清单。
   'text-edit-api.as': [],

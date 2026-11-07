@@ -46,6 +46,8 @@
 #include "skia_glue_internal.h"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -289,11 +291,13 @@ static SkAirLineMetrics sk_air_line_metrics(const char* family, double size, int
   font.getMetrics(&m);
   out.asc = sk_round_half(-m.fAscent);
   out.desc = sk_round_half(m.fDescent);
-  out.model = out.asc + out.desc;
   out.rawSum = -m.fAscent + m.fDescent;
   out.rawFull = out.rawSum + m.fLeading;
+  out.model = out.asc + out.desc;
   return out;
 }
+
+
 
 static double sk_air_line_height(const char* family, double size, int bold, int italic) {
   return sk_air_line_metrics(family, size, bold, italic).model;
@@ -316,6 +320,7 @@ static void sk_set_air_strut(skia::textlayout::ParagraphStyle& ps, const char* f
   if (size <= 0.0 || am.model <= 0.0 || am.rawSum <= 0.0) return;
   double box = am.model + leading;  // AIR's per-line height, px leading included
   if (box <= 0.0) return;
+
   StrutStyle strut;
   strut.setStrutEnabled(true);
   strut.setFontSize((SkScalar)size);
@@ -331,7 +336,6 @@ static void sk_set_air_strut(skia::textlayout::ParagraphStyle& ps, const char* f
   strut.setHeight((SkScalar)(box * am.rawFull / (am.rawSum * size)));
   strut.setHeightOverride(true);
   strut.setForceStrutHeight(true);
-  ps.setStrutStyle(strut);
   ps.setStrutStyle(strut);
 }
 
@@ -553,8 +557,8 @@ void* sk_textlayout_new(const char* text, const char* family, double size, int b
 // share strutHeight = font natural height + leading, matching AIR's uniform
 // line height for a single defaultTextFormat.
 void* sk_textlayout_new_leading(const char* text, const char* family, double size, int bold,
-                                int italic, unsigned color, double leading, double width,
-                                int align, int collapseNewlines) {
+                                int italic, unsigned color, double leading, double letterSpacing,
+                                double width, int align, int collapseNewlines) {
   if (text == NULL) return nullptr;
   using namespace skia::textlayout;
 
@@ -565,6 +569,8 @@ void* sk_textlayout_new_leading(const char* text, const char* family, double siz
                               SkFontStyle::kNormal_Width,
                               italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
   ts.setFontFamilies({ SkString(sk_family_alias(family)) });
+  // G32: TextFormat.letterSpacing (px) reaches the shaper here.
+  if (letterSpacing != 0.0) ts.setLetterSpacing((SkScalar)letterSpacing);
 
   ParagraphStyle ps;
   ps.setTextStyle(ts);
@@ -595,6 +601,10 @@ struct sk_text_run {
   int italic;
   unsigned color;
   double leading;
+  // G32: TextFormat.letterSpacing, in PIXELS. SkParagraph adds this to every
+  // cluster advance (Run::addSpacesEvenly), and AIR's TextFormat.letterSpacing is
+  // pixels too, so it crosses the seam unconverted.
+  double letterSpacing;
   // G28: TextFormat.underline. Not an input to layout (AIR's textWidth /
   // textHeight / getLineMetrics are bit-identical with and without it --
   // temp/g28/air-out-1.txt LAYOUT/LM lines) -- the paint pass reads it to
@@ -625,6 +635,8 @@ void* sk_textlayout_new_runs(const char* text, const sk_text_run* defaultStyle,
                                 SkFontStyle::kNormal_Width,
                                 r.italic ? SkFontStyle::kItalic_Slant : SkFontStyle::kUpright_Slant));
     ts.setFontFamilies({ SkString(sk_family_alias(r.family)) });
+    // G32: px per cluster, straight through (SkParagraph and AIR both use px).
+    if (r.letterSpacing != 0.0) ts.setLetterSpacing((SkScalar)r.letterSpacing);
     sk_set_air_run_height(ts, r.family, r.size, r.bold, r.italic, r.leading);
     return ts;
   };

@@ -10667,7 +10667,7 @@ static as_value as_json_parse(char* s) {
 // DisplayObject.render() will drive these through as_skia_* semantic wrappers.
 // sk_text_run is defined unconditionally (a plain C struct, no Skia symbols)
 // because the TextField runtime references it even in pure-C builds.
-typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; int underline; } sk_text_run;
+typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; double letterSpacing; int underline; } sk_text_run;
 // Graphics draw groups (swc.md §9 E). AIR paints each beginFill/endFill group
 // independently, so a single "one path + one fill + one stroke" pair cannot
 // represent two overlapping fills or two strokes of different colour: the last
@@ -11005,7 +11005,7 @@ extern void sk_canvas_draw_text_n(void* canvas, const char* text, int len, doubl
 extern double sk_text_measure(const char* text, double size, int bold, int italic);
 extern double sk_text_measure_n(const char* text, int len, double size, int bold, int italic);
 extern void* sk_textlayout_new(const char* text, const char* family, double size, int bold, int italic, unsigned color, double width, int align, int collapseNewlines);
-extern void* sk_textlayout_new_leading(const char* text, const char* family, double size, int bold, int italic, unsigned color, double leading, double width, int align, int collapseNewlines);
+extern void* sk_textlayout_new_leading(const char* text, const char* family, double size, int bold, int italic, unsigned color, double leading, double letterSpacing, double width, int align, int collapseNewlines);
 extern double sk_textlayout_height(void* para);
 extern double sk_textlayout_max_width(void* para);
 // Longest line INCLUDING trailing blanks = AIR's TextField.textWidth. Skia's own
@@ -11308,7 +11308,7 @@ static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, d
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { return sk_text_measure(t, sz, bold, italic); }
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { return sk_text_measure_n(t, len, sz, bold, italic); }
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { return sk_textlayout_new(t, fam, sz, bold, italic, color, w, align, collapse); }
-static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { return sk_textlayout_new_leading(t, fam, sz, bold, italic, color, leading, w, align, collapse); }
+static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls, double w, int align, int collapse) { return sk_textlayout_new_leading(t, fam, sz, bold, italic, color, leading, ls, w, align, collapse); }
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { return sk_textlayout_new_runs(t, def, runs, n, w, align, collapse); }
 static inline double as_skia_textlayout_height(void* p) { return sk_textlayout_height(p); }
 static inline double as_skia_textlayout_max_width(void* p) { return sk_textlayout_max_width(p); }
@@ -11339,7 +11339,7 @@ static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, d
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { (void)t; (void)sz; (void)bold; (void)italic; as_text_engine_absent(); return 0.0; }
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { (void)t; (void)len; (void)sz; (void)bold; (void)italic; as_text_engine_absent(); return 0.0; }
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
-static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
+static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)ls; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
@@ -12154,7 +12154,7 @@ static inline void as_skia_canvas_draw_text_n(void* c, const char* t, int len, d
 static inline double as_skia_text_measure(const char* t, double sz, int bold, int italic) { (void)t; (void)sz; (void)bold; (void)italic; return 0.0; }
 static inline double as_skia_text_measure_n(const char* t, int len, double sz, int bold, int italic) { (void)t; (void)len; (void)sz; (void)bold; (void)italic; return 0.0; }
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; return NULL; }
-static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; return NULL; }
+static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)ls; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; return NULL; }
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }

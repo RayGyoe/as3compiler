@@ -2086,6 +2086,7 @@ export class Emitter {
           this.line('unsigned _para_color;');
           this.line('int _para_collapse;');
           this.line('double _para_leading;');
+    this.line('double _para_ls;');
           this.line('int _para_align;');
           // Rich-text (run) invalidation counter: the cached paragraph is keyed on
           // the runs' CONTENT, but runs are appended into one Array whose address
@@ -24645,6 +24646,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->_para_color = 0u;');
     this.line('o->_para_collapse = 0;');
     this.line('o->_para_leading = 0.0;');
+    this.line('o->_para_ls = 0.0;');
     this.line('o->_para_align = 0;');
     this.line('o->_mask = NULL;');
     this.line('o->_mask_src = NULL;');
@@ -24734,6 +24736,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int bold = as_v_bool_val(fmt->bold) ? 1 : 0;');
     this.line('int italic = as_v_bool_val(fmt->italic) ? 1 : 0;');
     this.line('double leading = as_v_num_val(fmt->leading);');
+    this.line('double letterSpacing = as_v_num_val(fmt->letterSpacing);');
     // textColor (default 0 = black) overrides defaultTextFormat.color for plain
     // text; a field keeps fmt->color when textColor is left at its default.
     this.line('unsigned color = (tf->textColor != 0u) ? tf->textColor : (unsigned)as_v_num_val(fmt->color);');
@@ -24798,6 +24801,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (tf->_para != NULL && tf->_para_text == ltext && tf->_para_w == w &&');
     this.line('    tf->_para_size == size && tf->_para_bold == bold && tf->_para_italic == italic &&');
     this.line('    tf->_para_color == color && tf->_para_collapse == collapse && tf->_para_leading == leading &&');
+    this.line('    tf->_para_ls == letterSpacing &&');
     this.line('    tf->_para_align == layoutAlign &&');
     this.line('    tf->_para_runs_gen == tf->_runs_gen) {');
     this.indent++;
@@ -24827,6 +24831,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('runs[i].italic = as_v_bool_val(rf->italic) ? 1 : 0;');
     this.line('runs[i].color = (unsigned)as_v_num_val(rf->color);');
     this.line('runs[i].leading = as_v_num_val(rf->leading);');
+    this.line('runs[i].letterSpacing = as_v_num_val(rf->letterSpacing);');
     // G28: underline is NOT a layout input (AIR's textWidth/textHeight/getLineMetrics
     // are identical with and without it, temp/g28/air-out-1.txt), so this only feeds
     // the paint pass; the paragraph cache key therefore stays as it is.
@@ -24839,7 +24844,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // adl -- see sk_set_air_run_height in vendor/skia_text_glue.cc).
     this.line('sk_text_run dr;');
     this.line('dr.start = 0; dr.end = 0; dr.family = fmt->font; dr.size = size;');
-    this.line('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading; dr.underline = as_v_bool_val(fmt->underline) ? 1 : 0;');
+    this.line('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading; dr.letterSpacing = letterSpacing; dr.underline = as_v_bool_val(fmt->underline) ? 1 : 0;');
     this.line('double pw = w; int pa = layoutAlign;');
     this.line('if (w <= 0.0 && layoutAlign != 0) {');
     this.indent++;
@@ -24856,13 +24861,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('double pw = w; int pa = layoutAlign;');
     this.line('if (w <= 0.0 && layoutAlign != 0) {');
     this.indent++;
-    this.line('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, 0.0, 0, collapse);');
+    this.line('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, letterSpacing, 0.0, 0, collapse);');
     this.line('double m = as_skia_textlayout_text_width(pp);');
     this.line('as_skia_textlayout_delete(pp);');
     this.line('if (m > 0.0) pw = m + 1.0; else pa = 0;');
     this.indent--;
     this.line('}');
-    this.line('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, pw, pa, collapse);');
+    this.line('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, letterSpacing, pw, pa, collapse);');
     this.indent--;
     this.line('}');
     this.line('tf->_para_text = ltext;');
@@ -24873,6 +24878,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('tf->_para_color = color;');
     this.line('tf->_para_collapse = collapse;');
     this.line('tf->_para_leading = leading;');
+    this.line('tf->_para_ls = letterSpacing;');
     this.line('tf->_para_align = layoutAlign;');
     this.line('tf->_para_runs_gen = tf->_runs_gen;');
     this.line('return tf->_para;');
@@ -30691,7 +30697,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (tf->_comp != NULL && tf->_comp[0] != 0) {');
     this.indent++;
     this.line('TextFormat* kcf = as_tf_base_fmt(tf);');
-    this.line('void* kcp = as_skia_textlayout_new_leading(tf->_comp, kcf->font, as_v_num_val(kcf->size), as_v_bool_val(kcf->bold) ? 1 : 0, as_v_bool_val(kcf->italic) ? 1 : 0, 0u, as_v_num_val(kcf->leading), 0.0, 0, 1);');
+    this.line('void* kcp = as_skia_textlayout_new_leading(tf->_comp, kcf->font, as_v_num_val(kcf->size), as_v_bool_val(kcf->bold) ? 1 : 0, as_v_bool_val(kcf->italic) ? 1 : 0, 0u, as_v_num_val(kcf->leading), as_v_num_val(kcf->letterSpacing), 0.0, 0, 1);');
     this.line('if (kcp != NULL) { kdx = as_tf_longest_line(kcp); as_skia_textlayout_delete(kcp); }');
     this.indent--;
     this.line('}');
@@ -30729,7 +30735,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // The paint side: the geometry and colour the preview is drawn with, which is what
     // a caret/preview mismatch in the field is diagnosed against.
     this.line('if (getenv("ASC_IME_TRACE") != NULL) fprintf(stderr, "ime_paint comp=\\"%s\\" caret=%d x=%.2f y=%.2f h=%.2f col=%06x\\n", tf->_comp, as_tf_caret(tf), ccx, ccy, cch, ccol);');
-    this.line('void* cpara = as_skia_textlayout_new_leading(tf->_comp, cf->font, as_v_num_val(cf->size), as_v_bool_val(cf->bold) ? 1 : 0, as_v_bool_val(cf->italic) ? 1 : 0, ccol, as_v_num_val(cf->leading), 0.0, 0, 1);');
+    this.line('void* cpara = as_skia_textlayout_new_leading(tf->_comp, cf->font, as_v_num_val(cf->size), as_v_bool_val(cf->bold) ? 1 : 0, as_v_bool_val(cf->italic) ? 1 : 0, ccol, as_v_num_val(cf->leading), as_v_num_val(cf->letterSpacing), 0.0, 0, 1);');
     this.line('if (cpara != NULL) {');
     this.indent++;
     this.line('double px = 2.0 + alignDx - scrollX + ccx;');

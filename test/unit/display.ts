@@ -630,12 +630,12 @@ function checkLineMetrics(): string[] {
   // two stages sum to AIR's per-line offset (the M terms cancel, hence the +1).
   check('a width-less field hands its align to the paragraph, sized to its longest line',
     emitted.includes('if (w <= 0.0 && (align == 1 || align == 2)) layoutAlign = align;') &&
-    emitted.includes('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, 0.0, 0, collapse);') &&
+    emitted.includes('void* pp = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, letterSpacing, 0.0, 0, collapse);') &&
     emitted.includes('void* pr = as_skia_textlayout_new_runs(ltext, &dr, runs, n, 0.0, 0, collapse);') &&
     emitted.includes('sk_text_run dr;') &&
     emitted.includes('dr.family = fmt->font; dr.size = size;') &&
     emitted.includes('if (m > 0.0) pw = m + 1.0; else pa = 0;') &&
-    emitted.includes('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, pw, pa, collapse);') &&
+    emitted.includes('tf->_para = as_skia_textlayout_new_leading(ltext, fmt->font, size, bold, italic, color, leading, letterSpacing, pw, pa, collapse);') &&
     emitted.includes('tf->_para = as_skia_textlayout_new_runs(ltext, &dr, runs, n, pw, pa, collapse);'));
   // justify needs a wrap width to stretch into: it is left to the old path.
   check('justify keeps the old path (only center/right are carried into a width-less paragraph)',
@@ -1455,9 +1455,9 @@ function checkUnderline(): string[] {
   check('the per-run builder copies TextFormat.underline onto the run',
     emitted.includes('runs[i].underline = as_v_bool_val(rf->underline) ? 1 : 0;'));
   check('the default style carries it too (that is what fills run gaps)',
-    emitted.includes('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading; dr.underline = as_v_bool_val(fmt->underline) ? 1 : 0;'));
+    emitted.includes('dr.bold = bold; dr.italic = italic; dr.color = color; dr.leading = leading; dr.letterSpacing = letterSpacing; dr.underline = as_v_bool_val(fmt->underline) ? 1 : 0;'));
   check('sk_text_run declares the field in the C struct',
-    gen.includes('typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; int underline; } sk_text_run;'));
+    gen.includes('typedef struct { unsigned start; unsigned end; const char* family; double size; int bold; int italic; unsigned color; double leading; double letterSpacing; int underline; } sk_text_run;'));
   // The C and C++ sides of the bridge are two copies of one struct; a field added to
   // only one of them silently reads garbage. Compare the field NAME sequences.
   const rtStruct = (runtime.match(/typedef struct \{ unsigned start;[\s\S]*?\} sk_text_run;/) || [''])[0];
@@ -1471,9 +1471,32 @@ function checkUnderline(): string[] {
   const rtFields = fieldsOf(rtStruct, false);
   const ccFields = fieldsOf(ccStruct, true);
   check('runtime.ts and the glue declare sk_text_run with the same fields, in the same order',
-    rtFields.length === 9 && rtFields.join(',') === ccFields.join(','));
+    rtFields.length === 10 && rtFields.join(',') === ccFields.join(','));
+  // G32: letterSpacing crosses the same C/C++ seam in the slot right before underline,
+  // so adding it to one side only would silently read the wrong double.
+  check('...and letterSpacing sits between leading and underline on both sides',
+    rtFields[8] === 'letterSpacing' && ccFields[8] === 'letterSpacing' && rtFields[7] === 'leading');
+
+  // ---- G32: letterSpacing must reach the shaper, not just the TextFormat ----
+  check('TextFormat.letterSpacing is read into a local, stored on the run and on the default run',
+    emitted.includes('double letterSpacing = as_v_num_val(fmt->letterSpacing);') &&
+    emitted.includes('runs[i].letterSpacing = as_v_num_val(rf->letterSpacing);') &&
+    emitted.includes('dr.letterSpacing = letterSpacing;'));
+  // An edit that only changes the tracking must rebuild the paragraph, or the old
+  // layout is reused and the new spacing never shows up.
+  check('letterSpacing is part of the paragraph cache key',
+    emitted.includes('tf->_para_ls == letterSpacing &&') &&
+    emitted.includes('tf->_para_ls = letterSpacing;') &&
+    gen.includes('double _para_ls;'));
+  // AIR and SkParagraph both express it in pixels (Run::addSpacesEvenly adds the
+  // raw value to every cluster), so the seam must not divide by the font size.
+  check('both paragraph builders forward the px value unconverted',
+    glue.includes('ts.setLetterSpacing((SkScalar)r.letterSpacing)') &&
+    glue.includes('ts.setLetterSpacing((SkScalar)letterSpacing)') &&
+    glue.includes('double letterSpacing,') &&
+    glue.includes('color, leading, letterSpacing, double width') === false);
   check('...and underline is one of them on both sides',
-    rtFields[8] === 'underline' && ccFields[8] === 'underline');
+    rtFields[9] === 'underline' && ccFields[9] === 'underline');
 
   // ---- the seam exists in every build shape ----------------------------
   // Three definitions (Skia linked / text engine absent / pure C) plus the extern.
