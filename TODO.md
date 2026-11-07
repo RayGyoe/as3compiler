@@ -20950,3 +20950,48 @@ A/B 环保留、表满时 flush 而不是静默丢弃、定义先于使用）；
 
 ### 遗留待开发` 之前（= 末尾），不要插到某个「看起来该在这儿」的锚点上** —— 历史上有好几轮是插到固定锚点，插一次没事，插多了就形成逆序块（曾出现 `196→…→182` 整块逆序、`138`/`139` 对调、`178·九→·八→·七` 逆序）。`### Flappy-Starling…` 与 `### 下一阶段路线图…` 两个非阶段节是**其后那个阶段节的序言**，随它一起移动。
 - 实现任何新特性前，先查 [AS3 语言参考](https://airsdk.dev/reference/actionscript/3.0/) 的真实语义，尤其注意 AS3 与 C 的语义差异（`/` 恒 Number、字符串装箱、`Number` 默认 NaN 等），把差异写进注释再编码。
+
+### 阶段三百八十七：TextField 的渲染边界套用 autoSize（文字变长后第一次重画被裁）
+
+**症状（外部报告，真机）**：ui 库的文档应用里换页后，标题/正文的新文字**第一次画出来时右端被切**，
+下一次重画才补全 —— 用户描述为「最后一截字晚一点才出现」，两帧截图只有正文行末端不同。
+
+**先排除的两条**：不是库侧 `measureField` 的测量缓存（命中只表示文本没变、可跳过重写，而每次渲染都在
+写入之后），也不是「跳过无变化的呈现」（`ASC_NO_PRESENT_SKIP=1` 仍复现）。
+
+**确定性复现（`temp/repro-bake/`，最小 60 行）**：`autoSize=left` 的 TextField 放在会被 auto-bake 的
+Sprite 里，心跳图形让窗口每帧 present（22 帧后烘焙面就位）；**同一个 timer 回调内**把文本从 `"ab"`
+换成 26 字符，然后连做两次整舞台 `BitmapData.draw`（中间不插帧）：
+
+| 臂 | 改后第一次重画 | 第二次 |
+|---|---|---|
+| 修前 | `ink.right=49`（旧盒 30 宽 ⇒ 20+30，只画出前两个字母） | `358`（完整） |
+| `ASC_NO_AUTO_BAKE=1` | `358` | `358` |
+| `ASC_NO_PRESENT_SKIP=1` | `49` | `358` |
+| 修后 | `358` | `358` |
+
+**根因**：`TextField_set_text` 只作废段落，**不动** `_fieldWidth`；把它更新成新盒的 `as_tf_apply_autosize`
+原本只在**绘制**（字段自己的 paint 分支）与 `width`/`height`（`as_do_extents`）里被调用。两个**算盒**
+入口都只读裸 `_fieldWidth`：`as_bounds_walk`（getBounds/getRect/父级并集）与 `as_render_bounds`
+（烘焙与滤镜表面尺寸，其注释本就写明「这块盒专用于烘焙/滤镜面尺寸与父级并集」）⇒ 保留面按**上一段
+文字**的宽度建，画进去的却是新文字，右端被裁。绘制本身没错（paint 先 autoSize 再 `clip_rect`）：错的
+是**面**。文本越界只在表面边缘被切，所以表现为「少一截」而不是「报错/重叠」。
+
+**修法**：两个 TextField 分支在读 `_fieldWidth` 之前各加 `as_tf_apply_autosize(tf);`（与 `as_do_extents`
+里既有的那一行同因）。幂等：`autoSize=none` 直接返回，段落已缓存时只是读最长行。
+
+**示例 / 钉子**：`examples/tf-grow-bake.as`（像素：改后第一次 `ink.right` 必须等于第二次，另加「长串必须
+真的更宽」防烘焙未生效时的假绿；修前 `first=47 second=332`，修后两次都 `332`）；
+`test/unit/render.ts` 新增 `unit: render/TextFieldBoundsAutosize`（6 项：两个分支「先 autoSize 后读
+`_fieldWidth`」、`width/height` 既有调用不丢、paint 仍然先 autoSize、`as_tf_apply_autosize(` 全库 7 处
+定数；去掉两行即 3 项红）。
+
+**回归**：`node test.ts` **651 tests / 629 pass / 19 fail / 3 skipped**（418 s）。19 个失败与上一阶段同一批：
+除 `zlib.h file not found` 等 Windows 既有环境限制外，还包括本机字体度量相关的 `htmltext-metrics.as` /
+`text-underline.as` —— 这 8 个失败示例在**未打补丁的树上逐一复跑，同样全红**（`temp/subset-pristine.log`），
+故与本次改动无关。⚠️ 本机 `cc` 不在 PATH（只有 clang），全量跑时用一个 `cc` → `clang` 的转发垫片
+（`temp/ccshim/`，只转发 argv，不改命令行）把测试框架默认的 `cc` 解析到 LLVM，否则所有不带 manifest 的
+示例都会以「compiler not found: cc」失败。
+另：`asaotui` 全量门 **70/70 PASS**（含 `layout-check text
+half` 133 检查、`gallery tour` 60 页手算矩形、`descriptor DPI A/B`、G19/G20/G21 的 AIR 对照、
+`widgets/textfx`、`widgets/static-layer`）。

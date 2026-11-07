@@ -29006,6 +29006,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (as_is((void*)o, &TextField_vt)) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)o;');
+    // Settle autoSize before answering the box. `tf.text = ...` only invalidates the
+    // paragraph; _fieldWidth keeps the PREVIOUS run's box until something autosizes
+    // it (the draw, or the width/height getters). Reporting that stale box makes a
+    // parent's union too small -- and getBounds/getRect would answer with the old
+    // run's size. The draw autosizes first thing, so the box that is about to be
+    // painted IS the autosized one: the bounds walk has to describe that one.
+    // (examples/tf-grow-bake.as pins the pixel side of this.)
+    this.line('as_tf_apply_autosize(tf);');
     this.line('double fl = 0.0, ft = 0.0, fr = tf->_fieldWidth, fb = tf->_fieldHeight;');
     this.line('if (!found) { *l = fl; *t = ft; *r = fr; *b = fb; found = 1; }');
     this.line('else { if (fl < *l) *l = fl; if (ft < *t) *t = ft; if (fr > *r) *r = fr; if (fb > *b) *b = fb; }');
@@ -29189,6 +29197,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (as_is(o, &TextField_vt)) {');
     this.indent++;
     this.line('TextField* tf = (TextField*)o;');
+    // Same reason as as_bounds_walk's TextField branch: this box sizes the bake /
+    // filter surface, so it has to be the box the draw will actually use, i.e. the
+    // autoSized one. Without this a field whose text just grew is repainted into a
+    // surface sized for the OLD run, and the overflow is clipped away -- the tail of
+    // the line only shows up on the next render (examples/tf-grow-bake.as).
+    this.line('as_tf_apply_autosize(tf);');
     // The border's right/bottom lines sit ON x=width / y=height, one pixel outside
     // the background fill (measured, Ed6.as), so a bordered field's drawn extent is
     // (width+1)x(height+1). This box is only used to size bake/filter surfaces

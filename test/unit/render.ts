@@ -3002,3 +3002,59 @@ function checkBakeReleaseOnRemove(): string[] {
   return bad;
 }
 registerGroup('unit: render/BakeReleaseOnRemove', checkBakeReleaseOnRemove);
+
+// ---- TextFieldBoundsAutosize: 算盒入口必须先套 autoSize（G34） ----
+//
+// 症状：文字一变长，改后的**第一次**重画右端被裁，第二次才完整 —— 真机表现是「最后一截字
+// 晚一点才出现」。不是度量问题（宽度数字本身是对的），错的是「拿哪个宽度去建烘焙面」：
+// `tf.text = …` 只作废段落，`_fieldWidth` 要等 `as_tf_apply_autosize` 才跟上新文本，而它原本
+// 只在**绘制**（字段自己的 paint 分支）与 `width`/`height`（`as_do_extents`）里被调用；两个
+// 算盒入口 —— `as_bounds_walk`（getBounds/getRect/父级并集）与 `as_render_bounds`（烘焙与
+// 滤镜表面尺寸）—— 直接读裸字段 ⇒ 保留面按上一段文字的宽度建，新文字画进去就被裁掉。
+// 像素侧由 `examples/tf-grow-bake.as` 钉住（修前 first=47 second=332），这里钉生成 C 的形态。
+function checkTextFieldBoundsAutosize(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tfbounds] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tfbounds] ${label}`); }
+  };
+
+  const c = generateC(parse(
+    'import flash.display.TextField;\nvar t:TextField = new TextField();\n')).c;
+
+  // 只取**定义**（形参里没有右括号，故 [^)]* 安全）：同名的前向声明以 ; 结尾，正则跳过它。
+  const walkDef = /static int as_bounds_walk\([^)]*\) \{/.exec(c);
+  const renderDef = /static int as_render_bounds\([^)]*\) \{/.exec(c);
+  check('both bounds walkers are defined, walk before render',
+    walkDef !== null && renderDef !== null && walkDef.index < renderDef.index);
+
+  const walkBody = (walkDef && renderDef) ? c.slice(walkDef.index, renderDef.index) : '';
+  const renderBody = renderDef ? c.slice(renderDef.index, renderDef.index + 9000) : '';
+
+  // 分支窗口：从 &TextField_vt 判定起 300 字符内必须「先 autoSize、后读 _fieldWidth」。
+  const branchOrder = (body: string): { call: number; read: number } => {
+    const i = body.indexOf('&TextField_vt');
+    if (i < 0) return { call: -1, read: -1 };
+    const win = body.slice(i, i + 300);
+    return { call: win.indexOf('as_tf_apply_autosize(tf);'), read: win.indexOf('tf->_fieldWidth') };
+  };
+  const wb = branchOrder(walkBody);
+  const rb = branchOrder(renderBody);
+  check('as_bounds_walk autosizes before answering the box (getBounds/getRect/parent union)',
+    wb.call >= 0 && wb.read > wb.call);
+  check('as_render_bounds autosizes before sizing the bake/filter surface',
+    rb.call >= 0 && rb.read > rb.call);
+  check('width/height keeps its autosize (as_do_extents)',
+    c.includes('if (as_is((void*)o, &TextField_vt)) as_tf_apply_autosize((TextField*)o);'));
+  check('the field paint still autosizes first, so the box above is the painted one',
+    c.includes('if (tf->text != NULL && as_tf_base_fmt(tf) != NULL) {\n      as_tf_apply_autosize(tf);'));
+  // 7 = 1 前向声明 + 1 定义 + 5 调用点（烘焙落点、bounds walk、width/height、render bounds、paint）。
+  // 定数钉子：任何一处被删、或被挪出算盒路径，都会当场红。
+  check('every autosize call site is still there (5 call sites + decl + definition)',
+    (c.match(/as_tf_apply_autosize\(/g) ?? []).length === 7);
+
+  console.log(`[tfbounds] ${ok} TextField bounds/autoSize checks passed`);
+  return bad;
+}
+registerGroup('unit: render/TextFieldBoundsAutosize', checkTextFieldBoundsAutosize);

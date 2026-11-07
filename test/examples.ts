@@ -462,6 +462,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 写进 _fieldWidth 后整个子树（含 Stage）的 getBounds 变成 +-3.4028235e38。度量只在 Skia
   // 文本后端下存在，故与 autosize-metrics.as 一样链 Skia。
   'tf-autosize-empty.as': ['--manifest', join(dir, 'tf-autosize-empty.build.json')],
+  // tf-grow-bake.as（G34）断言的是**像素**：`tf.text` 变长后，改后的**第一次**重画必须已经完整
+  // —— 烘焙/滤镜表面的尺寸来自 as_render_bounds，而它曾直接读还没被 autoSize 更新的 `_fieldWidth`，
+  // 于是保留面按上一段文字建、新文字右端被裁，下一次重画才补上（真机「最后一截字晚一点才出现」）。
+  // 断言要读回真实字形，纯 C 构建没有光栅后端（draw 是空桩），故与 tf-scale-metrics.as 一样链 Skia。
+  'tf-grow-bake.as': ['--manifest', join(dir, 'tf-scale-metrics.build.json')],
   // sbtn-null-up.as 断言的也是**像素**（`upState==NULL` 时 `BitmapData.draw` 什么都不能画、
   // 有 up 态时画的正是 up 态），而纯 C 构建没有光栅后端（draw 是空桩），故与 bakecrisp.as 一样链 Skia。
   'sbtn-null-up.as': ['--manifest', join(dir, 'sbtn-null-up.build.json')],
