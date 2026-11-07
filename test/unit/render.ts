@@ -2977,10 +2977,19 @@ function checkBakeReleaseOnRemove(): string[] {
     c.includes('if (was_on_stage) as_bake_pend_push(child);'));
   check('the enqueue happens after the BitmapData back-edge is cut',
     c.indexOf('if (was_on_stage) as_bake_pend_push(child);') > c.indexOf('as_disp_unbind_bd(child);'));
-  check('the sweep keeps a node that came back on stage (virtual-list reuse)',
-    c.includes('if (as_on_stage(o)) continue;'));
-  check('the sweep skips slots whose owner was already collected',
-    c.includes('if (!gc_in_heap((void*)o)) continue;'));
+  // 阶段三百八十四·修复：sweep 不再解引用 pending 项（那里曾是崩溃点）。
+  check('a node that comes back on stage is dropped at addChild time, not by re-reading parent',
+    c.includes('as_bake_pend_drop(child);') &&
+    !c.includes('if (as_on_stage(o)) continue;'));
+  check('the sweep never tests gc_in_heap or parent on a possibly recycled slot',
+    !c.includes('if (!gc_in_heap((void*)o)) continue;'));
+  check('releasing a node whose owner the collector already freed is a no-op (no double free)',
+    ro.includes('if (!as_final_has_owner((void*)o)) return;'));
+  check('a resource is deleted only when its registration was actually still present',
+    ro.includes('if (as_final_release((void*)o, o->_cache_image)) as_skia_image_delete') &&
+    ro.includes('if (as_final_release((void*)o, o->_cache_surface)) as_skia_surface_delete'));
+  check('both addChild and addChildAt revoke the pending release',
+    c.split('as_bake_pend_drop(child);').length - 1 === 2);
   check('both frame entry points advance the sweep (window frame + headless render)',
     c.split('as_bake_pend_sweep();').length - 1 === 2);
   check('the release path keeps an A/B switch like ASC_NO_FINAL',

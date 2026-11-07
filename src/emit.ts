@@ -13305,10 +13305,28 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('static void as_bake_release_one(DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL) return;');
-    this.line('if (o->_cache_image != NULL) { as_final_release((void*)o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
-    this.line('if (o->_cache_surface != NULL) { as_final_release((void*)o, o->_cache_surface); as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }');
+    // Alive check first: a recycled slot still sits inside a GC segment, so an
+    // address test is not enough, and has_owner never dereferences o.
+    this.line('if (!as_final_has_owner((void*)o)) return;');
+    this.line('if (o->_cache_image != NULL) { if (as_final_release((void*)o, o->_cache_image)) as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
+    this.line('if (o->_cache_surface != NULL) { if (as_final_release((void*)o, o->_cache_surface)) as_skia_surface_delete(o->_cache_surface); o->_cache_surface = NULL; }');
     this.line('o->_cache_valid = 0;');
     this.line('o->_cache_w = 0.0; o->_cache_h = 0.0; o->_cache_phx = 0.0; o->_cache_phy = 0.0;');
+    this.indent--;
+    this.line('}');
+    // A subtree that comes back on stage is not detached any more; drop it (and
+    // its descendants) from the pending table instead of asking the sweep to read
+    // a maybe-stale `parent` field next frame.
+    this.line('static void as_bake_pend_drop(DisplayObject* o) {');
+    this.indent++;
+    this.line('if (o == NULL || AS_bake_pend_n == 0) return;');
+    this.line('int keep = 0;');
+    this.line('for (int i = 0; i < AS_bake_pend_n; i++) { if (AS_bake_pend[i] != o) AS_bake_pend[keep++] = AS_bake_pend[i]; }');
+    this.line('AS_bake_pend_n = keep;');
+    this.line('if (!as_is((void*)o, &DisplayObjectContainer_vt)) return;');
+    this.line('DisplayObjectContainer* c = (DisplayObjectContainer*)o;');
+    this.line('if (c->children == NULL) return;');
+    this.line('for (int i = 0; i < c->children->length; i++) as_bake_pend_drop((DisplayObject*)as_v_obj_val(c->children->data[i]));');
     this.indent--;
     this.line('}');
     this.line('static void as_bake_pend_push(DisplayObject* o) {');
@@ -13319,18 +13337,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (o == NULL) return;');
     this.line('if (AS_bake_pend_n >= (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0]))) {');
     this.indent++;
-    // Table full: flush everything already off-stage, keep the rest. Dropping an
-    // entry only postpones that node's release to its next removal.
-    this.line('int keep = 0;');
-    this.line('for (int i = 0; i < AS_bake_pend_n; i++) {');
-    this.indent++;
-    this.line('DisplayObject* p = AS_bake_pend[i];');
-    this.line('if (p == NULL || !gc_in_heap((void*)p)) continue;');
-    this.line('if (as_on_stage(p)) { AS_bake_pend[keep++] = p; continue; }');
-    this.line('as_bake_release_one(p);');
-    this.indent--;
-    this.line('}');
-    this.line('AS_bake_pend_n = keep;');
+// Table full: reclaim everything we can right now. A slot whose owner is gone
+// or unknown is simply dropped -- that node is then released on its next removal.
+this.line('for (int i = 0; i < AS_bake_pend_n; i++) as_bake_release_one(AS_bake_pend[i]);');
+this.line('AS_bake_pend_n = 0;');
     this.indent--;
     this.line('}');
     this.line('if (AS_bake_pend_n >= (int)(sizeof(AS_bake_pend) / sizeof(AS_bake_pend[0]))) return;');
@@ -13350,10 +13360,9 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent++;
     this.line('DisplayObject* o = AS_bake_pend[i];');
     this.line('if (o == NULL) continue;');
-    // A collected owner leaves a dangling slot; the address may even be reused by
-    // a new node, in which case as_final_release simply finds nothing to release.
-    this.line('if (!gc_in_heap((void*)o)) continue;');
-    this.line('if (as_on_stage(o)) continue;   // re-added (virtual list): forget it');
+    // No parent walk here: a pending slot may already be recycled, and the only
+    // safe survival test is a table lookup. Coming back on stage is expressed by
+    // as_bake_pend_drop in addChild instead of by re-reading `parent`.
     this.line('as_bake_release_one(o);');
     this.indent--;
     this.line('}');
@@ -13388,6 +13397,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // already in the bubble path -- and only then ADDED_TO_STAGE. Measured in
     // temp/dlprobe/: `kid:added b=1 p=2`, `kid:added b=1 p=3` (the parent), then
     // `kid:addedToStage b=0 p=2`.
+    this.line('as_bake_pend_drop(child);');
     this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
     this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
     this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage + %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');
@@ -13413,6 +13423,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('c->children->length++;');
     this.line('child->parent = (Object*)_this;');
     this.line('as_mark_dirty((DisplayObject*)c);');
+    this.line('as_bake_pend_drop(child);');
     this.line('EventDispatcher_dispatchEvent(child, Event_new((char*)"added", true, false));');
     this.line('if (as_on_stage((DisplayObject*)_this)) as_disp_stage_walk(child, (char*)"addedToStage");');
     this.line('if (getenv("ASC_MOUSE_TRACE") != NULL && as_cls_is_stage((void*)_this)) fprintf(stderr, "    stage + %s (n=%d)\\n", as_cls_of((void*)child), c->children->length);');

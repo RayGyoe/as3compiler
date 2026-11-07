@@ -8419,17 +8419,31 @@ static void as_final_register_surface(void* owner, void* res) { as_final_registe
 // Release ONE resource of an owner (a rebuild replaces an image): the caller has
 // already deleted it, this only forgets the registration so the owner's death
 // does not delete it a second time.
-static void as_final_release(void* owner, void* res) {
+// Returns 1 when the registration was found and dropped: the caller may then
+// delete the resource. A 0 means somebody already released it (the owner was
+// collected and as_final_on_free took it), so deleting again would be a double
+// free -- the crash this signature exists to prevent.
+static int as_final_release(void* owner, void* res) {
     for (int i = 0; i < ASC_final_used; i++) {
         if (ASC_final_owner[i] == owner && (res == NULL || ASC_final_res[i] == res)) {
             ASC_final_owner[i] = ASC_final_owner[ASC_final_used - 1];
             ASC_final_res[i] = ASC_final_res[ASC_final_used - 1];
             ASC_final_kind[i] = ASC_final_kind[ASC_final_used - 1];
             ASC_final_used--;
-            return;
+            return 1;
         }
     }
+    return 0;
 }
+// Does this address still own a registration? Pure pointer comparison -- it
+// never dereferences the candidate, so it is safe for a stale slot whose owner
+// the collector already recycled (as_final_on_free dropped its entries).
+static int as_final_has_owner(void* owner) {
+    if (owner == NULL) return 0;
+    for (int i = 0; i < ASC_final_used; i++) if (ASC_final_owner[i] == owner) return 1;
+    return 0;
+}
+
 // ASC_NO_FINAL=1 turns the hook off: the leak then reproduces exactly as it was
 // before this stage, which is how the fix is A/B-tested on one binary
 // (examples/gc-image-free.as grows by ~8.3 MB per dropped 1920x1080 page).

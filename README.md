@@ -436,7 +436,7 @@ releasing on removal would undo the reuse stage 380/381 made cheap. Measured slo
 3.29 MB per cycle**, `surf_bake` went from "+53 per cycle, n=1016" to **n=33 plateau,
 d=−7.08 MB**. A/B switch `ASC_NO_BAKE_RELEASE=1` (same convention as `ASC_NO_FINAL`);
 `examples/bake-release-on-remove.as` compares +28 MB against +0.95 MB. See
-[`gc.md`](docs/en/gc.md) §6.19 for the measurements.
+[`gc.md`](docs/en/gc.md) §6.19 for the measurements. The first sweep version tested liveness with `gc_in_heap()` and then walked `parent`: during the collection wave of "close the window" that double-frees and jumps to a non-instruction boundary (`0xc000001d`). It now releases only on a finalizer-table hit, gated by `as_final_has_owner()` (pointer comparison, no dereference). See §6.19.1.
 
 **Native memory ledger (stage three hundred and eighty-three)**: when private bytes climb, first split the
 question in two — the class census plateaus (`total=83275 n=13.1 MB`, three identical reports) while private

@@ -1053,6 +1053,60 @@ sits in the `untagged` bucket — a different path.
 order, going cold, subtree recursion, the `was_on_stage` gate, keeping a node that came back,
 skipping already-collected slots, both frame entry points, the A/B switch, flush-on-full, and
 definition-before-use.
+#### 6.19.1 Why the first version crashed (stage 384, follow-up fix)
+
+The first `sweep` decided liveness like this:
+
+```c
+if (!gc_in_heap((void*)o)) continue;   // wrong: a recycled block's address is still in a segment
+if (as_on_stage(o)) continue;          // so this walks `parent` over freed memory
+as_bake_release_one(o);                // then deletes a surface the finalizer already deleted
+```
+
+"Enter meeting → leave meeting → close window" crashed deterministically:
+
+```
+Exception code: 0xc000001d   (STATUS_ILLEGAL_INSTRUCTION)
+Fault offset:   0x00bd9110   ← second byte of the 4-byte instruction at bd910f
++ 0xc000041d                 (secondary exception in a callback, same offset)
+```
+
+An address inside an instruction means execution jumped to a non-instruction boundary — a return
+address or function pointer poisoned by a stale pointer. Three defects at once:
+
+| # | Defect | Effect |
+|---|---|---|
+| 1 | `gc_in_heap()` is not a liveness test (it only proves the address looks like heap) | the check passes, then `as_on_stage()` dereferences freed memory |
+| 2 | when the owner was collected `as_final_on_free` already deleted the resource, but the pending table kept the owner | second delete = **double free** |
+| 3 | `release_one` **wrote** `_cache_valid = 0` on a possibly recycled address | address reuse ⇒ corrupts another GC object's header |
+
+**Two structural fixes, both derived from "who can prove this resource is still mine"**:
+
+1. `as_final_release(owner, res)` now returns **whether it hit**. The resource is deleted only when
+   the registration was still in the table — no entry means somebody already released it, so not a
+   single byte is touched. A double free is now impossible by construction.
+2. New `as_final_has_owner(owner)`: **pointer comparison only, never dereferences**. It gates the
+   release; a collected owner had its entries dropped by `as_final_on_free`, so the gate says no.
+3. The sweep no longer walks `parent`; "came back on stage" is expressed by `as_bake_pend_drop(child)`
+   in `addChild`/`addChildAt` — same semantics, and it never reads a possibly stale field.
+
+**Three transferable lessons**:
+
+- **"Inside a GC segment" is not "alive".** `gc_in_heap()` answers "does this address look like
+  heap", not "is this object alive". A recycled block's address stays inside the segment, so the
+  test is always true.
+- **A possibly stale pointer may be neither read nor written.** The first version only worried about
+  reading garbage; it missed that `as_on_stage` dereferences level by level, and that writing
+  `_cache_valid` destroys whatever new object reused the address.
+- **The right to free must be proven by ownership**, not inferred from "it still looks present".
+  The finalizer table *is* that ownership record: delete only on a hit — the simplest and most
+  reliable rule available.
+
+**Regression**: the same run no longer crashes; `unit: render/BakeReleaseOnRemove` grew to 15 checks
+(the three new ones pin exactly the points above: no `gc_in_heap`/`as_on_stage` in the sweep, the
+`has_owner` gate must exist, and the delete must sit inside the hit branch); `node test.ts` reports
+645 / 623 pass / 19 fail / 3 skipped with a failing set **identical** to the pre-fix run.
+
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |

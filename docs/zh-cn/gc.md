@@ -919,6 +919,54 @@ GL/D3D 纹理、窗口后端资源都直接走 `malloc`/`new`，GC 扫不到它�
 **钉子**：`unit: render/BakeReleaseOnRemove`（12 项）钉生成 C 的形态 —— 释放顺序、置冷、
 子树递归、`was_on_stage` 门、回舞台不清、已回收槽跳过、两个帧入口、A/B 环、表满 flush、
 定义先于使用。
+#### 6.19.1 第一版为什么会崩（阶段三百八十四·修复）
+
+第一版 §6.19 的 sweep 这样判活：
+
+```c
+if (!gc_in_heap((void*)o)) continue;   // 错：已回收块的地址仍在段内
+if (as_on_stage(o)) continue;          // 于是这里沿 parent 解引用残留内存
+as_bake_release_one(o);                // 再 delete 一次 finalizer 已释放的 surface
+```
+
+真机复现「进会议室 → 退出会议 → 关闭窗口」必崩：
+
+```
+Exception code: 0xc000001d   (STATUS_ILLEGAL_INSTRUCTION)
+Fault offset:   0x00bd9110   ← 落在 bd910f 那条 4 字节指令的第 2 字节
++ 0xc000041d                 (回调里二次异常，同一个 offset)
+```
+
+地址落在指令中间 ⇒ 跳到非指令边界 ⇒ 返回地址/函数指针被野指针污染。三处缺陷同时存在：
+
+| # | 缺陷 | 后果 |
+|---|---|---|
+| 1 | `gc_in_heap()` 不是存活判据（只验地址在段表内） | 通过后 `as_on_stage()` deref 已释放内存 |
+| 2 | owner 被回收时 `as_final_on_free` 已 delete，pending 表仍留该 owner | 二次 delete = **double free** |
+| 3 | `release_one` 对可能已回收的地址**写** `_cache_valid = 0` | 地址复用 ⇒ 破坏别人的 GC 对象头 |
+
+**结构性修法（两条，都是从「谁能证明这块资源还归我」出发）**：
+
+1. `as_final_release(owner, res)` 改为返回**是否命中**。只有表里仍有这条注册时才 delete ——
+   表里没有 ⇒ 别人已经释放过 ⇒ 一个字节都不碰。double free 在结构上不可能。
+2. 新增 `as_final_has_owner(owner)`：**只做指针比较、绝不 deref**。作为释放前的生存门；
+   对象已被回收 ⇒ `as_final_on_free` 已删条目 ⇒ 不命中 ⇒ 直接返回。
+3. sweep 里**删掉 `parent` 上溯**；「退回舞台」改由 `addChild`/`addChildAt` 调
+   `as_bake_pend_drop(child)` 表达 —— 语义等价，且不需要读任何可能失效的字段。
+
+**三条通用教训**：
+
+- **GC 段检查 ≠ 存活**。`gc_in_heap()` 回答的是「这个地址像不像堆里的地址」，不是「这个对象还活着」。
+  已回收的块地址仍然在段内，检查恒真。
+- **对可能失效的指针既不能读也不能写**。第一版只想着「读到垃圾就跳过」，没意识到 `as_on_stage`
+  会一级级 deref，也没意识到写 `_cache_valid` 会毁掉复用该地址的新对象。
+- **释放权必须由持有关系证明**，不能由「它看起来还在」推断。finalizer 表就是那份持有关系：
+  命中才释放，是最省事也最可靠的判据。
+
+**回归**：修复后真机同一操作不再崩；`unit: render/BakeReleaseOnRemove` 扩到 15 项（新增三条正是
+钉死上面三点：sweep 不得出现 `gc_in_heap`/`as_on_stage`、`has_owner` 门必须存在、delete 必须在命中分支里）；
+`node test.ts` 645 / 623 pass / 19 fail / 3 skipped，失败集合与修复前**逐个相同**。
+
 ## 7. 与现有反射表的关系（复用，不重造）
 
 | 现有设施 | GC 用途 |

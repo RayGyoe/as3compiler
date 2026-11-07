@@ -281,7 +281,7 @@ AIR 里这棵树同样被钉住，可它只是几 KB 的矢量对象。修法：
 会把阶段 380/381 优化掉的复用打回每帧重烘。实测斜率 **10.5 → 3.29 MB/轮**，`surf_bake` 从「每轮 +53、
 n=1016」变成 **n=33 平台、d=−7.08 MB**。A/B 开关 `ASC_NO_BAKE_RELEASE=1`（同 `ASC_NO_FINAL` 惯例），
 `examples/bake-release-on-remove.as` 两态对照 +28 MB / +0.95 MB。口径与实测见
-[`gc.md`](docs/zh-cn/gc.md) §6.19。
+[`gc.md`](docs/zh-cn/gc.md) §6.19。首版 sweep 曾用 `gc_in_heap()` 判活并直接上溯 `parent`，在「关闭窗口」的回收潮里必然 double free 并跳到非指令边界（`0xc000001d`）——现改为「finalizer 表命中才释放」+ `as_final_has_owner()` 只比地址、绝不解引用的生存门，教训见 §6.19.1。
 
 **原生内存账本（阶段三百八十三）**：进程私有内存上涨时先分清「哪一半在涨」——GC 堆普查进入平台期
 （`total=83275 n=13.1 MB` 连续三次报表相同）而私有内存已到 1050 MB ⇒ 增长在原生侧（Skia surface/image、
