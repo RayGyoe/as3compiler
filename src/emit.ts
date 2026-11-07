@@ -8058,7 +8058,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
               // naming one of the class's methods is `this.method` / `Class.method`
               // used as a value and must register its bound-method thunk. Walking
               // it with no current class (the bug) missed the registration but the
-              // emit pass still produced `as_fn_make(X__bound, ...)`:
+              // emit pass still produced `as_fn_make_method(X__bound, ...)`:
               // "use of undeclared identifier '_parseApplicationData__bound'" --
               // measured on com.hurlant.crypto.tls.TLSEngine's
               // `protocolHandlers:Object = { 23 : parseApplicationData, ... }`.
@@ -12583,7 +12583,13 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('for (int i = 0; i < n; i++) {');
     this.indent++;
     this.line('if (evt->immStopped) break;');
-    this.line('as_fn fn = (as_fn)as_v_obj_val(arr->data[i]);');
+    this.line('as_lentry* le = (as_lentry*)as_v_obj_val(arr->data[i]);');
+    // A weak slot whose closure the collector already freed: as_weak_dead compares
+    // addresses only, so this is safe even though le->fn now names recycled memory.
+    // Clearing the slot keeps later dispatches on the fast path.
+    this.line('if (le->fn == NULL) continue;');
+    this.line('if (le->weak && as_weak_dead((void*)le->fn)) { le->fn = NULL; continue; }');
+    this.line('as_fn fn = le->fn;');
     this.line('as_value arg[1];');
     this.line('arg[0] = as_v_obj((void*)evt);');
     this.line('fn->fn(fn->env, arg, 1);');
@@ -12740,7 +12746,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('}');
     this.line('void EventDispatcher_addEventListener(void* _this, char* type, as_fn listener, bool useCapture, int priority, bool useWeakReference) {');
     this.indent++;
-    this.line('(void)priority; (void)useWeakReference; // priority/weak-ref are accepted but not reordered in this subset');
+    this.line('(void)useWeakReference; // weak references are their own stage (ASC_NO_WEAK_LISTENER documents the AIR asymmetry)');
     this.line('EventDispatcher* d = (EventDispatcher*)_this;');
     this.line('if (d->listeners == NULL) d->listeners = as_object_new();');
     this.line('char* key = as_disp_key(type, useCapture);');
@@ -12750,7 +12756,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('else { arr = as_array_new(); as_object_set(d->listeners, key, as_v_arr((void*)arr)); }');
     // AIR does NOT register the same listener twice: a second addEventListener with
     // the same listener function AND the same receiver AND the same useCapture is a
-    // no-op (measured on adl 51.4.1, temp/dupprobe cases A/B/C: the very same closure
+    // complete no-op (measured on adl 51.4.1, temp/dupprobe cases A/B/C: the very same closure
     // added twice runs once; a bound method added twice -- two distinct closures over
     // one method+receiver -- also runs once; add twice then remove once runs zero
     // times, i.e. there was only ever one entry). Appending the duplicate instead
@@ -12762,13 +12768,32 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // of them, and the leftover pair kept running the app's drag code -- which
     // disables mouse on the scrolled container and never bounces the flick back
     // (measured: temp/tkmeet-mac d28dbg.txt; pinned by examples/listener_identity.as).
+    // A repeat add also does NOT update that entry's priority (temp/weakprobe case G:
+    // `f` added at 0 and then at 50 still ran after the p5 listener). Removing first
+    // and adding again does reposition, because that is a fresh entry (case H).
     this.line('for (int i = 0; i < arr->length; i++) {');
     this.indent++;
-    this.line('as_fn a = (as_fn)as_v_obj_val(arr->data[i]);');
-    this.line('if (a->fn == listener->fn && a->env == listener->env) return;');
+    this.line('as_lentry* e = (as_lentry*)as_v_obj_val(arr->data[i]);');
+    this.line('if (e->fn != NULL && e->fn->fn == listener->fn && e->fn->env == listener->env) return;');
     this.indent--;
     this.line('}');
-    this.line('as_array_push(arr, as_v_obj((void*)listener));');
+    // AIR dispatches in DESCENDING priority and keeps registration order within one
+    // priority (measured on adl 51.4.1, temp/weakprobe cases E/F: p20 -> p10 -> p0 ->
+    // p-5, and three p7 listeners ran in registration order). The listener array is
+    // an as_value list whose num slot is unused, so it carries the priority and the
+    // array order IS the dispatch order -- no sort at dispatch time.
+    this.line('int at_i = arr->length;');
+    this.line('for (int i = 0; i < arr->length; i++) { as_lentry* pe = (as_lentry*)as_v_obj_val(arr->data[i]); if (pe->priority < priority) { at_i = i; break; } }');
+    this.line('as_array_ensure(arr, arr->length + 1);');
+    this.line('for (int i = arr->length; i > at_i; i--) arr->data[i] = arr->data[i - 1];');
+    // Weak is downgraded to strong for method values: AIR never collects a
+    // class-level member function, so a weak obj.method registration keeps firing
+    // (measured temp/weakprobe cases C and Z2). Nested closures stay weak.
+    this.line('arr->data[at_i] = as_v_obj((void*)as_lentry_new(listener, priority, useWeakReference && !listener->is_method));');
+    this.line('arr->length++;');
+    // The slot now points at a fresh closure: incremental marking needs the barrier
+    // (same reason as as_array_push).
+    this.line('gc_write_barrier_value(arr->data[at_i]);');
     this.line('if (strcmp(type, "enterFrame") == 0) as_ef_register(_this);');
     this.indent--;
     this.line('}');
@@ -12785,8 +12810,8 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // receiver), not closure-pointer identity. Each `this.method` reference
     // allocates a fresh closure, so comparing the closure pointer would make
     // removeEventListener a no-op for bound methods.
-    this.line('as_fn a = (as_fn)as_v_obj_val(arr->data[i]);');
-    this.line('if (a->fn == listener->fn && a->env == listener->env) {');
+    this.line('as_lentry* a = (as_lentry*)as_v_obj_val(arr->data[i]);');
+    this.line('if (a->fn != NULL && a->fn->fn == listener->fn && a->fn->env == listener->env) {');
     this.indent++;
     this.line('for (int j = i; j < arr->length - 1; j++) arr->data[j] = arr->data[j + 1];');
     this.line('arr->length--;');
@@ -36949,7 +36974,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
             throw new CodegenError(`method '${name}' is not accessible here`);
           }
-          return { code: `as_fn_make(${this.currentClass}_${name}__bound, (void*)${self}, ${this.requiredArity(m.params)})`, type: { kind: 'function' } };
+          return { code: `as_fn_make_method(${this.currentClass}_${name}__bound, (void*)${self}, ${this.requiredArity(m.params)})`, type: { kind: 'function' } };
         }
       }
       // A bare identifier naming a static method is `Class.method` used as a value
@@ -39893,7 +39918,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (!this.symbols.isAccessible(m.visibility, m.owner, this.currentClass)) {
         throw new CodegenError(`method '${expr.property}' is not accessible here`);
       }
-      return { code: `as_fn_make(${obj.type.className}_${expr.property}__bound, (void*)(${recv}), ${this.requiredArity(m.params)})`, type: { kind: 'function' } };
+      return { code: `as_fn_make_method(${obj.type.className}_${expr.property}__bound, (void*)(${recv}), ${this.requiredArity(m.params)})`, type: { kind: 'function' } };
     }
     // Dynamic class (AS3 `dynamic class`): an undeclared member read resolves at
     // runtime through the slot table (falls back to the `_dyn` record).

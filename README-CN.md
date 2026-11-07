@@ -538,6 +538,8 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/regexp.as` — 正则字面量/`new RegExp`、`test`/`exec`/捕获组/`lastIndex`、`String.match/search/replace` 正则版、字符类/量词/反向引用/前瞻、`i/m/s/x` flag
 - `examples/stage28.as` — `Array()`/`Object()` 构造器形式（含无 `new`）、`Vector.<T>` 的 `new`＝构造 vs 无 `new`＝转换
 - `examples/stage33.as` — `Event`/`EventDispatcher` 事件三阶段分发
+- `examples/listener-priority.as` — `addEventListener` 的 `priority`：降序分派、同值保注册序、重复注册不改 priority
+- `examples/weak-listener.as` — `useWeakReference`：嵌套闭包被回收后静默跳过，`obj.method` 类成员函数不回收（AIR 实测对称）
 - `examples/stage34.as` — 显示列表 `DisplayObject`/`DisplayObjectContainer`/`Stage`/`Sprite`
 - `examples/stage35.as` — 交互事件与命中测试（inside-out 分发、`mouseChildren`/`visible`、鼠标/键盘/焦点）
 - `examples/stage36.as` — Skia 最小闭环（`Shape` → `Stage.render` 离屏 PNG）

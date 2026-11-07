@@ -826,7 +826,8 @@ enum {
     GCT_FUNCTION_OBJ = GCT_TAG_BASE + 13, // as_function (boxed Function in an Object slot)
     GCT_BOOLEAN = GCT_TAG_BASE + 14,    // as_boolean (boxed Boolean stored in an Object slot)
     GCT_RAW = GCT_TAG_BASE + 15,        // raw payload buffer (monomorphized Vector.<T> element storage)
-    GCT_BYTES = GCT_TAG_BASE + 16       // raw BYTE buffer held by a GC object (ByteArray.data / BitmapData.pixels)
+    GCT_BYTES = GCT_TAG_BASE + 16,      // raw BYTE buffer held by a GC object (ByteArray.data / BitmapData.pixels)
+    GCT_LENTRY = GCT_TAG_BASE + 17      // as_lentry: one EventDispatcher listener registration
 };
 
 #define GC_SEG_SIZE (1u << 20)          // 1 MiB per segment
@@ -1048,6 +1049,7 @@ static const char* gc_type_name(int type) {
         case GCT_BOOLEAN: return "boxed_bool";
         case GCT_RAW: return "raw";
         case GCT_BYTES: return "bytes";
+        case GCT_LENTRY: return "lentry";
         default: return "?";
     }
 }
@@ -2968,10 +2970,81 @@ static bool as_v_loose_eq(as_value a, as_value b) {
 // arguments, calling the typed implementation, boxing the result) plus an optional
 // captured-environment pointer. Non-capturing functions use env = NULL.
 typedef as_value (*as_fn_impl)(void* env, as_value* args, int argc);
+
+// ---------- weak listener bookkeeping ----------
+// AIR is asymmetric about useWeakReference, and the asymmetry is documented, not
+// incidental: the AS3 reference says a nested inner function registered weakly is
+// collected and stops firing, while class-level member functions are not subject
+// to garbage collection at all. Measured on adl 51.4.1 (temp/weakprobe):
+//   * weak + nested closure -> closure collected, dispatch silently skips it;
+//   * weak + obj.method     -> receiver stays alive and the handler still runs;
+//   * weak + a second strong reference elsewhere -> still runs.
+// We mirror it with as_closure.is_method (set only for the __bound thunks that
+// materialise method values) plus a set of closure addresses the collector has
+// already freed. Every query below compares addresses only and never dereferences
+// the candidate: a freed block address still lies inside the GC segments, so a
+// liveness probe that reads through it is meaningless (stage 384 crash lesson).
+static void**         AS_weak_keys  = NULL;   // arena: candidate closure addresses
+static unsigned char* AS_weak_state = NULL;   // 0 empty, 1 live, 2 freed
+static int            AS_weak_cap   = 0;
+static int            AS_weak_len   = 0;
+static unsigned as_weak_hash(void* o, int cap) {
+    unsigned long long x = (unsigned long long)(size_t)o;
+    x ^= x >> 33;
+    x *= 0xFF51AFD7ED558CCDull;
+    x ^= x >> 33;
+    return (unsigned)x & (unsigned)(cap - 1);
+}
+static unsigned char as_weak_get(void* o) {
+    if (AS_weak_cap == 0 || o == NULL) return 0;
+    unsigned i = as_weak_hash(o, AS_weak_cap);
+    while (AS_weak_state[i] != 0) {
+        if (AS_weak_keys[i] == o) return AS_weak_state[i];
+        i = (i + 1) & (unsigned)(AS_weak_cap - 1);
+    }
+    return 0;
+}
+static void as_weak_grow(void) {
+    int ncap = AS_weak_cap == 0 ? 64 : AS_weak_cap * 2;
+    void** nk = (void**)as_alloc(sizeof(void*) * (size_t)ncap);
+    unsigned char* ns = (unsigned char*)as_alloc((size_t)ncap);
+    for (int i = 0; i < ncap; i++) ns[i] = 0;
+    for (int i = 0; i < AS_weak_cap; i++) {
+        if (AS_weak_state[i] == 0) continue;
+        unsigned j = as_weak_hash(AS_weak_keys[i], ncap);
+        while (ns[j] != 0) j = (j + 1) & (unsigned)(ncap - 1);
+        nk[j] = AS_weak_keys[i];
+        ns[j] = AS_weak_state[i];
+    }
+    AS_weak_keys = nk;
+    AS_weak_state = ns;
+    AS_weak_cap = ncap;
+}
+static void as_weak_set(void* o, unsigned char st) {
+    if (o == NULL) return;
+    if (AS_weak_cap == 0 || AS_weak_len * 2 >= AS_weak_cap) as_weak_grow();
+    unsigned i = as_weak_hash(o, AS_weak_cap);
+    while (AS_weak_state[i] != 0) {
+        if (AS_weak_keys[i] == o) { AS_weak_state[i] = st; return; }
+        i = (i + 1) & (unsigned)(AS_weak_cap - 1);
+    }
+    AS_weak_keys[i] = o;
+    AS_weak_state[i] = st;
+    AS_weak_len++;
+}
+// A weak registration starts life live; the collector flips it to freed.
+static void as_weak_watch(void* o)   { if (as_weak_get(o) == 0) as_weak_set(o, 1); }
+// A fresh allocation can land on a freed closure address: the dead mark belongs to
+// the object that is gone, not to whatever now occupies that slot.
+static void as_weak_revive(void* o)  { if (as_weak_get(o) == 2) as_weak_set(o, 1); }
+static int  as_weak_dead(void* o)    { return as_weak_get(o) == 2; }
+static void as_weak_on_free(void* o) { if (as_weak_get(o) != 0) as_weak_set(o, 2); }
+
 typedef struct {
     as_fn_impl fn;
     void* env;
     int arity;   // AS3 Function.length: the declared parameter count
+    unsigned char is_method;   // 1 = a class-level method value (never collected)
 } as_closure;
 typedef as_closure* as_fn;
 static as_fn as_fn_make(as_fn_impl fn, void* env, int arity) {
@@ -2979,7 +3052,33 @@ static as_fn as_fn_make(as_fn_impl fn, void* env, int arity) {
     f->fn = fn;
     f->env = env;
     f->arity = arity;
+    f->is_method = 0;
+    as_weak_revive((void*)f);
     return f;
+}
+// Method values (obj.method / Class.method) come from a __bound thunk. AIR never
+// collects those, so a weak registration of one behaves exactly like a strong one.
+static as_fn as_fn_make_method(as_fn_impl fn, void* env, int arity) {
+    as_fn f = as_fn_make(fn, env, arity);
+    f->is_method = 1;
+    return f;
+}
+// One listener registration. priority orders dispatch (descending); weak marks a
+// slot the collector is allowed to leave unmarked, after which fn is NULL and
+// dispatch skips it. Both live here rather than in an as_value so a registration
+// stays one GC object with exact scanning.
+typedef struct {
+    as_fn fn;
+    int priority;
+    unsigned char weak;
+} as_lentry;
+static as_lentry* as_lentry_new(as_fn fn, int priority, int weak) {
+    as_lentry* e = (as_lentry*)gc_alloc(GCT_LENTRY, sizeof(as_lentry));
+    e->fn = fn;
+    e->priority = priority;
+    e->weak = (unsigned char)(weak != 0);
+    if (e->weak) as_weak_watch((void*)fn);
+    return e;
 }
 // Function.prototype (temp/with3k A): each function owns a DISTINCT empty
 // dynamic Object. The object is keyed by the closure's (fn, env) IDENTITY
@@ -8117,6 +8216,17 @@ static void gc_scan(gc_header* h) {
         gc_mark_ptr(c->env);
         break;
     }
+    case GCT_LENTRY: {
+        // A weak registration deliberately does NOT mark its closure: letting the
+        // closure die is the whole point of useWeakReference (measured: AIR skips
+        // the handler after the collection, temp/weakprobe case A). Marking happens
+        // through as_lentry::fn on the strong path only; the freed address is
+        // remembered by as_weak_on_free at sweep time and dispatch compares
+        // addresses rather than reading through a possibly-recycled pointer.
+        as_lentry* e = (as_lentry*)b;
+        if (!e->weak) gc_mark_ptr(e->fn);
+        break;
+    }
     case GCT_CLASS: {
         // Walk the vtable super chain's props reflection tables. Only ref (6),
         // any (7), string (3) and name-string (13) fields carry pointers.
@@ -8307,7 +8417,7 @@ static void gc_note_stack_base(void* p) { gc_stack_top = (char*)p; }
 static bool gc_is_object(void* p) {
     if (!gc_in_heap(p)) return false;
     gc_header* h = gc_hdr(p);
-    return h->type >= GCT_STRING && h->type <= GCT_BYTES
+    return h->type >= GCT_STRING && h->type <= GCT_LENTRY
         && h->color >= GC_WHITE && h->color <= GC_BLACK
         && h->size >= sizeof(void*) && h->size <= (size_t)(1u << 30);
 }
@@ -8763,6 +8873,9 @@ static bool gc_sweep_step(size_t budget) {
             // The payload address is the block's body, which is what owners
             // register: gc_alloc returns (char*)h + sizeof(gc_header).
             as_final_on_free((char*)h + sizeof(gc_header));
+            // Same body address the finalisers key on. Only addresses are compared,
+            // never dereferenced, so the block is safe to name after it is freed.
+            as_weak_on_free((char*)h + sizeof(gc_header));
             if (gc_inc.sweep_prev) gc_inc.sweep_prev->next = next; else gc_all = next;
             gc_all_bytes -= sizeof(gc_header) + h->size;
             gc_header** fl = gc_free_list_for(h->size);

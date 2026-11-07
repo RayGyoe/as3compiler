@@ -1107,6 +1107,46 @@ address or function pointer poisoned by a stale pointer. Three defects at once:
 `has_owner` gate must exist, and the delete must sit inside the hit branch); `node test.ts` reports
 645 / 623 pass / 19 fail / 3 skipped with a failing set **identical** to the pre-fix run.
 
+#### 6.20 Listener priority and useWeakReference (stage 385)
+
+`EventDispatcher.addEventListener` discarded both parameters with `(void)` for a long time. What they
+actually do on AIR (`adl 51.4.1`, `temp/weakprobe/`):
+
+- **priority**: dispatch runs in descending priority, registration order within one value; a repeat
+  `addEventListener` (same fn + receiver + capture) is a complete no-op that does **not** update the
+  stored priority; remove followed by add does reposition.
+- **useWeakReference**: only affects **nested inner functions** (the closure is collected and dispatch
+  silently skips it). It does **not** affect `obj.method`: the receiver survives the collection and the
+  handler keeps firing, matching the AS3 reference sentence that class-level member functions are not
+  subject to garbage collection. A weak registration whose closure has another strong reference stays
+  alive, as expected.
+
+So the implementation reproduces that **asymmetry**, not a blanket weakness:
+
+| Concern | Where |
+|---|---|
+| Method-value detection | `as_closure.is_method`, set only by the three `__bound` thunk sites (`as_fn_make_method`) |
+| Weak downgrade | `weak = useWeakReference && !listener->is_method` in `addEventListener` |
+| Record | new GC type `GCT_LENTRY`: `{ as_fn fn; int priority; unsigned char weak; }` |
+| Marking | `case GCT_LENTRY` in `gc_scan` does `if (!e->weak) gc_mark_ptr(e->fn);` |
+| Death test | a set of weak closure **addresses** (`as_weak_*`): the sweep marks them freed, allocation revives a reused address |
+| Dispatch | `as_disp_arr` skips `fn == NULL`, then compares addresses via `as_weak_dead` and closes the slot on a hit |
+
+**Why the death test is a separate address set instead of reading the object header**: a freed block
+address still lies inside the GC segments, so `gc_in_heap()` is always true, and dereferencing a freed
+pointer can read whatever object reused the address. Those two mistakes together produced the stage 384
+crash. The set only answers "was this address ever freed", which never reads through the pointer.
+
+**Address reuse**: a fresh closure can land on a freed closure address; without a reset the dead mark
+would make `as_weak_dead` skip a live handler. `as_fn_make` therefore calls `as_weak_revive` after every
+allocation. Conversely `as_lentry_new` only calls `as_weak_watch` when the entry is weak.
+
+**Interaction with the conservative stack scan (known difference)**: our roots include a conservative C
+stack scan, so a stale closure pointer in a returned frame keeps that closure alive; AIR has an exact GC
+and would drop it. Example case F therefore asserts "at most one survivor out of a batch of weak
+registrations" rather than "none". That is the existing AGENTS §2.4 trade-off (may over-retain, never
+under-mark), not a defect of this stage.
+
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |

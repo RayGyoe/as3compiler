@@ -967,6 +967,40 @@ Fault offset:   0x00bd9110   ← 落在 bd910f 那条 4 字节指令的第 2 字
 钉死上面三点：sweep 不得出现 `gc_in_heap`/`as_on_stage`、`has_owner` 门必须存在、delete 必须在命中分支里）；
 `node test.ts` 645 / 623 pass / 19 fail / 3 skipped，失败集合与修复前**逐个相同**。
 
+#### 6.20 监听器 priority 与 useWeakReference（阶段三百八十五）
+
+`EventDispatcher.addEventListener` 的两个参数长期是 `(void)` 丢弃的。它们在 AIR 上的真实语义
+（`adl 51.4.1`，`temp/weakprobe/`）是：
+
+- **priority**：分派按降序，同值保持注册序；重复 `addEventListener`（同 fn + 同 receiver + 同 capture）
+  是完全 no-op，连 priority 都不更新；`removeEventListener` 后重加才会按新 priority 重定位。
+- **useWeakReference**：只对**嵌套内部函数**生效（闭包被回收后分派静默跳过）；对 `obj.method` 这类
+  **类级成员函数无效**（receiver 在 GC 后仍存活、处理器照常触发）—— 与 AS3 参考里「类成员函数不受 GC」
+  那句一致。弱注册若另有强引用，闭包自然继续存活。
+
+因此实现的是这条**不对称**：
+
+| 关注点 | 落点 |
+|---|---|
+| 方法值识别 | `as_closure.is_method`，只由三个 `__bound` thunk 生成点（`as_fn_make_method`）置 1 |
+| 弱退化 | `addEventListener` 里 `weak = useWeakReference && !listener->is_method` |
+| 记录 | 新 GC 类型 `GCT_LENTRY`：`{ as_fn fn; int priority; unsigned char weak; }` |
+| 标记 | `gc_scan` 的 `case GCT_LENTRY` 里 `if (!e->weak) gc_mark_ptr(e->fn);` |
+| 死亡判定 | 弱闭包**地址集合**（`as_weak_*`）：sweep 时 `as_weak_on_free` 标 freed，分配时 `as_weak_revive` 处理地址复用 |
+| 分派 | `as_disp_arr` 先 `fn == NULL` 跳过，再 `as_weak_dead` 比较地址，命中即关闭槽 |
+
+**为什么死亡判定用独立地址集合而不是「读对象头」**：被回收的块地址仍然落在 GC 段内，
+`gc_in_heap()` 恒真；而 deref 一个已回收指针可能读到复用该地址的新对象头。阶段三百八十四的崩溃
+正是这两条叠在一起。地址集合只回答「这个地址曾经被释放过吗」，不读被指向的内存，因此安全。
+
+**地址复用**：闭包 A 被回收后，新闭包 B 可能落在同一地址。若不复位，`as_weak_dead(B)` 会误判 B 已死
+而漏掉一个活着的处理器。`as_fn_make` 因此在每次分配后调 `as_weak_revive`，把该地址的 dead 标记改回 live。
+反过来 `as_lentry_new` 只在 `weak` 为真时 `as_weak_watch`，强注册不占表项。
+
+**与保守栈扫描的交互（已知差异）**：我们的根集合含保守 C 栈扫描，返回帧里残留的闭包指针会被误保留，
+AIR 的精确 GC 不会。`examples/weak-listener.as` 的 F 项因此断言「批量弱注册里至多残留 1 个」，
+而不是「全部消失」。这是 AGENTS §2.4「宁可误保留、不得漏标」的既有取舍，不是本阶段的缺陷。
+
 ## 7. 与现有反射表的关系（复用，不重造）
 
 | 现有设施 | GC 用途 |

@@ -4,6 +4,7 @@
 import './unit/diagnostics.ts';
 import './unit/parser.ts';
 import './unit/lexer.ts';
+import './unit/listeners.ts';
 import './unit/build.ts';
 import './unit/transport.ts';
 import './unit/render.ts';

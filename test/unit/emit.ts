@@ -1600,11 +1600,11 @@ function checkEmitListenerIdentity(): string[] {
     add.length > 0 && rem.length > 0 && target.length > 0 && phase.length > 0);
   // Dedup: the identical (fn, env) already in the list short-circuits the add.
   check('addEventListener skips an already-registered (function, receiver)',
-    /for \(int i = 0; i < arr->length; i\+\+\) \{[\s\S]*?if \(a->fn == listener->fn && a->env == listener->env\) return;[\s\S]*?\}\s*as_array_push\(arr, as_v_obj\(\(void\*\)listener\)\);/.test(add));
-  check('the dedup runs before the push, not after',
-    add.indexOf('a->env == listener->env') < add.indexOf('as_array_push(arr, as_v_obj'));
+    /for \(int i = 0; i < arr->length; i\+\+\) \{[\s\S]*?if \(e->fn != NULL && e->fn->fn == listener->fn && e->fn->env == listener->env\) return;/.test(add));
+  check('the dedup runs before the insert, not after',
+    add.indexOf('e->fn->env == listener->env') < add.indexOf('as_lentry_new(listener'));
   check('removeEventListener matches the same (function, receiver) pair',
-    /if \(a->fn == listener->fn && a->env == listener->env\)/.test(rem));
+    /if \(a->fn != NULL && a->fn->fn == listener->fn && a->fn->env == listener->env\)/.test(rem));
   // AT_TARGET: bubble list only -- no capture lookup may appear in the body.
   check('as_disp_target reads only the non-capture list',
     target.includes('as_listeners_get(d->listeners, evt->_type, false)') &&
@@ -1694,8 +1694,11 @@ function checkEmitListenerSnapshot(): string[] {
     /for \(int j = i; j < arr->length - 1; j\+\+\) arr->data\[j\] = arr->data\[j \+ 1\];\s*arr->length--;/.test(rem));
   check('removeEventListener leaves no tombstone behind',
     !rem.includes('as_v_null()') && !rem.includes('as_disp_depth'));
-  check('addEventListener appends immediately',
-    add.includes('as_array_push(arr, as_v_obj((void*)listener));') && !add.includes('as_disp_depth'));
+  // Registration stays immediate on the live list; only the ORDER became
+  // priority-driven (descending, stable within one priority -- measured on
+  // adl 51.4.1, temp/weakprobe cases E/F).
+  check('addEventListener registers immediately',
+    add.includes('as_lentry_new(listener, priority, useWeakReference && !listener->is_method)') && !add.includes('as_disp_depth'));
 
   // Depth bookkeeping: one increment for the whole dispatch (nested dispatches take
   // deeper snapshot slots), decremented before returning, and reset by the frame

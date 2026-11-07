@@ -20888,5 +20888,65 @@ A/B 环保留、表满时 flush 而不是静默丢弃、定义先于使用）；
 
 **验证**：真机同一路径复测不再崩（进程持续运行，无新 WER 记录）；单元钉 12 → **15 项**
 （新增正钉死上面三点）；`node test.ts` 645 / 623 pass / 19 fail / 3 skipped，失败集合与修复前**逐个相同**。
+
+
+### 阶段三百八十五：监听器 priority 与 useWeakReference（按 adl 实测对齐）
+
+`EventDispatcher.addEventListener` 的第五参 `useWeakReference` 自阶段三十三起就是 `(void)` 丢弃的，
+`priority` 同样被 `(void)priority` 吞掉 —— 分派恒按注册顺序，弱注册恒按强引用持有。本轮按 AGENTS §1.5
+先在 `adl 51.4.1` 上把两条语义钉死，再实现。
+
+**实测（`temp/weakprobe/`，headless `app.xml` + `FileStream` 落盘，`forceGC()` 由弱键 `Dictionary` 标定）**：
+
+| 用例 | 场景 | AIR 结果 |
+|---|---|---|
+| CAL | 20 个无引用对象放弱键字典 | GC 后 **0** ⇒ 校准有效 |
+| A | 弱注册**嵌套闭包** | **不触发**（闭包被回收） |
+| X | 弱注册 + 闭包捕获 8 MB | `alive=0`（闭包连同缓冲被回收） |
+| B | 弱注册 + 另有强引用 | 触发 |
+| C / Z2 | 弱注册 `obj.method` | 触发，receiver `alive=1` |
+| E | p10/p0/p20/p−5 | **p20 → p10 → p0 → p−5**（降序） |
+| F | 三个 p7 | 1 → 2 → 3（同值保注册序） |
+| G | f 先 p0 后 p50 | 只触发一次，仍在 p5 之后（重复 add 是 no-op，**不改 priority**） |
+| H | f p50 → remove → p0 | 按新 p0 定位 |
+
+**第一版探针把 weak 测成了「无效」**：注册闭包与 `forceGC()` 在同一个方法帧里，闭包引用还压在调用者
+的局部槽/操作数栈上，GC 判为可达。把注册动作移进独立方法、该方法返回后再 GC，A/X 立刻变成「被回收」。
+这条教训要记住：**验证可达性时，被观察的引用必须来自被测的持有者，不能还留在探针自己的帧里**。
+
+**语义结论**：AIR 的弱引用是**真实存在**的，且与文档原文的两句话严格对应 —— 嵌套内部函数会被回收，
+类级成员函数不受 GC。所以我们实现的是这条**不对称**，而不是「一律弱」。
+
+**实现**：
+
+1. `as_closure` 增 `unsigned char is_method`；`as_fn_make_method()` 只由三个 `__bound` thunk 生成点调用
+   （`this.method` / 接口方法值 / `obj.method`）。弱注册时 `weak = useWeakReference && !listener->is_method`，
+   即**方法值退化为强引用** —— 与 AIR 的「类成员函数不被回收」等价。
+2. 新 GC 类型 `GCT_LENTRY`（`as_lentry { as_fn fn; int priority; unsigned char weak; }`）：监听项从裸 `as_value`
+   改为一条独立记录，`priority` 与 `weak` 都是精确字段。`gc_scan` 里 `if (!e->weak) gc_mark_ptr(e->fn);`。
+3. 弱槽的「是否已回收」由一张**地址集合**回答（`as_weak_watch/on_free/dead/revive`，开放寻址 + 线性探测）：
+   `gc_sweep_step` 释放白块时调 `as_weak_on_free(body)` 把地址标为 freed；`as_fn_make` 里调 `as_weak_revive` 处理
+   地址复用（新闭包落在旧地址上，dead 标记属于已消失的那个对象）。**查询只比较地址，从不 deref** —— 这是
+   阶段三百八十四崩溃的直接教训。
+4. 分派顺序：监听数组按 `priority` **降序稳定插入**（找到第一个 `pe->priority < priority` 的位置，尾部 memmove），
+   数组顺序即分派顺序，分派期零排序。重复 add 仍是完全 no-op（不改 priority、不重定位），remove 后重加是
+   全新条目（按新 priority 定位）—— 三条都是实测所得。
+5. 分派与移除都透过 `as_lentry`：`if (le->fn == NULL) continue;` 跳过已关闭的弱槽；`if (le->weak && as_weak_dead(...))`
+   命中则把槽关闭并跳过。`removeEventListener` 同样容忍已关闭的槽（`a->fn != NULL` 门）。
+
+**示例 / 钉子**：`examples/listener-priority.as`（A–F：降序、同值保序、重复 add no-op、remove 后重加定位、
+中间移除、捕获/冒泡各自排序）与 `examples/weak-listener.as`（A–G：嵌套闭包被回收、另有强引用仍触发、
+方法值仍触发、强注册仍触发、弱注册可 remove、批量弱注册释放、已关闭槽永久静默）；
+`test/unit/listeners.ts` 新增 `unit: listeners/`（21 项：priority 不再丢弃、降序稳定插入、写屏障、
+弱对方法值退化、三个 `__bound` 生成点、`GCT_LENTRY` 扫描分支、弱槽不标记、类型范围上界、sweep 记录、
+地址复用复活、分派绝不先 deref）。
+
+**关于 F 项**：40 个弱闭包中允许至多 1 个残留 —— 我们的根集合包含**保守 C 栈扫描**（AGENTS §2.4 明示
+「宁可误保留」），返回帧里残留的闭包指针会被误保；AIR 是精确 GC，不会有这个残留。这条差异是已知且可接受的，
+示例把它写成断言而不是隐患。
+
+**回归**：`node test.ts` 647 tests / 625 pass / 19 fail / 3 skipped（19 个失败与上一阶段同一批，
+仍是 `zlib.h file not found` 等 Windows 既有环境限制）。
+
 ### 遗留待开发` 之前（= 末尾），不要插到某个「看起来该在这儿」的锚点上** —— 历史上有好几轮是插到固定锚点，插一次没事，插多了就形成逆序块（曾出现 `196→…→182` 整块逆序、`138`/`139` 对调、`178·九→·八→·七` 逆序）。`### Flappy-Starling…` 与 `### 下一阶段路线图…` 两个非阶段节是**其后那个阶段节的序言**，随它一起移动。
 - 实现任何新特性前，先查 [AS3 语言参考](https://airsdk.dev/reference/actionscript/3.0/) 的真实语义，尤其注意 AS3 与 C 的语义差异（`/` 恒 Number、字符串装箱、`Number` 默认 NaN 等），把差异写进注释再编码。
