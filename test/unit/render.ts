@@ -1680,7 +1680,7 @@ function checkImageFinalizer(): string[] {
   const c = generateC(parse(src)).c;
 
   // 1. the sweep-side hook
-  const swStart = c.indexOf('static bool gc_sweep_step(size_t budget) {');
+  const swStart = c.indexOf('static bool gc_sweep_step(');
   const swEnd = swStart < 0 ? -1 : c.indexOf('\nstatic ', swStart + 10);
   const sweep = swStart < 0 || swEnd < 0 ? '' : c.slice(swStart, swEnd);
   check('the sweeper runs the finalizer before recycling a block',

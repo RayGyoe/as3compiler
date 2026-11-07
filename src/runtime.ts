@@ -980,6 +980,10 @@ static size_t gc_threshold = (1u << 20); // collect when allocated exceeds this
 // would lose GC-4's bounded per-frame pause, and without the gc_alloc trigger an
 // offscreen build would never collect at all.
 static bool gc_frame_driven = false;
+// A System.gc() request waiting to be honoured at the next frame-boundary safe
+// point. AIR's System.gc() is a non-blocking hint (see as_system_gc), so a
+// frame-driven build defers it here instead of stopping the world mid-frame.
+static int gc_force_requested = 0;
 
 // Probe helpers for the ASC_GC_STATS logging below: dladdr() turns a runtime
 // return address into a symbol + offset, so the caller can be named with
@@ -8024,7 +8028,7 @@ static bool gc_audit_is_body(const void* p) {
     gc_seg_range* r = gc_seg_find(p);
     if (r == NULL || (const char*)p < r->base + sizeof(gc_header) || (const char*)p >= r->base + r->size) return false;
     const gc_header* h = (const gc_header*)((const char*)p - sizeof(gc_header));
-    if (h->type != 0 && (h->type < GCT_TAG_BASE || h->type > GCT_TAG_BASE + 16)) return false;
+    if (h->type != 0 && (h->type < GCT_TAG_BASE || h->type > GCT_LENTRY)) return false;
     if (h->color < 0 || h->color > 2) return false;
     if (h->size == 0 || (h->size & 7) != 0) return false;
     // The header sits *before* p, so only the body has to fit (a block that ends
@@ -8862,8 +8866,11 @@ static void as_mem_tick(void) {
 // Sweep a budget of the all-objects list: white objects return to the free-list,
 // black objects reset to white for the next cycle. Returns true when the walk is
 // complete. gc_all is stable during the walk because in-cycle allocations go to
-// gc_new (see gc_alloc), never prepended into gc_all.
-static bool gc_sweep_step(size_t budget) {
+// gc_new (see gc_alloc), never prepended into gc_all. t0/cap_ms add a wall-clock
+// ceiling on top of the object-count budget (cap_ms <= 0 disables it; SIZE_MAX
+// budget = unbounded count for the stop-the-world gc_collect call).
+static bool gc_sweep_step(size_t budget, double t0, double cap_ms) {
+    size_t visited = 0;
     while (budget-- > 0 && gc_inc.sweep_cursor != NULL) {
         gc_header* h = gc_inc.sweep_cursor;
         if (gc_audit_mode_cache != 0) gc_audit_gate("sweep cursor", h);
@@ -8894,6 +8901,7 @@ static bool gc_sweep_step(size_t budget) {
             gc_inc.sweep_prev = h;
         }
         gc_inc.sweep_cursor = next;
+        if (cap_ms > 0 && ((++visited) & 0x3Fu) == 0 && as_now_ms() - t0 >= cap_ms) break;
     }
     return gc_inc.sweep_cursor == NULL;
 }
@@ -9058,6 +9066,24 @@ static size_t gc_budget(void) {
     return adaptive > GC_SLICE_CAP ? GC_SLICE_CAP : adaptive;
 }
 
+// Wall-clock cap for one incremental slice. gc_budget() bounds the slice by
+// object count, but a "big" object (a 100k-element array, a multi-MB ByteArray)
+// costs orders of magnitude more to scan than a small string, so the count says
+// nothing about the pause. This cap makes the pause deterministic: a slice stops
+// once it has spent this many milliseconds, no matter how expensive the objects
+// it visited. The two limits combine as "make at least gc_budget() objects of
+// progress, but never run longer than this" -- the count is the throughput floor,
+// the clock is the latency ceiling. ASC_GC_TIME_BUDGET_MS overrides; 0 disables
+// the clock and restores the count-only behaviour for A/B measurement.
+static double gc_time_budget_ms(void) {
+    static double v = -1.0;
+    if (v < 0.0) {
+        const char* e = getenv("ASC_GC_TIME_BUDGET_MS");
+        v = e ? atof(e) : 3.0;
+    }
+    return v;
+}
+
 // The two callers of gc_trigger() want opposite things, so the *floor* differs
 // even though the adaptive term does not:
 //
@@ -9112,23 +9138,34 @@ static void gc_step(void) {
     // gc_alloc stops triggering its own stop-the-world collections.
     gc_frame_driven = true;
     gc_in_gc = 1;
+    // One slice budget measured against the clock, shared by the mark and sweep
+    // phases so the whole gc_step stays inside it. A deferred System.gc() request
+    // also starts a cycle here (see as_system_gc / gc_force_requested).
+    const double t0 = as_now_ms();
+    const double cap_ms = gc_time_budget_ms();
     if (gc_inc.state == GC_IDLE) {
         // Segment release / allocator trim is rate-limited and idempotent, so it
         // also runs here (every frame) rather than only at a cycle end: a scene
         // that stopped allocating never ends another cycle, and RSS would then
         // stay at the high-water mark forever after the ramp is over.
         gc_release_empty_segs();
-        if (gc_bytes_allocated < gc_trigger()) { gc_in_gc = 0; return; }
+        if (!gc_force_requested && gc_bytes_allocated < gc_trigger()) { gc_in_gc = 0; return; }
+        gc_force_requested = 0;
         gc_inc.state = GC_MARK;
         gc_inc.grey_top = 0;  // fresh mark; a previous cycle drains to empty first
         gc_mark_roots();
     }
     if (gc_inc.state == GC_MARK) {
         size_t n = gc_budget();
+        size_t visited = 0;
         while (n-- > 0 && gc_inc.grey_top > 0) {
             gc_header* g = gc_inc.grey[--gc_inc.grey_top];
             gc_scan(g);
             g->color = GC_BLACK;
+            // Check the clock every 64 objects: gc_scan's own cost dominates, so a
+            // per-object clock read would tax the hot loop for nothing, and 64 is
+            // small enough that the overrun above cap_ms stays negligible.
+            if ((++visited & 0x3Fu) == 0 && cap_ms > 0 && as_now_ms() - t0 >= cap_ms) break;
         }
         if (gc_inc.grey_top == 0) {
             gc_inc.state = GC_SWEEP;
@@ -9137,14 +9174,16 @@ static void gc_step(void) {
         }
     }
     if (gc_inc.state == GC_SWEEP) {
-        if (gc_sweep_step(gc_budget())) gc_finish_cycle();
+        if (gc_sweep_step(gc_budget(), t0, cap_ms)) gc_finish_cycle();
     }
     gc_in_gc = 0;
 }
 
 
-// Stop-the-world collection (System.gc() and offscreen leak checks): mark to
-// completion in one shot, then sweep atomically. Works from any gc_step state.
+// Stop-the-world collection (offscreen leak checks and gc_alloc's non-GUI
+// trigger): mark to completion in one shot, then sweep atomically. Frame-driven
+// System.gc() no longer lands here — it is deferred to gc_step (see
+// as_system_gc). Works from any gc_step state.
 // A partial incremental cycle may have (a) BLACK objects born on the gc_new side
 // list whose children were never scanned, and (b) half-marked BLACK objects on
 // gc_all. To get a correct result we first fold gc_new into gc_all, reset every
@@ -9166,7 +9205,7 @@ static void gc_collect(void) {
     gc_mark_drain();
     gc_inc.sweep_prev = NULL;
     gc_inc.sweep_cursor = gc_all;
-    gc_sweep_step((size_t)-1);
+    gc_sweep_step((size_t)-1, 0.0, 0.0);
     gc_finish_cycle();
     gc_in_gc = 0;
 }
@@ -15349,15 +15388,23 @@ static void as_dbg_frame(double gc_ms) {
     as_dbg_key_window_n = 0;
 }
 
-// System.gc(): force a stop-the-world collection. AIR exposes this for manual
-// GC; the frame loop instead calls gc_step() incrementally at the safe point,
-// but this lets offscreen scripts trigger a full collection inside a loop.
-// Unlike the frame loop it runs *inside* live AS3 frames, so the live C stack is
-// added to the root set conservatively (see gc_mark_stack) — otherwise objects
-// referenced only by stack locals of the calling chain would be swept underneath
-// their users.
+// System.gc(): AIR exposes this for manual GC, but it is a non-blocking hint, not
+// a synchronous stop-the-world — release runtimes may even drop it. A frame-driven
+// build therefore defers it to the next frame-boundary safe point (see the body);
+// only an offscreen build with no frame loop collects synchronously, and that path
+// runs *inside* live AS3 frames, so the live C stack is added to the root set
+// conservatively (see gc_mark_stack) — otherwise objects referenced only by stack
+// locals of the calling chain would be swept underneath their users.
 static void as_system_gc(void) {
-    gc_collect();
+    // AIR's System.gc() is a non-blocking hint: it does not guarantee collection
+    // finishes before the call returns, and release runtimes may drop it. Defer it
+    // to the next frame-boundary safe point so the incremental collector does it
+    // in bounded slices, and so the conservative stack scan runs with the AS3
+    // frames already returned (cheap) instead of mid-describe (deep). A build with
+    // no frame loop (offscreen leak checks) has no later safe point, so it must
+    // collect synchronously here.
+    if (gc_frame_driven) gc_force_requested = 1;
+    else gc_collect();
 }
 // System.output(): write a string verbatim to stdout (AIR 33.1 console output).
 // No trailing newline is added — AIR outputs exactly the given string.

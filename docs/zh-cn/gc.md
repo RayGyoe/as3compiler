@@ -208,8 +208,10 @@ typedef struct gc_header {
 > shadow stack。回收只在 `Stage_dispatchFrame` 开头的安全点（`gc_step()`）发生——此刻所有
 > 本帧回调都已返回，根集合仅剩永久根（静态字段、模块变量、`ASC_win_stage`、`ENTER_FRAME`
 > 注册表、定时器、`as_exception`、**在飞的异步 IO job 目标**（阶段八十九·四十五）），故**不需要**枚举栈上局部。代价是安全点只存在于帧循环里，
-> 且 `System.gc()`（`gc_collect()`）是用户可见的**手动采集点**，它会在任意位置触发。
-> "**中帧采集的保守栈扫描**"（§4.2.1）就是为后者补上的根来源。
+> 且 `System.gc()` 是用户可见的**手动采集点**。AIR 的 `System.gc()` 是非阻塞提示（release 运行时
+> 甚至可能忽略它），所以**帧驱动**的构建把它 defer 到下一帧安全点（`gc_force_requested`，见 §6.13），
+> 不再 mid-frame 停机；只有**无帧循环**的构建（offscreen 泄漏检查）才在调用点同步 `gc_collect()`，
+> 那条路径会在任意位置触发。"**中帧采集的保守栈扫描**"（§4.2.1）就是为后者补上的根来源。
 >
 > **在飞 job 必须登记为根**（阶段八十九·四十五）：`gc_mark_internal_roots()` 里调
 > `as_async_mark_roots()` 遍历 job 表，把每个 job 的 AS3 目标（`j->obj`）标为根——否则目标
@@ -249,8 +251,10 @@ void Foo_method(Foo* this, as_value a) {
 ### 4.2.1 中帧采集的保守栈扫描（阶段八十九·二十二）
 
 **问题**：`System.gc()` 是 AS3 语义里的显式采集点，Starling demo 的「返回主菜单」就调它
-（`Game.showMainMenu` → `System.pauseForGCIfCollectionImminent` + `System.gc()`）。此时 C 调用栈上
-还有活着的 AS3 帧，它们持有的对象**只存在于 C 局部变量里**（没有 shadow stack 就没有任何登记）。
+（`Game.showMainMenu` → `System.pauseForGCIfCollectionImminent` + `System.gc()`）。在**无帧循环**的
+构建里，这一调用发生在任意位置——此时 C 调用栈上还有活着的 AS3 帧，它们持有的对象**只存在于
+C 局部变量里**（没有 shadow stack 就没有任何登记）。帧驱动的构建不再走这条路：`System.gc()` 被
+defer 到下一帧安全点（§6.13），此时栈已空、无需保守扫描。
 实测后果：`EventDispatcher.dispatchEventWith` 里正在派发的 `Event*`（刚从 `Event.sEventPool` 弹出、
 作为 C 参数持有）被全停顿 `gc_collect()` 扫掉，随后 `Event.toPool` 把**已释放**的 event 压回对象池，
 下一次 `Event.fromPool` 弹出的 object 里 `vtable` 已变成垃圾（内存被复用为 `PTR_ARRAY`）
@@ -340,7 +344,7 @@ typedef struct {
     gc_header** grey_stack;   // 灰色对象工作栈（染灰即入栈）
     int grey_top;             // 栈顶（栈只增不减，直到标记完成）
     int grey_cap;             // 栈容量（按需 realloc，迁移注意 §8）
-    size_t budget;            // 每帧预算（对象数）
+    size_t budget;            // 每帧预算（对象数，下限）；另有墙钟上限（gc_time_budget_ms，见 §6.3）
 } gc_inc;
 ```
 
@@ -353,10 +357,11 @@ MARK ──(灰栈空)──> SWEEP                     // 标记完成
 SWEEP ──(每帧扫一片，回收 white、black 复位 white)──> IDLE
 ```
 
-**调度点**：`Stage_dispatchFrame` 每帧开头调用 `gc_step()`（在广播 ENTER_FRAME 之前）。budget
-用「每帧最多扫 N 个对象」的**确定性预算**（比时间预算好：跨平台一致、不依赖 `clock`）。
-没有帧的程序（纯脚本 / 服务端循环 / WASI）走不到这里，由 **`gc_alloc` 的分配阈值触发**兜底，
-见 §6.13。
+**调度点**：`Stage_dispatchFrame` 每帧开头调用 `gc_step()`（在广播 ENTER_FRAME 之前）。每帧切片受
+**双重上限**约束：对象数预算（`gc_budget()`，跨平台一致、不依赖 `clock`）保证吞吐下限，墙钟上限
+（`gc_time_budget_ms()`，默认 3 ms，`ASC_GC_TIME_BUDGET_MS` 覆盖）封顶延迟——一个大数组扫起来比一百
+个小字符串贵几个数量级，纯对象数预算无法预测停顿。没有帧的程序（纯脚本 / 服务端循环 / WASI）
+走不到这里，由 **`gc_alloc` 的分配阈值触发**兜底，见 §6.13。
 
 **预算与阈值必须随堆自适应，且切片需封顶（阶段八十九·二十五实测修正）**：固定 500 对象/帧只约束了
 *停顿*，没有约束*吞吐*。十万对象级的活集（Starling Benchmark 约 8000 个对象时活集已 ~15 万节点）
@@ -365,7 +370,11 @@ SWEEP ──(每帧扫一片，回收 white、black 复位 white)──> IDLE
 那一段工作又把帧率从 120 打到 75，基准测试的爬坡因此提前中止。修法：
 
 - **切片自适应且封顶**：`budget = min(count/16 + 500, 8000)`（`count` = 堆内对象数，O(1) 计数器）。
-  下限保住小堆的进度，上限保住*停顿*——不封顶时切片随堆线性增长，实测帧率从 120 一路滑到 47 fps。
+  下限保住小堆的进度，上限保住*吞吐*——不封顶时切片随堆线性增长，实测帧率从 120 一路滑到 47 fps。
+- **墙钟封顶（阶段三百八十八补）**：对象数预算说的是「扫多少个」，没说「花多久」——一个大数组
+  扫起来比一百个小字符串贵几个数量级，8000 个复杂对象仍能把单帧拖到几十 ms。因此每帧切片再加
+  一个墙钟上限 `gc_time_budget_ms()`（默认 3 ms，`ASC_GC_TIME_BUDGET_MS` 覆盖，0 关闭回到纯对象
+  数）：对象数下限保吞吐，墙钟上限保延迟，先到者停。
 - **触发阈值自适应**：`gc_threshold = max(1 MiB, inuse/8)`，垃圾约占堆 1/8 才开新轮，避免在大堆上
   「上一轮还没走完就又重启标记」。
 - 两个旋钮都可用环境变量 `ASC_GC_BUDGET` / `ASC_GC_THRESHOLD` 绝对覆盖（调参用，默认走自适应）。
@@ -374,16 +383,19 @@ SWEEP ──(每帧扫一片，回收 white、black 复位 white)──> IDLE
 
 ```c
 void gc_step(void) {
+    double t0 = now_ms();
+    double cap = gc_time_budget_ms();   // 默认 3 ms；0 = 关闭墙钟封顶
     if (gc_inc.state == GC_MARK) {
         size_t n = gc_inc.budget;
         while (n-- > 0 && gc_inc.grey_top > 0) {
             gc_header* g = gc_inc.grey_stack[--gc_inc.grey_top];
             gc_mark_children(g);   // 扫描 g 的子指针（§4.1 类型分派），white 子节点染灰入栈
             g->color = GC_BLACK;   // 子节点扫完，转黑
+            if (每 64 个对象 && cap > 0 && now_ms() - t0 >= cap) break;  // 墙钟封顶
         }
         if (gc_inc.grey_top == 0) gc_inc.state = GC_SWEEP;  // 标记完成
     } else if (gc_inc.state == GC_SWEEP) {
-        gc_sweep_step(gc_inc.budget);   // 每帧扫一片，回收 white
+        gc_sweep_step(gc_inc.budget, t0, cap);   // 每帧扫一片，回收 white（同受墙钟封顶）
         if (扫完) gc_inc.state = GC_IDLE;
     }
 }
@@ -642,9 +654,11 @@ free_bytes -= sizeof(gc_header) + h->size;   // 切分后 h->size 恰为真实�
 | 分配阈值触发 | `gc_alloc` 入口：`if (!gc_frame_driven && state == GC_IDLE && gc_bytes_allocated >= gc_trigger()) gc_collect();` | 从未派发过帧之前，分配自己按阈值（`max(1 MiB, 在用堆/8)`，§6.3）做**停机回收** |
 
 **为什么是停机回收**：这条路径上没有帧截止时间要保护，总工作量也一样，切片只会给一条
-「必须从任意调用点都正确」的路径引入状态机。它和已被支持的 `System.gc()`（可以在活着的 AS3
-帧内触发）是同一类操作：`gc_mark_roots` 照常跑**保守栈扫描**（setjmp 把 callee-saved 寄存器
-落到栈上再逐字扫，§4.2.1），因此调用链上每一层的活局部都还是根。触发点放在 `gc_alloc` 的
+「必须从任意调用点都正确」的路径引入状态机。它和无帧循环构建里同步执行的 `System.gc()`
+（offscreen 时在活着的 AS3 帧内触发）是同一类操作：`gc_mark_roots` 照常跑**保守栈扫描**
+（setjmp 把 callee-saved 寄存器落到栈上再逐字扫，§4.2.1），因此调用链上每一层的活局部都还是
+根。帧驱动的 `System.gc()` 已被 defer 到帧安全点（`gc_force_requested`），不走这条停机路径。
+触发点放在 `gc_alloc` 的
 **最前面**（新对象还不存在），所以清扫永远不会把「正在分配的那个对象」当成不可达垃圾。
 
 **不变式**：`main` 的第一条语句就是 `GC_NOTE_STACK_BASE()`（早于任何 AS3 语句），所以从
@@ -1023,8 +1037,8 @@ AIR 的精确 GC 不会。`examples/weak-listener.as` 的 F 项因此断言「�
 |---|---|---|
 | **Shadow Stack 漏登记一个根** | 对象过早回收 → 悬空指针 → **随机崩溃** | 保守起步：全函数生命周期登记全部持指针局部；AST 预扫描穷尽；永久根单独登记 |
 | 误保留（false retention） | 该回收的没回收，泄露残留 | 可接受（比崩溃安全）；后续可做 liveness 优化 |
-| GC 触发点非安全点 | 栈上局部未登记就被回收 | 帧边界安全点（`Stage_dispatchFrame` 的 `gc_step()`，此时所有帧回调已返回，只剩永久根）+ 任意位置触发时的**保守 C 栈扫描**（`System.gc()`、中帧采集 §4.2.1、非 GUI 的分配阈值触发 §6.13） |
-| **`System.gc()` 在任意位置触发（非安全点）** | 只有 C 局部持有的对象被扫掉 → 悬空指针 → `SIGSEGV`（阶段八十九·二十二：`Event` 池弹出后被回收再压回） | `gc_mark_roots()` 末尾做一次**保守栈扫描**（§4.2.1）：`[SP, main 锚点)` 逐字验证对象头（magic tag + 段内地址）后当根 mark；误保留只持续到下一次采集 |
+| GC 触发点非安全点 | 栈上局部未登记就被回收 | 帧边界安全点（`Stage_dispatchFrame` 的 `gc_step()`，此时所有帧回调已返回，只剩永久根）+ 任意位置触发时的**保守 C 栈扫描**（无帧循环构建里同步执行的 `System.gc()`、中帧采集 §4.2.1、非 GUI 的分配阈值触发 §6.13） |
+| **`System.gc()` 在任意位置触发（非安全点）** | 只有 C 局部持有的对象被扫掉 → 悬空指针 → `SIGSEGV`（阶段八十九·二十二：`Event` 池弹出后被回收再压回） | **帧驱动构建**把 `System.gc()` defer 到帧安全点（`gc_force_requested`），不 mid-frame 停机；**无帧循环构建**仍同步 `gc_collect()`，靠 `gc_mark_roots()` 末尾的**保守栈扫描**（§4.2.1）：`[SP, main 锚点)` 逐字验证对象头（magic tag + 段内地址）后当根 mark；误保留只持续到下一次采集 |
 | **段归还计数不精确（`free_bytes` 偏大）** | `free_bytes == size` 不再等价于「段空」→ 释放**仍有活对象**的段 → malloc 复用该地址 → 段内对象（含 `gc_all` 链表头、类实例 vtable 字）变成别人的数据 → 随机 `SIGSEGV`（阶段八十九·二十七：第二次跑 benchmark 崩溃，`gc_all` 被写成 double `0.9872449040412903`） | 分配计费按块的**实际尺寸**、且在切分之后扣除（§6.12），使 `free_bytes` 严格等于空闲链之和；`ASC_GC_AUDIT` 用活对象链对账（`DRIFT`/`RELEASING`），`examples/gc_seg_reap.as` 作常驻回归 |
 | 保守栈扫描把垃圾当对象头（误标/调垃圾函数指针） | `gc_scan` 的 `GCT_CUSTOM` 会把垃圾当头里的函数指针调 | `GCT_*` 全部偏移 `GCT_TAG_BASE`，空闲/新切分块 `type=0`（任意位模式都不可能等于合法 tag）；`gc_is_object` 还要求 color/size 合法 |
 | 保守栈扫描的栈字落在**段首** | 调用方读 `p - sizeof(gc_header)` 处的头字段落到段前未映射页 → `SIGBUS`（阶段八十九·二十四在 `stage57.as` `-O2` 下现形） | `gc_in_heap` 要求 `p >= base + sizeof(gc_header)`（首个对象体正在此位置，不会误拒合法对象） |
