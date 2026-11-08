@@ -252,6 +252,7 @@ equally free to use.
 |---|---|---|
 | `o` | the receiver parameter of a **constructor** (`Widget_ctor(Widget* o, ...)`, and `Widget_new`'s local) | `error: redefinition of 'o' with a different type: 'Object *' vs 'Widget *'` |
 | `_this` | the receiver parameter of **every instance method** (`Widget_add(void* _this, ...)`) | `error: redefinition of parameter '_this'` |
+| `_envp` | the new-env local inside the **closure env allocator** (`_fn0_env_make`) | `error: redefinition of 'e' with a different type: '_fn0_env *' vs 'IEnv'` (before stage 389 it was the raw name `e` and collided with a capture name — see G37) |
 | `_<word><N>` | `tmpName()` temporaries (`_once0`/`_i3`/`_ret1`, ...) and the closure-cell env tag `_cell0` | duplicate-definition error (and **silent** clobbering when the types match) |
 
 Minimal repro (`temp/d31probe/ocollide2.as`, a 7-line AIR app class that `adl` runs fine):

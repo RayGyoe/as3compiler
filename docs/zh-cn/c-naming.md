@@ -223,6 +223,7 @@ ctime_r asctime_r gmtime_r localtime_r gettimeofday
 |---|---|---|
 | `o` | **构造器**的接收者形参（`Widget_ctor(Widget* o, …)`、`Widget_new` 的局部） | `error: redefinition of 'o' with a different type: 'Object *' vs 'Widget *'` |
 | `_this` | **每个实例方法**的接收者形参（`Widget_add(void* _this, …)`） | `error: redefinition of parameter '_this'` |
+| `_envp` | **闭包 env 分配器**（`_fn0_env_make`）里指向新建 env 的局部量 | `error: redefinition of 'e' with a different type: '_fn0_env *' vs 'IEnv'`（阶段三百八十九之前它是裸 `e`，与捕获名撞上，见 G37） |
 | `_<word><N>` | `tmpName()` 临时（`_once0`/`_i3`/`_ret1`…）与闭包 cell 的 env 结构体标签 `_cell0` | 同名重定义（同类型时**静默**覆盖，更危险） |
 
 最小复现（`temp/d31probe/ocollide2.as`，7 行 AIR app 类；`adl` 跑它一切正常）：

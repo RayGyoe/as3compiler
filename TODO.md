@@ -21038,3 +21038,39 @@ half` 133 检查、`gallery tour` 60 页手算矩形、`descriptor DPI A/B`、G1
 `FileReference.download` / `requestPermission` 保持报明桩。
 
 口径全文见 `docs/{zh-cn,en}/flash-net.md` §6.11。
+
+### 阶段三百八十九：闭包捕获**接口类型**变量（asaotui `compiler-gaps.md` G37）
+
+`asaotui` 在给 `I18n.followEnv(env:Env)` 写回调时发现：`env.subscribe(function (d:int):void { … env.locale … })`
+能生成 C 但 **`clang` 编不过**。按 AGENTS §1.5 的硬判据，`mxmlc`/`adl 51.4.1` 接受同一形状
+（`temp/g37/air/`：661 字节 SWF，`adl` 输出 `start` / `cb zh-CN1` / `end`）⇒ 这是**遗留缺陷**，不是增强。
+
+根因是同一个结构体在两个发射点被当成指针，外加一处生成名撞名：
+
+1. **接口按值，mark 却按指针**。接口值在 C 侧是 `{ void* obj; <Iface>_vtable* vt; }` 结构体
+   （`cTypeName` 的 `'interface'` 分支，`vectorElemIsPtr` 与类字段 mark 早已这么处理），但
+   `captureMarkKind` 把 `interface` 与 `object` 同归 `'ptr'`，于是闭包 env 的 mark 发射成
+   `gc_mark_ptr((void*)e->f)` ⇒ `error: operand of type 'IEnv' (aka 'struct IEnv') where arithmetic or
+   pointer type is required`。新增 `'iface'` 一类并统一走 `emitCaptureMark()`，两个调用点
+   （共享 cell 组 `_cellN_mark` 与闭包 env `_fnN_env_mark`）都改用它。
+2. **env 分配器的局部量撞捕获名**。`_fnN_env_make` 的形参表就是捕获名本身，而局部指针裸写 `e`；
+   `function follow(e:IEnv)` 于是让 `IEnv e` 与 `_fn0_env* e` 同域（`redefinition of 'e' with a
+   different type`），后续 `e->field` 全写进形参结构体。局部改名为保留拼写 `_envp` 并登进
+   `isGeneratedLocalName`；**形参名不动**（它同时是 env 字段名来源）。
+
+触发面比 G37 记的更宽：不止「闭包当实参交给捕获对象自己的方法」，**任何**闭包捕获接口型局部量
+都会踩第 1 条（最小复现 `temp/g37/T1.as`，13 行）。
+
+**验收**：
+
+| 验收 | 方法 | 结果 |
+|---|---|---|
+| 编译 | `temp/g37/{Repro3,T1,T2,T3,T5}.as` | 全绿；`T3` 输出 `zh-CN1`，与 `adl` **逐行相同** |
+| 行为 | `examples/closure-iface-capture.as`（参数 / 局部 / 嵌套 / GC 存活 / cell 五形状） | `closure-iface-capture OK` |
+| 结构钉子 | `unit: emit/ClosureIfaceCapture`（14 钉） | 全过 |
+| 单元回归 | `node --test test/unit/*.ts` 与改动前 stash 基线逐条比对 | 340 / 329 / **10 fail**，失败名**逐条相同**（均为本机环境缺项，非本轮引入） |
+
+**顺带量到的性能数据（G38 评估用，未改代码）**：`String.length` 今天是 `strlen`（O(n) 但 SIMD），
+`charCodeAt` 是 `s[i]` O(1)。若内部改存 UTF-16：`length` 1.5ns、`charCodeAt` 1.5ns（今天 5.5 / 1.5ns），
+但每根字符串每次跨 C 边界（Skia 量/画文本、`printf`、curl、JSON/XML、正则）要多 24–58ns 转码，
+且 ASCII 字符串内存 ×2。实测表在 `temp/g38/bench.c` + `bench-result.txt`（结论：不换表示）。

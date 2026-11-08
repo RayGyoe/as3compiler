@@ -1196,15 +1196,35 @@ export class Emitter {
   }
 
   // How a captured CType must be traced from a closure environment: 'ptr' for a
-  // raw object/string/function pointer (gc_mark_ptr), 'value' for a boxed
-  // as_value (gc_mark_value), or null for a scalar needing no tracing.
-  private captureMarkKind(t: CType): 'ptr' | 'value' | null {
+  // raw object/string/function pointer (gc_mark_ptr), 'iface' for an interface
+  // VALUE, 'value' for a boxed as_value (gc_mark_value), or null for a scalar
+  // needing no tracing.
+  //
+  // An interface is NOT a pointer: `cTypeName` maps it to the by-value struct
+  // `{ void* obj; <Iface>_vtable* vt; }` (see also `vectorElemIsPtr`, which
+  // excludes interface elements for the same reason). Tracing it as a raw pointer
+  // emitted `gc_mark_ptr((void*)e->f)` over a struct -- a C type error G37 caught:
+  //   error: operand of type 'IEnv' (aka 'struct IEnv') where arithmetic or
+  //          pointer type is required
+  // The payload pointer is the `obj` member, so 'iface' marks `e->f.obj`.
+  private captureMarkKind(t: CType): 'ptr' | 'iface' | 'value' | null {
     switch (t.kind) {
-      case 'string': case 'object': case 'interface': case 'array':
+      case 'string': case 'object': case 'array':
       case 'vector': case 'record': case 'dict': case 'function':
       case 'regexp': case 'class': case 'xml': case 'xmllist': return 'ptr';
+      case 'interface': return 'iface';
       case 'any': return 'value';
       default: return null;
+    }
+  }
+
+  // Emit the GC trace call for ONE captured slot whose C lvalue is `expr`.
+  private emitCaptureMark(t: CType, expr: string): void {
+    switch (this.captureMarkKind(t)) {
+      case 'ptr': this.line(`gc_mark_ptr((void*)${expr});`); break;
+      case 'iface': this.line(`gc_mark_ptr((void*)(${expr}).obj);`); break;
+      case 'value': this.line(`gc_mark_value(${expr});`); break;
+      default: break;
     }
   }
 
@@ -1549,7 +1569,7 @@ export class Emitter {
   // so a spelling-level reservation would split declaration from use — see
   // docs/zh-cn/c-naming.md §7 for that residual hole.
   private static isGeneratedLocalName(n: string): boolean {
-    return n === 'o' || n === '_this' || /^_[A-Za-z]+\d+$/.test(n);
+    return n === 'o' || n === '_this' || n === '_envp' || /^_[A-Za-z]+\d+$/.test(n);
   }
 
   // Every C TYPE name the generated translation unit declares a typedef for.
@@ -8663,11 +8683,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.indent++;
       this.line(`${g.cellName}* e = (${g.cellName}*)self;`);
       for (const m of g.members) this.line(`gc_mark_ptr((void*)e->${m});`);
-      for (const c of g.varCaps) {
-        const k = this.captureMarkKind(c.type);
-        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cCapName(c.name)});`);
-        else if (k === 'value') this.line(`gc_mark_value(e->${this.cCapName(c.name)});`);
-      }
+      for (const c of g.varCaps) this.emitCaptureMark(c.type, `e->${this.cCapName(c.name)}`);
       this.indent--;
       this.line('}');
     }
@@ -8686,19 +8702,21 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       this.line(`static void ${fn.name}_env_mark(void* self) {`);
       this.indent++;
       this.line(`${fn.name}_env* e = (${fn.name}_env*)self;`);
-      for (const c of fn.captures) {
-        const k = this.captureMarkKind(c.type);
-        if (k === 'ptr') this.line(`gc_mark_ptr((void*)e->${this.cCapName(c.name)});`);
-        else if (k === 'value') this.line(`gc_mark_value(e->${this.cCapName(c.name)});`);
-      }
+      for (const c of fn.captures) this.emitCaptureMark(c.type, `e->${this.cCapName(c.name)}`);
       this.indent--;
       this.line('}');
       this.line(`static ${fn.name}_env* ${fn.name}_env_make(${params}) {`);
       this.indent++;
-      this.line(`${fn.name}_env* e = (${fn.name}_env*)gc_alloc(GCT_CUSTOM, sizeof(${fn.name}_env));`);
-      this.line(`e->mark = ${fn.name}_env_mark;`);
-      for (const c of fn.captures) this.line(`e->${this.cCapName(c.name)} = ${this.cCapName(c.name)};`);
-      this.line('return e;');
+      // The env pointer local must NOT be spelled `e`: the parameter list is made
+      // of raw capture names, and `e` is a common AS3 identifier (`function f(e:IEnv)`),
+      // so `_fn0_env* e` redeclared the parameter and every `e->field` write then
+      // addressed the ENV PARAM's struct (G37):
+      //   error: redefinition of 'e' with a different type: '_fn0_env *' vs 'IEnv'
+      // `_envp` is reserved by `isGeneratedLocalName`, so no capture can reach it.
+      this.line(`${fn.name}_env* _envp = (${fn.name}_env*)gc_alloc(GCT_CUSTOM, sizeof(${fn.name}_env));`);
+      this.line(`_envp->mark = ${fn.name}_env_mark;`);
+      for (const c of fn.captures) this.line(`_envp->${this.cCapName(c.name)} = ${this.cCapName(c.name)};`);
+      this.line('return _envp;');
       this.indent--;
       this.line('}');
     }

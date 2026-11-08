@@ -1026,6 +1026,26 @@ nested inner function。`examples/weak-listener.as` 的 H/I/J 三项钉住这条
 AIR 的精确 GC 不会。`examples/weak-listener.as` 的 F 项因此断言「批量弱注册里至多残留 1 个」，
 而不是「全部消失」。这是 AGENTS §2.4「宁可误保留、不得漏标」的既有取舍，不是本阶段的缺陷。
 
+#### 6.21 闭包环境里的**接口捕获**必须标 `.obj`（阶段三百八十九）
+
+一条与 §6.10 同源的契约，但落在**闭包**上而不是 Vector 上：接口类型的值在 C 侧是**按值结构体**
+`{ void* obj; <Iface>_vtable* vt; }`（`cTypeName` 的 `'interface'` 分支），所以闭包 env 的 mark
+回调不能把它当裸指针。
+
+| 关注点 | 落点 |
+|---|---|
+| 分类 | `emit.ts` 的 `captureMarkKind` 为 `interface` 单独返回 `'iface'`（此前与 `object` 同归 `'ptr'`） |
+| 发射 | 统一的 `emitCaptureMark(t, expr)`：`'ptr'`→`gc_mark_ptr((void*)e->f)`、`'iface'`→`gc_mark_ptr((void*)(e->f).obj)`、`'value'`→`gc_mark_value(e->f)`。两个调用点（共享 cell 组 `_cellN_mark` 与闭包 env `_fnN_env_mark`）都走它 |
+| 漏标的后果 | `gc_mark_ptr((void*)e->f)` 对结构体是 **C 类型错误**（不是静默漏标）：`operand of type 'IEnv' (aka 'struct IEnv') where arithmetic or pointer type is required` ⇒ 编译期就会红，不是运行时才掉对象 |
+| 同族已知点 | 类实例字段（`emit.ts` 的接口字段 mark）、Vector 接口元素（§6.10）早已按 `.obj` 走；闭包 env 是最后一条漏网的 |
+| 钉子 | `examples/closure-iface-capture.as`（参数/局部/嵌套/GC 存活/cell 五种形状）+ `unit: emit/ClosureIfaceCapture`（14 钉，含 `_fn0_env_make(IEnv e)` 与 `gc_mark_ptr((void*)(e->e).obj)` 的形状断言）|
+
+**同一处还有第二个缺陷**：`_fnN_env_make` 的形参表就是**捕获名本身**，而 env 指针局部原本裸写 `e`。
+`function follow(e:IEnv)` 这种极常见写法于是把形参 `IEnv e` 与局部 `_fn0_env* e` 撞在同一作用域，
+报 `redefinition of 'e' with a different type`，且后续 `e->field` 全部写进形参结构体。修法是把该局部
+改成保留拼写 `_envp` 并登进 `isGeneratedLocalName`（见 `docs/zh-cn/c-naming.md` §7），**不动形参名** ——
+形参名同时是 env 字段名的来源，改名会拆开声明与使用。
+
 ## 7. 与现有反射表的关系（复用，不重造）
 
 | 现有设施 | GC 用途 |

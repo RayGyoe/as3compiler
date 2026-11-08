@@ -4918,3 +4918,102 @@ function checkEmitFileUpload(): string[] {
   return bad;
 }
 registerGroup('unit: emit/FileUpload', checkEmitFileUpload);
+
+// G37 (asaotui/compiler-gaps.md): a closure that captures an INTERFACE-typed
+// variable. An interface is a BY-VALUE `{ void* obj; <Iface>_vtable* vt; }`
+// struct in the generated C (cTypeName 'interface'), so three things must agree:
+//   - the env field is the struct, not a pointer;
+//   - the env's GC trace reaches `.obj` (`gc_mark_ptr((void*)e->f)` over a struct
+//     is "operand of type 'IEnv' where arithmetic or pointer type is required");
+//   - the env allocator's pointer local is not spelled after a capture, which is
+//     what `function follow(e:IEnv)` used to trigger ("redefinition of 'e' with a
+//     different type: '_fn0_env *' vs 'IEnv'").
+// Hard criterion (AGENTS.md §1.5): `mxmlc`/`adl` accept the same program
+// (temp/g37/air: 661-byte SWF, `adl` prints "cb zh-CN1"), so the old failure was
+// a 遗留缺陷, not an enhancement.
+function checkClosureIfaceCapture(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++;
+    else bad.push(`[closure-iface] ${label}`);
+  };
+
+  const src = 'function follow(e:IEnv):void {\n'
+    + '  e.subscribe(function (d:int):void { trace(e.locale + d); });\n'
+    + '}\n'
+    + 'follow(new EnvImpl());\n'
+    + 'interface IEnv { function get locale():String; function subscribe(f:Function):void; }\n'
+    + 'class EnvImpl implements IEnv {\n'
+    + '  public function get locale():String { return "zh-CN"; }\n'
+    + '  public function subscribe(f:Function):void { f(1); }\n'
+    + '}\n';
+  const c = generateC(parse(src)).c;
+
+  check('the env field is the by-value interface struct',
+    c.includes('IEnv e; } _fn0_env;'));
+  check('the env traces the interface through its .obj payload pointer',
+    c.includes('gc_mark_ptr((void*)(e->e).obj);'));
+  check('the env is never traced as if it were a raw pointer',
+    !c.includes('gc_mark_ptr((void*)e->e);'));
+  check('the allocator local is not spelled after the capture',
+    c.includes('_fn0_env* _envp = (_fn0_env*)gc_alloc(GCT_CUSTOM, sizeof(_fn0_env));')
+    && c.includes('_envp->e = e;')
+    && c.includes('return _envp;'));
+  check('the capture parameter keeps its AS3-derived name',
+    /_fn0_env_make\(IEnv e\)/.test(c));
+  check('the closure body still reaches the payload through .obj',
+    c.includes('env->e.vt->get_locale'));
+
+  // An interface local the enclosing body writes AFTER the closure exists lives
+  // in a shared activation cell, whose mark callback has the same obligation.
+  const cell = generateC(parse('function f(env:IEnv):Function {\n'
+    + '  var cur:IEnv = env;\n'
+    + '  var g:Function = function ():String { return cur.locale; };\n'
+    + '  cur = env;\n'
+    + '  return g;\n'
+    + '}\n'
+    + 'interface IEnv { function get locale():String; }\n'
+    + 'class EnvImpl implements IEnv { public function get locale():String { return "L"; } }\n'
+    + 'f(new EnvImpl())();\n')).c;
+  const cellMarks = cell.match(/gc_mark_ptr\(\(void\*\)\(e->\w+\)\.obj\);/g) ?? [];
+  check('a cell holding an interface traces .obj too', cellMarks.length >= 1);
+  check('no interface capture is traced as a raw pointer',
+    !cell.includes('gc_mark_ptr((void*)e->cur);'));
+
+  // `_envp` is the env-allocator's own local, so an AS3 identifier of that name
+  // must be renamed rather than split declaration from use.
+  const clash = generateC(parse('function f(env:IEnv):Function {\n'
+    + '  var _envp:IEnv = env;\n'
+    + '  return function ():String { return _envp.locale; };\n'
+    + '}\n'
+    + 'interface IEnv { function get locale():String; }\n'
+    + 'class EnvImpl implements IEnv { public function get locale():String { return "L"; } }\n'
+    + 'f(new EnvImpl())();\n')).c;
+  check('a user local named `_envp` is renamed away from the generated local',
+    clash.includes('IEnv __envp;') && !clash.includes('IEnv _envp;'));
+
+  // Source-level: the three code sites that must stay in agreement.
+  const em = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  check("captureMarkKind classifies an interface as 'iface', not 'ptr'",
+    em.includes("case 'interface': return 'iface';"));
+  check("the emitted trace reaches the payload member for 'iface'",
+    em.includes('case \'iface\': this.line(`gc_mark_ptr((void*)(${expr}).obj);`); break;'));
+  check('the env allocator local is the reserved spelling `_envp`',
+    em.includes('_envp = (${fn.name}_env*)gc_alloc(GCT_CUSTOM, sizeof(${fn.name}_env));')
+    && em.includes("n === 'o' || n === '_this' || n === '_envp'"));
+
+  const ex = readFileSync(join(root, 'examples', 'closure-iface-capture.as'), 'utf8');
+  check('the example pins the parameter, local, nested, GC-survival and cell shapes',
+    ex.includes('captured interface parameter must stay usable in the closure')
+    && ex.includes('captured interface local')
+    && ex.includes('a grandchild closure must capture the interface transitively')
+    && ex.includes('a captured interface payload must survive a full collection')
+    && ex.includes('a captured interface local is shared by reference'));
+  check('the example names the AIR evidence',
+    ex.includes('mxmlc') && ex.includes('adl 51.4.1'));
+
+  console.log(`     [closure-iface] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/ClosureIfaceCapture', checkClosureIfaceCapture);

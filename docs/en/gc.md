@@ -1157,6 +1157,28 @@ and would drop it. Example case F therefore asserts "at most one survivor out of
 registrations" rather than "none". That is the existing AGENTS §2.4 trade-off (may over-retain, never
 under-mark), not a defect of this stage.
 
+#### 6.21 An **interface capture** in a closure environment must mark `.obj` (stage 389)
+
+Same contract as §6.10, but on **closures** instead of Vectors: an interface value is a **by-value struct**
+`{ void* obj; <Iface>_vtable* vt; }` on the C side (`cTypeName`'s `'interface'` branch), so a closure
+env's mark callback must not treat it as a raw pointer.
+
+| Concern | Where |
+|---|---|
+| Classification | `captureMarkKind` in `emit.ts` returns a dedicated `'iface'` for `interface` (it used to share `'ptr'` with `object`) |
+| Emission | one helper `emitCaptureMark(t, expr)`: `'ptr'` → `gc_mark_ptr((void*)e->f)`, `'iface'` → `gc_mark_ptr((void*)(e->f).obj)`, `'value'` → `gc_mark_value(e->f)`. Both call sites (the shared-cell group `_cellN_mark` and the closure env `_fnN_env_mark`) go through it |
+| What under-marking looked like | `gc_mark_ptr((void*)e->f)` over a struct is a **C type error**, not a silent leak: `operand of type 'IEnv' (aka 'struct IEnv') where arithmetic or pointer type is required` — it fails at build time, not at collection time |
+| Related sites | Interface-typed class fields and interface Vector elements (§6.10) already went through `.obj`; the closure env was the last one left |
+| Pins | `examples/closure-iface-capture.as` (parameter / local / nested / GC survival / cell) plus `unit: emit/ClosureIfaceCapture` (14 checks, including the `_fn0_env_make(IEnv e)` and `gc_mark_ptr((void*)(e->e).obj)` shapes) |
+
+**A second defect sat in the same spot**: `_fnN_env_make`'s parameter list is the **capture names themselves**,
+while the env pointer local used to be spelled `e` raw. The very common `function follow(e:IEnv)` therefore
+put the parameter `IEnv e` and the local `_fn0_env* e` in one scope (`redefinition of 'e' with a different
+type`), and every later `e->field` wrote into the parameter's struct. The fix renames that local to the
+reserved spelling `_envp` and registers it in `isGeneratedLocalName` (see `docs/en/c-naming.md` §7); the
+**parameter names stay untouched** — they are also the source of the env field names, so renaming them
+would split declaration from use.
+
 ## 7. Relationship with the Existing Reflection Tables (reuse, don't rebuild)
 
 | Existing facility | GC use |
