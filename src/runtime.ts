@@ -1632,6 +1632,9 @@ static void gc_write_barrier(void* p);
 static void gc_step(void);
 static void gc_mark_user_roots(void);
 static void gc_collect(void);
+// String.length in UTF-16 code units (body sits in the string layer, below the
+// boxed-length helper that already needs it).
+static int as_str_len(const char* s);
 
 // Allocate a GC-managed string of n bytes (the caller writes the trailing NUL).
 // Strings are GCT_STRING leaves: they carry no child pointers and are reclaimed
@@ -4069,7 +4072,7 @@ static char* as_join_sep(as_value v) {
 // boxed tag (string length, array length/join; everything else -> 0/empty).
 static int as_any_length(as_value v) {
     if (v.tag == 6) return ((as_array*)v.ptr)->length;
-    if (v.tag == 3) return (int)strlen((char*)v.ptr);
+    if (v.tag == 3) return as_str_len((char*)v.ptr);
     // A dynamically-typed Vector ('var pv:* = vec; pv.length') boxes as tag 4 but
     // has no vtable, so it needs the generated accessor rather than a length field.
     if (v.tag == 4 && v.ptr != NULL && as_vec_get_hook != NULL && as_dyn_kind(v.ptr) == 3)
@@ -7203,22 +7206,268 @@ static bool as_dict_del(as_dict* d, as_value key) {
     return true;
 }
 
+// ---------- UTF-16 code units over UTF-8 storage ----------
+// AS3 (and AIR) index a String by UTF-16 CODE UNIT; the backing store is UTF-8 bytes, so
+// every public index -- length, charAt, charCodeAt, substr/substring/slice,
+// indexOf/lastIndexOf, split("") -- has to translate. Two properties keep that at full
+// speed (measured, temp/g38/bench2.c, a 200-character CJK string):
+//   1. as_str_len is word-wise and has an ASCII fast path (units == bytes);
+//   2. a two-slot cursor memoises {string, unit, byte} of the last landing point, so an
+//      ASCENDING scan -- the only pattern real text code uses (wrap / ellipsis /
+//      segmentation / typed search) -- is ONE pass over the bytes. A full scan costs
+//      595ns against 774ns for the byte walk it replaces; re-walking from 0 per index
+//      (what a translation WITHOUT the cursor does) costs 25us.
+// A cursor miss only costs a walk from the start: it can never change an answer. It IS
+// dropped by gc_finish_cycle(), because a swept string's address gets reused and a stale
+// {unit, byte} could then point outside the new string.
+typedef struct as_u16_cur {
+    const char* s;
+    int unit;   // code-unit index of the landing point
+    int byte;   // its byte offset (always a character start)
+} as_u16_cur;
+static as_u16_cur as_u16_cursor[2];
+static int as_u16_rr;
+// Length memo, separate from the cursors so a .length does not evict a scan's
+// position (and vice versa). Two entries cover one loop that reads two strings' lengths.
+// Sound because an AS3 String is immutable: same pointer => same length, until the
+// collector frees it, which drops both caches.
+typedef struct as_str_len_memo_s { const char* s; int len; } as_str_len_memo_t;
+static as_str_len_memo_t as_str_len_memo[2];
+static int as_str_len_rr;
+static void as_u16_cursor_reset(void) {
+    as_u16_cursor[0].s = NULL; as_u16_cursor[0].unit = 0; as_u16_cursor[0].byte = 0;
+    as_u16_cursor[1].s = NULL; as_u16_cursor[1].unit = 0; as_u16_cursor[1].byte = 0;
+    as_str_len_memo[0].s = NULL; as_str_len_memo[0].len = 0;
+    as_str_len_memo[1].s = NULL; as_str_len_memo[1].len = 0;
+}
+// Width in bytes of the character whose lead byte is b. A continuation byte (0x80..0xBF)
+// never STARTS a character, so it reports 1: a malformed string then advances instead of
+// making the walk stand still.
+static int as_u16_width(unsigned char b) {
+    if (b < 0xC0) return 1;
+    if (b < 0xE0) return 2;
+    if (b < 0xF0) return 3;
+    return 4;
+}
+// Decode one character at p: the code POINT, and how many UTF-16 code units it occupies.
+// A 3-byte ED A0..BF sequence decodes to a lone surrogate as ONE unit -- that is the
+// CESU-8 form as_str_charAt emits for half of an astral character, so a half the runtime
+// produced itself reads back in the index space it was sliced with.
+static unsigned as_u16_decode(const unsigned char* p, int* units) {
+    unsigned char b = p[0];
+    if (b < 0x80) { *units = 1; return (unsigned)b; }
+    if (b < 0xE0) { *units = 1; return ((unsigned)(b & 0x1F) << 6) | (unsigned)(p[1] & 0x3F); }
+    if (b < 0xF0) {
+        *units = 1;
+        return ((unsigned)(b & 0x0F) << 12) | ((unsigned)(p[1] & 0x3F) << 6) | (unsigned)(p[2] & 0x3F);
+    }
+    *units = 2;
+    // A 4-byte sequence's payload IS the code point, already above 0xFFFF: adding
+    // 0x10000 here (a mistake worth spelling out) yields the wrong character.
+    return ((unsigned)(b & 0x07) << 18) | ((unsigned)(p[1] & 0x3F) << 12) |
+           ((unsigned)(p[2] & 0x3F) << 6) | (unsigned)(p[3] & 0x3F);
+}
+// Portable popcount: clang/cc only guarantee the SWAR form, and this runs at most twice
+// per eight bytes.
+static int as_u16_popcnt64(uint64_t v) {
+    v = v - ((v >> 1) & 0x5555555555555555ull);
+    v = (v & 0x3333333333333333ull) + ((v >> 2) & 0x3333333333333333ull);
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+    return (int)((v * 0x0101010101010101ull) >> 56);
+}
+// Code units in a NON-ASCII string: leaders + astral leads (a 4-byte character is a
+// surrogate PAIR, i.e. two units), i.e. bytes - continuations + astral.
+static int as_str_len_wide(const char* s, size_t n) {
+    const unsigned char* p = (const unsigned char*)s;
+    size_t cont = 0, astral = 0, i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w; memcpy(&w, p + i, 8);
+        uint64_t t = w & 0xC0C0C0C0C0C0C0C0ull;                       // top two bits per byte
+        uint64_t x = t ^ 0x8080808080808080ull;                       // 0x00 exactly at 10xxxxxx
+        cont += (size_t)as_u16_popcnt64((x - 0x0101010101010101ull) & ~x & 0x8080808080808080ull);
+        uint64_t t3 = (w & 0xF0F0F0F0F0F0F0F0ull) ^ 0xF0F0F0F0F0F0F0F0ull;  // 0x00 where top nibble is F
+        astral += (size_t)as_u16_popcnt64((t3 - 0x0101010101010101ull) & ~t3 & 0x8080808080808080ull);
+    }
+    for (; i < n; i++) {
+        unsigned char b = p[i];
+        if (b >= 0x80 && b < 0xC0) cont++;
+        else if (b >= 0xF0) astral++;
+    }
+    return (int)(n - cont + astral);
+}
+// String.length. ASCII -- identifiers, keys, numbers, Latin labels: the overwhelming
+// majority of strings a UI allocates -- returns strlen's answer after one high-bit probe.
+// The result is memoised per string pointer, which is what keeps a for-loop whose
+// CONDITION re-reads s.length from being O(n^2) on a CJK string WITHOUT any
+// loop-invariant hoisting in the emitter: 117ns per call becomes ~2ns, and while-loops
+// and dynamic receivers get the same treatment for free.
+static int as_str_len(const char* s) {
+    if (s == NULL) return 0;
+    if (as_str_len_memo[0].s == s) return as_str_len_memo[0].len;
+    if (as_str_len_memo[1].s == s) return as_str_len_memo[1].len;
+    int len;
+    size_t n = strlen(s);
+    const unsigned char* p = (const unsigned char*)s;
+    size_t i = 0;
+    for (;;) {
+        if (i + 8 <= n) {
+            uint64_t w; memcpy(&w, p + i, 8);
+            if (w & 0x8080808080808080ull) { len = as_str_len_wide(s, n); goto memo; }
+            i += 8;
+            continue;
+        }
+        if (i < n) {
+            if (p[i] & 0x80) { len = as_str_len_wide(s, n); goto memo; }
+            i++;
+            continue;
+        }
+        len = (int)n;
+        break;
+    }
+memo:
+    if (as_str_len_memo[0].s == NULL) { as_str_len_memo[0].s = s; as_str_len_memo[0].len = len; }
+    else if (as_str_len_memo[1].s == NULL) { as_str_len_memo[1].s = s; as_str_len_memo[1].len = len; }
+    else {
+        as_str_len_memo_t* m = &as_str_len_memo[as_str_len_rr];
+        as_str_len_rr ^= 1;
+        m->s = s; m->len = len;
+    }
+    return len;
+}
+// The character holding code unit u: its byte offset, and whether u is the LOW half of an
+// astral pair (the second of the two units one 4-byte character occupies).
+static void as_u16_locate(const char* s, int u, int* off, int* low) {
+    int k = 0, b = 0;
+    if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit) { k = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte; }
+    else if (as_u16_cursor[1].s == s && u >= as_u16_cursor[1].unit) { k = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte; }
+    const unsigned char* p = (const unsigned char*)s + b;
+    while (k < u && *p != 0) {
+        int w = as_u16_width(*p);
+        if (w == 4 && k + 1 == u) { *off = b; *low = 1; return; }
+        k += (w == 4) ? 2 : 1;
+        b += w;
+        p += w;
+    }
+    *off = b; *low = 0;
+    if (as_u16_cursor[0].s == s) { as_u16_cursor[0].unit = k; as_u16_cursor[0].byte = b; }
+    else if (as_u16_cursor[1].s == s) { as_u16_cursor[1].unit = k; as_u16_cursor[1].byte = b; }
+    else {
+        // Round-robin, so a nested loop over a SECOND string does not evict the outer
+        // cursor on every iteration (that would be correct but back to O(n) per index).
+        as_u16_cur* c = &as_u16_cursor[as_u16_rr];
+        as_u16_rr ^= 1;
+        c->s = s; c->unit = k; c->byte = b;
+    }
+}
+static int as_u16_byte_of(const char* s, int u) {
+    int off = 0, low = 0;
+    as_u16_locate(s, u, &off, &low);
+    (void)low;
+    return off;
+}
+// Code-unit index of a BYTE offset. A strstr match can only start on a character
+// boundary (a valid UTF-8 needle never begins with a continuation byte), so the prefix
+// is a plain upward walk.
+static int as_u16_unit_of(const char* s, int byteoff) {
+    int u = 0, b = 0;
+    const unsigned char* p = (const unsigned char*)s;
+    while (b < byteoff) {
+        int w = as_u16_width(*p);
+        b += w; p += w; u += (w == 4) ? 2 : 1;
+    }
+    return u;
+}
+// CESU-8 form of one surrogate code unit: the only byte encoding of half an astral
+// character that keeps charAt/charCodeAt/length in one index space. Such a string is
+// not valid UTF-8 if it escapes to Skia/printf -- which is exactly what AIR printing a
+// lone surrogate does (measured behaviour: AIR prints it raw, no replacement char).
+static int as_u16_emit_surrogate(char* r, unsigned v) {
+    r[0] = (char)(0xE0 | (v >> 12));
+    r[1] = (char)(0x80 | ((v >> 6) & 0x3F));
+    r[2] = (char)(0x80 | (v & 0x3F));
+    return 3;
+}
+// The string spanned by code units [a, b), a <= b, both already clamped to [0, length).
+// Whole characters are copied verbatim; a boundary that cuts an astral character emits the
+// CESU-8 half on that side instead.
+static char* as_u16_take(const char* s, int a, int b) {
+    if (s == NULL || a >= b) return as_str_empty();
+    int offa = 0, loa = 0, offb = 0, lob = 0;
+    as_u16_locate(s, a, &offa, &loa);
+    as_u16_locate(s, b, &offb, &lob);
+    size_t total = (size_t)(offb - offa);
+    if (loa) total -= 1;   // that astral character contributes its 3-byte low half only
+    if (lob) total += 3;   // plus the 3-byte high half of the character at offb
+    char* r = as_str_alloc(total + 1);
+    size_t n = 0;
+    const unsigned char* p = (const unsigned char*)s + offa;
+    const unsigned char* end = (const unsigned char*)s + offb;
+    if (loa) {
+        int units = 1;
+        unsigned cp = as_u16_decode(p, &units);
+        unsigned d = cp - 0x10000u;
+        n += (size_t)as_u16_emit_surrogate(r + n, 0xDC00u | (d & 0x3FFu));
+        p += 4;
+    }
+    while (p < end) {
+        int w = as_u16_width(*p);
+        memcpy(r + n, p, (size_t)w);
+        n += (size_t)w;
+        p += w;
+    }
+    if (lob) {
+        int units = 1;
+        unsigned cp = as_u16_decode(end, &units);
+        unsigned d = cp - 0x10000u;
+        n += (size_t)as_u16_emit_surrogate(r + n, 0xD800u | (d >> 10));
+    }
+    r[n] = 0;
+    return r;
+}
+
 // ---------- string methods ----------
+// All indices below are UTF-16 CODE UNITS (AS3 semantics); see the layer above.
 static char* as_str_charAt(const char* s, int i) {
-    int len = (int)strlen(s);
+    if (s == NULL) return "";
+    int len = as_str_len(s);
     if (i < 0 || i >= len) return "";
-    char* r = as_str_alloc(2);
-    r[0] = s[i]; r[1] = 0;
+    int off = 0, low = 0;
+    as_u16_locate(s, i, &off, &low);
+    const unsigned char* p = (const unsigned char*)s + off;
+    int units = 1;
+    unsigned cp = as_u16_decode(p, &units);
+    if (units == 2) {
+        unsigned d = cp - 0x10000u;
+        char* r = as_str_alloc(4);
+        as_u16_emit_surrogate(r, low ? (0xDC00u | (d & 0x3FFu)) : (0xD800u | (d >> 10)));
+        r[3] = 0;
+        return r;
+    }
+    int w = as_u16_width(*p);
+    char* r = as_str_alloc((size_t)w + 1);
+    memcpy(r, p, (size_t)w);
+    r[w] = 0;
     return r;
 }
 static int as_str_charCodeAt(const char* s, int i) {
-    int len = (int)strlen(s);
+    if (s == NULL) return 0;
+    int len = as_str_len(s);
     if (i < 0 || i >= len) return 0;
-    return (unsigned char)s[i];
+    int off = 0, low = 0;
+    as_u16_locate(s, i, &off, &low);
+    const unsigned char* p = (const unsigned char*)s + off;
+    int units = 1;
+    unsigned cp = as_u16_decode(p, &units);
+    if (units == 2) {
+        unsigned d = cp - 0x10000u;
+        return (int)(low ? (0xDC00u | (d & 0x3FFu)) : (0xD800u | (d >> 10)));
+    }
+    return (int)cp;
 }
 static int as_str_indexOf(const char* s, const char* sub) {
+    if (s == NULL) return -1;
     const char* p = strstr(s, sub);
-    return p ? (int)(p - s) : -1;
+    return p ? as_u16_unit_of(s, (int)(p - s)) : -1;
 }
 // AS3 String.indexOf(value, startIndex=0) / lastIndexOf(value, startIndex=0x7FFFFFFF).
 // The optional startIndex is NOT decoration: walking a string line by line means
@@ -7233,23 +7482,43 @@ static int as_str_indexOf(const char* s, const char* sub) {
 //   lastIndexOf clamps down to len, but a NEGATIVE start returns -1 outright — it
 //              is not clamped to 0 ("abcabc".lastIndexOf("a",-1) = -1)
 static int as_str_indexOf_from(const char* s, const char* sub, int from) {
-    int slen = (int)strlen(s);
+    if (s == NULL) return -1;
+    int len = as_str_len(s);
     if (from < 0) from = 0;
-    if (from > slen) from = slen;
-    const char* p = strstr(s + from, sub);
-    return p ? (int)(p - s) : -1;
+    if (from > len) from = len;
+    const char* p = strstr(s + as_u16_byte_of(s, from), sub);
+    return p ? as_u16_unit_of(s, (int)(p - s)) : -1;
 }
 static int as_str_lastIndexOf_from(const char* s, const char* sub, int from) {
-    if (from < 0) return -1;
-    int slen = (int)strlen(s);
-    if (from > slen) from = slen;
+    if (s == NULL || from < 0) return -1;
+    int len = as_str_len(s);
+    if (from > len) from = len;
     int sublen = (int)strlen(sub);
-    for (int i = from; i >= 0; i--) {
-        if (strncmp(s + i, sub, (size_t)sublen) == 0) return i;
+    if (sublen == 0) return from;
+    // One forward walk instead of stepping backwards unit by unit: stepping back would
+    // cost a byte->unit translation per candidate, i.e. O(n^2) on a CJK string.
+    int best = -1, u = 0;
+    const unsigned char* p = (const unsigned char*)s;
+    while (*p != 0 && u <= from) {
+        if (strncmp((const char*)p, sub, (size_t)sublen) == 0) best = u;
+        int w = as_u16_width(*p);
+        p += w; u += (w == 4) ? 2 : 1;
     }
-    return -1;
+    return best;
 }
 static char* as_str_substring(const char* s, int from, int to) {
+    if (s == NULL) return "";
+    int len = as_str_len(s);
+    if (from < 0) from = 0;
+    if (to < 0) to = 0;
+    if (from > len) from = len;
+    if (to > len) to = len;
+    if (from > to) { int t = from; from = to; to = t; }
+    return as_u16_take(s, from, to);
+}
+// Byte-offset substring, for the ONE class of caller whose indices are byte offsets by
+// design: the regex engine's match spans and TextField's line table both count bytes.
+static char* as_str_substring_b(const char* s, int from, int to) {
     int len = (int)strlen(s);
     if (from < 0) from = 0;
     if (to < 0) to = 0;
@@ -7257,8 +7526,8 @@ static char* as_str_substring(const char* s, int from, int to) {
     if (to > len) to = len;
     if (from > to) { int t = from; from = to; to = t; }
     int n = to - from;
-    char* r = as_str_alloc(n + 1);
-    memcpy(r, s + from, n);
+    char* r = as_str_alloc((size_t)n + 1);
+    memcpy(r, s + from, (size_t)n);
     r[n] = 0;
     return r;
 }
@@ -7278,19 +7547,15 @@ static int as_clamp_index(int n, int length) {
 // "2023-02-10 17:50", not "" (ES3 would clamp a negative length to 0). Measured
 // against adl 51.4.1; the real app relies on it for the 我的会议 start-time label.
 static char* as_str_substr(const char* s, int from, int len) {
-    int slen = (int)strlen(s);
+    int slen = as_str_len(s);
     int start = as_clamp_index(from, slen);
     // 0x7fffffff is the AS3 default for count; guard the addition against overflow.
     int end = (len == 0x7fffffff) ? slen : as_clamp_index(start + len, slen);
     if (end < start) end = start;
-    int n = end - start;
-    char* r = as_str_alloc(n + 1);
-    memcpy(r, s + start, n);
-    r[n] = 0;
-    return r;
+    return as_u16_take(s, start, end);
 }
 static char* as_str_slice(const char* s, int from, int to) {
-    int slen = (int)strlen(s);
+    int slen = as_str_len(s);
     if (from < 0) from = slen + from;
     if (to < 0) to = slen + to;
     if (from < 0) from = 0;
@@ -7298,20 +7563,14 @@ static char* as_str_slice(const char* s, int from, int to) {
     if (from > slen) from = slen;
     if (to > slen) to = slen;
     if (to < from) to = from;
-    int n = to - from;
-    char* r = as_str_alloc(n + 1);
-    memcpy(r, s + from, n);
-    r[n] = 0;
-    return r;
+    return as_u16_take(s, from, to);
 }
 static as_array* as_str_split(const char* s, const char* sep) {
     as_array* r = as_array_new();
     if (strlen(sep) == 0) {
-        for (int i = 0; s[i]; i++) {
-            char* copy = as_str_alloc(2);
-            copy[0] = s[i]; copy[1] = 0;
-            as_array_push(r, as_v_str(copy));
-        }
+        // Separator "" splits into CHARACTERS (code units), not bytes.
+        int len = as_str_len(s);
+        for (int i = 0; i < len; i++) as_array_push(r, as_v_str(as_str_charAt(s, i)));
         return r;
     }
     const char* p = s;
@@ -8914,6 +9173,12 @@ static bool gc_sweep_step(size_t budget, double t0, double cap_ms) {
             if (_sr != NULL) _sr->seg->free_bytes += sizeof(gc_header) + h->size;
             h->type = 0;   // free block: never a plausible object header again
             *fl = h;
+            // A recycled address is the ONLY way a string cache entry (code-unit cursor,
+            // length memo) can go stale without a full cycle ending, and this is where
+            // recycling becomes possible. Dropping the caches on every free -- not just at
+            // cycle end -- makes that impossible by construction. Two stores per swept
+            // block, against the mark work that already happened.
+            as_u16_cursor_reset();
         } else {
             h->color = GC_WHITE;   // black -> white for the next cycle
             gc_inc.sweep_prev = h;
@@ -9031,6 +9296,11 @@ static void gc_release_empty_segs(void) {
 // MARK/SWEEP (born BLACK) back into gc_all and reset them to WHITE for the next
 // cycle.
 static void gc_finish_cycle(void) {
+    // Swept strings' addresses are reusable, so the code-unit cursor memo becomes a lie
+    // the moment a cycle ends (a stale {unit, byte} could point past the new string's
+    // terminator). Dropping it here is the single choke point: both the incremental
+    // sweep and the stop-the-world gc_collect finish through this function.
+    as_u16_cursor_reset();
     if (gc_new != NULL) {
         gc_header* t = gc_new;
         while (t->next != NULL) t = t->next;
@@ -10244,11 +10514,11 @@ static as_regex* as_regex_compile(const char* pattern, const char* flags) {
 // capture groups (or undefined for non-participating groups), plus index/input.
 static as_array* as_regex_make_result(const char* s, int m, int e, as_regex* re, int* cap) {
     as_array* arr = as_array_new();
-    as_array_push(arr, as_v_str(as_str_substring(s, m, e)));
+    as_array_push(arr, as_v_str(as_str_substring_b(s, m, e)));
     for (int g = 1; g <= re->ngroups; g++) {
         int gs = cap[2 * g], ge = cap[2 * g + 1];
         if (gs < 0 || ge < 0) as_array_push(arr, as_v_undefined());
-        else as_array_push(arr, as_v_str(as_str_substring(s, gs, ge)));
+        else as_array_push(arr, as_v_str(as_str_substring_b(s, gs, ge)));
     }
     arr->index = m;
     arr->input = (char*)s;
@@ -10267,7 +10537,7 @@ static as_array* as_str_match_regex(char* s, as_regex* re, int global) {
             int end = -1;
             int m = as_regex_search(re, s, len, pos, cap, &end);
             if (m < 0) break;
-            as_array_push(result, as_v_str(as_str_substring(s, m, end)));
+            as_array_push(result, as_v_str(as_str_substring_b(s, m, end)));
             if (end == m) { if (m < len) pos = m + 1; else pos = len + 1; }
             else pos = end;
         }
@@ -10364,11 +10634,11 @@ static char* as_str_replace_regex_fn(char* s, as_regex* re, as_fn repl) {
         if (m < 0) break;
         as_re_buf_append(&out, &cap, &olen, s + pos, (size_t)(m - pos));
         as_value* args = (as_value*)malloc((size_t)argc * sizeof(as_value));
-        args[0] = as_v_str(as_str_substring(s, m, end));
+        args[0] = as_v_str(as_str_substring_b(s, m, end));
         for (int g = 1; g <= ngroups; g++) {
             int gs = cap2[2 * g], ge = cap2[2 * g + 1];
             if (gs < 0 || ge < 0) args[g] = as_v_undefined();
-            else args[g] = as_v_str(as_str_substring(s, gs, ge));
+            else args[g] = as_v_str(as_str_substring_b(s, gs, ge));
         }
         args[ngroups + 1] = as_v_num((double)m);
         args[ngroups + 2] = as_v_str(s);

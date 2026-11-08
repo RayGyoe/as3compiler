@@ -12444,21 +12444,21 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (strcmp(name, "substring") == 0) {');
     this.indent++;
     this.line('int from = as_v_int_cast(args[0]);');
-    this.line('int to = argc >= 2 ? as_v_int_cast(args[1]) : (int)strlen(s);');
+    this.line('int to = argc >= 2 ? as_v_int_cast(args[1]) : as_str_len(s);');
     this.line('return as_v_str(as_str_substring(s, from, to));');
     this.indent--;
     this.line('}');
     this.line('if (strcmp(name, "substr") == 0) {');
     this.indent++;
     this.line('int from = as_v_int_cast(args[0]);');
-    this.line('int len = argc >= 2 ? as_v_int_cast(args[1]) : (int)strlen(s);');
+    this.line('int len = argc >= 2 ? as_v_int_cast(args[1]) : as_str_len(s);');
     this.line('return as_v_str(as_str_substr(s, from, len));');
     this.indent--;
     this.line('}');
     this.line('if (strcmp(name, "slice") == 0) {');
     this.indent++;
     this.line('int from = as_v_int_cast(args[0]);');
-    this.line('int to = argc >= 2 ? as_v_int_cast(args[1]) : (int)strlen(s);');
+    this.line('int to = argc >= 2 ? as_v_int_cast(args[1]) : as_str_len(s);');
     this.line('return as_v_str(as_str_slice(s, from, to));');
     this.indent--;
     this.line('}');
@@ -25253,7 +25253,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int ls = starts[lineIndex];');
     this.line('int le = as_tf_line_end(t, starts, n, lineIndex, len);');
     this.line('if (le < ls) le = ls;');
-    this.line('return as_str_substring(t, ls, le);');
+    this.line('return as_str_substring_b(t, ls, le);');
     this.indent--;
     this.line('}');
     // getLineMetrics(index) -- flash.text.TextLineMetrics, measured against adl
@@ -39847,7 +39847,9 @@ void FileStream_writeObject(void* _this, as_value v) {
       return { code: `as_class_member_value((as_class*)(void*)(${obj.code}), "${this.escapeCString(expr.property)}")`, type: { kind: 'any' } };
     }
     if (obj.type.kind === 'string' && expr.property === 'length') {
-      return { code: `((int)strlen(${recv}))`, type: { kind: 'int' } };
+      // UTF-16 code units, not UTF-8 bytes: see the code-unit layer in the runtime
+      // preamble (`as_str_len`). ASCII short-circuits to strlen's answer.
+      return { code: `as_str_len(${recv})`, type: { kind: 'int' } };
     }
     if (obj.type.kind === 'array' && expr.property === 'length') {
       return { code: `(${recv}->length)`, type: { kind: 'int' } };
@@ -40755,17 +40757,17 @@ void FileStream_writeObject(void* _this, as_value v) {
       case 'substring': {
         // startIndex = 0, endIndex = 0x7fffffff (String.html).
         const from = argInt(0, '0');
-        const to = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
+        const to = args.length >= 2 ? argInt(1) : `as_str_len(${s})`;
         return { code: `as_str_substring(${s}, ${from}, ${to})`, type: { kind: 'string' } };
       }
       case 'substr': {
         const from = argInt(0, '0');
-        const len = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
+        const len = args.length >= 2 ? argInt(1) : `as_str_len(${s})`;
         return { code: `as_str_substr(${s}, ${from}, ${len})`, type: { kind: 'string' } };
       }
       case 'slice': {
         const from = argInt(0, '0');
-        const to = args.length >= 2 ? argInt(1) : `(int)strlen(${s})`;
+        const to = args.length >= 2 ? argInt(1) : `as_str_len(${s})`;
         return { code: `as_str_slice(${s}, ${from}, ${to})`, type: { kind: 'string' } };
       }
       case 'split': {

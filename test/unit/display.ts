@@ -1585,7 +1585,7 @@ function checkHtmlTextMetrics(): string[] {
     && emitted.includes('if (lineIndex < 0 || lineIndex >= n) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return NULL; }'));
   check('...and returns the line WITHOUT its break byte',
     emitted.includes('int le = as_tf_line_end(t, starts, n, lineIndex, len);')
-    && emitted.includes('return as_str_substring(t, ls, le);'));
+    && emitted.includes('return as_str_substring_b(t, ls, le);'));
 
   check('textHeight drops trailing EMPTY lines (their boxes are not charged)',
     emitted.includes('int k = n;')

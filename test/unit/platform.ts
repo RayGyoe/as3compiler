@@ -811,7 +811,7 @@ function checkNullRef(): string[] {
   check('a nullable Array index write is guarded',
     /as_array_set\(\(\(as_array\*\)as_req_obj\(\(void\*\)\(g_a\)\)\), 0, as_v_num\(\(double\)\(1\)\)\)/.test(c));
   check('a nullable String.length is guarded',
-    /\(\(int\)strlen\(\(\(char\*\)as_req_obj\(\(void\*\)\(g_st\)\)\)\)\)/.test(c));
+    /as_str_len\(\(\(char\*\)as_req_obj\(\(void\*\)\(g_st\)\)\)\)/.test(c));
   check('a nullable String method call is guarded',
     /as_str_charAt\(\(\(char\*\)as_req_obj\(\(void\*\)\(g_st\)\)\), 0\)/.test(c));
   // (3) Boxed (`*`) receivers: the null check lives in as_req_box, reached from
@@ -832,7 +832,7 @@ function checkNullRef(): string[] {
   check('this is not guarded (provably non-null)',
     c2.includes('return (this->name);'));
   check('a string-literal receiver is not guarded',
-    c2.includes('((int)strlen("abc"))'));
+    c2.includes('as_str_len("abc")'));
   return bad;
 }
 

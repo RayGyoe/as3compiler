@@ -51,7 +51,14 @@ check(text.data != null, "URLLoader.data is published at COMPLETE");
 check(seq == "progress,complete,", "PROGRESS precedes COMPLETE");
 check(textLoaded == textTotal && textTotal > 0, "PROGRESS reports loaded == total > 0");
 var textStr:String = text.data as String;
-check(textStr.length == textTotal, "text payload length matches the reported byte count");
+// TWO DIFFERENT UNITS, and the difference is the point (stage 390): a ProgressEvent
+// counts BYTES on the wire, String.length counts UTF-16 CODE UNITS. stage63.as is
+// not pure ASCII (it carries em dashes and middle dots), so the payload's unit count
+// must be strictly SMALLER than its byte count -- asserting equality here would be
+// asserting the old byte-offset String semantics back.
+check(textStr.length > 0 && textStr.length < textTotal,
+    "text payload length is code units, so it is smaller than the byte count");
+check(textTotal > 4000, "the reported byte count is the whole file");
 check(textStr.indexOf("stage63") >= 0, "text payload is the file that was requested");
 
 // --- 2. URLLoader (binary): data is a ByteArray with the exact byte count ---
@@ -86,7 +93,10 @@ function onConcComplete(e:Event):void { concDone++; }
 // URLLoader itself has no bytesTotal in this subset, so the per-request byte
 // count is recorded from the PROGRESS event and matched against the payload the
 // same request published: a payload delivered to the wrong target would show up
-// as a length mismatch here.
+// as a length mismatch here. The comparison is `<=` (and one byte of slack is
+// normal) because the two numbers are in different units -- bytes on the wire vs
+// UTF-16 code units in the String (stage 390). What must hold is the ORDER: a
+// payload belonging to another request is a different SIZE, so a swap shows up.
 function onConcProgress(e:ProgressEvent):void {
     var t:URLLoader = e.target as URLLoader;
     for (var k:int = 0; k < conc.length; k++) {
@@ -108,7 +118,7 @@ for (var j:int = 0; j < conc.length; j++) {
     check(cl.data != null, "concurrent request " + j + " published its data");
     var cs:String = cl.data as String;
     check(cs.indexOf(names[j]) >= 0, "concurrent request " + j + " got its own file, not another one's");
-    check(cs.length == concTotals[j] && concTotals[j] > 0, "concurrent request " + j + " reports its own byte count");
+    check(cs.length > 0 && cs.length <= concTotals[j], "concurrent request " + j + " reports its own byte count");
 }
 
 // --- 4. A repeated load() supersedes the request in flight ---

@@ -21039,6 +21039,59 @@ half` 133 检查、`gallery tour` 60 页手算矩形、`descriptor DPI A/B`、G1
 
 口径全文见 `docs/{zh-cn,en}/flash-net.md` §6.11。
 
+### 阶段三百九十：`String` 索引改按 **UTF-16 码元**（asaotui `compiler-gaps.md` G38）
+
+`asaotui` 的中文折行曾被 G38 挡住：`"行令由应用自身…"`（60 个汉字）的 `.length` 报 **180**，
+`charCodeAt(0)` 回的是首字节 `0xE8`，于是 `charCodeAt(i) >= 0x2E80` 这类 CJK 判断**恒假**，
+`substr(i, 1)` 会切在 UTF-8 序列中间。`adl 51.4.1` 是码元口径（`"中文".length == 2`）⇒ 遗留缺陷。
+
+阶段三百八十九 已实测量清「**换存储**（UTF-16）是降不是升」：`length`/`charCodeAt` 从 1–5ns 变
+1–1.5ns，但每根串每次跨 C 边界（Skia/`printf`/curl/JSON/正则）多 24–58ns，ASCII 内存 ×2，
+且反射 ABI（`as_prop.name` 等）全按字节比。故本轮**只翻译索引空间，不动存储**：
+
+| 件 | 作用 |
+|---|---|
+| `as_str_len` | 码元长度：字级 `0x8080…` 探 ASCII（命中直接回 `strlen` 的答案），否则 `as_str_len_wide` 按位计数前导字节 + astral 修正；**结果按指针记忆**（两槽） |
+| `as_u16_locate` / `as_u16_byte_of` / `as_u16_unit_of` | 码元下标 ↔ 字节偏移；两槽游标，顺序扫描只走新增那段，下标回退才重扫 |
+| `as_u16_take` / `as_u16_emit_surrogate` / `as_u16_decode` | 按码元切片；切在 astral 中间时两侧各发半个（CESU-8）；4 字节序列的 payload **本身就是码点**，**不能**再加 `0x10000` |
+| `as_str_charAt/charCodeAt/substring/substr/slice/indexOf_from/lastIndexOf_from/split("")` | 全部改走上面的层 |
+| `as_str_substring_b` | 字节偏移切片，**只**服务索引域本来就是字节的两处：正则 match span、`TextField` 行表（`getLineText`） |
+
+**为什么不必在 emit 里做循环不变量外提**：`.length` 写进 `for` 条件原本会退化成 O(n²)，本轮用
+**长度记忆**解决——`while` 循环、第三方代码、动态接收者一起受益，且不必动 codegen 结构。
+缓存作废点是两处：**清扫每释放一块**（`gc_sweep_step`，这是唯一能让地址被复用的地方）与
+`gc_finish_cycle`；漏了前者，增量清扫期间「刚释放的串地址被新串复用」会让旧条目替新串作答。
+
+**实测**（`temp/g38/bench2.c`，200 码元，`clang -O2`，`volatile` 下标）：
+
+| 操作 | 旧（字节域） | 新（码元域） |
+|---|---|---|
+| `.length` ASCII | 1.50 ns | **1.30 ns** |
+| `.length` CJK | 1.28 ns（**答案错**：报 600） | **1.25 ns**（200，正确） |
+| 整串扫描 CJK | 808 ns | **591 ns** |
+| 分词 CJK | 316 ns | **328 ns** |
+
+**验收**：
+
+| 验收 | 方法 | 结果 |
+|---|---|---|
+| 语义 | `temp/g38u16/T1.as` 17 行 vs `adl 51.4.1`（`air/AirT1.as`） | **逐行相同** |
+| 语义（全量断言） | `examples/string-utf16-index.as` 44 条 = `air/AirT2.as` 同一份断言 | 两臂都 `string-utf16-index OK` |
+| 缓存/复用压测 | `temp/g38u16/T4.as`（4000 轮重赋值 + `ASC_GC_THRESHOLD=4096` 逼采集） | `bad=0` |
+| 结构钉子 | `unit: emit/StringUtf16Index`（23 钉） | 全过 |
+| 库侧折行不变量 | `asaotui/ui-demo/run-gallery.cjs`（stage 8a 中文扫描） | `pages=61 badPages=0 overflowingBlocks=0`，`RESULT: PASS` |
+| 全量回归 | `node test.ts`（`temp/g38u16/full3.log`） | **662 tests / 640 pass / 19 fail / 3 skipped**，失败集与基线 `temp/node-test-388b.log` **逐条相同**（0 新增 / 0 消失） |
+
+**同批改动的存量断言**（原本钉在字节口径上，按新语义更正而非放宽）：
+
+- `examples/async-io.as`：`textStr.length == textTotal` 改成「码元数 **<** 字节数」——
+  `ProgressEvent` 数**字节**、`String.length` 数**码元**，`stage63.as` 里有非 ASCII 字符，两者本就该不等。
+- `test/unit/{emit,display,platform}.ts` 三处：`((int)strlen(x))` → `as_str_len(x)`（String `.length` 的
+  规范发射形态）、`as_str_substring` → `as_str_substring_b`（`TextField` 行表是字节域）。
+
+**残留**（登记在 `docs/zh-cn/as3-semantics.md` §2 与 asaotui G38）：`TextField` 的编辑索引
+（`caretIndex`/选区/行表）仍是字节域；`charCodeAt` 越界我们给 0、AIR 给 NaN。
+
 ### 阶段三百八十九：闭包捕获**接口类型**变量（asaotui `compiler-gaps.md` G37）
 
 `asaotui` 在给 `I18n.followEnv(env:Env)` 写回调时发现：`env.subscribe(function (d:int):void { … env.locale … })`

@@ -4665,7 +4665,7 @@ function checkInAndWithReceivers(): string[] {
     /char\* __w[0-9]+ = g_s;/.test(c) && /"\)\)\);/.test(c));
   check('a with over a Vector resolves length statically',
     /as_vector_int\* __w[0-9]+ = g_v;/.test(c));
-  check('the String case reuses the static length path', c.includes('((int)strlen('));
+  check('the String case reuses the static length path', c.includes('as_str_len('));
   check('a String/Vector/Function with receiver is a builtin (name-set) scope',
     em.includes("mode: runtime ? 'runtime' : builtinReceiver ? 'builtin' : classReceiver ? 'class' : 'sealed',"));
   check('assigning a builtin with member fails loudly instead of emitting a non-lvalue',
@@ -4736,7 +4736,7 @@ function checkWithClosureCapture(): string[] {
   check('the runtime scope dispatches through the captured box',
     /as_dyn_has\(as_with_box_soft\(env->with\$0\), "x"\)/.test(c));
   check('the builtin scope reuses the static String path from the env copy',
-    /char\* __wc\d+ = env->with\$0;/.test(c) && c.includes('((int)strlen('));
+    /char\* __wc\d+ = env->with\$0;/.test(c) && c.includes('as_str_len('));
   check('the capture is filled from the with receiver temp',
     /_fn\d+_env_make\(__w\d+\)/.test(c) || /_fn\d+_env_make\(as_v_obj\(\(void\*\)\(__w\d+\)\)\)/.test(c));
 
@@ -5017,3 +5017,108 @@ function checkClosureIfaceCapture(): string[] {
   return bad;
 }
 registerGroup('unit: emit/ClosureIfaceCapture', checkClosureIfaceCapture);
+
+// G38 (asaotui/compiler-gaps.md): String indices are UTF-16 CODE UNITS.
+// What is pinned here is the shape of the decision, not a benchmark:
+//   * the backing store stays UTF-8 (every C boundary -- Skia, printf, paths,
+//     curl, JSON -- speaks UTF-8), so what changes is the INDEX SPACE only;
+//   * `.length` and the byte->unit walk are word-wise, and `.length` is memoised
+//     per string pointer, which is what keeps a for-loop whose condition re-reads
+//     s.length linear without any emitter-side hoisting (measured
+//     temp/g38/bench2.c: 111.9ns -> 1.25ns on a 200-char CJK string);
+//   * the memo/cursor must be dropped whenever a swept string's address becomes
+//     reusable, or a stale entry silently answers for the NEW string;
+//   * one astral character is TWO units, and charAt of either half is a 1-unit
+//     string (CESU-8), so length/charAt/charCodeAt stay in one index space;
+//   * byte-offset slicing survives as a separate helper for the two callers whose
+//     spans really are byte spans (regex engine, TextField line table).
+// Oracle: `adl 51.4.1` runs the same 44 assertions (temp/g38u16/air/AirT2.as).
+function checkStringUtf16Index(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++;
+    else bad.push(`[string-u16] ${label}`);
+  };
+
+  const src = 'var s:String = "中文ab";\n'
+    + 'var a:int = s.length;\n'
+    + 'var b:int = s.charCodeAt(1);\n'
+    + 'var c:String = s.charAt(1);\n'
+    + 'var d:String = s.substr(1, 2);\n'
+    + 'var e:String = s.substring(1);\n'
+    + 'var f:String = s.slice(-2);\n'
+    + 'var g:int = s.indexOf("文");\n'
+    + 'var h:Array = s.split("");\n'
+    + 'var i:int = s.lastIndexOf("b");\n';
+  const c = generateC(parse(src)).c;
+
+  // ---- routing: every index-taking String member goes through the code-unit layer
+  check('length is as_str_len', c.includes('as_str_len(((char*)as_req_obj((void*)(g_s))))'));
+  check('charCodeAt is the code-unit reader', c.includes('as_str_charCodeAt(((char*)as_req_obj((void*)(g_s))), 1)'));
+  check('charAt is the code-unit reader', c.includes('as_str_charAt(((char*)as_req_obj((void*)(g_s))), 1)'));
+  check('substr/substring/slice take code-unit indices',
+    c.includes('as_str_substr(((char*)as_req_obj((void*)(g_s))), 1, 2)')
+    && c.includes('as_str_substring(((char*)as_req_obj((void*)(g_s))), 1, as_str_len(')
+    && c.includes('as_str_slice(((char*)as_req_obj((void*)(g_s))), (-2), as_str_len('));
+  check('indexOf/lastIndexOf answer code-unit indices',
+    c.includes('as_str_indexOf_from(') && c.includes('as_str_lastIndexOf_from('));
+  check('split("") splits into characters', c.includes('as_str_split(') && c.includes('as_str_charAt(s, i)'));
+
+  // ---- the code-unit layer itself
+  check('length counts lead bytes, not continuation bytes',
+    c.includes('static int as_str_len_wide(')
+    && c.includes('if (b >= 0x80 && b < 0xC0) cont++;')
+    && c.includes('return (int)(n - cont + astral);')
+    && c.includes('uint64_t t = w & 0xC0C0C0C0C0C0C0C0ull;'));
+  check('length has an ASCII word probe before the fold',
+    c.includes('0x8080808080808080ull'));
+  check('length is memoised per string pointer',
+    c.includes('if (as_str_len_memo[0].s == s) return as_str_len_memo[0].len;')
+    && c.includes('if (as_str_len_memo[1].s == s) return as_str_len_memo[1].len;'));
+  check('the code-unit cursor has two slots and a forward fast path',
+    c.includes('static as_u16_cur as_u16_cursor[2];')
+    && c.includes('if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit)')
+    && c.includes('if (w == 4 && k + 1 == u) { *off = b; *low = 1; return; }'));
+  check('the cursor falls back to rescan when the index moves backwards',
+    c.includes('if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit)'));
+  check('a cursor miss round-robins instead of always evicting slot 0',
+    c.includes('as_u16_cur* c = &as_u16_cursor[as_u16_rr];') && c.includes('as_u16_rr ^= 1;'));
+  check('both caches are dropped when a swept string address becomes reusable',
+    c.includes('            as_u16_cursor_reset();\n') && c.includes('    as_u16_cursor_reset();\n'));
+  check('the reset clears the length memo as well',
+    c.includes('as_str_len_memo[0].s = NULL; as_str_len_memo[0].len = 0;')
+    && c.includes('as_str_len_memo[1].s = NULL; as_str_len_memo[1].len = 0;'));
+
+  // ---- encoding invariants that the earlier byte semantics did not have to face
+  check('a 4-byte sequence decodes WITHOUT adding 0x10000 (the payload IS the code point)',
+    c.includes('return ((unsigned)(b & 0x07) << 18)')
+    && !c.includes('0x10000u + (((unsigned)(b & 0x07) << 18)'));
+  check('one astral character is two units',
+    c.includes('if (b < 0xF0) return 3;') && c.includes('*units = 2;'));
+  check('charAt of a surrogate half emits CESU-8',
+    c.includes('static int as_u16_emit_surrogate(') && c.includes('low ? (0xDC00u | (d & 0x3FFu)) : (0xD800u | (d >> 10))'));
+  check('a slice boundary that cuts an astral character keeps one half on each side',
+    c.includes('if (loa) total -= 1;') && c.includes('if (lob) total += 3;'));
+
+  // ---- the byte-offset escape hatch stays exactly as wide as its two callers
+  check('byte-offset slicing survives for regex/TextField spans',
+    c.includes('static char* as_str_substring_b('));
+  check('the regex engine is the caller that keeps byte spans',
+    readFileSync(join(root, 'src', 'runtime.ts'), 'utf8').includes('as_v_str(as_str_substring_b(s, m, e))'));
+
+  // ---- the example pins the observable contract and names the oracle
+  const ex = readFileSync(join(root, 'examples', 'string-utf16-index.as'), 'utf8');
+  check('the example covers length/index/search/slice/split/astral/concat',
+    ex.includes('1) length and index') && ex.includes('3) search returns')
+    && ex.includes('4) split(') && ex.includes('6) astral characters')
+    && ex.includes('8) concatenation'));
+  check('the example names the AIR evidence',
+    ex.includes('adl 51.4.1') && ex.includes('temp/g38u16/air'));
+  check('the example documents the measured cost instead of claiming zero',
+    ex.includes('temp/g38/bench2.c') && ex.includes('1.25ns'));
+
+  console.log(`     [string-u16] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/StringUtf16Index', checkStringUtf16Index);
