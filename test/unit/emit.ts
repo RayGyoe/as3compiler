@@ -91,6 +91,74 @@ function checkEmitStringConcatFlat(): string[] {
 
 registerGroup('unit: emit/StringConcatFlat', checkEmitStringConcatFlat);
 
+// `key in <primitive>`: the receiver autoboxes to its wrapper, so `in` must answer
+// the wrapper's members, not constant false (adl 51.4.1, temp/leaves/in). The
+// end-to-end behaviour is pinned by examples/in-primitive.as; these are the
+// source-level invariants no example output can show.
+function checkEmitInPrimitiveMembers(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+
+  const src = 'var i:int = 5;\nvar b:Boolean = true;\nvar f:Function = function():int { return 1; };\nvar o:* = i;\ntrace("toFixed" in i);\ntrace("valueOf" in b);\ntrace("apply" in f);\ntrace("toFixed" in o);\n';
+  const c = generateC(parse(src)).c;
+
+  // Shared Object.prototype set, and the per-wrapper helpers, must exist.
+  for (const helper of ['as_obj_proto_has', 'as_number_has_member', 'as_bool_has_member', 'as_fn_has_member']) {
+    check(`the ${helper} helper is emitted`, c.includes(`static bool ${helper}(`));
+  }
+  check('as_obj_proto_has covers every Object.prototype name',
+    ['toString', 'toLocaleString', 'valueOf', 'constructor', 'hasOwnProperty', 'propertyIsEnumerable', 'isPrototypeOf']
+      .every((n) => c.includes(`strcmp(k, "${n}") == 0`)));
+
+  // as_in_v dispatches each primitive tag to its wrapper set (no constant false).
+  check('as_in_v routes Number/int/uint tags (1/8/9) to as_number_has_member',
+    c.includes('if (v.tag == 1 || v.tag == 8 || v.tag == 9) return as_number_has_member(key);'));
+  check('as_in_v routes Boolean (tag 2) to as_bool_has_member',
+    c.includes('if (v.tag == 2) return as_bool_has_member(key);'));
+  check('as_in_v routes Function (tag 7) to as_fn_has_member',
+    c.includes('if (v.tag == 7) return as_fn_has_member(key);'));
+
+  // The statically typed Number/Boolean receivers no longer fold to `false`.
+  check('a static int receiver emits as_number_has_member, not constant false',
+    c.includes('as_number_has_member("toFixed")'));
+  check('a static Boolean receiver emits as_bool_has_member',
+    c.includes('as_bool_has_member("valueOf")'));
+
+  console.log(`     [emit] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/InPrimitiveMembers', checkEmitInPrimitiveMembers);
+
+// Members whose AS3 name collides with an emitter-planted per-class symbol
+// (Owner_cls / Owner_amf_members / ...) must compile: their C name gains a
+// trailing underscore, while the AS3-visible name and static methods (_static)
+// stay untouched. Source-level pin; example member-suffix-clash.as runs it live.
+function checkEmitMemberSuffixClash(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+  const src = 'class Weird {\n'
+    + '  function cls():int { return 1; }\n'
+    + '  static var amf_members:int = 0;\n'
+    + '  static function props():void {}\n'
+    + '}\n';
+  const c = generateC(parse(src)).c;
+  check('colliding instance method C name gains an underscore', /Weird_cls_\(void\* _this/.test(c));
+  check('colliding static field C name gains an underscore', c.includes('static int Weird_amf_members_;'));
+  check('static method keeps its _static suffix (no collision, no rename)', c.includes('Weird_props_static('));
+  check('the AS3 method name is unchanged in the method table, pointing at the renamed thunk',
+    /\{ "cls", Weird_cls___dyn/.test(c));
+  return bad;
+}
+registerGroup('unit: emit/MemberSuffixClash', checkEmitMemberSuffixClash);
+
 // Interface accessors satisfied by an accessor-backed BUILT-IN property. AIR
 // declares `DisplayObject.x` as `get x`/`set x`, so a subclass INHERITING it
 // implements `interface I { get x():Number; set x(v:Number):void; }` (measured on
@@ -522,9 +590,11 @@ function checkRuntimeGcSizeClasses(): string[] {
     flat.includes('int i = gc_small_class(size); if (i >= 0) return &gc_free_small[i]; return size >= GC_BIG_CLASS ? &gc_free_big : &gc_free_mid;'));
   check('allocation re-checks h->size >= size while walking a class',
     flat.includes('for (gc_header* h = *list; h != NULL; prev = h, h = h->next) { if (gc_audit_mode_cache != 0) gc_audit_gate("free-list node", h); if (h->size >= size) { *out_head = list; *out_prev = prev; return h; } }'));
-  check('a small request climbs from its own class; a big request only uses the big list',
-    flat.includes('bool big = size >= GC_BIG_CLASS; int first = big ? GC_SMALL_CLASSES + 1 : gc_small_class(size);')
-    && flat.includes('if (!big && first < 0) first = GC_SMALL_CLASSES;')
+  check('small requests probe at most eight own-class nodes, then jump to ceil(size/ALIGN)',
+    flat.includes('int first = big ? GC_SMALL_CLASSES + 1 : size >= GC_SMALL_MAX ? GC_SMALL_CLASSES : gc_small_class(size);')
+    && flat.includes('if (!big && li == first && li < GC_SMALL_CLASSES && li != (int)((size + GC_SMALL_ALIGN - 1) / GC_SMALL_ALIGN))')
+    && flat.includes('for (gc_header* h = *list; h != NULL && probes < 8; h = h->next, probes++)')
+    && flat.includes('if (h->size >= size) { *out_head = list; *out_prev = prev; return h; } prev = h; } continue;')
     && flat.includes('int last = big ? GC_SMALL_CLASSES + 1 : GC_SMALL_CLASSES;'));
   check('gc_alloc takes its block from gc_find_block, then splits/charges as before',
     flat.includes('gc_header* h = gc_find_block(size, &head, &prev); if (h != NULL) {')

@@ -2901,6 +2901,18 @@ function checkInitialWindowStyle(): string[] {
       return on.includes('ASC_WINDOW_TRANSPARENT=1') && !off.includes('ASC_WINDOW_TRANSPARENT=1');
     })());
 
+  // The descriptor's <width>/<height> is the initial window's OUTER frame (AIR), so
+  // Stage_showWindow shrinks it to the client area before the surface is built.
+  check('an initial-window descriptor becomes ASC_WINDOW_FRAME_SIZE=1',
+    (man(strict)['defines'] as string[]).includes('ASC_WINDOW_FRAME_SIZE=1'));
+  check('Stage_showWindow shrinks the descriptor frame to the client area under ASC_WINDOW_FRAME_SIZE',
+    /#ifdef ASC_WINDOW_FRAME_SIZE\n\s*#ifndef ASC_WINDOW_NOCHROME/.test(c)
+    && /sk_frame_insets_new_window\(1, &ift, &ifl, &ifb, &ifr\);/.test(c)
+    && /width -= ifl \+ ifr; height -= ift \+ ifb;/.test(c));
+  check('sk_frame_insets_new_window measures borders with the same backing-scale normalisation as sk_measure_borders',
+    /void sk_frame_insets_new_window\(int decorated, int\* t, int\* l, int\* b, int\* r\)/.test(glueWin)
+    && /sk_window_backing_scale\(tmp\)/.test(glueWin));
+
   // The glue half: one place applies AIR's frame style, read off the real window.
   check('the three SK_MAIN_ macros come from the three defines',
     /#ifdef ASC_WINDOW_FIXED\n#define SK_MAIN_RESIZABLE 0\n#else\n#define SK_MAIN_RESIZABLE 1\n#endif/.test(glueWin)

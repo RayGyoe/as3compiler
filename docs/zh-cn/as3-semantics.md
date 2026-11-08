@@ -445,6 +445,15 @@ true、`"name"` 为 false），`toString()` 是常量 `"function Function() {}"`
 在 AIR 上都是 `undefined`（`u === undefined` 为 true），而 `Object` 类型仍是 `null`；这个差别决定
 `var x:Object; x.foo` 报 `#1009` 还是 `#1010`。
 
+**6. `in` 运算符对原始值接收者答包装类的成员集（2026-11-08，v0.4.357 起）。** `"toString" in 5`、
+`"toFixed" in 5`、`"constructor" in 5`、`"valueOf" in true`、`"apply" in f` 在 AIR 上都是 true —— `in`
+查的是该值包装类的成员面，与上面的方法调用同一套成员：`Number/int/uint` 含
+`toFixed`/`toExponential`/`toPrecision`（`Boolean` 不含这三个），共有 `toString`/`toLocaleString`/
+`valueOf`/`constructor`/`hasOwnProperty`/`propertyIsEnumerable`/`isPrototypeOf`；`Function` 另含
+`apply`/`call`/`length`/`prototype`（`name` 为 false）。实现上 `as_number_has_member`/
+`as_bool_has_member`/`as_fn_has_member` 与 `as_str_has_member` 同形，`as_in_v` 按 box tag 分派，静态
+`Number/int/uint`/`Boolean` 路径与动态 `as_in_v` 共用这些表（`examples/in-primitive.as` 与 adl 逐字一致）。
+
 ### 3.10 生成 C 的默认警告集归零（阶段三百六十四 · clang 默认诊断 + mxmlc 51.4.1 实测）
 
 一份 41.4 万行的真实产物（`bin-aot/TalkMED Meeting.c`）用 `clang -O2` 编译时报了 **725 条警告**。它们

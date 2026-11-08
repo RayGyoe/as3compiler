@@ -372,6 +372,16 @@ per-method special case.
 hole in `new Array(n)` are all `undefined` on AIR (`u === undefined` is true), while an `Object`-typed slot
 stays `null`; that difference decides whether `var x:Object; x.foo` raises `#1009` or `#1010`.
 
+**6. The `in` operator answers a primitive receiver's wrapper-class member set (from 2026-11-08, v0.4.357).**
+`"toString" in 5`, `"toFixed" in 5`, `"constructor" in 5`, `"valueOf" in true` and `"apply" in f` are all true on
+AIR — `in` queries the receiver's wrapper-class member surface, the same members as the method calls above:
+`Number/int/uint` add `toFixed`/`toExponential`/`toPrecision` (Boolean does not), and all share
+`toString`/`toLocaleString`/`valueOf`/`constructor`/`hasOwnProperty`/`propertyIsEnumerable`/`isPrototypeOf`;
+`Function` adds `apply`/`call`/`length`/`prototype` (`name` is false). `as_number_has_member`/
+`as_bool_has_member`/`as_fn_has_member` mirror `as_str_has_member`; `as_in_v` dispatches on the box tag, and the
+static `Number/int/uint`/`Boolean` paths share these tables with the dynamic `as_in_v` (`examples/in-primitive.as`
+matches adl verbatim).
+
 
 ### 3.10 Generated C compiles with zero default warnings (stage 364, clang default diagnostics + mxmlc 51.4.1)
 

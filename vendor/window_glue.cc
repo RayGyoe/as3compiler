@@ -896,6 +896,42 @@ static void sk_measure_borders(WinCtx* c, int decorated) {
   }
 }
 
+// Chrome insets for a NEW decorated window, in LOGICAL points, measured WITHOUT the
+// app's real window. The initial-window path needs these BEFORE the surface is
+// built: AIR's descriptor <width>/<height> is the OUTER frame rectangle (measured on
+// adl 51.4.1, temp/nwwin W.as: a 366x630 descriptor yields bounds=366x630 but a
+// noScale stage of 350x591), so the client area -- and the surface sized from it --
+// is the frame minus these insets. Same SDL_GetWindowBordersSize + backing-scale
+// normalisation as sk_measure_borders so the two never disagree; macOS uses its
+// measured 32pt title bar because SDL_GetWindowBordersSize is unimplemented there.
+// This is used only for the app's FIRST window (the one the descriptor describes);
+// a window the program creates takes its client size directly.
+void sk_frame_insets_new_window(int decorated, int* t, int* l, int* b, int* r) {
+  *t = *l = *b = *r = 0;
+  if (!decorated) return;
+#if defined(__APPLE__)
+  *t = 32;
+  return;
+#else
+  ensure_video();
+  if (sk_video_init() != 0) return;
+  SDL_Window* tmp = SDL_CreateWindow("", 0, 0, 100, 100, SDL_WINDOW_HIDDEN);
+  if (tmp == NULL) return;
+  int tt = 0, ll = 0, bb = 0, rr = 0;
+  if (SDL_GetWindowBordersSize(tmp, &tt, &ll, &bb, &rr) == 0) {
+    const double bs = sk_window_backing_scale(tmp);
+    if (bs > 0.0 && bs != 1.0) {
+      tt = (int)((double)tt / bs + 0.5);
+      ll = (int)((double)ll / bs + 0.5);
+      bb = (int)((double)bb / bs + 0.5);
+      rr = (int)((double)rr / bs + 0.5);
+    }
+    *t = tt; *l = ll; *b = bb; *r = rr;
+  }
+  SDL_DestroyWindow(tmp);
+#endif
+}
+
 // One application frame plus one repaint pass — the shared body of the main loop
 // AND of the live-resize watch below. Returns the next frame deadline in ms (the
 // caller sleeps to it), or -1 when no window can hold the frame clock.

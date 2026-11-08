@@ -33,7 +33,10 @@ export function generateC(
   // `--features` names in effect. Only the symbol surface consults them today:
   // a gated class must not EXIST in a default build, because its absence is what
   // makes getDefinitionByName answer #1065 like adl (see symbols.ts §E6 gate).
-  features: readonly string[] = []
+  features: readonly string[] = [],
+  // `--air-app` document class short name: only its instance may use the
+  // constructor-time stage fallback (see Emitter.docRootClass).
+  docRootClass?: string
 ): CodegenResult {
   // mxmlc rejects a non-void function that can fall off the end; without this
   // check we emitted a C function that reaches `}` with no `return` (undefined
@@ -42,7 +45,7 @@ export function generateC(
   const symbols = new SymbolTable();
   symbols.features = features;
   symbols.collect(program, embedFieldInits);
-  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml, aneDescriptors);
+  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml, aneDescriptors, docRootClass);
   const c = emitter.run();
   return { c, exports: [...symbols.exports] };
 }

@@ -661,6 +661,9 @@ async function main(): Promise<void> {
     return l;
   };
 
+  // The --air-app document class short name, forwarded to codegen so only that
+  // class's instance enjoys the constructor-time stage fallback.
+  let docRootClass: string | undefined;
   if (opts.airApp) {
     const vendorAbs = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
     // --package web selects the browser backend for the generated manifest; the
@@ -684,6 +687,7 @@ async function main(): Promise<void> {
       Object.assign(cfg, applyManifest(cfg, loadedManifest, opts.manifest));
     }
 
+    docRootClass = air.mainClass.split('.').pop();
     program = { body: [], imports: [] };
     const bootSrc = generateBootstrap(air.info, air.mainClass);
     featureScanTexts.push(bootSrc);
@@ -1022,7 +1026,7 @@ async function main(): Promise<void> {
   if (opts.airApp) {
     try { appDescriptorXml = readFileSync(opts.airApp, 'utf8'); } catch { appDescriptorXml = undefined; }
   }
-  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? [], cfg.features);
+  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? [], cfg.features, docRootClass);
   mkdirSync(dirname(cPath), { recursive: true });
   writeFileSync(cPath, c);
 

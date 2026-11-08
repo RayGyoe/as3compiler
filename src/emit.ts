@@ -767,6 +767,10 @@ export class Emitter {
   // native extension with this ID is part of the build" instead of fabricating
   // a context that can never reach native code.
   private aneDescriptors: readonly AneDescriptor[];
+  // The --air-app document class's short name (undefined for a plain single-file
+  // build). Only this class's instance gets the constructor-time stage fallback
+  // (ASC_doc_root); every other orphan's DisplayObject.stage is null, matching adl.
+  private docRootClass: string | undefined;
 
   constructor(
     program: Program,
@@ -776,7 +780,8 @@ export class Emitter {
     swcBake: SwcBake | undefined = undefined,
     embedResources: readonly EmbedResourceSpec[] = [],
     appDescriptorXml: string | undefined = undefined,
-    aneDescriptors: readonly AneDescriptor[] = []
+    aneDescriptors: readonly AneDescriptor[] = [],
+    docRootClass: string | undefined = undefined
   ) {
     this.program = program;
     this.symbols = symbols;
@@ -795,6 +800,7 @@ export class Emitter {
     // answered an empty version and the update check compared nothing).
     this.appDescriptorXml = appDescriptorXml;
     this.aneDescriptors = aneDescriptors;
+    this.docRootClass = docRootClass;
     const subclassed = new Set<string>();
     for (const info of this.symbols.classes.values()) {
       if (info.superClass !== null) subclassed.add(info.superClass);
@@ -925,6 +931,20 @@ export class Emitter {
     this.usedFreeCNames.add(c);
     this.freeCNameCache.set(asName, c);
     return c;
+  }
+
+  // 发射器为每个类种下的顶层符号后缀（`Foo_cls`/`Foo_vt`/`Foo_methods`/`Foo_cinit`/…）。
+  // 成员的 C 名若等于这些后缀之一，会与发射器自己的符号 redefinition（实测
+  // `function cls()`、`static var amf_members` 等都编不过）。此时给成员的 C 名加一个
+  // 下划线——仅 C 名改变，AS3 可见名（props 表 / for-in / AMF 序列化 / getQualifiedClassName）
+  // 一律不变。实例方法（`Owner_m`）与静态字段（`Owner_f`）走这里；静态方法带 `_static`、
+  // 访问器带 `get_`/`set_`、实例字段是 struct 成员，都不会撞这些后缀，故不走。
+  private static readonly EMITTER_MEMBER_SUFFIXES = new Set([
+    'cls', 'vt', 'vtable', 'ctor', 'ctorfn', 'new', 'new_default',
+    'props', 'amf_members', 'methods', 'getters', 'setters', 'cinit', 'cinit_done', 'init',
+  ]);
+  private memberCName(owner: string, member: string): string {
+    return Emitter.EMITTER_MEMBER_SUFFIXES.has(member) ? `${owner}_${member}_` : `${owner}_${member}`;
   }
 
   private staticizeTopLevelFunctions(): void {
@@ -2761,14 +2781,35 @@ export class Emitter {
     this.line('return as_v_bool(false);');
     this.indent--;
     this.line('}');
-    // The Function object's own sealed member set for `key in fn` (temp/with3m).
+    // Object.prototype 的成员集：一切原始包装值（Number/int/uint/Boolean/Function）
+    // 对 `in` 都回答这些名字（adl 51.4.1 实测 temp/leaves/in：toString/toLocaleString/
+    // valueOf/constructor/hasOwnProperty/propertyIsEnumerable/isPrototypeOf 全为 true）。
+    this.line('static bool as_obj_proto_has(const char* k) {');
+    this.indent++;
+    this.line('if (k == NULL) return false;');
+    this.line('return strcmp(k, "toString") == 0 || strcmp(k, "toLocaleString") == 0 || strcmp(k, "valueOf") == 0');
+    this.line('    || strcmp(k, "constructor") == 0 || strcmp(k, "hasOwnProperty") == 0');
+    this.line('    || strcmp(k, "propertyIsEnumerable") == 0 || strcmp(k, "isPrototypeOf") == 0;');
+    this.indent--;
+    this.line('}');
+    // Number/int/uint 的包装成员 = 基类 + 数值格式化三方法（toFixed/toExponential/
+    // toPrecision）。int 与 uint 在 AIR 里与 Number 同集（temp/leaves/in 三行逐字相同）。
+    this.line('static bool as_number_has_member(const char* k) {');
+    this.indent++;
+    this.line('if (k == NULL) return false;');
+    this.line('return as_obj_proto_has(k) || strcmp(k, "toFixed") == 0 || strcmp(k, "toExponential") == 0 || strcmp(k, "toPrecision") == 0;');
+    this.indent--;
+    this.line('}');
+    // Boolean 的包装成员 = 仅基类（无数值格式化、无 Function 方法）。
+    this.line('static bool as_bool_has_member(const char* k) { return as_obj_proto_has(k); }');
+    // The Function object's own sealed member set for `key in fn`：基类 + call/apply/
+    // length/prototype（temp/with3m 测了前一半，temp/leaves/in 补测 toLocaleString/
+    // constructor/isPrototypeOf 亦为 true）。`name`/`arguments` 不是成员。
     this.line('static bool as_fn_has_member(const char* k) {');
     this.indent++;
     this.line('if (k == NULL) return false;');
-    this.line('return strcmp(k, "call") == 0 || strcmp(k, "apply") == 0 || strcmp(k, "length") == 0');
-    this.line('    || strcmp(k, "toString") == 0 || strcmp(k, "valueOf") == 0');
-    this.line('    || strcmp(k, "hasOwnProperty") == 0 || strcmp(k, "propertyIsEnumerable") == 0');
-    this.line('    || strcmp(k, "prototype") == 0;');
+    this.line('return as_obj_proto_has(k) || strcmp(k, "call") == 0 || strcmp(k, "apply") == 0');
+    this.line('    || strcmp(k, "length") == 0 || strcmp(k, "prototype") == 0;');
     this.indent--;
     this.line('}');
     // A name that resolves in no scope at all: ReferenceError #1065. Reachable only
@@ -2903,9 +2944,10 @@ export class Emitter {
     // has no vtable, so the trait walk read its first bytes as a vtable header and
     // segfaulted (measured: 'var o:* = "abc"; "length" in o').
     //
-    // The remaining gap (Number/Boolean/Function receivers answer false here and on
-    // their statically typed path, where AIR answers the wrapper's members) is
-    // registered in TODO.md; it is the pre-existing behaviour, not a new one.
+    // Number/Boolean/Function receivers answer their wrapper's member set here and
+    // on the statically typed path (adl 51.4.1, temp/leaves/in): the Object.prototype
+    // names plus Number's toFixed/toExponential/toPrecision and Function's call/
+    // apply/length/prototype -- no longer the old constant-false.
     {
       const strNames = [...STRING_WITH_MEMBERS].filter((n) => n !== 'length');
       // One source of truth for the String member names: the same set `with`
@@ -2935,6 +2977,11 @@ export class Emitter {
       // A String's only own property is length; 'constructor' is Object's trait
       // every value answers (adl 51.4.1 J15).
       this.line('if (v.tag == 3) return strcmp(key, "constructor") == 0 || as_str_has_member(key);');
+      // 原始包装值（Number/int/uint=tag1、内部 i64/u64=tag8/9、Boolean=tag2、
+      // Function=tag7）对 `in` 回答各自包装类的成员集，而不是 false（adl 实测）。
+      this.line('if (v.tag == 1 || v.tag == 8 || v.tag == 9) return as_number_has_member(key);');
+      this.line('if (v.tag == 2) return as_bool_has_member(key);');
+      this.line('if (v.tag == 7) return as_fn_has_member(key);');
       this.line('if (v.tag == 4 || v.tag == 6) return as_dyn_has(as_v_obj_val(v), key);');
       this.line('return false;');
       this.indent--;
@@ -2996,7 +3043,7 @@ export class Emitter {
       for (const [mname, m] of info.methods) {
         if (m.owner !== cname) continue; // inherited methods are declared under their owner
         const p = this.paramDecls(m.params, info.importAlias);
-        this.line(`${this.cTypeName(m.returnType)} ${cname}_${mname}(void* _this${p ? ', ' + p : ''});`);
+        this.line(`${this.cTypeName(m.returnType)} ${this.memberCName(cname, mname)}(void* _this${p ? ', ' + p : ''});`);
       }
       // static methods (no receiver)
       for (const [mname, m] of info.staticMethods) {
@@ -3125,7 +3172,7 @@ export class Emitter {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
         const t = f.isConst && this.isConstExpr(f.init) ? this.constTypeName(f.type) : this.cTypeName(f.type);
-        this.line(`static ${t} ${cname}_${fname};`);
+        this.line(`static ${t} ${this.memberCName(cname, fname)};`);
       }
     }
     // Interface vtables (per class implementing the interface) are also referenced
@@ -3202,7 +3249,7 @@ export class Emitter {
   // null guard, evaluation order and single evaluation.
   private instanceMethodCallCode(receiverClass: string, m: MethodInfo, name: string, objCode: string, callArgs: string): string {
     if (this.leafClasses.has(receiverClass) && m.visibility !== 'private' && !m.isProxyNs) {
-      return `(${m.owner}_${name}(${objCode}${callArgs}))`;
+      return `(${this.memberCName(m.owner, name)}(${objCode}${callArgs}))`;
     }
     return `(${objCode}->vtable->${this.cIdent(name)}(${objCode}${callArgs}))`;
   }
@@ -3274,7 +3321,7 @@ export class Emitter {
       // isDynamic/isFinal feed describeType's <type isDynamic=... isFinal=...>.
       const entries: string[] = [`"${name}"`, superVt, ifaceArr, props, methods, getters, setters, dynOffset, `"${this.escapeCString(fqn)}"`, info.isProxy ? '1' : '0', info.isDynamic ? '1' : '0', info.isFinal ? '1' : '0'];
       for (const slot of info.vtableSlots ?? []) {
-        if (slot.kind === 'method') entries.push(`${slot.info.owner}_${slot.name}`);
+        if (slot.kind === 'method') entries.push(this.memberCName(slot.info.owner, slot.name));
         else if (slot.kind === 'getter') entries.push(`${slot.info.owner}_get_${slot.name}`);
         else entries.push(`${slot.info.owner}_set_${slot.name}`);
       }
@@ -3776,7 +3823,7 @@ export class Emitter {
             // interface struct, say) stays addr-less and fails loudly on access
             // instead of writing a wrong-sized value.
             const slot = this.staticSlotKind(sf.type);
-            const addr = slot > 0 ? `(void*)&${sf.owner}_${mname}` : 'NULL';
+            const addr = slot > 0 ? `(void*)&${this.memberCName(sf.owner, mname)}` : 'NULL';
             const cinit = this.cinitClasses.has(sf.owner) ? `${sf.owner}_cinit` : 'NULL';
             rows.push(`{ "${this.escapeCString(mname)}", ${sf.isConst ? 4 : 2}, NULL, 0, ${addr}, ${slot}, ${cinit} }`);
             continue;
@@ -4842,8 +4889,8 @@ export class Emitter {
         }
         const callArgs = argCodes.join(', ');
         const receiver = `(${cname}*)_this`;
-        const call = `${cname}_${mname}(${receiver}${callArgs ? ', ' + callArgs : ''})`;
-        this.line(`as_value ${cname}_${mname}__dyn(void* _this, as_value* args, int argc) {`);
+        const call = `${this.memberCName(cname, mname)}(${receiver}${callArgs ? ', ' + callArgs : ''})`;
+        this.line(`as_value ${this.memberCName(cname, mname)}__dyn(void* _this, as_value* args, int argc) {`);
         this.indent++;
         if (req === 0 && max < 0) this.line('(void)argc;');   // f(...rest): any count is legal
         else {
@@ -4882,7 +4929,7 @@ export class Emitter {
         // does. AIR declares them in the flash_proxy namespace, not the public one.
         const key = m.isProxyNs ? `flash_proxy::${mname}` : mname;
         const vis = m.visibility === 'public' ? 0 : 1;
-        this.line(`{ "${this.escapeCString(key)}", ${name}_${mname}__dyn, ${vis}, "${this.reflectSigOfMethod(m, info)}" },`);
+        this.line(`{ "${this.escapeCString(key)}", ${this.memberCName(name, mname)}__dyn, ${vis}, "${this.reflectSigOfMethod(m, info)}" },`);
       }
       this.line('{ NULL, NULL }');
       this.indent--;
@@ -5039,7 +5086,7 @@ export class Emitter {
         // class), so an override declared in a subclass wins — `sub.label.read`
         // is "sub" on adl 51.4.1 even when read through the base-typed interface.
         for (const [mname, m] of intf.methods) {
-          entries.push(`${cinfo.methods.get(mname)!.owner}_${mname}`);
+          entries.push(this.memberCName(cinfo.methods.get(mname)!.owner, mname));
         }
         for (const [mname, g] of intf.getters) {
           entries.push(accessorSym(mname, 'get'));
@@ -5127,7 +5174,7 @@ export class Emitter {
         if (f.isConst && this.isConstExpr(f.init)) {
           const init = this.platformStaticConst(cname, fname)
             ?? (f.init ? this.convertImplicit(this.emitExpr(f.init), f.type) : this.defaultInit(f.type));
-          this.line(`static ${this.constTypeName(f.type)} ${cname}_${fname} = ${init};`);
+          this.line(`static ${this.constTypeName(f.type)} ${this.memberCName(cname, fname)} = ${init};`);
         } else {
           // Mutable static slot with a default; the initializer (when present)
           // runs in main(). This covers both non-const fields and AS3 `const`
@@ -5135,7 +5182,7 @@ export class Emitter {
           // `static const Dictionary = new Dictionary()` or a RegExp literal) —
           // C's `static const` demands a compile-time constant, so such a slot is
           // declared non-const and written once before any use.
-          this.line(`static ${this.cTypeName(f.type)} ${cname}_${fname} = ${this.defaultInit(f.type)};`);
+          this.line(`static ${this.cTypeName(f.type)} ${this.memberCName(cname, fname)} = ${this.defaultInit(f.type)};`);
           if (f.init) {
             this.staticFieldInits.push({ cname, fname, f });
             this.cinitClasses.add(cname);
@@ -6766,7 +6813,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
         if (f.isConst && this.isConstExpr(f.init)) continue; // compile-time literal const, never a GC object
-        const m = this.gcMarkExpr(`${cname}_${fname}`, f.type);
+        const m = this.gcMarkExpr(this.memberCName(cname, fname), f.type);
         if (m) this.line(m);
       }
     }
@@ -13057,17 +13104,21 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     // The single window's Stage, set when the Stage is constructed (before the
-    // document class runs). DisplayObject_get_stage falls back to it for a
-    // not-yet-attached root object, so the main class's `stage` is non-null inside
-    // its constructor — matching Flash, where the document class's `stage` is set
-    // before its constructor runs.
+    // document class runs). DisplayObject_get_stage falls back to it ONLY for the
+    // document class's own instance (ASC_doc_root, registered in its _new before
+    // the constructor runs), so the main class's `stage` is non-null inside its
+    // constructor — matching Flash, where the document class's `stage` is set
+    // before its constructor runs. Every OTHER orphan (an object whose parent
+    // chain does not reach a Stage) gets NULL: adl reports `new Sprite().stage
+    // == null`, so the blanket root fallback was wrong (temp/leaves/stage).
     this.line('static Stage* ASC_root_stage = NULL;');
+    this.line('static DisplayObject* ASC_doc_root = NULL;');
     this.line('Stage* DisplayObject_get_stage(void* _this) {');
     this.indent++;
     this.line('DisplayObject* o = (DisplayObject*)_this;');
     this.line('while (o->parent != NULL) o = (DisplayObject*)o->parent;');
     this.line("if (o->vtable != NULL && strcmp(o->vtable->cls_name, \"Stage\") == 0) return (Stage*)o;");
-    this.line('return ASC_root_stage;');
+    this.line('return (o == ASC_doc_root) ? ASC_root_stage : NULL;');
     this.indent--;
     this.line('}');
     this.line('');
@@ -32598,6 +32649,20 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('w->scale = 1.0;');
     this.line('ASC_win_scale = 1.0;');
     this.line('w->design_w = (int)width; w->design_h = (int)height;');
+    // The --air-app initial window: the descriptor's <width>/<height> is the OUTER
+    // frame (AIR), so the client area, the stage (noScale) and the surface are the
+    // frame minus the chrome insets. design_w/h keeps the descriptor value (the SWF
+    // design size showAll scales against); only the client-side sizes shrink. Plain
+    // Stage.showWindow(w,h) calls keep their client-area meaning (no define there).
+    this.line('#ifdef ASC_WINDOW_FRAME_SIZE');
+    this.line('#ifndef ASC_WINDOW_NOCHROME');
+    this.line('int ift = 0, ifl = 0, ifb = 0, ifr = 0;');
+    this.line('sk_frame_insets_new_window(1, &ift, &ifl, &ifb, &ifr);');
+    this.line('width -= ifl + ifr; height -= ift + ifb;');
+    this.line('if (width < 1) width = 1; if (height < 1) height = 1;');
+    this.line('#endif');
+    this.line('st->stage_w = (int)width; st->stage_h = (int)height;');
+    this.line('#endif');
     this.line('w->lw = (int)width; w->lh = (int)height;');
     this.line('w->pw = (int)width; w->ph = (int)height;');
     this.line('int fullscreen = (st->display_state != NULL && strcmp(st->display_state, "fullScreen") == 0) ? 1 : 0;');
@@ -33337,6 +33402,11 @@ void FileStream_writeObject(void* _this, as_value v) {
       // `new Sequence` therefore starts with length 0 and an empty named-property
       // table, exactly like a plain Array.
       if (info.arrayBacked) this.line(`o->_arr = as_array_new();`);
+      // The document class is linked to the Stage BEFORE its constructor runs
+      // (AIR behaviour). Register it as ASC_doc_root here so DisplayObject_get_stage
+      // can answer a non-null stage for `this` inside the constructor while every
+      // other not-yet-attached object still answers null.
+      if (name === this.docRootClass) this.line('ASC_doc_root = (DisplayObject*)o;');
       this.line(`${name}_ctor(o${paramNames ? ', ' + paramNames : ''});`);
       this.line('return o;');
       this.indent--;
@@ -33444,7 +33514,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.line('}');
           this.line('');
         } else {
-          this.line(`${this.cTypeName(returnType)} ${cname}_${m.name}(void* _this${params ? ', ' + params : ''}) {`);
+          this.line(`${this.cTypeName(returnType)} ${this.memberCName(cname, m.name)}(void* _this${params ? ', ' + params : ''}) {`);
           this.indent++;
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
@@ -33620,7 +33690,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (!si) return false;
         this.currentClass = cname;
         const init = this.convertImplicit(this.emitExpr(si.f.init!), si.f.type);
-        this.line(`${si.cname}_${si.fname} = ${init};`);
+        this.line(`${this.memberCName(si.cname, si.fname)} = ${init};`);
         this.currentClass = null;
         return true;
       };
@@ -33683,16 +33753,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     }
   }
 
-  private sfRead(owner: string, name: string): string {    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name})`;
-    return `${owner}_${name}`;
+  private sfRead(owner: string, name: string): string {    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${this.memberCName(owner, name)})`;
+    return this.memberCName(owner, name);
   }
 
   // Write a static field, running the declaring class's `_cinit` first for the
   // same reason as `sfRead` (a `static var`'s initializer must run before any
   // write can overwrite it).
   private sfWrite(owner: string, name: string, value: string): string {
-    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${owner}_${name} = ${value})`;
-    return `(${owner}_${name} = ${value})`;
+    if (this.cinitClasses.has(owner)) return `(${owner}_cinit(), ${this.memberCName(owner, name)} = ${value})`;
+    return `(${this.memberCName(owner, name)} = ${value})`;
   }
 
   // ---------- native extensions (FRE host + loader) ----------
@@ -41967,12 +42037,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     // closed set: a String answers length and its method names (measured on adl
     // 51.4.1: '"length" in "abc"' true, '"charAt" in s' true, '"0" in s' false),
     // which is the same set `with (s) { ... }` resolves against. Number/Boolean
-    // still answer false (registered gap); both operands are evaluated either way.
+    // answer their wrapper's member set (below); both operands are evaluated once.
     if (obj.type.kind === 'string') {
       return { code: `(strcmp(${keyStr}, "constructor") == 0 || as_str_has_member(${keyStr}))`, type: { kind: 'bool' } };
     }
-    if (obj.type.kind === 'bool' || obj.type.kind === 'number' || obj.type.kind === 'int' || obj.type.kind === 'uint') {
-      return { code: `((void)(${obj.code}), (void)(${keyStr}), false)`, type: { kind: 'bool' } };
+    // 静态原始数值/布尔接收者：AIR 自动装箱成包装对象，`in` 回答包装类成员集
+    // （adl 51.4.1 实测 temp/leaves/in），不再是恒 false。操作数仍各求值一次。
+    if (obj.type.kind === 'number' || obj.type.kind === 'int' || obj.type.kind === 'uint') {
+      return { code: `((void)(${obj.code}), as_number_has_member(${keyStr}))`, type: { kind: 'bool' } };
+    }
+    if (obj.type.kind === 'bool') {
+      return { code: `((void)(${obj.code}), as_bool_has_member(${keyStr}))`, type: { kind: 'bool' } };
     }
     // `key in fn`: the Function object's own sealed surface (call/apply/length/
     // toString/valueOf/hasOwnProperty/propertyIsEnumerable/prototype); `name` and

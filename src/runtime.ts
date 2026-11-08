@@ -921,18 +921,36 @@ static gc_header** gc_free_list_at(int i) {
     return &gc_free_big;
 }
 // Find a free block able to serve 'size', searching the graded lists in order:
-// a small request starts at its own size class and climbs (classes hold blocks
-// within one GC_SMALL_ALIGN window, so the climb is bounded and a higher class
-// always fits), then falls through to the mid list; a big request searches only
-// the big list. Returns NULL when nothing fits, so the caller carves a segment.
+// a small request probes at most eight nodes of its own class, then climbs from
+// the rounded-up class (whose blocks all fit), then falls through to the mid list; a big request
+// searches only the big list. Returns NULL when nothing fits, so the caller carves
+// a segment.
 static gc_header* gc_find_block(size_t size, gc_header*** out_head, gc_header** out_prev) {
     bool big = size >= GC_BIG_CLASS;
-    int first = big ? GC_SMALL_CLASSES + 1 : gc_small_class(size);
-    if (!big && first < 0) first = GC_SMALL_CLASSES;
+    // Preserve the old layout for the usual first-fit hits near the class head,
+    // but never walk an unbounded chain of too-small nodes: at most eight probes,
+    // then start at ceil(size/ALIGN), where the first node is large enough. The old
+    // walk made 30000 allocations take 12885 ms under a small-block flood
+    // (temp/perf/gcfindblock.as). Keeping the bounded prefix also avoids needless
+    // address-reuse perturbation, which matters to conservative stack scanning
+    // (examples/gc_alloc_threshold.as).
+    int first = big ? GC_SMALL_CLASSES + 1
+        : size >= GC_SMALL_MAX ? GC_SMALL_CLASSES
+        : gc_small_class(size);
     int last = big ? GC_SMALL_CLASSES + 1 : GC_SMALL_CLASSES;
     for (int li = first; li <= last; li++) {
         gc_header** list = gc_free_list_at(li);
         gc_header* prev = NULL;
+        if (!big && li == first && li < GC_SMALL_CLASSES
+            && li != (int)((size + GC_SMALL_ALIGN - 1) / GC_SMALL_ALIGN)) {
+            int probes = 0;
+            for (gc_header* h = *list; h != NULL && probes < 8; h = h->next, probes++) {
+                if (gc_audit_mode_cache != 0) gc_audit_gate("free-list node", h);
+                if (h->size >= size) { *out_head = list; *out_prev = prev; return h; }
+                prev = h;
+            }
+            continue;
+        }
         // The audit gate is off by default and is called once per node visited,
         // i.e. ~once per allocation. Testing the cached mode flag here instead of
         // calling the gate unconditionally keeps the off case a load and a branch:
@@ -11461,6 +11479,9 @@ static inline int as_window_in_move_loop(void) { return sk_window_in_move_loop()
 extern int sk_display_count(void);
 extern int sk_display_bounds(int i, int* x, int* y, int* w, int* h);
 extern int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h);
+// Chrome insets of a NEW decorated window, in logical points, measured before the
+// initial window's surface is built (the descriptor's <width>/<height> is the frame).
+extern void sk_frame_insets_new_window(int decorated, int* t, int* l, int* b, int* r);
 // Dynamic window API behind flash.display.NativeWindow. A window is created
 // hidden (adl reports visible=false right after the constructor) with a CPU
 // streaming-texture paint path, and is shown/raised by activate().

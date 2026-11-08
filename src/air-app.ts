@@ -699,6 +699,10 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
   if (visible && !style.maximizable) defines.push('ASC_WINDOW_NOT_MAXIMIZABLE=1');
   if (visible && !style.minimizable) defines.push('ASC_WINDOW_NOT_MINIMIZABLE=1');
   if (visible && style.systemChrome === 'none') defines.push('ASC_WINDOW_NOCHROME=1');
+  // The descriptor's <width>/<height> is the initial window's OUTER frame (AIR), not
+  // its client area: Stage_showWindow subtracts the chrome insets so the stage
+  // (noScale), surface and SDL window all land on the client size. First window only.
+  if (visible) defines.push('ASC_WINDOW_FRAME_SIZE=1');
   // A transparent initial window: the glue makes the NSWindow non-opaque (and the
   // generated compose step clears to alpha 0 instead of the stage colour), because
   // AIR does NOT fill the stage background in this mode.
