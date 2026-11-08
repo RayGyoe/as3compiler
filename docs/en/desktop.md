@@ -38,6 +38,7 @@
 | `NativeMenu` / `NativeMenuItem` | ✅ all members | list semantics, error codes and copy semantics match `adl` (§4, §5) |
 | `NativeMenu.display()` / `ContextMenu.display()` | ✅ | modal on macOS (nested tracking loop) and on Windows (`TrackPopupMenu`), async on web (§7.3, §7.7, §7.8) |
 | `ContextMenu` / `ContextMenuItem` | ✅ right-click popup | object model matches `adl` item by item, including the three rules that are the **opposite** of the base class (§7.7) |
+| `NativeProcess` / `NativeProcessStartupInfo` / `NativeProcessExitEvent` | ✅ real child process + three pipes + `exit` event | separate page: class shapes, error ids and texts, event order, the Windows command-line joining rule, and the three honestly reported divergences in [`native-process.md`](native-process.md) |
 | `keyEquivalentModifiers` | ✅ mapped | `15..20` measured one by one, then translated to `NSEventModifierFlags` (§7.2) |
 
 ---

@@ -4,6 +4,7 @@
 import type { Program, Stmt, Expr, ASType, Param, ClassMember, Block } from './ast.ts';
 import { RUNTIME_PREAMBLE } from './runtime.ts';
 import { FILE_DIALOG_RUNTIME } from './file-dialog.ts';
+import { NATIVE_PROCESS_RUNTIME } from './native-process.ts';
 import { NATIVE_DRAG_HEAD, NATIVE_DRAG_BODY } from './native-drag.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
 import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation, stmtCompletesNormally } from './symbols.ts';
@@ -4466,6 +4467,20 @@ export class Emitter {
   // slots where a NULL would make a DOCUMENTED call pattern crash instead of
   // reporting itself (NativeProcess's three pipes are read/written directly).
   private emitShellClasses(): void {
+    // Prototypes for the flash.desktop.NativeProcess backend (native-process.ts).
+    // The shell class BODIES below are emitted before the runtime block, so the
+    // thin wrappers that call as_np_* need the declarations first -- the same
+    // forward-declaration shape the vector/ClassValue helpers use.
+    this.line('static int as_np_supported(void);');
+    this.line('static void as_np_start(void* obj, void* info);');
+    this.line('static void as_np_exit(void* obj, int force);');
+    this.line('static void as_np_close_input(void* obj);');
+    this.line('static void as_np_tick(void);');
+    this.line('static File* as_np_info_get_exe(void* info);');
+    this.line('static File* as_np_info_get_wd(void* info);');
+    this.line('static void as_np_info_set_exe(void* info, File* value);');
+    this.line('static void as_np_info_set_wd(void* info, File* value);');
+    this.line('');
     let any = false;
     for (const [name, info] of this.symbols.classes) {
       if (info.shell !== true) continue;
@@ -4531,15 +4546,43 @@ export class Emitter {
           this.line('Event* NativeDragEvent_clone(void* self) { NativeDragEvent* o = (NativeDragEvent*)self; NativeDragEvent* copy = NativeDragEvent_new(o->_type, o->_bubbles, o->_cancelable, o->localX, o->localY, (InteractiveObject*)o->relatedObject, o->clipboard, o->allowedActions, o->dropAction, o->controlKey, o->altKey, o->shiftKey, o->commandKey); copy->stageX = o->stageX; copy->stageY = o->stageY; return (Event*)copy; }');
           continue;
         }
+        if (name === 'NativeProcess' && mname === 'start') {
+          this.line('void NativeProcess_start(void* _this, NativeProcessStartupInfo* info) { as_np_start(_this, (void*)info); }');
+          continue;
+        }
+        if (name === 'NativeProcess' && mname === 'exit') {
+          this.line('void NativeProcess_exit(void* _this, bool force) { as_np_exit(_this, force ? 1 : 0); }');
+          continue;
+        }
+        if (name === 'NativeProcess' && mname === 'closeInput') {
+          this.line('void NativeProcess_closeInput(void* _this) { as_np_close_input(_this); }');
+          continue;
+        }
         if (name === 'NetworkInfo' && mname === 'findInterfaces') { this.emitNetworkInfoFindInterfaces(); continue; }
         this.emitShellStub(`${name}_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, m.returnType, `${label}.${mname}`);
       }
       for (const [mname, m] of info.getters) {
         if (m.owner !== name) continue;
+        if (name === 'NativeProcessStartupInfo' && mname === 'executable') {
+          this.line('File* NativeProcessStartupInfo_get_executable(void* _this) { return as_np_info_get_exe(_this); }');
+          continue;
+        }
+        if (name === 'NativeProcessStartupInfo' && mname === 'workingDirectory') {
+          this.line('File* NativeProcessStartupInfo_get_workingDirectory(void* _this) { return as_np_info_get_wd(_this); }');
+          continue;
+        }
         this.emitShellStub(`${name}_get_${mname}`, 'void* _this', m.returnType, `${label}.${mname}`);
       }
       for (const [mname, m] of info.setters) {
         if (m.owner !== name) continue;
+        if (name === 'NativeProcessStartupInfo' && mname === 'executable') {
+          this.line('void NativeProcessStartupInfo_set_executable(void* _this, File* value) { as_np_info_set_exe(_this, value); }');
+          continue;
+        }
+        if (name === 'NativeProcessStartupInfo' && mname === 'workingDirectory') {
+          this.line('void NativeProcessStartupInfo_set_workingDirectory(void* _this, File* value) { as_np_info_set_wd(_this, value); }');
+          continue;
+        }
         this.emitShellStub(`${name}_set_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, { kind: 'void' }, `${label}.${mname}`);
       }
       for (const [mname, m] of info.staticMethods) {
@@ -4555,6 +4598,12 @@ export class Emitter {
       for (const [mname, m] of info.staticGetters ?? []) {
         if (m.owner !== name) continue;
         if (name === 'NativeDragManager') continue;
+        // flash.desktop.NativeProcess.isSupported: a real platform answer, so a
+        // program can branch the way AIR documents instead of catching a throw.
+        if (name === 'NativeProcess' && mname === 'isSupported') {
+          this.line('bool NativeProcess_get_isSupported_static(void* _this) { (void)_this; return as_np_supported() != 0; }');
+          continue;
+        }
         // A static getter returning the class it lives on is the documented
         // singleton (`NativeApplication.nativeApplication`, `Clipboard.
         // generalClipboard`, `NetworkInfo.networkInfo`): hand back one shared
@@ -16436,16 +16485,48 @@ this.line('AS_bake_pend_n = 0;');
     this.line('}');
     this.line('#endif // ASC_HAVE_FRE');
     // getExtensionDirectory() names the directory the extension's OWN files live in.
-    // This build now stages each extension's native library into a directory of its
-    // own, <exeDir>/extensions/<extensionID>/<platform>/ (see ane.ts
-    // stageAneNatives), but that directory holds the LIBRARY and nothing else: the
-    // rest of the .ane is not unpacked, so the data files an extension ships are not
-    // there. Handing back that path would therefore look right and immediately fail
-    // one level later (a FileNotFound inside the extension, with nothing on stderr),
-    // which is the shape AGENTS.md section 1.5 forbids: it reports instead, and the
-    // gap is registered in TODO.md 遗留待开发. Fixing it means unpacking the whole
-    // .ane into <extensionID>/, not just its native library.
-    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) { (void)extensionID; as_shell_unsupported("ExtensionContext.getExtensionDirectory (this build stages only the native library, under extensions/<extensionID>/<platform>; the rest of the package is not unpacked)"); return File_new_empty(); }');
+    //
+    // Measured on adl 51.4.1 (temp/extdir-probe, extension ANEWinCore): the answer is
+    // a File whose nativePath is the directory holding the UNPACKED PACKAGE -- for
+    // that probe, `ext-folder/ANEWinCore.ane`, whose listing is catalog.xml,
+    // library.swf, mimetype and META-INF/ (with the library at
+    // META-INF/ANE/Windows-x86-64/). So the value is the package directory itself,
+    // not a directory per platform and not a path this runtime had to synthesise.
+    //
+    // ane.ts now stages every entry of every package under
+    // `<exeDir>/extensions/<extensionID>/`, which is exactly that shape (stage 391;
+    // before it, only the native library was written and the honest answer had to be
+    // "unsupported"). The path is built from as_app_dir() -- the same executable
+    // directory as_ext_dir() (fre.ts) resolves against -- so the loader and this API
+    // can never disagree about where extensions live.
+    //
+    // AIR's two error cases are reproduced rather than invented (measured):
+    // ArgumentError #1508 for an unknown or empty ID, TypeError #2007 for null.
+    this.line('File* ExtensionContext_getExtensionDirectory_static(char* extensionID) {');
+    this.indent++;
+    this.line('if (extensionID == NULL) {');
+    this.indent++;
+    this.line('as_throw(TypeError_new((char*)"Error #2007: Parameter extensionID must be non-null.", 2007));');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('if (!as_ane_id_known(extensionID)) {');
+    this.indent++;
+    this.line('as_throw(ArgumentError_new((char*)"Error #1508: The value specified for argument extensionID is invalid.", 1508));');
+    this.line('return NULL;');
+    this.indent--;
+    this.line('}');
+    this.line('char path[4096];');
+    this.line('#ifdef _WIN32');
+    this.line('snprintf(path, sizeof(path), "%s\\\\extensions\\\\%s", as_app_dir(), extensionID);');
+    this.line('#else');
+    this.line('snprintf(path, sizeof(path), "%s/extensions/%s", as_app_dir(), extensionID);');
+    this.line('#endif');
+    this.line('File* dir = File_new_empty();');
+    this.line('File_set_nativePath((void*)dir, path);');
+    this.line('return dir;');
+    this.indent--;
+    this.line('}');
     // ---- flash.net.NetConnection / NetStream + flash.media.Video (stage 110) ----
     // The transport surface away3d's SimpleVideoPlayer drives. There is no media
     // transport and no video decoder in this subset: the connection state machine
@@ -19877,6 +19958,15 @@ FileReferenceList* FileReferenceList_new(void) {
 }
 as_array* FileReferenceList_get_fileList(void* _this) { return ((FileReferenceList*)_this)->_fileList; }
 `);
+    // flash.desktop.NativeProcess (stage 391): pipe slots, spawn, the non-blocking
+    // pump and the measured AIR error texts. Emitted next to the file-dialog
+    // runtime, and for the same reason: it is hand-written C with no per-program
+    // shape. Whether a program uses it is NOT decided here -- AGENTS.md §2.6 puts
+    // that on -O2 (every emission site is `static` and the only externally visible
+    // entry points are the shell-class wrappers, which the call graph reaches only
+    // when the program calls them), so a launcher-free program's BINARY does not
+    // carry it even though its .c file still shows the module.
+    this.cblock(NATIVE_PROCESS_RUNTIME);
     this.cblock(FILE_DIALOG_RUNTIME);
     // ---- flash.filesystem.StorageVolume ---------------------------------------
     // Constructed only by AIR itself (a volume-change event carries one); the
@@ -28770,6 +28860,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // yet this frame, so a listener sees the tree in the state AIR would show it.
     this.line('as_hover_flush();');
     this.line('as_async_tick();');
+    // Child processes (flash.desktop.NativeProcess): non-blocking pipe probes plus
+    // the data/exit events they produce. Same frame-boundary contract as the async
+    // IO jobs above -- a listener never runs in the middle of another dispatch.
+    this.line('as_np_tick();');
     // Fire due setTimeout/clearTimeout timers first (AIR drives timers on the
     // same frame clock as ENTER_FRAME), then advance playing MovieClips, then
     // broadcast the enterFrame event.
@@ -33799,6 +33893,35 @@ void FileStream_writeObject(void* _this, as_value v) {
   // files, then the host and loader themselves.
   private emitAnePreamble(): void {
     this.line(FRE_STUBS.trimEnd());
+    this.line('');
+    // The extension IDs this build knows, WITHOUT the FRE host.
+    //
+    // ExtensionContext.getExtensionDirectory() is the one member of the bridge that
+    // does not need the native side at all -- it answers a directory path -- so its
+    // two AIR behaviours must hold in every build: a known ID names the staged
+    // package directory, and anything else is the measured error (adl 51.4.1,
+    // temp/extdir-probe): ArgumentError #1508 for an unknown or empty ID, TypeError
+    // #2007 for null. Keeping this table outside the `#ifdef ASC_HAVE_FRE` is what
+    // makes the no-host build answer those instead of a generic "unsupported".
+    this.line(`#define ASC_ANE_IDS_COUNT ${this.aneDescriptors.length}`);
+    if (this.aneDescriptors.length === 0) {
+      // A zero-length array is not standard C; one NULL element keeps the loop
+      // below legal without changing any answer.
+      this.line('static const char* const as_ane_ids[1] = { NULL };');
+    } else {
+      this.line('static const char* const as_ane_ids[] = {');
+      this.indent++;
+      for (const d of this.aneDescriptors) this.line(`"${this.escapeCString(d.extId)}",`);
+      this.indent--;
+      this.line('};');
+    }
+    this.line('static int as_ane_id_known(const char* id) {');
+    this.indent++;
+    this.line('if (id == NULL) return 0;');
+    this.line('for (int i = 0; i < ASC_ANE_IDS_COUNT; i++) { if (as_ane_ids[i] != NULL && strcmp(as_ane_ids[i], id) == 0) return 1; }');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
     this.line('');
     this.line(FRE_HEAD.trimEnd());
     this.line('');
@@ -41295,14 +41418,14 @@ void FileStream_writeObject(void* _this, as_value v) {
       // non-blocking as_async_tick) is what keeps the examples deterministic:
       // one call is enough to observe COMPLETE even when the work ran on a
       // worker thread.
-      case 'tickTimers': return { code: '(as_async_tick_wait(), as_timer_tick())', type: { kind: 'void' } };
+      case 'tickTimers': return { code: '(as_async_tick_wait(), as_np_tick(), as_timer_tick())', type: { kind: 'void' } };
       // tickFrame(): the NON-blocking variant of tickTimers — exactly one frame
       // boundary (as_async_tick + as_timer_tick), with no wait for the workers.
       // Streaming reads (URLStream.bytesAvailable) are only observable across
       // frames while a transfer is still running, which tickTimers' drain-then-wait
       // semantics can never show; this is the headless equivalent of the real
       // frame loop for that case. Callers that need determinism use tickTimers.
-      case 'tickFrame': return { code: '(as_async_tick(), as_timer_tick())', type: { kind: 'void' } };
+      case 'tickFrame': return { code: '(as_async_tick(), as_np_tick(), as_timer_tick())', type: { kind: 'void' } };
       // tickMovieClips(): headless test hook — advances every playing MovieClip by
       // one frame (as_mc_tick). In window builds clips are driven by the frame loop.
       case 'tickMovieClips': return { code: 'as_mc_tick()', type: { kind: 'void' } };

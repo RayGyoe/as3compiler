@@ -205,4 +205,69 @@ if (ctx != null) {
     check("disposed", true, true);
 }
 
-trace("RESULT passed=" + passed + " failed=0 assumptions-checked");
+// ---------------------------------------------------------------------------
+// ExtensionContext.getExtensionDirectory() -- the directory the extension's OWN
+// files live in.
+//
+// The independent oracle here is `adl 51.4.1` reading an UNPACKED package through
+// `-extdir` (temp/extdir-probe: a real ANEWinCore.ane directory). It answers:
+// nativePath = the directory holding the unpacked PACKAGE; the listing is the
+// package verbatim (`catalog.xml`, `library.swf`, `mimetype`, `META-INF/`) with the
+// library at `META-INF/ANE/<platform>/<lib>`; an unknown or empty ID throws
+// ArgumentError #1508; a null ID throws TypeError #2007; and neither case returns
+// null. This build stages the whole package under `<exeDir>/extensions/<id>/`
+// (ane.ts stageAneNatives), which is the same shape, so the checks below are the
+// AIR contract expressed against this fixture's tree: it holds `extension.xml` and
+// one directory per platform, and nothing else.
+var extDir:File = ExtensionContext.getExtensionDirectory("com.example.probe");
+check("extdir non-null", extDir != null, true);
+check("extdir is the staged package directory",
+      extDir.nativePath == File.applicationDirectory.resolvePath("extensions/com.example.probe").nativePath, true);
+check("extdir exists", extDir.exists, true);
+check("extdir is a directory", extDir.isDirectory, true);
+check("extdir parent is the extensions root",
+      extDir.parent.nativePath == File.applicationDirectory.resolvePath("extensions").nativePath, true);
+// The package's descriptor is a data file, so an extension can open its own files
+// relative to this directory -- that is the whole reason the API exists.
+var extXml:File = extDir.resolvePath("extension.xml");
+check("extdir/extension.xml exists", extXml.exists, true);
+var extXmlStream:FileStream = new FileStream();
+extXmlStream.open(extXml, FileMode.READ);
+var extXmlText:String = extXmlStream.readUTFBytes(extXmlStream.bytesAvailable);
+extXmlStream.close();
+check("extdir/extension.xml names this extension", extXmlText.indexOf("<id>com.example.probe</id>") >= 0, true);
+// One directory per declared platform: the tree's own layout, kept verbatim.
+check("extdir/Windows-x86-64 is a directory", extDir.resolvePath("Windows-x86-64").isDirectory, true);
+// Every declared platform is staged, not only the host's -- the package is copied
+// whole, and a probe that only wrote the library it loads would fail this line.
+var extKids:int = 0;
+var extSeen:String = "";
+var extList:Array = extDir.getDirectoryListing();
+for (var ek:int = 0; ek < extList.length; ek++) {
+    var kn:String = (extList[ek] as File).name;
+    extKids++;
+    extSeen += (ek == 0 ? "" : ",") + kn;
+}
+check("extdir holds the whole package", extKids, 3);
+check("extdir entries", extSeen.indexOf("extension.xml") >= 0 && extSeen.indexOf("Windows-x86-64") >= 0, true);
+// AIR's two error cases: ArgumentError #1508 for an unknown or EMPTY id (the
+// measured wording), TypeError #2007 for null -- and both THROW rather than
+// returning null, which is what a caller's try/catch is written against.
+var extErr:Error = null;
+try { ExtensionContext.getExtensionDirectory("com.example.not-an-extension"); }
+catch (e:Error) { extErr = e; }
+check("extdir unknown id throws #1508", extErr != null && extErr.errorID == 1508, true);
+check("extdir unknown id is an ArgumentError", extErr is ArgumentError, true);
+check("extdir unknown id message",
+      extErr != null && extErr.message == "Error #1508: The value specified for argument extensionID is invalid.", true);
+var extErr2:Error = null;
+try { ExtensionContext.getExtensionDirectory(""); }
+catch (e:Error) { extErr2 = e; }
+check("extdir empty id throws #1508", extErr2 != null && extErr2.errorID == 1508, true);
+var extErr3:Error = null;
+try { ExtensionContext.getExtensionDirectory(null); }
+catch (e:Error) { extErr3 = e; }
+check("extdir null id throws #2007", extErr3 != null && extErr3.errorID == 2007, true);
+check("extdir null id is a TypeError", extErr3 is TypeError, true);
+
+ trace("RESULT passed=" + passed + " failed=0 assumptions-checked");

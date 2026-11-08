@@ -1562,10 +1562,19 @@ function checkAnePackageLayout(): string[] {
     else { bad.push(label); console.log(`FAIL  [anepkg] ${label}`); }
   };
 
-  // The staged key IS the path the generated loader will use, so it belongs to the
-  // pinned contract rather than being an implementation detail:
-  // <extensionID>/<platform>/<nativeLibrary>, one directory per extension.
+  // The staged key IS the path the generated loader uses, so it belongs to the
+  // pinned contract rather than being an implementation detail. Since stage 391 the
+  // extension directory holds the WHOLE package exactly as the .ane delivered it
+  // (measured on adl 51.4.1: `catalog.xml`, `library.swf`, `mimetype`, `META-INF/`
+  // all appear under extensions/<id>/), which is what makes
+  // ExtensionContext.getExtensionDirectory() useful -- an extension that reads a
+  // data file next to its own library finds it. The key is therefore
+  // <extensionID>/<the entry's own path inside the package>, and the three package
+  // layouts differ in where that puts the library.
   const key = (platform: string, lib = 'Pkg.dll', extId = 'com.example.pkg'): string =>
+    `${extId}/META-INF/ANE/${platform}/${lib}`;                       // official adt package
+  const flatKey = (lib = 'Pkg.dll', extId = 'com.example.pkg'): string => `${extId}/${lib}`;
+  const stageKey = (platform: string, lib = 'Pkg.dll', extId = 'com.example.pkg'): string =>
     `${extId}/${platform}/${lib}`;
 
   // STORE-method ZIP writer: swc.ts's `unzip` walks the EOCD + central directory
@@ -1634,14 +1643,14 @@ function checkAnePackageLayout(): string[] {
   //     why the pins below synthesize all three shapes instead of borrowing one.)
   const flat = write('flat.ane', zip([['extension.xml', EXT_XML], ['Pkg.dll', X64]]));
   check('the flat package layout keeps resolving',
-    (() => { try { return String(resolveAneDescriptors([flat], 'Windows-x86-64').staging.get(key('Windows-x86-64'))) === 'x64-slice-bytes'; }
+    (() => { try { return String(resolveAneDescriptors([flat], 'Windows-x86-64').staging.get(flatKey())) === 'x64-slice-bytes'; }
              catch { return false; } })());
 
   // (c) The on-disk staging directory adt is fed (`-C Windows-x86-64 .`), in case a
   //     user zips that instead of running adt: <platform>/<lib> at the root.
   const staged = write('staged.ane', zip([['extension.xml', EXT_XML], ['Windows-x86-64/Pkg.dll', X64]]));
   check('a package holding the adt staging directory resolves',
-    (() => { try { return String(resolveAneDescriptors([staged], 'Windows-x86-64').staging.get(key('Windows-x86-64'))) === 'x64-slice-bytes'; }
+    (() => { try { return String(resolveAneDescriptors([staged], 'Windows-x86-64').staging.get(stageKey('Windows-x86-64'))) === 'x64-slice-bytes'; }
              catch { return false; } })());
 
   // (d) A package holding ONLY the other platform's slice must NOT resolve for this
@@ -1690,7 +1699,7 @@ function checkAnePackageLayout(): string[] {
   put(dirstage, 'Windows-x86-64/Pkg.dll', X64);
   put(dirstage, 'Windows-x86/Pkg.dll', X86);
   const dirSlice = (platform: string): Buffer | string => {
-    try { return resolveAneDescriptors([dirstage], platform).staging.get(key(platform)) ?? 'staged-nothing'; }
+    try { return resolveAneDescriptors([dirstage], platform).staging.get(stageKey(platform)) ?? 'staged-nothing'; }
     catch (e) { return `threw: ${String(e)}`; }
   };
   check('a staging DIRECTORY resolves for Windows-x86-64', String(dirSlice('Windows-x86-64')) === 'x64-slice-bytes');
@@ -1730,19 +1739,21 @@ function checkAnePackageLayout(): string[] {
       catch (e) { return /ANE '.*nope-ane': no such file or directory/.test(String(e)); }
     })());
 
-  // (g) THE LAYOUT: one directory per extension, two levels deep, named after the
-  //     extensionID and the platform. Pinned on the DESCRIPTOR (what the emitted
-  //     as_ane_descs[] row carries and the loader joins onto <exeDir>/extensions/)
-  //     and on the staged map, because those two drifting apart is exactly the bug
-  //     this replaced.
+  // (g) THE LAYOUT: one directory per extension, holding the package verbatim.
+  //     Pinned on the DESCRIPTOR (what the emitted as_ane_descs[] row carries and the
+  //     loader joins onto <exeDir>/extensions/) and on the staged map, because those
+  //     two drifting apart is exactly the bug this replaced. The flat package stages
+  //     BOTH its entries -- extension.xml is not dropped just because this build only
+  //     loads the library: an extension that reads its own descriptor at run time is
+  //     ordinary, and getExtensionDirectory() is what tells it where to look.
   const one = ((): { desc: string; keys: string[] } => {
     try { const r = resolveAneDescriptors([flat], 'Windows-x86-64'); return { desc: r.descriptors[0]?.nativeLib ?? '<none>', keys: [...r.staging.keys()] }; }
     catch (e) { return { desc: `threw: ${e}`, keys: [] }; }
   })();
-  check('the descriptor names the library <extensionID>/<platform>/<lib>',
-    one.desc === key('Windows-x86-64'));
-  check('…and the staged map is keyed by that same path',
-    one.keys.length === 1 && one.keys[0] === key('Windows-x86-64'));
+  check('the descriptor names the library inside its own extension directory',
+    one.desc === flatKey());
+  check('…and the staged map is keyed by filesystem-looking <extensionID>/<entry> paths',
+    one.keys.length === 2 && one.keys.includes(flatKey()) && one.keys.includes('com.example.pkg/extension.xml'));
   check('…so nothing is staged under the bare file name any more',
     !one.keys.includes('Pkg.dll'));
 
@@ -1765,14 +1776,15 @@ function checkAnePackageLayout(): string[] {
     typeof two !== 'string' && two.descriptors.length === 2);
   check('…each addressed by its own extension directory',
     typeof two !== 'string' &&
-    two.descriptors[0]?.nativeLib === key('Windows-x86-64', 'Pkg.dll', 'com.example.a') &&
-    two.descriptors[1]?.nativeLib === key('Windows-x86-64', 'Pkg.dll', 'com.example.b'));
+    two.descriptors[0]?.nativeLib === flatKey('Pkg.dll', 'com.example.a') &&
+    two.descriptors[1]?.nativeLib === flatKey('Pkg.dll', 'com.example.b'));
   check('…so both libraries are staged, not one',
-    typeof two !== 'string' && two.staging.size === 2);
+    typeof two !== 'string' && two.staging.size === 4 &&
+    two.staging.has(flatKey('Pkg.dll', 'com.example.a')) && two.staging.has(flatKey('Pkg.dll', 'com.example.b')));
   check('…and each holds its own bytes',
     typeof two !== 'string' &&
-    String(two.staging.get(key('Windows-x86-64', 'Pkg.dll', 'com.example.a'))) === 'x64-slice-bytes' &&
-    String(two.staging.get(key('Windows-x86-64', 'Pkg.dll', 'com.example.b'))) === 'x86-slice-bytes');
+    String(two.staging.get(flatKey('Pkg.dll', 'com.example.a'))) === 'x64-slice-bytes' &&
+    String(two.staging.get(flatKey('Pkg.dll', 'com.example.b'))) === 'x86-slice-bytes');
 
   // (i) A library declared in a SUBDIRECTORY keeps that relative path: flattening it
   //     onto a base name would recreate the collision above, and would rename a file
@@ -1783,7 +1795,7 @@ function checkAnePackageLayout(): string[] {
         const sub = resolveAneDescriptors([write('sub.ane', zip([
           ['extension.xml', extXml('com.example.sub', 'libs/Pkg.dll')], ['libs/Pkg.dll', X64],
         ]))], 'Windows-x86-64');
-        return sub.descriptors[0]?.nativeLib === key('Windows-x86-64', 'libs/Pkg.dll', 'com.example.sub');
+        return sub.descriptors[0]?.nativeLib === flatKey('libs/Pkg.dll', 'com.example.sub');
       } catch { return false; }
     })());
 

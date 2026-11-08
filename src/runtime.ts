@@ -8617,6 +8617,10 @@ static void gc_scan(gc_header* h) {
 // gc_mark_user_roots.) Both walks are defined further down with their tables.
 static void as_async_mark_roots(void);
 static void as_file_dialog_mark_roots(void);
+// Live child processes (flash.desktop.NativeProcess, native-process.ts): the AS3
+// process objects are permanent roots while a child runs, so a listener registered
+// before AS3 dropped its last reference still receives the exit event.
+static void as_np_mark_roots(void);
 static void as_native_drag_mark_roots(void);
 static void as_sock_mark_roots(void);
 static void as_audio_mark_roots(void);
@@ -8640,6 +8644,7 @@ static void gc_mark_internal_roots(void) {
     }
     as_async_mark_roots();
     as_file_dialog_mark_roots();
+    as_np_mark_roots();
     as_native_drag_mark_roots();
     as_sock_mark_roots();
     as_audio_mark_roots();

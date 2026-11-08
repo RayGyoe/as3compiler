@@ -2080,24 +2080,27 @@ function checkAneExtensionContextSurface(): string[] {
   // surface, not about this call's arity (see unit: builtin/Arity).
   const c = generateC(parse('import flash.external.ExtensionContext;\nvar x:* = ExtensionContext.createExtensionContext("a.b", null);\ntrace(x);\n')).c;
 
-  // getExtensionDirectory() names the directory the extension's OWN files live in.
-  // The build stages each extension's native library into a directory of its own,
-  // but that directory holds the library alone -- the rest of the package is not
-  // unpacked -- so it has to say so rather than hand back a path that looks right
-  // and fails one level deeper inside the extension.
-  const dir = /File\* ExtensionContext_getExtensionDirectory_static\(char\* extensionID\) \{[^}]*\}/.exec(c);
+  // getExtensionDirectory() answers the directory the extension's OWN package was
+  // staged into (stage 391). The staging tree holds the WHOLE .ane -- catalog.xml,
+  // library.swf, mimetype, META-INF/ -- so an extension that reads a data file next
+  // to its own library finds it, which is what `adl 51.4.1` does (temp/extdir-probe).
+  // The contract is measured, not invented: an unknown/empty id throws #1508 and a
+  // null id throws #2007, from THIS call, before any path is built.
+  const dir = /File\* ExtensionContext_getExtensionDirectory_static\(char\* extensionID\) \{[\s\S]*?\n\}/.exec(c);
   check('getExtensionDirectory has an emitted body', dir !== null);
-  check('…and reports the gap instead of silently returning a pathless File',
-    dir !== null && /as_shell_unsupported\("/.test(dir[0]));
-  check('…still returns a live File so a caller can inspect it',
-    dir !== null && /return File_new_empty\(\);/.test(dir[0]));
-  // …and the report is not a guess about the platform: it names this build's own
-  // staging layout and what is missing from it, which is what a reader needs to know
-  // to work around it.
-  check('…naming the staging layout rather than guessing a path',
-    dir !== null && /extensions\/<extensionID>\/<platform>/.test(dir[0]));
-  check('…and saying what that directory does NOT hold',
-    dir !== null && /the rest of the package is not unpacked/.test(dir[0]));
+  check('…which no longer reports a gap', dir !== null && !/as_shell_unsupported\("/.test(dir[0]));
+  check('a null id throws TypeError #2007 (measured text)',
+    dir !== null && dir[0].includes('#2007: Parameter extensionID must be non-null.", 2007)'));
+  check('an unknown id throws ArgumentError #1508 (measured text)',
+    dir !== null && dir[0].includes('#1508: The value specified for argument extensionID is invalid.", 1508)'));
+  // The check is against the ids this BUILD packaged, so a directory is only ever
+  // answered for an extension that is really staged next to the app.
+  check('…gated on the packed ids', dir !== null && /as_ane_id_known\(extensionID\)/.test(dir[0]));
+  check('…and the answer is <app dir>/extensions/<id> on both platforms',
+    dir !== null && dir[0].includes('"%s\\\\extensions\\\\%s", as_app_dir(), extensionID')
+      && dir[0].includes('"%s/extensions/%s", as_app_dir(), extensionID'));
+  check('the packed-id table is emitted unconditionally (no FRE host needed to answer a path)',
+    /#define ASC_ANE_IDS_COUNT \d+/.test(c) && /static int as_ane_id_known\(const char\* id\) \{/.test(c));
 
   // AIR has no ExtensionContext.extensionID member (mxmlc rejects it, adl raises
   // #1069). The struct must not grow one just to look more complete: the id is an

@@ -424,12 +424,33 @@ function nativeEntryCandidates(platform: string, nativeLibrary: string): string[
  * name is not an address — it is two addresses, and picking the wrong one is a
  * load-with-the-wrong-bitness failure far from its cause.
  */
-function findNativeEntry(pkg: AnePackage, platform: string, nativeLibrary: string): Buffer | null {
+function findNativeEntry(pkg: AnePackage, platform: string, nativeLibrary: string): { name: string; bytes: Buffer } | null {
   for (const candidate of nativeEntryCandidates(platform, nativeLibrary)) {
     const bytes = pkg.natives.get(candidate);
-    if (bytes) return bytes;
+    if (bytes) return { name: candidate, bytes };
   }
   return null;
+}
+
+/**
+ * Refuse an entry name that would land outside the extension's own directory.
+ *
+ * The staging step now writes EVERY entry of a package, using the archive's own
+ * paths (that is what makes `ExtensionContext.getExtensionDirectory()` name a
+ * directory whose contents are the package -- measured under `adl 51.4.1`, see
+ * docs/zh-cn/ane.md §6), so a hostile or corrupt ZIP with `../..` inside it would
+ * otherwise be able to write anywhere the build has permission to. Rejecting at
+ * COMPILE time is the right place: the failure names the package and the entry,
+ * and no bytes were written yet.
+ */
+function assertStagableEntry(source: string, name: string): void {
+  const bad =
+    name.length === 0 ||
+    name.startsWith('/') ||
+    name.startsWith('\\') ||
+    /^[A-Za-z]:/.test(name) ||
+    name.split(/[\\/]/).some((seg) => seg === '..');
+  if (bad) throw new Error(`ANE '${source}': entry '${name}' is not a path inside the package (refusing to unpack it)`);
 }
 
 /** What a build's `--ane-path` list resolved to. */
@@ -589,8 +610,8 @@ export function resolveAneDescriptors(paths: readonly string[], platform: string
           ` A build cannot load another platform's native library.`
       );
     }
-    const bytes = findNativeEntry(pkg, platform, entry.nativeLibrary);
-    if (!bytes) {
+    const found = findNativeEntry(pkg, platform, entry.nativeLibrary);
+    if (!found) {
       // Listing what the ZIP does hold turns "does not contain it" into a
       // one-read diagnosis: a wrong-case `META-INF/ANE/` prefix, a `.zip` that
       // holds only the staged directory, or a truly empty package all look
@@ -604,32 +625,54 @@ export function resolveAneDescriptors(paths: readonly string[], platform: string
             .join(', ')}; the package holds: ${listed || '(no entries)'}${more}`
       );
     }
-    // The library keeps the RELATIVE PATH its descriptor declares, two levels down
-    // from the extensions root, so a library declared in a subdirectory is not
-    // flattened onto a name it never had (AIR keeps that relative path too).
-    const rel = `${pkg.extId}/${platform}/${entry.nativeLibrary.replace(/\\/g, '/')}`;
+    // The library keeps the entry name it was FOUND under, one level down from
+    // the extensions root, so a library declared in a subdirectory is not flattened
+    // onto a name it never had (AIR keeps that relative path too), and an official
+    // package keeps its META-INF/ANE/<platform>/ shape verbatim.
+    const rel = `${pkg.extId}/${found.name}`;
     descriptors.push({
       extId: pkg.extId,
       nativeLib: rel,
       initializer: entry.initializer,
       finalizer: entry.finalizer,
     });
-    staging.set(rel, bytes);
+    // The WHOLE package, not just the native library (stage 391).
+    //
+    // Measured on adl 51.4.1 (temp/extdir-probe): ExtensionContext.getExtensionDirectory()
+    // answers the directory holding the UNPACKED PACKAGE -- every entry, at the
+    // archive's own path, with the library at META-INF/ANE/<platform>/<lib> -- and
+    // an extension resolves its own data files relative to that directory. Staging
+    // only the library made that API unanswerable, which is the gap TODO.md listed.
+    for (const [name, bytes] of pkg.natives) {
+      assertStagableEntry(path, name);
+      staging.set(`${pkg.extId}/${name}`, bytes);
+    }
   }
   return { descriptors, staging, platform };
 }
 
 /**
- * Write every staged native library into `<exeDir>/extensions/<extensionID>/<platform>/`.
+ * Write the staged extension tree into `<exeDir>/extensions/`.
  *
- * That root is where as_ext_dir() (fre.ts) looks; the rest of the path comes from
- * the descriptor, so the pairing is compile-time-determined on both sides. One
- * directory per extension is what keeps two extensions that happen to ship a
- * library with the same file name from becoming one file (see
- * resolveAneDescriptors), and it mirrors AIR, whose extension directories are
- * per-extension as well. Returns the paths written (relative to the extensions
- * root), so the caller can report them: a program whose extension silently is not
- * there is the failure mode this whole step exists to prevent.
+ * Every entry of every package is written under `<extensionID>/<entry name>` --
+ * the package's own paths, verbatim, which is what AIR's extension directory
+ * holds (measured under `adl 51.4.1`: the directory `getExtensionDirectory()`
+ * returns contains `catalog.xml`, `library.swf`, `mimetype` and `META-INF/`, with
+ * the native library at `META-INF/ANE/<platform>/<lib>`). One directory per
+ * extension is what keeps two extensions that happen to ship a file of the same
+ * name from becoming one file, and it mirrors AIR, whose extension directories
+ * are per-extension as well.
+ *
+ * The native library is written where the descriptor's `nativeLib` says, and
+ * `nativeLib` IS the entry name the library was found under, so the loader
+ * (`as_ext_dir()` in fre.ts) needs no second layout decision. That covers all
+ * three package shapes with one rule: an official package keeps
+ * `META-INF/ANE/<platform>/<lib>`, an on-disk staging tree keeps
+ * `<platform>/<lib>`, and a flat package keeps `<lib>`.
+ *
+ * Returns the paths written (relative to the extensions root), so the caller can
+ * report them: a program whose extension silently is not there is the failure
+ * mode this whole step exists to prevent.
  */
 export function stageAneNatives(resolution: AneResolution, exePath: string): string[] {
   if (resolution.staging.size === 0) return [];

@@ -42,6 +42,7 @@
 | `NativeMenu.display()` / `ContextMenu.display()` | ✅ 实现（macOS / Windows 真模态；web 异步） | Cocoa 走嵌套 tracking loop、Win32 走 `TrackPopupMenu`，都阻塞到选中/取消；三端差异与 Windows 实测见 §7.7、§7.8 |
 | `ContextMenu` / `ContextMenuItem` | ✅ 实现（右键弹窗） | 对象模型逐条对 `adl`，含三条**与基类相反**的独有规则（§8） |
 | `keyEquivalentModifiers` | ✅ 已映射 | `15..20` 逐值实测后译成 `NSEventModifierFlags`（§7.2） |
+| `NativeProcess` / `NativeProcessStartupInfo` / `NativeProcessExitEvent` | ✅ 实现（真子进程 + 三条管道 + `exit` 事件） | 独立成页：类形状、错误号与文案、事件顺序、Windows 命令行拼接口径、三处如实报明的差异见 [`native-process.md`](native-process.md) |
 
 ---
 

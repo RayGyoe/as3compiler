@@ -21127,3 +21127,56 @@ half` 133 检查、`gallery tour` 60 页手算矩形、`descriptor DPI A/B`、G1
 `charCodeAt` 是 `s[i]` O(1)。若内部改存 UTF-16：`length` 1.5ns、`charCodeAt` 1.5ns（今天 5.5 / 1.5ns），
 但每根字符串每次跨 C 边界（Skia 量/画文本、`printf`、curl、JSON/XML、正则）要多 24–58ns 转码，
 且 ASCII 字符串内存 ×2。实测表在 `temp/g38/bench.c` + `bench-result.txt`（结论：不换表示）。
+
+### 阶段三百九十一：AIR 桌面两处**契约**补齐 —— 扩展目录（ANE）+ `NativeProcess` 子进程（v0.4.361 → v0.4.362）
+
+两条都是「形状早就有了、真行为一直缺」的 AIR 面，都由 `adl 51.4.1` 实测定契约、再照实测实现。
+
+**① `ExtensionContext.getExtensionDirectory()` 答出**真目录**（`temp/extdir-probe/`）**
+
+此前是报明桩，回一个**无路径**的 `File`——调用方分不清「这个扩展真没有目录」和「这个后端没实现」。
+实测口径：入参是本构建打进来的扩展 id 时，回 `<app dir>/extensions/<id>`，目录里是**整个 .ane 原样解开**
+（`catalog.xml`、`library.swf`、`mimetype`、`META-INF/`），原生库仍在 `META-INF/ANE/<platform>/<lib>`；
+未知 id 与空串抛 `ArgumentError #1508`（`The value specified for argument extensionID is invalid.`），
+`null` 抛 `TypeError #2007`。实现上 `src/ane.ts` 改为**整包暂存**（原先只解出原生库），并在解包时
+**编译期**拒绝会逃出扩展目录的条目名（空、以 `/`/`\` 开头、带盘符、含 `..` 段）；`src/emit.ts` 无条件发射
+`as_ane_ids[]` + `as_ane_id_known()`（回答路径不需要 FRE 宿主），函数体改为查表后拼
+`<app dir>{/,\}extensions{/,\}<id>`。
+
+**② `flash.desktop.NativeProcess` 真起子进程（`src/native-process.ts`）**
+
+形状先按实测矫正：`pid`/`processID`、`NativeProcessStartupInfo.environment`、三条重定向字段、
+`NativeProcessExitEvent.process` 在 `mxmlc 51.4.1` + `adl describeType` 下**都不存在**，全部删除
+（`exitCode` 实测 `typeof` 是 `"number"`，不是 `uint`）；`isSupported` 由常量改成**静态 getter**，
+答平台而不是答字面量。然后在 Windows 用 `CreateProcessW` + 三条匿名管道、POSIX 用 `fork` + `execv` 实现，
+帧边界泵（`tickFrame`/`tickTimers`/`Stage_dispatchFrame` 同一条路径）、全程非阻塞、
+`AS_NP_MAX=8` 个活子进程、对象由 GC 根表保住（丢引用也能收到 `exit`）。
+
+**三处最容易做错、都靠实测纠正的点**：
+
+1. **Windows 命令行不能加引号**。第一版按 CRT 规则给每个参数包引号，`cmd.exe` 重解析后把
+   `echo hello-out & …` 变成 `'…' 不是内部或外部命令`（实测日志在 `temp/npa/aot/P3.as` 早期输出）。
+   `temp/npa/air/Q.as` 量到 AIR 的口径是**只给 argv[0] 加引号、其余参数原样单空格拼接**——
+   调用方自己写引号才保留。加引号不是修复而是**制造不一致**。
+2. **事件顺序与计数**：数据先、`EXIT` 后；`bytesLoaded` 是本帧字节数、`bytesTotal` **恒 0**（管道不预告长度）；
+   `running` 在 `exit(true)` 调用的**下一行仍为 true**，由 `exit` 事件清掉。
+3. **校验在 setter**：`si.executable = 不存在` 当场抛 `#3214`、`workingDirectory` 对应 `#3215`；
+   `start(null)` 抛 `#1009`、重复 `start()` 抛 `#3213`。
+
+**验收**：
+
+| 验收 | 方法 | 结果 |
+|---|---|---|
+| 扩展目录 | `examples/ane/driver.as`（目录/父目录/内容/整包树/未知 id/空 id/null id 共 12 组断言） | `RESULT passed=72 failed=0` |
+| 子进程 | `examples/native-process.as`（16 组：形状、错误号/文案、事件序、计数、stdin 往返+EOF、`#3213`、强杀、重启、`workingDirectory`） | **Windows 全过**（本机实测）；POSIX 分支（`fork`/`execv`、`O_NONBLOCK`、`waitpid`）同一份脚本走 `/bin/sh`，但**本机没有跑过**——要等 macOS arm64 的 CI 回报，在那之前口径是「写了、未测」 |
+| 结构钉子 | `unit: desktop/NativeProcess`（39 钉）+ `unit: ane/ExtensionContextSurface`（11 钉，改为钉新契约） | 全过 |
+| `adl` 证据 | `temp/npa/air/{T,NP,NP2,Q}.as`、`temp/extdir-probe/` | 形状/错误/事件/命令行四项逐条对应 |
+
+**全量回归**：`node test.ts > temp/g391/full.log 2>&1` ⇒ **664 tests / 642 pass / 19 fail / 3 skipped**
+（`duration_ms 420818.8882`），失败集与基线 `temp/g38u16/full3.log` **逐条相同**（0 新增 / 0 消失）；
+新增的 `example: native-process.as` 与 `unit: desktop/NativeProcess` 两组均绿。
+
+**如实报明的三处差异**（`docs/{zh-cn,en}/native-process.md` §7）：`standardInput` 在本后端是 `ByteArray`
+（AIR 是 `OutboundPipe`），写入在帧边界落地 ⇒ 子进程死后写入**不会**抛 `#3212`、写为追加语义；
+被强杀子进程的退出码报平台等待状态（AIR 在 Windows 上报 `NaN`，我们不伪造）；
+Windows 上 `exit(false)` 也走 `TerminateProcess`（控制台子进程没有消息循环可「请求关闭」）。

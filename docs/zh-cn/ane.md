@@ -22,7 +22,7 @@
 > **macOS x86-64（通用二进制，一个键服务两种架构）** —— macOS 那一半于 2026-10-20（阶段二百零七）落地，
 > 含宿主库、C 面的 POSIX 分支、夹具与示例（见 §5.1）。仍未做的只有 **iOS**：它把扩展**静态链进应用镜像**、
 > 没有 `dlopen` 这一步，故不是一个可加载的宿主库，`aneHostLibName()` 对它**响亮抛错并说明原因**
-> （其余任何没有宿主库的平台，`--ane` 同样响亮报错并给出缺失路径，见 §5）。端到端证据：`examples/ane/`（**56 条断言全过**，Windows 与 macOS 都真跑）与 `examples/ane-app/`（**13 条**，描述符那条路）、`test/unit/emit.ts` 的
+> （其余任何没有宿主库的平台，`--ane` 同样响亮报错并给出缺失路径，见 §5）。端到端证据：`examples/ane/`（**72 条断言全过**，Windows 与 macOS 都真跑）与 `examples/ane-app/`（**13 条**，描述符那条路）、`test/unit/emit.ts` 的
 > `unit: ane/ExtensionContextSurface`、`test/unit/build.ts` 的 `unit: ane/ExtensionXmlComments`
 > / `unit: ane/PackageLayout` / `unit: ane/PlatformForBuild` / `unit: ane/ExampleFixtureTrees` /
 > `unit: ane/HostLibrary` / `build/AneHostLayout` / `build/WindowsArch`、`test/unit/fre.ts` 的
@@ -89,7 +89,7 @@ D 面为什么单列：它不是「漏了」，是**分两半决定**——句�
 | `createExtensionContext(id, ctxType)` | 按 extensionID 查表 → `LoadLibrary` → 跑 `Initializer` + `ContextInitializer` → 返回上下文 | AIR 的两种 null 情形之外**不会**再有第三种；每种失败都自报 |
 | `call(fn, ...args)` | 走扩展发布的函数表；扩展没发布这个名字 → 自报 + 返回 `null` | 同步调用，与 AIR 一致 |
 | `dispose()` | 跑 `ContextFinalizer`，标记失效，返回 `true` | 原生库**不卸载**（其他上下文可能共用） |
-| `getExtensionDirectory()` | 返回一个**活着的但无路径**的 `File`，并**自报**为什么无路径 | 见 §5 缺陷 4 |
+| `getExtensionDirectory(id)` | 回 `<app 目录>/extensions/<id>` 的 `File`——本构建打过包的扩展 id 才有；未知/空 id 抛 `ArgumentError #1508`、`null` 抛 `TypeError #2007`（均按 `adl 51.4.1` 实测） | 目录里是**整包原样解开**，见 §5 缺陷 4（已修） |
 | `actionScriptData` | 真属性，读写走与普通 AS3 属性相同的动态访问器 | FRE 侧 `FREGet/SetContextActionScriptData` 与它同一份存储 |
 | `StatusEvent` 派发 | 原生侧 `FREDispatchStatusEventAsync` → 队列 → 在**调用返回前** pump 出去 | `addEventListener(StatusEvent.STATUS, …)` 必须在下一条语句前已经触发过 |
 | **`extensionID` 属性** | **故意不存在** | AIR 没有它（`mxmlc` 拒绝、`adl` 报 `Error #1069`），凭空加一个反而让本编译器放行 `mxmlc` 拒绝的程序 |
@@ -139,7 +139,7 @@ D 面为什么单列：它不是「漏了」，是**分两半决定**——句�
 |---|---|---|---|
 | 找扩展 | 运行期解析 `extensions/` 下每个 `extension.xml` | **编译期**解析 `--ane` 给的 `.ane` 包**或解包后的目录**，发射成 C 数据 `as_ane_descs[]` | 运行时不带 XML 引擎，也不想带（§1.1） |
 | 设备 ID → 描述符 | 字符串查找 | `as_ane_index()` 线性查表（上限 `ASC_ANE_COUNT_MAX = 32`） | 表是静态的，查 32 行毫无开销 |
-| 加载原生库 | `<app>/extensions/<id>/<nativeLibrary>` | `<exe 目录>/extensions/<extID>/<平台>/<nativeLibrary>` | 相对可执行文件解析（`as_ext_dir()` 用 `GetModuleFileNameA`），产物**可整体搬走**。**一扩展一目录**不是装饰：多个扩展的同名库若落在同一目录里会变成同一个文件（§5.1），而 AIR 就是把每个扩展的库放在**那个扩展自己的路径**上 |
+| 加载原生库 | `<app>/extensions/<id>/<nativeLibrary>` | `<exe 目录>/extensions/<extID>/<库在包内的自身路径>` | 相对可执行文件解析（`as_ext_dir()` 用 `GetModuleFileNameA`），产物**可整体搬走**。**一扩展一目录**不是装饰：多个扩展的同名库若落在同一目录里会变成同一个文件（§5.1），而 AIR 就是把每个扩展的库放在**那个扩展自己的路径**上。阶段三百九十一 起这棵目录是**整包原样**（`catalog.xml`、`library.swf`、`mimetype`、`META-INF/` 全在），于是库的位置就跟着包布局走：adt 包是 `<extID>/META-INF/ANE/<平台>/<库>`，`-C <平台> .` 的暂存目录是 `<extID>/<平台>/<库>` |
 | 初始化 | `Initializer(&data, &ctxInit, &ctxFinal)` 然后 `ctxInit(...)` | 同样 | 协议一致 |
 | 调用函数 | 扩展发布的 `FRENamedFunction[]` 按名字查 | 同样，`functionData` 也按扩展给的传 | 不发明上下文槽 |
 | 失败 | `createExtensionContext` 返回 null | 返回 null **且** stderr 自报，说明是「没有这个 ID」还是「库加载不了」还是「没有 Initializer」 | 静默的 null 让应用无法区分，而这是应用唯一要区分的 |
@@ -324,7 +324,7 @@ macOS 是 `NSWindow*`（`lib/asaot.h` 里 `FRENativeWindow` 就是按平台选�
 `stage.nativeWindow` 调 acquire 会得到 `FRE_ILLEGAL_STATE`；AIR 是先建窗再跑构造器。第一帧之后两边
 一致，`examples/ane-app/src/Main.as` 正是在第一帧断言的。
 
-**证据**：`examples/ane/`（离屏构建，钉住 `Point` / `null` 两条拒绝路径，56 条断言）+
+**证据**：`examples/ane/`（离屏构建，钉住 `Point` / `null` 两条拒绝路径，72 条断言，含扩展目录那一组）+
 `examples/ane-app/`（窗口构建，扩展自己用 `IsWindow` + `GetWindowThreadProcessId` 校验句柄属于**本进程**，
 并连 acquire 两次证明同一个槽位答同一个对象，13 条断言）+ 结构钉 `unit: fre/NativeWindowHandle`（21 条）。
 
@@ -716,12 +716,12 @@ this build: ...`。按症状查：
 | `the extension publishes no function named <fn>` | 名字拼错，或该函数不在发布的函数表里 | 对上扩展的 `FRENamedFunction[]` |
 | `the extension published no function table` | `ContextInitializer` 返回时 `numFunctions=0` | 扩展实现问题 |
 | `FREGetRenderMode (the render pipeline is out of scope for this build)` 等 5 条 | 命中了 **D 面**里仍未实现的那 5 个 | 见 §5 缺陷 1；视频/呈现类功能本期没有 |
-| `ExtensionContext.getExtensionDirectory (this build stages only the native library, under extensions/<extensionID>/<platform>; the rest of the package is not unpacked)` | 扩展在找自己携带的资源文件 | 见 §5 缺陷 4 |
+| ~~`ExtensionContext.getExtensionDirectory (…only the native library…)`~~ 已随缺陷 4 一起消失：本构建现在返回真目录 | —— | 见 §5 缺陷 4 |
 | 整个程序不报错但 `createExtensionContext` 返回 null | **不应该出现**——如果出现就是缺陷，请连同 stderr 一起报 | —— |
 
 ### 4.9 最小可跑示例：`examples/ane/`（两条路子，同一个夹具）
 
-本仓有一个完整、可重复生成的最小闭环（**56 条断言全过**，两端同一份 `driver.as`）。
+本仓有一个完整、可重复生成的最小闭环（**72 条断言全过**，两端同一份 `driver.as`）。
 **重编产物是暂存目录树，不是 `.ane`**
 （§4.6 已不再打包），所以示例目录的形状就是运行期 `extensions/` 的形状——`<扩展 id>/<平台>/<库>`：
 
@@ -817,7 +817,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 | 1b | **初始窗口的创建晚于文档类构造器** | 在文档类构造器里对 `stage.nativeWindow` 调 `FREAcquireNativeWindowHandle` 得到 `FRE_ILLEGAL_STATE`（**响亮自报**，不是静默 null）；AIR 是先建窗再跑构造器，所以那边拿得到 HWND。未在 `adl` 上实测这条 FRE 调用（需要把夹具重编回 AIR 版），依据是两边各自的窗口创建时序 | ✅ 自报 | 把初始窗口的创建挪到文档类之前；代价是「构造器里写的 bounds/title 由谁生效」这条既有约定要重定（见 `src/emit.ts` 里 `Stage_get_nativeWindow` 上方注释） |
 | 2 | **iOS 没有（也不会有同样的）宿主库** | `lib/bin/ios-arm64/` 不存在 | ✅ `aneHostLibName()` 直接抛并说明原因 | 这一行**不是**「macOS 那一半还没做」（那半已于 2026-10-20 落地，见 §5.1）。iOS 的平台模型不一样：扩展被**静态链进应用镜像**，没有 `dlopen` 这一步，于是 `asaot` 会成为一份**静态库**、initializer 由**直接符号引用**到达，而不是运行期按名字查。要落地得先定「谁调用 initializer」这件事，不是重编一遍 |
 | 3 | **Windows ARM64 未验证** | 有守卫（拒绝猜键、要求显式 64 位），但 arm64 依赖链从未构建过（本机没有 MSVC arm64 工具集） | ✅ 拒绝并给建议 | 需要一台 arm64 Windows + 工具集 |
-| 4 | **扩展只被部分解包** | 每个扩展现在有自己的目录 `<exe 目录>/extensions/<extID>/<平台>/`（本次新加，§3.3），但里面**只有那个原生库**：扩展随包带的其它文件（数据文件、附属 DLL）不在。所以 `getExtensionDirectory()` 仍只**自报**、不返回该目录 | ✅ 自报 | 把**整包**倒进 `extensions/<extID>/`（布局这一半已经做了，剩下的是解包全部条目），之后 `getExtensionDirectory()` 才能返回真目录 |
+| 4 | ~~**扩展只被部分解包**~~ **已修（阶段三百九十一）** | 现在**整包**倒进 `<exe 目录>/extensions/<extID>/`，目录内容与 `.ane` 逐条相同，`getExtensionDirectory()` 回这个真目录。解包时**编译期**拒绝会逃出扩展目录的条目名（空、以 `/` 或 `\` 开头、带盘符、含 `..` 段） | ✅ 已实现 | —— |
 | 5 | **没有 `.as` 源码的 ANE 类无法 AOT** | 扩展的 AS3 包装类只存在于 `library.swf` 的 `DoABC` 里时，这个扩展用不了 | ✅ 编译期缺类就报未定义 | 需要反编译器或 AVM2 解释器，本项目范围外（§3.3 结论） |
 | 6 | **`ExtensionContext` 的 AIR 50 成员未建模** | `functions` / `knownExtensions` / `getExtensionInfo` / `loadExtension` 不存在 | ✅ 未定义即报错 | 前三者是只读反射面；`loadExtension` **不是小修**：它是**延迟加载**（首次 `call` 时才 `LoadLibrary` + Initializer），要把 C 面加载时机从「构造时」挪到「首次调用时」并缓存 |
 | 7 | **`File.applicationDirectory` 缺失** | 真实 AIR 应用用它定位随包资源（也是 `extensions/` 布局的基准） | ✅ 未定义即报错 | 按 `adl` 实测的 `url`/`nativePath` 落地 |
@@ -860,9 +860,9 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 | 证据 | 内容 | 怎么复现 |
 |---|---|---|
-| `examples/ane/` | 端到端示例，**56 条断言全过**，末行 `RESULT passed=56 failed=0`。**Windows 与 macOS 跑的是同一份 `driver.as`、同一个夹具源码、同一组断言**（macOS 侧加载的是真 `dlopen` 的 `ProbeANE.dylib`） | `node --test --test-name-pattern='example: ane' test/examples.ts` |
+| `examples/ane/` | 端到端示例，**72 条断言全过**，末行 `RESULT passed=72 failed=0`。**Windows 与 macOS 跑的是同一份 `driver.as`、同一个夹具源码、同一组断言**（macOS 侧加载的是真 `dlopen` 的 `ProbeANE.dylib`） | `node --test --test-name-pattern='example: ane' test/examples.ts` |
 | `examples/ane-app/` | 端到端示例·**描述符那一半**：`--air-app` 把描述符里的 `<extensions>` 解析成 `ane-paths`、把库落到 `extensions/<扩展 id>/<平台>/`，再运行；**13 条断言全过**，末行 `RESULT passed=13 failed=0`（窗口真的存在，所以程序自己 `exit()` 收尾）（另有一行是未声明 id 的自报原文） | 同上 |
-| `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 9 条：钉**发射出来的 C** 里 `getExtensionDirectory` 必须自报、必须仍返回活着的 `File`、自报必须**点名本构建的布局**并说清那个目录里**没有**整包、`actionScriptData` 是真成员而 `extensionID` **不是**、`call` 的「扩展从未加载」自报必须具名 | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
+| `test/unit/emit.ts` → `unit: ane/ExtensionContextSurface` | 11 条：钉**发射出来的 C** 里 `getExtensionDirectory` 不再自报、`null` 抛 `#2007` 与未知 id 抛 `#1508` 的**实测文案**、按 `as_ane_id_known()` 查本构建打进来的 id、两个平台都拼 `<app 目录>{/,\}extensions{/,\}<id>`、id 表与查表函数**无条件发射**（回答路径不需要 FRE 宿主）；`actionScriptData` 是真成员而 `extensionID` **不是**、`call` 的「扩展从未加载」自报必须具名 | `node --test --test-name-pattern='ane/ExtensionContextSurface' test/unit/emit.ts` |
 | `test/unit/fre.ts` → `unit: fre/Utf8LengthContract`（8 条） | FRE 字符串边界的两向契约：`FREGetObjectAsUTF8` 的 `length` 必须是 `strlen`（**不得**加上终止符，也不得变成别的计数）、`value` 必须是字符串本身、非 String 仍须 `FRE_TYPE_MISMATCH`；反方向 `FRENewObjectFromUTF8` 必须容忍调用方传入的终止符，且不得把它算进字符串。变异 7/7（`+1u`、`+1`、换掉 `value` 指针、放开 tag 判定、去掉容忍、把终止符拷进字符串、不写结尾 0） | `node --test --test-name-pattern='fre/' test/unit.ts` |
 | `test/unit/build.ts` → `unit: ane/ExtensionXmlComments` | 9 条：注释不得凭空造出平台条目、不得吞掉真实条目、未闭合注释必须拒绝并指名包 | 同上换成 `test/unit/build.ts` |
 | `test/unit/build.ts` → `unit: ane/PackageLayout`（27 条） | 官方 `adt` 布局、扁平布局、`adt` 暂存布局都认；**解包后的目录**也认（含递归与 `/` 分隔名字两条，所以手工解压的 `META-INF/ANE` 树可读）；目录形式同样按平台取切片、不借另一平台的切片；找不到时不得只说「没有」，要列出候选路径；**落盘路径必须是 `<extID>/<平台>/<库>`**（描述符与暂存键两处都要，且不得再出现裸文件名）；**两个扩展可以各带一个同名库且各留各的字节**；声明在子目录里的库**保留那个子目录**；**扩展数上限是硬闸门**（正好 32 过、33 拒绝并给出计数与常量名） | 同上换成 `test/unit/build.ts` |
@@ -885,7 +885,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 「那里没有 Windows 宿主库，所以两个扩展示例会响亮 skip，真正跑的只有 `test/unit/` 的结构钉」——
 现在**不成立了**：macOS 宿主库与夹具产物都是**入库**的（`lib/bin/macos-x86-64/libasaot.dylib`
 通用二进制、`ext-aot/…/MacOS-x86-64/ProbeANE.dylib` 同为通用），所以在那个运行器上两个示例是
-**真跑**（`skipped 0`），加载的是经 `dlopen` 的真 dylib，56 条断言照旧。**一处要注意**：
+**真跑**（`skipped 0`），加载的是经 `dlopen` 的真 dylib，72 条断言照旧。**一处要注意**：
 阶段三百零九 只重编了 **Windows** 切片（本机没有 macOS 工具链）——macOS 切片要在 mac 上跑一次
 `examples/ane/build-ane.sh` 才带上新增的 `nativeWindowHandle` 命令，在那之前 Intel macOS 上这条
 会**响亮变红**（不是假绿）。仍然 skip 的情形只有一种：

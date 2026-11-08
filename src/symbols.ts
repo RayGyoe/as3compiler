@@ -4943,35 +4943,78 @@ export class SymbolTable {
       [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false), shNumP('position', 0), shNullP('data', 'ByteArray')],
       [['clone', shObj('Event'), []]]);
     // flash.events.NativeProcessExitEvent: NativeProcess termination.
+    //
+    // `exitCode` is the ONLY member AIR 51.4.1 declares here (`mxmlc`: "[NativeProcessExitEvent]
+    // 上可能未定义 process"), so the `process` field the earlier shape carried was
+    // invented and is gone. Everything a listener needs is on the target, which
+    // EventDispatcher sets to the NativeProcess itself.
     shell('NativeProcessExitEvent', 'flash.events::NativeProcessExitEvent', 'Event',
-      [['exitCode', { kind: 'uint' }], ['process', shObj('NativeProcess')]],
+      [['exitCode', { kind: 'number' }]],
       [['EXIT', 'exit']],
       [shReq('type', 'String'), shBoolP('bubbles', false), shBoolP('cancelable', false),
-       { name: 'exitCode', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
-       shNullP('process', 'NativeProcess')],
+       shNumP('exitCode', 0)],
       [['clone', shObj('Event'), []]]);
     // flash.desktop.NativeProcessStartupInfo: the launcher descriptor.
+    //
+    // MEASURED SHAPE (mxmlc 51.4.1, temp/npa/air/Members.as): only `executable`,
+    // `workingDirectory` and `arguments` exist. `environment` and the three
+    // `standardInput/Output/Error` redirections the AIR *guide* mentions are NOT in
+    // the 51.4 class (introduced in later SDKs); declaring them here made a program
+    // that sets them compile and silently do nothing, which is the one thing this
+    // project refuses to do. `arguments` is a Vector.<String> that starts EMPTY, and
+    // the two File properties start null.
+    //
+    // The two File setters VALIDATE, because AIR validates (temp/npa/air/NP.as):
+    //   * a File that does not exist  -> ArgumentError #3214 "NativeProcessStartupInfo.executable
+    //     does not specify a valid executable file."
+    //   * a File that is not a directory -> ArgumentError #3215 "NativeProcessStartupInfo.workingDirectory
+    //     does not specify a valid directory."
+    // Both are thrown AT THE SETTER, and null is #3214 as well (that is how AIR reads
+    // "no executable").
     shell('NativeProcessStartupInfo', 'flash.desktop::NativeProcessStartupInfo', 'Object',
-      [['arguments', { kind: 'vector', elem: { kind: 'string' } }], ['executable', shObj('File')],
-       ['workingDirectory', shObj('File')], ['environment', { kind: 'vector', elem: { kind: 'string' } }],
-       ['standardInput', shObj('File')], ['standardOutput', shObj('File')], ['standardError', shObj('File')]],
+      [['arguments', { kind: 'vector', elem: { kind: 'string' } }]],
       [],
       []);
-    // flash.desktop.NativeProcess: the child-process handle. The three pipes are
-    // typed ByteArray rather than AIR's IDataInput/IDataOutput: a shell cannot
-    // hand back a live stream, and an empty ByteArray serves every read/write the
-    // documented pattern uses (bytesAvailable is 0, readUTFBytes returns "").
+    // The two hidden slots + the accessor pairs that front them. They are installed
+    // here rather than in the `fields` argument above because shell() wraps every
+    // entry as a PUBLIC field, and these must stay invisible to AS3 (a program that
+    // writes `si._exe` is not a program AIR would compile).
+    {
+      const si = this.classMap.get('NativeProcessStartupInfo')!;
+      const slot = (n: string): FieldInfo => ({ type: shObj('File'), init: null, visibility: 'private', owner: 'NativeProcessStartupInfo', isStatic: false, isConst: false });
+      si.fields.set('_exe', slot('_exe'));
+      si.fields.set('_wd', slot('_wd'));
+      si.getters.set('executable', { returnType: shObj('File'), params: [], owner: 'NativeProcessStartupInfo', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      si.setters.set('executable', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'File', defaultValue: null, isRest: false }], owner: 'NativeProcessStartupInfo', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+      si.getters.set('workingDirectory', { returnType: shObj('File'), params: [], owner: 'NativeProcessStartupInfo', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false });
+      si.setters.set('workingDirectory', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'File', defaultValue: null, isRest: false }], owner: 'NativeProcessStartupInfo', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true });
+    }
+    // flash.desktop.NativeProcess: the child-process handle -- a REAL backend since
+    // stage 391 (src/native-process.ts).
+    //
+    // AIR 51.4.1 declares exactly `running:Boolean` (read-only), the three pipe
+    // readers/writer (`IDataInput`/`IDataOutput`) and static `isSupported`; there is
+    // no `pid` and no `processID` (both rejected by mxmlc), so the invented
+    // `processID` field is gone. The pipes stay typed ByteArray here: a ByteArray
+    // implements both interfaces, so every documented recipe (read
+    // `bytesAvailable`, `readUTFBytes`, `writeUTFBytes`) compiles and behaves,
+    // while AIR's anonymous InboundPipe/OutboundPipe classes are not reproducible
+    // without inventing a whole stream type. The difference is observable only
+    // through `getQualifiedClassName`/`is ByteArray` (docs/zh-cn/native-process.md).
     shell('NativeProcess', 'flash.desktop::NativeProcess', 'EventDispatcher',
-      [['running', { kind: 'bool' }], ['processID', { kind: 'uint' }],
+      [['running', { kind: 'bool' }],
        ['standardInput', shObj('ByteArray')], ['standardOutput', shObj('ByteArray')], ['standardError', shObj('ByteArray')]],
       [],
       [],
       [['start', { kind: 'void' }, [shReq('info', 'NativeProcessStartupInfo')]],
-       // exit(force:Boolean = false) -- the AIR signature (the flag is ignored by
-       // the stub, which never starts a process in the first place).
+       // exit(force:Boolean = false) -- AIR's signature; force TERMINATES on this
+       // backend rather than asking nicely (the divergence is documented).
        ['exit', { kind: 'void' }, [{ name: 'force', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false }]],
        ['closeInput', { kind: 'void' }, []]],
-      [], [], ['isSupported']);
+      // isSupported is a STATIC GETTER, not a constant: on adl 51.4.1 it reads true
+      // because the platform can spawn, and it must read false in a build that cannot
+      // (a WASI bundle) rather than a hard-coded literal.
+      [], [['isSupported', { kind: 'bool' }]], []);
     // flash.media.StageWebView: the native web view.
     shell('StageWebView', 'flash.media::StageWebView', 'EventDispatcher',
       [['viewPort', shObj('Rectangle')], ['stage', shObj('Stage')], ['userAgent', { kind: 'string' }],

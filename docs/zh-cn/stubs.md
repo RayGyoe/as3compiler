@@ -52,7 +52,7 @@
 | `InvokeEvent` | `flash.events` | 1 | `INVOKE` 常量、`arguments`/`currentDirectory`/`reason` | 没有「用文档启动」的入口，事件不会来 |
 | `LocationChangeEvent` | `flash.events` | 1 | `LOCATION_CHANGE` 常量、`location` 字段 | 依赖 `StageWebView`，见 2.2 |
 | `NativeDragEvent` | `flash.events` | 1 | 8 个常量（含项目真正监听的 `NATIVE_DRAG_ENTER`/`NATIVE_DRAG_DROP`）、7 个字段 | 已接原生拖放会话，平台验收状态见 desktop-file-interaction.md |
-| `NativeProcessExitEvent` | `flash.events` | 8 | `EXIT` 常量、`exitCode`/`process` | 没有子进程，事件不会来 |
+| `NativeProcessExitEvent` | `flash.events` | 8 | `EXIT` 常量、`exitCode`（**`number`**，实测 `typeof` 如此） | **真事件**：子进程退出时由 `NativeProcess` 派发；早期自造的 `process` 字段已删（`mxmlc`/`describeType` 均无此成员），见 `native-process.md` §1 |
 | `NativeWindowBoundsEvent` | `flash.events` | 4 | `MOVE`/`MOVING`/`RESIZE`/`RESIZING`、`beforeBounds`/`afterBounds` | **窗口真会派发这两个事件**（`NativeWindow` 是真的），只是本类实例由窗口层构造，字段来自真实几何 |
 | `NativeWindowDisplayStateEvent` | `flash.events` | 0 | `DISPLAY_STATE_CHANGING`/`DISPLAY_STATE_CHANGE`、两字段 | 同上（当前无调用方） |
 | `SampleDataEvent` | `flash.events` | 4 | `SAMPLE_DATA`、`data`/`position` | 麦克风回调不存在，事件不会来 |
@@ -60,16 +60,19 @@
 > `NativeWindowBoundsEvent` / `NativeWindowDisplayStateEvent` 属「模型类真被窗口后端使用」，
 > 登记在 shell 列表里只是因为它们的成员集合由 shell 生成；这两个类是**能用的**。
 
-### 2.2 真能力缺口（6 个）
+### 2.2 真能力缺口（4 个）
 
 > 阶段三百六十三之前这里还有 `NetworkInfo` / `NetworkInterface` 两行。它们已经不是缺口了：
 > `findInterfaces()` 现在真的走 `getifaddrs` 枚举网卡，`NetworkInterface` / `InterfaceAddress`
 > 随之变成真实数据类（字段集合也按 adl 实测改对了）。契约与验收见 `flash-net.md` §6.10。
+>
+> 阶段三百九十一之前这里还有 `NativeProcess` / `NativeProcessStartupInfo` 两行：现在
+> `start()` 真的创建子进程（Windows `CreateProcessW`、POSIX `fork`+`execv`），三条管道是活管道，
+> `exit` 事件在帧边界真派发，`executable`/`workingDirectory` 的 setter 校验抛 `#3214`/`#3215`。
+> 契约、事件顺序与三处如实报明的差异见 [`native-process.md`](native-process.md)。
 
 | 类 | 包 | 应用引用 | 现在调用会发生什么（实测） | 真实现需要 |
 |---|---|---|---|---|
-| `NativeProcess` | `flash.desktop` | 10 | `isSupported=false`；`new` 得到实例，`running=false`、`processID=0`，三个管道是**空 ByteArray**（`bytesAvailable` 0）；`start()` 空转并报明 | 进程创建 + 三条管道 + `exit` 事件回灌 |
-| `NativeProcessStartupInfo` | `flash.desktop` | 13 | 7 个字段真赋值；`arguments` 空 Vector、`executable=null` | 无（数据类，配合上一行） |
 | `StageWebView` | `flash.media` | 3 | `isSupported=false`；实例可建，`location`/`title`/`viewPort` 全 `null`，`loadURL()` 报明 | 内嵌浏览器（WebView2 / WKWebView） |
 | `NativeDragManager` | `flash.desktop` | 1 | 原生窗口后端接入 `doDrag`/`acceptDragDrop`/动作与会话状态；无后端 isSupported=false | Windows 未验证；macOS 外部投递矩阵待验收 |
 | `Microphone` | `flash.media` | 4 | `isSupported=false`、`names` 空数组（报明）、`getMicrophone()` 返回 `null`（报明） | 音频采集 |
