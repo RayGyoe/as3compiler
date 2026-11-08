@@ -47,7 +47,11 @@ static void as_dialog_io_error(void* obj, const char* text) {
 }
 static int as_dialog_busy(void* obj) {
     if (as_dialog_active && as_dialog_active->obj == obj) return 1;
-    return as_async_kind_pending(obj, AS_JOB_READ_BYTES) || as_async_kind_pending(obj, AS_JOB_FILE_WRITE);
+    // An upload counts: AIR's FileReference runs ONE operation at a time, so
+    // browsing or loading while an upload is in flight is the same #2037 an
+    // upload submitted during a load gets.
+    return as_async_kind_pending(obj, AS_JOB_READ_BYTES) || as_async_kind_pending(obj, AS_JOB_FILE_WRITE) ||
+           as_async_kind_pending(obj, AS_JOB_FILE_UPLOAD);
 }
 static void as_dialog_cancel(void* obj) {
     for (as_dialog_request* r = as_dialog_requests; r; r = r->next) {
@@ -192,8 +196,7 @@ static int as_file_dialog_tick(void) {
     return 1;
 }
 
-bool FileReference_browse(void* self, as_array* filters) { return as_dialog_begin(self, 5, NULL, filters, NULL, NULL); }
-void FileReference_cancel(void* self) { as_dialog_cancel(self); }
+bool FileReference_browse(void* self, as_array* filters) { return as_dialog_begin(self, 5, NULL, filters, NULL, NULL); }void FileReference_cancel(void* self) { as_dialog_cancel(self); }
 bool FileReferenceList_browse(void* self, as_array* filters) { return as_dialog_begin(self, 6, NULL, filters, NULL, NULL); }
 void FileReference_load(void* self) {
     FileReference* o = (FileReference*)self;
@@ -224,4 +227,283 @@ void File_browseForDirectory(void* self, char* title) { as_dialog_begin(self, 3,
 void File_browseForOpen(void* self, char* title, as_array* filters) { as_dialog_begin(self, 1, title, filters, NULL, NULL); }
 void File_browseForOpenMultiple(void* self, char* title, as_array* filters) { as_dialog_begin(self, 2, title, filters, NULL, NULL); }
 void File_browseForSave(void* self, char* title) { as_dialog_begin(self, 4, title, NULL, NULL, NULL); }
+
+// ---- FileReference.upload / File.upload: the measured multipart envelope -----
+//
+// AIR's upload is not a POST of the file: it is multipart/form-data with a fixed
+// envelope. Everything below was captured byte for byte from adl 51.4.1
+// (temp/uploadprobe/, requests req-1..req-5, plus the event log):
+//
+//   --<boundary>\r\n
+//   Content-Disposition: form-data; name="Filename"\r\n\r\n<file NAME>\r\n
+//   --<boundary>\r\n                                            (once per variable)
+//   Content-Disposition: form-data; name="<key>"\r\n\r\n<value>\r\n
+//   --<boundary>\r\n
+//   Content-Disposition: form-data; name="<field>"; filename="<file NAME>"\r\n
+//   Content-Type: application/octet-stream\r\n\r\n<file bytes>
+//   \r\n--<boundary>\r\n
+//   Content-Disposition: form-data; name="Upload"\r\n\r\nSubmit Query\r\n
+//   --<boundary>--
+//
+// Details that are easy to get wrong, each one measured:
+//
+//  * the leading "Filename" part comes FIRST and carries the bare file name (no
+//    directory) -- AIR's servers use it as the display name;
+//  * variable keys AND values go out RAW. A value "a%20b" arrives as a%20b, "a b"
+//    as a b, "a&b=c" unchanged and CJK as raw UTF-8: the multipart side does NOT
+//    apply the percent-encoding URLVariables.toString() uses;
+//  * variable ORDER follows AIR's property hash (measured: insertion order is not
+//    the wire order). Our dynamic object is insertion-ordered, so the order differs
+//    while the set does not -- the same documented divergence as
+//    URLVariables.toString (docs/zh-cn/flash-net.md §3.1);
+//  * the file part's Content-Type is ALWAYS application/octet-stream (a .txt and a
+//    .pptx are indistinguishable on the wire) and the name inside filename="..."
+//    is raw UTF-8, never RFC 2231/5987 encoded;
+//  * the closing part is always present and is literally "Upload"/"Submit Query";
+//  * no CRLF follows the final "--<boundary>--";
+//  * the boundary is "----------" + 30 alphanumerics (40 characters, opaque to
+//    servers, but the shape a WAF or a hand-rolled parser has been tuned to);
+//  * uploadUnencoded() sends the file bytes as the WHOLE body, with no Content-Type
+//    header at all and no variables part;
+//  * a non-2xx response is NOT a transport failure: AIR still reports
+//    httpResponseStatus, httpStatus, the body as uploadCompleteData, and only then
+//    ioError #2038;
+//  * a successful upload reports progress 1000/1000 for a 1000-byte file even
+//    though the envelope is 1639 bytes: bytesTotal is the FILE length;
+//  * testUpload=true is observably a no-op here (identical request, identical
+//    events, measured).
+//
+// The envelope is built here on the AS3 thread (that is where the AS3 strings and
+// the file name live) and handed to the job as two malloc'd halves. The FILE BYTES
+// are never read here: the worker streams them from disk between the halves, so a
+// 30 MB deck costs one open FILE* instead of a second copy.
+
+typedef struct as_up_buf {
+    unsigned char* buf;
+    size_t len, cap;
+    int oom;
+} as_up_buf;
+
+static void as_up_add(as_up_buf* b, const void* p, size_t n) {
+    if (b->oom || n == 0) return;
+    if (b->len + n > b->cap) {
+        size_t cap = (b->cap != 0) ? b->cap : 256;
+        while (cap < b->len + n) cap *= 2;
+        unsigned char* grown = (unsigned char*)realloc(b->buf, cap);
+        if (grown == NULL) { b->oom = 1; return; }
+        b->buf = grown;
+        b->cap = cap;
+    }
+    memcpy(b->buf + b->len, p, n);
+    b->len += n;
+}
+
+static void as_up_str(as_up_buf* b, const char* s) {
+    if (s != NULL) as_up_add(b, s, strlen(s));
+}
+
+// "----------" + 30 alphanumerics (40 characters total), the shape AIR uses --
+// measured on all five captured requests. The token itself is opaque (a server
+// must read it from Content-Type); matching the shape and the LENGTH keeps parsers
+// and WAF rules that assume AIR's layout working.
+static unsigned as_up_seed = 0;
+static void as_up_boundary(char* out) {
+    static const char alpha[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    if (as_up_seed == 0) as_up_seed = (unsigned)(as_now_ms() * 1000.0) ^ (unsigned)(uintptr_t)&as_up_seed;
+    int i = 0;
+    for (; i < 10; i++) out[i] = '-';
+    for (; i < 40; i++) {
+        as_up_seed = as_up_seed * 1103515245u + 12345u;
+        out[i] = alpha[(as_up_seed >> 16) % 62];
+    }
+    out[40] = '\0';
+}
+
+// File and FileReference are both uploadable (File extends FileReference in AIR);
+// only a real File carries a nativePath, exactly as in FileReference_load.
+static const char* as_up_path_of(void* self) {
+    if (self == NULL) return NULL;
+    if (as_is(self, &File_vt)) return ((File*)self)->_nativePath;
+    return ((FileReference*)self)->_selectedPath;
+}
+
+static void FileReference__uploadFinish(void* job);
+static void as_upload_pre_events(void* job);
+
+// The response body as the DataEvent payload. AIR hands uploadCompleteData the
+// body decoded as UTF-8 text (a JSON or HTML error page arrives readable), and an
+// empty body is the empty String, never null.
+static char* as_up_body_text(void* job) {
+    unsigned n = as_job_len(job);
+    char* s = as_str_alloc((size_t)n + 1);
+    if (n > 0) memcpy(s, as_job_bytes(job), (size_t)n);
+    s[n] = '\0';
+    return s;
+}
+
+static void FileReference__uploadFinish(void* job) {
+    void* obj = as_job_obj(job);
+    if (obj == NULL) return;
+    // Everything still owed from the in-flight sequence (open, the progress
+    // watermarks, the response head) is raised here first, in AIR's order, so an
+    // upload that finished inside a single frame still reports all of it.
+    as_upload_pre_events(job);
+    if (((as_job*)job)->dead) return;
+    int status = as_job_status(job);
+    // Both a transport failure and a non-2xx answer end in ioError #2038, but they
+    // differ in what was reported before it: a request that never got a response
+    // reports nothing but the error (measured: a file that no longer exists ->
+    // no open, no progress, just ioError), while a 500 reports the full sequence
+    // and the error body LAST.
+    if (as_job_failed(job) || status >= 300) {
+        if (status >= 300) {
+            EventDispatcher_dispatchEvent(obj, (Event*)URLLoader__httpStatusEvent((char*)"httpStatus", status));
+            if (((as_job*)job)->dead) return;
+            EventDispatcher_dispatchEvent(obj, (Event*)DataEvent_new((char*)"uploadCompleteData", false, false, as_up_body_text(job)));
+            if (((as_job*)job)->dead) return;
+        }
+        IOErrorEvent* ev = IOErrorEvent_new((char*)"ioError", false, false, as_ioerror_text(as_job_path(job), 2038, NULL));
+        ev->errorID = 2038;
+        EventDispatcher_dispatchEvent(obj, (Event*)ev);
+        return;
+    }
+    // Success: COMPLETE comes BEFORE uploadCompleteData -- measured, and the
+    // reverse of the download order (where complete is last).
+    EventDispatcher_dispatchEvent(obj, Event_new((char*)"complete", false, false));
+    if (((as_job*)job)->dead) return;
+    EventDispatcher_dispatchEvent(obj, (Event*)DataEvent_new((char*)"uploadCompleteData", false, false, as_up_body_text(job)));
+}
+
+// The in-flight half of the upload sequence. Called from as_net_pre_events (the
+// frame pre-pass) and again from the finish thunk; every step is flag-guarded, so
+// the events are raised exactly once and in order.
+static void as_upload_pre_events(void* job) {
+    void* obj = as_job_obj(job);
+    if (obj == NULL) return;
+    if (!as_job_sent_open(job) && as_job_started(job)) {
+        as_job_set_sent_open(job);
+        EventDispatcher_dispatchEvent(obj, Event_new((char*)"open", false, false));
+    }
+    // PROGRESS precedes the response head (the body is on the wire before the
+    // server can answer) -- measured: open;progress 1000/1000;httpResponseStatus.
+    unsigned total = as_job_total(job);
+    unsigned sent = as_job_marks_sent(job);
+    unsigned mc = (unsigned)as_job_mark_count(job);
+    while (sent < mc) {
+        unsigned loaded = as_job_mark(job, (int)sent);
+        sent++;
+        as_job_set_marks_sent(job, sent);
+        as_job_set_last_progress(job, loaded);
+        EventDispatcher_dispatchEvent(obj, (Event*)ProgressEvent_new((char*)"progress", false, false, loaded, total));
+    }
+    if (!as_job_sent_status(job)) {
+        int st = as_job_status(job);
+        if (st > 0) {
+            as_job_set_sent_status(job);
+            as_array* hdrs = URLLoader__parseHeaders(as_job_headers(job));
+            EventDispatcher_dispatchEvent(obj, (Event*)URLLoader__httpResponseEvent((char*)"httpResponseStatus", st, (char*)as_job_eff_url(job), hdrs, as_job_redirected(job) != 0));
+        }
+    }
+}
+
+// Shared entry for FileReference.upload / File.upload / uploadUnencoded.
+// 'field' is the uploadDataFieldName (ignored by the unencoded form, whose whole
+// body is the file).
+static void as_upload_begin(void* self, URLRequest* request, char* field, int unencoded) {
+    // AIR's parameter validation, in the order the measurements fix it: no
+    // selected file first (#2037), then an empty field name (#2085).
+    if (request == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter request must be non-null.", 2007)); return; }
+    const char* path = as_up_path_of(self);
+    if (path == NULL) { as_file_throw(2037); return; }
+    if (!unencoded && (field == NULL || field[0] == '\0')) {
+        as_throw(Error_new((char*)"Error #2085: Parameter uploadDataFieldName must be non-empty string.", 2085));
+        return;
+    }
+    if (as_dialog_busy(self) || as_async_kind_pending(self, AS_JOB_FILE_UPLOAD)) { as_file_throw(2037); return; }
+    // The file as it is NOW: AIR reads it at upload time, not when the File was
+    // constructed, and the name inside the envelope is the basename.
+    if (!as_path_exists(path)) {
+        // AIR does not throw here: the call returns and ioError #2038 arrives at a
+        // frame boundary, with no open event.
+        if (!as_async_submit_upload(self, FileReference__uploadFinish, request->url, request->userAgent, NULL, NULL, NULL, 0, path, 0, NULL, 0, request->idleTimeout * 1000.0, request->manageCookies ? 1 : 0)) as_file_throw(2038);
+        return;
+    }
+    // Without a transport there is nothing to report that AIR would: an
+    // ioError #2038 would blame the FILE, which is present and readable. Say so on
+    // stderr once and dispatch nothing, rather than manufacture a failure AIR never
+    // produces. (The missing-file case ABOVE still reports #2038: that one is true
+    // with or without a backend.)
+#if !defined(ASC_HTTP_BACKEND)
+    as_shell_unsupported((char*)"File.upload (no HTTP upload backend in this build)");
+    return;
+#else
+    File* fileObj = File_new((char*)path);
+    const char* name = File_get_name(fileObj);
+    double dsize = File_get_size(fileObj);
+    size_t size = (dsize > 0.0) ? (size_t)dsize : 0;
+    net_req nr;
+    net__prepare_request(request, &nr);
+    char boundary[64];
+    as_up_boundary(boundary);
+    as_up_buf head;
+    as_up_buf tail;
+    memset(&head, 0, sizeof(head));
+    memset(&tail, 0, sizeof(tail));
+    char ct[128];
+    ct[0] = '\0';
+    if (!unencoded) {
+        // 1. the leading Filename part
+        as_up_str(&head, "--"); as_up_str(&head, boundary);
+        as_up_str(&head, "\r\nContent-Disposition: form-data; name=\"Filename\"\r\n\r\n");
+        as_up_str(&head, (name != NULL) ? name : "");
+        as_up_str(&head, "\r\n");
+        // 2. one part per URLVariables entry, key and value RAW
+        if (request->data.tag != 0 && request->data.tag != 5 && as_v_is_inst(request->data, &URLVariables_vt)) {
+            URLVariables* vars = (URLVariables*)as_v_obj_val(request->data);
+            as_object* d = (vars != NULL) ? vars->_dyn : NULL;
+            for (int i = 0; d != NULL && i < d->length; i++) {
+                as_up_str(&head, "--"); as_up_str(&head, boundary);
+                as_up_str(&head, "\r\nContent-Disposition: form-data; name=\"");
+                as_up_str(&head, (d->keys[i] != NULL) ? d->keys[i] : "");
+                as_up_str(&head, "\"\r\n\r\n");
+                as_up_str(&head, as_v_str_val(d->vals[i]));
+                as_up_str(&head, "\r\n");
+            }
+        }
+        // 3. the file part's headers; the bytes follow from disk
+        as_up_str(&head, "--"); as_up_str(&head, boundary);
+        as_up_str(&head, "\r\nContent-Disposition: form-data; name=\"");
+        as_up_str(&head, field);
+        as_up_str(&head, "\"; filename=\"");
+        as_up_str(&head, (name != NULL) ? name : "");
+        as_up_str(&head, "\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+        // 4. the closing "Upload"/"Submit Query" part, with no CRLF after the
+        //    final delimiter.
+        as_up_str(&tail, "\r\n--"); as_up_str(&tail, boundary);
+        as_up_str(&tail, "\r\nContent-Disposition: form-data; name=\"Upload\"\r\n\r\nSubmit Query\r\n--");
+        as_up_str(&tail, boundary);
+        as_up_str(&tail, "--");
+        snprintf(ct, sizeof(ct), "multipart/form-data; boundary=%s", boundary);
+    }
+    int ok = !head.oom && !tail.oom &&
+        as_async_submit_upload(self, FileReference__uploadFinish, request->url, request->userAgent,
+                               (ct[0] != '\0') ? ct : NULL, nr.headers,
+                               head.buf, head.len, path, size, tail.buf, tail.len,
+                               request->idleTimeout * 1000.0, request->manageCookies ? 1 : 0);
+    free(head.buf);
+    free(tail.buf);
+    if (!ok) as_file_throw(2038);
+#endif
+}
+
+void FileReference_upload(void* self, URLRequest* request, char* uploadDataFieldName, bool testUpload) {
+    // testUpload asks AIR for a server-side connectivity check; measured on 51.4.1
+    // it changes NOTHING observable (same request bytes, same events), so it is
+    // accepted and ignored rather than faked.
+    (void)testUpload;
+    as_upload_begin(self, request, uploadDataFieldName, 0);
+}
+void FileReference_uploadUnencoded(void* self, URLRequest* request) {
+    as_upload_begin(self, request, NULL, 1);
+}
 `;

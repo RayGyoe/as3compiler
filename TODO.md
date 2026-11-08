@@ -20616,7 +20616,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
 | **`Clipboard.setData`/`setDataHandler` 的 `serializable` 参数被接受但不产生序列化副本** | 未开始（2026-10-27 阶段二百九十三 登记） | AIR 在 `serializable=true` 且数据无法原生跨进程表示时做 AMF 序列化；我们跨进程只搬原生格式，故没有副本可分。同一处还埋着一层：`serializable=false` 时 AIR 拒绝跨进程传递，我们同样不区分 | 先把 `fileList`/`bitmap` 补上，再判「本进程内可不可观测」——`generalClipboard` 是单例，同进程内本来看不到差异 |
 | **`File` 的两个卷粒度 static 方法缺失**：`getVolumeByDrive(drive:String)` / `getVolumeByPath(path:String)` | 未开始（2026-10-27 阶段二百九十九：B/C 批收窄——成员面其余 14 方法 / 8 属性 / 5 常量 / `getRootDirectories` 均已落地） | 这两个要**卷枚举**（POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`）才能回答「这个路径在哪个卷上」；`StorageVolume` 的构造器和六个 getter 已按实测实现，缺的只是「谁来造它」。当前 `File.getRootDirectories()` 会造出根卷（POSIX `["/"]`、Windows 盘符），但反查没有 | 与「原生对话框」同一批后端活；两条一起做能在真机上一次性验证 `StorageVolumeChangeEvent` |
-| **`File` 家族的卷粒度查询仍缺（对话框部分已于阶段三百七十七 完成）**：`FileReference.browse`/`load`/`save`、`FileReferenceList.browse`、`File.browseFor*` 已真接后端（macOS `NSOpenPanel`/`NSSavePanel`，Windows Shell `IFileDialog`，**两平台均默认接入 native 窗口构建**，见 `docs/zh-cn/desktop-file-interaction.md`）；仍只报明的是 `FileReference.download`/`upload` 与两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)` | 部分完成（2026-11-06 阶段三百六十三：对话框后端与 Windows 真机验收完成；卷枚举未开始） | 本行原记的两件缺口中①平台对话框已完成并真机验证（含 CJK 路径、取消、单选/多选），②卷枚举仍未开始：`StorageVolume` 的构造器与六个 getter 已按实测实现，但只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查（`GetDiskFreeSpaceExA` 已随路径层迁移改 W 版） | 剩卷枚举：POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`；`download`/`upload` 是另一条 HTTP 传输活 |
+| **`File` 家族的卷粒度查询仍缺（对话框部分已于阶段三百七十七 完成）**：`FileReference.browse`/`load`/`save`、`FileReferenceList.browse`、`File.browseFor*` 已真接后端（macOS `NSOpenPanel`/`NSSavePanel`，Windows Shell `IFileDialog`，**两平台均默认接入 native 窗口构建**，见 `docs/zh-cn/desktop-file-interaction.md`）；仍只报明的是 `FileReference.download`/`requestPermission` 与两个 static 方法 `File.getVolumeByDrive(name)` / `File.getVolumeByPath(path)`（`File.upload`/`FileReference.upload`/`uploadUnencoded` 已于 2026-11-09 阶段三百八十八 接上原生 curl 后端） | 部分完成（2026-11-06 阶段三百六十三：对话框后端与 Windows 真机验收完成；2026-11-09 阶段三百八十八：上传落地；卷枚举未开始） | 本行原记的两件缺口中①平台对话框已完成并真机验证（含 CJK 路径、取消、单选/多选），②卷枚举仍未开始：`StorageVolume` 的构造器与六个 getter 已按实测实现，但只有 `getRootDirectories()` 会造出根卷，没有按盘符/路径反查（`GetDiskFreeSpaceExA` 已随路径层迁移改 W 版） | 剩卷枚举：POSIX `getmntinfo`/`statfs`，Windows `GetLogicalDrives` + `GetVolumeInformation`；`download`（流式落盘 + `defaultFileName`）是另一条活 |
 | **`examples/file-ops.as` 的路径断言是 POSIX 形态**（`/tmp` 字面量 22 处、「反斜杠是合法文件名字节」），`file-symlink.as` / `file-listing-async.as` 亦未在 Windows 实跑 | 未开始（2026-10-27 阶段三百：这三例都要软链夹具，而本机账号建软链报 `EPERM` ⇒ 一直在 `test/examples.ts` 里 `SKIP`，Windows 侧只有 `adl` 探针读数） | 两端 | 待排期（要一台开了 Developer Mode 的 Windows） |
 | **初始窗口的创建晚于文档类构造器**（`FREAcquireNativeWindowHandle(stage.nativeWindow)` 在文档类构造器里得到 `FRE_ILLEGAL_STATE`；`adl` 先建窗再跑构造器，那边拿得到 HWND。**已响亮自报，不是静默 null**；未在 `adl` 上实测这条 FRE 调用——需要把夹具重编回 AIR 版） | 未开始（2026-10-28 阶段三百零九 发现） | 根因是既有取舍：`Stage.showWindow` 在文档类之后建窗，构造器里写的 bounds/title 延后由它生效（`src/emit.ts` 的 `Stage_get_nativeWindow` 上方注释记录了这条约定） | 把初始窗口的创建挪到文档类之前，并重定「构造器里写的窗口属性由谁生效」；改窗口创建时序会波及窗口事件面，需独立阶段 |
 | **`clipDepth` 遮罩的 stencil 对 morph 跟随 ratio，而 AIR 冻结在起始形** | 未开始（2026-10-29 阶段三百一十九 的像素 oracle 量到；本阶段刻意保留「跟当前几何」这一侧，因为它与被遮画面自洽） | `temp/mask3/Teal2.as`（adl）对 `skin_fla.元件77_50` 的 morph 遮罩做逐帧 teal 计数：帧 1/2/3/5/10/20/50/80/99 **逐字节相同**，只有帧 100（换成 `char73`）变；同一探针的 AOT 侧帧 99 窗口已右移到 ratio≈0.99 的位置。AIR 自己**画**该 morph 时是按当前 ratio 画的（阶段三百一十七），所以这是「stencil 冻结、画面不冻结」的 AIR 内部不一致 | 复刻只需在 `as_clip_path` 的 morph 分支换用 `Graphics._mdecl` 声明盒矩形（`as_swc_morph_<id>` 的 `as_swc_clip` 一侧，本库为 `-92.9,-10 .. 0.0,31.6`，与 `adl` 帧 1 的 `clipdbg` 逐位一致）；先与产品确认「遮罩跟画面」与「遮罩冻结」哪个才是要的呈现，再改并补一条 oracle |
@@ -20993,3 +20993,48 @@ Sprite 里，心跳图形让窗口每帧 present（22 帧后烘焙面就位）�
 另：`asaotui` 全量门 **70/70 PASS**（含 `layout-check text
 half` 133 检查、`gallery tour` 60 页手算矩形、`descriptor DPI A/B`、G19/G20/G21 的 AIR 对照、
 `widgets/textfx`、`widgets/static-layer`）。
+
+### 阶段三百八十八：`File.upload` / `FileReference.upload` / `uploadUnencoded` 真传输
+
+原生文件对话框接上之后，应用的下一个动作必然是上传，而这三个入口一直是 `as_shell_unsupported`
+报明桩：调用返回、**一个事件都不派发**。调用方（`FileReference` 上挂 `SELECT` → `upload()`，
+另挂 `COMPLETE`）因此永远停在「上传中」，既没有 `COMPLETE` 也没有 `IO_ERROR`。本轮把这条链闭合。
+
+先在 `adl 51.4.1` 上把契约钉死（`temp/uploadprobe/`：抓包 `req-*.bin` + 事件日志），再实现：
+
+**信封（按字节对）**：`Filename` 段（裸文件名）→ 每个 `URLVariables` 条目各一段且**原文不编码**
+→ 文件段（`name="<field>"; filename="<裸名>"` + `application/octet-stream` + 文件字节）
+→ `Upload`/`Submit Query` 收尾段；最终分隔符后**无 CRLF**；boundary 是 10 个 `-` + 30 位字母数字。
+
+**事件序**：200 是 `open → progress → httpResponseStatus → complete → uploadCompleteData`；
+5xx 在后面追加 `httpStatus`、错误体与 `ioError #2038`；源文件不存在**不抛**，`upload()` 返回后
+只有 `ioError #2038`（无 `open`、无 `progress`）。
+
+**两条最容易做错的口径**：
+
+1. `ProgressEvent.bytesLoaded/bytesTotal` 数是**文件字节**，不是信封长度，而且只报一次。第一版实现
+   同时踩了两头：`total` 在传输结束时被响应体长度覆盖（报成 `1000/31`），响应体又追加了一条下载水位
+   （再报一条 `31/31`）。修法是两个显式分流——`as_http_on_data` 按 job 类型跳过响应体水位，
+   `as_http_perform` 对上传不覆盖 `total`。
+2. `testUpload=true` 在 `adl` 上**无可观测差异**（请求体与事件序完全相同），所以接受并忽略，不伪造模式。
+
+**实现**：`AS_JOB_FILE_UPLOAD`（第 13 种异步 job）+ `as_http_upload_setup()` 用 libcurl 的
+`UPLOAD` + `CUSTOMREQUEST=POST`，read 回调按「head → 文件字节 → tail」流式喂，**文件不在 AS3 线程读全量、
+也不整体进内存**；进度由 `ulnow - head_len` 夹到文件长度得出。无 HTTP 后端时只报明一次、不派发事件
+（源文件不存在的 `#2038` 仍照常，那是与后端无关的文件系统事实）。
+
+**验收**：
+
+| 验收 | 方法 | 结果 |
+|---|---|---|
+| 请求体逐字节 | `temp/uploadaot/aot-req-*.bin` vs `temp/uploadprobe/req-*.bin`（boundary 归一后比较） | 1639 / 1615 / 1921 / 1000，四场景**完全相同** |
+| 事件序 | 同一份 `UploadAot.as` 双端各跑一遍，日志逐行 diff | 200 / 5xx / `URLVariables` / unencoded / 缺文件 / 未选择 / 空字段名 **逐行相同** |
+| 默认构建同步契约 | `examples/upload-contract.as`（无 HTTP 后端也跑） | `#2037` / `#2085` / 缺文件 `#2038` 全中 |
+| 结构钉子 | `unit: emit/FileUpload` 27 钉 | 全过 |
+
+已知偏差（显式记录）：`URLVariables` 段序我们是插入序、`adl` 是哈希序（段内容逐字节相同）；
+`user-agent` 沿用本构建统一串（这是所有 HTTP 请求的共同口径，不是上传特有）；
+`--target wasm` 下仍走「无后端」分支，浏览器上传是独立一轮。
+`FileReference.download` / `requestPermission` 保持报明桩。
+
+口径全文见 `docs/{zh-cn,en}/flash-net.md` §6.11。

@@ -1624,6 +1624,94 @@ NUL cannot be observed via `readUTFBytes`, hence two separate reads), and `Secur
 
 ---
 
+### 6.11 `FileReference.upload` / `uploadUnencoded` (the step after the file is picked) — **executed (stage 388)**
+
+#### 6.11.1 Why it had to be done: picking a file is not uploading it
+
+Once the native file dialog worked, the app's very next action was an upload, and all three entries
+(`File.upload`, `FileReference.upload`, `FileReference.uploadUnencoded`) were `as_shell_unsupported`
+stubs: the call returned `false` and **dispatched nothing at all**. The usual caller shape is
+
+```as3
+sFile.addEventListener(Event.SELECT, onPick);
+function onPick(e:Event):void { sFile.upload(new URLRequest(URL), "file"); }
+sFile.addEventListener(Event.COMPLETE, onDone);
+```
+
+so the UI hung on "uploading" with neither `COMPLETE` nor `IO_ERROR` — harder to diagnose than an error.
+This item is therefore not "add an API" but "close the selected-file → uploaded chain".
+
+#### 6.11.2 The measured adl 51.4.1 contract (`temp/uploadprobe/`, capture + event log, first-hand)
+
+Request body (`req-1.bin`, compared byte for byte):
+
+| Order | Content |
+|---|---|
+| 1 | `--<boundary>` + `Content-Disposition: form-data; name="Filename"` + the **bare** file name |
+| 2 | one part per `URLVariables` entry, key and value **raw** (not URL-encoded) |
+| 3 | the file part: `name="<uploadDataFieldName>"; filename="<bare name>"` + `Content-Type: application/octet-stream` + the file bytes |
+| 4 | the closing part: `name="Upload"` + `Submit Query`; **no CRLF after the final delimiter** |
+
+| Request header | Value |
+|---|---|
+| `content-type` | `multipart/form-data; boundary=<40 characters>` (10 dashes + 30 alphanumerics) |
+| `accept` | `text/*` |
+| `cache-control` | `no-cache` |
+| `connection` | `Keep-Alive` |
+| `content-length` | the length of the whole envelope |
+
+Events and errors:
+
+| Scenario | adl order |
+|---|---|
+| 200 | `open` → `progress` → `httpResponseStatus` → `complete` → `uploadCompleteData(<response body>)` |
+| 5xx | `open` → `progress` → `httpResponseStatus` → `httpStatus` → `uploadCompleteData(<error page>)` → **`ioError #2038` (naming the request URL)** |
+| source file missing | does **not** throw; `upload()` returns, then `ioError #2038` at a frame boundary, with **no `open` and no `progress`** |
+| empty `uploadDataFieldName` | throws `Error #2085: Parameter uploadDataFieldName must be non-empty string.` from the call |
+| `FileReference` with no selection | throws `Error #2037` from the call |
+| `testUpload=true` | **no observable difference** (same request bytes, same event order) |
+| `uploadUnencoded` | a raw file-byte POST, **no** `content-type`, no envelope, no field name |
+
+Two things most easily got wrong:
+
+1. **`ProgressEvent.bytesLoaded/bytesTotal` count FILE bytes, not the envelope length** — a 1000-byte file
+   reports `progress 1000/1000`, once. Using the envelope length as the total, or recording the response
+   length as a second mark (which the first version of this implementation did: `1000/1000` followed by
+   `31/1000`), makes a caller's progress bar run twice.
+2. **`URLVariables` are raw inside multipart**, unlike `URLVariables.toString()`'s percent-encoding — CJK
+   values arrive as bare UTF-8, and `a b` / `a+b` / `a%20b` stay distinguishable in the capture.
+
+#### 6.11.3 Implementation contract
+
+| Layer | Location | What it does |
+|---|---|---|
+| Parameters and envelope (AS3 semantics) | `as_upload_begin()` in `file-dialog.ts` | validates in the measured order (`request` non-null → a file is selected → the field name is non-empty), reads the file's **current** state (AIR reads at upload time), then builds the head/tail envelope pieces |
+| Transport (async job) | `AS_JOB_FILE_UPLOAD` + `as_http_upload_setup()` in `runtime.ts` | libcurl with `CURLOPT_UPLOAD` + `CUSTOMREQUEST=POST`; the read callback feeds "head → file bytes → tail", so the file is **never read whole on the AS3 thread** and never buffered |
+| Progress accounting | `as_upload_xfer()` | curl's `ulnow` minus the head length, clipped to the file size — **file bytes**; the response body records no mark (`as_http_on_data` branches on the job kind) |
+| Event order | `as_upload_pre_events()` | an upload's pre-pass differs from a download's (`progress` comes **before** the response head), so the generated `as_net_pre_events()` routes by job kind first |
+| Failure tail | `FileReference__uploadFinish()` | 200 → `complete` + `uploadCompleteData`; non-2xx → `httpStatus` + the error body, then `ioError #2038`; an unopenable file → only `ioError` (`started` is set only after `fopen` succeeds, so there is no `open`) |
+| No transport backend | the `#if !defined(ASC_HTTP_BACKEND)` branch in the same file | reports itself **once** and dispatches nothing: the file is fine, and manufacturing a `#2038` would describe "this build has no transport" as "the file is broken". The missing-file `#2038` still fires (that is a file-system fact, backend or not) |
+
+#### 6.11.4 Known divergences (all recorded, none accidental)
+
+| Divergence | Why |
+|---|---|
+| `URLVariables` part order | insertion order here, hash order on adl (same parts, byte-identical content); rare is the server that depends on it, but it does differ |
+| `user-agent` | this build's uniform `Mozilla/5.0 (Windows NT 10.0; Win64; x64) … AdobeAIR/50.0` vs adl's `(Windows; U; zh-CN) … AdobeAIR/51.4`. Common to every HTTP request, not upload-specific |
+| `web` backend | uploads are native-curl only; under `--target wasm` the honest no-backend branch applies. A browser upload means `fetch` + `Blob` or `<input type=file>` — a separate round of work |
+| `FileReference.download` / `requestPermission` | still stubs, see [`stubs.md`](stubs.md) |
+
+#### 6.11.5 Acceptance
+
+| Acceptance | Method | Result |
+|---|---|---|
+| request body, byte for byte | `temp/uploadaot/aot-req-*.bin` vs `temp/uploadprobe/req-*.bin` (compared after boundary normalisation) | **identical** (1639 / 1615 / 1921 / 1000 bytes across four scenarios) |
+| event sequence | the same `UploadAot.as` run on AOT and on adl, logs diffed line by line | seven scenarios (200 / 5xx / variables / unencoded / missing file / no selection / empty field name) are **line-for-line identical** |
+| the synchronous half in the default build | `examples/upload-contract.as` (runs without an HTTP backend) | `#2037` / `#2085` / missing-file `#2038` all hold |
+| structural pins | `unit: emit/FileUpload`, 27 pins (envelope literals, event order, progress scale, `#2038` text, the no-backend report) | all pass |
+
+---
+
 ## 8. Boundaries Explicitly Not Done / Deferred
 
 | Item | Judgment |

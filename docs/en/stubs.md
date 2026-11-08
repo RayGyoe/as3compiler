@@ -101,8 +101,8 @@ deliberately does not do (`as_shell_unsupported`, complete as of stage 293):
 | `DisplayObject.mask` | the renderer does not apply masks (`clipDepth` masking is a different, implemented path) |
 | `Error.getStackTrace` | no AS3 frame model |
 | `ExtensionContext.createExtensionContext` / `.call` | no native-extension host (the `--air-app` ANE path is separate) |
-| `File.browseForOpen` / `browseForOpenMultiple` / `browseForSave` / `browseForDirectory` / `openWithDefaultApplication` / `upload` | no system file dialog / ShellExecute / HTTP upload (stage 299 added the two symbols that were missing outright, which used to be a LINK error) |
-| `FileReference.browse` / `load` / `save` / `download` / `upload` / `uploadUnencoded`, `FileReferenceList.browse` | same backends. They report themselves and return `false` rather than pretending the user cancelled — without a dialog, `fileList`/`data`/`name` can never be filled |
+| `File.openWithDefaultApplication` | no ShellExecute / `NSWorkspace.open` (`browseFor*` themselves have a native backend, see [`desktop-file-interaction.md`](desktop-file-interaction.md)) |
+| `FileReference.download` / `requestPermission` | no backend for download or the permission prompt (`upload` / `uploadUnencoded` got a real native-curl backend in stage 388, see [`flash-net.md`](flash-net.md) §6.11). They report themselves and return rather than pretending the user cancelled — with no dialog or transfer, `data`/`name` can never be filled |
 | `File.icon` contents | no icon extraction (`NSWorkspace.iconForFile`). An empty `Icon` plus a loud report; `bitmapDatas` answers an empty array (reading it on AIR 51.4 itself throws `#1069`) |
 | `File.getVolumeByDrive` / `getVolumeByPath` | no volume enumeration (`getmntinfo`/`statfs`). `StorageVolume` itself is real and measured; what is missing is who constructs it |
 | `DockIcon.bitmaps` (painting) | that backend does not paint a Dock icon bitmap |
@@ -119,7 +119,7 @@ deliberately does not do (`as_shell_unsupported`, complete as of stage 293):
 | `ClipboardTransferMode` | 293 | added (the class was **missing entirely**, so `import flash.desktop.ClipboardTransferMode` did not compile) |
 | `System.setClipboard` | 293 | real (`clear()` + `setData(TEXT_FORMAT, s)`) |
 | `FileFilter` | 299 | **real**: three fields; the invented `winType`/`name`/`clone()` are gone |
-| `FileReference` | 299 | **real** (`File`'s superclass): with nothing picked, every accessor is `#2037` except `data` (null); the interactive members report themselves |
+| `FileReference` | 299 | **real** (`File`'s superclass): with nothing picked, every accessor is `#2037` except `data` (null); `upload`/`uploadUnencoded` are real transfers (stage 388), `download`/`requestPermission` report themselves |
 | `FileReferenceList` | 299 | **real**: `fileList` starts as `null` and is read-only (exactly as measured) |
 | `StorageVolume` / `StorageVolumeChangeEvent` | 299 | **real**: the measured constructor order, six read-only getters, two constants and `clone()` |
 | `FileStream` | 299 | **no longer a stub**: really `implements IDataInput, IDataOutput` (23 read/write members, `endian`/`objectEncoding`/`readAhead`, a writable `Number` `position`), see [`filesystem.md`](filesystem.md) §13.1 |

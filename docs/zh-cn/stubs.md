@@ -91,8 +91,8 @@
 | `DisplayObject.mask` | 渲染器不施加 mask（`clipDepth` 遮罩是另一条已实现的路径） |
 | `Error.getStackTrace` | 无 AS3 栈帧模型 |
 | `ExtensionContext.createExtensionContext` / `.call` | 无原生扩展宿主（`--air-app` 的 ANE 路径是另一套） |
-| `File.browseForOpen` / `browseForOpenMultiple` / `browseForSave` / `browseForDirectory` / `openWithDefaultApplication` / `upload` | 未接系统文件对话框 / ShellExecute / HTTP 上传（阶段二百九十九把缺的两个符号补齐成报明桩，此前是**链接失败**） |
-| `FileReference.browse` / `load` / `save` / `download` / `upload` / `uploadUnencoded`、`FileReferenceList.browse` | 同上：无原生对话框/HTTP 后端。它们**报明后返回 `false`**，不假装「用户点了取消」—— 没有对话框，`fileList`/`data`/`name` 这些「选择结果」字段永远为空 |
+| `File.openWithDefaultApplication` | 未接 ShellExecute / `NSWorkspace.open`（`browseFor*` 本身已有原生后端，见 [`desktop-file-interaction.md`](desktop-file-interaction.md)） |
+| `FileReference.download` / `requestPermission` | 下载与权限询问没有后端（`upload` / `uploadUnencoded` 已在阶段三百八十八接上原生 curl 后端，见 [`flash-net.md`](flash-net.md) §6.11）。它们**报明后返回**，不假装「用户点了取消」—— 没有对话框/传输，`data`/`name` 这些「结果」字段永远为空 |
 | `File.icon` 的位图内容 | 无图标提取（macOS 走 `NSWorkspace.iconForFile`）。给空 `Icon` 并报明；`bitmapDatas` 回空数组（AIR 51.4 里读它本身就抛 `#1069`） |
 | `File.getVolumeByDrive` / `getVolumeByPath` | 无卷枚举（`getmntinfo`/`statfs`）。`StorageVolume` 的构造器与六个 getter 已按实测实现，缺的是「谁来造它」 |
 | `DockIcon.bitmaps`（上屏） | 该后端不画 Dock 图标位图 |
@@ -109,7 +109,7 @@
 | `ClipboardTransferMode` | 二百九十三 | 补齐（此前**整个类缺失**，`import flash.desktop.ClipboardTransferMode` 编译不过） |
 | `System.setClipboard` | 二百九十三 | 真实现（= `clear()` + `setData(TEXT_FORMAT, s)`） |
 | `FileFilter` | 二百九十九 | **真类**，三个字段；删掉自造的 `winType`/`name`/`clone()` |
-| `FileReference` | 二百九十九 | **真类**（`File` 的父类）：未选择过文件时除 `data`（null）外全部 `#2037`，`toString()` 与实测一致；交互成员报明 |
+| `FileReference` | 二百九十九 | **真类**（`File` 的父类）：未选择过文件时除 `data`（null）外全部 `#2037`，`toString()` 与实测一致；`upload`/`uploadUnencoded` 是真传输（阶段三百八十八），`download`/`requestPermission` 报明 |
 | `FileReferenceList` | 二百九十九 | **真类**：`fileList` 初值 `null` 且只读（与 `adl` 实测一致） |
 | `StorageVolume` / `StorageVolumeChangeEvent` | 二百九十九 | **真类**：构造器按实测参数序、六个只读 getter、两个常量 + `clone()` |
 | `FileStream` | 二百九十九 | **不是空替代了**：真 `implements IDataInput, IDataOutput`（23 个读写成员 + `endian`/`objectEncoding`/`readAhead` + 可写 `Number` 的 `position`），见 [`filesystem.md`](filesystem.md) §13.1 |

@@ -97,8 +97,13 @@ function checkContract(): string[] {
   }
   // 2038 is the fall-through: every unclassified refusal (EACCES on an rmdir, a
   // dangling rename, ...) ends up as "File I/O Error." without a case of its own.
+  // Scoped to `as_file_err_text` -- the HTTP error mapper (`as_ioerror_text`)
+  // legitimately spells 2038 out, because there the ids are a disjoint set and the
+  // fall-through means "no measured AIR pair", which is NOT what 2038 means.
+  const fileErr = c.substring(c.indexOf('static const char* as_file_err_text(int err)'))
+    .split('static void as_file_throw')[0];
   check("#2038 carries AIR's sentence verbatim",
-    c.includes('Error #2038: File I/O Error.";') && !c.includes('case 2038:'));
+    fileErr.includes('Error #2038: File I/O Error.";') && !fileErr.includes('case 2038:'));
 
   // ---- links: lstat for existence, stat for the directory gate --------------
   check('delete existence is lstat-based',

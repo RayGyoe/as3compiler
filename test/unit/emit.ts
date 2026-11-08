@@ -4816,4 +4816,105 @@ function checkEmitYuv420(): string[] {
 }
 registerGroup('unit: emit/Yuv420', checkEmitYuv420);
 
+// ---- 阶段三百八十八：FileReference.upload / File.upload / uploadUnencoded ----
+// The three members used to be `as_shell_unsupported` stubs: an app that picked a
+// file and then called upload() waited forever on UPLOAD_COMPLETE_DATA, which is
+// exactly how the file-upload panel of a real app appeared to do nothing. They are
+// real multipart/form-data transfers now, and the shape below is what adl 51.4.1
+// actually put on the wire (temp/uploadprobe/, byte for byte) and what it actually
+// dispatched (same probe, event log). Both are pinned here because no example can
+// stand up the capture server that proves them; the synchronous half of the
+// contract (ids #2037/#2085 and the missing-file ioError) is pinned by
+// examples/upload-contract.as, which runs in the default build.
+function checkEmitFileUpload(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [upload] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [upload] ${label}`); }
+  };
 
+  const c = generateC(parse(
+    'import flash.net.FileReference;\n'
+    + 'import flash.net.URLRequest;\n'
+    + 'var f:FileReference = new FileReference();\n'
+    + 'f.upload(new URLRequest("http://example.com/u"), "file", false);\n')).c;
+
+  // 1. The members are implemented, not stubs.
+  check('FileReference.upload no longer reports itself unsupported',
+    !c.includes('FileReference.upload (no HTTP upload backend'));
+  check('uploadUnencoded no longer reports itself unsupported',
+    !c.includes('FileReference.uploadUnencoded (no HTTP upload backend'));
+  check('both delegate to the shared envelope builder',
+    c.includes('as_upload_begin(self, request, uploadDataFieldName, 0);')
+    && c.includes('as_upload_begin(self, request, NULL, 1);'));
+  check('File-typed upload hands over to FileReference (File extends it in AIR)',
+    c.includes('FileReference_upload(_this, request, uploadDataFieldName, testUpload);'));
+
+  // 2. The envelope itself: the measured order Filename -> variables -> file -> Upload.
+  const head = c.substring(c.indexOf('static void as_upload_begin'));
+  check('the leading part is "Filename" with the bare file name',
+    head.includes('name=\\"Filename\\"'));
+  check('the file part is always application/octet-stream',
+    head.includes('Content-Type: application/octet-stream'));
+  check('the closing part is the literal Upload / Submit Query',
+    head.includes('name=\\"Upload\\"') && head.includes('Submit Query'));
+  check('the final delimiter closes the body (--boundary--), with no trailing CRLF',
+    head.includes('as_up_str(&tail, "--");'));
+  check('Content-Type is multipart/form-data with the generated boundary',
+    head.includes('"multipart/form-data; boundary=%s"'));
+  check('the boundary is 10 dashes + 30 chars (AIR\'s 40-character shape)',
+    c.includes('for (; i < 40; i++)') && c.includes('out[40] ='));
+  check('the variable values go out RAW, not percent-encoded',
+    head.includes('as_up_str(&head, as_v_str_val(d->vals[i]));')
+    && !head.includes('as_url_encode_into'));
+
+  // 3. The transport: a POST whose body is streamed from disk.
+  check('an upload is its own job kind', c.includes('#define AS_JOB_FILE_UPLOAD 13'));
+  check('the file part is read from disk by the transport, never buffered whole',
+    c.includes('curl_easy_setopt(h, CURLOPT_READFUNCTION, as_upload_read);')
+    && c.includes('static int as_http_upload_setup(as_job* j, CURL* h, struct curl_slist** hdrs, as_upload_src* s)'));
+  check('the wire method is POST even though libcurl is in UPLOAD mode',
+    c.includes('curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");'));
+  check('Expect: 100-continue is suppressed (AIR sends the body immediately)',
+    c.includes('curl_slist_append(*hdrs, "Expect:")'));
+  check('OPEN is withheld until the file could be opened (a missing file has none)',
+    c.includes('if (j->kind != AS_JOB_FILE_UPLOAD) j->started = 1;'));
+
+  // 4. Progress counts FILE bytes, and the response body adds no second pair.
+  check('the upload progress watermark is file bytes',
+    c.includes('curl_off_t sent = ulnow - (curl_off_t)s->head_len;'));
+  check('the response body does not record a download watermark for an upload',
+    c.includes('if (c->job == NULL || c->job->kind != AS_JOB_FILE_UPLOAD) as_job_mark_append(c->job, (unsigned)c->body.len);'));
+  check('bytesTotal stays the file size instead of the response length',
+    c.includes('if (j->kind != AS_JOB_FILE_UPLOAD) j->total = (unsigned)j->len;'));
+
+  // 5. Event order, both halves.
+  const preStart = c.indexOf('static void as_upload_pre_events(void* job) {');
+  const pre = c.substring(preStart, c.indexOf('static void as_upload_begin'));
+  check('uploads are routed out of the download pre-pass',
+    c.includes('if (as_job_is_upload(job)) { as_upload_pre_events(job); return; }'));
+  check('progress precedes httpResponseStatus inside the upload pre-pass',
+    pre.indexOf('"progress"') >= 0 && pre.indexOf('"progress"') < pre.indexOf('"httpResponseStatus"'));
+  check('a non-2xx reports httpStatus and the body before ioError #2038',
+    c.indexOf('URLLoader__httpStatusEvent((char*)"httpStatus", status)') >= 0
+    && c.indexOf('URLLoader__httpStatusEvent((char*)"httpStatus", status)') < c.indexOf('as_ioerror_text(as_job_path(job), 2038'));
+  check('COMPLETE precedes uploadCompleteData (the reverse of a download)',
+    c.indexOf('Event_new((char*)"complete", false, false)') >= 0
+    && c.indexOf('Event_new((char*)"complete", false, false)') < c.indexOf('DataEvent_new((char*)"uploadCompleteData"'));
+
+  // 6. AIR's ids, and the honest no-transport state.
+  check('#2038 is "File I/O Error" (the upload failure id)',
+    c.includes('case 2038: desc = "File I/O Error"; break;'));
+  check('an empty field name is #2085, measured verbatim',
+    c.includes('Error #2085: Parameter uploadDataFieldName must be non-empty string.'));
+  check('a FileReference with no selection is #2037',
+    c.includes('Error #2037: Functions called in incorrect sequence, or earlier call was unsuccessful.'));
+  check('a build without a transport says so instead of blaming the file',
+    c.includes('#if !defined(ASC_HTTP_BACKEND)')
+    && c.includes('File.upload (no HTTP upload backend in this build)'));
+
+  console.log(`     [upload] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/FileUpload', checkEmitFileUpload);

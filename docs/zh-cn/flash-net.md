@@ -1361,6 +1361,93 @@ if (macAddress.length == 0) deviceId = windowsOnlyPath();  // new File("C:/Windo
 
 ---
 
+### 6.11 `FileReference.upload` / `uploadUnencoded`（选完文件之后那一步）—— **已执行（阶段三百八十八）**
+
+#### 6.11.1 为什么必须做：选完文件不等于能上传
+
+原生文件对话框接上之后，应用的下一个动作就是上传，而三个入口
+（`File.upload`、`FileReference.upload`、`FileReference.uploadUnencoded`）此前都是
+`as_shell_unsupported` 报明桩：调用返回 `false`、**一个事件都不派发**。调用方的典型写法是
+
+```as3
+sFile.addEventListener(Event.SELECT, onPick);
+function onPick(e:Event):void { sFile.upload(new URLRequest(URL), "file"); }
+sFile.addEventListener(Event.COMPLETE, onDone);
+```
+
+于是界面停在「上传中」，既没有 `COMPLETE` 也没有 `IO_ERROR` —— 比报错更难查。所以这一项不是
+「补一个 API」，而是**把选文件到上传这条链闭合**。
+
+#### 6.11.2 adl 51.4.1 实测契约（`temp/uploadprobe/`，抓包 + 事件日志，全部一手）
+
+请求体（`req-1.bin`，按字节对）：
+
+| 顺序 | 内容 |
+|---|---|
+| 1 | `--<boundary>` + `Content-Disposition: form-data; name="Filename"` + **裸文件名** |
+| 2 | 每个 `URLVariables` 条目**各占一段**，键与值都是**原文**（不 URL 编码） |
+| 3 | 文件段：`name="<uploadDataFieldName>"; filename="<裸文件名>"` + `Content-Type: application/octet-stream` + 文件字节 |
+| 4 | 收尾段：`name="Upload"` + `Submit Query`；**最终分隔符后没有 CRLF** |
+
+| 请求头 | 值 |
+|---|---|
+| `content-type` | `multipart/form-data; boundary=<40 字符>`（10 个 `-` + 30 位字母数字） |
+| `accept` | `text/*` |
+| `cache-control` | `no-cache` |
+| `connection` | `Keep-Alive` |
+| `content-length` | 整个信封的长度 |
+
+事件与错误：
+
+| 场景 | adl 顺序 |
+|---|---|
+| 200 | `open` → `progress` → `httpResponseStatus` → `complete` → `uploadCompleteData(<响应体>)` |
+| 5xx | `open` → `progress` → `httpResponseStatus` → `httpStatus` → `uploadCompleteData(<错误页>)` → **`ioError #2038`（URL 是请求 URL）** |
+| 源文件不存在 | **不抛**；`upload()` 正常返回，帧边界上报 `ioError #2038`，**没有 `open`、没有 `progress`** |
+| `uploadDataFieldName` 为空串 | 调用处抛 `Error #2085: Parameter uploadDataFieldName must be non-empty string.` |
+| `FileReference` 未选过文件 | 调用处抛 `Error #2037` |
+| `testUpload=true` | **无任何可观测差异**（同样的请求体、同样的事件序） |
+| `uploadUnencoded` | 裸文件字节 POST，**不带** `content-type`，无信封、无字段名 |
+
+两条最容易搞错的口径：
+
+1. **`ProgressEvent.bytesLoaded/bytesTotal` 数的是文件字节，不是信封长度** —— 1000 字节的文件只报
+   `progress 1000/1000`，一次；把信封长度当总量、或把响应体长度也记一笔（本实现第一版就是这样：
+   `1000/1000` 后又来一条 `31/1000`），都会让调用方的进度条跑两遍。
+2. **`URLVariables` 在 multipart 里是原文**，与 `URLVariables.toString()` 的百分号编码**不同** —— 中文
+   值是裸 UTF-8，`a b` / `a+b` / `a%20b` 三种写法在抓包里原样可辨。
+
+#### 6.11.3 实现口径
+
+| 层 | 位置 | 做什么 |
+|---|---|---|
+| 参数与信封（AS3 语义） | `file-dialog.ts` 的 `as_upload_begin()` | 先按实测顺序校验（`request` 非空 → 有选中文件 → 字段名非空），再读**当下**的文件信息（AIR 在上传时才读），最后拼信封的 head/tail 两段 |
+| 传输（异步 job） | `runtime.ts` 的 `AS_JOB_FILE_UPLOAD` + `as_http_upload_setup()` | 走 libcurl：`CURLOPT_UPLOAD` + `CUSTOMREQUEST=POST`，read 回调按「head → 文件字节 → tail」流式喂；文件**不在 AS3 线程读全量**，也不进内存 |
+| 进度职责 | `as_upload_xfer()` | curl 的 `ulnow` 减去 head 长度并夹到文件长度，得到**文件字节**水位；响应体不再记水位（`as_http_on_data` 按 job 类型分流） |
+| 事件序 | `as_upload_pre_events()` | 上传的 pre-pass 与下载不同（`progress` 在响应头**之前**），故在生成的 `as_net_pre_events()` 里按 job 类型早分流 |
+| 失败后处理 | `FileReference__uploadFinish()` | 200 走 `complete` + `uploadCompleteData`；非 2xx 先 `httpStatus` + 错误体再 `ioError #2038`；打不开文件则只有 `ioError`（`started` 只在 fopen 成功后置位，所以没有 `open`） |
+| 无传输后端 | 同一文件的 `#if !defined(ASC_HTTP_BACKEND)` 分支 | **只报明一次**、不派发任何事件：文件是好的，编个 `#2038` 等于把「本构建不支持」说成「文件坏了」。源文件不存在那种 `#2038` 仍然照常（那是与后端无关的文件系统事实） |
+
+#### 6.11.4 已知偏差（都是显式记录，不是「碰巧不一样」）
+
+| 偏差 | 说明 |
+|---|---|
+| `URLVariables` 的段序 | 我们是插入序，adl 是哈希序（同一组键值，段内容逐字节相同）；依赖段序的服务器少见，但确实不同 |
+| `user-agent` | 我们沿用本构建统一的 `Mozilla/5.0 (Windows NT 10.0; Win64; x64) … AdobeAIR/50.0`，adl 是 `(Windows; U; zh-CN) … AdobeAIR/51.4`。这是所有 HTTP 请求的共同口径，不是上传特有 |
+| `web` 后端 | 上传目前只有原生 curl 目标；`--target wasm` 下仍走「无后端」分支（诚实报明）。浏览器的上传要么 `fetch` + `Blob`、要么 `<input type=file>`，是独立的一轮工作 |
+| `FileReference.download` / `requestPermission` | 仍是报明桩，见 [`stubs.md`](stubs.md) |
+
+#### 6.11.5 验收
+
+| 验收 | 方法 | 结果 |
+|---|---|---|
+| 请求体逐字节 | `temp/uploadaot/aot-req-*.bin` vs `temp/uploadprobe/req-*.bin`（boundary 归一后比较） | **完全相同**（1639 / 1615 / 1921 / 1000 字节，四个场景全中） |
+| 事件序列 | 同一份 `UploadAot.as` 在 AOT 与 adl 上各跑一遍，日志逐行 diff | 七个场景（200 / 5xx / 变量 / unencoded / 缺文件 / 未选择 / 空字段名）**逐行相同** |
+| 默认构建的同步契约 | `examples/upload-contract.as`（无 HTTP 后端也跑） | `#2037` / `#2085` / 缺文件 `#2038` 全中 |
+| 结构钉子 | `unit: emit/FileUpload` 27 钉（信封字面量、事件序、进度口径、`#2038` 文案、无后端报明） | 全过 |
+
+---
+
 ## 7. `Socket` / `SecureSocket` / `ServerSocket` / `XMLSocket`（阶段八十九·五十三）
 
 > 本节每条语义都来自 `mxmlc + adl` **实测**（探针 `temp/air-probe/Probe11.as` →

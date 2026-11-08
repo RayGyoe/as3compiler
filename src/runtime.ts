@@ -12443,6 +12443,14 @@ static void as_gradient_linearrgb_report(void) {
 // event without undoing the work.
 #define AS_JOB_FS_OP      11
 #define AS_JOB_FILE_WRITE 12
+// FileReference.upload / File.upload / uploadUnencoded. A multipart/form-data
+// POST whose file part is STREAMED from disk by the transport (a deck can be tens
+// of megabytes: it must not be copied twice, and the AS3 thread must not read
+// it). The envelope is built on the AS3 thread, where the AS3 strings live, and
+// staged as two malloc'd halves -- 'upl_head' (everything before the file bytes)
+// and 'upl_tail' (the closing boundary). The measured adl contract this kind has
+// to reproduce is documented on as_upload_begin in file-dialog.ts.
+#define AS_JOB_FILE_UPLOAD 13
 
 #define AS_JOB_QUEUED 0
 #define AS_JOB_RUNNING 1
@@ -12493,6 +12501,18 @@ typedef struct as_job {
     char* path;     // malloc copies of the inputs, so workers never read GC memory
     char* mode;
     int binary;
+    // AS_JOB_FILE_UPLOAD only (see the kind's comment above). 'upl_path' is the
+    // file whose bytes form the body, 'upl_size' its length -- which is also the
+    // bytesTotal AIR reports on ProgressEvent (measured: a 1000-byte file reports
+    // progress 1000/1000, NOT the multipart envelope's 1639 bytes). 'upl_sent' is
+    // the watermark the transfer callback last reported, in FILE bytes.
+    char* upl_path;
+    size_t upl_size;
+    size_t upl_sent;
+    unsigned char* upl_head;
+    size_t upl_head_len;
+    unsigned char* upl_tail;
+    size_t upl_tail_len;
     // HTTP staging (AS_JOB_HTTP): 'path' is the URL, 'mode' the method, and the
     // response body lands in 'bytes'. Unlike the file jobs, the request body is a
     // second buffer (the file jobs' input is a path, not data), so it needs its
@@ -12626,6 +12646,13 @@ static int as_stream_append(as_job* j, const void* p, size_t n);
 // and it is declared here because as_async_tick is what drives it. Defined in
 // emit.ts; idempotent, so the finish thunk calls it too.
 static void as_net_pre_events(void* job);
+
+// The upload pre-pass. An upload cannot share the download ordering above: a
+// request body is sent BEFORE the response head arrives, so AIR dispatches
+// open -> progress -> httpResponseStatus (measured), while the download path
+// dispatches open -> httpResponseStatus -> progress. Defined in file-dialog.ts
+// beside the rest of the upload support; called from as_net_pre_events.
+static void as_upload_pre_events(void* job);
 
 // Record a byte-count watermark on the job, so the finish thunk can replay the
 // PROGRESS events AS3 never saw (see as_job.marks). Bounded on purpose: PROGRESS
@@ -12822,7 +12849,10 @@ static size_t as_http_on_data(char* ptr, size_t size, size_t nmemb, void* userp)
         return n;
     }
     if (!as_http_sink_append(&c->body, ptr, n)) return 0;
-    as_job_mark_append(c->job, (unsigned)c->body.len);
+    // An UPLOAD records no download watermark: its PROGRESS counts the bytes SENT
+    // (the file), and a mark here would append the RESPONSE length after them --
+    // measured as the wrong pair "progress 1000/1000" then "progress 31/1000".
+    if (c->job == NULL || c->job->kind != AS_JOB_FILE_UPLOAD) as_job_mark_append(c->job, (unsigned)c->body.len);
     return n;
 }
 
@@ -12982,6 +13012,153 @@ static int as_http_env_proxy_set(void) {
 extern int as_sysproxy_get(const char* url, char* proxy, int proxy_cap, char* noproxy, int noproxy_cap);
 #endif
 
+// ---- File.upload / FileReference.upload: the streaming request body ---------
+//
+// The body is multipart/form-data, but only the head and tail of the envelope are
+// held in memory (staged by the AS3 thread, where the AS3 strings live); the file
+// part in the middle is read from disk by this callback as libcurl drains it. A
+// 30 MB deck therefore costs two small buffers and one open FILE*, not a second
+// copy of the file, and no work at all on the AS3 thread.
+//
+// See as_upload_begin (file-dialog.ts) for the measured wire format this carries.
+typedef struct as_upload_src {
+    as_job* j;
+    const unsigned char* head;
+    size_t head_len, head_pos;
+    const unsigned char* tail;
+    size_t tail_len, tail_pos;
+    FILE* file;
+    size_t file_size, file_pos;
+    int stage;   // 0 = head, 1 = file bytes, 2 = tail, 3 = exhausted
+} as_upload_src;
+
+static size_t as_upload_read(char* buf, size_t size, size_t nmemb, void* userp) {
+    as_upload_src* s = (as_upload_src*)userp;
+    size_t want = size * nmemb;
+    size_t done = 0;
+    while (done < want) {
+        if (s->stage == 0) {
+            size_t n = s->head_len - s->head_pos;
+            if (n > want - done) n = want - done;
+            if (n > 0) { memcpy(buf + done, s->head + s->head_pos, n); s->head_pos += n; done += n; }
+            if (s->head_pos < s->head_len) break;
+            s->stage = 1;
+        } else if (s->stage == 1) {
+            size_t n = s->file_size - s->file_pos;
+            if (n > want - done) n = want - done;
+            if (n > 0) {
+                size_t got = fread(buf + done, 1, n, s->file);
+                // A short read is a real failure: continuing would upload a
+                // truncated file that the server accepts as complete (the
+                // Content-Length already said otherwise). Abort instead.
+                if (got != n) { s->j->error = AS_JOB_ERR_IO; return CURL_READFUNC_ABORT; }
+                s->file_pos += n; done += n;
+            }
+            if (s->file_pos < s->file_size) break;
+            s->stage = 2;
+        } else if (s->stage == 2) {
+            size_t n = s->tail_len - s->tail_pos;
+            if (n > want - done) n = want - done;
+            if (n > 0) { memcpy(buf + done, s->tail + s->tail_pos, n); s->tail_pos += n; done += n; }
+            if (s->tail_pos < s->tail_len) break;
+            s->stage = 3;
+        } else {
+            break;
+        }
+    }
+    return done;
+}
+
+// libcurl asks for a rewind when it has to replay the body (a redirect it may
+// follow, a 401 retry). Only "from the start" is supported, which IS the only
+// rewind that can happen here; anything else reports CANTSEEK so libcurl fails the
+// transfer instead of silently sending a body whose tail is missing.
+static int as_upload_seek(void* userp, curl_off_t offset, int origin) {
+    as_upload_src* s = (as_upload_src*)userp;
+    if (origin != SEEK_SET || offset != 0) return CURL_SEEKFUNC_CANTSEEK;
+    s->head_pos = 0;
+    s->tail_pos = 0;
+    s->file_pos = 0;
+    s->stage = (s->head_len > 0) ? 0 : 1;
+    if (s->file != NULL) fseek(s->file, 0, SEEK_SET);
+    return CURL_SEEKFUNC_OK;
+}
+
+// Upload progress. AIR's bytesLoaded/bytesTotal for an upload count FILE bytes
+// (measured: progress 1000/1000 for a 1000-byte file whose envelope is 1639),
+// so the head/tail of the envelope are subtracted out before the watermark is
+// recorded -- the same bounded replay as as_http_on_data, so a fast upload that
+// finishes inside one frame still reports the same events in the same order.
+static int as_upload_xfer(void* userp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+    as_upload_src* s = (as_upload_src*)userp;
+    (void)dltotal; (void)dlnow; (void)ultotal;
+    if (ulnow <= 0) return 0;
+    curl_off_t sent = ulnow - (curl_off_t)s->head_len;
+    if (sent < 0) sent = 0;
+    if ((size_t)sent > s->file_size) sent = (curl_off_t)s->file_size;
+    if ((size_t)sent > s->j->upl_sent) {
+        s->j->upl_sent = (size_t)sent;
+        as_job_mark_append(s->j, (unsigned)sent);
+    }
+    return 0;
+}
+
+// Open the file and install the upload options. Returns 0 when the file cannot be
+// opened, which the thunk reports the way adl does for a path that is gone
+// (ioError #2038 naming the URL) -- never as a successful empty upload.
+static int as_http_upload_setup(as_job* j, CURL* h, struct curl_slist** hdrs, as_upload_src* s) {
+    s->j = j;
+    s->head = j->upl_head;
+    s->head_len = j->upl_head_len;
+    s->tail = j->upl_tail;
+    s->tail_len = j->upl_tail_len;
+    s->file_size = j->upl_size;
+    s->stage = (s->head_len > 0) ? 0 : 1;
+    // as_p_fopen is the one path->FILE* mapping this runtime uses: it converts
+    // UTF-8 to wide on Windows, so a CJK file name opens the same file the dialog
+    // returned.
+    s->file = (j->upl_path != NULL) ? as_p_fopen(j->upl_path, "rb") : NULL;
+    if (s->file == NULL) return 0;
+    // The transfer counts as started only HERE, once the body can actually be
+    // read. as_http_run does not set it for an upload: a file that vanished
+    // reports ioError #2038 with NO open event (measured, adl 51.4.1).
+    j->started = 1;
+    curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
+    // UPLOAD makes libcurl want a PUT; the wire method is still POST, exactly as
+    // AIR sends it.
+    curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)(s->head_len + s->file_size + s->tail_len));
+    curl_easy_setopt(h, CURLOPT_READFUNCTION, as_upload_read);
+    curl_easy_setopt(h, CURLOPT_READDATA, s);
+    curl_easy_setopt(h, CURLOPT_SEEKFUNCTION, as_upload_seek);
+    curl_easy_setopt(h, CURLOPT_SEEKDATA, s);
+    // Progress is what turns the app's 0% into a moving bar; NOPROGRESS must be
+    // off for the callback to run (the global setting above silences libcurl's
+    // own meter, and installing this callback keeps it silenced).
+    curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, as_upload_xfer);
+    curl_easy_setopt(h, CURLOPT_XFERINFODATA, s);
+    // AIR issues this request WITHOUT an Expect: 100-continue handshake (its whole
+    // upload is sent in one go), so suppress libcurl's automatic one: a server
+    // that does not answer the expectation would otherwise stall for a second
+    // before the body is sent.
+    *hdrs = curl_slist_append(*hdrs, "Expect:");
+    if (j->content_type != NULL && j->content_type[0] != 0) {
+        char ct[512];
+        snprintf(ct, sizeof(ct), "Content-Type: %s", j->content_type);
+        *hdrs = curl_slist_append(*hdrs, ct);
+    }
+    // AIR's upload request carries "accept: text/*" and "cache-control: no-cache"
+    // (both captured from adl); a server that content-negotiates or caches the
+    // response would otherwise answer differently for us than for AIR.
+    *hdrs = curl_slist_append(*hdrs, "Accept: text/*");
+    *hdrs = curl_slist_append(*hdrs, "Cache-Control: no-cache");
+    // HTTP/1.1 keep-alive is implicit, but AIR states it, and it is part of what a
+    // captured request looks like -- harmless to say out loud.
+    *hdrs = curl_slist_append(*hdrs, "Connection: Keep-Alive");
+    return 1;
+}
+
 // The blocking transfer, called from as_job_run — i.e. on a worker thread
 // whenever ASC_ASYNC_THREADS is set (it is, on every native target: POSIX
 // pthreads, Windows over the SRWLOCK shim above), so the AS3 thread never blocks
@@ -12995,7 +13172,13 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
     struct curl_slist* hdrs = NULL;
     const char* method = (j->mode != NULL) ? j->mode : "GET";
     int is_post = (strcmp(method, "POST") == 0);
-    int has_body = (j->body != NULL && j->body_len > 0);
+    // An upload is a POST whose body comes from a FILE through a read callback
+    // rather than from j->body, so every body/POST block below is bypassed for it
+    // (as_http_upload_setup installs the transfer options and its own headers).
+    int is_upload = (j->kind == AS_JOB_FILE_UPLOAD);
+    int has_body = (!is_upload && j->body != NULL && j->body_len > 0);
+    as_upload_src ups;
+    memset(&ups, 0, sizeof(ups));
     curl_easy_setopt(h, CURLOPT_URL, j->path);
     curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, as_http_on_data);
     curl_easy_setopt(h, CURLOPT_WRITEDATA, ctx);
@@ -13004,7 +13187,10 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, j->follow_redirects ? 1L : 0L);
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 20L);
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 10L);
-    curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
+    // The 30 s ceiling is a guard for a request whose response never arrives. It
+    // must NOT apply to an upload: a 30 MB deck on a slow link legitimately takes
+    // minutes, and AIR only ever times out on an IDLE transfer (idleTimeout, below).
+    if (!is_upload) curl_easy_setopt(h, CURLOPT_TIMEOUT, 30L);
     // libcurl's default progress meter prints a transfer table to stderr on EVERY
     // request. AIR prints nothing for a URLLoader, and now that Windows transfers
     // run on four workers the rows interleave into unreadable noise -- disable it
@@ -13059,7 +13245,14 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
         curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, secs);
     }
     if (j->user_agent != NULL) curl_easy_setopt(h, CURLOPT_USERAGENT, j->user_agent);
-    if (is_post) {
+    if (is_upload) {
+        if (!as_http_upload_setup(j, h, &hdrs, &ups)) {
+            if (hdrs != NULL) curl_slist_free_all(hdrs);
+            curl_easy_cleanup(h);
+            j->error = AS_JOB_ERR_IO;
+            return;
+        }
+    } else if (is_post) {
         // POST carries the payload as the body; GET (and everything else) is a
         // plain request whose query string URLLoader_load already folded in.
         curl_easy_setopt(h, CURLOPT_POST, 1L);
@@ -13075,17 +13268,23 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
             curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)j->body_len);
         }
     }
-    const char* ctype = as_http_effective_ctype(j);
-    if (ctype != NULL) {
-        char ct[512];
-        snprintf(ct, sizeof(ct), "Content-Type: %s", ctype);
-        hdrs = curl_slist_append(hdrs, ct);
-    } else if (is_post) {
-        // libcurl invents "Content-Type: application/x-www-form-urlencoded" for
-        // every POST it issues; adl sends NO Content-Type when the request carries
-        // no body (measured: POST with Content-Length 0 arrives header-less). An
-        // empty-valued entry is how a libcurl default header is switched off.
-        hdrs = curl_slist_append(hdrs, "Content-Type:");
+    // as_http_upload_setup already put the exact "multipart/form-data;
+    // boundary=..." header (or none at all for uploadUnencoded) on the list, so
+    // the generic Content-Type blocks below must not run for an upload -- a second
+    // Content-Type header would be sent.
+    if (!is_upload) {
+        const char* ctype = as_http_effective_ctype(j);
+        if (ctype != NULL) {
+            char ct[512];
+            snprintf(ct, sizeof(ct), "Content-Type: %s", ctype);
+            hdrs = curl_slist_append(hdrs, ct);
+        } else if (is_post) {
+            // libcurl invents "Content-Type: application/x-www-form-urlencoded" for
+            // every POST it issues; adl sends NO Content-Type when the request carries
+            // no body (measured: POST with Content-Length 0 arrives header-less). An
+            // empty-valued entry is how a libcurl default header is switched off.
+            hdrs = curl_slist_append(hdrs, "Content-Type:");
+        }
     }
     if (j->request_headers != NULL && j->request_headers[0] != '\\0') {
         hdrs = as_http_add_headers(hdrs, j->request_headers);
@@ -13106,6 +13305,9 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
     curl_easy_getinfo(h, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &clen);
     if (hdrs != NULL) curl_slist_free_all(hdrs);
     curl_easy_cleanup(h);
+    // The read callback has done its work, so the file handle is closed here --
+    // on every exit from the transfer, including a failed one.
+    if (ups.file != NULL) { fclose(ups.file); ups.file = NULL; }
     if (rc != CURLE_OK || ctx->body.oom || ctx->hdr.oom) {
         // An ioError with no cause is untriable. AIR's #2032 tells the .as
         // program only that the transfer failed, and the AS3-visible text must
@@ -13135,7 +13337,10 @@ static void as_http_perform(as_job* j, as_http_ctx* ctx) {
         j->bytes = ctx->body.buf;
         j->len = ctx->body.len;
     }
-    j->total = (unsigned)j->len;
+    // 'total' is the bytesTotal AS3 sees. For an upload that is the FILE size,
+    // staged before the transfer -- the response length is not the progress scale
+    // (measured: 1000-byte file, 31-byte response, AIR reports 1000/1000).
+    if (j->kind != AS_JOB_FILE_UPLOAD) j->total = (unsigned)j->len;
     j->expected_total = (clen >= 0 && clen <= 0xFFFFFFFFLL) ? (unsigned)clen : 0;
     j->headers = ctx->hdr.buf;
     j->headers_len = ctx->hdr.len;
@@ -13149,7 +13354,9 @@ static void as_http_run(as_job* j) {
     ctx.job = j;
     // The request is issued from here on, so the load counts as started: AIR
     // still dispatches OPEN for a refused connection (adl: open;httpStatus(0);ioError).
-    j->started = 1;
+    // An UPLOAD is the exception: it marks itself started only once the file could
+    // be opened, because a missing source file produces no OPEN at all.
+    if (j->kind != AS_JOB_FILE_UPLOAD) j->started = 1;
     as_http_perform(j, &ctx);
 }
 
@@ -13652,6 +13859,13 @@ static void as_job_run(as_job* j) {
             as_http_run(j);
             break;
         }
+        // An upload IS an HTTP transfer (same backend, same response staging);
+        // only as_http_perform's request side differs -- the body comes from a
+        // file through a read callback instead of from j->body.
+        case AS_JOB_FILE_UPLOAD: {
+            as_http_run(j);
+            break;
+        }
         case AS_JOB_HTTP_STREAM: {
             as_http_stream_run(j);
             break;
@@ -13928,6 +14142,45 @@ static void* as_async_submit_http(void* obj, void (*finish)(void*), const char* 
     return (void*)j;
 }
 
+// Submit an upload job (FileReference.upload / File.upload / uploadUnencoded).
+// The envelope halves and the file path are copied out of the GC heap HERE, on the
+// AS3 thread: the worker only ever sees malloc'd bytes and a path. 'head'/'tail'
+// are owned by the job from this call on (freed by as_job_retire), so the caller
+// must not free them. Returns 0 when nothing was started -- an OOM means no event
+// fires, exactly like as_async_submit_http.
+static int as_async_submit_upload(void* obj, void (*finish)(void*), const char* url, const char* user_agent, const char* content_type, const char* request_headers, const void* head, size_t head_len, const char* file_path, size_t file_size, const void* tail, size_t tail_len, double idle_timeout, int manage_cookies) {
+    as_job* j = as_job_alloc(AS_JOB_FILE_UPLOAD, obj, finish);
+    if (j == NULL) return 0;
+    j->path = as_job_strdup(url);
+    j->mode = as_job_strdup("POST");
+    j->user_agent = as_job_strdup(user_agent);
+    j->content_type = as_job_strdup(content_type);
+    j->request_headers = as_job_strdup(request_headers);
+    j->upl_path = as_job_strdup(file_path);
+    j->upl_size = file_size;
+    // AIR reports bytesTotal as the FILE length, not the envelope length, so the
+    // two are kept apart: 'total' is what ProgressEvent sees.
+    j->total = (unsigned)file_size;
+    j->idle_timeout = idle_timeout;
+    j->manage_cookies = manage_cookies;
+    if (head_len > 0) {
+        unsigned char* copy = (unsigned char*)malloc(head_len);
+        if (copy == NULL) { as_job_retire(j); as_job_release(j); return 0; }
+        memcpy(copy, head, head_len);
+        j->upl_head = copy;
+        j->upl_head_len = head_len;
+    }
+    if (tail_len > 0) {
+        unsigned char* copy = (unsigned char*)malloc(tail_len);
+        if (copy == NULL) { as_job_retire(j); as_job_release(j); return 0; }
+        memcpy(copy, tail, tail_len);
+        j->upl_tail = copy;
+        j->upl_tail_len = tail_len;
+    }
+    if (!as_job_publish(j)) { as_job_retire(j); as_job_release(j); return 0; }
+    return 1;
+}
+
 // Submit an image load for 'obj' (Loader.load). The transport is picked from the
 // URL: a local path is the pre-existing file read, while http(s):// goes through
 // the HTTP transport — so the two are different job kinds rather than one kind
@@ -13970,6 +14223,12 @@ static void as_job_retire(as_job* j) {
         j->name_cap = 0;
     }
     free((void*)j->bytes);
+    free((void*)j->upl_head);
+    free((void*)j->upl_tail);
+    free(j->upl_path);
+    j->upl_head = NULL;
+    j->upl_tail = NULL;
+    j->upl_path = NULL;
     free(j->pixels);
     free(j->path);
     free(j->mode);
@@ -15012,6 +15271,7 @@ static char* as_ioerror_text(const char* url, int id, const char* detail) {
         case 2032: desc = "Stream Error"; break;
         case 2035: desc = "URL Not Found"; break;
         case 2036: desc = "Load Never Completed"; break;
+        case 2038: desc = "File I/O Error"; break;
         case 2124: desc = "Loaded file is an unknown type"; break;
         default: return NULL;  // no measured AIR pair (build-level diagnostics)
     }
@@ -15042,9 +15302,17 @@ static int as_job_is_binary(void* job) { return ((as_job*)job)->binary; }
 static int as_job_status(void* job) { return ((as_job*)job)->status; }
 static const char* as_job_headers(void* job) { return (const char*)((as_job*)job)->headers; }
 static const char* as_job_eff_url(void* job) { const char* u = ((as_job*)job)->eff_url; return (u != NULL) ? u : ""; }
+// The REQUEST url, as opposed to the effective (post-redirect) one; see
+// as_job_path above. An upload that failed before any response must still name a
+// URL in its #2038 text (measured: Error #2038: File I/O Error. URL: <request
+// url>), and at that point there is no effective URL at all.
 static int as_job_redirected(void* job) { return ((as_job*)job)->redirected; }
 static unsigned as_job_expected_total(void* job) { return ((as_job*)job)->expected_total; }
 static int as_job_started(void* job) { return ((as_job*)job)->started; }
+// The one place the pre-event dispatcher needs the kind: an upload reports its
+// own progress (file bytes, not envelope bytes) and has no download phase, so it
+// cannot share the URLLoader/URLStream path in as_net_pre_events.
+static int as_job_is_upload(void* job) { return ((as_job*)job)->kind == AS_JOB_FILE_UPLOAD; }
 static void as_job_set_net_events(void* job) { ((as_job*)job)->net_events = 1; }
 static int as_job_sent_open(void* job) { return ((as_job*)job)->sent_open; }
 static void as_job_set_sent_open(void* job) { ((as_job*)job)->sent_open = 1; }

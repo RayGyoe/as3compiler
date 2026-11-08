@@ -95,7 +95,7 @@ npm run test:unit
 - M7：macOS 已观察到启动及取消为 none；应用→Finder/文字编辑器的文件/文字/URL 接收，以及 COPY/MOVE/LINK 和拖动图像位置仍待系统级验收。Windows 拖动图像暂未实现；其余拖出代码未验证。
 - 延迟 Clipboard handler 当前在发起 OS 拖出前渲染为快照，尚非目标首次读取时才调用；自定义格式仅随本地 Clipboard 保留，不能跨应用运输。
 - IO 当前按完成聚合进度；过滤表达式、扩展名自动补全、错误分类与所有 AIR 文案仍有对齐项。ByteArray 沿用有符号 int 长度上限。
-- Linux、Web、HTTP 上传下载、移动文件权限和文件承诺继续不在本批范围。
+- Linux、Web、移动文件权限和文件承诺继续不在本批范围。HTTP 上传（`File.upload` / `FileReference.upload` / `uploadUnencoded`）已在本批之外的另一轮接上原生 curl 后端，其信封、事件序与错误号见 [`flash-net.md`](flash-net.md) §6.11；`FileReference.download` / `requestPermission` 仍是报明桩。
 
 本轮验证：完整单元 **329/329**、完整示例 **306/306**；文件选择器/拖放/Clipboard 定向 **6/6**（Clipboard 内部 68 检查）；Cocoa 桥接探针通过，覆盖中文多文件、text/URL、同步动作返回、重复 attach 及 detach 恢复。另已补测 MOVE/LINK 协商、无效源载荷，以及 start/complete 监听器异常清理。原生 .app 编译、ad-hoc 签名通过。Cocoa 探针的可复现源码和运行命令见 `test/native/README.md`。上一批真实面板已完成中文路径选择、27 字节文本读取与中文文本保存；该结果只代表当时场景。
 

@@ -16886,6 +16886,9 @@ this.line('AS_bake_pend_n = 0;');
     this.line('static void Sound__finish(void* job);');
     this.line('static void as_net_pre_events(void* job) {');
     this.indent++;
+    // Uploads have their own ordering (progress BEFORE the response head) and
+    // their own bytesTotal; see as_upload_pre_events in file-dialog.ts.
+    this.line('if (as_job_is_upload(job)) { as_upload_pre_events(job); return; }');
     this.line('void* obj = as_job_obj(job);');
     this.line('if (obj == NULL) return;');
     this.line('if (as_job_finish(job) == (void*)Sound__finish) {');
@@ -19827,10 +19830,15 @@ Date* FileReference_get_modificationDate(void* _this) {
 }
 ByteArray* FileReference_get_data(void* _this) { return (ByteArray*)((FileReference*)_this)->_data; }
 `);
+    // FileReference.upload / uploadUnencoded are real transfers now: the multipart
+    // envelope and its measured event sequence live in file-dialog.ts
+    // (as_upload_begin / FileReference__uploadFinish), because that is where the
+    // File/FileReference state and the AS3-thread pump already are. download and
+    // requestPermission still have no backend here and say so once, loudly.
     this.line('void FileReference_download(void* _this, URLRequest* request, char* defaultFileName) { (void)_this; (void)request; (void)defaultFileName; as_shell_unsupported((char*)"flash.net.FileReference.download (no HTTP download backend in this build)"); }');
     this.line('void FileReference_requestPermission(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.net.FileReference.requestPermission (no native file dialog in this build)"); }');
-    this.line('void FileReference_upload(void* _this, URLRequest* request, char* uploadDataFieldName, bool testUpload) { (void)_this; (void)request; (void)uploadDataFieldName; (void)testUpload; as_shell_unsupported((char*)"flash.net.FileReference.upload (no HTTP upload backend in this build)"); }');
-    this.line('void FileReference_uploadUnencoded(void* _this, URLRequest* request) { (void)_this; (void)request; as_shell_unsupported((char*)"flash.net.FileReference.uploadUnencoded (no HTTP upload backend in this build)"); }');
+    this.line('void FileReference_upload(void* self, URLRequest* request, char* uploadDataFieldName, bool testUpload);');
+    this.line('void FileReference_uploadUnencoded(void* self, URLRequest* request);');
     // ---- flash.net.FileReferenceList -----------------------------------------
     // Measured on adl 51.4.1 (temp/fileaudit2/AH.as): a fresh FileReferenceList has
     // `fileList == null` (NOT an empty Array), `fileList` is read-only, there is no
@@ -20342,12 +20350,12 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     // themselves once (stderr) instead of silently returning, so a flow that
     // depends on one is visibly stalled rather than mysteriously empty.
     this.line('void File_openWithDefaultApplication(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.filesystem.File.openWithDefaultApplication"); }');
-    // File.upload(request, fieldName, testUpload): POST the file's contents as
-    // multipart/form-data. There is no HTTP request backend in this build, so the
-    // call reports itself once (stderr) and dispatches NOTHING -- the upload cannot
-    // silently "succeed", which is what an app waiting on
-    // DataEvent.UPLOAD_COMPLETE_DATA would otherwise conclude.
-    this.line('void File_upload(void* _this, URLRequest* request, char* uploadDataFieldName, bool testUpload) { (void)_this; (void)request; (void)uploadDataFieldName; (void)testUpload; as_shell_unsupported((char*)"flash.filesystem.File.upload (no HTTP upload backend in this build)"); }');
+    // File.upload(request, fieldName, testUpload): File extends FileReference in
+    // AIR, and this build implements the upload for real (file-dialog.ts carries
+    // the measured multipart envelope), so the File-typed entry point hands
+    // straight over to it. Kept as a symbol of its own because code that names the
+    // class statically (or a vtable built from a File-typed slot) must link.
+    this.line('void File_upload(void* _this, URLRequest* request, char* uploadDataFieldName, bool testUpload) { FileReference_upload(_this, request, uploadDataFieldName, testUpload); }');
     // getDirectoryListing: list a directory's children as File objects (skipping
     // . and ..), used by AssetManager to recursively enqueue folder contents.
     this.line('as_array* File_getDirectoryListing(void* _this) {');
