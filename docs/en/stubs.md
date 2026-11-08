@@ -146,6 +146,6 @@ node src/index.ts <probe>.as -o out --run
 
 The criterion: `adl` runs it correctly and we cannot ⇒ **remaining defect** (belongs
 in `TODO.md` under "remaining work"); `adl` also errors, or the API does not exist in
-AIR at all ⇒ **enhancement**. All eight real gaps above are of the first kind, except
+AIR at all ⇒ **enhancement**. All four real gaps above are of the first kind, except
 where the platform physically has no such feature (`LocalConnection` has no transport
 in AIR either).
