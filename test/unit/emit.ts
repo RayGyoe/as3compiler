@@ -5209,3 +5209,86 @@ function checkPasswordStars(): string[] {
   return bad;
 }
 registerGroup('unit: emit/PasswordStars', checkPasswordStars);
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// unit: emit/SoundNoBackend (阶段三百九十四)
+//
+// A build with no audio backend used to turn as_audio_decode's stub -1 into
+// `ArgumentError #2068` ("Invalid sound"), i.e. it reported "bad data" for a
+// payload it never looked at. AIR only fails a load when the DATA is bad; with no
+// device it loads normally and the silence appears at play() time
+// (length 0, play() null, SoundMixer.areSoundsInaccessible() true).
+//
+// The pins below are what keeps the two apart: a "no decoder" answer must be
+// accepted (AS_SND_NOCDC), and play() must still throw #2068 for an EMPTY Sound
+// (measured on adl, with or without a device).
+// ---------------------------------------------------------------------------
+function checkSoundNoBackend(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++;
+    else bad.push(`[sound-nobackend] ${label}`);
+  };
+
+  const src = 'import flash.media.Sound;\n'
+    + 'var s:Sound = new Sound();\n'
+    + 's.play();\n';
+  const c = generateC(parse(src)).c;
+
+  // ---- the sentinel and its gate
+  check('a "no decoder" answer has its own sentinel',
+    c.includes('#define AS_SND_NOCDC (-2)'));
+  check('only a build without a usable backend accepts an undecoded payload',
+    c.includes('static int as_snd_accept_undecoded(Sound* o, unsigned total, unsigned loaded) {')
+    && c.includes('if (as_audio_ready()) return 0;')
+    && c.includes('o->_snd_buf = AS_SND_NOCDC;'));
+
+  // ---- every load path consults it before reporting bad data
+  // The prototypes above carry the same text, so the anchors end at the "{" of the
+  // DEFINITION (the prototypes end at ";").
+  const comp = c.indexOf('static void Sound_loadCompressedDataFromByteArray(void* _this, ByteArray* bytes, unsigned int length) {');
+  const pcm = c.indexOf('static void Sound_loadPCMFromByteArray(void* _this, ByteArray* bytes, unsigned int samples, char* format, bool stereo, double sampleRate) {');
+  check('the compressed path accepts instead of throwing', comp >= 0 && pcm > comp
+    && c.slice(comp, pcm).includes('if (as_snd_accept_undecoded(o, n, n)) { o->_snd_buffering = false; o->_snd_xpos = 0; return; }'));
+  check('the accept branch runs BEFORE the #2068 throw', comp >= 0 && pcm > comp
+    && c.slice(comp, pcm).indexOf('as_snd_accept_undecoded(o, n, n)') < c.slice(comp, pcm).indexOf('Error #2068'));
+  check('the PCM path accepts instead of throwing',
+    c.includes('if (o->_snd_buf < 0 && !as_snd_accept_undecoded(o, (unsigned int)need, (unsigned int)need))'));
+  const finish = c.indexOf('if (o->_snd_buf < 0 && as_snd_accept_undecoded(o, btotal, total)) {');
+  const tail = (finish >= 0) ? c.slice(finish, finish + 700) : '';
+  check('a finished Sound.load() reports COMPLETE, not ioError, without a decoder',
+    finish >= 0
+    && tail.includes('Event_new((char*)"complete", false, false)')
+    && tail.indexOf('"complete"') < tail.indexOf('ioError'));
+
+  // ---- an EMPTY Sound must still fail loudly (adl-measured, device or not)
+  check('play() still throws #2068 for an empty Sound',
+    c.includes('if (o->_snd_buf < 0 && o->_snd_buf != AS_SND_NOCDC)'));
+  check('the no-device answer is still null (unchanged)',
+    c.includes('if (!as_audio_ready()) return NULL;'));
+
+  // ---- the example, the build-time warning and both docs must agree
+  const ex = readFileSync(join(root, 'examples', 'sound-nobackend.as'), 'utf8');
+  check('the example asserts the accepted load, length 0 and play() null',
+    ex.includes('must NOT throw') && ex.includes('snd.length == 0') && ex.includes('ch == null'));
+  check('the example still asserts the empty-Sound throw',
+    ex.includes('play() on a Sound with no data must still throw #2068'));
+  const reg = readFileSync(join(root, 'test', 'examples.ts'), 'utf8');
+  check('the example is registered in the regression suite',
+    reg.includes('sound-nobackend.as'));
+  const zh = readFileSync(join(root, 'docs', 'zh-cn', 'audio.md'), 'utf8');
+  const en = readFileSync(join(root, 'docs', 'en', 'audio.md'), 'utf8');
+  check('the zh doc states the no-decoder load contract',
+    zh.includes('AS_SND_NOCDC'));
+  check('the en doc states the no-decoder load contract',
+    en.includes('AS_SND_NOCDC'));
+  const warn = readFileSync(join(root, 'src', 'air-app.ts'), 'utf8');
+  check('the build-time warning still promises exactly what the runtime now does',
+    warn.includes('play() returns null and SoundMixer.areSoundsInaccessible() is true'));
+
+  console.log(`     [sound-nobackend] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/SoundNoBackend', checkSoundNoBackend);

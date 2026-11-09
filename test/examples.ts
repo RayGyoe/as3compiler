@@ -441,6 +441,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // shaper -- Δwidth = characters × letterSpacing -- and the paragraph cache must follow
   // the format. Needs the same Skia text backend as the metric examples above.
   'text-letterspacing.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // sound-nobackend.as（阶段三百九十四）钉「没有音频后端」时的**载入**口径：无解码器不再
+  // 被翻成 #2068（那是「数据坏」的罪名），载荷照样记账、length 为 0、play() 返 null；只有
+  // 空 Sound 的 play() 才抛。默认构建就是无后端，所以不需要额外清单；带 audio.build.json
+  // 的构建里示例整组自跳过。
+  'sound-nobackend.as': [],
   // password-stars.as（阶段三百九十三）钉 displayAsPassword 的星号个数按 UTF-16 **码元**：
   // 星号串是布局文本，其宽度就是 N 颗星的宽度，所以只要把 masked "中文ab" 的 textWidth
   // 与字面 "****"/"********" 比一下就能区分码元与字节口径，不需要截图。判据来自 adl 51.4.1

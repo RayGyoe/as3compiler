@@ -193,9 +193,9 @@ miniaudio **v0.11.25**，4,108,168 B / 95,864 行。）
 | `startTime` / `position` | 毫秒；`position` 停止后**保留**最后值、循环开始时**归零** | `position` 恒 0 或单位搞成秒 |
 | `SOUND_COMPLETE` | 在**播完**（循环也终止）时于 `SoundChannel` 上派发 | 永远不派；或在 `Sound` 上派 |
 | `SoundTransform` | channel 级 → `SoundMixer.soundTransform` 全局**再叠一层** | 只存字段、不影响输出 |
-| `loadCompressedDataFromByteArray` | **同步解码**（AIR 3）；数据不足**抛异常**；含 ID3 会派 `Event.ID3` | 异步、静默吞错 |
+| `loadCompressedDataFromByteArray` | **同步解码**（AIR 3）；数据不足**抛异常**；含 ID3 会派 `Event.ID3`。**本构建没有解码器**（无音频后端 ⇒ `as_audio_decode` 是桩）时**不**抛 `#2068`：载荷照样记账（`bytesTotal`/`bytesLoaded`）、`length` 为 0、`play()` 返 `null` | 异步、静默吞错；或把「没有解码器」误报成「数据坏」 |
 | `SoundMixer.stopAll()` | 停掉所有在播声道 | 缺失 |
-| 无音频设备时 | `play()` 返回 `null`（官方：「没有声卡或用尽声道时返回 null」） | 崩溃或静默返回空 channel |
+| 无音频设备时 | `play()` 返回 `null`（官方：「没有声卡或用尽声道时返回 null」）；**装载不受影响**——`loadCompressedDataFromByteArray` / `loadPCMFromByteArray` / `load(url)` 都照样成功（`length` 0、`play()` null） | 崩溃或静默返回空 channel；或反过来把装载报成失败 |
 
 ---
 
@@ -205,6 +205,10 @@ miniaudio **v0.11.25**，4,108,168 B / 95,864 行。）
   所以**不需要** `--features` 具名开关、不需要「默认拒绝」——默认就该有声音。
 - **WASI 无音频**（无 SDL/无 CoreAudio/无 Web Audio/无 miniaudio 后端）⇒ 属**平台硬边界**，
   必须**如实报明「本后端不支持音频」**（`play()` 返回 `null` 或响亮报明），**绝不静默假装成功**。
+  注意「无后端」只在**播放**时表现为无声，**装载**依旧成功：没有解码器就看不出数据好坏，
+  此时把载荷收进 `AS_SND_NOCDC`（阶段三百九十四）、`length` 为 0，`areSoundsInaccessible()` 为真；
+  只有**空** `Sound`（压根没有数据）的 `play()` 才抛 `#2068`（adl 实测，有无设备都一样）。
+  判据链：`examples/sound-nobackend.as`（无后端构建断言装载成功、不抛、`play()` null；有后端构建自跳过）。
 - **浏览器自动播放策略**（`AudioContext` 须在用户手势后 `resume()`）⇒ 同样是平台硬边界。
   本仓库的窗口 harness 已有合成点击能力（`temp/nwtest/`、Flappy 的驱动脚本），可据此处理；web 端需
   在首次用户手势时 `resume()`。**如实处理，不静默。**
@@ -509,7 +513,7 @@ node src/index.ts examples/audio/AudioPlayer.as \
 | 14.5 | **VBR/Xing 的 MP3** | `vbr.mp3`（LAME VBR，Xing 声明 78 帧、物理 79 帧）在 adl 上**永不派发 open/complete**（120 s 看门狗内只有 `START`），即卡死 | 走**物理帧游走**：79 帧 → `2063.6734693878 ms`（ffprobe 依 Xing 得 2038.37 ms） | 不复刻卡死（卡死不是可对齐的行为）；与我们 10 个 CBR 素材在 adl 上**逐位一致**的口径保持一致。Xing 时长与物理帧数是两件事，取后者 |
 | 14.6 | **`play(startTime ≥ length)`** | **卡死**（实测） | 夹取到 `frames`（首块即结束） | 同上：不复刻卡死 |
 | 14.7 | **`app:/` URL 文本** | `File.applicationDirectory` 相对路径解析成 `app:/…`（文件缺失与负载不可解码两种 `Sound.load` 失败的 `ioError.text` 亦然） | 绝对路径文本；**`errorID`（2032）、`len=0`、`buffering=true`、`url` 非 null 全部一致**（轮 10） | 属 `flash.filesystem` 的 URL 文本口径（非音频），已由 §13.2 的 `url` 语义覆盖「null vs 非 null」 |
-| 14.8 | **动态音频（`SampleDataEvent`）与 WASI/web 后端** | `play()` 派发 `sampleData` 让我们自己喂 PCM；`Sound` 加上 `SampleDataEvent.SAMPLE_DATA` 监听器后 `play()` 返回**真实 channel**（实测 `F dyn play=true len=0`） | 未实现 `SampleDataEvent`（录制到遗留）；WASI 无后端（`areSoundsInaccessible()=true`，`play()` 返回 `null`）；web 端当前清单**不接** glue，构建期**会警告**「this app uses flash.media, but the web build has no audio backend yet」 | 均**如实报明**，不静默假成功（§1.5）。`SampleDataEvent` 已入 `TODO.md` 遗留待开发 |
+| 14.8 | **动态音频（`SampleDataEvent`）与 WASI/web 后端** | `play()` 派发 `sampleData` 让我们自己喂 PCM；`Sound` 加上 `SampleDataEvent.SAMPLE_DATA` 监听器后 `play()` 返回**真实 channel**（实测 `F dyn play=true len=0`） | 未实现 `SampleDataEvent`（录制到遗留）；WASI 无后端（`areSoundsInaccessible()=true`，`play()` 返回 `null`）；web 端当前清单**不接** glue，构建期**会警告**「this app uses flash.media, but the web build has no audio backend yet」。**阶段三百九十四起**，无解码器时**装载也成功**（不再把桩的 -1 翻成 `#2068`）：载荷收进 `AS_SND_NOCDC`、`length` 0、`play()` null，见 §6 | 均**如实报明**，不静默假成功（§1.5）。`SampleDataEvent` 已入 `TODO.md` 遗留待开发 |
 
 ---
 

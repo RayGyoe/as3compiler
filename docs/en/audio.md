@@ -206,9 +206,9 @@ behaviour to be measured per item during implementation):
 | `startTime` / `position` | Milliseconds; `position` **retains** its last value after stop and **resets to 0** at each loop start | `position` stuck at 0, or measured in seconds |
 | `SOUND_COMPLETE` | Dispatched on the `SoundChannel` when playback **finishes** (loops exhausted too) | Never dispatched; or dispatched on `Sound` |
 | `SoundTransform` | Channel-level, then `SoundMixer.soundTransform` applies a **further global layer** | Storing the fields without affecting output |
-| `loadCompressedDataFromByteArray` | **Synchronous** decode (AIR 3); throws if the data is insufficient; dispatches `Event.ID3` when ID3 is present | Async, or silently swallowing errors |
+| `loadCompressedDataFromByteArray` | **Synchronous** decode (AIR 3); throws if the data is insufficient; dispatches `Event.ID3` when ID3 is present. With **no decoder in this build** (no audio backend ⇒ `as_audio_decode` is a stub) it does **not** throw `#2068`: the payload is still accounted (`bytesTotal`/`bytesLoaded`), `length` is 0 and `play()` returns `null` | Async, or silently swallowing errors; or reporting "no decoder" as "bad data" |
 | `SoundMixer.stopAll()` | Stops every playing channel | Missing |
-| No audio device | `play()` returns `null` (official: "returns null if you have no sound card or run out of channels") | Crashing, or silently returning an empty channel |
+| No audio device | `play()` returns `null` (official: "returns null if you have no sound card or run out of channels"); **loading is unaffected** — `loadCompressedDataFromByteArray` / `loadPCMFromByteArray` / `load(url)` all still succeed (`length` 0, `play()` null) | Crashing, or silently returning an empty channel; or the reverse — reporting the load itself as a failure |
 
 ---
 
@@ -218,6 +218,12 @@ behaviour to be measured per item during implementation):
   and do produce sound. So **no `--features` flag and no "deny by default"** — sound should simply work.
 - **WASI has no audio** (no SDL, no CoreAudio, no Web Audio, no miniaudio backend) ⇒ a **platform hard boundary**;
   it must **honestly report "this backend does not support audio"** (`play()` returns `null`, or a loud error),
+  and must **never pretend to succeed silently**. Note that "no backend" only shows up as silence at **play**
+  time — **loading still succeeds**: without a decoder the data cannot be judged, so the payload is kept as
+  `AS_SND_NOCDC` (stage 394), `length` is 0 and `areSoundsInaccessible()` is true; only the `play()` of an
+  **empty** `Sound` (no data at all) throws `#2068` (measured on adl, with or without a device).
+  Contract: `examples/sound-nobackend.as` (a no-backend build asserts the load succeeds, does not throw and
+  `play()` is null; a build with a backend skips the group).
   and **must never silently pretend success**.
 - **Browser autoplay policy** (an `AudioContext` must be `resume()`d after a user gesture) ⇒ likewise a platform
   hard boundary. The window harness already has synthetic-click capability (`temp/nwtest/`, the Flappy driver

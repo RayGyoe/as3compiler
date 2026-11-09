@@ -16103,6 +16103,24 @@ this.line('AS_bake_pend_n = 0;');
     this.line('char* Sound_get_url(void* _this) { return ((Sound*)_this)->_snd_url; }');
     this.line('ID3Info* Sound_get_id3(void* _this) { return ((Sound*)_this)->_snd_id3; }');
     this.line('bool Sound_get_isURLInaccessible(void* _this) { return ((Sound*)_this)->_snd_inaccessible; }');
+    // A build with no audio backend (wasm/web, or a host whose device failed to open)
+    // has no decoder, so as_audio_decode's -1 cannot be read as "the DATA is bad" --
+    // from here the two are indistinguishable. AIR fails a load only when the data is
+    // bad; on a machine with no device it still loads the sound and the silence shows
+    // up later (length 0, play() returns null, SoundMixer.areSoundsInaccessible()
+    // true). The payload therefore lands in AS_SND_NOCDC, which is distinct from the
+    // -1 of "no data at all", so play() keeps throwing #2068 for an empty Sound
+    // (measured on adl, device or not, see Sound_play). bytesTotal/bytesLoaded still
+    // report the payload that was handed in.
+    this.line('#define AS_SND_NOCDC (-2)');
+    this.line('static int as_snd_accept_undecoded(Sound* o, unsigned total, unsigned loaded) {');
+    this.indent++;
+    this.line('if (as_audio_ready()) return 0;');
+    this.line('o->_snd_buf = AS_SND_NOCDC;');
+    this.line('o->_snd_bytesTotal = total; o->_snd_bytesLoaded = loaded;');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
     this.line('void Sound_loadCompressedDataFromByteArray(void* _this, ByteArray* bytes, unsigned int length) {');
     this.indent++;
     this.line('Sound* o = (Sound*)_this;');
@@ -16127,6 +16145,8 @@ this.line('AS_bake_pend_n = 0;');
     this.line('o->_snd_buf = as_audio_decode(src, n);');
     this.line('if (o->_snd_buf < 0) {');
     this.indent++;
+    // No decoder in this build: accept the payload and stay silent (see the helper).
+    this.line('if (as_snd_accept_undecoded(o, n, n)) { o->_snd_buffering = false; o->_snd_xpos = 0; return; }');
     // AIR reports a sound whose data will not decode exactly like an empty one.
     this.line('o->_snd_bytesTotal = 0; o->_snd_bytesLoaded = 0;');
     this.line('as_throw(ArgumentError_new((char*)"Error #2068: Invalid sound.", 2068));');
@@ -16215,7 +16235,9 @@ this.line('AS_bake_pend_n = 0;');
     this.line('}');
     this.line('o->_snd_buf = as_audio_register_pcm(pcm, (long long)samples, chans, rate);');
     this.line('free(pcm);');
-    this.line('if (o->_snd_buf < 0) { as_throw(ArgumentError_new((char*)"Error #2068: Invalid sound.", 2068)); return; }');
+    // Same rule as the compressed path: with no backend there is nothing to
+    // validate against, so the PCM payload is accepted rather than rejected.
+    this.line('if (o->_snd_buf < 0 && !as_snd_accept_undecoded(o, (unsigned int)need, (unsigned int)need)) { as_throw(ArgumentError_new((char*)"Error #2068: Invalid sound.", 2068)); return; }');
     this.line('o->_snd_xpos = 0;');
     this.line('o->_snd_bytesTotal = (unsigned int)need; o->_snd_bytesLoaded = (unsigned int)need; o->_snd_buffering = false;');
     this.line('Sound__applyID3(o, o->_snd_buf);');
@@ -16296,7 +16318,10 @@ this.line('AS_bake_pend_n = 0;');
     // The parameter check comes FIRST: an empty Sound throws #2068 on any machine,
     // device or not (measured on adl), so a missing backend must not mask it --
     // otherwise an audio-less build returns null for a Sound AIR rejects outright.
-    this.line('if (o->_snd_buf < 0) { as_throw(ArgumentError_new((char*)"Error #2068: Invalid sound.", 2068)); return NULL; }');
+    // AS_SND_NOCDC is the one negative that is NOT empty: its payload loaded fine
+    // and there was simply nothing to decode with, so play() falls through to the
+    // no-device answer below (null), exactly as AIR does without a device.
+    this.line('if (o->_snd_buf < 0 && o->_snd_buf != AS_SND_NOCDC) { as_throw(ArgumentError_new((char*)"Error #2068: Invalid sound.", 2068)); return NULL; }');
     // AIR with no sound card (and our no-backend build) returns null from play().
     this.line('if (!as_audio_ready()) return NULL;');
     // The channel's gains are the ones AIR hands back through
@@ -17262,6 +17287,16 @@ this.line('AS_bake_pend_n = 0;');
     // loadCompressedDataFromByteArray does: AIR decodes a Sound synchronously and
     // the terminate event is COMPLETE, not "still buffering".
     this.line('o->_snd_buf = as_audio_decode(as_job_bytes(job), total);');
+    // No decoder in this build: the payload was fetched fine and there is nothing to
+    // judge it against, so the load finishes (COMPLETE) and the silence shows up at
+    // play() time -- see as_snd_accept_undecoded. Reporting #2032 here would blame the
+    // stream for a missing audio backend.
+    this.line('if (o->_snd_buf < 0 && as_snd_accept_undecoded(o, btotal, total)) {');
+    this.indent++;
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"complete", false, false));');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
     // Measured on adl (round 10): fetching a file that is NOT audio (a .ts source
     // file) raises ioError #2032 -- "Stream Error", the same number a missing file
     // gets -- and dispatches no COMPLETE at all. AIR decodes before it reports the
