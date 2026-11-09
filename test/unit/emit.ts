@@ -5125,3 +5125,87 @@ function checkStringUtf16Index(): string[] {
   return bad;
 }
 registerGroup('unit: emit/StringUtf16Index', checkStringUtf16Index);
+
+// ---------------------------------------------------------------------------
+// unit: emit/PasswordStars (阶段三百九十三)
+//
+// displayAsPassword lays the field out from a string of stars (measured on adl
+// 51.4.1, temp/editprobe + temp/pwd/air/AirPwd.as). Since G38 the String index
+// space is UTF-16 code units, so the mask is one star per CODE UNIT; the old
+// "one star per UTF-8 byte" mask was the last place still answering in the byte
+// domain, and it forced as_tf_utf16_index/as_tf_byte_index to short-circuit for
+// password fields. Those shortcuts are gone, and the paragraph's run ranges are
+// converted through the same map.
+//
+// Oracle (adl 51.4.1, `_typewriter` 12, textWidth of the star string):
+//   pwd "中文ab" = 20.00 == pwd "****"  (4 stars, NOT 8 bytes = 40.00)
+//   pwd "😀"     = 10.00 == pwd "**"    (2 stars, NOT 4 bytes = 20.00)
+// The AOT build measured 40.00 / 20.00 before this change and 20.00 / 10.00 after.
+// ---------------------------------------------------------------------------
+function checkPasswordStars(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) ok++;
+    else bad.push(`[password-stars] ${label}`);
+  };
+
+  const src = 'import flash.text.TextField;\n'
+    + 'var tf:TextField = new TextField();\n'
+    + 'tf.displayAsPassword = true;\n'
+    + 'tf.text = "中文ab";\n';
+  const c = generateC(parse(src)).c;
+
+  // ---- the mask is built per code unit, and a break byte survives verbatim
+  check('the mask decodes UTF-8 lead bytes',
+    c.includes('static const char* as_tf_layout_text(TextField* tf)')
+    && c.includes("size_t len = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2 : ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xF8) == 0xF0) ? 4 : 1;"));
+  check('one star per code unit, two for an astral character',
+    c.includes("else { m[o++] = '*'; if (len == 4) m[o++] = '*'; }"));
+  check('CR/LF are copied through, not starred',
+    c.includes("if (len == 1 && (c == '\\r' || c == '\\n')) { m[o++] = (char)c; }"));
+  check('a truncated trailing sequence cannot read past the buffer',
+    c.includes('if (i + len > n) len = n - i;'));
+  check('the OLD per-byte mask is gone',
+    !c.includes("m[i] = (c == '\\r' || c == '\\n') ? c : '*';"));
+
+  // ---- the two index bridges no longer special-case passwords
+  const utf16At = c.indexOf('static int as_tf_utf16_index(');
+  const byteAt = c.indexOf('static int as_tf_byte_index(');
+  check('as_tf_utf16_index exists', utf16At >= 0);
+  check('as_tf_byte_index exists', byteAt >= 0);
+  if (utf16At >= 0 && byteAt > utf16At) {
+    const bridges = c.slice(utf16At, byteAt);
+    check('as_tf_utf16_index does not short-circuit to the byte index',
+      !bridges.includes('if (tf->displayAsPassword) return byteIndex;'));
+  }
+  if (byteAt >= 0) {
+    const byteBody = c.slice(byteAt, byteAt + 1200);
+    check('as_tf_byte_index does not short-circuit to the unit index',
+      !byteBody.includes('if (tf->displayAsPassword) { int m = (int)strlen(s); return unitIndex > m ? m : unitIndex; }'));
+  }
+
+  // ---- run ranges reach the glue in the layout string's index space
+  check('a password run range is converted before the glue sees it',
+    c.includes('int rb = tf->displayAsPassword ? as_tf_utf16_index(tf, b) : b;')
+    && c.includes('int re = tf->displayAsPassword ? as_tf_utf16_index(tf, e) : e;')
+    && c.includes('runs[i].start = (unsigned)rb;')
+    && c.includes('runs[i].end = (unsigned)re;'));
+
+  // ---- the example holds the observable contract and names the oracle
+  const ex = readFileSync(join(root, 'examples', 'password-stars.as'), 'utf8');
+  check('the example compares the mask against literal star strings',
+    ex.includes('check(cjk.textWidth == four') && ex.includes('check(cjk.textWidth != eight'));
+  check('the example covers astral characters (surrogate pair = 2 stars)',
+    ex.includes('check(emoji.textWidth == two') && ex.includes('check(emoji.textWidth != four'));
+  check('the example pins the break and the real text',
+    ex.includes('multi.numLines == 2') && ex.includes("multi.getLineText(0) == \"a\""));
+  check('the example names the AIR evidence',
+    ex.includes('adl 51.4.1') && ex.includes('temp/pwd/air/AirPwd.as'));
+  check('the example records the byte-based numbers it replaced',
+    ex.includes('w=40.00') && ex.includes('w=20.00（4 颗）'));
+
+  console.log(`     [password-stars] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/PasswordStars', checkPasswordStars);

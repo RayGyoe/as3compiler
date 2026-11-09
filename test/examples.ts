@@ -441,6 +441,11 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // shaper -- Δwidth = characters × letterSpacing -- and the paragraph cache must follow
   // the format. Needs the same Skia text backend as the metric examples above.
   'text-letterspacing.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
+  // password-stars.as（阶段三百九十三）钉 displayAsPassword 的星号个数按 UTF-16 **码元**：
+  // 星号串是布局文本，其宽度就是 N 颗星的宽度，所以只要把 masked "中文ab" 的 textWidth
+  // 与字面 "****"/"********" 比一下就能区分码元与字节口径，不需要截图。判据来自 adl 51.4.1
+  // （temp/pwd/air/AirPwd.as：20.00 == "****"，8 字节会是 40.00；"😀" == "**"）。同 Skia 文本后端。
+  'password-stars.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
   // text-edit-api.as（阶段三百三十七）钉 replaceText/replaceSelectedText 的区间与
   // 选区口径、赋 .text 重置光标、setSelection(0,0) 收缩；与字体无关，无特殊清单。
   'text-edit-api.as': [],

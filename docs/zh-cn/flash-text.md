@@ -3,7 +3,7 @@
 > **触发**：真应用 talkmed-meeting 的 AOT ↔ `adl` 差异报告
 > （工作区根 `talkmed-meeting-aot-vs-adl-diff.md`，2026-10-14）把 12 项可见差异归并成 4 条根因——
 > 其中 **R2（SWC 的 `DefineEditText`/`DefineText` 未烘文本、也未烘 `TextFormat`）** 与
-> **R3 的文本项**（`as_str_alloc(1)` 未写终止符、`displayAsPassword` 按字节掩码、字体别名/度量残差）
+> **R3 的文本项**（`as_str_alloc(1)` 未写终止符、`displayAsPassword` 掩码——当时按字节、阶段三百九十三起按码元、字体别名/度量残差）
 > 全部落在 `flash.text` 这一个面上。本文是**立项文档**：先盘点现状与差距、给出显示矩阵与示例口径，
 > 再把「对齐 `TextField` 这座大山」拆成可逐阶段验收的工作包。
 >
@@ -96,7 +96,7 @@
 | # | 现象 | 根因 | 代码位置 | 证据 |
 |---|---|---|---|---|
 | **D-T5** | 空 `TextField` 会渲染出「上一条文本布局」的残留（`MS: 17` / `_sans`，每次运行不同） | `TextField_ctor` 用 `o->text = as_str_alloc(1)` —— 1 字节、`gc_alloc` 对 `GCT_STRING` **故意不清零**、**未写终止符**，`strlen` 一直读到该 GC 块上次残留 → 违反 `as_str_alloc` 的契约（调用者写 NUL） | `src/emit.ts:16140`；契约在 `src/runtime.ts:968`。同类：`src/emit.ts:12789/12791`（`Socket__str`） | 差异报告 D4（决定性实验：给它设红/粗/等宽格式但文本空 ⇒ 乱码变红色等宽） |
-| **D-T6** | 密码框占位按**字节**掩码（`请输入密码` 5 汉字 → 15 星号），adl 5 颗；星号颜色我们黑、adl 灰 162 | `as_tf_layout_text` 逐**字节**替换（一个星一字节），而 AIR 按 **UTF-16 码元** | `src/emit.ts` `as_tf_layout_text`（`m[i] = (c=='\r'||c=='\n') ? c : '*'`） | 差异报告 D9、`cmp_pwd.png` |
+| **D-T6** | 密码框占位星号**计数口径** ✅（阶段三百九十三）；**星号颜色**仍开放（我们黑、adl 灰 162） | ~~`as_tf_layout_text` 逐**字节**替换~~ 现按 **UTF-16 码元**一颗星（代理对 2 颗、CR/LF 原样保留），与 G38 之后的 `String` 索引域同源；`as_tf_utf16_index`/`as_tf_byte_index` 的「密码恒等」短路随之删除，run 区间改走同一换算 | `src/emit.ts` `as_tf_layout_text`、两个 index 桥、paragraph run 区间 | adl 51.4.1 `temp/pwd/air/AirPwd.as`：masked `中文ab` `textWidth` **20.00** = `****`（8 星会是 40.00）、`😀` **10.00** = `**`；本仓修前 40.00/20.00、修后 20.00/10.00 |
 | **D-T7** | `_sans`/`_serif` 通用别名的**行高**与 AIR 不同（我们 12/13，adl 15.5/15）；`textWidth` 行尾空格不计（AIR 计）；字形进位 ≤0.5px 残差 | AIR 对三个通用别名用**自有非线性设备字体度量表**，无可解析字面能复现 | `vendor/skia_glue.cc` `sk_air_line_metrics`/`sk_round_half` | 遗留表「`_sans`/`_serif` 行高」「`textWidth` 不含行尾空格」「字形累进残差」三行 |
 | **D-T8** | `String` 是 **UTF-8 字节索引**（非 UTF-16 码元）：`"中".length` 我们 3、adl 1；`displayAsPassword` 星号数、编辑索引同源 | 运行时字符串表示的直接后果 | `src/runtime.ts` 字符串层 | 遗留表「UTF-8 字节索引」行（**非本方案目标**，见 §0） |
 | **D-T9** | `TextFormat` 字段是子集：缺 `leftMargin`/`rightMargin`/`indent`/`blockIndent`/`bullet`/`display`/`tabStops`/`url`/`target`；ctor 只收 6 参（AIR 11 参） | 未建模 | `src/symbols.ts` `TextFormat` classMap | 遗留表「`TextFormat` 字段是子集」行（**响亮报错**，非静默） |
@@ -195,7 +195,8 @@ property），C 存储换成运行时槽 `_dtf`/`_insFmt`（进 props 表的 GC 
 | **N7** | `BitmapData.draw()` **不 alpha 合成**：目标位图已有的内容被源**逐像素覆盖**。同是 `new BitmapData(w,h,false,0xFFFFFFFF)` + `draw()`，adl 的底在 draw 之后**仍是白的**（`alpha>=8` 的像素占 100%），我们只剩源本身有墨的那 4.2%（其余写成了 `0x00000000`） | 新，**`BitmapData` 面**（由 §5.2 的 UI 通道发现） | 实测定案（两端 `textfield-grid.raw` 逐像素统计）；`src/emit.ts` `BitmapData_draw` 采样尾 `dp[…] = (sa<<24)\|\|…` 无条件写 |
 | **N8** | `Graphics.lineStyle(0, …)` 到底画不画 hairline？我们按 `hasStroke = thickness > 0` 判**无描边**；AIR 侧**未实测** | **待查**（`Graphics` 面） | 网格最初用 `lineStyle(0)` 画字段盒，**我们侧完全没画出来**；为避免把两条口径混在一起，harness 改用 1 |
 
-> **D-T6 根因收窄**：不是「星号字宽不对」，而是两点——① AIR **每 UTF-16 码元**一个星（我们每字节）；
+> **D-T6 根因收窄**：不是「星号字宽不对」，而是两点——① ~~AIR **每 UTF-16 码元**一个星（我们每字节）~~
+> **① 已于阶段三百九十三修齐**（星号数按码元、代理对两颗、CR/LF 原样，实测见 D-T6 行）；
 > ② AIR 的 `displayAsPassword` setter **不重排**（我们每次排版都重算星号串）。②是本 app 里
 > `tf.text=…; tf.displayAsPassword=true;`（常见顺序）看不到星号的原因。
 
@@ -700,7 +701,8 @@ C-3 的对照探针需要 `replaceSelectedText`，而我们**根本没有**这�
 4. glue 的 `sk_textlayout_paint_underline` 用 `getRectsForRange(kMax, kTight)` 拿到每个区间在
    **每个视觉行**上的前进框（含行尾空格），按框的竖直中线匹配到行，再画 `1.0f` 高的矩形。
 
-字节偏移 → Skia 的 UTF-16 码元一律走既有的 `as_tf_utf16_index`（密码字段是「一字节一星」，恒等）。
+字节偏移 → Skia 的 UTF-16 码元一律走既有的 `as_tf_utf16_index`（密码字段的布局串是**一码元一星**，
+阶段三百九十三起同样按码元换算，不再有恒等短路）。
 
 ### 15.4 顺带修正：行盒取该行**最高**的 run
 

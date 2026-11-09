@@ -635,6 +635,7 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
 - `examples/textwidth-trailing.as` — `textWidth`/`getLineMetrics` **include** trailing blanks (relational assertions; self-skips without a text backend)
 - `examples/text-letterspacing.as` — `TextFormat.letterSpacing` **reaches the shaper** (stage 386, G32): `Δwidth = characters × letterSpacing` (SkParagraph adds it per cluster, same pixel unit); re-filling the text after an edit gives the new layout (relational assertions; self-skips without a text backend)
 - `examples/text-edit-api.as` — `replaceText`/`replaceSelectedText` range+selection contract, assigning `.text` resets the caret/selection to 0, `setSelection(0,0)` collapses
+- `examples/password-stars.as` — `displayAsPassword`'s star string is **one star per UTF-16 code unit** (stage 393): masked `中文ab` measures the same as `****` (not the 8 bytes it used to), an astral character is 2 stars, CR still breaks the line and `getLineText` still reports the real text (adl 51.4.1 oracle; relational assertions, self-skips without a text backend)
 - `examples/textformat-merge.as` — `TextFormat`'s "unset means keep" per-field merge, the copy-returning getter, insert-time binding
 - `examples/bytearray-index.as` — the full semantics of the `ByteArray` index form
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` is a conversion, `new Vector.<T>(length)` is a construction

@@ -724,6 +724,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/textwidth-trailing.as` — `textWidth`/`getLineMetrics` **含**行尾空白（关系式断言，无文本后端自跳过）
 - `examples/text-letterspacing.as` — `TextFormat.letterSpacing` **真的参与排版**（阶段三百八十六，G32）：`Δwidth = 字符数 × letterSpacing`（SkParagraph 逐簇加上、单位同为像素），改字距后重新填文本即为新布局（关系式断言，无文本后端自跳过）
 - `examples/text-edit-api.as` — `replaceText`/`replaceSelectedText` 的区间与选区口径、赋 `.text` 重置光标/选区、`setSelection(0,0)` 收缩
+- `examples/password-stars.as` — `displayAsPassword` 的星号串是**一码元一颗星**（阶段三百九十三）：masked `中文ab` 量与 `****` 相同（不再是过去的 8 字节 8 颗）、星形字符（代理对）2 颗、CR 仍折行而 `getLineText` 仍读到真实文本（adl 51.4.1 对照；关系式断言，无文本后端自跳过）
 - `examples/textformat-merge.as` — `TextFormat` 的「未设则保持」逐字段合并、返回副本的 getter、插入时绑定
 - `examples/bytearray-index.as` — `ByteArray` 下标形式的完整语义
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` 是转换、`new Vector.<T>(length)` 是构造

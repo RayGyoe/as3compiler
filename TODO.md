@@ -5860,6 +5860,8 @@ AIR 文档明确软件窗口不支持 StageVideo/Stage3D 合成，且该构建�
 
 **为什么是「一个字节一个 `*`」而不是「一个字符一个 `*`」**：本运行时的 `String` 是 **UTF-8 字节索引**模型（既有全局口径，见遗留行），若星号串按 UTF-16 码元生成，遮罩串的**字节区间**就与 `.text` 的索引体系对不上，光标/选区/`index_at` 全会错位。故选择与本运行时索引模型自洽：**每字节一颗星**。代价是 **CJK 密码会比 `adl` 多显星**（`中文ab`：adl 4 颗 / 我们 12 颗）——已作为同源偏差登记在「`String` 是 UTF-8 字节索引」行。
 
+> ⚠️ **本段理由已于阶段三百九十三失效**（前置条件变了，不是被推翻）：G38 把 `String` 的索引域换成 **UTF-16 码元**后，「遮罩串按码元」不再与索引体系冲突，星号串已改为**一码元一颗**（代理对 2 颗、CR/LF 原样），`as_tf_utf16_index`/`as_tf_byte_index` 的密码恒等短路一并删除，run 区间也走同一换算。现行口径见 `docs/zh-cn/flash-text.md` D-T6 与 `examples/password-stars.as`。
+
 **顺带修复的两个真缺口（不新增遗留行）**：① **遮罩字段拒复制/剪切**（`adl` 实测是硬边界，不是我们的选择）；② **程序化 `text = ...` 把光标与选区钳到新长度**（`adl` 实测口径；修前我们的光标会停在越界位置，渲染器随后量出越界矩形）。
 
 **验收**：新 `examples/stage94o.as`（A~F：默认值与往返、遮罩不改文本/长度、遮罩开关不改文本与行结构、赋值钳光标、与 `restrict` 正交、多行遮罩字段的行/光标一致性）纳入回归；`test.ts` `[textinput]` 新增 **6 条**钉子（`as_tf_layout_text` 形状、星号串逐字节 + CR/LF 保留、缓存键改 `ltext`、遮罩优先于 run 表、copy/cut 守卫、赋值钳位）；`node test.ts` **140 例全通**。
@@ -20572,7 +20574,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | `with` 的 String/`Vector` 接收者体内的赋值/自增/`delete` 写形态仍无左值路径 | **部分完成**（2026-10-30 阶段三百四十 登记；**2026-10-31 阶段三百四十五**：Function/类/RegExp 三类接收者的成员面已全部落地并移出本行，见该阶段 note；行内只剩 String/`Vector` 体内写形态） | 读取/调用面（八种接收者，`temp/proxyany/MainW.as` + `oursW.as`）与三类新接收者（`temp/with3/`，双端 diff=IDENTICAL）都已对齐；缺的是静态 String/`Vector` 发射器的左值形态：`with (s) { length = 5 }` 这类体内写目前是响亮 CodegenError（Function 接收者已按 `#1074`/`#1037` 分类落地，见 `withAssignFrom` 的 builtin 分支） | `builtin` 写路径按成员分类：`length` 按 AIR 实测分类（String 的 `length` 只读 `#1074`？需先 `adl` 量清）、方法名 `#1037`、未知名落词法/隐式全局；String/`Vector` 各有 `as_str_*`/`as_vector_*` 的 set 助手或直接 C 槽写 |
 | VM 抛错文案与未捕获打印格式与 `adl` **不逐字一致**（编号/异常类/时机一致） | 未开始（2026-10-03 阶段九十四·二 实测登记；**既有全局差异**，with 只是又新增 4 个发射点） | `adl 51.4.1` 实测（探针 `temp/errprobe/`）：`e.message` 对 VM 抛错是**短式**——`with (null)` → `Error #1009`、`with (undefined)` → `Error #1010`、`f()`（`f:Function = null`）→ `Error #1006`、`throw new Error("custom")` → `custom`（自定义 `Error` 保留用户文案）、`throw new TypeError("tmsg",1234)` → `tmsg`；`Error.getErrorMessage(1009)` 同样是 `Error #1009`；`String(e)`/`e.toString()` = `TypeError: Error #1009`；**未捕获**打印恰好是 `<异常类名>: <message>`（无前缀）。本子集自阶段「异常」起用带描述的长文案（`Error #1009: Cannot access a property or method of a null object reference.` 等，约 36 处发射点），未捕获走 `Uncaught exception: <message>`；`e.name` 在本子集是**编译期错误**（未声明）。**结论**：编号、异常类与抛出时机全部一致，仅**文案与打印前缀**不同，故登记为遗留而非误实现。 | 若要逐字对齐：把 VM 抛错文案统一改为短式 `Error #<id>`（`Error.getErrorMessage` 走同一表；用户文案的自定义 `Error` 保持原样），未捕获打印改为 `<类名>: <message>`，并给 `Error` 补 `name`/`getErrorMessage`。属跨切面改动（约 36 个发射点 + runtime 助手），宜单独立项、一次性对齐 + 全量 `test.ts` 回归 |
 | **int/uint 算术在 C 侧按 int32 回绕，AIR 在 double 里算、只在落到 int 槽时才回绕**（`adl 51.4.1`：`2147483647 + 1` 得 `2147483648`、`2000000000 * 2` 得 `4000000000`、`46341 * 46341` 得 `2147488281`、`-1 * 0` 得 **`-0`**；同一批值赋回 `int` 变量时才是 `-2147483648` / `-294967296`） | 未开始（2026-10-30 阶段三百三十四 顺带量到并登记） | 证据：`temp/qcn/Main10.as`、`Main11.as`（adl，运行期从 Array/Vector 取值以排除 `mxmlc` 常量折叠）× `temp/qcn/ours/m10.as`（我们）。**不溢出的形态两侧一致**（`5+5`、`7%2`、`100-3`、`-5` 都是 `int`），分歧只在结果超出 int32 或需要保留 `-0` 时：我们输出 `-294967296` / `1` / `-2`，AIR 输出 `4000000000` / `4611686014132420600` / `4294967294`。根因是发射层给 int×int 直接发 C 的 `int` 运算：C 的 int 加法/乘法溢出是 UB（实际回绕），而 AIR 走 ES3 的 double 加法后按值域归一 | 修法（跨切面，须独立阶段）：`+`/`-`/`*` 的 int×int 发射改 double 运算并保持结果类型为 double，**只在写入 `int`/`uint` 槽（或显式 `int()`/`uint()`）时**才 `as_to_int32`/`as_to_uint32`；同时要重新量 `%`/位运算（实测 `7 % 2` 仍是 `int`、`uint` 的 `%` 语义未测）与所有依赖 int 算术的示例（哈希、索引、坐标取整），并复核 `-0` 在 `trace` 外的可见面。**风险高**：影响所有整型热点路径的生成形态，须先有性能对照再落地。
-| 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |
+| 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗）。**阶段三百九十三 已修掉这半边**：星号串改为每**码元**一颗（代理对 2 颗、CR/LF 原样），`as_tf_layout_text` 不再逐字节替换，`as_tf_utf16_index`/`as_tf_byte_index` 的密码恒等短路一并删除（adl 51.4.1 对照：masked `中文ab` `textWidth` 20.00 = `****`、`😀` 10.00 = `**`；本仓修前 40.00/20.00）。本行**现在只剩编辑索引那半边**（`caretIndex`/选区/行表仍是字节域） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |
 | `URLStream.readObject` 要求 `Loader` **已完成**（AMF 值须已完整缓冲） | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `URLStream` 的读取在本运行时是**缓冲式**：`readObject` 直接从已下载的字节缓冲解（此前也如此），若加载**在飞**（`_job != NULL`）则**响亮抛错**并说明「本子集需要 URLStream 已完成加载」。`adl` 支持流式（边下边解） | 若要流式须让 AMF 读侧与异步 IO 的增量到达打通（读侧要能「不够就等下一块」——与既有 `as_async` 的 pump 模型耦合），成本中；真实工程（`as3swf` 读远程 SWF）通常先整体下载再解析 |
 | `wasm`/`web` 目标**不链接 `iconv`** ⇒ 除 `utf-8`/`unicode` 外的字符集**响亮抛错** | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `build.ts` 的 `platformLinkLibs()` 只在 **darwin** 追加 `iconv`；`AS_HAVE_ICONV=0`（`__EMSCRIPTEN__`/`__wasi__`）时 `writeMultiByte`/`readMultiByte` 遇到非 UTF-8/UTF-16 字符集走 `as_throw_charset_unsupported`（**不静默降级**成 UTF-8——静默会给错字节）。工程的真实用法里 `gbk`/`gb2312`/`shift-jis`/`IBM437`/`iso-8859-*` 都有使用 ⇒ web 目标上这些路径当前**不可用** | emscripten 侧需带 `iconv` 或内置精简代码页表（GBK/Big5/Shift-JIS 三张表即可覆盖工程里的字符集），或改链 ICU/`libiconv` 到 wasm。成本中，且**只影响非 UTF-8 字符集**的 web 构建 |
 | Function 值的 **`this` 绑定**（成员调用 / `with` 调用 / `Function.call(thisArg)` / `apply(thisArg)`）不在本子集 | 未开始（2026-10-03 阶段九十四·五 主动登记；2026-10-30 阶段三百四十一 把证据面从 3 例扩到 9 例，口径未变） | `adl 51.4.1` 实测（`temp/a4probe/` 三行 + `temp/proxyany/thisbp/` U1–U9 + 镜像 `thisb.as`）：`this` 在**函数值**里由**呼叫点**决定——`o.cb()` → `o`、裸 `fn()` → **全局对象**（`String(this)` 是 `[object global]`）、`fn.call(a)`/`fn.apply(a, …)` → `a`（普通函数**认** `thisArg`，方法 thunk 不认）、`with (d) { cb() }` → `d`；而**不带 `this.` 前缀**的名字仍按**创建点**的词法作用域解析（同一闭包里 `name` 得创建者实例、`this.name` 得接收者，两者可以不同）。本子集的闭包在创建点把 `this` 捕获进 `env->this` ⇒ 九例全部与 AIR 不同（U1/U3/U4/U5/U6/U8 拿到创建者实例、U2/U7/U9 该给全局对象）。差异只在「函数体里写 `this`」时可观测 | 忠实须两件表示层改动：① `as_fn` 的调用约定要带一个 self 槽（或在 `as_fn_push_self` 全局里传递，由被调方取走一次），② 实现一个**全局对象**供裸调用回退（`global.name` 之类可观测）。前者要动 `as_fn_make`/所有 `fn(...)` 站点/事件派发，后者是独立的一件事；本子集目前的行为（词法 `this`）至少是稳定的，不做半吊子重绑。|
@@ -20737,7 +20739,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **G4b** | **macOS 菜单栏状态项**（`NSStatusItem`） | **零命中** + **AIR 在 macOS 上没有对应物**：实测 `supportsSystemTrayIcon` = **`false`**、`icon` 是 `DockIcon`、`new SystemTrayIcon()` 抛 **`#2012`**；SDL2 亦无托盘 API ⇒ 需新 `vendor/statusitem_glue.mm` 并接进 `vendor/window_glue.cc` 的事件泵 | **增强**（AIR **在 macOS 上**无对应物）⇒ 必须 opt-in、默认产物与现状同构、缺能力时**报明**不静默降级 | 二百五十五 |
 | **G5** | accessory app（`LSUIElement=1`：无 Dock 图标、不抢焦点） | `src/xcode-project.ts:353` 的 `infoPlist()` 生成器**无此键**；AIR 描述符里也没有这个开关 | **增强** ⇒ 构建清单新字段（如 `agent-app`），默认关 | 二百五十五 |
 | **G8** | **一条命令出已签名 `.app` / `.dmg`** | **✅ 已落地（阶段三百零六～三百零八）**：`--package app`/`dmg`/`exe` 复用既有编译链接管线，支持 AIR 元信息/图标、macOS 签名公证 DMG 与 Windows 资源/Authenticode；口径见 [`docs/zh-cn/release-packaging.md`](docs/zh-cn/release-packaging.md) | **增强已完成**（工程化便利，非 AIR 语义） | 三百零六～三百零八 ✅ |
-| **单行字段（`multiline=false`）里的 `\n` 被我们折叠** | 未开始（2026-10-30 阶段三百三十七 顺带实测登记） | `adl 51.4.1`：`multiline=false` 的字段 `tf.text = "ab\ncd"` 给出 `len=5 / numLines=2 / tw=11 / th=24`（`numLines` 与 `textHeight` 都按**两行**算，换行没有被吞）；我们把 `\n` 折成空格（`as_tf_*` 里 `collapse = (multiline || _html_block) ? 0 : 1`）⇒ 单行字段的 `numLines`/`textHeight`/`getLineText` 与 AIR 不同。**不是**本轮回归，是既有口径差；本轮只是把它从「隐藏」变成「显式」（`examples/textwidth-trailing.as` 里显式 `multiline = true` 并注明） | 修它要动 `collapse` 的默认语义，会波及**全部**单行文本示例、`autoSize` 的高度、`getLineMetrics`/`selection` 的索引域；先补一组「单行 + `\n`」的 adl 矩阵（`numLines`/`textHeight`/`getLineText`/`getLineMetrics`/`getCharIndexAtPoint`）再动手。**成本中高** |
+| **单行字段（`multiline=false`）里的 `\n` 被我们折叠** | 未开始（2026-10-30 阶段三百三十七 顺带实测登记；2026-11-09 阶段三百九十三 补一条同样的 `\r` 实锤） | `adl 51.4.1`：`multiline=false` 的字段 `tf.text = "ab\ncd"` 给出 `len=5 / numLines=2 / tw=11 / th=24`（`numLines` 与 `textHeight` 都按**两行**算，换行没有被吞）；我们把 `\n` 折成空格（`as_tf_*` 里 `collapse = (multiline || _html_block) ? 0 : 1`）⇒ 单行字段的 `numLines`/`textHeight`/`getLineText` 与 AIR 不同。**`\r` 同病**：`multiline=false` + `"a\r中"` 在 adl 是 `lines=2 th=30`（`temp/pwd/air/AirPwd.as` 的 `cr-ml-false`/`plain-cr-mlfalse` 两行，masked 与 unmasked 都一样），我们只有 1 行。**不是**本轮回归，是既有口径差；本轮只是把它从「隐藏」变成「显式」 | 修它要动 `collapse` 的默认语义，会波及**全部**单行文本示例、`autoSize` 的高度、`getLineMetrics`/`selection` 的索引域；先补一组「单行 + `\n`」的 adl 矩阵（`numLines`/`textHeight`/`getLineText`/`getLineMetrics`/`getCharIndexAtPoint`）再动手。**成本中高** |
 
 > **当前判断（2026-10-28 刷新）**：**G8 已在阶段三百零六～三百零八落地**，上表只剩 **G5 仍待排期**
 > （G4a/G4b 已清偿、G3 已以 ANE 交付、G7 已在阶段二百六十四落地）；下面这段 2026-10-23 的排期判断保留原文：
@@ -21218,3 +21220,45 @@ Windows 上 `exit(false)` 也走 `TerminateProcess`（控制台子进程没有�
   工具链发现这条是**独立缺陷**，未在本阶段修（改了也无法在本机验证）。
 - **POSIX 原生分支**（`fork`/`execv`/`O_NONBLOCK`/`waitpid`）本机依旧没跑过，等 macOS arm64 CI 的
   `example: native-process.as`。
+
+### 阶段三百九十三：密码框星号按 UTF-16 码元（v0.4.363 → v0.4.364）
+
+`displayAsPassword` 的布局串是「N 颗星」的替换文本，而它的 N 一直按 **UTF-8 字节**算：
+`中文ab`（8 字节）画 8 颗星，AIR 画 4 颗。阶段九十四·七 当时是**有意**选字节口径的——
+那时 `String` 的索引域就是字节，星号串按码元生成会让遮罩串的字节区间与 `.text` 对不上。
+**G38 把这个前提换掉了**（`length`/`charCodeAt`/`slice` 已是码元域），于是这条口径从「自洽的
+选择」变成「跨域的残留」，也是运行时文本面上最后一处「字节 == 码元」的假设。
+
+**实测（adl 51.4.1，`temp/pwd/air/AirPwd.as` + AOT 同源 `temp/pwd/T.as`）**：密码框的
+`textWidth` 就是星号串的宽度，所以「与字面 `****` 比」即可读出星数，不需要截图。
+
+| 用例（`_typewriter` 12） | adl 51.4.1 | 本仓修前 | 本仓修后 |
+|---|---|---|---|
+| masked `中文ab` | **20.00** | 40.00（8 颗） | **20.00**（4 颗） |
+| masked `****` | 20.00 | 20.00 | 20.00 |
+| masked `************` | 60.00 | 60.00 | 60.00 |
+| masked `😀` | **10.00** | 20.00（4 颗） | **10.00**（2 颗） |
+| masked `**` | 10.00 | 10.00 | 10.00 |
+| masked `a\r中`（`multiline=true`） | `lines=2`，`getLineText` = `a` / `中` | 同 | 同 |
+
+**做法**（`src/emit.ts`）：
+
+1. `as_tf_layout_text` 改为**一码元一颗星**：逐 UTF-8 序列跳（1/2/3 字节各 1 颗，4 字节 = 代理对
+   2 颗），`\r` / `\n` 原样写入；`o`（写游标）与 `i`（读游标）分离，掩码永远不长于明文；
+   截断的尾序列由 `if (i + len > n) len = n - i;` 兜住，不会读到缓冲外。
+2. `as_tf_utf16_index` / `as_tf_byte_index` 的「密码字段恒等」短路**删除**——它们当初存在的
+   唯一理由就是掩码让字节数 == 码元数；现在两个方向都走同一套明文码元换算。
+3. paragraph 的 run 区间：run 表存的是 `.text` 的**字节**偏移，而段落是用 layout 串建的，
+   故密码字段先 `as_tf_utf16_index` 再交给 glue（非密码字段两者同指针，行为不变）。
+
+**回归面**：新增 `examples/password-stars.as`（关系式：只比同字体的星宽，无 Skia 时自跳过）
+与 `unit: emit/PasswordStars`（15 钉）。钉子有牙：把 `src/emit.ts` 回退到修前，**8 条红**
+（掩码形状、代理对两颗、CR/LF 原样、旧逐字节形态不得回来、两处短路不得回来、run 换算）。
+
+**顺带量清（并入既有遗留行，不新开）**：`multiline=false` 的硬换行——`adl 51.4.1` 对
+`"a\r中"` 在 `multiline=false` 下仍是 `lines=2 th=30`（masked 与 unmasked 都一样），我们折叠成
+1 行。这与遗留表「单行字段里的 `\n` 被折叠」是同一行（`collapse = (multiline || _html_block) ? 0 : 1`），
+已在那一行补上 `\r` 的实锤，仍未修。
+
+**未修（本阶段明确留白）**：星号**颜色**（我们黑、adl 占位灰 162）仍开放；`TextField` 的
+**编辑索引**（`caretIndex`/选区/行表）仍是字节域，与 G38 之后的码元域之间仍差一层换算。

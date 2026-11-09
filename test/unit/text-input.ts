@@ -351,16 +351,18 @@ function checkTextInput(): string[] {
     c.includes('static void as_tf_word_select(TextField* tf, int idx) {')
     && c.includes('while (lo > 0 && !as_tf_is_space(t[lo - 1])) lo--;'));
 
-  // displayAsPassword：排版串 = 一个字节一个 '*'（CR/LF 保留），.text 仍是明文。
-  // 实测（adl 51.4.1，temp/editprobe/src/Ed16.as）：`_sans` 的 "W…W" 明文 113px、
-  // 遮罩后 46.5px，且同一字段换成 "i…i" 也是 46.5px —— 两者量的是同一个星号串。
+  // displayAsPassword：排版串 = 一**码元**一个 '*'（CR/LF 保留），.text 仍是明文。
+  // 阶段三百九十三前这里是「一字节一个 '*'」；G38 把 String 的索引域换成码元后该口径
+  // 成了跨域残留，已改齐。实测（adl 51.4.1，temp/pwd/air/AirPwd.as + examples/password-stars.as）：
+  // masked "中文ab" 的 textWidth 与 "****" 相同（8 字节会是 40.00）。
   check('the password mask is a separate layout string, never the .text value',
     c.includes('static const char* as_tf_layout_text(TextField* tf) {')
     && c.includes('if (!tf->displayAsPassword) return tf->text;')
     && c.includes('tf->_mask_src = tf->text;')
     && /const char\* ltext = as_tf_layout_text\(tf\);/.test(c));
-  check('the mask emits one star per byte and keeps CR/LF as hard breaks',
-    /m\[i\] = \(c == '\\r' \|\| c == '\\n'\) \? c : '\*';/.test(c)
+  check('the mask emits one star per code unit and keeps CR/LF as hard breaks',
+    c.includes("else { m[o++] = '*'; if (len == 4) m[o++] = '*'; }")
+    && c.includes("if (len == 1 && (c == '\\r' || c == '\\n')) { m[o++] = (char)c; }")
     && c.includes('free(tf->_mask);'));
   check('the paragraph cache is keyed on the layout string, not on .text',
     c.includes('tf->_para_text == ltext') && c.includes('tf->_para_text = ltext;')
@@ -675,15 +677,16 @@ function checkIndexDomain(): string[] {
     's.addChild(f);\n' +
     's.focus = f;\n')).c;
 
-  // (1) the inverse of as_tf_utf16_index, and the mask identity: a masked paragraph
-  // is laid out from one ASCII star per BYTE, so its code-unit index IS the byte
-  // index -- the plaintext count would land short on CJK.
+  // (1) the inverse of as_tf_utf16_index. The mask used to make a masked paragraph's
+  // code-unit index EQUAL its byte index (one star per byte); since stage 393 the mask
+  // is one star per code unit, so both directions go through the plaintext count and
+  // the password must NOT short-circuit any more.
   check('a byte index is the inverse of the code-unit index',
     c.includes('static int as_tf_byte_index(TextField* tf, int unitIndex) {')
     && /int units = 0, i = 0;\n\s*while \(i < n && units < unitIndex\) \{/.test(c));
-  check('the masked paragraph keeps the identity in BOTH directions',
-    /static int as_tf_utf16_index\(TextField\* tf, int byteIndex\) \{[\s\S]{0,420}?if \(tf->displayAsPassword\) return byteIndex;/.test(c)
-    && /static int as_tf_byte_index\(TextField\* tf, int unitIndex\) \{[\s\S]{0,260}?displayAsPassword\) \{ int m = \(int\)strlen\(s\); return unitIndex > m \? m : unitIndex; \}/.test(c));
+  check('the masked paragraph is NOT the identity in either direction any more',
+    !/static int as_tf_utf16_index\(TextField\* tf, int byteIndex\) \{[\s\S]{0,420}?if \(tf->displayAsPassword\) return byteIndex;/.test(c)
+    && !c.includes('displayAsPassword) { int m = (int)strlen(s); return unitIndex > m ? m : unitIndex; }'));
 
   // (2) the visual line table converts Skia's answer at its exit, so every consumer
   // (as_tf_line_of_index, as_tf_line_end's CR test, the column arithmetic, the
@@ -737,8 +740,11 @@ function checkMaskHtml(): string[] {
     && !c.includes('&& !tf->displayAsPassword);'));
   check('the masked layout still comes from the star string',
     /static const char\* as_tf_layout_text\(TextField\* tf\) \{[\s\S]{0,200}?if \(!tf->displayAsPassword\) return tf->text;/.test(c)
-    && c.includes("m[i] = (c == '\\r' || c == '\\n') ? c : '*';"));
-  check('the runs are built from the LAYOUT text, so a run\'s byte range lands on its stars',
+    && c.includes("else { m[o++] = '*'; if (len == 4) m[o++] = '*'; }"));
+  check("a run's byte range becomes a star index before the glue sees it",
+    c.includes('int rb = tf->displayAsPassword ? as_tf_utf16_index(tf, b) : b;')
+    && c.includes('runs[i].start = (unsigned)rb;'));
+  check("the runs are built from the LAYOUT text, so a run's byte range lands on its stars",
     c.includes('void* pr = as_skia_textlayout_new_runs(ltext, &dr, runs, n, 0.0, 0, collapse);')
     && c.includes('tf->_para = as_skia_textlayout_new_runs(ltext, &dr, runs, n, pw, pa, collapse);')
     && !/as_skia_textlayout_new_runs\(tf->text/.test(c));

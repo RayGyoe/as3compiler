@@ -4,7 +4,7 @@
 > (workspace root `acme-app-aot-vs-adl-diff.md`, 2026-10-14) collapses 12 visible
 > differences into 4 root causes — of which **R2 (SWC `DefineEditText`/`DefineText` bake neither
 > text nor `TextFormat`)** and **the text items of R3** (`as_str_alloc(1)` without a terminator,
-> `displayAsPassword` masking per byte, font-alias/metric residuals) all land on the single
+> `displayAsPassword` masking — per byte then, per code unit since stage 393 — font-alias/metric residuals) all land on the single
 > `flash.text` surface. This is a **charter document**: it takes stock of the current state and the
 > gaps, gives the display matrix and example contract, then splits "aligning the `TextField`
 > mountain" into work packages that can each be accepted per stage.
@@ -109,9 +109,9 @@ defect** (AGENTS §1.5).
 | # | Symptom | Root cause | Code location | Evidence |
 |---|---|---|---|---|
 | **D-T5** | An empty `TextField` renders the residue of the "previous text layout" (`MS: 17` / `_sans`, different each run) | `TextField_ctor` uses `o->text = as_str_alloc(1)` — 1 byte, `gc_alloc` **deliberately does not zero** `GCT_STRING`, **no terminator written**, so `strlen` reads whatever that GC block last held → violates the `as_str_alloc` contract (caller writes the NUL) | `src/emit.ts:16140`; contract at `src/runtime.ts:968`. Same class: `src/emit.ts:12789/12791` (`Socket__str`) | report D4 (decisive experiment: set a red/bold/mono format with empty text ⇒ residue becomes red mono) |
-| **D-T6** | Password field masks per **byte** (`请输入密码`, 5 CJK chars → 15 stars), adl 5; star colour black vs adl grey 162 | `as_tf_layout_text` replaces per **byte** (one star per byte) while AIR counts **UTF-16 code units** | `src/emit.ts` `as_tf_layout_text` (`m[i] = (c=='\r'||c=='\n') ? c : '*'`) | report D9, `cmp_pwd.png` |
+| **D-T6** | Password-star **count** ✅ (stage 393); star **colour** still open (ours black, adl grey 162) | ~~`as_tf_layout_text` replaces per **byte**~~ now one star per **UTF-16 code unit** (a surrogate pair is 2, CR/LF kept verbatim), matching the post-G38 `String` index space; the "password is identity" shortcuts in `as_tf_utf16_index`/`as_tf_byte_index` are gone and paragraph run ranges use the same conversion | `src/emit.ts` `as_tf_layout_text`, both index bridges, paragraph run ranges | adl 51.4.1 `temp/pwd/air/AirPwd.as`: masked `中文ab` `textWidth` **20.00** = `****` (8 stars would be 40.00), `😀` **10.00** = `**`; this repo measured 40.00/20.00 before and 20.00/10.00 after |
 | **D-T7** | The `_sans`/`_serif` generic aliases' **line height** differs (ours 12/13, adl 15.5/15); `textWidth` excludes trailing spaces (AIR includes); glyph-advance ≤0.5px residual | AIR uses a **non-linear built-in device font metrics table** for the three generic aliases; no parseable face reproduces it | `vendor/skia_glue.cc` `sk_air_line_metrics`/`sk_round_half` | legacy rows "`_sans`/`_serif` line height", "`textWidth` without trailing spaces", "glyph-advance residual" |
-| **D-T8** | `String` is a **UTF-8 byte index** (not UTF-16 code units): `"中".length` is 3 for us, 1 for adl; the same source as `displayAsPassword` star count and edit indices | A direct consequence of the runtime string representation | `src/runtime.ts` string layer | legacy row "UTF-8 byte index" (**not** a goal of this plan, see §0) |
+| **D-T8** | `String` was a **UTF-8 byte index** (not UTF-16 code units) in the pre-G38 runtime: `"中".length` was 3 for us, 1 for adl. String members moved to code units in G38; `displayAsPassword` star count followed in stage 393; **TextField edit indices** (`caretIndex`/selection/line table) are still byte offsets | A direct consequence of the runtime string representation | `src/runtime.ts` string layer; `src/emit.ts` `as_tf_*` edit helpers | legacy row "UTF-8 byte index" (the edit-index half is **not** a goal of this plan, see §0) |
 | **D-T9** | `TextFormat` fields are a subset: missing `leftMargin`/`rightMargin`/`indent`/`blockIndent`/`bullet`/`display`/`tabStops`/`url`/`target`; ctor takes 6 params (AIR 11) | Not modelled | `src/symbols.ts` `TextFormat` classMap | legacy row "`TextFormat` fields are a subset" (**loud error**, not silent) |
 | **D-T10** | Multi-line run **line height is ~1.5× too large**; a rule's `leading` is not folded into the run; `getLineText` is unimplemented | Incomplete evidence collection for per-run line boxes; `as_ss_str(rule,"leading")` is unread | `src/emit.ts` htmlText/run path | legacy row "htmlText multi-line run height", stage 148 |
 | **D-T11** | `TextField.textWidth` excludes trailing spaces (AIR includes); glyph-advance ≤0.5px residual | Which glyphs are taken / advance rounding | `vendor/skia_glue.cc` metric path; `as_tf_*width*` | two legacy rows |
@@ -217,8 +217,9 @@ A line-by-line diff of the two reports (`temp/textfield-oracle/{adl,aot}.txt`, *
 | **N8** | Does `Graphics.lineStyle(0, …)` draw a hairline at all? We read `hasStroke = thickness > 0` ⇒ **no stroke**; the AIR side is **unmeasured** | **open question** (`Graphics` surface) | the grid drew its field boxes with `lineStyle(0)` first and **nothing appeared on our side**; to avoid mixing two contracts in one place the harness switched to 1 |
 
 > **D-T6 root cause narrowed**: it is not "the star glyph width is wrong" but two things — ① AIR uses one
-> star per **UTF-16 code unit** (we use one per byte); ② AIR's `displayAsPassword` setter **does not
-> re-layout** (we recompute the star string on every layout). ② is why the app's usual order
+> star per **UTF-16 code unit** (we used one per byte) — **fixed in stage 393** (surrogate pairs 2 stars,
+> CR/LF verbatim; see the D-T6 row); ② AIR's `displayAsPassword` setter **does not re-layout** (we
+> recompute the star string on every layout). ② is why the app's usual order
 > `tf.text=…; tf.displayAsPassword=true;` never shows stars.
 
 **D-T13 `htmlText` does not decode HTML character references** ✅ (fixed in stage 149)

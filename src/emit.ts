@@ -14008,11 +14008,11 @@ this.line('AS_bake_pend_n = 0;');
     this.line('int n = (int)strlen(s);');
     this.line('if (byteIndex < 0) byteIndex = 0;');
     this.line('if (byteIndex > n) byteIndex = n;');
-    // displayAsPassword: the paragraph is laid out from the MASK (one ASCII star per
-    // byte, see as_tf_layout_text), so the paragraph's code-unit index is the byte
-    // index -- the conversion below would count the PLAINTEXT's units and land short
-    // on any multi-byte character (CJK masked field).
-    this.line('if (tf->displayAsPassword) return byteIndex;');
+    // displayAsPassword included: the masked layout string is one star per CODE
+    // UNIT (as_tf_layout_text), so the paragraph's unit index comes from the same
+    // count -- counting the PLAINTEXT's units names the star that covers this byte.
+    // This used to short-circuit to the byte index, which was right only while the
+    // mask had one star per byte.
     this.line('int units = 0, i = 0;');
     this.line('while (i < byteIndex) {');
     this.indent++;
@@ -14107,12 +14107,14 @@ this.line('AS_bake_pend_n = 0;');
     // two domains directly mis-locates the caret on CJK text (measured family: the
     // visual line table, TODO L8152). A unit index that falls INSIDE a multi-byte
     // sequence (Skia only reports break positions, so this cannot normally happen)
-    // rounds down to the start of that character instead of splitting it.
+    // rounds down to the start of that character instead of splitting it. The
+    // password mask is one star per code unit, so a paragraph unit index maps
+    // through the plaintext exactly as an unmasked field's does -- this used to
+    // short-circuit to the identity, which matched the old per-byte mask.
     this.line('static int as_tf_byte_index(TextField* tf, int unitIndex) {');
     this.indent++;
     this.line('const char* s = tf->text;');
     this.line('if (s == NULL || unitIndex <= 0) return 0;');
-    this.line('if (tf->displayAsPassword) { int m = (int)strlen(s); return unitIndex > m ? m : unitIndex; }');
     this.line('int n = (int)strlen(s);');
     this.line('int units = 0, i = 0;');
     this.line('while (i < n && units < unitIndex) {');
@@ -24881,12 +24883,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     //     laid out from the SAME string of 10 stars, not from the plaintext.
     //   * the mask applies to `type='dynamic'` fields too (screenshot), and a CR
     //     still breaks the line (2 lines of 20 stars), so the break bytes survive.
-    //   * AIR's star count is per UTF-16 unit; this runtime models strings as UTF-8
-    //     BYTES (String.length/charCodeAt/indexOf are byte offsets, see the text
-    //     field notes), so one star per byte keeps every index in the field exact
-    //     and self-consistent -- a CJK password therefore shows one star per byte
-    //     where AIR shows one per code unit (registered limitation, same root
-    //     cause as the byte-index row).
+    //   * AIR's star count is per UTF-16 CODE UNIT, and since G38 this runtime's
+    //     String index space is code units too (the backing store is still UTF-8),
+    //     so the mask is one star per code unit: a 3-byte CJK character is ONE star,
+    //     an astral character (4 bytes, surrogate pair) is TWO, and CR/LF is kept
+    //     verbatim (1 byte, 1 unit). Measured on adl 51.4.1 (`_typewriter` 12,
+    //     "中文ab" masked): 20.00 px = the width of FOUR stars. It used to be one star
+    //     per BYTE -- 8 stars = 40.00 px for that string -- which was right only while
+    //     every TextField index was a byte offset; the code-unit domain now bridges
+    //     the two through as_tf_utf16_index/as_tf_byte_index.
     // The buffer is rebuilt whenever the text pointer changes, so a splice/assign
     // (both of which allocate a new string) is picked up automatically.
     this.line('static const char* as_tf_layout_text(TextField* tf) {');
@@ -24897,13 +24902,19 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('size_t n = strlen(tf->text);');
     this.line('char* m = (char*)malloc(n + 1);');
     this.line('if (m == NULL) return tf->text;');
-    this.line('for (size_t i = 0; i < n; i++) {');
+    // One star per code unit: the mask can never be longer than the plaintext.
+    this.line('size_t o = 0, i = 0;');
+    this.line('while (i < n) {');
     this.indent++;
-    this.line('char c = tf->text[i];');
-    this.line("m[i] = (c == '\\r' || c == '\\n') ? c : '*';");
+    this.line('unsigned char c = (unsigned char)tf->text[i];');
+    this.line('size_t len = (c < 0x80) ? 1 : ((c & 0xE0) == 0xC0) ? 2 : ((c & 0xF0) == 0xE0) ? 3 : ((c & 0xF8) == 0xF0) ? 4 : 1;');
+    this.line('if (i + len > n) len = n - i;');
+    this.line("if (len == 1 && (c == '\\r' || c == '\\n')) { m[o++] = (char)c; }");
+    this.line("else { m[o++] = '*'; if (len == 4) m[o++] = '*'; }");
+    this.line('i += len;');
     this.indent--;
     this.line('}');
-    this.line('m[n] = 0;');
+    this.line('m[o] = 0;');
     this.line('free(tf->_mask);');
     this.line('tf->_mask = m;');
     this.line('tf->_mask_src = tf->text;');
@@ -24981,11 +24992,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and the drawn star for that character is the 24px one, in RED; a run-free
     // masked field keeps the defaultTextFormat metrics. So the mask replaces the
     // GLYPHS, not the run styles: the layout string is still the star string
-    // (as_tf_layout_text), and because that string is one ASCII star per byte of
-    // tf->text, a run's byte range lands on exactly the stars it covers -- the
-    // runs array needs no re-indexing (that is why the layout text, not tf->text,
-    // is handed to the glue below: for an unmasked field they are the same
-    // pointer).
+    // (as_tf_layout_text), and because that string is one ASCII star per CODE UNIT
+    // of tf->text, a run's BYTE range is converted through as_tf_utf16_index before
+    // it reaches the glue (see the loop below); for an unmasked field the layout
+    // text IS tf->text, so the byte offset is already its index.
     this.line('const char* ltext = as_tf_layout_text(tf);');
     this.line('int hasRuns = (tf->_runs != NULL && tf->_runs->length > 0);');
     this.line('if (tf->_para != NULL && tf->_para_text == ltext && tf->_para_w == w &&');
@@ -25013,8 +25023,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int e = as_v_int_val(tf->_runs->data[i * 3 + 1]);');
     this.line('TextFormat* rf = (TextFormat*)as_v_obj_val(tf->_runs->data[i * 3 + 2]);');
     this.line('if (rf == NULL) continue;');
-    this.line('runs[i].start = (unsigned)b;');
-    this.line('runs[i].end = (unsigned)e;');
+    // The run table stores BYTE offsets into tf->text while the paragraph is built
+    // from the LAYOUT string. Those coincide for an unmasked field (same pointer);
+    // for a password field the layout string has one star per code unit, so the
+    // range goes through the same byte->unit map the caret uses. A byte that falls
+    // inside a multi-byte character rounds down to that character's first star.
+    this.line('int rb = tf->displayAsPassword ? as_tf_utf16_index(tf, b) : b;');
+    this.line('int re = tf->displayAsPassword ? as_tf_utf16_index(tf, e) : e;');
+    this.line('runs[i].start = (unsigned)rb;');
+    this.line('runs[i].end = (unsigned)re;');
     this.line('runs[i].family = rf->font;');
     this.line('runs[i].size = as_v_num_val(rf->size);');
     this.line('runs[i].bold = as_v_bool_val(rf->bold) ? 1 : 0;');
