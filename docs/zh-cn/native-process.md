@@ -123,6 +123,18 @@ POSIX 不存在这个问题：`execv` 的 argv 是分开的数组，原样传。
 | macOS / Linux | `pipe` + `fork` + `execv`；读端 `O_NONBLOCK`；`exit(force)` 为 `SIGKILL`、否则 `SIGTERM`；退出码取 `WEXITSTATUS`，被信号杀死按 shell 惯例报 `128 + 信号` |
 | WASI / web | `isSupported = false`；`start()` **报明不支持**，不伪造成功 |
 
+三个后端共用**一个 seam**：`ASC_NP_WIN` / `ASC_NP_POSIX` / `ASC_NP_NONE`（`src/native-process.ts`
+顶部按 `_WIN32`、`__wasi__ || __EMSCRIPTEN__ || __wasm__`、其余三档选出）：
+
+- 只有 Windows 与 POSIX 原生目标编**真身**。wasm 那两个目标上 `fork`/`execv`/`fcntl` **压根不存在**，
+  所以 spawn 与管道实体是**整段不参与编译**，不是「编进去但运行时不调用」；
+- `ASC_NP_NONE` 下 `as_np_spawn`/`as_np_read_pipe`/`as_np_flush_stdin`/`as_np_close_stdin` 退化成
+  「起不来 / 无数据 / 空操作」的桩，槽位永远进不了 running ⇒ `start()` 在到达 spawn 之前就已按上表报明不支持；
+- 上一版只按 `#ifdef _WIN32` 分支，`--package web` 把 POSIX 实体编进 emscripten，
+  `fork`/`execv`/`fcntl` 报 10 个错误、直接编不过。`unit: desktop/NativeProcessSeam` 钉住这条：
+  文件里任何 `#ifdef _WIN32` 只要落在「seam 本身」与「`#ifdef ASC_NP_NONE` 区块」之外，测试就红——
+  因为这类回退在**有 `fork()` 的宿主上完全看不出来**。
+
 - **同时最多 8 个子进程**（`AS_NP_MAX`）。第 9 个 `start()` 走「报明不支持」通道，不静默丢。
 - 进程对象由 GC 根表保住：AS3 侧丢掉引用后，管道数据与 `exit` 事件**仍会投递**，
   不会因为一次 GC 把子进程变成孤儿事件。
@@ -170,4 +182,5 @@ AIR 的 `force=false` 语义是「请求子进程自己关闭」（GUI 子进程
 | 示例 | `examples/native-process.as`：16 组断言，覆盖形状、错误号/文案、事件顺序、`bytesLoaded/bytesTotal`、stdin 往返 + EOF、`#3213`、强杀、重启、`workingDirectory` 生效。子进程按宿主选（Windows `cmd.exe`，其余 `/bin/sh`），同一份脚本覆盖两端；但**本阶段只在 Windows 上实测**，POSIX 分支（`fork`/`execv`、`O_NONBLOCK`、`waitpid`）在本机**没跑过**——要等 macOS arm64 的 CI 跑同一份示例才算数，在那之前 POSIX 侧的口径是「写了、未测」 |
 | 单元钉 | `unit: desktop/NativeProcess`：钉模块形状（槽位数、帧边界泵、非阻塞读、`CREATE_NO_WINDOW`、POSIX `O_NONBLOCK`、错误文案常量、`standardInput` 缓冲冲写点）、钉示例存在 |
 | `adl` 证据 | `temp/npa/air/T.as`（形状）、`NP.as`/`NP2.as`（错误与事件）、`Q.as`（命令行拼接） |
+| web 目标 | `node src/index.ts examples/web/hello-web.as --manifest examples/web/hello-web.build.json`（emcc 3.1.44，`-O2`） | **Build successful**（19.4 s）：`fork`/`execv`/`fcntl` 的 10 个错误消失，`isSupported` 在该目标上为 `false`。WASI **未在本机跑通**——本机没有可调用的 WASI SDK（`wasiCc()` 在 Windows 上给出不带 `.exe` 的路径，`WASI_SDK_HOME` 也没有配），但 WASI 与 web **共用同一个 `ASC_NP_NONE` 分支**，`unit: desktop/NativeProcessSeam` 钉死两者不可被拆开 |
 | 回归 | 见 `TODO.md` 阶段三百九十一的全量结果行 |

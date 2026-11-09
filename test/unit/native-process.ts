@@ -116,3 +116,86 @@ function checkNativeProcess(): string[] {
   return bad;
 }
 registerGroup('unit: desktop/NativeProcess', checkNativeProcess);
+
+// --- the platform seam ------------------------------------------------------
+//
+// Stage 391 split this backend on `#ifdef _WIN32` alone, and that is not a seam: the
+// `#else` half IS the POSIX body, so `fork`/`execv`/`fcntl` were compiled into every
+// non-Windows target -- including WASI and Emscripten, which have none of them. The
+// AS3 side kept answering isSupported=false, but the translation unit stopped
+// compiling, so `as-aot --package web` broke (10 errors). The table in
+// docs/{zh-cn,en}/native-process.md §6 said the right thing all along; what was
+// missing was the INCLUDE-level exclusion, not a runtime check.
+//
+// These pins hold the shape of the fix, because the failure mode is invisible on the
+// host that has fork(): a `#ifdef _WIN32` added later anywhere outside these two
+// regions silently puts POSIX code back into the wasm targets.
+function checkNativeProcessSeam(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [np-seam] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [np-seam] ${label}`); }
+  };
+
+  const runtime = read('src/native-process.ts');
+  const c = generateC(parse('import flash.desktop.NativeProcess;\nvar n:NativeProcess = new NativeProcess();\ntrace(n.running);\n')).c;
+
+  // --- one seam, three answers ---------------------------------------------
+  const seamAt = runtime.indexOf('#ifdef _WIN32\n#define ASC_NP_WIN 1');
+  check('the backend picks its platform in ONE seam', seamAt > 0);
+  check('Windows keeps the Win32 backend', runtime.includes('#define ASC_NP_WIN 1'));
+  check('wasi / Emscripten / any other wasm target share ONE "no process API" answer',
+    /#elif defined\(__wasi__\) \|\| defined\(__EMSCRIPTEN__\) \|\| defined\(__wasm__\)\n#define ASC_NP_NONE 1/.test(runtime));
+  check('every other POSIX host keeps the fork/execv backend',
+    /#else\n#define ASC_NP_POSIX 1\n#endif/.test(runtime));
+  check('isSupported answers false exactly on the no-backend target',
+    /static int as_np_supported\(void\) \{\n#ifdef ASC_NP_NONE\n[\s\S]{0,240}return 0;/.test(runtime));
+  check('start() reports the unsupported build before it tries to spawn',
+    /if \(!as_np_supported\(\)\) \{\n\s*as_shell_unsupported\("flash\.desktop\.NativeProcess\.start/.test(runtime));
+
+  // --- the POSIX half is EXCLUDED from wasm, not merely unused ---------------
+  check('<sys/wait.h> is included for ASC_NP_POSIX, not for "anything but Windows"',
+    runtime.includes('#ifdef ASC_NP_POSIX\n#include <sys/wait.h>\n#endif'));
+  check('the old "#ifndef _WIN32" include shape is gone', !/#ifndef _WIN32/.test(runtime));
+
+  const guardAt = runtime.indexOf('#ifdef ASC_NP_NONE\n// No process API on this target');
+  const guardEnd = runtime.indexOf('#endif  // !ASC_NP_NONE');
+  check('the pipe machinery sits behind ONE ASC_NP_NONE guard', guardAt > 0 && guardEnd > guardAt);
+
+  // Every `#ifdef _WIN32` left in the file must be either the seam itself or inside
+  // that guard; anything else is a split a wasm target would take the other half of.
+  let stray = 0;
+  for (let i = runtime.indexOf('#ifdef _WIN32'); i >= 0; i = runtime.indexOf('#ifdef _WIN32', i + 1)) {
+    if (i === seamAt) continue;
+    if (i > guardAt && i < guardEnd) continue;
+    stray++;
+  }
+  check('no `#ifdef _WIN32` split survives outside the seam and the wasm-excluded block', stray === 0);
+
+  check('the NONE target still gets the pipe stubs the AS3 shells call',
+    /#ifdef ASC_NP_NONE[\s\S]{0,400}static int as_np_read_pipe\([\s\S]{0,200}as_np_flush_stdin\([\s\S]{0,200}as_np_close_stdin\(/.test(runtime));
+  check('the struct keeps its handle fields inside the per-platform branches only',
+    /#elif defined\(ASC_NP_POSIX\)\n    pid_t pid;/.test(runtime));
+  check('every pid_t use is behind an ASC_NP_POSIX branch',
+    (runtime.match(/#elif defined\(ASC_NP_POSIX\)/g) || []).length >= 3 &&
+      runtime.indexOf('pid_t') > runtime.indexOf('#elif defined(ASC_NP_POSIX)\n    pid_t pid;'));
+
+  // The generated C is the runtime text, so the same seam has to be in it: this is
+  // what emcc and clang actually see.
+  check('the emitted C carries the seam', c.includes('#define ASC_NP_NONE 1'));
+  check('the emitted C never includes sys/wait.h unguarded',
+    c.indexOf('#ifdef ASC_NP_POSIX\n#include <sys/wait.h>') > 0);
+
+  // --- the docs say the same thing the code now enforces -------------------
+  const zh = read('docs/zh-cn/native-process.md');
+  const en = read('docs/en/native-process.md');
+  check('zh docs state the wasi/web contract and name the seam',
+    /WASI \/ web[^\n]*isSupported = false/.test(zh) && zh.includes('ASC_NP_NONE'));
+  check('en docs state the wasi/web contract and name the seam',
+    /WASI \/ web[^\n]*isSupported = false/.test(en) && en.includes('ASC_NP_NONE'));
+
+  console.log(`     [np-seam] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: desktop/NativeProcessSeam', checkNativeProcessSeam);

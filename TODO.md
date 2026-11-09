@@ -21180,3 +21180,41 @@ half` 133 检查、`gallery tour` 60 页手算矩形、`descriptor DPI A/B`、G1
 （AIR 是 `OutboundPipe`），写入在帧边界落地 ⇒ 子进程死后写入**不会**抛 `#3212`、写为追加语义；
 被强杀子进程的退出码报平台等待状态（AIR 在 Windows 上报 `NaN`，我们不伪造）；
 Windows 上 `exit(false)` 也走 `TerminateProcess`（控制台子进程没有消息循环可「请求关闭」）。
+
+### 阶段三百九十二：`NativeProcess` 的平台 seam —— 修 `--package web` 编不过（v0.4.362 → v0.4.363）
+
+阶段三百九十一 的 NativeProcess 后端只按 `#ifdef _WIN32` 分支，`#else` 直接就是 POSIX 实体，
+于是 `__EMSCRIPTEN__` / `__wasi__` 把 `fork`/`execv`/`fcntl` 编进了 wasm 目标：
+`as-aot --package web` 报 `10 errors generated`。文档 §6 写的「WASI / web ⇒ `isSupported = false`」
+本身没错，错的是**实现没把这半边排除在编译之外**——运行期判断救不了一个编不过的翻译单元。
+
+**做法**：三档 seam 收敛到文件顶部，`ASC_NP_WIN` / `ASC_NP_POSIX` / `ASC_NP_NONE`：
+
+- `_WIN32` ⇒ `ASC_NP_WIN`；`__wasi__ || __EMSCRIPTEN__ || __wasm__` ⇒ `ASC_NP_NONE`；其余 ⇒ `ASC_NP_POSIX`；
+- `<sys/wait.h>` 从「非 Windows」收紧到 `ASC_NP_POSIX`（原先 wasm 目标也会去包含它）；
+- 槽位句柄字段、`as_np_release`、`as_np_exit`、`as_np_tick` 的判活分支改由 seam 分派，不再散落 `#ifdef _WIN32`；
+- spawn 与三条管道的实体整段进 `#ifdef ASC_NP_NONE ... #else`，NONE 侧留「起不来 / 无数据 / 空操作」的桩，
+  AS3 壳照旧可链接；
+- `as_np_supported()` 在 NONE 返回 0，`start()` 在到达 spawn 之前就按 §6 报明不支持，不伪造成功。
+
+**A/B（同一份 `.as`、同一个 emcc 3.1.44）**：
+
+| 版本 | 结果 |
+|---|---|
+| 修前（`HEAD` 的 `src/native-process.ts`） | `10 errors generated`（`fcntl`/`F_SETFL`/`F_GETFL`/`O_NONBLOCK`），emcc 失败——**逐条复现上游报告** |
+| 修后 | 同一 TU 编译通过；`node src/index.ts examples/web/hello-web.as --manifest examples/web/hello-web.build.json` ⇒ **Build successful**（19.4 s，`hello-web.html` + `.js` + `.wasm`） |
+
+**单元钉**：新增 `unit: desktop/NativeProcessSeam`（17 钉）。核心那条是「文件里任何 `#ifdef _WIN32`
+只要落在『seam 本身』与『`#ifdef ASC_NP_NONE` 区块』之外就红」——这类回退在**有 `fork()` 的宿主上
+完全看不出来**，只能靠结构钉兜住；另有 `<sys/wait.h>` 归属、NONE 侧桩齐全、`pid_t` 全在
+`ASC_NP_POSIX` 分支内、中英文文档口径一致。
+
+**未验到位（如实报明）**：
+
+- **WASI 目标本机跑不通**，且原因不在本轮改动：`wasiCc()`（`src/build.ts`）在 Windows 上返回
+  `…/bin/clang`，而 Windows 的 WASI SDK 实际可执行名带 `.exe`，`spawnSync` 必然 ENOENT；
+  本机 `WASI_SDK_HOME` 也没配（`build-tools/wasi` 只有 sysroot 与 resource-dir，没有 `bin/clang`）。
+  WASI 与 web **共用同一个 `ASC_NP_NONE` 分支**，由上面的钉子钉死不可分叉，所以本轮的排除对它是同一份代码。
+  工具链发现这条是**独立缺陷**，未在本阶段修（改了也无法在本机验证）。
+- **POSIX 原生分支**（`fork`/`execv`/`O_NONBLOCK`/`waitpid`）本机依旧没跑过，等 macOS arm64 CI 的
+  `example: native-process.as`。

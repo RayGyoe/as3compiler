@@ -134,6 +134,22 @@ Windows. POSIX has no such issue — `execv` takes a real argv array.
 | macOS / Linux | `pipe` + `fork` + `execv`; read ends non-blocking; `exit(force)` sends `SIGKILL`, otherwise `SIGTERM`; exit code from `WEXITSTATUS`, or `128 + signal` per shell convention |
 | WASI / web | `isSupported = false`; `start()` **reports** that it is unsupported instead of faking success |
 
+All three backends sit behind **one seam**: `ASC_NP_WIN` / `ASC_NP_POSIX` / `ASC_NP_NONE`, picked at
+the top of `src/native-process.ts` from `_WIN32`, `__wasi__ || __EMSCRIPTEN__ || __wasm__`, and
+"everything else":
+
+- Only Windows and native POSIX build the real body. On the two wasm targets `fork`/`execv`/`fcntl`
+  **do not exist**, so the spawn and pipe bodies are **compiled out entirely** — not compiled and then
+  skipped at run time;
+- Under `ASC_NP_NONE`, `as_np_spawn`/`as_np_read_pipe`/`as_np_flush_stdin`/`as_np_close_stdin` degrade
+  to "could not start / no data / no-op" stubs, so a slot can never become running and `start()` has
+  already reported the row above by the time it would have spawned;
+- The first version split on `#ifdef _WIN32` alone, which put the POSIX body into the Emscripten
+  translation unit and broke `--package web` with 10 `fork`/`execv`/`fcntl` errors.
+  `unit: desktop/NativeProcessSeam` holds the line: any `#ifdef _WIN32` in that file outside the seam
+  itself and the `#ifdef ASC_NP_NONE` block turns the test red — because this class of regression is
+  **invisible on a host that has `fork()`**.
+
 - **At most 8 live children** (`AS_NP_MAX`). A ninth `start()` goes through the "reported
   unsupported" channel rather than being silently dropped.
 - Process objects are held by the GC root table: dropping the AS3 reference still delivers pipe
@@ -187,4 +203,5 @@ child has no message loop to ask, so on Windows this backend ignores `force` and
 | Example | `examples/native-process.as`: 16 assertion groups covering shapes, error ids/texts, event order, `bytesLoaded/bytesTotal`, stdin round trip + EOF, `#3213`, force stop, restart, `workingDirectory`. The script picks its child by host (`cmd.exe` on Windows, `/bin/sh` elsewhere), so one script covers both. Measured **on Windows only** in stage 391: the POSIX branch of the runtime (`fork`/`execv`, `O_NONBLOCK`, `waitpid`) was **not executed on this machine**, so until the macOS arm64 CI job (which compiles and runs this same example) reports it, POSIX support is written but unmeasured |
 | Unit pins | `unit: desktop/NativeProcess`: module shape (slot count, frame-boundary pump, non-blocking reads, `CREATE_NO_WINDOW`, POSIX `O_NONBLOCK`, error text constants, the `standardInput` flush point) plus the example's presence |
 | `adl` evidence | `temp/npa/air/T.as` (shape), `NP.as`/`NP2.as` (errors and events), `Q.as` (command-line joining) |
+| web target | `node src/index.ts examples/web/hello-web.as --manifest examples/web/hello-web.build.json` (emcc 3.1.44, `-O2`) | **Build successful** (19.4 s): the 10 `fork`/`execv`/`fcntl` errors are gone and `isSupported` answers `false` on that target. WASI was **not** run end to end here — this host has no invocable WASI SDK (`wasiCc()` yields a path with no `.exe` on Windows, and `WASI_SDK_HOME` is unset), but WASI and web share the **same `ASC_NP_NONE` branch**, and `unit: desktop/NativeProcessSeam` pins that the two cannot be split apart |
 | Regression | see the full-run row in `TODO.md` stage 391 |

@@ -39,7 +39,25 @@ export const NATIVE_PROCESS_RUNTIME = String.raw`
 // the GC root (as_np_mark_roots), which is what keeps a process object alive while
 // the child runs even if AS3 dropped every reference to it -- AIR keeps delivering
 // its events, and a listener registered on it before the drop must still fire.
-#ifndef _WIN32
+// ---- platform seam ---------------------------------------------------------
+// THREE backends behind ONE seam. Windows and POSIX really spawn a child; WASI
+// Preview 1 and the Emscripten/web target have no process API at all -- fork,
+// execv and fcntl are not merely unwise there, they do not EXIST, so a split on
+// a split on _WIN32 alone compiled the POSIX body into the web target and broke the
+// --package web build (fork/execv/fcntl: 10 errors). Those two answer
+// isSupported=false, which is the same answer AIR gives on a platform whose
+// runtime cannot spawn (docs/zh-cn/native-process.md §8).
+#ifdef _WIN32
+#define ASC_NP_WIN 1
+#elif defined(__wasi__) || defined(__EMSCRIPTEN__) || defined(__wasm__)
+#define ASC_NP_NONE 1
+#else
+#define ASC_NP_POSIX 1
+#endif
+
+// <unistd.h>/<fcntl.h>/<signal.h> already come from the runtime preamble, and only
+// for POSIX natives (it skips wasi and Emscripten); <sys/wait.h> is ours.
+#ifdef ASC_NP_POSIX
 #include <sys/wait.h>
 #endif
 
@@ -53,17 +71,19 @@ typedef struct as_np_slot {
     int in_sent;      // bytes of the standardInput buffer already written to the child
     int exited;
     int exit_code;
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
     HANDLE proc;
     HANDLE in_w;
     HANDLE out_r;
     HANDLE err_r;
-#else
+#elif defined(ASC_NP_POSIX)
     pid_t pid;
     int in_w;
     int out_r;
     int err_r;
 #endif
+    // ASC_NP_NONE: no handle fields at all -- the struct has to stay valid C on a
+    // target where HANDLE and pid_t are not declared.
 } as_np_slot;
 static as_np_slot as_np_slots[AS_NP_MAX];
 
@@ -75,11 +95,9 @@ static as_np_slot as_np_slots[AS_NP_MAX];
 #define AS_NP_ERR_NULL "Error #1009: Cannot access a property or method of a null object reference."
 
 static int as_np_supported(void) {
-#if defined(_WIN32)
-    return 1;
-#elif defined(__wasi__) || defined(__EMSCRIPTEN__)
-    // No process API at all: a WASI build answers isSupported=false, which is the
-    // same answer AIR gives on a platform whose runtime cannot spawn.
+#ifdef ASC_NP_NONE
+    // No process API at all: a WASI / web build answers isSupported=false, which is
+    // the same answer AIR gives on a platform whose runtime cannot spawn.
     return 0;
 #else
     return 1;
@@ -97,22 +115,20 @@ static as_np_slot* as_np_find(void* obj) {
 // a force-kill that never got its exit event must not both close, or a closed
 // HANDLE could be closed again after the OS reused the value.
 static void as_np_release(as_np_slot* s) {
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
     if (s->proc != NULL) CloseHandle(s->proc);
     if (s->in_w != NULL) CloseHandle(s->in_w);
     if (s->out_r != NULL) CloseHandle(s->out_r);
     if (s->err_r != NULL) CloseHandle(s->err_r);
-    s->proc = NULL; s->in_w = NULL; s->out_r = NULL; s->err_r = NULL;
-#else
+#elif defined(ASC_NP_POSIX)
     if (s->in_w >= 0) close(s->in_w);
     if (s->out_r >= 0) close(s->out_r);
     if (s->err_r >= 0) close(s->err_r);
-    s->in_w = -1; s->out_r = -1; s->err_r = -1; s->pid = -1;
 #endif
     memset(s, 0, sizeof(*s));
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
     s->proc = NULL; s->in_w = NULL; s->out_r = NULL; s->err_r = NULL;
-#else
+#elif defined(ASC_NP_POSIX)
     s->in_w = -1; s->out_r = -1; s->err_r = -1; s->pid = -1;
 #endif
 }
@@ -157,7 +173,7 @@ static void as_np_dispatch_data(void* obj, ByteArray* pipe, const char* type, in
 }
 
 // ---------------------------------------------------------------- command line --
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
 // The command line AIR builds on Windows, reproduced rather than improved: argv[0]
 // is quoted (so a program path with spaces still resolves), and every argument is
 // appended VERBATIM, one space apart, with NO quoting at all. Measured on adl
@@ -195,7 +211,7 @@ static void as_np_quote(char* buf, size_t cap, size_t* len, const char* arg) {
 // between the setter and the call is exactly that error, not a silent no-op).
 static int as_np_spawn(as_np_slot* s, const char* exe, const char* cwd, as_vector_string* args) {
     int argc = args != NULL ? args->length : 0;
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
     SECURITY_ATTRIBUTES sa;
     HANDLE in_r = NULL, in_w = NULL, out_r = NULL, out_w = NULL, err_r = NULL, err_w = NULL;
     STARTUPINFOW si;
@@ -269,7 +285,7 @@ done:
     if (err_r != NULL) CloseHandle(err_r);
     free(wexe); free(wcwd); free(wcmd); free(cmd);
     return ok;
-#else
+#elif defined(ASC_NP_POSIX)
     int in_pipe[2], out_pipe[2], err_pipe[2];
     pid_t pid;
     char* argv_local[64];
@@ -314,10 +330,28 @@ done:
     s->out_r = out_pipe[0];
     s->err_r = err_pipe[0];
     return 1;
+#else
+    // ASC_NP_NONE: unreachable in practice -- as_np_start reports the unsupported
+    // build before it gets here -- but the body must not name a fork() the target
+    // cannot link, so it answers "could not spawn" and never pretends to start.
+    (void)argc; (void)s; (void)exe; (void)cwd; (void)args;
+    return 0;
 #endif
 }
 
 // --------------------------------------------------------------- pipe traffic --
+#ifdef ASC_NP_NONE
+// No process API on this target, so there is no pipe to read or write: the three
+// helpers below degrade to quiet no-ops. A slot can never go live here (as_np_start
+// reports the unsupported build first), so nothing can reach them with work to do.
+static int as_np_read_pipe(as_np_slot* s, int which, ByteArray* ba) { (void)s; (void)which; (void)ba; return 0; }
+static void as_np_flush_stdin(as_np_slot* s, ByteArray* in) { (void)s; (void)in; }
+static void as_np_close_stdin(as_np_slot* s, ByteArray* in) { (void)s; (void)in; }
+#else
+// Everything between this #else and the matching #endif compiles ONLY on a target
+// that actually has file descriptors, which is why the _WIN32 split inside it is
+// safe: ASC_NP_NONE has already excluded wasi and the web target.
+//
 // Reads what the child wrote since the last tick. Returns the byte count, appending
 // into 'ba'; 0 means "nothing available" (EOF included -- the exit event is what
 // reports the end, exactly as AIR does: 51.4 has no STANDARD_OUTPUT_CLOSE).
@@ -400,6 +434,7 @@ static void as_np_close_stdin(as_np_slot* s, ByteArray* in) {
     if (s->in_w >= 0) { close(s->in_w); s->in_w = -1; }
 #endif
 }
+#endif  // !ASC_NP_NONE
 
 // --------------------------------------------------------------- AS3 surface --
 static File* as_np_info_get_exe(void* info) {
@@ -489,12 +524,12 @@ static void as_np_exit(void* obj, int force) {
     as_np_slot* s = as_np_find(obj);
     (void)force;
     if (s == NULL || !s->running) return;   // measured: a silent no-op
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
     // AIR's force=false asks the child to close; a console child with no window has
     // no message loop to ask, so this backend terminates in both cases. Documented
     // divergence (docs/zh-cn/native-process.md).
     if (s->proc != NULL) TerminateProcess(s->proc, 0);
-#else
+#elif defined(ASC_NP_POSIX)
     if (s->pid > 0) kill(s->pid, force ? SIGKILL : SIGTERM);
 #endif
     // Not reaped here: the exit event must still go out at the frame boundary, in
@@ -536,13 +571,13 @@ static void as_np_tick(void) {
         }
         as_np_flush_stdin(s, np->standardInput);
 
-#ifdef _WIN32
+#ifdef ASC_NP_WIN
         if (s->proc != NULL && WaitForSingleObject(s->proc, 0) == WAIT_OBJECT_0) {
             DWORD c = 0;
             if (GetExitCodeProcess(s->proc, &c)) code = (int)c;
             done = 1;
         }
-#else
+#elif defined(ASC_NP_POSIX)
         {
             int status = 0;
             pid_t r = waitpid(s->pid, &status, WNOHANG);
