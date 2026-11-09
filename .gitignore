@@ -199,3 +199,15 @@ examples/air-native/air-native.log
 # themselves are tracked).
 __pycache__/
 *.pyc
+# Generated ANE example artifacts (stage 391). Running `driver.as` stages the fixture
+# package into `examples/ane/extensions/`, leaves the generated `driver.c` beside the
+# source, and the executable finds `asaot.dll` beside itself -- so a copy of the host
+# runtime gets dropped here too. All three are OUTPUTS of running the example: the
+# extension tree is a per-machine snapshot of the platform packages the next run
+# overwrites, and `asaot.dll` is a duplicate of the tracked lib/bin/** host library.
+# The `!examples/ane/*.c` negation above exists ONLY for the hand-written ProbeANE.c
+# fixture, so this per-file rule re-ignores driver.c without touching it (later rules
+# win in .gitignore).
+examples/ane/driver.c
+examples/ane/extensions/
+examples/ane/asaot.dll
