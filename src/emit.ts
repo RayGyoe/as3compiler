@@ -24956,6 +24956,22 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return m;');
     this.indent--;
     this.line('}');
+    // G41 fast-path predicate: the layout string is a short, pure-ASCII, single-line
+    // sequence (no hard breaks). Every byte is then exactly one glyph in every font
+    // Skia can hand us, so HarfBuzz glyph ids + SkFont::getWidths reproduce the
+    // paragraph metrics and paint byte-for-byte.
+    this.line('static int as_tf_fast_ascii(const char* s) {');
+    this.indent++;
+    this.line('size_t n = strlen(s);');
+    this.line('for (size_t i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('unsigned char c = (unsigned char)s[i];');
+    this.line("if (c >= 0x80 || c == '\\r' || c == '\\n') return 0;");
+    this.indent--;
+    this.line('}');
+    this.line('return 1;');
+    this.indent--;
+    this.line('}');
     this.line('static void* as_tf_paragraph(TextField* tf) {');
     this.indent++;
     // A field with htmlText but no defaultTextFormat still lays out (AIR: Fps.as
@@ -25041,6 +25057,56 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('    tf->_para_runs_gen == tf->_runs_gen) {');
     this.indent++;
     this.line('return tf->_para;');
+    this.indent--;
+    this.line('}');
+    // G41 fast path: a short, pure-ASCII, single-style, single-line, non-wrapping,
+    // non-selected, non-underlined, non-masked field skips SkParagraph and is laid
+    // out by the glue's sk_text_light_new (HarfBuzz glyph ids + SkFont::getWidths).
+    // The guard below is the exact subset the light object reproduces byte-for-byte;
+    // anything outside it falls through to SkParagraph unchanged.
+    this.line('{');
+    this.indent++;
+    this.line('TextFormat* fpf = fmt;');
+    this.line('int frn = (tf->_runs != NULL) ? tf->_runs->length / 3 : 0;');
+    this.line('if (frn == 1) {');
+    this.indent++;
+    this.line('int rb = as_v_int_val(tf->_runs->data[0]);');
+    this.line('int re = as_v_int_val(tf->_runs->data[1]);');
+    this.line('TextFormat* rf = (TextFormat*)as_v_obj_val(tf->_runs->data[2]);');
+    this.line('if (rb == 0 && re == (int)strlen(ltext) && rf != NULL) fpf = rf; else frn = 99;');
+    this.indent--;
+    this.line('}');
+    this.line('int fast = (frn <= 1)');
+    this.line('  && !tf->displayAsPassword');
+    this.line('  && !(tf->wordWrap && tf->_fieldWidth > 0.0)');
+    this.line('  && !tf->multiline && !tf->_html_block');
+    this.line('  && !(tf->_sel_begin >= 0 && tf->_sel_end > tf->_sel_begin)');
+    this.line('  && ltext != NULL && ltext[0] != 0');
+    this.line('  && fpf != NULL && !as_v_bool_val(fpf->underline)');
+    this.line('  && strlen(ltext) <= 64');
+    this.line('  && as_tf_fast_ascii(ltext);');
+    this.line('if (fast) {');
+    this.indent++;
+    this.line('double fsize = as_v_num_val(fpf->size);');
+    this.line('int fbold = as_v_bool_val(fpf->bold) ? 1 : 0;');
+    this.line('int fital = as_v_bool_val(fpf->italic) ? 1 : 0;');
+    this.line('unsigned fcol = (tf->textColor != 0u && frn == 0) ? tf->textColor : (unsigned)as_v_num_val(fpf->color);');
+    this.line('double flead = as_v_num_val(fpf->leading);');
+    this.line('double fls = as_v_num_val(fpf->letterSpacing);');
+    this.line('void* lp = as_skia_text_light_new(ltext, (int)strlen(ltext), fpf->font, fsize, fbold, fital, fcol, flead, fls);');
+    this.line('if (lp != NULL) {');
+    this.indent++;
+    this.line('as_skia_textlayout_delete(tf->_para);');
+    this.line('tf->_para = lp;');
+    this.line('tf->_para_text = ltext; tf->_para_w = w; tf->_para_size = size;');
+    this.line('tf->_para_bold = bold; tf->_para_italic = italic; tf->_para_color = color;');
+    this.line('tf->_para_collapse = collapse; tf->_para_leading = leading; tf->_para_ls = letterSpacing;');
+    this.line('tf->_para_align = layoutAlign; tf->_para_runs_gen = tf->_runs_gen;');
+    this.line('return tf->_para;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('as_skia_textlayout_delete(tf->_para);');

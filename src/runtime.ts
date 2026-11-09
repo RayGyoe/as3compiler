@@ -11338,6 +11338,7 @@ extern double sk_text_measure(const char* text, double size, int bold, int itali
 extern double sk_text_measure_n(const char* text, int len, double size, int bold, int italic);
 extern void* sk_textlayout_new(const char* text, const char* family, double size, int bold, int italic, unsigned color, double width, int align, int collapseNewlines);
 extern void* sk_textlayout_new_leading(const char* text, const char* family, double size, int bold, int italic, unsigned color, double leading, double letterSpacing, double width, int align, int collapseNewlines);
+extern void* sk_text_light_new(const char* text, int len, const char* family, double size, int bold, int italic, unsigned color, double leading, double letterSpacing);
 extern double sk_textlayout_height(void* para);
 extern double sk_textlayout_max_width(void* para);
 // Longest line INCLUDING trailing blanks = AIR's TextField.textWidth. Skia's own
@@ -11642,6 +11643,7 @@ static inline double as_skia_text_measure_n(const char* t, int len, double sz, i
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { return sk_textlayout_new(t, fam, sz, bold, italic, color, w, align, collapse); }
 static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls, double w, int align, int collapse) { return sk_textlayout_new_leading(t, fam, sz, bold, italic, color, leading, ls, w, align, collapse); }
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { return sk_textlayout_new_runs(t, def, runs, n, w, align, collapse); }
+static inline void* as_skia_text_light_new(const char* t, int len, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls) { return sk_text_light_new(t, len, fam, sz, bold, italic, color, leading, ls); }
 static inline double as_skia_textlayout_height(void* p) { return sk_textlayout_height(p); }
 static inline double as_skia_textlayout_max_width(void* p) { return sk_textlayout_max_width(p); }
 static inline double as_skia_textlayout_text_width(void* p) { return sk_textlayout_max_width_incl_spaces(p); }
@@ -11673,6 +11675,7 @@ static inline double as_skia_text_measure_n(const char* t, int len, double sz, i
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
 static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)ls; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; as_text_engine_absent(); return NULL; }
+static inline void* as_skia_text_light_new(const char* t, int len, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls) { (void)t; (void)len; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)ls; as_text_engine_absent(); return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_text_width(void* p) { (void)p; return 0.0; }
@@ -12491,6 +12494,7 @@ static inline double as_skia_text_measure_n(const char* t, int len, double sz, i
 static inline void* as_skia_textlayout_new(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)w; (void)align; (void)collapse; return NULL; }
 static inline void* as_skia_textlayout_new_leading(const char* t, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls, double w, int align, int collapse) { (void)t; (void)fam; (void)sz; (void)ls; (void)bold; (void)italic; (void)color; (void)leading; (void)w; (void)align; (void)collapse; return NULL; }
 static inline void* as_skia_textlayout_new_runs(const char* t, const sk_text_run* def, const sk_text_run* runs, int n, double w, int align, int collapse) { (void)t; (void)def; (void)runs; (void)n; (void)w; (void)align; (void)collapse; return NULL; }
+static inline void* as_skia_text_light_new(const char* t, int len, const char* fam, double sz, int bold, int italic, unsigned color, double leading, double ls) { (void)t; (void)len; (void)fam; (void)sz; (void)bold; (void)italic; (void)color; (void)leading; (void)ls; return NULL; }
 static inline double as_skia_textlayout_height(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_max_width(void* p) { (void)p; return 0.0; }
 static inline double as_skia_textlayout_text_width(void* p) { (void)p; return 0.0; }

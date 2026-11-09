@@ -30,6 +30,11 @@
 #include "include/core/SkTypeface.h"
 #include "include/core/SkString.h"
 #include "include/core/SkFontStyle.h"
+#include "include/core/SkStream.h"
+// HarfBuzz headers for the G41 single-line fast path (glyph id from the shaper,
+// advance from SkFont::getWidths). Link order already carries -lharfbuzz.
+#include "third_party/externals/harfbuzz/src/hb.h"
+#include "third_party/externals/harfbuzz/src/hb-ot.h"
 
 // SkParagraph (modules/skparagraph) is the full text-layout engine used for
 // TextField's real typesetting (shaping via HarfBuzz, UAX#14 line breaking,
@@ -466,6 +471,154 @@ double sk_text_measure_n(const char* text, int len, double size, int bold, int i
   return (double)font.measureText(text, (size_t)len, SkTextEncoding::kUTF8);
 }
 
+// ---------- G41 single-line ASCII fast path (SkFont measure + draw, no SkParagraph) ----------
+// A live tick's hot set is short pure-ASCII strings (prices, percents) in a single
+// style on one unwrapped line. SkParagraph costs ~16us/op for those: its SkShaper
+// pipeline (bidi / script-run / fallback) and its line-break / bidi / advance
+// machinery run even though none of them can change the result. This path skips
+// both: HarfBuzz supplies the glyph ids (0.5us), SkFont::getWidths supplies the
+// HINTED advances (Skia's own scaler context, so the width is byte-identical to
+// SkParagraph — HarfBuzz's own advance is unhinted and drifts ~0.78px on GDI),
+// and paint() draws SkCanvas::drawGlyphs over the accumulated positions. Measured
+// in temp/g41/bench.cc: 0.68us/op vs 16.4us/op, widths diff 0.0000.
+
+#define SK_TEXT_LIGHT_MAX 64
+#define SK_TEXT_LIGHT_MAGIC 0x54584C31u  // "TXL1"
+
+struct sk_text_light {
+  uint32_t magic;
+  double width;      // textWidth: sum(hinted advance) + letterSpacing*glyphCount
+  double line_width; // getLineMetrics().width: 0 for an all-blank line, else == width
+  double ascent;     // AIR line box: rhalf(fAscent)
+  double descent;    // AIR line box: rhalf(fDescent)
+  double height;     // ascent + descent + leading (single line keeps the full box)
+  char* family;      // malloc'd alias-resolved family (paint needs it)
+  double size;
+  int bold, italic;
+  unsigned color;
+  int glyph_count;
+  uint16_t glyphs[SK_TEXT_LIGHT_MAX];
+  float positions[SK_TEXT_LIGHT_MAX];  // per-glyph x origin (paragraph-relative)
+};
+
+static int sk_is_text_light(void* p) {
+  return p != nullptr && ((sk_text_light*)p)->magic == SK_TEXT_LIGHT_MAGIC;
+}
+
+// hb_font per (resolved family, size, bold, italic). Built from the SAME
+// sk_match_typeface the paragraph path uses, so glyph ids agree with Skia's
+// typeface; only the shaper changes (raw HarfBuzz instead of SkShaper).
+// openStream + hb_face_create is expensive, hence the cache.
+static hb_font_t* sk_hb_font(const char* family, double size, int bold, int italic) {
+  static std::map<std::string, hb_font_t*> cache;
+  uint64_t bits = 0;
+  memcpy(&bits, &size, sizeof(bits));
+  SkString key;
+  key.printf("%s|%016llx|%d|%d", family ? family : "",
+             (unsigned long long)bits, bold ? 1 : 0, italic ? 1 : 0);
+  std::string k(key.c_str());
+  auto it = cache.find(k);
+  if (it != cache.end()) return it->second;
+
+  hb_font_t* font = nullptr;
+  sk_sp<SkTypeface> tf = sk_match_typeface(family, bold, italic);
+  if (tf) {
+    std::unique_ptr<SkStreamAsset> stream = tf->openStream(nullptr);
+    if (stream) {
+      size_t len = stream->getLength();
+      char* data = (char*)malloc(len ? len : 1);
+      if (data) {
+        size_t got = stream->read(data, len);
+        hb_blob_t* blob = hb_blob_create(data, (unsigned)got, HB_MEMORY_MODE_WRITABLE, data, free);
+        hb_face_t* face = hb_face_create(blob, 0);
+        hb_blob_destroy(blob);
+        font = hb_font_create(face);
+        hb_face_destroy(face);
+        hb_ot_font_set_funcs(font);
+        hb_font_set_scale(font, (int)(size * 64.0), (int)(size * 64.0));
+      }
+    }
+  }
+  cache[k] = font;
+  return font;
+}
+
+void* sk_text_light_new(const char* text, int len,
+                        const char* family, double size, int bold, int italic,
+                        unsigned color, double leading, double letterSpacing) {
+  if (text == nullptr || len <= 0 || len > SK_TEXT_LIGHT_MAX) return nullptr;
+  const char* resolved = sk_family_alias(family);
+  hb_font_t* hbf = sk_hb_font(resolved, size, bold, italic);
+  if (hbf == nullptr) return nullptr;
+
+  hb_buffer_t* buf = hb_buffer_create();
+  hb_buffer_add_utf8(buf, text, len, 0, len);
+  hb_buffer_guess_segment_properties(buf);
+  hb_shape(hbf, buf, nullptr, 0);
+  unsigned n = 0;
+  hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(buf, &n);
+  if (n == 0 || n > SK_TEXT_LIGHT_MAX) { hb_buffer_destroy(buf); return nullptr; }
+
+  sk_sp<SkTypeface> tf = sk_match_typeface(resolved, bold, italic);
+  SkFont font(tf, (SkScalar)size);
+  // The fast path only reproduces SkParagraph byte-for-byte when BOTH resolve to
+  // the same face. An uninstalled family (e.g. Monaco on Windows) falls back to a
+  // DIFFERENT default in sk_match_typeface than in SkParagraph's FontCollection,
+  // so a light object laid out against the wrong face would disagree with the
+  // paragraph path's width. Bail to SkParagraph whenever the matched face is not
+  // the requested family.
+  {
+    SkString matched;
+    if (tf) tf->getFamilyName(&matched);
+    if (!tf || strcmp(matched.c_str(), resolved) != 0) { hb_buffer_destroy(buf); return nullptr; }
+  }
+  uint16_t glyphs[SK_TEXT_LIGHT_MAX];
+  SkScalar widths[SK_TEXT_LIGHT_MAX];
+  for (unsigned i = 0; i < n; i++) glyphs[i] = (uint16_t)infos[i].codepoint;
+  font.getWidths(glyphs, n, widths);
+
+  float positions[SK_TEXT_LIGHT_MAX];
+  double x = 0.0;
+  for (unsigned i = 0; i < n; i++) {
+    positions[i] = (float)x;
+    x += (double)widths[i] + letterSpacing;
+  }
+
+  SkAirLineMetrics am = sk_air_line_metrics(resolved, size, bold, italic);
+  double height = am.model + leading;
+  if (height <= 0.0) { hb_buffer_destroy(buf); return nullptr; }
+
+  sk_text_light* l = (sk_text_light*)calloc(1, sizeof(sk_text_light));
+  if (l == nullptr) { hb_buffer_destroy(buf); return nullptr; }
+  l->magic = SK_TEXT_LIGHT_MAGIC;
+  l->width = x;
+  // AIR reports getLineMetrics().width 0 for a line of only spaces (the field's
+  // textWidth stays the full advance), mirroring sk_line_advance_incl_spaces's
+  // early return when a line has no visible glyph.
+  {
+    int all_blank = 1;
+    for (int i = 0; i < len; i++) {
+      char c = text[i];
+      if (c != ' ' && c != '\t') { all_blank = 0; break; }
+    }
+    l->line_width = all_blank ? 0.0 : x;
+  }
+  l->ascent = am.asc;
+  l->descent = am.desc;
+  l->height = height;
+  size_t flen = strlen(resolved);
+  l->family = (char*)malloc(flen + 1);
+  if (l->family) memcpy(l->family, resolved, flen + 1);
+  l->size = size;
+  l->bold = bold; l->italic = italic;
+  l->color = color;
+  l->glyph_count = (int)n;
+  memcpy(l->glyphs, glyphs, n * sizeof(uint16_t));
+  memcpy(l->positions, positions, n * sizeof(float));
+  hb_buffer_destroy(buf);
+  return l;
+}
+
 // ---------- text layout (SkParagraph: TextField full typesetting) ----------
 // SkParagraph replaces the self-built greedy word-wrap that measured every word
 // with SkFont. A single flat TextField becomes one Paragraph: shaping is done by
@@ -679,6 +832,7 @@ void* sk_textlayout_new_runs(const char* text, const sk_text_run* defaultStyle,
 // (the same origin paint() uses). Returns -1 when the paragraph is empty.
 int sk_textlayout_glyph_position_at(void* para, double x, double y) {
   if (para == NULL) return -1;
+  if (sk_is_text_light(para)) return -1;  // fast path has no hit-testing
   auto p = (skia::textlayout::Paragraph*)para;
   auto r = p->getGlyphPositionAtCoordinate((SkScalar)x, (SkScalar)y);
   return r.position;
@@ -699,6 +853,7 @@ int sk_textlayout_rects_for_range(void* para, int start, int end, int skip,
                                   double* lefts, double* tops, double* rights, double* bottoms,
                                   int max_rects) {
   if (para == NULL || max_rects <= 0 || skip < 0) return 0;
+  if (sk_is_text_light(para)) return 0;  // fast path has no selection
   using namespace skia::textlayout;
   auto p = (Paragraph*)para;
   auto boxes = p->getRectsForRange((unsigned)start, (unsigned)end,
@@ -730,6 +885,7 @@ int sk_textlayout_rects_for_range(void* para, int start, int end, int skip,
 // UTF-8 BYTE (the documented divergence) — identical for ASCII.
 int sk_textlayout_caret_rect(void* para, int index, double* x, double* y, double* h) {
   if (para == NULL) return 0;
+  if (sk_is_text_light(para)) return 0;  // fast path has no caret/IME
   using namespace skia::textlayout;
   auto p = (Paragraph*)para;
   unsigned i = (index > 0) ? (unsigned)index : 0u;
@@ -750,11 +906,13 @@ int sk_textlayout_caret_rect(void* para, int index, double* x, double* y, double
 
 // Total height of the laid-out paragraph (sum of every line's ascent+descent).
 double sk_textlayout_height(void* para) {
+  if (sk_is_text_light(para)) return ((sk_text_light*)para)->height;
   return (double)((skia::textlayout::Paragraph*)para)->getHeight();
 }
 
 // Longest physical line width = AS3 TextField.textWidth.
 double sk_textlayout_max_width(void* para) {
+  if (sk_is_text_light(para)) return ((sk_text_light*)para)->width;
   return (double)((skia::textlayout::Paragraph*)para)->getLongestLine();
 }
 
@@ -805,6 +963,7 @@ static double sk_line_advance_incl_spaces(skia::textlayout::Paragraph* p,
 // textWidth 6 for two spaces but getLineMetrics().width 0).
 double sk_textlayout_max_width_incl_spaces(void* para) {
   if (para == NULL) return 0.0;
+  if (sk_is_text_light(para)) return ((sk_text_light*)para)->width;
   using namespace skia::textlayout;
   auto p = (Paragraph*)para;
   double w = (double)p->getLongestLine();
@@ -818,6 +977,7 @@ double sk_textlayout_max_width_incl_spaces(void* para) {
 }
 
 int sk_textlayout_line_count(void* para) {
+  if (sk_is_text_light(para)) return 1;
   return (int)((skia::textlayout::Paragraph*)para)->lineNumber();
 }
 
@@ -830,6 +990,14 @@ int sk_textlayout_line_count(void* para) {
 // `cap` lines; returns how many were written.
 int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops, double* bottoms, int cap) {
   if (para == NULL || cap <= 0) return 0;
+  if (sk_is_text_light(para)) {
+    sk_text_light* l = (sk_text_light*)para;
+    if (starts) starts[0] = 0;
+    if (ends) ends[0] = l->glyph_count;
+    if (tops) tops[0] = 0.0;
+    if (bottoms) bottoms[0] = l->height;
+    return 1;
+  }
   using namespace skia::textlayout;
   auto p = (Paragraph*)para;
   std::vector<LineMetrics> lm;
@@ -861,6 +1029,25 @@ int sk_textlayout_line_box(void* para, int idx, double leading, const char* fami
                            int bold, int italic,
                            double* ascent, double* descent, double* left, double* width) {
   if (para == NULL || idx < -1) return 0;
+  if (sk_is_text_light(para)) {
+    sk_text_light* l = (sk_text_light*)para;
+    if (idx == 0) {
+      if (ascent) *ascent = l->ascent;
+      if (descent) *descent = l->descent;
+      if (left) *left = 0.0;
+      if (width) *width = l->line_width;
+      return 1;
+    }
+    // idx == -1 (no chars on the line) or out of range: AIR reports the default
+    // format's box with width 0, exactly like the run-free branch below.
+    SkAirLineMetrics am = sk_air_line_metrics(l->family ? l->family : family, l->size, l->bold, l->italic);
+    if (am.model <= 0.0) return 0;
+    if (ascent) *ascent = am.asc;
+    if (descent) *descent = am.desc;
+    if (left) *left = 0.0;
+    if (width) *width = 0.0;
+    return 1;
+  }
   using namespace skia::textlayout;
   std::vector<LineMetrics> lm;
   ((Paragraph*)para)->getLineMetrics(lm);
@@ -922,6 +1109,23 @@ int sk_textlayout_line_box(void* para, int idx, double leading, const char* fami
 }
 
 void sk_textlayout_paint(void* para, void* canvas, double x, double y) {
+  if (sk_is_text_light(para)) {
+    sk_text_light* l = (sk_text_light*)para;
+    sk_sp<SkTypeface> tf = sk_match_typeface(l->family, l->bold, l->italic);
+    SkFont font(tf, (SkScalar)l->size);
+    SkPaint paint;
+    paint.setColor(0xFF000000u | l->color);
+    paint.setAntiAlias(true);
+    SkPoint pts[SK_TEXT_LIGHT_MAX];
+    for (int i = 0; i < l->glyph_count; i++)
+      pts[i] = SkPoint::Make((SkScalar)l->positions[i], 0.0f);
+    // SkParagraph::paint's (x, y) is the paragraph's top-left; the baseline sits
+    // one ascent below it. drawGlyphs takes the baseline origin instead.
+    ((SkCanvas*)canvas)->drawGlyphs(l->glyph_count, l->glyphs, pts,
+                                    SkPoint::Make((SkScalar)x, (SkScalar)(y + l->ascent)),
+                                    font, paint);
+    return;
+  }
   ((skia::textlayout::Paragraph*)para)->paint((SkCanvas*)canvas, (SkScalar)x, (SkScalar)y);
 }
 
@@ -951,6 +1155,7 @@ void sk_textlayout_paint_underline(void* para, void* canvas, double ox,
                                    const int* u16, const unsigned* colors, int rangeCount) {
   if (para == NULL || canvas == NULL || rowY == NULL || u16 == NULL || colors == NULL) return;
   if (rangeCount <= 0 || lineCount <= 0) return;
+  if (sk_is_text_light(para)) return;  // fast path has no underline
   using namespace skia::textlayout;
   auto p = (Paragraph*)para;
   auto c = (SkCanvas*)canvas;
@@ -991,6 +1196,12 @@ void sk_textlayout_paint_underline(void* para, void* canvas, double ox,
 }
 
 void sk_textlayout_delete(void* para) {
+  if (sk_is_text_light(para)) {
+    sk_text_light* l = (sk_text_light*)para;
+    if (l->family) free(l->family);
+    free(l);
+    return;
+  }
   delete (skia::textlayout::Paragraph*)para;
 }
 
