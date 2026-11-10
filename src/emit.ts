@@ -25063,10 +25063,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     // G41 fast path: a short, pure-ASCII, single-style, single-line, non-wrapping,
-    // non-selected, non-underlined, non-masked field skips SkParagraph and is laid
-    // out by the glue's sk_text_light_new (HarfBuzz glyph ids + SkFont::getWidths).
-    // The guard below is the exact subset the light object reproduces byte-for-byte;
-    // anything outside it falls through to SkParagraph unchanged.
+    // non-editable, non-selected, non-underlined, non-masked field skips SkParagraph
+    // and is laid out by the glue's sk_text_light_new (HarfBuzz glyph ids +
+    // SkFont::getWidths). The guard below is the exact subset the light object
+    // reproduces byte-for-byte; anything outside it falls through to SkParagraph
+    // unchanged. Editable (input) fields are excluded (G42): rebuilding the
+    // paragraph on every paint drops selectionIndex, so the caret jumps to the end.
     this.line('{');
     this.indent++;
     this.line('TextFormat* fpf = fmt;');

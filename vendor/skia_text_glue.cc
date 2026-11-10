@@ -505,12 +505,72 @@ static int sk_is_text_light(void* p) {
   return p != nullptr && ((sk_text_light*)p)->magic == SK_TEXT_LIGHT_MAGIC;
 }
 
+// G42 fix: SkParagraph's advance is not a plain SkFont::getWidths sum. SkShaper
+// bridges getWidths into HarfBuzz (skhb funcs) on a sub-font scaled by
+// size*65536 and lets HarfBuzz apply GPOS kerning, so the per-glyph advance is
+// hinted-advance + kern. A raw getWidths sum drops the kern (Arial "1111" loses
+// -1.78pt x3 -> 52pt vs SkParagraph's 46.65625). Bridging getWidths into
+// HarfBuzz and reading hb_buffer_get_glyph_positions reproduces the advance
+// byte-for-byte (probe: 46.6562500000 == SkParagraph 46.6562500000).
+static hb_bool_t sk_g42_nominal_glyph(hb_font_t*, void* fd, hb_codepoint_t u,
+                                      hb_codepoint_t* glyph, void*) {
+  SkFont* font = (SkFont*)fd;
+  SkGlyphID g = font->unicharToGlyph(u);
+  *glyph = g;
+  return g != 0;
+}
+static hb_position_t sk_g42_h_advance(hb_font_t*, void* fd, hb_codepoint_t g, void*) {
+  SkFont* font = (SkFont*)fd;
+  SkScalar a;
+  SkGlyphID sg = (SkGlyphID)g;
+  font->getWidths(&sg, 1, &a);
+  if (!font->isSubpixel()) a = SkScalarRoundToInt(a);
+  return (hb_position_t)SkScalarRoundToInt(a * 65536.0);
+}
+static void sk_g42_h_advances(hb_font_t*, void* fd, unsigned count,
+                              const hb_codepoint_t* glyphs, unsigned glyph_stride,
+                              hb_position_t* advances, unsigned advance_stride, void*) {
+  SkFont* font = (SkFont*)fd;
+  uint16_t g[SK_TEXT_LIGHT_MAX];
+  SkScalar a[SK_TEXT_LIGHT_MAX];
+  const char* gp = (const char*)glyphs;
+  for (unsigned i = 0; i < count; i++) {
+    g[i] = (uint16_t)*(const hb_codepoint_t*)gp;
+    gp += glyph_stride;
+  }
+  font->getWidths(g, count, a);
+  if (!font->isSubpixel()) {
+    for (unsigned i = 0; i < count; i++) a[i] = SkScalarRoundToInt(a[i]);
+  }
+  char* ap = (char*)advances;
+  for (unsigned i = 0; i < count; i++) {
+    *(hb_position_t*)ap = (hb_position_t)SkScalarRoundToInt(a[i] * 65536.0);
+    ap += advance_stride;
+  }
+}
+static void sk_g42_font_destroy(void* d) { delete (SkFont*)d; }
+static hb_font_funcs_t* sk_g42_funcs() {
+  static hb_font_funcs_t* f = []() {
+    hb_font_funcs_t* ff = hb_font_funcs_create();
+    hb_font_funcs_set_nominal_glyph_func(ff, sk_g42_nominal_glyph, nullptr, nullptr);
+    hb_font_funcs_set_glyph_h_advance_func(ff, sk_g42_h_advance, nullptr, nullptr);
+    hb_font_funcs_set_glyph_h_advances_func(ff, sk_g42_h_advances, nullptr, nullptr);
+    return ff;
+  }();
+  return f;
+}
+
 // hb_font per (resolved family, size, bold, italic). Built from the SAME
 // sk_match_typeface the paragraph path uses, so glyph ids agree with Skia's
 // typeface; only the shaper changes (raw HarfBuzz instead of SkShaper).
 // openStream + hb_face_create is expensive, hence the cache.
+struct sk_hb_font_pair {
+  hb_font_t* ot;
+  hb_font_t* sub;
+};
+
 static hb_font_t* sk_hb_font(const char* family, double size, int bold, int italic) {
-  static std::map<std::string, hb_font_t*> cache;
+  static std::map<std::string, sk_hb_font_pair> cache;
   uint64_t bits = 0;
   memcpy(&bits, &size, sizeof(bits));
   SkString key;
@@ -518,9 +578,9 @@ static hb_font_t* sk_hb_font(const char* family, double size, int bold, int ital
              (unsigned long long)bits, bold ? 1 : 0, italic ? 1 : 0);
   std::string k(key.c_str());
   auto it = cache.find(k);
-  if (it != cache.end()) return it->second;
+  if (it != cache.end()) return it->second.sub;
 
-  hb_font_t* font = nullptr;
+  sk_hb_font_pair entry = {nullptr, nullptr};
   sk_sp<SkTypeface> tf = sk_match_typeface(family, bold, italic);
   if (tf) {
     std::unique_ptr<SkStreamAsset> stream = tf->openStream(nullptr);
@@ -532,15 +592,23 @@ static hb_font_t* sk_hb_font(const char* family, double size, int bold, int ital
         hb_blob_t* blob = hb_blob_create(data, (unsigned)got, HB_MEMORY_MODE_WRITABLE, data, free);
         hb_face_t* face = hb_face_create(blob, 0);
         hb_blob_destroy(blob);
-        font = hb_font_create(face);
+        hb_font_t* ot = hb_font_create(face);
         hb_face_destroy(face);
-        hb_ot_font_set_funcs(font);
-        hb_font_set_scale(font, (int)(size * 64.0), (int)(size * 64.0));
+        hb_ot_font_set_funcs(ot);  // scale stays upem, matching SkShaper's typefaceFont
+        hb_font_t* sub = hb_font_create_sub_font(ot);
+        SkFont* sf = new SkFont(tf, (SkScalar)size);
+        sf->setEdging(SkFont::Edging::kAntiAlias);
+        sf->setHinting(SkFontHinting::kSlight);
+        sf->setSubpixel(true);
+        hb_font_set_funcs(sub, sk_g42_funcs(), sf, sk_g42_font_destroy);
+        hb_font_set_scale(sub, (int)(size * 65536.0), (int)(size * 65536.0));
+        entry.ot = ot;
+        entry.sub = sub;
       }
     }
   }
-  cache[k] = font;
-  return font;
+  cache[k] = entry;
+  return entry.sub;
 }
 
 void* sk_text_light_new(const char* text, int len,
@@ -560,7 +628,6 @@ void* sk_text_light_new(const char* text, int len,
   if (n == 0 || n > SK_TEXT_LIGHT_MAX) { hb_buffer_destroy(buf); return nullptr; }
 
   sk_sp<SkTypeface> tf = sk_match_typeface(resolved, bold, italic);
-  SkFont font(tf, (SkScalar)size);
   // The fast path only reproduces SkParagraph byte-for-byte when BOTH resolve to
   // the same face. An uninstalled family (e.g. Monaco on Windows) falls back to a
   // DIFFERENT default in sk_match_typeface than in SkParagraph's FontCollection,
@@ -572,16 +639,16 @@ void* sk_text_light_new(const char* text, int len,
     if (tf) tf->getFamilyName(&matched);
     if (!tf || strcmp(matched.c_str(), resolved) != 0) { hb_buffer_destroy(buf); return nullptr; }
   }
+  // Advance comes from HarfBuzz glyph positions (getWidths bridged into HarfBuzz
+  // + GPOS kerning), NOT a raw getWidths sum: the latter drops the kern.
+  hb_glyph_position_t* hbpos = hb_buffer_get_glyph_positions(buf, &n);
   uint16_t glyphs[SK_TEXT_LIGHT_MAX];
-  SkScalar widths[SK_TEXT_LIGHT_MAX];
-  for (unsigned i = 0; i < n; i++) glyphs[i] = (uint16_t)infos[i].codepoint;
-  font.getWidths(glyphs, n, widths);
-
   float positions[SK_TEXT_LIGHT_MAX];
   double x = 0.0;
   for (unsigned i = 0; i < n; i++) {
+    glyphs[i] = (uint16_t)infos[i].codepoint;
     positions[i] = (float)x;
-    x += (double)widths[i] + letterSpacing;
+    x += (double)hbpos[i].x_advance / 65536.0 + letterSpacing;
   }
 
   SkAirLineMetrics am = sk_air_line_metrics(resolved, size, bold, italic);
@@ -1116,6 +1183,14 @@ void sk_textlayout_paint(void* para, void* canvas, double x, double y) {
     sk_text_light* l = (sk_text_light*)para;
     sk_sp<SkTypeface> tf = sk_match_typeface(l->family, l->bold, l->italic);
     SkFont font(tf, (SkScalar)l->size);
+    // G42: the paint SkFont must carry the SAME edging/hinting/subpixel as the
+    // one the light object was measured with (sk_hb_font's SkFont). drawGlyphs
+    // renders each glyph against font's advance, so a default-hinted font here
+    // rounds the advance to whole pixels and drifts off the fractional positions
+    // (the tabbar label centred 3.33pt off its cell).
+    font.setEdging(SkFont::Edging::kAntiAlias);
+    font.setHinting(SkFontHinting::kSlight);
+    font.setSubpixel(true);
     SkPaint paint;
     paint.setColor(0xFF000000u | l->color);
     paint.setAntiAlias(true);
