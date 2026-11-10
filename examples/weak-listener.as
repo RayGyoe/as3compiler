@@ -45,12 +45,19 @@ function churn():void {
 }
 
 // --- A: weak + nested closure -> collected, handler never runs -------------
+//
+// -O2 inlines regWeakAnon into main(), so the closure's spilled pointer slots land
+// in main()'s own frame; a separate churn() call has its frame below main() and
+// cannot reach them, which is why case A scrubs inline (in main()'s frame) below.
+// The string concat temporaries overwrite those dead slots so the conservative
+// stack scan (gc_mark_stack) does not falsely pin the weak closure. AIR's GC is
+// exact and needs no scrub.
 function regWeakAnon(d:EventDispatcher):void {
   d.addEventListener("e", function (ev:Event):void { rec("weak-anon"); }, false, 0, true);
 }
 var dA:EventDispatcher = new EventDispatcher();
 regWeakAnon(dA);
-churn();
+for (var sa:int = 0; sa < 64; sa++) log.push("scrub-" + sa + "-" + (sa * 7919));
 System.gc();
 reset();
 dA.dispatchEvent(new Event("e"));

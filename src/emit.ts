@@ -3219,6 +3219,23 @@ export class Emitter {
     // NativeApplication bodies that call as_win_active).
     this.line('static NativeWindow* as_win_wrapper(int id);');
     this.line('static NativeWindow* as_win_active(void);');
+    // flash.desktop.NativeProcess backend (native-process.ts): tickTimers/tickFrame
+    // (emitGlobalCall) and Stage_dispatchFrame call as_np_tick(), and those call
+    // sites are emitted in emitFunctionValues / emitDefinitions — both AFTER this
+    // pass but BEFORE the shell-class wrappers in emitShellClasses that used to
+    // carry these declarations. stage 392 moved the POSIX body behind ASC_NP_POSIX
+    // and the file-dialog test (no NativeProcess use) started compiling as_np_tick
+    // as an implicit declaration followed by a static definition — a build error.
+    // One source here; native-process.ts only defines them.
+    this.line('static int as_np_supported(void);');
+    this.line('static void as_np_start(void* obj, void* info);');
+    this.line('static void as_np_exit(void* obj, int force);');
+    this.line('static void as_np_close_input(void* obj);');
+    this.line('static void as_np_tick(void);');
+    this.line('static File* as_np_info_get_exe(void* info);');
+    this.line('static File* as_np_info_get_wd(void* info);');
+    this.line('static void as_np_info_set_exe(void* info, File* value);');
+    this.line('static void as_np_info_set_wd(void* info, File* value);');
     // NativeApplication.openedWindows. Defined with the window table (it needs
     // ASC_wins), but the getter that calls it is emitted long before that.
     this.line('static as_array* as_win_opened_windows(void);');
@@ -4467,20 +4484,6 @@ export class Emitter {
   // slots where a NULL would make a DOCUMENTED call pattern crash instead of
   // reporting itself (NativeProcess's three pipes are read/written directly).
   private emitShellClasses(): void {
-    // Prototypes for the flash.desktop.NativeProcess backend (native-process.ts).
-    // The shell class BODIES below are emitted before the runtime block, so the
-    // thin wrappers that call as_np_* need the declarations first -- the same
-    // forward-declaration shape the vector/ClassValue helpers use.
-    this.line('static int as_np_supported(void);');
-    this.line('static void as_np_start(void* obj, void* info);');
-    this.line('static void as_np_exit(void* obj, int force);');
-    this.line('static void as_np_close_input(void* obj);');
-    this.line('static void as_np_tick(void);');
-    this.line('static File* as_np_info_get_exe(void* info);');
-    this.line('static File* as_np_info_get_wd(void* info);');
-    this.line('static void as_np_info_set_exe(void* info, File* value);');
-    this.line('static void as_np_info_set_wd(void* info, File* value);');
-    this.line('');
     let any = false;
     for (const [name, info] of this.symbols.classes) {
       if (info.shell !== true) continue;
@@ -25080,6 +25083,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('  && !tf->displayAsPassword');
     this.line('  && !(tf->wordWrap && tf->_fieldWidth > 0.0)');
     this.line('  && !tf->multiline && !tf->_html_block');
+    // An editable field needs the caret rect, hit-testing, selection and IME that
+    // the light object does not provide (sk_textlayout_caret_rect and
+    // sk_textlayout_glyph_position_at both return 0/-1 for it). Routing an input
+    // field through the fast path silently froze its horizontal auto-scroll: after
+    // typing past the right edge, as_tf_scroll_after_edit reads a 0 caret rect and
+    // early-returns with _scroll_h still 0 (tf-scale-metrics.as). Exclude it.
+    this.line('  && !as_tf_is_input(tf)');
     this.line('  && !(tf->_sel_begin >= 0 && tf->_sel_end > tf->_sel_begin)');
     this.line('  && ltext != NULL && ltext[0] != 0');
     this.line('  && fpf != NULL && !as_v_bool_val(fpf->underline)');

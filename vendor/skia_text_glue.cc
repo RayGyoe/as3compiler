@@ -1028,6 +1028,7 @@ int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops,
 int sk_textlayout_line_box(void* para, int idx, double leading, const char* family, double size,
                            int bold, int italic,
                            double* ascent, double* descent, double* left, double* width) {
+  (void)leading;  // the caller folds leading into height = asc + desc + lead
   if (para == NULL || idx < -1) return 0;
   if (sk_is_text_light(para)) {
     sk_text_light* l = (sk_text_light*)para;
@@ -1086,18 +1087,20 @@ int sk_textlayout_line_box(void* para, int idx, double leading, const char* fami
   // over all of them (measured on adl: a 12 px default plus a 24 px run has line
   // heights 13.975 / 27.950, not a uniform box).
   LineMetrics& m = lm[idx];
-  const double lh = (double)m.fHeight;
-  // AIR splits that box as ascent + descent + leading with an ascent/descent pair
-  // that ignores the leading. Skia keeps exposing the UNFORCED halves when a box
-  // was forced on the line (measured: a 12 px Arial strut reports asc 10 / desc 4
-  // for a 12 px box), so scale the pair into the box minus the leading. With
-  // leading 0 -- the common case -- the split is left exactly as Skia reports it,
-  // and a run-level height override already reports halves that sum to its box.
-  const double sum = (double)m.fAscent + (double)m.fDescent;
-  const double model = lh - leading;
-  const double k = (sum > 0.0 && model > 0.0) ? model / sum : 1.0;
-  double asc = (double)m.fAscent * k;
-  double desc = (double)m.fDescent * k;
+  // AIR splits the line box as ascent + descent + leading with an ascent/descent
+  // pair that ignores the leading and drops the face's own line gap: it is exactly
+  // rhalf(face ascent) / rhalf(face descent). Skia's LineMetrics keeps exposing the
+  // UNFORCED halves instead (the line gap folded in as half-leading -- Monaco 12 px
+  // reports fAscent 12.5 / fDescent 3.5), and scaling those into the box left up to
+  // ~0.3 px of residual (Monaco 12 px came out 11.718 / 3.28 rather than AIR's
+  // 12 / 3). The caller has already resolved the tallest run's face/size/bold/italic
+  // (as_tf_line_fmt), so read the AIR halves straight from sk_air_line_metrics -- the
+  // same source the empty-line branches above and the G41 fast path use, so underline
+  // (which disables the fast path) cannot change the reported ascent/descent.
+  SkAirLineMetrics am = sk_air_line_metrics(family, size, bold, italic);
+  if (am.model <= 0.0) return 0;
+  double asc = am.asc;
+  double desc = am.desc;
   if (ascent) *ascent = asc;
   if (descent) *descent = desc;
   if (left) *left = (double)m.fLeft;

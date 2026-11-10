@@ -296,6 +296,20 @@ done:
     argv[0] = (char*)exe;
     for (int i = 0; i < argc; i++) argv[i + 1] = (args->data != NULL) ? args->data[i] : (char*)"";
     argv[narg] = NULL;
+    // The host may run us with no stdin/stdout/stderr (a headless harness or a
+    // GUI runtime closes them). If pipe() then reuses 0/1/2, the child's
+    // dup2/close dance below would close a standard stream it had just wired.
+    // Point any closed standard fd at /dev/null first so the three pipes always
+    // land above fd 2 and the child's closes can never touch 0/1/2.
+    {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            for (int fd = 0; fd <= 2; fd++) {
+                if (fd != devnull && fcntl(fd, F_GETFD) < 0) dup2(devnull, fd);
+            }
+            if (devnull > 2) close(devnull);
+        }
+    }
     if (pipe(in_pipe) != 0) { if (argv != argv_local) free(argv); return 0; }
     if (pipe(out_pipe) != 0) { close(in_pipe[0]); close(in_pipe[1]); if (argv != argv_local) free(argv); return 0; }
     if (pipe(err_pipe) != 0) { close(in_pipe[0]); close(in_pipe[1]); close(out_pipe[0]); close(out_pipe[1]); if (argv != argv_local) free(argv); return 0; }

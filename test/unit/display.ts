@@ -679,21 +679,22 @@ function checkLineMetrics(): string[] {
   check('an empty field falls back to the AIR face metrics with width 0',
     /if \(idx >= n\) \{[\s\S]{0,600}?if \(idx != 0 \|\| n != 0\) return 0;[\s\S]{0,300}?SkAirLineMetrics am = sk_air_line_metrics\(family, size, bold, italic\);/.test(glue) &&
     glue.includes('if (left) *left = 0.0;') && glue.includes('if (width) *width = 0.0;'));
-  // The per-line box is Skia's own LineMetrics::fHeight, and the ascent/descent
-  // pair is scaled into (box - leading) because a forced box (strut or per-run
-  // height override) leaves Skia reporting the UNFORCED halves there (measured on
-  // Windows/Arial 12: a 12 px box reports asc 10 / desc 4).
-  check('the line box is Skia\'s own per-line height, not a stride over the paragraph',
-    glue.includes('const double lh = (double)m.fHeight;') &&
+  // The per-line box is Skia's own LineMetrics (indexed by the line, never a
+  // paragraph-wide stride), and the ascent/descent split is rebuilt to AIR's
+  // model: rhalf(face ascent) / rhalf(face descent), dropping the face's line gap.
+  // Skia keeps exposing the UNFORCED halves there (the line gap folded in as
+  // half-leading), so we read the AIR halves straight from sk_air_line_metrics --
+  // the same source the G41 fast path uses, so underline (which disables the fast
+  // path) cannot change the reported ascent/descent.
+  check('the line box is Skia\'s own per-line box, not a stride over the paragraph',
+    glue.includes('LineMetrics& m = lm[idx];') &&
     !glue.includes('double stride = (n > 1) ? (lm[n - 1].fBaseline') &&
     !glue.includes('(double)idx * stride'));
-  check('the ascent/descent pair is scaled so that asc + desc + leading == the box',
-    glue.includes('const double sum = (double)m.fAscent + (double)m.fDescent;') &&
-    glue.includes('const double model = lh - leading;') &&
-    glue.includes('const double k = (sum > 0.0 && model > 0.0) ? model / sum : 1.0;') &&
-    glue.includes('double asc = (double)m.fAscent * k;') &&
-    glue.includes('double desc = (double)m.fDescent * k;') &&
-    !glue.includes('if (leading < 0.0) {'));
+  check('the ascent/descent pair is AIR\'s rounded face halves, not Skia\'s unforced halves',
+    glue.includes('double asc = am.asc;') &&
+    glue.includes('double desc = am.desc;') &&
+    !glue.includes('const double sum = (double)m.fAscent + (double)m.fDescent;') &&
+    !glue.includes('double asc = (double)m.fAscent * k;'));
   check('left/width come from the line box itself',
     glue.includes('if (left) *left = (double)m.fLeft;') &&
     glue.includes('if (width) *width = sk_line_advance_incl_spaces((Paragraph*)para, m);'));

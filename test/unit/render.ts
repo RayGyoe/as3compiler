@@ -150,11 +150,15 @@ function checkFontMetrics(): string[] {
   // ignores the leading, and Skia has no usable leading knob here: StrutStyle's
   // leading never reaches the line box (measured -- a leading of 4 left a 2-line
   // paragraph at 2*model) and a negative one is clamped to 0 outright, so BOTH
-  // signs go through the height and sk_textlayout_line_box scales the split back.
+  // signs go through the height. sk_textlayout_line_box reads the AIR halves
+  // straight from sk_air_line_metrics (its ascent/descent never depend on the
+  // leading) instead of scaling Skia's unforced halves back out of the forced
+  // line height.
   check('leading, either sign, is folded into the strut height',
     glue.includes('strut.setHeight((SkScalar)(box * am.rawFull / (am.rawSum * size)));') &&
     !glue.includes('strut.setLeading(') &&
-    glue.includes('const double model = lh - leading;'));
+    glue.includes('double asc = am.asc;') &&
+    glue.includes('double desc = am.desc;'));
   // Both run-free paragraph builders install the strut (flat field, flat field
   // with TextFormat.leading) -- the rich-text builder cannot: it must give EACH
   // run its own AIR box (TextStyle::heightOverride) because a strut would force

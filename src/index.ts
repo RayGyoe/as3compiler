@@ -687,7 +687,15 @@ async function main(): Promise<void> {
       Object.assign(cfg, applyManifest(cfg, loadedManifest, opts.manifest));
     }
 
-    docRootClass = air.mainClass.split('.').pop();
+    // The emitter compares the class's C name (qualifiedName(name, pkg)) against
+    // docRootClass, so this must be the fully-qualified C name (`aneapp_Main`),
+    // not the short name (`Main`). The short name never equals a namespaced C
+    // name, which silently disabled the constructor-time stage fallback and made
+    // `this.stage` null inside the document class's constructor (ane-app #1009).
+    const dcParts = air.mainClass.split('.');
+    const dcShort = dcParts.pop() as string;
+    const dcPkg = dcParts.length > 0 ? dcParts.join('.') : null;
+    docRootClass = qualifiedName(dcShort, dcPkg);
     program = { body: [], imports: [] };
     const bootSrc = generateBootstrap(air.info, air.mainClass);
     featureScanTexts.push(bootSrc);

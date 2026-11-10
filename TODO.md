@@ -21293,3 +21293,41 @@ return flag;
 default body 赋值后 `break` 且不可达零返回仍存在）。钉子有牙：把 `src/emit.ts` 回退到修前，
 「default body 先赋值再 break」这条红。端到端由 `examples/air-starling-demo` 复验——修前
 每秒 22 条 `#1009`，修后 `Uncaught exception` 为 0、基准跑满 50080 对象无崩溃。
+
+### 阶段三百九十六：收口全量回归既有红 —— 文档类构造期 stage、NativeProcess stdin fd、非轻路径文本行盒、弱监听器保守栈误保留（v0.4.367 → v0.4.368）
+
+全量 `node test.ts` 在 switch 修复后仍红 7 处，逐一收口；除两处真 bug 外多为「既有实现/钉子漂移」。
+
+**文档类构造期 `stage`（ane-app #1009，真 bug）**：`--air-app` 把 `docRootClass` 设成短名（`Main`），
+而 `Emitter` 在 `name === this.docRootClass` 里拿它比对**C 名**（`aneapp_Main`）——永不相等，于是
+`ASC_doc_root = (DisplayObject*)o;` 从不发射，文档类构造器里 `this.stage` 为 null，
+`stage.addEventListener` 抛 `#1009`。修法（`src/index.ts`）：用 `qualifiedName(短名, 包名)` 算全限定 C 名再传。
+
+**NativeProcess stdin fd（真 bug）**：宿主 fd 0 被关时 POSIX `pipe(in_pipe)` 会复用 fd 0，子进程
+`dup2(in_pipe[0], 0)` 成 no-op、随后的 `close(in_pipe[0])` 又把刚接好的 stdin 关掉，`/bin/cat` 报
+`EBADF`。修法（`src/native-process.ts`）：`pipe` 前先把缺失的 0/1/2 重定向到 `/dev/null`。例子里
+Windows 路径（`C:/definitely/not/here.exe`）在 macOS 上先被当无效路径拒绝，改成按平台取路径。
+
+**非轻路径文本行盒**：`sk_textlayout_line_box` 此前把 Skia 的**未强制** `fAscent/fDescent` 按
+`lh - leading` 缩放进强制行高，导致 `getLineMetrics` 的 ascent/descent 变成分数（11.718/3.281 而非
+AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像素）不一致——`TextFormat.underline`
+只是绘制输入却改变了布局度量。修法（`vendor/skia_text_glue.cc`）：段落路径直接读 `sk_air_line_metrics`
+的 `asc/desc`。配套改 `test/unit/display.ts`（LineMetrics 钉）与 `test/unit/render.ts`（FontMetrics 钉）。
+
+**G41 快路径不得用于输入框**：快路径无 caret rect / hit-test / selection / IME，可编辑字段输入越过
+右边界时算不出光标位置、不自动横向滚动。修法（`src/emit.ts`）：`as_tf_paragraph` 的 `fast` 谓词加
+`!as_tf_is_input(tf)`。
+
+**file-dialog 前向声明**：`as_np_tick` 等 NativeProcess 原型从 `emitShellClasses()` 提前到
+`emitForwardDecls()`，消除「先引用后定义」的隐式声明/静态声明冲突。
+
+**weak-listener.as 保守栈误保留**：`-O2` 把 `regWeakAnon` 内联进 `main()`，闭包指针的死槽落在
+`main()` 自己的帧里，独立的 `churn()` 帧在它下方够不着；保守栈扫描把它当根误保留。这是 gc.md
+§4.2.1 已登记的「宁可误保留」边界，不是监听器注册 bug。改 example：在顶层帧内联 scrubbing（字符串
+拼接临时量覆盖死槽）再 `System.gc()`。
+
+**platform/NativeWindow 钉漂移**：阶段三百八十三把 `as_skia_surface_new(pw, ph)` 改成
+`as_skia_surface_new_tagged(pw, ph, AS_MEM_SURF_WIN)`，钉仍搜旧串。改 `test/unit/platform.ts` 搜新串。
+
+**回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
+`weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。

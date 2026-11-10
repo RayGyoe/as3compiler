@@ -508,7 +508,7 @@ function checkNativeWindow(): string[] {
   const onResize = body('static void* ASC_window_on_resize(int id, int lw, int lh, int pw, int ph, double scale) {');
   check('resizing a GPU window only re-sizes the drawable, never allocates a surface',
     onResize.indexOf('if (w->is_gpu) {') >= 0
-    && onResize.indexOf('if (w->is_gpu) {') < onResize.indexOf('as_skia_surface_new('));
+    && onResize.indexOf('if (w->is_gpu) {') < onResize.indexOf('as_skia_surface_new_tagged('));
 
   // Seam half: the backend request must cross both signatures, and the headless /
   // browser stub must accept it rather than fall out of sync with the caller.

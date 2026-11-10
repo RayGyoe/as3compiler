@@ -103,11 +103,13 @@ check(si.executable == null && si.workingDirectory == null, "executable/workingD
 check(si.arguments != null && si.arguments.length == 0, "arguments starts as an empty Vector");
 ok("descriptor defaults");
 
-var e3:Error = threw(function():void { si.executable = new File("C:/definitely/not/here.exe"); });
+var missingExe:String = isWindows ? "C:/definitely/not/here.exe" : "/definitely/not/here.exe";
+var e3:Error = threw(function():void { si.executable = new File(missingExe); });
 check(e3 != null && e3.errorID == 3214, "a missing executable throws #3214 from the SETTER");
 ok("executable setter");
 
-var e4:Error = threw(function():void { si.workingDirectory = new File("C:/definitely/not/here"); });
+var missingWd:String = isWindows ? "C:/definitely/not/here" : "/definitely/not/here";
+var e4:Error = threw(function():void { si.workingDirectory = new File(missingWd); });
 check(e4 != null && e4.errorID == 3215, "a missing workingDirectory throws #3215 from the SETTER");
 check(e4.message.indexOf("does not specify a valid directory") >= 0, "the #3215 message names the directory");
 ok("workingDirectory setter");
