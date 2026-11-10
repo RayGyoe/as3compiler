@@ -306,9 +306,31 @@ static EM_BOOL on_mouse_evt(int eventType, const EmscriptenMouseEvent* e, void* 
 // window_glue.cc forwards. Stage_dispatchWheel on the AS3 side treats delta as
 // "positive = scrolling up" (scrollV -= delta), so we negate deltaY here to make
 // the web backend match the native convention — otherwise scroll direction flips.
+//
+// THE UNIT HAS TO MATCH TOO, and it did not until this was fixed: on the SDL side
+// one delta unit is ONE NOTCH (Stage_dispatchWheel moves a TextField by one line
+// per unit, and the kit's scroll views move `wheelStep` px per unit — the docs say
+// "one wheel notch is wheelStep px"), while the DOM reports deltas in whatever
+// deltaMode the browser picked: Chrome/Edge send 100 CSS px per notch with
+// DOM_DELTA_PIXEL, Firefox sends 3 with DOM_DELTA_LINE, page-mode senders send 1.
+// Passing those straight through made a single notch worth 100 x wheelStep = 4000px,
+// i.e. "one click and you are already at the bottom" (measured on the published
+// page: deltaY 100 -> MouseEvent.delta -100, -3 -> -3, -1 -> -1). Normalise every
+// mode to notches so `delta` means the same thing on both backends; the result
+// stays FRACTIONAL on purpose, because a trackpad sends a stream of small pixel
+// deltas and rounding each to +-1 would turn a glide into a stutter.
+static double wheel_notches(const EmscriptenWheelEvent* e) {
+  // 3 lines per notch and 100 px per notch are the browser conventions (Chrome's
+  // 100 is 3 lines of a 33px default line box); a page-mode delta is one page per
+  // notch already. deltaMode is an unsigned long, so compare against the EM_* names.
+  if (e->deltaMode == DOM_DELTA_LINE) return e->deltaY / 3.0;
+  if (e->deltaMode == DOM_DELTA_PAGE) return e->deltaY;
+  return e->deltaY / 100.0;
+}
+
 static EM_BOOL on_wheel_evt(int eventType, const EmscriptenWheelEvent* e, void* ud) {
   (void)eventType; (void)ud;
-  if (g_on_wheel) g_on_wheel(0, (double)e->mouse.targetX, (double)e->mouse.targetY, -(double)e->deltaY);
+  if (g_on_wheel) g_on_wheel(0, (double)e->mouse.targetX, (double)e->mouse.targetY, -wheel_notches(e));
   return EM_TRUE;
 }
 
