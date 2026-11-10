@@ -5292,3 +5292,51 @@ function checkSoundNoBackend(): string[] {
   return bad;
 }
 registerGroup('unit: emit/SoundNoBackend', checkSoundNoBackend);
+
+// A non-integer switch (string/Number/bool) lowers to an index switch: the labels
+// are tested into an `_swN` int, then a native `switch (_swN)` re-creates the
+// matching/fall-through semantics. Its LAST label is the AS3 `default:` body,
+// which in AS3 may legally omit the trailing `break` (the switch just ends).
+// Stage 364 appended a provably-unreachable `default: return <zero>;` to silence
+// clang's "control reaches end of non-void function", but that label swallowed the
+// default body's fall-through: `default: flag = "rgba";` emitted as
+// `case 3: flag = "rgba"; default: return NULL;` and the function returned NULL.
+// A real app then handed the NULL out of RenderUtil.createAGALTexOperation and died
+// with #1009 in the AGAL assembler. The emitter must keep the AS3 exit by closing
+// the default body with an explicit `break;` before the unreachable label.
+function checkSwitchDefaultFallthrough(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [emit] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [emit] ${label}`); }
+  };
+
+  const src = 'function f(format:String):String {\n' +
+    '  var flag:String;\n' +
+    '  switch (format) {\n' +
+    '    case "COMPRESSED": flag = "dxt1"; break;\n' +
+    '    case "COMPRESSED_ALPHA": flag = "dxt5"; break;\n' +
+    '    default: flag = "rgba";\n' +
+    '  }\n' +
+    '  return flag;\n' +
+    '}\n' +
+    'trace(f("x"));\n';
+  const c = generateC(parse(src)).c;
+  const i = c.indexOf('int _sw');
+  check('the string switch lowers to an index switch', i >= 0);
+  const seg = c.slice(i, i + 600);
+
+  // The default body (case 3) must close with a break BEFORE the unreachable
+  // `default: return NULL;`, so `flag = "rgba"` reaches `return flag`, not NULL.
+  const dflt = seg.indexOf('(flag = "rgba");');
+  const unreachable = seg.indexOf('default: return NULL;');
+  check('the default body assigns and then breaks (not falls into the zero return)',
+    dflt >= 0 && unreachable > dflt && seg.slice(dflt, unreachable).includes('break;'));
+  check('the unreachable zero-return label is still present (non-void fn)',
+    unreachable >= 0);
+
+  console.log(`     [switch-default-fallthrough] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/SwitchDefaultFallthrough', checkSwitchDefaultFallthrough);

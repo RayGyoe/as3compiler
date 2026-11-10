@@ -21262,3 +21262,34 @@ Windows 上 `exit(false)` 也走 `TerminateProcess`（控制台子进程没有�
 
 **未修（本阶段明确留白）**：星号**颜色**（我们黑、adl 占位灰 162）仍开放；`TextField` 的
 **编辑索引**（`caretIndex`/选区/行表）仍是字节域，与 G38 之后的码元域之间仍差一层换算。
+
+### 阶段三百九十五：非整型 `switch` 的 default 分支不得落入不可达零返回（v0.4.366 → v0.4.367）
+
+`emitSwitchChained` 把非整型判别式（`String`/`Number`/`bool`）降级成「先测进 `_swN` 整型，
+再原生 `switch (_swN)` 重建语义」。为了压掉 clang 对非 void 函数的「control reaches end of
+non-void function」警告，链尾追加了一条可证不可达的 `default: return <zero>;`。但当 AS3 的
+`default:` 是**最后一个 label 且省略了收尾 `break`**（switch 就此结束，完全合法）时，那条
+不可达 label 会吞掉 default body 的 fall-through：
+
+```as
+switch (format) {
+  case "COMPRESSED":        flag = "dxt1"; break;
+  case "COMPRESSED_ALPHA":  flag = "dxt5"; break;
+  default:                  flag = "rgba";          // 无 break，AS3 就此结束
+}
+return flag;
+```
+
+生成 C 成了 `case 3: flag = "rgba"; default: return NULL;`，函数返回 NULL。Starling 的
+`RenderUtil.createAGALTexOperation()` 正是这个形态，于是 shader 串变成 NULL，一路漏进
+`AGALMiniAssembler.assemble(null)`，`as_req_obj(NULL)` 反复抛 `Error #1009`（`-D ASC_NULL_TRACE=1`
+定位到 `Starling-Demo.c:142353`）。
+
+**做法**（`src/emit.ts`）：在 AS3 `default` body 发射后显式补一条 `break;`，再发不可达的
+`default: return <zero>;`。若 body 本来就以 `break/return/continue/throw` 结束，这条补的
+`break` 是死代码，`-O2` 会清掉，不影响语义。
+
+**回归面**：新增 `unit: emit/SwitchDefaultFallthrough`（3 钉：串 switch 降级为索引 switch、
+default body 赋值后 `break` 且不可达零返回仍存在）。钉子有牙：把 `src/emit.ts` 回退到修前，
+「default body 先赋值再 break」这条红。端到端由 `examples/air-starling-demo` 复验——修前
+每秒 22 条 `#1009`，修后 `Uncaught exception` 为 0、基准跑满 50080 对象无崩溃。

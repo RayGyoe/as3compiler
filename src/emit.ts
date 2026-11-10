@@ -36160,6 +36160,16 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.line(`case ${cases.length + 1}: ;`);
       this.indent++;
       for (const s of def.body) this.emitStmt(s);
+      // The default body is the LAST label in the index switch, so in AS3 it may
+      // legally omit its trailing `break` (the switch simply ends). But the
+      // provably-unreachable `default:` below would otherwise swallow that
+      // fall-through: `switch (format) { case COMPRESSED: ...; break; default:
+      // formatFlag = "rgba"; }` emitted as `case 3: formatFlag = "rgba";
+      // default: return NULL;` returned NULL instead of ending (a real app died
+      // with #1009 from the null shader that leaked out of RenderUtil
+      // .createAGALTexOperation). The explicit break keeps the AS3 exit, while a
+      // body that already ends in break/return/continue/throw leaves it dead.
+      this.line('break;');
       this.indent--;
     }
     // The chain above assigns the index one of exactly these labels, so this
