@@ -310,7 +310,7 @@ AIR 默认设 `ACCEPT` 头为一串 MIME 列表（除非你在 `requestHeaders` 
 | `DatagramSocket`（UDP） | ❌ 未实现（与 TCP 底座不同，独立立项） |
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **已落地（阶段八十九·五十三）**：TCP 底座 + 完整 `IDataInput`/`IDataOutput`；`SecureSocket` 仅 API 面 + 诚实失败（`isSupported=false`，TLS 状态机未做）。语义详见 §7 |
 | `FileReference`/`FileReferenceList`/`FileFilter` | ❌ |
-| `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌（`NetStream` 仅有 dynamic `client` 槽，见 `symbols.ts:2451`） |
+| `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌（`NetStream` 仅有 dynamic `client` 槽，见 `symbols.ts:2451`；播放路线已单独立项评估，见 [`video.md`](video.md)） |
 | `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **已落地（阶段三百六十三）**：`findInterfaces()` 走 `getifaddrs` 真枚举（MAC / `active` / `mtu` / IPv4+IPv6 地址与前缀长度），返回值与身份语义全部按 adl 51.4.1 实测对齐；Windows 与 WASI 仍是诚实报明 + 空 Vector。契约与验收见 §6.10 |
 | `Responder` | ❌ |
 | 静态自包含打包（含 curl 的 `vendor/` 静态库） | ✅ **已落地（阶段八十九·五十三）**：`vendor/curl` 提供 `libcurl.a`/`libnghttp2.a`/`libz.a`，`otool -L` 不再出现 `libcurl.4.dylib`（见 §4.1） |

@@ -348,7 +348,7 @@ content via `progress`/`complete`, rather than `ioError`".
 | `DatagramSocket` (UDP) | ❌ not implemented (a different base from TCP, a standalone effort) |
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **landed (stage eighty-nine / fifty-three)**: TCP base + complete `IDataInput`/`IDataOutput`; `SecureSocket` is API surface only + honest failure (`isSupported=false`, TLS state machine not done). Semantics in detail in §7 |
 | `FileReference`/`FileReferenceList`/`FileFilter` | ❌ |
-| `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌ (`NetStream` has only a dynamic `client` slot, see `symbols.ts:2451`) |
+| `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌ (`NetStream` has only a dynamic `client` slot, see `symbols.ts:2451`; a playback stack has been scoped separately, see [`video.md`](video.md)) |
 | `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **landed (stage 363)**: `findInterfaces()` really enumerates through `getifaddrs` (MAC / `active` / `mtu` / IPv4+IPv6 addresses with prefix lengths), with return-value and identity semantics aligned to adl 51.4.1 measurements; Windows and WASI still report the gap honestly and return an empty Vector. Contract and acceptance: §6.10 |
 | `Responder` | ❌ |
 | Static self-contained packaging (including the `vendor/` static library with curl) | ✅ **landed (stage eighty-nine / fifty-three)**: `vendor/curl` provides `libcurl.a`/`libnghttp2.a`/`libz.a`, and `otool -L` no longer shows `libcurl.4.dylib` (see §4.1) |
