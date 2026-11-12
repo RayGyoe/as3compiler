@@ -340,14 +340,35 @@ vendor/ffmpeg/
 |---|---|
 | `vendor/provision/ffmpeg-static.sh broad` | 跑 `configure`/`make`，量体积，装到 `build-tools/ffmpeg-out/broad/` |
 | `vendor/provision/macos.sh --only video` | 校验 5 个 `.a` 与 include 树 → 拷进 `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+| `vendor/provision/windows.ps1 -Only video -Arch both` | 按位宽各跑一次配方（`--arch=x64|x86`），产物落 `build-tools/ffmpeg-out/broad-win-<arch>/` → `vendor/ffmpeg/lib/windows-<arch>/*.lib` |
 
-**产物的入库时机**：`vendor/ffmpeg/` 现在已能一键生成（约 24 MB），但要等 V1 的 seam 真的引用它时才提交——
-先入库一个没人链接的 24 MB 二进制没有意义，而重建只要一条 `macos.sh --only video`。
+**产物已入库（macOS + Windows）**：2026-11-12 决定把 `vendor/ffmpeg/` 整体提交（macOS arm64 的 5 个 `.a`
+与 Windows 的 10 个 `.lib`，合计 ~62 MB）。代价是仓库体积，换来的是「clone 下来就能编」——不必先凑齐
+MSYS2/nasm/vcvars 才能连一个视频程序。重建仍然只是一条命令：`macos.sh --only video` /
+`windows.ps1 -Only video -Arch both`（后者会同时重写两位宽）。
 
 档位用 `ASC_FFMPEG_PROFILE` 覆盖（默认 `broad`），源码位置用 `ASC_FFMPEG_SRC` 覆盖（缺省
 `build-tools/ffmpeg-src`，不存在时按 `ASC_FFMPEG_TAG`（默认 `n9.0.2`）`git clone --depth 1`）。
-**Windows 侧没有对应入口**：`windows.ps1` 是 clang-cl + MSVC ABI，FFmpeg 没有那套构建系统，只能在
-MSYS2/MinGW 下编——不要以为加个 `-Only video` 就能用。
+
+**Windows 侧（x86 与 x64 都要）**：入口是 `windows.ps1 -Only video`（缺省不包含，因为它比另外三个包多要
+两个工具）。产物名与 macOS 不同——msvc 工具链的 `LIBPREF` 为空，归档是 `avformat.lib`/`avcodec.lib`，
+没有 `lib` 前缀。三条实测出的约束（配方文件头有完整出处）：
+
+1. **必须 MSVC ABI**，与 `src/build.ts::windowsTargetTriple` 的 `--target={x86_64,i686}-pc-windows-msvc`
+   一致。MinGW 编出来的 `libav*.a` 是 GNU ABI（`___chkstk_ms`、mingw CRT），链不上——失败会出现在
+   应用链接期，离原因很远，所以不能“试试看”。
+2. **真正的编译器是 clang-cl**：MSVC 19.43 已不认 `-o`（D9035），而 configure 每个测试都用
+   `-c -o obj src`，真 `cl.exe` 会把 obj 丢到 cwd，首个链接测试就死在 `LNK1136`。但 configure 的 msvc
+   版本门仍要探 `cl.exe`，所以两者都得在 PATH 上——`windows.ps1` 已经把这件事做掉了。
+3. **x86 必须导入 x86 的 vcvars 环境**（`INCLUDE`/`LIB` 逐位宽），否则 `LNK4272`（x64 的 `libcmt.lib`
+   撞 x86 目标）。`windows.ps1` 本来就是按位宽分层导入的，`Build-Video` 复用了这一点。
+
+外部依赖：POSIX shell（MSYS2 或 Cygwin）+ GNU `make` + `nasm`（x86 SIMD 内核）。Git for Windows 自带的
+bash 是 MSYS2 血统但**不含 make**，脚本会点名缺哪个而不是让它在 `make` 处神秘失败。
+**`--arch` 不传就是两位宽都编**：配方先 x64 再 x86，每一轮自己把对应位宽的 vcvars 环境导入当前
+shell（`vswhere` → `vcvarsall` → 环境快照 → `cygpath`），所以单跑一条 `ffmpeg-static.sh broad` 也能出
+两套；半导入（PATH 上没 System32 而 SDK 静默缺失）会被硬拒，而不是拖到 `windows.h` 报错。
+**Windows 的体积已实测**（§7 末段：探针 x64 10.6 MB / x86 9.4 MB，归档合计 20.4 / 16.9 MB）。
 
 `checks.ts` 增一行 `vendor.video`（`kind: "warn"`，与 `vendor.audio` 同形：链接了→ok；没链但该链→
 给出「glue 缺失」「本机不支持」「清单没写」三种原因之一）；`doctor.ts` 的配置摘要加一位 `video`。
@@ -531,6 +552,11 @@ LGPL（不是 GPL），但会拖进 mpegvideo 编码框架，体积未测，所�
   n9 的 `videotoolbox` 系 hwaccel 多了一个 `prores_raw`，解复用与 DSP 也变大了。**换 tag 必须重量。**
 
 **要重测就重跑 §15 的脚本**：三档配置共用一份源，换 `--enable-*` 列表即可；数字变了就改回本节。
+
+**Windows（MSVC ABI，同一探针、同一 `broad`+publish 档位）**：探针 x64 **10.6 MB** / x86 **9.4 MB**；
+五个归档合计 x64 **20.4 MB** / x86 **16.9 MB**。比 macOS arm64 大 2 MB 左右：MSVC 目标把自己的 CRT/SEH
+带进来，且 Windows 侧硬解是 **14 个**（7 个编解码器 × d3d11va/dxva2）。这里的 `linked` 与 `stripped`
+两列**相同**——PE 上没有 `strip -x` 那种收益（本来就没带调试信息），不是没跑 `llvm-strip`。
 **按需注入时的分程序体积账见 §5.8**。
 
 ---
@@ -680,8 +706,10 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 **仍未定**（不阻塞实现）：
 
 1. **`all` 档接不接**：VVC + `libdav1d` + DASH（`libxml2`）。`broad` 已覆盖实际使用面，`all` 只是「更全」。
-2. **Windows 侧的 video 入口**：`macos.sh --only video` 已就位，`windows.ps1` 没有——FFmpeg 需要 MSYS2/MinGW
-   环境，而那个脚本整套是 clang-cl + MSVC ABI。要不要做、怎么做，等 V5（publish 落地）Windows 端验收时再定。
+2. **Windows 侧的 video 入口**：**已落地**（2026-11-12）。`windows.ps1 -Only video` 按位宽各跑一次
+   `ffmpeg-static.sh --arch=x64|x86`，走 `--toolchain=msvc` + clang-cl，产物是 `vendor/ffmpeg/lib/windows-<arch>/*.lib`。
+   仍未验证的只有最后一步：本机缺 MSYS2/`make`/`nasm`，所以 **`make` 阶段与体积数没有实测**；
+   `configure` 阶段（含全部组件断言、两位宽的 `ARCH_X86_32/64` 核对）已在 MSVC 14.43 + LLVM 23.1 上跑通。
 
 ---
 

@@ -65,7 +65,9 @@ SDL2_SRC="$BUILD_TOOLS/sdl2-src"
 # FFmpeg differs from the three above: its recipe lives IN git, next to this file.
 # The --enable-* list in it *is* the design recorded in docs/zh-cn/video.md §3/§6, and
 # the measured size table only stays reproducible if the recipe is tracked. See that
-# file's header for why, and for the Windows (MSYS2-only) caveat.
+# file's header for why. Windows uses the same recipe through windows.ps1's
+# Build-Video (--arch=x64|x86, --toolchain=msvc); the split is "one recipe, one
+# thin entry point per platform", so the --enable-* list never forks.
 FFMPEG_RECIPE="$PROVISION/ffmpeg-static.sh"
 FFMPEG_SRC="${ASC_FFMPEG_SRC:-$BUILD_TOOLS/ffmpeg-src}"
 FFMPEG_PROFILE="${ASC_FFMPEG_PROFILE:-broad}"

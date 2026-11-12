@@ -376,15 +376,41 @@ Two layers, same as curl (`build_curl()` in `vendor/provision/macos.sh:221-240` 
 |---|---|
 | `vendor/provision/ffmpeg-static.sh broad` | runs `configure`/`make`, measures size, installs into `build-tools/ffmpeg-out/broad/` |
 | `vendor/provision/macos.sh --only video` | validates the five `.a` files and the include tree → copies into `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+| `vendor/provision/windows.ps1 -Only video -Arch both` | runs the recipe once per arch (`--arch=x64|x86`); artifacts land in `build-tools/ffmpeg-out/broad-win-<arch>/` → `vendor/ffmpeg/lib/windows-<arch>/*.lib` |
 
-**When the artifacts get committed**: `vendor/ffmpeg/` can be produced in one command today (~24 MB), but it
-lands in git only when V1's seam actually links it — committing a 24 MB binary nobody references buys nothing,
-while rebuilding it is one `macos.sh --only video`.
+**The artifacts are committed (macOS + Windows)**: as of 2026-11-12 the whole `vendor/ffmpeg/` tree is in git
+(the five macOS arm64 `.a` files and the ten Windows `.lib` files, ~62 MB total). The cost is repository size;
+the gain is "clone and build" — no need to assemble MSYS2/nasm/vcvars before linking a video program.
+Rebuilding is still one command: `macos.sh --only video` / `windows.ps1 -Only video -Arch both` (the latter
+rewrites both widths).
 
 Profile via `ASC_FFMPEG_PROFILE` (default `broad`); source tree via `ASC_FFMPEG_SRC` (default
 `build-tools/ffmpeg-src`, cloned at `ASC_FFMPEG_TAG`, default `n9.0.2`, when absent).
-**There is no Windows entry point**: `windows.ps1` is clang-cl + MSVC ABI and FFmpeg has no build system for
-that — it needs an MSYS2/MinGW shell. Do not assume `-Only video` would work.
+
+**On Windows (both x86 and x64)**: the entry point is `windows.ps1 -Only video` (not in the default package
+set — it needs two tools the other three packages do not). Artifact names differ from macOS: the msvc
+toolchain sets `LIBPREF` empty, so the archives are `avformat.lib`/`avcodec.lib` with no `lib` prefix. Three
+constraints, all measured (the recipe header carries the full evidence):
+
+1. **MSVC ABI, not MinGW**, matching `src/build.ts::windowsTargetTriple`'s
+   `--target={x86_64,i686}-pc-windows-msvc`. A MinGW `libav*.a` is GNU ABI (`___chkstk_ms`, the mingw CRT)
+   and does not link — the failure surfaces in the *application* link, far from the cause.
+2. **clang-cl is the compiler**: MSVC 19.43 no longer honours `-o` (D9035) while configure compiles every
+   test as `-c -o obj src`, so a real `cl.exe` drops the object into the CWD and the first link test dies
+   with `LNK1136`. configure's msvc version gate still probes `cl.exe`, so both must be on PATH —
+   `windows.ps1` arranges that.
+3. **x86 needs the x86 vcvars environment** (`INCLUDE`/`LIB` are per-arch); with the x64 environment the
+   link test dies with `LNK4272` (x64 `libcmt.lib` against an x86 target). `windows.ps1` already imports
+   per arch, and `Build-Video` reuses that.
+
+External dependencies: a POSIX shell (MSYS2 or Cygwin) + GNU `make` + `nasm` (x86 SIMD kernels). Git for
+Windows' bundled bash is MSYS2-derived but has **no make**; the script names whichever piece is missing
+instead of failing mysteriously at `make`.
+**Omitting `--arch` builds both widths**: the recipe runs x64 then x86, and each pass imports that width's
+vcvars environment into the current shell itself (`vswhere` → `vcvarsall` → env dump → `cygpath`), so a single
+`ffmpeg-static.sh broad` produces both trees. A half import (no System32 on PATH, hence the SDK silently
+missing) is rejected outright instead of surfacing later as `windows.h` not found.
+**Windows sizes are measured** (§7's closing paragraph: probes 10.6 MB x64 / 9.4 MB x86, archives 20.4 / 16.9 MB).
 
 `checks.ts` gains a `vendor.video` row (`kind: "warn"`, same shape as `vendor.audio`: linked → ok; should be
 linked but is not → name which of the three reasons applies — glue missing, host unsupported, or the manifest
@@ -578,6 +604,12 @@ How to read these numbers:
 **To re-measure, rerun §15's script** — all profiles share one source, just a different `--enable-*` list. If the
 numbers move, update this table. **Per-program accounting for the injection gate is §5.8.**
 
+**Windows (MSVC ABI, same probe, same `broad`+publish profile)**: probe **10.6 MB** on x64 / **9.4 MB** on x86;
+the five archives total **20.4 MB** (x64) / **16.9 MB** (x86). That is ~2 MB more than macOS arm64: the MSVC
+target carries its own CRT/SEH, and Windows has **14** hardware backends (7 codecs × d3d11va/dxva2). The
+`linked` and `stripped` columns are **identical** here — PE gives no `strip -x` win because nothing ever carried
+debug info; it is not that `llvm-strip` was skipped.
+
 ---
 
 ## 8. LGPL compliance (mandatory; the risk is larger than the size)
@@ -732,9 +764,11 @@ the native manifest carries the FFmpeg `link-libs`, the web manifest does not. T
 
 1. **Whether to add the `all` profile**: VVC + `libdav1d` + DASH (`libxml2`). `broad` already covers real-world use;
    `all` only makes it "more complete".
-2. **The Windows entry point for video**: `macos.sh --only video` exists, `windows.ps1` has none — FFmpeg needs an
-   MSYS2/MinGW shell while that script is entirely clang-cl + MSVC ABI. Whether and how to add it is deferred to
-   the Windows acceptance for V5 (publish).
+2. **The Windows entry point for video**: **landed** (2026-11-12). `windows.ps1 -Only video` runs
+   `ffmpeg-static.sh --arch=x64|x86` once per arch through `--toolchain=msvc` + clang-cl, producing
+   `vendor/ffmpeg/lib/windows-<arch>/*.lib`. The only unverified part is the final step: this host has no
+   MSYS2/`make`/`nasm`, so **the `make` stage and the size numbers are unmeasured**; the `configure` stage
+   (every component assertion plus the `ARCH_X86_32/64` check, both arches) passed on MSVC 14.43 + LLVM 23.1.
 
 ---
 

@@ -128,28 +128,46 @@ Skia 编一次 30~60 分钟（几千个 C++ 文件）。两套位宽是两棵独
 
 ---
 
-## macOS / FFmpeg（`ffmpeg-static.sh` + `macos.sh --only video`）
+## macOS / Windows FFmpeg（`ffmpeg-static.sh` + 平台薄入口）
 
-macOS 侧是两层，与 curl 完全同形，但**配方本身在 git 里**：
+两端都是两层，与 curl 完全同形，但**配方本身在 git 里**，且**只有一份**——Windows 不在 `windows.ps1`
+里另写一套 `--enable-*`：
 
 | 层 | 文件 | 入 git | 职责 |
 |---|---|---|---|
-| recipe | `vendor/provision/ffmpeg-static.sh` | ✅ | `configure`/`make` + 体积探针 + 断言，装到 `build-tools/ffmpeg-out/<profile>/` |
-| deploy | `vendor/provision/macos.sh --only video` | ✅ | 校验 5 个 `.a` 与 include 树 → `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+| recipe | `vendor/provision/ffmpeg-static.sh` | ✅ | `configure`/`make` + 体积探针 + 断言，装到 `build-tools/ffmpeg-out/<profile>[-win-<arch>]/`；Windows 下不传 `--arch` = 两位宽都编 |
+| deploy (macOS) | `vendor/provision/macos.sh --only video` | ✅ | 校验 5 个 `.a` 与 include 树 → `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+| deploy (Windows) | `vendor/provision/windows.ps1 -Only video` | ✅ | 按位宽各跑一次配方 → `vendor/ffmpeg/lib/windows-<arch>/*.lib`（msvc 归档无 `lib` 前缀） |
 
 ```sh
 cd as3compiler
 bash vendor/provision/ffmpeg-static.sh broad      # 或 air|mid|broad；--no-publish 只做解码
-bash vendor/provision/macos.sh --only video       # 部署进 vendor/ffmpeg/
+bash vendor/provision/macos.sh --only video       # 部署进 vendor/ffmpeg/（macOS arm64）
 ```
+```powershell
+# Windows：x86 与 x64 各一份，走 --toolchain=msvc（产物名字是 avcodec.lib，不是 libavcodec.a）
+cd as3compiler\vendor\provision
+powershell -ExecutionPolicy Bypass -File .\windows.ps1 -Only video -Arch both
+```
+
+- **`--arch` 不传就是两位宽都编**（airscreen 只取 32/64 两种）：配方会先编 x64 再编 x86，两条各自
+  自动把对应位宽的 vcvars 环境导入当前 shell（`vswhere` → `vcvarsall` → 环境快照 → `cygpath`），
+  否则第二条必然死在 `LNK4272`。所以 `bash vendor/provision/ffmpeg-static.sh broad` 一条命令就能出
+  两套产物；任一位宽失败都以非零退出，且会先跑完另一条再汇总（两位宽红的原因不一样）。
+  半导入的环境会被拒：shell 的 PATH 上没 System32 时 `VsDevCmd` 的 `reg query` 找不到 Windows SDK
+  且**不报错**，那种环境会在很久以后以 `'windows.h' file not found` / `LNK1104 kernel32.lib` 爆开。
 
 - **为什么这个配方入 git、curl 的不入**：那份 `--enable-*` 列表就是 `docs/zh-cn/video.md` §3/§6 记录的
   设计（带哪些解码器、publish 留哪三件），体积表（§3/§7）只有在配方被版本化时才可复现。curl 的配方留在
   未跟踪的 `build-tools/` 属历史包袱，不是可以照抄的理由。
 - 源码默认 `build-tools/ffmpeg-src`（不在 git），不存在时按 `ASC_FFMPEG_TAG`（默认 `n9.0.2`）自动
   `git clone --depth 1`；档位用 `ASC_FFMPEG_PROFILE` 覆盖。
-- **Windows 没有对应入口**：`windows.ps1` 是 clang-cl + MSVC ABI，FFmpeg 没有那套构建系统，只能在
-  MSYS2/MinGW 下编。别以为加个 `-Only video` 就能用（脚本里也是这么写的）。
+- **Windows 侧必须是 MSVC ABI**（与 `src/build.ts::windowsTargetTriple` 一致），MinGW 编的 `libav*.a` 是
+  GNU ABI、链不上。工具链实际用 `clang-cl`：MSVC 19.43 已不认 `-o`（D9035），configure 的每个测试都
+  是 `-c -o obj src`，真 `cl.exe` 会把 obj 丢到 cwd、首个链接测试死在 `LNK1136`——但 configure 的版本门
+  仍要探 `cl.exe`，所以两者都得在 PATH 上。x86 还必须导入 x86 的 vcvars 环境，否则 `LNK4272`。
+- Windows 额外要 POSIX shell（MSYS2 或 Cygwin）+ `make` + `nasm`；Git for Windows 自带的 bash 不含 make，
+  脚本会一次点名缺哪个。**Windows 的体积数尚未测量**（§3/§7 的数字都是 macOS arm64 实测）。
 - 断言失败是 `exit 3` 而不是「编译成功但推不了流 / 硬解形同虚设」——`configure` 对缺依赖的显式
   `--enable-*` 只发警告。
 

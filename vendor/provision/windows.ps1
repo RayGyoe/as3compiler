@@ -43,13 +43,16 @@
        安装时勾 "Add LLVM to the system PATH"，或设环境变量 LLVM_HOME 指向安装根目录。
     3. Git（拉 Skia 源码）、Python 3（跑 Skia 的 git-sync-deps / fetch-gn / fetch-ninja）。
     4. CMake（编 SDL2/curl）。Ninja 由脚本自动取（Skia 自带 fetch-ninja），你也可以自己装一个。
+    5. **只有 -Only video 才需要**：POSIX bash（MSYS2 推荐 / Cygwin 亦可，脚本会自动找并报明缺什么）
+       与 nasm（x86 SIMD 内核：h264 软解与 swscale）。FFmpeg 没有 cmd/PowerShell 构建路径，
+       configure 是 sh 脚本；MSYS2 里需要 `pacman -S --needed make nasm diffutils`。
 
   用法（PowerShell）：
     cd as3compiler\vendor\provision
     powershell -ExecutionPolicy Bypass -File .\windows.ps1
     常用开关：-Arch both|x64|x86|arm64（缺省 both；both = x64+x86，**不含** arm64）
-              -Only skia,sdl2,curl
-              -SkipSkia / -SkipSdl2 / -SkipCurl
+              -Only skia,sdl2,curl,video
+              -SkipSkia / -SkipSdl2 / -SkipCurl / -SkipVideo
               -Clean（清构建目录重编） -SkipDownload（源码下好了，跳过下载） -LlvmHome 'C:\Program Files\LLVM'
 
   位置说明：本脚本住在 vendor/provision/（provision = 产物是怎么来的），产物写回 vendor/（= 产物本身），
@@ -65,6 +68,12 @@
       vendor/sdl2/licenses/SDL2/LICENSE.txt    （两套位宽字节相同，共用一份）
       vendor/curl/lib/<arch>/*.lib             （curl.lib / nghttp2.lib / zlib.lib / z.lib）
       vendor/curl/include/                     （头与平台无关，两套位宽共享）
+      vendor/ffmpeg/lib/<arch>/*.lib           （avformat.lib / avcodec.lib / avutil.lib /
+                                                swscale.lib / swresample.lib：msvc 工具链的
+                                                归档名没有 lib 前缀，与 macOS 的 libav*.a 不同）
+      vendor/ffmpeg/include/                   （头树与平台无关，共享；唯一逐目标生成的是
+                                                libavutil/avconfig.h，部署时逐字节核对）
+      vendor/ffmpeg/LICENSE.LGPLv2.1           （LGPL-2.1 §4 要求许可证随二进制走）
     macOS 侧同形，且位宽键也带 OS 前缀：vendor/sdl2/<lib|include|bin|share>/macos-arm64/。
     这里的 sdl2 三件产物由本脚本落盘，macOS 的 macos-arm64 那套是 configure 手工构建的
     （不在本脚本内；薄入口见同目录的 macos.sh）。
@@ -113,13 +122,14 @@ param(
   [ValidateSet('x64', 'x86', 'arm64', 'both')]
   [string]$Arch = 'both',
 
-  # 只构建其中一部分：skia / sdl2 / curl
-  [ValidateSet('skia', 'sdl2', 'curl')]
+  # 只构建其中一部分：skia / sdl2 / curl / video
+  [ValidateSet('skia', 'sdl2', 'curl', 'video')]
   [string[]]$Only,
 
   [switch]$SkipSkia,
   [switch]$SkipSdl2,
   [switch]$SkipCurl,
+  [switch]$SkipVideo,
 
   # 清掉构建输出目录（不动已下载的源码，便于重编）
   [switch]$Clean,
@@ -218,10 +228,13 @@ Write-Ok "vendor:      $Vendor"
 
 # ---------------------------------------------------------------- 1. 要构建哪些
 $Want = @()
+# video 刻意**不在**缺省集合里：它要额外的 POSIX shell + nasm，而 Skia/SDL2/curl 的老流程不该
+# 因为视频后端存在就突然要求新工具链。要它就显式写 -Only video（或 -Only skia,curl,video）。
 if ($Only) { $Want = @($Only) } else { $Want = @('skia', 'sdl2', 'curl') }
 if ($SkipSkia) { $Want = @($Want | Where-Object { $_ -ne 'skia' }) }
 if ($SkipSdl2) { $Want = @($Want | Where-Object { $_ -ne 'sdl2' }) }
 if ($SkipCurl) { $Want = @($Want | Where-Object { $_ -ne 'curl' }) }
+if ($SkipVideo) { $Want = @($Want | Where-Object { $_ -ne 'video' }) }
 if ($Want.Count -eq 0) { Fail '没有要构建的目标（-Only / -Skip* 全被关掉了）。' }
 
 # 位宽列表。x64 与 x86 是两棵独立的 Skia out 目录、两套 CMake 构建目录、两个中间前缀。
@@ -392,6 +405,13 @@ if (-not $ComspecPath) { $ComspecPath = 'cmd.exe' }
 # 把 vcvarsall.bat <arch> 的环境导入当前进程。arch 用 vcvarsall 自己的词：x64 / x86。
 # 经典手法：在 cmd 里跑完 vcvarsall 再 set，把全部环境变量读回来逐条导入本进程。
 function Import-MsvcEnv([string]$arch) {
+  # VsDevCmd 用 `reg query` 定位 Windows SDK，而那次查找在 PATH 上没有 System32 时**静默失败**：
+  # 导进来的 INCLUDE/LIB 只有 MSVC 一份，SDK 一个都不加。后果分布在很远的地方——
+  # `'windows.h' file not found`、`LNK1104 kernel32.lib`，或者本函数末尾 $env:WindowsSdkDir
+  # 为空、Join-Path 报 "Cannot bind argument to parameter 'Path'"（谁看了都不知道去查 PATH）。
+  # 所以先将 System32 放到 PATH 上，并在导入后把「半导入」当错误拒掉。
+  $sys32 = Join-Path $env:SystemRoot 'System32'
+  if (($env:PATH -split ';') -notcontains $sys32) { $env:PATH = "$sys32;$env:PATH" }
   $lines = & $ComspecPath /c "`"$vcvarsall`" $arch >nul 2>&1 && set"
   if ((Get-ExitCode) -ne 0) {
     Fail "执行 vcvarsall.bat $arch 失败：$vcvarsall （x86 需要 VC++ x86 工具集，工作负载「使用 C++ 的桌面开发」自带。）"
@@ -403,6 +423,14 @@ function Import-MsvcEnv([string]$arch) {
     }
   }
   if (-not $env:VCToolsInstallDir) { Fail "vcvarsall $arch 执行后仍没有 VCToolsInstallDir，环境导入失败。" }
+  if (-not $env:WindowsSdkDir -or -not $env:WindowsSDKVersion) {
+    Fail @"
+vcvarsall $arch 只导入了 MSVC，没导入 Windows SDK（WindowsSdkDir / WindowsSDKVersion 为空）。
+这是**半导入**：之后会以 'windows.h' file not found 或 LNK1104 kernel32.lib 的形式爆在很远的地方。
+已知成因：PATH 上没有 $env:SystemRoot\System32，VsDevCmd 的 `reg query` 找不到 SDK 且不报错。
+本函数已会预先补上 System32；仍失败就请确认 Windows SDK 组件已装（VS Installer → 单个组件）。
+"@
+  }
 
   # 位宽工具集自检（写入文件为准，不信退出码）。**vcvarsall 的退出码证明不了这个位宽的
   # 工具集装没装**：实测本机 `vcvarsall arm64` 返回 0，而 HostX64\arm64\cl.exe 与
@@ -1400,7 +1428,162 @@ function Build-CurlStack([string]$arch) {
   Assert-LibBitness -Dir $destLib -Arch $arch -Label "curl 依赖栈 ($arch)"
 }
 
-# ---------------------------------------------------------------- 11. 跑
+# ---------------------------------------------------------------- 11. FFmpeg（video）
+# 配方住在 git 里（vendor/provision/ffmpeg-static.sh），本函数只负责「把环境摆对 + 部署产物」——
+# 与 curl 同一个分工：重建一个包不必理解另一个包的旗标。
+#
+# 三条**实测**出来的硬约束（配方文件头里有完整出处）：
+#   1. Windows 侧必须是 MSVC ABI。src/build.ts::windowsTargetTriple 钉的是
+#      --target={x86_64,i686}-pc-windows-msvc，MinGW 编出来的 libav*.a 是 GNU ABI，链不上；
+#   2. 真正的编译器是 clang-cl：MSVC 19.43 已不认 `-o`（D9035），而 configure 的每个测试都用
+#      `-c -o obj src`，真 cl.exe 会把 obj 丢到 cwd，首次链接测试就死在 LNK1136。但 configure 的
+#      msvc 版本门仍要探 cl.exe，所以 cl.exe 与 clang-cl 都得在 PATH 上；
+#   3. x86 必须导入 **x86 的 vcvars 环境**（INCLUDE/LIB 逐位宽），否则 LNK4272（x64 的 libcmt.lib
+#      撞 x86 目标）。所以本函数必须在调用方 Import-MsvcEnv $arch 之后跑。
+#
+# 找 shell 不是「顺手」，而是硬依赖：FFmpeg 没有 cmd/PowerShell 构建路径，configure 就是 sh 脚本。
+# 任意一个 bash 都不行：PATH 上常见的 C:\Windows\System32\bash.exe 是 WSL 的 launcher
+# （GNU/Linux）——它看不到 C:\ 路径，也绕不出 MSVC ABI 对象。只看名字会选中它。
+#
+# 判身份**不用外部命令**：`uname` 是 coreutils 里的程序，而 PowerShell 启动的 bash 继承到的
+# PATH 往往没有 /usr/bin（Git for Windows 的 coreutils 在 …\Git\usr\bin），于是 `uname` 会
+# "command not found"，再被 $ErrorActionPreference='Stop' 当成终止错误——判身份本身把流程搞挂。
+# `$OSTYPE` 是 bash 自己的内置变量（cygwin / msys / linux-gnu），零外部依赖。
+function Test-PosixBash([string]$p) {
+  if (-not $p) { return $false }
+  if ($p -match '(?i)\\Windows\\(System32|SysWOW64)\\bash\.exe$') { return $false }
+  # 2>&1 而不是 2>$null：native 命令的 stderr 在 EA=Stop 下会变成 NativeCommandError 并抛出。
+  $o = (@(& $p -c 'printf %s "$OSTYPE"' 2>&1) -join ' ')
+  if ($o -match '(?i)msys|cygwin') { return $true }
+  if ($o -match '(?i)linux|darwin|bsd') { return $false }   # WSL / 其它 Unix
+  # $OSTYPE 为空：再问一次 uname（此时已能容忍它不存在）。
+  $u = (@(& $p -c 'uname -o 2>/dev/null' 2>&1) -join ' ')
+  return ($u -match '^(Msys|Cygwin)')
+}
+
+function Find-PosixBash {
+  $cands = @()
+  if ($env:MSYS2_ROOT) { $cands += (Join-Path $env:MSYS2_ROOT 'usr\bin\bash.exe') }
+  $cands += 'C:\msys64\usr\bin\bash.exe', 'C:\msys2\usr\bin\bash.exe'
+  foreach ($c in $cands) {
+    if ($c -and (Test-Path $c) -and (Test-PosixBash $c)) { return (Resolve-Path $c).Path }
+  }
+  # PATH 上可能同时有好几个 bash（System32 的 WSL launcher、Git for Windows 的 MSYS2 血统那支…），
+  # 所以不能只看第一个命中：全部走一遍，取第一个身份对得上的。
+  foreach ($c in @(Get-Command 'bash' -All -ErrorAction SilentlyContinue)) {
+    if (Test-PosixBash $c.Source) { return $c.Source }
+  }
+  Fail @'
+找不到可用的 POSIX bash（MSYS2 / Cygwin）。FFmpeg 的 configure 是 sh 脚本，Windows 上没有第二条路。
+注意：C:\Windows\System32\bash.exe 是 WSL 的 launcher（GNU/Linux），**不算**——它看不到 C:\ 路径。
+二选一：
+  A) MSYS2（推荐，FFmpeg 在 Windows 上的官方构建环境）：
+       winget install MSYS2.MSYS2
+       然后在 MSYS2 终端里补三个包：
+         pacman -S --needed make nasm diffutils
+  B) Cygwin：https://cygwin.com/install.html ，安装时勾上 make 与 nasm。
+注意：装好 MSYS2 但没装 make/nasm 时，配方会点名缺哪个并硬失败（不会静默降级成无 SIMD）。
+'@
+}
+
+function Build-Video([string]$arch) {
+  # AIR descriptors ask for 32 or 64 only, so video is delivered at exactly those two widths.
+  # Saying so here beats letting the recipe answer "--arch must be x64 or x86" (它也将拒绝)。
+  if ($arch -ne 'x64' -and $arch -ne 'x86') {
+    Fail "FFmpeg 只产 x64 / x86 两位宽（AIR 的 <architecture> 只有 32/64）；-Arch $arch 不是视频后端的交付位宽。"
+  }
+  $profile = if ($env:ASC_FFMPEG_PROFILE) { $env:ASC_FFMPEG_PROFILE } else { 'broad' }
+  Write-Step "构建 FFmpeg（video / MSVC $arch / $profile + publish）"
+
+  $bash = Find-PosixBash
+  Write-Ok "POSIX shell -> $bash"
+
+  # bash 自己的 bin 目录必须在 PATH 最前：PowerShell 启动的 bash 只继承 Windows 形式的环境，
+  # 而 `sed`/`grep`/`awk`/`uname` 都在 shell 的 /usr/bin 里（Git for Windows：…\Git\usr\bin）。
+  # 缺了它们，configure 第一行就 "sed: command not found"。
+  $env:PATH = (Split-Path $bash -Parent) + ';' + $env:PATH
+
+  # 一次把缺的东西报全，而不是让配方先死在 nasm、装完再死在 make。最常踩的坑：PATH 上的
+  # bash 是 Git for Windows 自带的那份（它是 MSYS2 血统，但**不含 make**），而不是 MSYS2。
+  # 逐个调（而不是在 bash 里循环打印）：Windows 上 PowerShell→bash 传 `\n` 会被吞成 `n`，
+  # 多行输出会糊成一个字符串。
+  $missing = @()
+  foreach ($tool in @('make', 'nasm')) {
+    $found = & $bash -c "command -v $tool" 2>$null
+    if (-not $found) { $missing += $tool }
+  }
+  if ($missing.Count -gt 0) {
+    $missText = $missing -join ', '
+    Fail @"
+这个 POSIX shell 缺：$missText（shell = $bash）
+FFmpeg 必须要 GNU make 与 nasm（x86 SIMD 内核：h264 软解与 swscale）。
+  * MSYS2（推荐）：在 MSYS2 终端里 `pacman -S --needed make nasm diffutils`；
+  * Cygwin：安装时勾上 make 与 nasm。
+注意：Git for Windows 自带的 bash（…\Git\usr\bin\bash.exe）是 MSYS2 血统但不含 make，
+只它一个在 PATH 上时就会停在这里。要么装 MSYS2（脚本会优先用它），要么把它从 PATH 上挤下去。
+"@
+  }
+
+  # clang-cl 必须在 bash 子进程的 PATH 上；cl.exe / lib.exe 由调用方的 Import-MsvcEnv 提供。
+  $env:PATH = (Join-Path $LlvmRoot 'bin') + ';' + $env:PATH
+  $env:ASC_FFMPEG_PROFILE = $profile
+
+  Push-Location $Provision
+  try {
+    # -c 而不是 -lc：login shell 会重跑 /etc/profile 把刚导入的 vcvars PATH 盖掉。
+    & $bash -c "./ffmpeg-static.sh $profile --arch=$arch"
+    if ($LASTEXITCODE -ne 0) {
+      Fail "ffmpeg-static.sh 失败（exit $LASTEXITCODE）。常见三处：nasm 缺失、该 shell 里没有 make、
+或这一位宽的 vcvars 环境没导入（配方会点名是哪一条）。"
+    }
+  } finally { Pop-Location }
+
+  # --- 收产物到 vendor/ffmpeg
+  $src = Join-Path $BuildTools "ffmpeg-out\$profile-win-$arch"
+  $destLib = Join-Path $Vendor "ffmpeg\lib\windows-$arch"
+  New-Item -ItemType Directory -Force -Path $destLib | Out-Null
+  New-CleanDir $destLib
+
+  # msvc 工具链的归档名没有 lib 前缀（LIBPREF 为空）——与 macOS 的 libav*.a 不同，
+  # 所以这里不能照抄 macos.sh 的文件名。
+  foreach ($l in @('avformat', 'avcodec', 'avutil', 'swscale', 'swresample')) {
+    $f = Join-Path $src "$l.lib"
+    if (-not (Test-Path $f)) { Fail "配方没有产出 $f（期望 msvc 工具链的无前缀命名）" }
+    Copy-Item $f $destLib -Force
+  }
+  Write-Ok "部署 5 个 .lib -> vendor\ffmpeg\lib\windows-$arch"
+
+  # 头树跨平台共用（与 Skia/curl 同一条规则）。唯一逐目标生成的是 libavutil/avconfig.h ——
+  # 它必须与已部署的那份逐字节相同，否则就是「头文件配另一份实现」的 ABI 漂移
+  # （docs/zh-cn/skia.md §6.5）。不同就硬失败，让人决定是分层还是重建另一侧。
+  $srcInclude = Join-Path $src 'include'
+  if (-not (Test-Path (Join-Path $srcInclude 'libavcodec'))) { Fail "$srcInclude 缺 libavcodec（头树没拷成功）" }
+  $destInclude = Join-Path $Vendor 'ffmpeg\include'
+  $deployedCfg = Join-Path $destInclude 'libavutil\avconfig.h'
+  $freshCfg    = Join-Path $srcInclude  'libavutil\avconfig.h'
+  if ((Test-Path $deployedCfg) -and (Test-Path $freshCfg)) {
+    $a = (Get-FileHash $deployedCfg -Algorithm SHA256).Hash
+    $b = (Get-FileHash $freshCfg    -Algorithm SHA256).Hash
+    if ($a -ne $b) {
+      Fail "libavutil/avconfig.h 与已部署的那份不一致（$arch）：$deployedCfg。
+这份头是 configure 逐目标生成的，共用一份 include 树的前提是它们字节相同；
+不同就说明两端拿到的宏不同（字节序/对齐/ABI），必须分层部署而不是覆盖。"
+    }
+    Write-Ok "avconfig.h 与既有部署逐字节一致（共用 include 树的判据）"
+  }
+  New-Item -ItemType Directory -Force -Path $destInclude | Out-Null
+  Copy-Item (Join-Path $srcInclude '*') $destInclude -Recurse -Force
+  Write-Ok "头文件 -> $destInclude"
+
+  # LGPL-2.1 §4：许可证必须随二进制产物走。
+  $lic = Join-Path $src 'COPYING.LGPLv2.1'
+  if (-not (Test-Path $lic)) { Fail "缺 $lic（配方没把许可证拷进产物目录）" }
+  Copy-Item $lic (Join-Path $Vendor 'ffmpeg\LICENSE.LGPLv2.1') -Force
+
+  Assert-LibBitness -Dir $destLib -Arch $arch -Label "FFmpeg ($arch)"
+}
+
+# ---------------------------------------------------------------- 12. 跑
 # 每套位宽：先导入该位宽的 vcvars 环境（头/库路径随架构变），再把这一位宽的目标全建完。
 # 顺序是「按位宽分层」而不是「按包分层」—— 因为 vcvars 环境是进程级的，切架构必须整段切。
 $script:NinjaExe = Resolve-Ninja
@@ -1409,6 +1592,7 @@ foreach ($archName in $Arches) {
   if ($Want -contains 'skia') { Build-Skia $archName }
   if ($Want -contains 'sdl2') { Build-Sdl2 $archName }
   if ($Want -contains 'curl') { Build-CurlStack $archName }
+  if ($Want -contains 'video') { Build-Video $archName }
 }
 
 # ---------------------------------------------------------------- 12. 汇总
@@ -1418,6 +1602,7 @@ foreach ($a in $Arches) {
   $summaryPaths += "skia\lib\windows-$a"
   $summaryPaths += "sdl2\lib\windows-$a"
   $summaryPaths += "curl\lib\windows-$a"
+  if ($Want -contains 'video') { $summaryPaths += "ffmpeg\lib\windows-$a" }
 }
 foreach ($p in $summaryPaths) {
   $full = Join-Path $Vendor $p
