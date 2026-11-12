@@ -377,6 +377,10 @@ Two layers, same as curl (`build_curl()` in `vendor/provision/macos.sh:221-240` 
 | `vendor/provision/ffmpeg-static.sh broad` | runs `configure`/`make`, measures size, installs into `build-tools/ffmpeg-out/broad/` |
 | `vendor/provision/macos.sh --only video` | validates the five `.a` files and the include tree → copies into `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
 
+**When the artifacts get committed**: `vendor/ffmpeg/` can be produced in one command today (~24 MB), but it
+lands in git only when V1's seam actually links it — committing a 24 MB binary nobody references buys nothing,
+while rebuilding it is one `macos.sh --only video`.
+
 Profile via `ASC_FFMPEG_PROFILE` (default `broad`); source tree via `ASC_FFMPEG_SRC` (default
 `build-tools/ffmpeg-src`, cloned at `ASC_FFMPEG_TAG`, default `n9.0.2`, when absent).
 **There is no Windows entry point**: `windows.ps1` is clang-cl + MSVC ABI and FFmpeg has no build system for

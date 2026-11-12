@@ -341,6 +341,9 @@ vendor/ffmpeg/
 | `vendor/provision/ffmpeg-static.sh broad` | 跑 `configure`/`make`，量体积，装到 `build-tools/ffmpeg-out/broad/` |
 | `vendor/provision/macos.sh --only video` | 校验 5 个 `.a` 与 include 树 → 拷进 `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
 
+**产物的入库时机**：`vendor/ffmpeg/` 现在已能一键生成（约 24 MB），但要等 V1 的 seam 真的引用它时才提交——
+先入库一个没人链接的 24 MB 二进制没有意义，而重建只要一条 `macos.sh --only video`。
+
 档位用 `ASC_FFMPEG_PROFILE` 覆盖（默认 `broad`），源码位置用 `ASC_FFMPEG_SRC` 覆盖（缺省
 `build-tools/ffmpeg-src`，不存在时按 `ASC_FFMPEG_TAG`（默认 `n9.0.2`）`git clone --depth 1`）。
 **Windows 侧没有对应入口**：`windows.ps1` 是 clang-cl + MSVC ABI，FFmpeg 没有那套构建系统，只能在
