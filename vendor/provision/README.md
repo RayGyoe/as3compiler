@@ -3,11 +3,11 @@
 > 在 Windows 上把 as3compiler 的本地依赖库（**Skia / SDL2 / curl 三件套**）从源码编译出来，
 > 产物直接落到 `as3compiler/vendor/<pkg>/`，供 `--air-app` 的 Windows 原生链接使用。
 
-本 README **只**讲 Windows 这一个脚本。脚本的完整设计背景、自愈点与版本 pin 写在脚本头部注释里
-（`<# ... #>` 块），需要细节时以脚本头注释为准。
+本 README 主要讲 Windows 这一个脚本。脚本的完整设计背景、自愈点与版本 pin 写在脚本头部注释里
+（`<# ... #>` 块），需要细节时以脚本头注释为准。macOS 侧（含视频用的 FFmpeg）见文末。
 
 **位置约定**：`vendor/provision/` 放「产物是怎么来的」（provisioning）；`vendor/` 本身放产物与胶水源码。
-同目录另有 `macos.sh`（macOS 侧的薄入口）。
+同目录另有 `macos.sh`（macOS 侧的薄入口）与 `ffmpeg-static.sh`（FFmpeg 构建配方，**唯一一个入 git 的配方**）。
 **注意**：`build-tools/`（本脚本存放下载源码与中间构建的地方）**不在 git 仓库里** —— 仓库根是
 `as3compiler/`，`build-tools/` 是它旁边一个本机未跟踪目录，所以全新 clone 上它并不存在，本脚本会把
 它建出来。
@@ -127,6 +127,31 @@ powershell -ExecutionPolicy Bypass -File .\windows.ps1 -Arch x64 -Only curl -Ski
 Skia 编一次 30~60 分钟（几千个 C++ 文件）。两套位宽是两棵独立 out 目录，时间与磁盘大致翻倍。
 
 ---
+
+## macOS / FFmpeg（`ffmpeg-static.sh` + `macos.sh --only video`）
+
+macOS 侧是两层，与 curl 完全同形，但**配方本身在 git 里**：
+
+| 层 | 文件 | 入 git | 职责 |
+|---|---|---|---|
+| recipe | `vendor/provision/ffmpeg-static.sh` | ✅ | `configure`/`make` + 体积探针 + 断言，装到 `build-tools/ffmpeg-out/<profile>/` |
+| deploy | `vendor/provision/macos.sh --only video` | ✅ | 校验 5 个 `.a` 与 include 树 → `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+
+```sh
+cd as3compiler
+bash vendor/provision/ffmpeg-static.sh broad      # 或 air|mid|broad；--no-publish 只做解码
+bash vendor/provision/macos.sh --only video       # 部署进 vendor/ffmpeg/
+```
+
+- **为什么这个配方入 git、curl 的不入**：那份 `--enable-*` 列表就是 `docs/zh-cn/video.md` §3/§6 记录的
+  设计（带哪些解码器、publish 留哪三件），体积表（§3/§7）只有在配方被版本化时才可复现。curl 的配方留在
+  未跟踪的 `build-tools/` 属历史包袱，不是可以照抄的理由。
+- 源码默认 `build-tools/ffmpeg-src`（不在 git），不存在时按 `ASC_FFMPEG_TAG`（默认 `n9.0.2`）自动
+  `git clone --depth 1`；档位用 `ASC_FFMPEG_PROFILE` 覆盖。
+- **Windows 没有对应入口**：`windows.ps1` 是 clang-cl + MSVC ABI，FFmpeg 没有那套构建系统，只能在
+  MSYS2/MinGW 下编。别以为加个 `-Only video` 就能用（脚本里也是这么写的）。
+- 断言失败是 `exit 3` 而不是「编译成功但推不了流 / 硬解形同虚设」——`configure` 对缺依赖的显式
+  `--enable-*` 只发警告。
 
 ## 注意事项
 

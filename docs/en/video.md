@@ -328,7 +328,7 @@ it speaks" rule.
 > once, so there is no "MP4 or FLV" decision to make.
 
 **Detection hit but the FFmpeg prebuilts are missing for this host** ⇒ **the build fails**, pointing at
-`build-tools/ffmpeg-src/build-static.sh`. Not a silent skip: if the sources want video, the artifact must
+`vendor/provision/ffmpeg-static.sh` (§5.5). Not a silent skip: if the sources want video, the artifact must
 actually play it (AGENTS.md §1.5). To accept "builds but cannot play", write `video: "off"` explicitly — then
 `play()` takes the loud path in §5.7.
 
@@ -356,15 +356,31 @@ iOS/Android later does not touch the detection logic.
 Same shape as curl / sqlite / sdl2 / skia — FFmpeg sources are not vendored into `vendor/`:
 
 ```text
-build-tools/ffmpeg-src/           # sources + build-static.sh (§6's flags)
+build-tools/ffmpeg-src/           # sources (clean clone, not in git)
+build-tools/ffmpeg-out/<profile>/ # staging: *.a + include/ + COPYING.LGPLv2.1
+vendor/provision/ffmpeg-static.sh # ★ the build recipe (§6's flags), IN git
 vendor/ffmpeg/
 ├── include/                      # libav*.h
 ├── lib/<platform>/               # libavformat.a libavcodec.a libavutil.a libswscale.a libswresample.a
 └── LICENSE.LGPLv2.1              # the distribution obligation from §8
 ```
 
-`build-static.sh` writes to `build-tools/ffmpeg-out/<profile>/` (outside the source tree, not in git); the build
-then copies that into `vendor/ffmpeg/lib/<platform>/` — same handling as curl/sqlite.
+**The recipe is tracked; the sources and staging output are not** — the one place this differs from curl.
+The reason: that `--enable-*` list **is** the design recorded in §3/§6 (which decoders, which three publish
+pieces survive), and the size table only stays reproducible while the recipe is versioned. curl's recipe living
+in an untracked `build-tools/` tree is inherited debt, not a precedent to copy.
+
+Two layers, same as curl (`build_curl()` in `vendor/provision/macos.sh:221-240` has the identical shape):
+
+| Who | What |
+|---|---|
+| `vendor/provision/ffmpeg-static.sh broad` | runs `configure`/`make`, measures size, installs into `build-tools/ffmpeg-out/broad/` |
+| `vendor/provision/macos.sh --only video` | validates the five `.a` files and the include tree → copies into `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+
+Profile via `ASC_FFMPEG_PROFILE` (default `broad`); source tree via `ASC_FFMPEG_SRC` (default
+`build-tools/ffmpeg-src`, cloned at `ASC_FFMPEG_TAG`, default `n9.0.2`, when absent).
+**There is no Windows entry point**: `windows.ps1` is clang-cl + MSVC ABI and FFmpeg has no build system for
+that — it needs an MSYS2/MinGW shell. Do not assume `-Only video` would work.
 
 `checks.ts` gains a `vendor.video` row (`kind: "warn"`, same shape as `vendor.audio`: linked → ok; should be
 linked but is not → name which of the three reasons applies — glue missing, host unsupported, or the manifest
@@ -486,7 +502,7 @@ Hardware backends (append per target; **the software decoders are always kept fo
 | `broad` (default) | everything in 6.1 | 8.09 MB | **8.28 MB** |
 | `all` | `broad` + VVC decoder + `--enable-libdav1d` (faster, smaller AV1) + `--enable-libxml2` (DASH) + image sequences | unmeasured, est. +2–4 MB | — |
 
-All three share one `build-static.sh`, swapping only the decoder/demuxer lists — so the size table is
+All three share one `ffmpeg-static.sh`, swapping only the decoder/demuxer lists — so the size table is
 re-measurable at any time. **Publish is on by default** in all three; pass `--no-publish` for the old decode-only
 shape.
 
@@ -512,7 +528,7 @@ shape.
 | `bsf=*_mp4toannexb` | **required when hardware decode is the default** (VT / D3D11VA both want Annex B start codes); only software-only builds can drop it |
 | `--disable-autodetect` | do not pick up system libraries (zlib, iconv, sdl…) — keeps builds reproducible |
 | Version | **take the latest stable tag** (currently `n9.0.2`), not master. **Sizes are tied to the tag**: the same flags grow 0.4–0.6 MB from n7.1 to n9.0.2, so re-measure after any tag change |
-| **`--disable-postproc` is gone in n8+** | libpostproc was removed, so older scripts abort with `Unknown option`. `build-static.sh` now probes `--help` for the flag (`--disable-everything` already turns that library off) |
+| **`--disable-postproc` is gone in n8+** | libpostproc was removed, so older scripts abort with `Unknown option`. `ffmpeg-static.sh` now probes `--help` for the flag (`--disable-everything` already turns that library off) |
 | **accel flags changed spelling in n9** | n7's help lists only `--enable-videotoolbox`, n9's only `--disable-videotoolbox`. `--enable-X` still works on both, and **it must be passed explicitly**: measured, `--disable-autodetect` leaves `CONFIG_VIDEOTOOLBOX` at `0`, and only `--enable-videotoolbox` turns it back on. **Branching on `--help` will silently miss this** |
 | GPL | **never** `--enable-gpl` / `--enable-nonfree` in the build script (drags in x264/x265/libfdk and breaks §8) |
 
@@ -666,7 +682,7 @@ the native manifest carries the FFmpeg `link-libs`, the web manifest does not. T
 
 | Phase | Content | Acceptance |
 |---|---|---|
-| V0 | **Settle this document + trim measurement**: build each profile, measure linked size, the hwaccel marginal cost, and 1080p throughput for both decode paths | **done 2026-11-12**: numbers in §3/§7; reproducible via `build-tools/ffmpeg-src/build-static.sh` |
+| V0 | **Settle this document + trim measurement**: build each profile, measure linked size, the hwaccel marginal cost, and 1080p throughput for both decode paths | **done 2026-11-12**: numbers in §3/§7; reproducible via `vendor/provision/ffmpeg-static.sh` (tracked) |
 | V1 | **Decode seam + software + the injection gate + three format profiles**: `as_video_*` takes `backend` and `formats`; land `usesVideoCodec` / `video` / `video-formats`; containers `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`, video `h264,hevc,vp9,av1` software, audio `aac,mp3,opus,vorbis,flac`; `onMetaData` + audible audio | `examples/video.as` plays a bundled sample; item-by-item parity with `adl` (`videoWidth/Height`, `time`, `onMetaData`); **format matrix self-test**: at least one clip per container×codec yields both sound and picture; examples that do not touch video keep their size (§5.8) |
 | V2 | **macOS hardware decode + zero-copy presentation**: `videotoolbox` backend covering all 8 hwaccels (h264/hevc/mpeg1/2/4/h263/prores/vp9) + `CVMetalTextureCache` bridge; probe failure falls back silently | A/B on the same source: user CPU, wall clock, bridge cost; forcing VT off must fall back silently rather than produce a black screen; HEVC 1080p run both ways |
 | V3 | **Windows D3D11VA backend** (7 hwaccels) + `pause/seek` + buffering states + the `NetStream.Play.*` event sequence | parity with `adl`; identical behaviour from one `.as` on all three targets (backend differences confined to pixel formats) |
@@ -712,9 +728,9 @@ the native manifest carries the FFmpeg `link-libs`, the web manifest does not. T
 
 1. **Whether to add the `all` profile**: VVC + `libdav1d` + DASH (`libxml2`). `broad` already covers real-world use;
    `all` only makes it "more complete".
-2. **Where `build-static.sh` should live**: today it sits in `build-tools/ffmpeg-src/` (inside the clean FFmpeg
-   clone, **not under git**, same shape as `curl-src/build-static.sh`). The docs call it the sole proof of
-   reproducibility, and a fresh clone does not get it — whether to move it to `as3compiler/scripts/` is open.
+2. **The Windows entry point for video**: `macos.sh --only video` exists, `windows.ps1` has none — FFmpeg needs an
+   MSYS2/MinGW shell while that script is entirely clang-cl + MSVC ABI. Whether and how to add it is deferred to
+   the Windows acceptance for V5 (publish).
 
 ---
 
@@ -738,10 +754,13 @@ cd /path/to/repo-root                       # repository root, one level above b
 [ -d build-tools/ffmpeg-src ] || git clone --depth 1 -b n9.0.2 https://git.ffmpeg.org/ffmpeg.git build-tools/ffmpeg-src
 # latest stable: git ls-remote --tags origin | grep -oE 'n[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V | tail -1
 # every size number above is an n9.0.2 measurement (n7.1 is 0.4-0.6 MB smaller with identical flags)
-bash build-tools/ffmpeg-src/build-static.sh air     # 4.45 MB (publish included)
-bash build-tools/ffmpeg-src/build-static.sh mid     # 6.67 MB (comparison only)
-bash build-tools/ffmpeg-src/build-static.sh broad   # 8.28 MB (default profile)
-bash build-tools/ffmpeg-src/build-static.sh air --no-publish   # 4.25 MB (decode-only column in §3)
+bash vendor/provision/ffmpeg-static.sh air     # 4.45 MB (publish included)
+bash vendor/provision/ffmpeg-static.sh mid     # 6.67 MB (comparison only)
+bash vendor/provision/ffmpeg-static.sh broad   # 8.28 MB (default profile)
+bash vendor/provision/ffmpeg-static.sh air --no-publish   # 4.25 MB (decode-only column in §3)
+# first run clones the sources: ASC_FFMPEG_TAG defaults to n9.0.2 (latest stable) into build-tools/ffmpeg-src
+# deploy into vendor/ (same pipeline as curl/skia, LGPL license included):
+bash vendor/provision/macos.sh --only video    # = ffmpeg-static.sh broad + copy into vendor/ffmpeg/
 # the script prints profile=… publish=… linked=… stripped=…; artifacts land in build-tools/ffmpeg-out/<profile>/
 # on Windows/Linux hosts it swaps in --enable-d3d11va / --enable-vaapi and h264_mf / h264_vaapi
 # a failed publish assertion exits 3 instead of silently producing a library that cannot stream

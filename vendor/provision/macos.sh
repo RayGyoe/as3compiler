@@ -36,14 +36,14 @@
 #                               the tree's own out/macos-arm64/args.gn)
 #
 # Usage:
-#   sh vendor/provision/macos.sh                  # skia + curl (+ SDL2 note)
+#   sh vendor/provision/macos.sh                  # skia + curl + video (+ SDL2 note)
 #   sh vendor/provision/macos.sh --only curl      # just one package
-#   sh vendor/provision/macos.sh --only skia,curl
+#   sh vendor/provision/macos.sh --only skia,curl,video
 #   sh vendor/provision/macos.sh --dry            # print the commands, run none
 #
 # Everything lands where the build already looks for it:
 #   vendor/skia/lib/macos-arm64/*.a     vendor/skia/include/     (must stay 1:1)
-#   vendor/curl/{include,lib/macos-arm64}/...
+#   vendor/curl/{include,lib/macos-arm64}/...  vendor/ffmpeg/{include,lib/macos-arm64}/...
 #
 # Skia's from-source build is genuinely long (tens of minutes / thousands of C++
 # files). That is normal, not a hang. An incremental `ninja` after a patch is
@@ -62,12 +62,21 @@ SKIA_OUT="$SKIA_SRC/out/macos-arm64"
 CURL_SRC="$BUILD_TOOLS/curl-src"
 SDL2_SRC="$BUILD_TOOLS/sdl2-src"
 
+# FFmpeg differs from the three above: its recipe lives IN git, next to this file.
+# The --enable-* list in it *is* the design recorded in docs/zh-cn/video.md §3/§6, and
+# the measured size table only stays reproducible if the recipe is tracked. See that
+# file's header for why, and for the Windows (MSYS2-only) caveat.
+FFMPEG_RECIPE="$PROVISION/ffmpeg-static.sh"
+FFMPEG_SRC="${ASC_FFMPEG_SRC:-$BUILD_TOOLS/ffmpeg-src}"
+FFMPEG_PROFILE="${ASC_FFMPEG_PROFILE:-broad}"
+FFMPEG_OUT="$BUILD_TOOLS/ffmpeg-out/$FFMPEG_PROFILE"
+
 # Pinned to match the archives already committed under vendor/ (and the Windows
 # script's own pins: SDL2 2.32.10 / curl 8.11.1 / nghttp2 1.64.0 / zlib 1.3.1).
 SDL2_VERSION=2.32.10
 
 DRY=0
-ONLY="skia curl sdl2"
+ONLY="skia curl video sdl2"
 
 usage() {
   sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'
@@ -96,7 +105,7 @@ run() {
 # --- arguments --------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
-    --only)   ONLY=${2:?"--only needs a value (skia,sdl2,curl)"}; shift 2 ;;
+    --only)   ONLY=${2:?"--only needs a value (skia,sdl2,curl,video)"}; shift 2 ;;
     --only=*) ONLY=${1#--only=}; shift ;;
     --dry|-n) DRY=1; shift ;;
     -h|--help) usage 0 ;;
@@ -108,8 +117,8 @@ done
 # error rather than a silently-empty run.
 for w in $ONLY; do
   case "$w" in
-    skia|sdl2|curl) ;;
-    *) die "unknown --only '$w' (expected: skia, sdl2, curl)" ;;
+    skia|sdl2|curl|video) ;;
+    *) die "unknown --only '$w' (expected: skia, sdl2, curl, video)" ;;
   esac
 done
 
@@ -240,6 +249,36 @@ build_curl() {
   ok "部署 curl 头 + libcurl/libnghttp2/libz -> vendor/curl/"
 }
 
+# --- 3b. FFmpeg (video) -----------------------------------------------------
+# The recipe is tracked (see the vars above), builds `broad` by default (the product's
+# default format surface, docs §3), and installs into build-tools/ffmpeg-out/<profile>/.
+# This script only deploys the result -- same split as curl, so a rebuild of one package
+# never has to understand another's flags. Override the profile with
+# ASC_FFMPEG_PROFILE=air|mid|broad.
+build_video() {
+  step "3b. FFmpeg (video: decode + publish)"
+  [ -f "$FFMPEG_RECIPE" ] || die "找不到 $FFMPEG_RECIPE"
+
+  run bash "$FFMPEG_RECIPE" "$FFMPEG_PROFILE"
+
+  [ "$DRY" -eq 1 ] && { info "[dry] 部署 $FFMPEG_OUT/{*.a,include} -> $VENDOR/ffmpeg/"; return; }
+  for a in libavformat.a libavcodec.a libavutil.a libswscale.a libswresample.a; do
+    [ -f "$FFMPEG_OUT/$a" ] || die "$FFMPEG_RECIPE 没有产出 $FFMPEG_OUT/$a"
+  done
+  [ -d "$FFMPEG_OUT/include/libavcodec" ] || die "$FFMPEG_OUT/include 缺 libavcodec 头（header 树没拷成功）"
+
+  mkdir -p "$VENDOR/ffmpeg/lib/macos-arm64"
+  rm -rf "$VENDOR/ffmpeg/include"
+  cp -R "$FFMPEG_OUT/include" "$VENDOR/ffmpeg/"
+  for a in libavformat.a libavcodec.a libavutil.a libswscale.a libswresample.a; do
+    cp "$FFMPEG_OUT/$a" "$VENDOR/ffmpeg/lib/macos-arm64/"
+  done
+  # LGPL-2.1 §4 requires the license text to travel with the binary artifacts.
+  [ -f "$FFMPEG_OUT/COPYING.LGPLv2.1" ] || die "缺 $FFMPEG_OUT/COPYING.LGPLv2.1（§8 ④ 的许可证随包）"
+  cp "$FFMPEG_OUT/COPYING.LGPLv2.1" "$VENDOR/ffmpeg/LICENSE.LGPLv2.1"
+  ok "部署 FFmpeg 头 + 5 个 .a ($FFMPEG_PROFILE) -> vendor/ffmpeg/"
+}
+
 # --- 4. SDL2 ----------------------------------------------------------------
 # Reported, never faked: there is no source tree, so there is no recipe.
 # A full run treats it as a warning (skia + curl still succeeded); asking for
@@ -265,12 +304,13 @@ report_sdl2() {
 # --- run --------------------------------------------------------------------
 if want skia; then build_skia; fi
 if want curl; then build_curl; fi
+if want video; then build_video; fi
 if want sdl2; then report_sdl2; fi
 
 # --- summary ----------------------------------------------------------------
 step "完成"
 [ "$DRY" -eq 1 ] && { info "（--dry：什么都没写盘）"; exit 0; }
-for p in skia/lib/macos-arm64 curl/lib/macos-arm64 sdl2/lib/macos-arm64; do
+for p in skia/lib/macos-arm64 curl/lib/macos-arm64 ffmpeg/lib/macos-arm64 sdl2/lib/macos-arm64; do
   full="$VENDOR/$p"
   if [ -d "$full" ]; then
     cnt=$(find "$full" -type f | wc -l | tr -d ' ')

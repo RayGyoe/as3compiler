@@ -295,7 +295,7 @@ const re = /flash\.net\.NetStream|flash\.media\.Video\b|(?:^|[^A-Za-z0-9_.$])(?:
 > ——**容器不是一个需要选的维度**：`broad` 同时含 MP4/FLV/MKV/TS/HLS，首期不存在「MP4 还是 FLV」二选一。
 
 **探测命中但本机没有 FFmpeg 预编译产物** ⇒ **构建失败**，提示跑
-`build-tools/ffmpeg-src/build-static.sh`，不是静默跳过：源码要用视频，产物就必须真能播（AGENTS.md §1.5）。
+`vendor/provision/ffmpeg-static.sh`（§5.5），不是静默跳过：源码要用视频，产物就必须真能播（AGENTS.md §1.5）。
 真要「链不上也照编」，就显式写 `video: "off"`，那时 `play()` 走 §5.7 的响亮报错。
 
 ### 5.4 多端解析（同一探测信号，七种注入结果）
@@ -321,15 +321,30 @@ native，`targets.wasm.link-libs: []` 把 FFmpeg 摘掉——与 curl 在 web �
 与 curl / sqlite / sdl2 / skia 同一形状，不把 FFmpeg 源码放进 `vendor/`：
 
 ```text
-build-tools/ffmpeg-src/           # 源码 + build-static.sh（§6 的旗标）
+build-tools/ffmpeg-src/           # 源码（干净克隆，不在 git 里）
+build-tools/ffmpeg-out/<profile>/ # 产物暂存：*.a + include/ + COPYING.LGPLv2.1
+vendor/provision/ffmpeg-static.sh # ★ 构建配方（§6 的旗标），在 git 里
 vendor/ffmpeg/
 ├── include/                      # libav*.h
 ├── lib/<platform>/               # libavformat.a libavcodec.a libavutil.a libswscale.a libswresample.a
 └── LICENSE.LGPLv2.1              # §8 的随包义务
 ```
 
-`build-static.sh` 的产物落在 `build-tools/ffmpeg-out/<profile>/`（源码目录之外，不进 git），
-再由构建脚本/手工拷进 `vendor/ffmpeg/lib/<platform>/`——与 curl/sqlite 的取用方式一致。
+**配方入 git，源码与中间产物不入**——这是与 curl 唯一的不同。原因是那份 `--enable-*` 列表**本身就是
+本文 §3/§6 的设计**（带哪些解码器、publish 留哪三件），体积表只有在配方被版本化时才可复现；curl 的配方
+留在未跟踪的 `build-tools/` 里属于历史包袱，不是可以照抄的理由。
+
+分层与 curl 相同（`vendor/provision/macos.sh:221-240` 的 `build_curl()` 是同一形状）：
+
+| 谁 | 做什么 |
+|---|---|
+| `vendor/provision/ffmpeg-static.sh broad` | 跑 `configure`/`make`，量体积，装到 `build-tools/ffmpeg-out/broad/` |
+| `vendor/provision/macos.sh --only video` | 校验 5 个 `.a` 与 include 树 → 拷进 `vendor/ffmpeg/{lib/macos-arm64,include}` + `LICENSE.LGPLv2.1` |
+
+档位用 `ASC_FFMPEG_PROFILE` 覆盖（默认 `broad`），源码位置用 `ASC_FFMPEG_SRC` 覆盖（缺省
+`build-tools/ffmpeg-src`，不存在时按 `ASC_FFMPEG_TAG`（默认 `n9.0.2`）`git clone --depth 1`）。
+**Windows 侧没有对应入口**：`windows.ps1` 是 clang-cl + MSVC ABI，FFmpeg 没有那套构建系统，只能在
+MSYS2/MinGW 下编——不要以为加个 `-Only video` 就能用。
 
 `checks.ts` 增一行 `vendor.video`（`kind: "warn"`，与 `vendor.audio` 同形：链接了→ok；没链但该链→
 给出「glue 缺失」「本机不支持」「清单没写」三种原因之一）；`doctor.ts` 的配置摘要加一位 `video`。
@@ -448,7 +463,7 @@ LGPL（不是 GPL），但会拖进 mpegvideo 编码框架，体积未测，所�
 | `broad`（默认） | 6.1 的全部 | 8.09 MB | **8.28 MB** |
 | `all` | `broad` + VVC 解码器 + `--enable-libdav1d`（AV1 更快更小）+ `--enable-libxml2`（DASH）+ 图像序列 | 未实测，估 +2–4 MB | — |
 
-三档共用同一个 `build-static.sh`，只是把 decoder/demuxer 列表替换掉——体积表可随时重测。
+三档共用同一个 `ffmpeg-static.sh`，只是把 decoder/demuxer 列表替换掉——体积表可随时重测。
 **publish 默认开启**（三档都是），要回旧的纯解码口径加 `--no-publish`。
 
 ### 6.3 要点与坑（都是实测踩出来的）
@@ -473,7 +488,7 @@ LGPL（不是 GPL），但会拖进 mpegvideo 编码框架，体积未测，所�
 | `bsf=*_mp4toannexb` | **走硬解时必需**（VT / D3D11VA 都吃 Annex B 起始码），只保留软解的构建才可以去掉 |
 | `--disable-autodetect` | 不自动抓系统库（zlib、iconv、sdl…），保证产物可复现 |
 | 版本 | **取最新稳定 tag**（当前 `n9.0.2`），不跟 master。**体积与 tag 绑定**：同一套旗标 n7.1 → n9.0.2 涨 0.4~0.6 MB，换 tag 必须重量 |
-| **`--disable-postproc` 在 n8+ 已不存在** | libpostproc 被移除，旧版本脚本会直接 `Unknown option` 退出。`build-static.sh` 现在用 `--help` 探测该旗标是否存在（`--disable-everything` 本来就已经关掉这个库） |
+| **`--disable-postproc` 在 n8+ 已不存在** | libpostproc 被移除，旧版本脚本会直接 `Unknown option` 退出。`ffmpeg-static.sh` 现在用 `--help` 探测该旗标是否存在（`--disable-everything` 本来就已经关掉这个库） |
 | **accel 旗标在 n9 改了拼法** | n7 的 help 只列 `--enable-videotoolbox`，n9 只列 `--disable-videotoolbox`。但 `--enable-X` 在两边都能用，而且**必须显式给**：实测 `--disable-autodetect` 会让 `CONFIG_VIDEOTOOLBOX` 停在 `0`，必须靠 `--enable-videotoolbox` 把它拉回 `1`。**以 `--help` 为准写条件分支会踩空** |
 | GPL | 构建脚本里**禁止** `--enable-gpl` / `--enable-nonfree`（会拉进 x264/x265/libfdk，且违反 §8） |
 
@@ -617,7 +632,7 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`build-tools/ffmpeg-src/build-static.sh` 可复现 |
+| V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
 | V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8） |
 | V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比 |
 | V3 | **Windows D3D11VA 后端**（7 个 hwaccel）+ `pause/seek` + 缓冲状态 + `NetStream.Play.*` 事件序列 | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
@@ -662,9 +677,8 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 **仍未定**（不阻塞实现）：
 
 1. **`all` 档接不接**：VVC + `libdav1d` + DASH（`libxml2`）。`broad` 已覆盖实际使用面，`all` 只是「更全」。
-2. **`build-static.sh` 的落点**：现在它在 `build-tools/ffmpeg-src/`（FFmpeg 的干净克隆内，**不受 git 管理**，
-   与 `curl-src/build-static.sh` 同形）。文档把它当「可复现」的唯一凭据，新克隆拿不到——是否挪进
-   `as3compiler/scripts/` 待定。
+2. **Windows 侧的 video 入口**：`macos.sh --only video` 已就位，`windows.ps1` 没有——FFmpeg 需要 MSYS2/MinGW
+   环境，而那个脚本整套是 clang-cl + MSVC ABI。要不要做、怎么做，等 V5（publish 落地）Windows 端验收时再定。
 
 ---
 
@@ -682,18 +696,21 @@ grep -n "media transport and FLV decoding" src/emit.ts
 # 2) 确认零解码后端（应为空）
 grep -rniE "avcodec|avformat|libavcodec|h264_decode" src/ vendor/*.cc vendor/*.c
 
-# 3) 裁剪实测（V0 已完成，可一键复现）
-cd /path/to/repo-root                       # 仓库根，build-tools/ 的上一层
-[ -d build-tools/ffmpeg-src ] || git clone --depth 1 -b n9.0.2 https://git.ffmpeg.org/ffmpeg.git build-tools/ffmpeg-src
-# 取最新稳定版：git ls-remote --tags origin | grep -oE 'n[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V | tail -1
-# 上面所有体积数字都是 n9.0.2 口径（n7.1 上同一套旗标会小 0.4~0.6 MB）
-bash build-tools/ffmpeg-src/build-static.sh air     # 4.45 MB（含 publish）
-bash build-tools/ffmpeg-src/build-static.sh mid     # 6.67 MB（仅供对照）
-bash build-tools/ffmpeg-src/build-static.sh broad   # 8.28 MB（默认档）
-bash build-tools/ffmpeg-src/build-static.sh air --no-publish   # 4.25 MB（纯解码口径，§3 那列）
+# 3) 裁剪实测（V0 已完成，可一键复现）—— 配方在 git 里，源码不在
+cd as3compiler
+bash vendor/provision/ffmpeg-static.sh air     # 4.45 MB（含 publish）
+bash vendor/provision/ffmpeg-static.sh mid     # 6.67 MB（仅供对照）
+bash vendor/provision/ffmpeg-static.sh broad   # 8.28 MB（默认档）
+bash vendor/provision/ffmpeg-static.sh air --no-publish   # 4.25 MB（纯解码口径，§3 那列）
+# 首次跑会自动 clone 源码：ASC_FFMPEG_TAG 默认 n9.0.2（最新稳定）→ build-tools/ffmpeg-src
+#   查最新稳定：git ls-remote --tags https://git.ffmpeg.org/ffmpeg.git | grep -oE 'n[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V | tail -1
+#   上面所有体积数字都是 n9.0.2 口径（n7.1 上同一套旗标会小 0.4~0.6 MB）
 # 脚本末尾输出 profile=… publish=… linked=… stripped=…；产物在 build-tools/ffmpeg-out/<profile>/
 # 换 Windows/Linux 主机时脚本自动换 --enable-d3d11va / --enable-vaapi 与 h264_mf / h264_vaapi
-# publish 断言不过则 exit 3（而不是静默产出一个推不了流的库）
+# publish / hwaccel 断言不过则 exit 3（而不是静默产出一个推不了流、或硬解形同虚设的库）
+
+# 3b) 部署进 vendor/（与 curl/skia 同一条流水线，含 LGPL 许可证）
+bash vendor/provision/macos.sh --only video      # = ffmpeg-static.sh broad + 拷到 vendor/ffmpeg/
 
 # 4) 确认硬解后端真的在工作（用系统 ffmpeg 即可，不需要先自己编）
 ffmpeg -hwaccels                                   # 应列出 videotoolbox（macOS）
