@@ -9,7 +9,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
+import { readFileSync, existsSync, copyFileSync, writeFileSync, mkdirSync, rmSync, statSync, renameSync, readdirSync, openSync, readSync, closeSync, linkSync } from 'node:fs';
 import { resolve, dirname, join, basename, delimiter, isAbsolute } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -1882,6 +1882,173 @@ function objectPathFor(cfg: BuildConfig, src: string, suffix: string): string {
   return join(objectDir(cfg), `${tag}-${basename(src).replace(/\.[^.]+$/, '')}${suffix}`);
 }
 
+// ---------- object cache: reuse what did not change ----------
+//
+// Measured on examples/native-window.as (8.66 s end to end, this machine): 4.73 s
+// compiling the generated .c, 3.10 s compiling the four native glue files
+// (skia_glue.cc 0.92 + metal_glue.mm 0.82 + file_dialog_macos.mm ~0.70 +
+// native_drag_macos.mm ~0.70), 0.17 s linking. The glue cannot change when an .as
+// file does, so recompiling it is 36% of the edit-compile loop spent on nothing.
+// Those objects are byte-identical across runs -- verified, not assumed: two
+// compiles of skia_glue.cc produced the same SHA-256 -- so they can be shared.
+//
+// This is a deliberate, narrow exception to "objects belong to the build that made
+// them" (see objectDir), and the rule it excepts still holds: a compile still
+// writes ONLY into the private scratch. Only *finished* objects enter the cache,
+// and they enter by hardlink + atomic rename, so no reader can ever observe a
+// half-written file (the failure this all exists to prevent). Content identity
+// does the rest: the key is a hash of the exact compile command minus `-o`, plus
+// the source bytes, plus the compiler binary's own size/mtime -- so two configs
+// cannot share an entry, and a toolchain swap cannot resurrect an old object.
+//
+// ASC_OBJ_CACHE=0 turns it off; a build that must not see a stale entry then
+// cannot, which is what a "is this really a compiler bug?" post-mortem wants.
+const OBJECT_CACHE_DIR = join(tmpdir(), 'as-aot-obj-cache');
+const OBJECT_CACHE_CAP_BYTES = 1024 * 1024 * 1024;
+let objectCacheTrimmed = false;
+
+export function objectCacheEnabled(): boolean {
+  return process.env.ASC_OBJ_CACHE !== '0';
+}
+
+export function objectCacheDir(): string {
+  return OBJECT_CACHE_DIR;
+}
+
+export function objectCachePath(key: string): string {
+  return join(OBJECT_CACHE_DIR, `${key}.o`);
+}
+
+// The key must change whenever the object's bytes could. Everything that reaches
+// the compiler is in the command line, so the command line is the honest input --
+// minus `-o <path>`, because where an object is written does not change what is in
+// it (that is exactly why the cache can exist).
+export function objectCacheKey(cmd: string[], src: string): string {
+  const out = cmd.indexOf('-o');
+  const head = out >= 0 ? [...cmd.slice(0, out), ...cmd.slice(out + 2)] : cmd;
+  const h = createHash('sha256');
+  h.update('asc-object-cache-1\u0000');
+  h.update(compilerIdentity(cmd[0]));
+  h.update('\u0000');
+  h.update(head.join('\u0000'));
+  h.update('\u0000');
+  h.update(createHash('sha256').update(readFileSync(src)).digest('hex'));
+  return h.digest('hex').slice(0, 40);
+}
+
+// Size+mtime of the compiler binary, resolved through PATH. Deliberately not
+// `cc --version`: every build would pay a subprocess for it, and a reinstall or
+// upgrade moves size/mtime anyway -- the property the key actually needs.
+function compilerIdentity(exe: string): string {
+  const p = findOnPath(exe);
+  if (!p) return `unresolved:${exe}`;
+  try {
+    const st = statSync(p);
+    return `${p}:${st.size}:${Math.round(st.mtimeMs)}`;
+  } catch {
+    return `unstattable:${p}`;
+  }
+}
+
+function findOnPath(exe: string): string | null {
+  if (exe.includes('/') || exe.includes('\\')) return existsSync(exe) ? resolve(exe) : null;
+  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    const cand = join(dir, exe);
+    if (existsSync(cand)) return cand;
+  }
+  return null;
+}
+
+// Only real compile steps are cacheable. The C-only path and the web path each emit
+// one command that compiles AND links (no `-c`); caching that would mean caching a
+// binary, which is a different promise than "these objects are reproducible".
+export function isObjectCacheStep(cmd: string[]): boolean {
+  return cmd.includes('-c') && cmd.includes('-o');
+}
+
+// Every step this build emits puts the source immediately before `-o <object>`.
+function sourceOfCompileStep(cmd: string[]): string | null {
+  const out = cmd.indexOf('-o');
+  return out > 0 ? cmd[out - 1] : null;
+}
+
+// Put a finished object into the shared cache without ever writing it in place:
+// hardlink into a pid-named temp name, then rename (atomic on one filesystem, so a
+// concurrent reader sees either no entry or a complete one). The hardlink also
+// means the scratch and the cache share one inode -- no copy of a 3 MB object.
+function storeObject(obj: string, cached: string): void {
+  try {
+    if (existsSync(cached)) return;
+    mkdirSync(OBJECT_CACHE_DIR, { recursive: true });
+    const tmp = `${cached}.${process.pid}.tmp`;
+    rmSync(tmp, { force: true });
+    try {
+      linkSync(obj, tmp);
+    } catch {
+      copyFileSync(obj, tmp);
+    }
+    renameSync(tmp, cached);
+    trimObjectCache();
+  } catch {
+    // A cache that cannot be written is a slower build, never a failed one.
+  }
+}
+
+// Give a cached object the name this build's link line expects. A miss here (the
+// entry was trimmed between the existsSync and the link) is not an error: the
+// caller simply compiles.
+function adoptCachedObject(cached: string, obj: string): boolean {
+  try {
+    rmSync(obj, { force: true });
+    mkdirSync(dirname(obj), { recursive: true });
+    try {
+      linkSync(cached, obj);
+    } catch {
+      copyFileSync(cached, obj);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Best-effort cap so the cache cannot grow without bound in the temp dir. Oldest
+// first (mtime is the compile time: adopting an entry never rewrites it, so this
+// is "least recently created", which is close enough for a cache of compiled glue).
+function trimObjectCache(): void {
+  if (objectCacheTrimmed) return;
+  objectCacheTrimmed = true;
+  try {
+    const entries = readdirSync(OBJECT_CACHE_DIR).filter((n) => n.endsWith('.o'));
+    let total = 0;
+    const stats: { path: string; size: number; mtime: number }[] = [];
+    for (const n of entries) {
+      const p = join(OBJECT_CACHE_DIR, n);
+      try {
+        const st = statSync(p);
+        stats.push({ path: p, size: st.size, mtime: st.mtimeMs });
+        total += st.size;
+      } catch {
+        // vanished under us: nothing to account for
+      }
+    }
+    if (total <= OBJECT_CACHE_CAP_BYTES) return;
+    stats.sort((a, b) => a.mtime - b.mtime);
+    for (const s of stats) {
+      if (total <= OBJECT_CACHE_CAP_BYTES) break;
+      try {
+        rmSync(s.path, { force: true });
+        total -= s.size;
+      } catch {
+        // ignore: an entry we cannot remove is one we simply do not reclaim
+      }
+    }
+  } catch {
+    // no cache dir yet, or unreadable: nothing to trim
+  }
+}
+
 // Build the full set of compiler invocations. Pure-C builds are a single command
 // (unchanged); when the manifest adds C++ sources (.cc/.cpp), we compile C and
 // C++ separately and link with the C++ driver so libstdc++ is pulled in. The
@@ -2094,6 +2261,21 @@ function spawnTool(argv: string[], env: NodeJS.ProcessEnv | Record<string, strin
 // Run the compiler and propagate failure. Returns true on success. `extraEnv`
 // (e.g. the Emscripten toolchain's PATH) is merged over the inherited
 // environment rather than replacing it, so unrelated env vars survive.
+// Compile one step, reusing a matching cache entry when there is one. The command
+// line and every path stay exactly what buildCompileSteps produced -- the cache is
+// invisible to `--dry` and to the printed step, so what you read is what runs.
+export function runObjectCacheStep(argv: string[], extraEnv?: Record<string, string>): boolean {
+  if (!objectCacheEnabled() || !isObjectCacheStep(argv)) return runCompile(argv, extraEnv);
+  const src = sourceOfCompileStep(argv);
+  const obj = argv[argv.indexOf('-o') + 1];
+  if (!src || !obj || !existsSync(src)) return runCompile(argv, extraEnv);
+  const cached = objectCachePath(objectCacheKey(argv, src));
+  if (existsSync(cached) && adoptCachedObject(cached, obj)) return true;
+  if (!runCompile(argv, extraEnv)) return false;
+  storeObject(obj, cached);
+  return true;
+}
+
 export function runCompile(argv: string[], extraEnv?: Record<string, string>): boolean {
   ensureOutDir(argv);
   const env = extraEnv ? { ...process.env, ...extraEnv } : process.env;

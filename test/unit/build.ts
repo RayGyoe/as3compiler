@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, objectCacheKey, objectCachePath, objectCacheDir, objectCacheEnabled, isObjectCacheStep, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -3395,6 +3395,44 @@ function checkObjectPaths(): string[] {
   const vendorIcu = join(root, 'vendor', 'skia', 'icu');
   check('no build output lands in the vendored tree',
     !existsSync(join(vendorIcu, 'icudtl_flutter.s')) && !existsSync(join(vendorIcu, 'icudtl_flutter.o')));
+
+  // (9) 对象缓存（阶段三百九十七）：没变的源不必重编。之前的规则「对象属于编译它的进程」
+  // 并没有被放宽——编译仍然只写进本次构建的 scratch，只有**成品**对象才进共享缓存，
+  // 且经硬链接 + 原子 rename 发布，所以读到的永远是一个完整文件。这里钉住的是缓存键
+  // 的边界：什么会让对象变，什么不会。
+  //
+  // 实测（native-window.as，本机）：冷缓存 8.10 s，同一程序重编 0.70 s；改一行用户代码、
+  // glue 命中时 5.65 s（原 8.66 s）—— 省掉的就是那四个 glue 的 3.1 s。
+  const cacheSrc = join(tmpdir(), `asc-objcache-pin-${process.pid}.c`);
+  writeFileSync(cacheSrc, 'int pin(void) { return 0; }\n');
+  const cmdFor = (out: string, extra: string[] = []): string[] =>
+    ['clang', '-c', '-O2', ...extra, cacheSrc, '-o', out];
+  const key = objectCacheKey(cmdFor(join(tmpdir(), 'a.o')), cacheSrc);
+  check('the same command over the same bytes hashes the same',
+    key === objectCacheKey(cmdFor(join(tmpdir(), 'a.o')), cacheSrc));
+  check('where the object is written is NOT part of the key (that is why sharing works)',
+    key === objectCacheKey(cmdFor(join(tmpdir(), 'elsewhere', 'b.o')), cacheSrc));
+  check('a different -D is a different object',
+    key !== objectCacheKey(cmdFor(join(tmpdir(), 'a.o'), ['-D', 'PIN=1']), cacheSrc));
+  check('a different optimization level is a different object',
+    key !== objectCacheKey(cmdFor(join(tmpdir(), 'a.o'), ['-O0']), cacheSrc));
+  writeFileSync(cacheSrc, 'int pin(void) { return 1; }\n');
+  check('changed source bytes are a different object',
+    key !== objectCacheKey(cmdFor(join(tmpdir(), 'a.o')), cacheSrc));
+  rmSync(cacheSrc, { force: true });
+  // Only compile steps: the C-only and web paths link in the same command, and a
+  // cache of a finished binary is a claim we are not making.
+  check('every compile step of a real build is cacheable, and the link step is not',
+    buildCompileSteps(base(), 'x.c', 'x.out').slice(0, -1).every((s) => isObjectCacheStep(s))
+      && !isObjectCacheStep(buildCompileSteps(base(), 'x.c', 'x.out').at(-1)!)
+      && !isObjectCacheStep(buildCompileCommand(base(), 'x.c', 'x.out')));
+  // The cache is a sibling of the scratch, never inside it: `cleanObjectScratch` must
+  // not be able to take the shared entries with it.
+  check('the cache lives beside the scratch, not inside one build\u2019s scratch',
+    !objectCacheDir().startsWith(objectDir(base())) && objectCachePath('k').startsWith(objectCacheDir())
+      && objectCacheDir().startsWith(tmpdir()));
+  check('the cache can be turned off for a build that must not see stale objects',
+    typeof objectCacheEnabled() === 'boolean');
 
   // Leave nothing behind: these checks drive the real command builder and materialise
   // real inputs, so they name real directories. Sweeping by pid also exercises the

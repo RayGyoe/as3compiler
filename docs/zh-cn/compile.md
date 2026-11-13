@@ -664,7 +664,22 @@ as-aot --air-app examples/air-native/air-native-app.xml --target wasm --package 
 被回收（失败则刻意保留，那才是事后分析想要的现场）。两道闸各自堵一类静默：对象内容是编译旗标
 的函数，两条配置不同的构建共用一条路径会互相串；而**即使内容完全相同**，`cc -o` 也是就地截断
 再写，两个构建共写一条路径会让**正在链接的一方读到空文件**（实测：示例套件并发六路文本构建，
-`ld: file is empty in .../icudtl_flutter.o`，三轮里红两轮）。运行期 `File.applicationDirectory` 与 `extensions/` 按
+`ld: file is empty in .../icudtl_flutter.o`，三轮里红两轮）。
+
+**对象缓存（阶段三百九十七）**：上面那条闸说的是「两个构建不能共写一条路径」，不是「同样的对象
+必须重算一遍」。从本条起，**已经编好的对象会被复用**：缓存落在 `$TMPDIR/as-aot-obj-cache/<键>.o`，
+键 = 完整编译命令行（**除掉 `-o` 路径**，因为写到哪里不改变内容）+ 源码字节的 SHA-256 + 编译器
+二进制自身的 size/mtime（换工具链即失效）。缓存**不放松**那道闸：编译仍然只写本次构建的私有
+scratch，只有**成品**对象经「硬链接到 pid 名临时名 + `rename` 原子发布」进缓存，所以任何读者
+看到的只能是「没有这个条目」或「一个完整文件」，不会是半截。写入失败、条目被并发清掉都只退化
+为重编，不影响构建结果；条目总量按 1 GB 上限、按创建时间淘汰。`ASC_OBJ_CACHE=0` 关闭——怀疑
+「是不是编了个旧对象」时用它做一次干净复现。
+
+实测（`examples/native-window.as`，本机）：冷缓存 **8.10 s**；同一程序原样重编 **0.70 s**；改一行
+用户代码、glue 命中 **5.65 s**（原 8.66 s）。省下的就是四个 glue 的 **3.10 s**（`skia_glue.cc` 0.92 /
+`metal_glue.mm` 0.82 / `file_dialog_macos.mm` ~0.70 / `native_drag_macos.mm` ~0.70），它们与你的
+`.as` 改动毫无关系。纯 C 单命令路径（`hello.as` 那类：编译与链接同一条命令、没有 `-c`）不进缓存
+——那要缓存的是**产物**而不是对象，是另一个承诺。运行期 `File.applicationDirectory` 与 `extensions/` 按
 **exe 所在目录**解析，产物可整体搬走）。
 
 #### 3.5.0 原生扩展从描述符来（不用拼 `--ane`）

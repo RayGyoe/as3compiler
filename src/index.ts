@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, runObjectCacheStep, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
@@ -1208,7 +1208,7 @@ async function main(): Promise<void> {
     const env = webCompileStepsEnv();
     for (const s of steps) {
       console.log(`[4/4] compile     ${s.join(' ')}`);
-      if (!runCompile(s, env)) process.exit(1);
+      if (!runObjectCacheStep(s, env)) process.exit(1);
     }
     // 对象是中间产物（文本构建约 3 MB），链接成功后连同本次构建的 scratch 一并
     // 丢弃；构建失败则刻意保留，那才是事后分析想要的状态。
@@ -1255,7 +1255,7 @@ async function main(): Promise<void> {
   }
   for (const s of steps) {
     console.log(`[4/4] compile     ${s.join(' ')}`);
-    if (!runCompile(s)) process.exit(1);
+    if (!runObjectCacheStep(s)) process.exit(1);
   }
   // 同上：链接成功即回收对象，失败保留（见 build.ts::cleanObjectScratch）。
   cleanObjectScratch(cfg);

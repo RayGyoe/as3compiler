@@ -719,7 +719,26 @@ Two guards, two distinct silent failures: an object's contents are a function of
 two builds with different flags sharing one path would leak into each other, and — even when the bytes
 are *identical* — `cc -o` truncates in place, so two builds sharing one path hand a **linking** build an
 empty file (measured: six concurrent text builds in the example suite, `ld: file is empty in
-.../icudtl_flutter.o`, two runs in three red); at run time `File.applicationDirectory` and
+.../icudtl_flutter.o`, two runs in three red).
+
+**Object cache (stage 397)**: that guard says two builds must not write one path — not that identical
+objects must be recomputed. Compiled objects are now **reused**: entries live in
+`$TMPDIR/as-aot-obj-cache/<key>.o`, where the key is the full compile command **minus the `-o` path**
+(where an object is written does not change what is in it) plus the SHA-256 of the source bytes plus
+the compiler binary's own size/mtime (so a toolchain swap invalidates). It does **not** loosen the
+guard: a compile still writes only into this build's private scratch, and only **finished** objects
+enter the cache, by hardlink to a pid-named temp name followed by an atomic `rename` — a reader can
+therefore see either no entry or a complete file, never half of one. A failed write or an entry
+trimmed by a concurrent build degrades to recompiling, never to a wrong result; total size is capped
+at 1 GB with oldest-created eviction. `ASC_OBJ_CACHE=0` disables it — that is the clean reproduction
+to run when a build looks like it linked a stale object.
+
+Measured on `examples/native-window.as` (this machine): cold cache **8.10 s**; identical rebuild
+**0.70 s**; one line of user code changed with glue hits **5.65 s** (was 8.66 s). The saving is the
+four glue objects' **3.10 s** (`skia_glue.cc` 0.92 / `metal_glue.mm` 0.82 / `file_dialog_macos.mm`
+~0.70 / `native_drag_macos.mm` ~0.70), none of which depend on the `.as` you edited. The pure-C
+single-command path (`hello.as` and friends: compile and link in one command, no `-c`) stays
+uncached — that would mean caching a **finished artifact**, a different promise. at run time `File.applicationDirectory` and
 `extensions/` resolve against the
 **executable's own directory**, so the artifacts move as a unit).
 
