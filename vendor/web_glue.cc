@@ -736,11 +736,16 @@ int sk_window_main(void) { return 0; }
 typedef struct sk_menu_item_t { int kind; const char* label; int enabled; int checked; const char* key; int mods; int submenu; int tag; } sk_menu_item_t;
 typedef struct sk_menu_t { const char* title; int first; int count; } sk_menu_t;
 int sk_menu_supported(void) { return 0; }
-int sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
-  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
+// These two are declared `void` in the generated C (src/runtime.ts's menu seam), so
+// they must be `void` here too: as `int` wasm-ld reports "function signature
+// mismatch: sk_menu_install_app" on EVERY web build (measured 2026-11-13, emcc
+// 3.1.44). Harmless while the caller ignores the result, but it is a real type
+// disagreement in the one place the wasm linker cannot paper over.
+void sk_menu_install_app(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb;
 }
-int sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
-  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb; return 0;
+void sk_menu_install_dock(const sk_menu_t* menus, int nmenus, const sk_menu_item_t* items, int nitems, int root, void (*cb)(int)) {
+  (void)menus; (void)nmenus; (void)items; (void)nitems; (void)root; (void)cb;
 }
 void sk_dock_bounce(int critical) { (void)critical; }
 // ---- context-menu popup (阶段二百八十九) ----

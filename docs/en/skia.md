@@ -892,7 +892,8 @@ semantic mutations (force visible only, force alpha only, drop the alpha restore
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.
 - **wasm (browser, `--target wasm --package web`)**: Emscripten compiles Skia + the glue layer into a wasm32
   static library (`vendor/skia/lib/wasm/`), and emcc links it into `.wasm` + `.js` + `index.html`.
-  The font backend switches from CoreText to `SkFontMgr_New_Custom_Data()` (runtime font-data injection), and
+  The font backend switches from CoreText to `SkFontMgr_New_Custom_Data()` (runtime font-data injection,
+  wrapped in `SkFontMgrCascading` for per-character fallback — see [`html5-web.md`](html5-web.md) §4), and
   the window layer switches from SDL2 to canvas + `requestAnimationFrame`. Implementation and constraints are
   detailed in [`html5-web.md`](html5-web.md).
 - **wasm (WASI, `--target wasm --package raw`)**: still a GUI-less command-line `.wasm`, with no rendering.

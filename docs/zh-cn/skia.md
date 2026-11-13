@@ -1018,7 +1018,8 @@ talkmed meeting 的会议窗口同时播本地 1080p 采集 + 远端画面，帧
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。
 - **wasm（浏览器，`--target wasm --package web`）**：用 Emscripten 把 Skia + 胶水层一起编成
   wasm32 静态库（`vendor/skia/lib/wasm/`），经 emcc 链接产出 `.wasm` + `.js` + `index.html`。
-  字体后端由 CoreText 切换为 `SkFontMgr_New_Custom_Data()`（运行时注入字体数据），窗口层由 SDL2
+  字体后端由 CoreText 切换为 `SkFontMgr_New_Custom_Data()`（运行时注入字体数据，外面再包一层
+  `SkFontMgrCascading` 补逐字符回退，见 [`html5-web.md`](html5-web.md) §4），窗口层由 SDL2
   切换为 canvas + `requestAnimationFrame`。实现与约束详见 [`html5-web.md`](html5-web.md)。
 - **wasm（WASI，`--target wasm --package raw`）**：仍是无 GUI 的命令行 `.wasm`，不含渲染。
 

@@ -609,6 +609,23 @@ function checkBackendParity(): string[] {
   const missingOnWeb = [...nativeMenu].filter((n) => !webMenu.has(n));
   check('both backends define the whole flash.desktop menu seam',
     nativeMenu.size >= 5 && missingOnWeb.length === 0);
+  // ...and the SIGNATURE has to match too, not just the name. The generated C declares
+  // these two `void` (runtime.ts's menu seam), while web_glue.cc used to return `int`:
+  // native C compilers never compare across translation units, so it went unnoticed
+  // until a web build, where wasm-ld reports `function signature mismatch:
+  // sk_menu_install_app` on EVERY link (measured 2026-11-13, emcc 3.1.44). Nothing
+  // reads the result, so `void` is the honest declaration.
+  {
+    const webGlue = readNorm(join(root, 'vendor', 'web_glue.cc'));
+    const declared = readNorm(join(root, 'src', 'runtime.ts'));
+    check('the generated C declares the menu installers as void',
+      declared.includes('extern void sk_menu_install_app(') &&
+      declared.includes('extern void sk_menu_install_dock('));
+    check('the web stubs return void, matching that declaration',
+      /^void sk_menu_install_app\(/m.test(webGlue) &&
+      /^void sk_menu_install_dock\(/m.test(webGlue) &&
+      !/^int sk_menu_install_(?:app|dock)\(/m.test(webGlue));
+  }
   // 文字输入 seam 必须在两个后端都落地（这正是断链的那三个）。
   check('the composed-text seam is implemented by BOTH backends',
     ['sk_window_text_take', 'sk_window_text_edit_take', 'sk_window_set_text_input_rect']
@@ -2450,6 +2467,111 @@ function checkFontFallback(): string[] {
 }
 
 registerGroup('unit: platform/FontFallback', checkFontFallback);
+
+// ---- web/wasm per-character font fallback (G40) ----
+// The web arm has no system fonts, so it builds its manager from injected byte
+// streams (SkFontMgr_New_Custom_Data). That manager is SkFontMgr_Custom, whose
+// onMatchFamilyStyleCharacter() is an unconditional `return nullptr`
+// (skia-src/src/ports/SkFontMgr_custom.cpp:190): every code point the run's own
+// face misses becomes .notdef, and a second injected face is never consulted.
+// Measured through SkParagraph (temp/para-probe.cc, Arial + MiSans registered,
+// text "A中"):
+//   base     unresolved=1 runs [Arial:36] [Arial:0]
+//   cascade  unresolved=0 runs [Arial:36] [MiSans:7220]
+// The fix is a wrapper that adds ONLY the character tier. These pins are on the
+// structure, because the failure mode of a "tidy" refactor here is silent: any
+// name/style method that stops forwarding changes which face resolves, and the
+// suite has no way to notice from rendered output.
+function checkWebFontCascade(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [webfont] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [webfont] ${label}`); }
+  };
+
+  const readVendor = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  const hdrRaw = readVendor('skia_fontmgr_cascade.h');
+  const hdr = strip(hdrRaw);
+  const glueRaw = readVendor('skia_glue.cc');
+  const glue = strip(glueRaw);
+
+  // (1) The tier exists and really scans: a bare `return nullptr` body would be a
+  // header that compiles, links, and restores G40 byte for byte.
+  const cd0 = hdr.indexOf('class SkFontMgrCascading : public SkFontMgr');
+  const body = cd0 < 0 ? '' : hdr.slice(cd0);
+  const ov = (sig: string): string => {
+    const i = body.indexOf(sig);
+    if (i < 0) return '';
+    const j = body.indexOf('\n    }', i);
+    return body.slice(i, j < 0 ? body.length : j);
+  };
+  check('the web font manager is a subclass of SkFontMgr', cd0 >= 0);
+  const charOv = ov('onMatchFamilyStyleCharacter(');
+  check('it overrides the per-character query', charOv !== '');
+  check('...and walks every family the base manager knows',
+    charOv.includes('fBase->countFamilies()') && charOv.includes('fBase->getFamilyName(') &&
+    charOv.includes('firstWithGlyph(family.c_str(), style, character)') &&
+    charOv.includes('firstWithGlyph(familyName, style, character)'));
+  const glyphHelper = (() => {
+    const i = body.indexOf('sk_sp<SkTypeface> firstWithGlyph(');
+    return i < 0 ? '' : body.slice(i, body.indexOf('\n    }', i));
+  })();
+  check('...resolving each family through the base manager, style first then default',
+    glyphHelper.includes('fBase->matchFamilyStyle(familyName, s)') &&
+    glyphHelper.includes('{style, SkFontStyle()}'));
+  check('...taking only a face that actually maps the code point',
+    charOv.includes('firstWithGlyph(') &&
+    body.includes('tf->unicharToGlyph(character) != 0'));
+  check('...after letting the wrapped manager answer first',
+    /fBase->matchFamilyStyleCharacter\(familyName, style, bcp47, bcp47Count, character\)/.test(charOv));
+
+  // (2) Every name/style/make query must still forward: that is the promise that
+  // no family which resolves today changes face.
+  for (const sig of ['int onCountFamilies() const override',
+                     'void onGetFamilyName(int index, SkString* familyName) const override',
+                     'sk_sp<SkFontStyleSet> onCreateStyleSet(int index) const override',
+                     'sk_sp<SkFontStyleSet> onMatchFamily(const char familyName[]) const override',
+                     'sk_sp<SkTypeface> onMatchFamilyStyle(const char familyName[],',
+                     'sk_sp<SkTypeface> onMakeFromData(sk_sp<SkData> data, int ttcIndex) const override',
+                     'sk_sp<SkTypeface> onMakeFromStreamIndex(std::unique_ptr<SkStreamAsset> stream,',
+                     'sk_sp<SkTypeface> onMakeFromStreamArgs(std::unique_ptr<SkStreamAsset> stream,',
+                     'sk_sp<SkTypeface> onMakeFromFile(const char path[], int ttcIndex) const override',
+                     'sk_sp<SkTypeface> onLegacyMakeTypeface(const char familyName[],']) {
+    check(`forwarded verbatim: ${sig.split('(')[0].trim()}`, ov(sig).includes('fBase->') || ov(sig).includes('return fBase->'));
+  }
+
+  // (3) The wrapper is wired into the web branch and ONLY there: native arms have
+  // a real cascade (CoreText / GDI+DirectWrite) and must keep using it.
+  check('the header is included only under __EMSCRIPTEN__',
+    /#ifdef __EMSCRIPTEN__\s*#include "skia_fontmgr_cascade\.h"\s*#endif/.test(glue));
+  const em = glue.indexOf('#ifdef __EMSCRIPTEN__');
+  const win = glue.indexOf('#elif defined(_WIN32)');
+  const webRegion = em >= 0 && win > em ? glue.slice(em, win) : '';
+  check('the web manager is wrapped by the cascade',
+    webRegion.includes('SkFontMgrCascading::Make(std::move(base))'));
+  check('...for the empty manager too (no font injected yet)',
+    webRegion.includes('base = SkFontMgr_New_Custom_Empty();') &&
+    webRegion.indexOf('SkFontMgr_New_Custom_Empty()') < webRegion.indexOf('SkFontMgrCascading::Make('));
+  check('...and for the injected-data manager',
+    webRegion.includes('base = SkFontMgr_New_Custom_Data('));
+  check('the native branches do not wrap', !webRegion.includes('.replace') &&
+    (glue.match(/SkFontMgrCascading::Make/g) ?? []).length === 1);
+
+  // (4) The header stays header-only: it is included by the glue, never listed as
+  // a build source, so no arm can end up linking it twice or not at all.
+  check('the cascade has no translation unit of its own',
+    !existsSync(join(root, 'vendor', 'skia_fontmgr_cascade.cc')));
+
+  console.log(`     [webfont] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/WebFontCascade', checkWebFontCascade);
 
 // ---- NativeWindow minSize/maxSize, startMove/startResize, listOwnedWindows and the
 // ---- per-frame event poll (阶段一百九十六) ----

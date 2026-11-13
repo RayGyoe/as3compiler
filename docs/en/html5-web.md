@@ -61,7 +61,9 @@ also `preload`s the whole app directory into `<base>.data` (fonts are separately
 
 ```bash
 # requires the Emscripten SDK (provides emcc) + the wasm build of Skia (vendor/skia/lib/wasm/)
-export EMSDK_HOME=/path/to/emsdk
+# A ready copy ships inside the Skia source tree (3.1.44 — the same one that produced
+# vendor/skia/lib/wasm), so no separate install is needed:
+export EMSDK_HOME=<repo>/build-tools/skia-src/third_party/externals/emsdk
 
 as-aot examples/web/hello-web.as \
   --manifest examples/web/hello-web.build.json
@@ -465,6 +467,22 @@ On the Skia side (`skia_glue.cc`'s `#ifdef __EMSCRIPTEN__` branch):
 - `sk_platform_fontmgr()`: with no fonts → `SkFontMgr_New_Custom_Empty()`; with fonts →
   `SkFontMgr_New_Custom_Data(g_font_datas)`, using FreeType to scan each font's data, building the
   family→typeface table, from which `matchFamilyStyle` / SkParagraph find injected fonts by name.
+- **Both managers are wrapped in `SkFontMgrCascading`** (`vendor/skia_fontmgr_cascade.h`):
+  `SkFontMgr_Custom`'s `onMatchFamilyStyleCharacter()` is an **unconditional `return nullptr`**
+  (`build-tools/skia-src/src/ports/SkFontMgr_custom.cpp:190`), and SkParagraph calls it for **every
+  code point the current run's face does not map**. So with two faces injected (a Latin one + a CJK
+  one) a CJK run still came out as all .notdef — that is the real root cause of G40 ("the web arm can
+  only ever install one face"). The wrapper adds only that tier: ask the wrapped manager first
+  (platforms with a real cascade keep their own answer), then walk every family in **injection
+  order**, requesting the run's style and then the default style, and accept a face only when
+  `unicharToGlyph(cp) != 0`. Every name/style/make query is forwarded verbatim, so no family that
+  resolves today changes face. Measured (`temp/para-probe.cc`, Arial + MiSans registered, text
+  `A中`): unwrapped `unresolved=1`, runs `[Arial:36][Arial:0]`; wrapped `unresolved=0`, runs
+  `[Arial:36][MiSans:7220]`. In the browser (`temp/webfont/`, the same `.as` built twice with only
+  `font-urls` differing): with Arial alone, `A中文字B` draws as `A□□□B` with `textWidth=157.70`; with
+  Arial + MiSans the same line draws real glyphs with `textWidth=190.70` (= 29.35 for A and B each +
+  3×44), while the MiSans family measures the same three characters at `132.00` — the fallback face's
+  advance is identical to a direct hit (the 33.00 delta is exactly 3 × (33px .notdef − 44px CJK)).
 - `sk_fontmgr_register_data` is exported to JS with `EMSCRIPTEN_KEEPALIVE`.
 
 > Injection-order constraint: `sk_default_typeface()` / `sk_textlayout_collection()` are function-local static
@@ -556,6 +574,12 @@ must be written before `showWindow`, with `showWindow` as the last statement. Th
      (`Acme Pharma`/`视频通话`/`我的会议`…), so it carries a 7.9 MB `MiSans-Regular.ttf` (measured: Arial's and
      Ubuntu-R's cmap hit 0/8 for these characters, MiSans 8/8). With only a Western font, those Chinese
      characters render as ▯, **without erroring**.
+   - **Faces stack and fall back per character** (§4's `SkFontMgrCascading`): `font-urls` may list a Latin face
+     and a CJK face together, and a run whose font misses a code point reaches the next face. But **the only
+     fallback candidates are the faces you injected** — there are no system fonts in the sandbox, so a code
+     point none of them maps (Thai or emoji while shipping just Arial + MiSans) is still an empty box / missing
+     glyph: an honest failure, not a wrong rendering (measured, `temp/cascade-probe.cc`: U+0E01 and U+1F600
+     unmapped by both → null is returned).
    - **Fonts are downloaded only once (since stage eighty-nine / fifty-eight)**: a font's actual source is the
      page's `fetch` + `_sk_fontmgr_register_data` injection, and the copy in the wasm FS is never read
      (measured: replacing a page's `.data` with a font-free version and having the font come only over HTTP,
@@ -651,7 +675,12 @@ must be written before `showWindow`, with `showWindow` as the last statement. Th
 
 ## 7. Toolchain Reuse
 
-Under `build-tools/`, ready and kept uncleaned: `emsdk/` (Emscripten 3.1.44), `skia-src/` (chrome/m124 source
-+ dependencies, GN args in `out/wasm/args.gn`), `out/wasm/` (wasm32 build artifacts, already copied to
-`vendor/skia/lib/wasm/`). To reproduce the wasm build of Skia, see `skia.md` §7 and the comments inside
-`build-tools/skia-src/out/wasm/args.gn`.
+Under `build-tools/`, two things matter for the web arm:
+
+- **Emscripten 3.1.44**: a ready copy lives at `build-tools/skia-src/third_party/externals/emsdk` (the
+  checkout Skia's own source tree carries, with its own node 16 and python 3.9; `emcc.bat --version` works
+  as-is). Point `EMSDK_HOME` there — no separate SDK download is required. A standalone emsdk works too.
+- **The wasm build of Skia**: the artifacts are already copied to `vendor/skia/lib/wasm/` (14 `.a` files).
+  This tree does **not** keep `skia-src/out/wasm` (`out/` only holds `windows-x64` and `windows-x86`), so
+  rebuilding it needs a fresh `gn gen` with the GN args in `skia.md` §7. `--package web` only consumes
+  `vendor/skia/lib/wasm/` and does not depend on `out/wasm/`.

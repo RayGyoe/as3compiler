@@ -53,13 +53,21 @@
 
 ```bash
 # 需要 Emscripten SDK（提供 emcc）+ wasm 版 Skia（vendor/skia/lib/wasm/）
-export EMSDK_HOME=/path/to/emsdk
+# 现成可用的一份在 Skia 源码树里（3.1.44，就是产出 vendor/skia/lib/wasm 的那份），
+# 不必另装：
+export EMSDK_HOME=<repo>/build-tools/skia-src/third_party/externals/emsdk
 
 as-aot examples/web/hello-web.as \
   --manifest examples/web/hello-web.build.json
 ```
 
-> **Windows**：`EMSDK_HOME` 同样指向 emsdk 根目录，但那份 `emcc` 是 `#!/bin/sh` 脚本，Windows,> 上编译器选的是同目录的 `emcc.bat` 并经 `cmd.exe` 启动，`PATH` 用 `;` 拼，SDK 自带 python,> 与 `.emscripten` 时自动补 `EMSDK_PYTHON` / `EM_CONFIG`（阶段二百七十六）。设置变量的写法：,> `$env:EMSDK_HOME='C:\emsdk'`（PowerShell）或 `set EMSDK_HOME=C:\emsdk`（cmd）。,> `asaotui/ui-demo` 里那份 PE 转发器（`tools/emcc-launcher.c` + `.scratch/emcc-shim`）已不再需要。,,产物生成在 `examples/web/` 下：`hello-web.html` + `hello-web.js` + `hello-web.wasm`。
+> **Windows**：`EMSDK_HOME` 同样指向 emsdk 根目录，但那份 `emcc` 是 `#!/bin/sh` 脚本，
+> Windows 上编译器选的是同目录的 `emcc.bat` 并经 `cmd.exe` 启动，`PATH` 用 `;` 拼，SDK
+> 自带 python 与 `.emscripten` 时自动补 `EMSDK_PYTHON` / `EM_CONFIG`（阶段二百七十六）。
+> 设置变量的写法：`$env:EMSDK_HOME='C:\emsdk'`（PowerShell）或 `set EMSDK_HOME=C:\emsdk`（cmd）。
+> `asaotui/ui-demo` 里那份 PE 转发器（`tools/emcc-launcher.c` + `.scratch/emcc-shim`）已不再需要。
+>
+> 产物生成在 `examples/web/` 下：`hello-web.html` + `hello-web.js` + `hello-web.wasm`。
 浏览器不能 `file://` 直接加载 wasm，需经 HTTP 服务（`python3 -m http.server` 等），
 打开 `hello-web.html` 即可看到蓝色矩形 + `TextField` 文字。
 
@@ -411,6 +419,20 @@ Skia 侧（`skia_glue.cc` 的 `#ifdef __EMSCRIPTEN__` 分支）：
 - `sk_platform_fontmgr()`：无字体 → `SkFontMgr_New_Custom_Empty()`；有字体 →
   `SkFontMgr_New_Custom_Data(g_font_datas)`，用 FreeType 扫描每份字体数据，构建
   family→typeface 表，`matchFamilyStyle` / SkParagraph 由此按名找到注入字体。
+- **两种 manager 都被 `SkFontMgrCascading` 包一层**（`vendor/skia_fontmgr_cascade.h`）：
+  `SkFontMgr_Custom` 的 `onMatchFamilyStyleCharacter()` 是**无条件的 `return nullptr`**
+  （`build-tools/skia-src/src/ports/SkFontMgr_custom.cpp:190`），而 SkParagraph 对**每个
+  当前 run 字体缺的码点**都会调这个接口要回退字体。所以注入「拉丁面 + CJK 面」两份字体时，
+  CJK 仍会整段变成 .notdef —— 这就是 G40「web 只能装一个面」的真根因。包装器只补这一层回退：
+  先问被包的 manager（有系统级回退的平台行为不变），再按**注入顺序**逐 family 试「请求的
+  style → 默认 style」，且**只接受 `unicharToGlyph(cp) != 0` 的面**。所有 name/style/make 查询
+  原样转发，故今天能解析的族不会换面。实测（`temp/para-probe.cc`，注册 Arial + MiSans、
+  文本 `A中`）：裸 manager `unresolved=1`、runs `[Arial:36][Arial:0]`；包装后 `unresolved=0`、
+  runs `[Arial:36][MiSans:7220]`。浏览器端 A/B（`temp/webfont/`，同一份 `.as` 两次构建，
+  只差 `font-urls`）：只注入 Arial 时 `A中文字B` 渲染成 `A□□□B`、`textWidth=157.70`；注入
+  Arial + MiSans 后同一行是真字形、`textWidth=190.70`（= A/B 各 29.35 + 3×44），而 MiSans 族
+  直接量同一串是 `132.00` —— 回退面的 advance 与直接命中完全一致（33.00 的差恰好是 3 个
+  .notdef 33px 与 3 个 CJK 44px 之差）。
 - `sk_fontmgr_register_data` 用 `EMSCRIPTEN_KEEPALIVE` 导出给 JS。
 
 > 注入顺序约束：`sk_default_typeface()` / `sk_textlayout_collection()` 是函数局部 static
@@ -494,6 +516,11 @@ try { Module._main(); } catch (e) { if (e !== 'unwind') throw e; }
      响应的 JSON 原样打进 TextField，里面有中文（`住友制药`/`视频通话`/`我的会议`…），所以它带的是
      7.9 MB 的 `MiSans-Regular.ttf`（实测 Arial 与 Ubuntu-R 的 cmap 对这几个字命中 0/8，MiSans 8/8）。
      只带西文字体时那些汉字会渲染成 ▯，**不报错**。
+   - **多面可叠加，按字符回退**（§4 的 `SkFontMgrCascading`）：`font-urls` 里可以同时放西文面
+     与 CJK 面，某个 run 的字体缺码点时会落到下一面。但**回退候选只有你注入的那几个面**——
+     沙箱里没有系统字体，注入面都不含的码点（例如只带 Arial+MiSans 时的泰文、emoji）仍然是
+     空框/缺字，这是诚实的失败而不是错渲染（实测 `temp/cascade-probe.cc`：U+0E01 与 U+1F600
+     两面皆无 → 返回 null）。
    - **字体只下载一次（阶段八十九·五十八 起）**：字体的实际来源是页面 `fetch` +
      `_sk_fontmgr_register_data` 注入，wasm FS 里那份副本从不被读取（实测：把一个页面的 `.data`
      换成不含字体的版本、字体仅走 HTTP，文字照样渲染）。但 `--air-app` 的 `preload-paths` 会把 app
@@ -569,7 +596,12 @@ try { Module._main(); } catch (e) { if (e !== 'unwind') throw e; }
 
 ## 7. 工具链复用
 
-`build-tools/` 下已就绪且保留不清理：`emsdk/`（Emscripten 3.1.44）、`skia-src/`
-（chrome/m124 源码 + 依赖，GN args 见 `out/wasm/args.gn`）、`out/wasm/`（wasm32 编译产物，
-已拷贝至 `vendor/skia/lib/wasm/`）。复现 wasm 版 Skia 见 `skia.md` §7 与
-`build-tools/skia-src/out/wasm/args.gn` 内注释。
+`build-tools/` 下与 web 臂有关的两件事：
+
+- **Emscripten 3.1.44**：现成可用的一份在 `build-tools/skia-src/third_party/externals/emsdk`
+  （Skia 源码自带的 checkout，含自备 node 16 与 python 3.9，`emcc.bat --version` 直接可用）。
+  把 `EMSDK_HOME` 指向它即可，不必另下 SDK；若另装了独立 emsdk，指向那份也一样。
+- **wasm 版 Skia**：产物已拷至 `vendor/skia/lib/wasm/`（14 个 `.a`）。**本机没有保留
+  `skia-src/out/wasm` 构建目录**（`out/` 里只有 `windows-x64` 与 `windows-x86`），要重编须先
+  按 `skia.md` §7 的 GN args 重新 `gn gen`。`--package web` 只用 `vendor/skia/lib/wasm/`，
+  不依赖 `out/wasm/`。

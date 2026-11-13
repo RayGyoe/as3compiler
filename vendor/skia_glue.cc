@@ -65,6 +65,13 @@
 #include "include/core/SkYUVAInfo.h"
 #include "include/core/SkYUVAPixmaps.h"
 #include "include/gpu/ganesh/SkImageGanesh.h"
+// Only the web branch needs it: SkFontMgr_New_Custom_Data refuses per-character
+// fallback (skia-src/src/ports/SkFontMgr_custom.cpp:190), so the injected faces
+// are wrapped in SkFontMgrCascading — see the font manager section below and the
+// header's own comment for the full reason.
+#ifdef __EMSCRIPTEN__
+#include "skia_fontmgr_cascade.h"
+#endif
 // E1 (opt-in, native-only): the SVG rasterizer needs the stream adapter and the
 // svg module. Both are guarded by ASC_USE_SVG -- see the forward declarations in
 // the bitmap/image section for why this is an opt-in enhancement.
@@ -219,15 +226,24 @@ sk_sp<SkFontMgr> sk_platform_fontmgr() {
   if (g_fontmgr_cache == nullptr) {
     // No fonts injected yet -> empty manager (matchFamilyStyle returns an empty
     // typeface, so text renders as nothing until the host registers fonts).
+    sk_sp<SkFontMgr> base;
     if (g_font_datas.empty()) {
-      g_fontmgr_cache = SkFontMgr_New_Custom_Empty();
+      base = SkFontMgr_New_Custom_Empty();
     } else {
       // SkFontMgr_New_Custom_Data scans each data blob (via FreeType) and builds
       // a matchable family->typeface table, so matchFamilyStyle / SkParagraph
       // find the injected fonts by name — the wasm analogue of CoreText.
-      g_fontmgr_cache = SkFontMgr_New_Custom_Data(
+      base = SkFontMgr_New_Custom_Data(
           SkSpan<sk_sp<SkData>>(g_font_datas.data(), g_font_datas.size()));
     }
+    // ...but that table has no cascade: SkFontMgr_Custom's
+    // onMatchFamilyStyleCharacter() is an unconditional `return nullptr`, and
+    // SkParagraph asks for a fallback face for EVERY code point the run's own
+    // face misses. With a Latin face + a CJK face both registered, a CJK run
+    // used to draw .notdef for every character (G40). The wrapper adds only that
+    // tier — every name/style query still goes straight to `base`, so no family
+    // that resolves today changes face.
+    g_fontmgr_cache = SkFontMgrCascading::Make(std::move(base));
   }
   return g_fontmgr_cache;
 }
