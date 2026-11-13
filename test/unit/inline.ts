@@ -53,7 +53,7 @@ import { join } from 'node:path';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { registerGroup, root, EXAMPLE_TIMEOUT_MS } from '../harness.ts';
+import { registerGroup, root, EXAMPLE_TIMEOUT_MS, PROBE_ZLIB_FLAGS } from '../harness.ts';
 
 // The array benchmark's hot loop, verbatim in shape: `sum += a[j]` where a[j] is
 // boxed (dynamic) and sum is int, so the emitter must route the + through
@@ -78,7 +78,7 @@ function compileToAsm(cSource: string, tag: string): { asm: string; stderr: stri
   const cfile = join(scratch, `${tag}.c`);
   const sfile = join(scratch, `${tag}.s`);
   writeFileSync(cfile, cSource);
-  const r = spawnSync('cc', ['-O2', '-S', '-o', sfile, cfile], { encoding: 'utf8', timeout: EXAMPLE_TIMEOUT_MS });
+  const r = spawnSync('cc', [...PROBE_ZLIB_FLAGS, '-O2', '-S', '-o', sfile, cfile], { encoding: 'utf8', timeout: EXAMPLE_TIMEOUT_MS });
   if (r.error || r.status !== 0) return null;
   return { asm: readFileSync(sfile, 'utf8'), stderr: r.stderr ?? '' };
 }

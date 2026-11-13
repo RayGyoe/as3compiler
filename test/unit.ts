@@ -61,3 +61,4 @@ import './unit/windows-release.ts';
 import './unit/devirtualization.ts';
 import './unit/prim-methods.ts';
 import './unit/c-warnings.ts';
+import './unit/video.ts';

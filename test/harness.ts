@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { join } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 
 // The package root. This file lives in <root>/test/, so the original
 // `root = import.meta.dirname` (test.ts used to sit at the package root) is now
@@ -42,6 +42,40 @@ export function registerGroup(name: string, fn: () => string[]): void {
 export function readNorm(path: string): string {
   return readFileSync(path, 'utf8').replace(/\r\n/g, '\n');
 }
+
+// Flags every unit probe needs when it hands GENERATED C to `cc`.
+//
+// The generated translation unit includes <zlib.h> on every non-wasm target, and a
+// bare MSVC toolchain has no zlib on its search path: the vendored curl tree carries
+// the header and the import library, exactly what a real build's manifest names. On
+// a Windows checkout every probe that compiled generated C therefore answered
+// `fatal error: 'zlib.h' file not found` -- a TEST-HOST gap, not a codegen defect
+// (the same C compiles fine through `as-aot`). Empty where zlib is a system header
+// (macOS/Linux), so the probes keep testing the plain default toolchain there.
+//
+// Split into an INCLUDE list and a LINK list on purpose: Windows has no `m.lib`
+// (`-lm` is a hard link error there) and its zlib is the vendored `z.lib`, while
+// macOS/Linux link the system `-lz`/`-lm`. Mixing them also breaks the
+// zero-warning pin -- `-fsyntax-only` with a `-L` on the line makes clang warn
+// `argument unused during compilation`.
+export const PROBE_ZLIB_FLAGS: string[] = (() => {
+  const inc = join(root, 'vendor', 'curl', 'include');
+  return existsSync(join(inc, 'zlib.h')) ? ['-I', inc] : [];
+})();
+
+export const PROBE_ZLIB_LINK_FLAGS: string[] = (() => {
+  if (process.platform !== 'win32') return ['-lz', '-lm'];
+  const lib = join(root, 'vendor', 'curl', 'lib', `windows-${process.arch === 'ia32' ? 'x86' : 'x64'}`);
+  return existsSync(join(lib, 'z.lib')) ? ['-L', lib, '-lz'] : [];
+})();
+
+// And the Win32 imports the generated C's DESKTOP paths call (`SHFileOperationW`
+// from <shell32>, the window/menu/drag entry points from <user32>/<ole32>). A real
+// build gets them from the manifest; a `cc gen.c -o probe` one-liner has nothing to
+// read that from, so the probe list carries them on Windows only.
+export const PROBE_SYSTEM_LINK_FLAGS: string[] = process.platform === 'win32'
+  ? ['-lshell32', '-luser32', '-lole32', '-ladvapi32']
+  : [];
 
 // The Skia glue is TWO translation units since stage 221: vendor/skia_glue.cc is
 // the graphics half and vendor/skia_text_glue.cc the text engine (SkParagraph +

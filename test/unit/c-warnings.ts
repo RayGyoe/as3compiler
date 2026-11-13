@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup } from '../harness.ts';
+import { registerGroup, PROBE_ZLIB_FLAGS, PROBE_ZLIB_LINK_FLAGS, PROBE_SYSTEM_LINK_FLAGS } from '../harness.ts';
 
 // One program exercising every emitter shape that used to warn. Kept as a single
 // source (not several) so the compile is one process: the group runs in the
@@ -123,16 +123,18 @@ function checkGeneratedCWarnings(): string[] {
     const p = join(dir, 'warn.c');
     writeFileSync(p, c);
     // Default warning set, exactly like a real build (`clang -O2`).
-    const result = spawnSync(cc, ['-fsyntax-only', p], { encoding: 'utf8' });
+    const result = spawnSync(cc, ['-fsyntax-only', ...PROBE_ZLIB_FLAGS, p], { encoding: 'utf8' });
     const out = `${result.stdout ?? ''}${result.stderr ?? ''}`;
     check('the generated C passes syntax checking', result.status === 0, out);
-    const exe = join(dir, 'warn-probe');
-    const linked = spawnSync(cc, [p, '-O2', '-lm', '-lz', ...(process.platform === 'darwin' ? ['-liconv'] : []), '-o', exe], { encoding: 'utf8' });
+    // Windows writes `warn-probe.exe` (spawning the bare name is ENOENT) and its
+    // text-mode printf emits CRLF, so the pinned stdout is compared normalised.
+    const exe = join(dir, 'warn-probe' + (process.platform === 'win32' ? '.exe' : ''));
+    const linked = spawnSync(cc, [...PROBE_ZLIB_FLAGS, p, '-O2', ...PROBE_ZLIB_LINK_FLAGS, ...PROBE_SYSTEM_LINK_FLAGS, ...(process.platform === 'darwin' ? ['-liconv'] : []), '-o', exe], { encoding: 'utf8' });
     check('the warning probe links', linked.status === 0, linked.stderr ?? '');
     if (linked.status === 0) {
       const run = spawnSync(exe, [], { encoding: 'utf8' });
       check('dirty-field assignment values and comma effects are preserved',
-        run.status === 0 && run.stdout.startsWith('center 456 1 2\n'),
+        run.status === 0 && (run.stdout ?? '').replace(/\r\n/g, '\n').startsWith('center 456 1 2\n'),
         `${run.stdout ?? ''}${run.stderr ?? ''}`);
     }
     const warnings = out.split('\n').filter((l) => l.includes('warning:'));

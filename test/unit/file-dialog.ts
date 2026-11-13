@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { defaultBuildConfig, buildCompileSteps, effectiveDefines, objectDir, withNativeDesktopBackends } from '../../src/build.ts';
-import { root } from '../harness.ts';
+import { root, PROBE_ZLIB_FLAGS, PROBE_ZLIB_LINK_FLAGS, PROBE_SYSTEM_LINK_FLAGS } from '../harness.ts';
 
 const dir = join(root, 'temp', 'file-dialog-tests');
 mkdirSync(dir, { recursive: true });
@@ -14,7 +14,8 @@ const pathA = join(dir, '中文 # fixture.txt'), pathB = join(dir, 'other.txt');
 const savedText = join(dir, 'saved-text.txt'), savedBytes = join(dir, 'saved-bytes.bin');
 writeFileSync(pathA, 'hello 中文\n'); writeFileSync(pathB, 'second');
 function run(name: string, source: string, native: boolean) {
-  const c = join(dir, `${name}.c`), exe = join(dir, name);
+  // Windows writes `name.exe`; spawning the bare name is ENOENT (status null).
+  const c = join(dir, `${name}.c`), exe = join(dir, name + (process.platform === 'win32' ? '.exe' : ''));
   writeFileSync(c, generateC(parse(source)).c);
   const backend = join(dir, 'backend.c');
   if (native) writeFileSync(backend, `
@@ -42,7 +43,7 @@ const char* sk_file_dialog_path(int i) {return paths[i];}
 const char* sk_file_dialog_error(void) {return "injected native failure";}
 void sk_file_dialog_release(void) {ready=0;active=0;}
 `);
-  const args = [c, '-O2', '-lm', '-lz', ...(process.platform === 'darwin' ? ['-liconv', '-framework', 'CoreFoundation'] : []), ...(native ? ['-DASC_USE_FILE_DIALOG=1', backend] : []), '-o', exe];
+  const args = [...PROBE_ZLIB_FLAGS, ...PROBE_ZLIB_LINK_FLAGS, ...PROBE_SYSTEM_LINK_FLAGS, c, '-O2', ...(process.platform === 'darwin' ? ['-liconv', '-framework', 'CoreFoundation'] : []), ...(native ? ['-DASC_USE_FILE_DIALOG=1', backend] : []), '-o', exe];
   const build = spawnSync('cc', args, { encoding: 'utf8', timeout: 60000 });
   assert.equal(build.status, 0, build.stderr);
   assert(!/warning:/.test(build.stderr), build.stderr);

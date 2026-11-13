@@ -7,13 +7,17 @@
 // fields) and the argument-quoting layer that looked like a fix but was a divergence
 // from AIR. Those are source-level facts, so they are pinned here -- per AGENTS.md
 // §2.7, examples only ever contain programs that must succeed.
-import { readFileSync, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup, root } from '../harness.ts';
+import { registerGroup, root, readNorm } from '../harness.ts';
 
-const read = (rel: string): string => readFileSync(join(root, rel), 'utf8');
+// CRLF-normalised: several pins below are multi-line regexes (a `#elif ...` line
+// followed by its `#define` line), and a Windows checkout of this very file has
+// CRLF -- reading it raw made 6 of the 13 seam checks red on Windows and green on
+// macOS, i.e. the pin was measuring the checkout instead of the seam.
+const read = (rel: string): string => readNorm(join(root, rel));
 
 function checkNativeProcess(): string[] {
   const bad: string[] = [];

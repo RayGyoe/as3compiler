@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { root } from '../harness.ts';
+import { root, PROBE_ZLIB_FLAGS, PROBE_ZLIB_LINK_FLAGS, PROBE_SYSTEM_LINK_FLAGS } from '../harness.ts';
 
 const dir=join(root,'temp','native-drag-tests');mkdirSync(dir,{recursive:true});
 function run(source:string) {
@@ -28,8 +28,9 @@ int sk_drag_begin(int w,uint64_t serial,const sk_drag_data* d,int a,const unsign
  return d && d->text && !strcmp(d->text,"outgoing");
 }
 int main(void) {`);
-  const file=join(dir,'state.c'),exe=join(dir,'state');writeFileSync(file,c);
-  const build=spawnSync('cc',[file,'-DASC_USE_NATIVE_DRAG=1','-O2','-lm','-lz',...(process.platform==='darwin'?['-liconv','-framework','CoreFoundation']:[]),'-o',exe],{encoding:'utf8',timeout:60000});
+  const file=join(dir,'state.c'),exe=join(dir,'state'+(process.platform==='win32'?'.exe':''));  // Windows appends .exe; spawning the bare name is ENOENT (status null).
+  writeFileSync(file,c);
+  const build=spawnSync('cc',[...PROBE_ZLIB_FLAGS,...PROBE_ZLIB_LINK_FLAGS, ...PROBE_SYSTEM_LINK_FLAGS,file,'-DASC_USE_NATIVE_DRAG=1','-O2',...(process.platform==='darwin'?['-liconv','-framework','CoreFoundation']:[]),'-o',exe],{encoding:'utf8',timeout:60000});
   assert.equal(build.status,0,build.stderr);assert(!/warning:/.test(build.stderr),build.stderr);
   const out=spawnSync(exe,[],{encoding:'utf8',timeout:30000});assert.equal(out.status,0,out.stdout+out.stderr);return out;
 }
