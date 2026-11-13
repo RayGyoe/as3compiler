@@ -7,6 +7,9 @@
 // alone with:
 //   node --test --test-name-pattern='video/' test/unit/*.ts
 
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { registerGroup, root, readNorm } from '../harness.ts';
@@ -291,6 +294,113 @@ function checkVideoSurface(): string[] {
   // Audio-only streams have no video context at all: the gate must not stop them.
   check('the "decoder not open" gate only applies to streams with video',
     glue.includes('if (v->vs >= 0 && !v->vc_open) return;'));
+
+  // ---- HDR -> SDR tone mapping (video.md §16.10) ----
+  // The colour numbers are the whole point of vendor/video_hdr.c, and a source-level
+  // pin cannot check a curve. So this group COMPILES the real file with a tiny driver
+  // and asserts the shape end to end -- exactly the kind of check that would have caught
+  // the first version's BT.2408 white point (203 nits), which made a dark HDR scene land
+  // at a mean of 8.8 against the pass-through path's 16.8.
+  check('the mapping is opt-in and never touches an SDR stream',
+    glue.includes('static int as_video_hdr_wanted(void)') &&
+    /const char\* e = getenv\("AS_VIDEO_HDR"\);\n    if \(e == NULL\) cached = 0;/.test(glue) &&
+    glue.includes('if (trc == AVCOL_TRC_SMPTE2084) return 1;') &&
+    glue.includes('if (trc == AVCOL_TRC_ARIB_STD_B67) return 2;'));
+  check('the verdict comes from the transfer function, not the bit depth',
+    glue.includes('v->v_trc = st->codecpar->color_trc;') &&
+    !glue.includes('src_10bit && as_video_hdr'));
+  check('zero copy is off while tone mapping is on (Skia cannot map, so RGB is required)',
+    /as_video_zc_wanted\(\) &&\n          v->hdr == NULL/.test(glue));
+  check('tone mapping keeps the CPU decode (GPU would add the readback on top)',
+    glue.includes('if (as_video_hdr_wanted() && as_video_hdr_kind(v->v_trc) != 0) { v->decided = 1; return; }'));
+  check('the mapping input is 16-bit RGB, so a 10-bit source keeps its bits',
+    glue.includes('AV_PIX_FMT_RGB48LE') && glue.includes('sws_setColorspaceDetails') &&
+    glue.includes('SWS_CS_BT2020'));
+  check('AS_VIDEO_STATS reports the HDR route and its two costs',
+    glue.includes('hdr=%s') && glue.includes('sws=%.2fms map=%.2fms'));
+  const manifestWithHdr = readNorm(join(root, 'examples', 'video', 'video.build.json'));
+  check('the video manifest compiles the tone-mapping file',
+    manifestWithHdr.includes('video_hdr.c'));
+
+  // Numeric: compile the real implementation and check the curve by running it.
+  const cc = (() => {
+    for (const c of ['clang', 'cc', 'gcc']) {
+      try { execFileSync(c, ['--version'], { stdio: 'ignore' }); return c; } catch { /* next */ }
+    }
+    return null;
+  })();
+  if (cc === null) {
+    console.log('SKIP  [video] no C compiler for the tone-mapping probe');
+  } else {
+    const dir = mkdtempSync(join(tmpdir(), 'as-hdr-'));
+    const drv = join(dir, 'drv.c');
+    const exe = join(dir, process.platform === 'win32' ? 'drv.exe' : 'drv');
+    writeFileSync(drv, `
+#include <stdio.h>
+#include <math.h>
+#include "${join(root, 'vendor', 'video_hdr.h').replace(/\\/g, '/')}"
+static double pq_code(double nits) {
+  const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;
+  const double c1 = 3424.0 / 4096.0, c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
+  double p = pow(nits / 10000.0, m1);
+  return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+int main(void) {
+  as_hdr* h = as_hdr_create(1, 1);
+  if (!h) { printf("create=0\\n"); return 1; }
+  const double nits[] = {0, 1, 4, 18, 50, 100, 203, 1000, 4000};
+  printf("create=1\\n");
+  for (int i = 0; i < 9; ++i)
+    printf("m %g %d\\n", nits[i], as_hdr_map8(h, (int)(pq_code(nits[i]) * 65535.0 + 0.5)));
+  int mono = 1, prev = -1;
+  for (int c = 0; c <= 65535; c += 97) { int v = as_hdr_map8(h, c); if (v < prev) mono = 0; prev = v; }
+  printf("mono=%d\\n", mono);
+  as_hdr_set_gain(h, 2.0f);
+  printf("gain18=%d\\n", as_hdr_map8(h, (int)(pq_code(18) * 65535.0 + 0.5)));
+  as_hdr_set_gain(h, 0.0f);
+  printf("gain_bad_still=%d\\n", as_hdr_map8(h, (int)(pq_code(18) * 65535.0 + 0.5)));
+  as_hdr_destroy(h);
+  as_hdr* g = as_hdr_create(2, 1);
+  printf("hlg0=%d hlgmid=%d\\n", as_hdr_map8(g, 0), as_hdr_map8(g, 49152));
+  as_hdr_destroy(g);
+  return 0;
+}
+`);
+    let out = '';
+    try {
+      execFileSync(cc, ['-O1', '-o', exe, drv, join(root, 'vendor', 'video_hdr.c')], { stdio: 'pipe' });
+      out = execFileSync(exe, [], { encoding: 'utf8', timeout: 60000 });
+    } catch (e) {
+      out = '';
+      const se = (e as { stderr?: string }).stderr ?? '';
+      console.log(`      tone-mapping probe failed: ${String(se || (e as Error).message).slice(0, 400)}`);
+    }
+    // The driver prints key=value for scalars and `m <nits> <code>` for the curve.
+    const num = (name: string): number => {
+      const m = new RegExp(`^${name}=(\\S+)$`, 'm').exec(out);
+      return m ? Number(m[1]) : NaN;
+    };
+    const at = (nits: string): number => {
+      const m = new RegExp(`^m ${nits} (\\d+)$`, 'm').exec(out);
+      return m ? Number(m[1]) : NaN;
+    };
+    check('the tone-mapping probe builds and runs', out.includes('create=1'));
+    check('PQ black maps to 0 and the curve is monotonic',
+      at('0') === 0 && num('mono') === 1);
+    check('reference white (100 nits) is near the top of the range',
+      at('100') >= 200 && at('100') <= 245);
+    check('1000 nits is brighter than 100 nits and still below clip',
+      at('1000') >= at('100') && at('1000') <= 255);
+    // Shadows stay visible: the first version mapped 18 nits to 84 (with BT.2408's 203
+    // nit white) and a real scene lost its shadow detail to clipping at the bottom.
+    check('shadows are not crushed (18 nits lands in the visible middle)',
+      at('18') >= 100 && at('18') <= 165);
+    check('gain scales the picture, and a bad gain is rejected rather than blacking out',
+      num('gain18') > at('18') && num('gain_bad_still') === num('gain18'));
+    check('HLG shares the same output range',
+      num('hlg0') === 0 || out.includes('hlg0=0'));
+    rmSync(dir, { recursive: true, force: true });
+  }
 
   console.log(`[video] ${ok} check(s) passed`);
   return bad;

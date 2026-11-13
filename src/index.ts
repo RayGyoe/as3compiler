@@ -1199,6 +1199,12 @@ async function main(): Promise<void> {
         );
       }
       if (!manifestNamesVideo) cfg.sources.push(resolve(vendorDir, 'video_glue.c'));
+      // The HDR tone-mapping tables are part of the same seam: video_glue.c calls into
+      // video_hdr.c unconditionally (whether to map is a runtime switch), so a build
+      // that links one must link the other. Injected separately because a manifest may
+      // name video_glue.c itself (then the line above is skipped) and still forget this.
+      if (!cfg.sources.some((p) => basename(p) === 'video_hdr.c'))
+        cfg.sources.push(resolve(vendorDir, 'video_hdr.c'));
       if (!cfg.includePaths.some((p) => resolve(p) === incDir)) cfg.includePaths.push(incDir);
       if (!cfg.linkPaths.some((p) => resolve(p) === libDir)) cfg.linkPaths.push(libDir);
       for (const l of ffLibs) if (!cfg.linkLibs.includes(l)) cfg.linkLibs.push(l);

@@ -21334,6 +21334,39 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
 
+### 阶段四百零三：HDR10+/HLG 在 SDR 屏幕上——能做，但默认关（v0.4.377 → v0.4.378）
+
+用那支 4K HDR10+ 素材试播，画面「发灰、暗部糊成一片、高光全白」。这不是新 bug：AIR 根本没有
+HDR 上屏面，`Video` 拿到的 YUV 交给 Skia，`SkYUVColorSpace` 只描述矩阵与范围、**不携带 transfer
+function**，于是 PQ 码值被当 sRGB 直画。按 AGENTS.md §1.5，这是一层**增强**：`AS_VIDEO_HDR=1`
+打开、**默认关**（默认仍与 AIR 逐像素同构）。
+
+**落点**：新文件 `vendor/video_hdr.c` / `vendor/video_hdr.h`（纯 C、只依赖 libm），由
+`vendor/video_glue.c` 在帧出口调用；`examples/video/video.build.json` 增加该源文件；判定读
+`AVFrame.color_trc`/`codecpar.color_trc`（**不看位深**，10-bit SDR 不能被误压暗），在 `open()`
+就用容器参数做完，表与 60 MB 缓冲也在 `open()` 建好（放到首帧会是一次 ~100 ms 的帧间隔）。
+
+**四个反例决定的形状**：
+
+1. 中间格式必须是 **16-bit RGB**（`AV_PIX_FMT_RGB48LE`）：PQ 码值在暗部挤在 0.3–0.5，先降到
+   8 bit 再线性化会出台阶。
+2. 参考白从 BT.2408 的 **203 nits 改成 100 nits**：203 是「HDR 与 SDR 图形同屏」的口径，套整部
+   电影明显偏暗——同一帧实测均值 `8.83/3.49/2.20`，而直通路径是 `16.83/12.15/8.31`。改成 100
+   后再加一道中间调 lift（gamma 0.8，折进输出表，每像素零成本）。
+3. 映射必须多线程：单线程 4K 是 **19.5 ms**（41 ms 预算的一半），按行切 8 块后 **4.2 ms**。
+4. 与零拷贝**互斥且优先**：Skia 的 YUVA 纹理没地方解 transfer function，HDR 生效时既不试
+   `sk_video_d3d_image()` 也不升级硬解（否则等于在回读之上再加一次映射）。
+
+**实测（同素材 20 s，3832×1592，23.976 fps）**：直通 `6.6 ms/帧` / 59 fps；`AS_VIDEO_HDR=1`
+`sws=12.23 + map=4.16 + upload=3.07 ≈ 19.5 ms/帧` / 57 fps；零拷贝（HDR 关时）`0.3 ms/帧`。
+画面上色前后（6000 点采样）：meanR/G/B `16.83/12.15/8.31 → 22.39/11.00/7.34`，p99 `65 → 93`，
+max `108 → 175`——高光拉开、暗部压深，正是 HDR 素材在 SDR 上该有的对比度。
+
+`test/unit/video.ts` 新增**会真编译** `vendor/video_hdr.c` 的可执行断言（PQ 黑→0、单调、
+100 nits 落 200–245、1000 nits ≤255、18 nits 落 100–165、gain 生效且非法 gain 被拒），
+视频组从 47 条涨到 71 条。文档：`docs/zh-cn/video.md` §16.10 / `docs/en/video.md` §16.10。
+未做（已在文档写明）：HDR10+ 动态元数据、Dolby Vision、局部 tone mapping、HLG 完整 OOTF。
+
 ### 阶段四百零二：视频解码默认自适应——软解起步，首个帧边界按零拷贝探针翻牌（v0.4.376 → v0.4.377）
 
 零拷贝做完后，默认仍是软解：不是偏好，而是**两个答案出现在不同时刻**——硬解开不开在 `open`，零拷贝

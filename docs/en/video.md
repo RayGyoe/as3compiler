@@ -8,7 +8,7 @@
 > no demuxer, no video decoder, and no video clock.
 >
 > **Status: V1 is implemented and verified (2026-11-13, see §16); V3 hardware decode and its zero-copy path are
-> wired up and measured (2026-11-14, see §16.8/§16.9); V2 and the transport surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
+> wired up and measured (2026-11-14, see §16.8/§16.9); HDR10+/HLG tone mapping exists but is off by default (§16.10); V2 and the transport surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
 > point is what motivated every trade-off below; §16 is the authoritative description of the code as it stands:
 > `NetStream` / `Video` / `NetConnection` follow AIR semantics, decode goes through FFmpeg (software), and the
 > 31 assertions in `examples/video/` all pass in a real window.
@@ -1205,6 +1205,97 @@ Three routes with one binary ("default" = no `AS_VIDEO_*` set):
 
 With no window there is no D3D11 device at all: `grctx == NULL` leaves the decision undecided (not
 "software"), so a headless program pays nothing and a windowed app that paints later still gets the GPU.
+
+### 16.10 HDR10+ / HLG on an SDR screen: supported, and off by default (measured 2026-11-14)
+
+Same 4K HDR10+ sample (`color_trc=smpte2084`, `colorspace=bt2020nc`, P010). The problem
+is concrete: **AIR has no HDR presentation surface**. `Video` receives YUV, and Skia's
+YUV shader only applies the matrix and range -- **it carries no transfer function** -- so
+the PQ code values are painted as if they were sRGB: shadows flatten, highlights pile up
+against 255, and the picture looks both grey and muddy. This is not something we added;
+it is what "match AIR" necessarily produces.
+
+So this layer follows AGENTS.md §1.5 and is an **enhancement**: `AS_VIDEO_HDR=1` turns it
+on, and the default is **off** (the default still paints exactly what AIR paints, not one
+pixel moved). While it is off, `vendor/video_hdr.c` never enters the hot path and SDR
+streams behave exactly as described in §16.7/§16.9.
+
+**Pipeline** (`vendor/video_hdr.c` + `vendor/video_hdr.h`, plain C, `libm` only, called
+from `video_glue.c`):
+
+```text
+P010/NV12 --sws--> RGB48LE (16-bit per channel) --per-channel linearise--> linear
+          --[BT.2020 -> BT.709, linear light]--> display-referred
+          --[shoulder + gamma 0.8]--> 8-bit BGRA --sk_image_from_argb--> Skia
+```
+
+Four decisions, each with a measured counter-example:
+
+1. **The verdict reads the transfer function, never the bit depth** (`AVFrame.color_trc`
+   / `codecpar.color_trc`). 10-bit SDR is common (ProRes 422 HQ among others), and
+   deciding by bit depth would darken it for nothing.
+2. **The intermediate format is 16-bit RGB (`AV_PIX_FMT_RGB48LE`), not 8-bit**: PQ code
+   values crowd into 0.3-0.5 in the shadows, and quantising to 8 bits before linearising
+   produces banding. The cost is 6 bytes per pixel through sws and memory (see below).
+3. **Reference white is 100 nits (video diffuse white), not BT.2408's 203 nits (graphics
+   white)**. 203 is the right number when HDR and SDR graphics share one screen; applied
+   to a whole film it is visibly dark -- on the same frame (t≈10 s) the 203 white point
+   gave means of `8.83/3.49/2.20` against the pass-through path's `16.83/12.15/8.31`,
+   i.e. the shadow detail was gone. At 100 nits, plus a **mid-tone lift (gamma 0.8, folded
+   into the output table, zero per-pixel cost)**, the numbers become the table below.
+4. **It is mutually exclusive with zero copy, and takes precedence over it**: Skia's YUVA
+   textures have nowhere to decode a transfer function, so while HDR is on the path does
+   **not** try `sk_video_d3d_image()` and does not upgrade to hardware decode (that would
+   stack a mapping on top of a readback). The verdict is made in `open()` from the
+   container parameters so no frame ever takes the wrong route; the tables and the two
+   buffers are also built there (doing it on the first frame showed up as a ~100 ms frame
+   interval).
+
+Same binary, same sample (20 s, 3832x1592, 23.976 fps):
+
+| Route | Per-frame CPU cost | App frames | Worst frame interval |
+|---|---|---|---|
+| pass-through (default, AIR-shaped: PQ as sRGB) | `conv=5.91` + `upload=0.67` ≈ **6.6 ms** | 1195 / 20.2 s ≈ 59 fps | 44 ms |
+| `AS_VIDEO_HDR=1` (software decode + mapping) | `sws=12.23` + `map=4.16` + `upload=3.07` ≈ **19.5 ms** | 1156 / 20.2 s ≈ 57 fps | 94 ms |
+| zero copy (§16.9, only reachable with HDR off) | `copy≈0.26` ≈ **0.3 ms** | 1180 / 20.1 s ≈ 59 fps | 20 ms |
+
+The mapping started at **19.5 ms single-threaded** (4K, 6.1 M pixels, three table lookups
+plus a 3x3 matrix per pixel) -- half of a 41 ms frame budget. `video_hdr.c` now splits it
+by row across up to 8 threads (blocks share nothing; below 64 rows per thread it stays
+serial), measured down to **4.2 ms**. The sws half (12.2 ms) was left alone: it is
+FFmpeg's own SIMD conversion, 1:1, doing only YUV -> RGB48.
+
+**Picture statistics before and after** (`temp/probe-hdr.as`, 6000 samples at the same
+point in the file, BT.709 luma):
+
+| | meanR/G/B | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| pass-through (default) | 16.83 / 12.15 / 8.31 | 7 | 34 | 65 | 108 |
+| `AS_VIDEO_HDR=1` | 22.39 / 11.00 / 7.34 | 2 | 39 | 93 | 175 |
+
+The direction is "highlights opened up, shadows pushed down", which is the contrast an
+HDR master is supposed to have on an SDR display: max goes from 108 to 175 and p99 from
+65 to 93 while the overall mean stays in the same range. **The costs, stated plainly**:
+this is a per-channel curve with no content adaptation, so very saturated highlights shift
+hue slightly (it is not a whole-gamut clip); HLG uses a simplified OOTF (the cross-channel
+luminance term is ignored, and there is no HLG sample on this machine to calibrate
+against). HDR10+ **dynamic** metadata, Dolby Vision and local (spatially varying) tone
+mapping are not implemented.
+
+The curve itself has an executable assertion: `test/unit/video.ts` **compiles the real
+`vendor/video_hdr.c` with the machine's C compiler** and runs a driver, pinning "PQ black
+maps to 0", "monotonic", "100 nits lands in 200-245", "1000 nits is no brighter than 255
+and no darker than 100 nits", "18 nits lands in 100-165 (shadows are not crushed)",
+"gain applies and an invalid gain is rejected" -- a source-level grep cannot pin a curve.
+
+Reproduce:
+
+```bash
+AS_VIDEO_HDR=1 AS_VIDEO_STATS=1 ./temp/probe-4k.exe      # per-frame cost + hdr=pq
+AS_VIDEO_HDR_GAIN=1.3 ./temp/probe-4k.exe                # brighter, if a title needs it
+node --test --test-name-pattern='video' test/unit/*.ts   # the curve assertions
+```
+
 
 ---
 

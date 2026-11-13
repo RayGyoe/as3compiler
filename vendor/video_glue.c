@@ -48,6 +48,7 @@
 #endif
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
+#include "video_hdr.h"   // HDR -> SDR tone mapping (video.md §16.10)
 
 #include <math.h>
 #include <stdint.h>   // intptr_t: a hw frame carries its slice index in data[1]
@@ -208,6 +209,15 @@ typedef struct {
   void* hw_dev11;           // identity of the D3D11 device behind hw_device (see below)
   struct SwsContext* sws;   // -> packed I420 (only when the source is not 420p)
   struct SwsContext* sws_bgra;  // -> packed BGRA (only on a build with no GPU ctx)
+  // HDR -> SDR tone mapping (video.md §16.10). `hdr` is non-NULL only when the stream
+  // really carries PQ/HLG and the switch is on; when it is, the frame takes the CPU
+  // route (sws -> RGB48 -> tone map -> BGRA) no matter what the GPU can do, because
+  // Skia's YUV shader has no place to insert a transfer-function decode.
+  struct SwsContext* sws_rgb48;
+  unsigned char* rgb48;
+  as_hdr* hdr;
+  int v_trc;                // codecpar color_trc, the HDR verdict before any frame
+  int hdr_pq;               // 1 = PQ, 2 = HLG (for diagnostics)
   struct SwrContext* swr;
   unsigned char* i420;      // converted planes buffer (w*h*3/2), NULL when direct
   unsigned char* bgra;
@@ -269,6 +279,8 @@ typedef struct {
   double t_conv_ms;         // sws_scale to packed I420 (or BGRA on a CPU build)
   double t_upload_ms;       // sk_image_from_* (CPU planes -> GPU textures)
   double t_hw_ms;           // av_hwframe_transfer_data (GPU -> system memory)
+  double t_hdr_ms;          // HDR: sws -> RGB48 (tone mapping input)
+  double t_map_ms;          // HDR: the mapping itself
   char url[512];
   char err[256];
 } as_video;
@@ -362,6 +374,61 @@ static int as_video_zc_wanted(void) {
   return cached;
 }
 
+// HDR -> SDR tone mapping switch (video.md §16.10). OFF by default: AIR has no HDR
+// surface and paints PQ code values as-is, so mapping them here is an ENHANCEMENT
+// (AGENTS.md §1.5) and must be opt-in. SDR sources are never touched either way -- the
+// mapping only engages when the stream's transfer function is PQ or HLG, so there is
+// no case where turning the switch on changes a non-HDR file.
+static int as_video_hdr_wanted(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = getenv("AS_VIDEO_HDR");
+    if (e == NULL) cached = 0;
+    else if (e[0] == '0' || e[0] == 'o' || e[0] == 'O' || e[0] == 'f') cached = 0;
+    else if (e[0] == 'n' || e[0] == 'N') cached = 0;   // "none"/"no"
+    else cached = 1;                                   // 1|on|auto|tonemap|sdr
+  }
+  return cached;
+}
+
+// 1 = PQ (SMPTE ST 2084, what HDR10/HDR10+ carries), 2 = HLG (BT.2100), 0 = SDR.
+// Read from the transfer characteristic, never guessed from the bit depth: 10-bit
+// SDR exists (ProRes 422 HQ among others) and mapping it would darken it for nothing.
+static int as_video_hdr_kind(int trc) {
+  if (trc == AVCOL_TRC_SMPTE2084) return 1;
+  if (trc == AVCOL_TRC_ARIB_STD_B67) return 2;
+  return 0;
+}
+
+// Build the mapping tables on first use. BT.2020 primaries are assumed when the frame
+// does not say, because every HDR10/HLG delivery is BT.2020; an explicit BT.709 signal
+// is honoured, which keeps the gamut matrix out of the path when it would be wrong.
+// Split out of as_video_hdr_ctx so open() can build the same context from the container
+// before the first frame arrives (see the call site for why that timing matters).
+static as_hdr* as_video_hdr_make(as_video* v, int kind, int is_2020) {
+  if (v->hdr != NULL) return v->hdr;
+  if (kind == 0) return NULL;
+  v->hdr = as_hdr_create(kind, is_2020);
+  if (v->hdr == NULL) return NULL;
+  v->hdr_pq = kind;
+  const char* g = getenv("AS_VIDEO_HDR_GAIN");
+  if (g != NULL) as_hdr_set_gain(v->hdr, (float)atof(g));
+  if (getenv("AS_VIDEO_DEBUG") != NULL)
+    fprintf(stderr, "[video] hdr: %s -> sRGB, primaries=%s, gain=%s\n",
+            kind == 1 ? "PQ" : "HLG", is_2020 ? "BT.2020->BT.709" : "native",
+            g != NULL ? g : "1");
+  return v->hdr;
+}
+
+static as_hdr* as_video_hdr_ctx(as_video* v, const AVFrame* f) {
+  if (v->hdr != NULL) return v->hdr;
+  const int kind = as_video_hdr_kind(f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : v->v_trc);
+  const int is_2020 = (f->colorspace == AVCOL_SPC_BT2020_NCL ||
+                       f->colorspace == AVCOL_SPC_BT2020_CL ||
+                       f->colorspace == AVCOL_SPC_UNSPECIFIED);
+  return as_video_hdr_make(v, kind, is_2020);
+}
+
 // Returns 1 when a new image was produced. `grctx` is the backend's
 // GrRecordingContext (NULL on a pure-CPU raster build). `pre_img` is a frame that some
 // other route already produced as a GPU texture (the zero-copy seam): when it is set,
@@ -372,14 +439,51 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
   if (w <= 0 || h <= 0) return 0;
   const int direct = (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P);
   const int cv = as_video_sk_cs(f);
+  const double t_conv0 = as_video_ms();
   void* img = pre_img;
+  // HDR first, and it overrides every GPU route: Skia's YUV shader converts YCbCr to
+  // RGB but has nowhere to decode PQ/HLG or map BT.2020 into BT.709, so a tone-mapped
+  // frame has to be RGB before it reaches Skia. sws gives us 16-bit RGB (the 10 bits of
+  // a P010 source survive), the mapping produces BGRA, and that uploads like any raster
+  // image. `pre_img` cannot coexist with this: the zero-copy attempt is gated off
+  // entirely while v->hdr is set (see as_video_drain_video).
+  if (img == NULL && as_video_hdr_wanted() && as_video_hdr_kind(
+          f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : v->v_trc) != 0 &&
+      as_video_hdr_ctx(v, f) != NULL) {
+    if (v->rgb48 == NULL) v->rgb48 = (unsigned char*)malloc((size_t)w * (size_t)h * 6);
+    if (v->bgra == NULL) v->bgra = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
+    if (v->rgb48 == NULL || v->bgra == NULL) return 0;
+    if (v->sws_rgb48 == NULL) {
+      v->sws_rgb48 = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h,
+                                    AV_PIX_FMT_RGB48LE, SWS_BILINEAR, NULL, NULL, NULL);
+      if (v->sws_rgb48 == NULL) return 0;
+      // The YUV matrix and range are the FRAME's (BT.2020 NCL limited for HDR10), and
+      // the destination is full-range RGB so the 16-bit code is a plain 0..1 PQ code.
+      // swscale does not touch the transfer function -- that is this file's job.
+      const int* coeffs = sws_getCoefficients(
+          (f->colorspace == AVCOL_SPC_BT2020_NCL || f->colorspace == AVCOL_SPC_BT2020_CL)
+              ? SWS_CS_BT2020 : SWS_CS_ITU709);
+      const int src_full = (f->color_range == AVCOL_RANGE_JPEG);
+      sws_setColorspaceDetails(v->sws_rgb48, coeffs, src_full, coeffs, 1, 0, 1 << 16, 1 << 16);
+    }
+    unsigned char* rdst[4] = {v->rgb48, NULL, NULL, NULL};
+    int rstride[4] = {w * 6, 0, 0, 0};
+    sws_scale(v->sws_rgb48, (const uint8_t* const*)f->data, f->linesize, 0, h, rdst, rstride);
+    const double t_map0 = as_video_ms();
+    v->t_hdr_ms += t_map0 - t_conv0;
+    if (!as_hdr_tonemap_rgb48(v->hdr, v->rgb48, w * 6, v->bgra, w * 4, w, h)) return 0;
+    v->t_map_ms += as_video_ms() - t_map0;
+    v->t_conv_ms += as_video_ms() - t_conv0;
+    const double t_up0 = as_video_ms();
+    img = sk_image_from_argb(v->bgra, w, h);
+    v->t_upload_ms += as_video_ms() - t_up0;
+  }
   // Two routes, decided by whether a GPU context exists -- never both. The I420 pass
   // exists only to feed sk_image_from_yuv_strided, so on a CPU-raster build (grctx
   // NULL) running it first converted every 4K frame TWICE: once to I420 and then to
   // BGRA, 6 ms + 12 ms per frame on a 3832x1592 10-bit source. Measured as the whole
   // reason a 4K file played at ~20 fps in a window with no GPU backend.
   const int want_gpu = (grctx != NULL) && (img == NULL);
-  const double t_conv0 = as_video_ms();
   if (want_gpu) {
     // Try the GPU entry first even with a NULL context: sk_image_from_yuv_strided
     // returns NULL then, and the fallback below decides.
@@ -706,6 +810,9 @@ static void as_video_maybe_upgrade(as_video* v, void* grctx) {
   if (v->vc == NULL || v->vdec == NULL || v->vs < 0) return;
   const int mode = as_video_decode_mode();
   if (mode == 0) { v->decided = 1; return; }
+  // HDR tone mapping keeps the CPU decode: the mapping has to happen on CPU anyway
+  // (§16.10 -- Skia cannot do it), so the GPU route would add the readback on top.
+  if (as_video_hdr_wanted() && as_video_hdr_kind(v->v_trc) != 0) { v->decided = 1; return; }
   // Without a renderer there is no question to answer yet: stay undecided, so a
   // windowed app that paints its first frame later can still take the GPU. A headless
   // program simply never upgrades (and never pays for a device).
@@ -753,7 +860,7 @@ static void as_video_free_state(as_video* v) {
     fprintf(stderr,
             "[video] %s video_frames=%lld audio_frames=%lld w=%d h=%d pts=%.3f "
             "threads=%d decode=%s zc=%lld starved=%lld cost/frame: dec=%.2fms conv=%.2fms "
-            "upload=%.2fms hw=%.2fms copy=%.2fms\n",
+            "upload=%.2fms hw=%.2fms copy=%.2fms hdr=%s",
             v->url[0] ? v->url : "?", v->n_vframes, v->n_aframes, v->w, v->h, v->frame_pts,
             v->vc != NULL ? v->vc->thread_count : 0,
             v->zc_used ? "d3d11va-zero-copy" : (v->hw_used ? "d3d11va-readback" : "soft"),
@@ -762,7 +869,13 @@ static void as_video_free_state(as_video* v) {
             v->n_vframes > 0 ? v->t_conv_ms / (double)v->n_vframes : 0.0,
             v->n_vframes > 0 ? v->t_upload_ms / (double)v->n_vframes : 0.0,
             v->n_vframes > 0 ? v->t_hw_ms / (double)v->n_vframes : 0.0,
-            v->n_vframes > 0 ? v->t_zc_ms / (double)v->n_vframes : 0.0);
+            v->n_vframes > 0 ? v->t_zc_ms / (double)v->n_vframes : 0.0,
+            v->hdr_pq == 1 ? "pq" : (v->hdr_pq == 2 ? "hlg" : "none"));
+    if (v->hdr_pq != 0) {
+      fprintf(stderr, "       hdr cost/frame: sws=%.2fms map=%.2fms\n",
+              v->n_vframes > 0 ? v->t_hdr_ms / (double)v->n_vframes : 0.0,
+              v->n_vframes > 0 ? v->t_map_ms / (double)v->n_vframes : 0.0);
+    }
   }
   as_video_drop_image(v);
   while (v->qn > 0) { v->qn--; sk_image_delete((void*)v->qimg[v->qn]); }
@@ -774,6 +887,9 @@ static void as_video_free_state(as_video* v) {
   if (v->swr != NULL) swr_free(&v->swr);
   if (v->sws != NULL) { sws_freeContext(v->sws); v->sws = NULL; }
   if (v->sws_bgra != NULL) { sws_freeContext(v->sws_bgra); v->sws_bgra = NULL; }
+  if (v->sws_rgb48 != NULL) { sws_freeContext(v->sws_rgb48); v->sws_rgb48 = NULL; }
+  if (v->hdr != NULL) { as_hdr_destroy(v->hdr); v->hdr = NULL; }
+  if (v->rgb48 != NULL) { free(v->rgb48); v->rgb48 = NULL; }
   if (v->frame != NULL) av_frame_free(&v->frame);
   if (v->aframe != NULL) av_frame_free(&v->aframe);
   if (v->sw_frame != NULL) av_frame_free(&v->sw_frame);
@@ -819,7 +935,8 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
                 v->url, AS_VIDEO_ZC, grctx, v->frame->data[0], as_video_zc_wanted(),
                 v->frame->width, v->frame->height, as_video_ten_bit(v->frame));
       }
-      if (grctx != NULL && v->frame->data[0] != NULL && as_video_zc_wanted()) {
+      if (grctx != NULL && v->frame->data[0] != NULL && as_video_zc_wanted() &&
+          v->hdr == NULL) {
         const double t_z0 = as_video_ms();
         zc_img = sk_video_d3d_image(grctx, (void*)v->frame->data[0],
                                     (int)(intptr_t)v->frame->data[1],
@@ -1054,6 +1171,25 @@ int as_video_open(const char* url, const char* backend, const char* formats, cha
       v->has_video = 1;
     }
     v->src_10bit = as_pix_fmt_10bit(st->codecpar->format);
+    // The transfer function is known from the container, so the HDR verdict is made
+    // here rather than at the first frame: a lazy decision would let the first frame go
+    // through the un-mapped path (wrong colour, one frame) and, worse, through
+    // zero-copy, whose textures cannot be re-mapped afterwards.
+    v->v_trc = st->codecpar->color_trc;
+    // Prepare the tone-mapping context and its buffers HERE, not on the first frame:
+    // the linearisation tables are 65k pow() calls and the two buffers are 60 MB for a
+    // 4K frame, which measured as a ~100 ms frame interval immediately after play().
+    // Everything it needs (transfer function, primaries, geometry) is already in the
+    // container parameters.
+    if (v->w > 0 && v->h > 0 && as_video_hdr_wanted() && as_video_hdr_kind(v->v_trc) != 0) {
+      const int is_2020 = (st->codecpar->color_space == AVCOL_SPC_BT2020_NCL ||
+                           st->codecpar->color_space == AVCOL_SPC_BT2020_CL ||
+                           st->codecpar->color_space == AVCOL_SPC_UNSPECIFIED);
+      if (as_video_hdr_make(v, as_video_hdr_kind(v->v_trc), is_2020) != NULL) {
+        if (v->rgb48 == NULL) v->rgb48 = (unsigned char*)malloc((size_t)v->w * (size_t)v->h * 6);
+        if (v->bgra == NULL) v->bgra = (unsigned char*)malloc((size_t)v->w * (size_t)v->h * 4);
+      }
+    }
     if (!as_video_open_vdec(v, as_video_decode_mode() == 1)) {
       if (errbuf != NULL) snprintf(errbuf, (size_t)errlen, "%s", v->err);
       as_video_free_state(v);

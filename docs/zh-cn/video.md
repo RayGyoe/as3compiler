@@ -6,7 +6,7 @@
 > （`src/emit.ts:16607`），`Video.attachNetStream()` 是空函数（`src/emit.ts:16630`）。全仓没有解复用器、
 > 没有视频解码器、没有视频时钟。
 >
-> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16）；V3 硬解 + 零拷贝已接通（2026-11-14，见 §16.8/§16.9）；V2 与传输面未排期。**
+> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16）；V3 硬解 + 零拷贝已接通（2026-11-14，见 §16.8/§16.9）；HDR10+/HLG 的 SDR 上色已实现但默认关（见 §16.10）；V2 与传输面未排期。**
 > §1 是**实现前**的快照（2026-11-12），保留它是因为「起点是什么」决定了后面每条取舍；
 > 现在的代码状态以 §16 为准：`NetStream` / `Video` / `NetConnection` 已按 AIR 语义实现，
 > 解码走 FFmpeg 软解，`examples/video/` 的 31 条断言在真窗口里全绿。
@@ -753,7 +753,7 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
 | V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16；4K 素材的代价拆分见 §16.7） |
 | V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
-| V3 | **Windows D3D11VA 后端 + 零拷贝上屏 + 自适应默认**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— 解码、零拷贝与自适应默认均已完成（§16.8、§16.9）；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
+| V3 | **Windows D3D11VA 后端 + 零拷贝上屏 + 自适应默认**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— 解码、零拷贝与自适应默认均已完成（§16.8、§16.9）；另加一份 opt-in 的 HDR→SDR 上色（§16.10）；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
 | V5 | **publish 输出面（写）**：`NetStream.publish()` + `appendBytes()`（AIR 原生 API，可绕过采集设备直接堆已编码数据）+ `flv` 封装 + 硬编 H.264/AAC + `rtmp`/`rtmps` 推流；构建侧已在 V0 付完（§6.1） | 用 `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` 当收流端做可重复验收；`appendBytes` 路径不依赖任何采集设备；缺硬编的机器必顶报明确错误（不静默） |
 | V6（增强，opt-in） | `all` 档（VVC、`libdav1d`、DASH 需 `libxml2`）、多音轨/字幕轨选择、`StageVideo` | 明确标注为增强，默认不启用 |
@@ -774,7 +774,7 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 | DASH | demuxer 依赖 libxml2（实测 configure 跳过）；HLS 已够用，需要 DASH 就进 `all` 档并引入 libxml2 |
 | 图像序列当视频播 | AIR 用 `Loader`/`BitmapData` 处理静帧，走视频路径是错误模型 |
 | DRM（`DRMContentData`） | AIR 自身在多数平台已不可用 |
-| **HDR（PQ / HLG）** | 本文的上屏路径只做「YUV → sRGB」，不上色彩管理：`SkYUVColorSpace` 只描述矩阵与范围，**不携带 transfer function**，所以 HLG/PQ 会被当 SDR 画得发灰。真要支持得自己接 `AVFrame` 的 `color_trc` + tone mapping，是独立的一层（见 §10.3） |
+| **HDR（PQ / HLG）** | 原先不做：`SkYUVColorSpace` 只描述矩阵与范围、**不携带 transfer function**，所以 HLG/PQ 会被当 SDR 画得发灰。现已实现为一层独立的 **opt-in 增强**（`AS_VIDEO_HDR=1`，`vendor/video_hdr.c`；默认关 = 与 AIR 同构），实测见 §16.10 |
 | WASI 目标的视频 | 无窗口、无音频设备，做出来也无法验证 |
 
 ---
@@ -1214,6 +1214,81 @@ P010 用 sws 降到 8-bit I420，却仍按 10-bit 矩阵（`kBT2020_10bit_Limite
 | `examples/video-headless.as` 默认（无窗口 ⇒ 软解） | — | — | — | 24 断言全绿 |
 
 无窗口时不会去建 D3D11 设备：`grctx == NULL` 就不升级，判定保持未决，无头程序一分钱不花。
+
+### 16.10 HDR10+ / HLG 在 SDR 屏幕上：能做，但默认关（2026-11-14 实测）
+
+素材仍是那支 4K HDR10+ 文件（`color_trc=smpte2084`、`colorspace=bt2020nc`、P010）。
+问题很具体：**AIR 没有 HDR 上屏面**，`Video` 拿到的是 YUV，Skia 的 YUV 着色器只做
+矩阵与范围、**不带 transfer function**，于是 PQ 码值被当成 sRGB 直接画——暗部整体抬平、
+高光全糊在 255 附近，画面又灰又闷。这不是我们引入的行为，是「照 AIR 同构」的必然结果。
+
+所以这一层按 AGENTS.md §1.5 做成 **增强**：`AS_VIDEO_HDR=1` 打开，默认**关**（默认仍然是
+「照 AIR 画」，一个像素都不动）。关闭时 `vendor/video_hdr.c` 根本不进热路径，SDR 流的行为
+与 §16.7/§16.9 完全一致。
+
+**管线**（`vendor/video_hdr.c` + `vendor/video_hdr.h`，纯 C，唯一的外部依赖是 `libm`，
+只被 `video_glue.c` 调用）：
+
+```text
+P010/NV12 --sws--> RGB48LE (16-bit/通道) --逐通道线性化--> 线性
+          --[BT.2020 -> BT.709, 线性光]--> display-referred
+          --[shoulder + gamma 0.8]--> 8-bit BGRA --sk_image_from_argb--> Skia
+```
+
+四个实现决策，每个都有实测反例：
+
+1. **判定只看 transfer function，不看位深**（`AVFrame.color_trc` / `codecpar.color_trc`）。
+   10-bit SDR（ProRes 422 HQ 等）不少，按位深判定会把它们无故压暗。
+2. **中间格式是 16-bit RGB（`AV_PIX_FMT_RGB48LE`），不是 8-bit**：PQ 的码值在暗部集中在
+   0.3–0.5，先降到 8 bit 再线性化会出台阶。代价是 6 字节/像素的 sws 与内存带宽（见下）。
+3. **参考白用 100 nits（video diffuse white），不是 BT.2408 的 203 nits（graphics white）**。
+   203 是「HDR 与 SDR 图形同屏」的口径，套在整部电影上会明显偏暗——同一帧（t≈10 s）实测：
+   203 白点下均值 `8.83/3.49/2.20`，直通路径是 `16.83/12.15/8.31`，暗部细节直接消失。
+   改成 100 后再加一道**中间调 lift（gamma 0.8，折进输出表，每像素零额外成本）**，得到下文表格。
+4. **与零拷贝互斥，且优先于它**：Skia 的 YUVA 纹理没有地方做 transfer function 解码，
+   所以 HDR 生效时**不尝试** `sk_video_d3d_image()`，也不升级硬解（否则等于在回读之上再加
+   一次映射）。判定在 `open()` 就用容器参数做完，避免首帧走错路径；表与两块缓冲也在
+   `open()` 建好（放到首帧会是一次 ~100 ms 的帧间隔）。
+
+同一支 exe、同一素材（20 s，3832×1592，23.976 fps）：
+
+| 路线 | 每帧 CPU 成本 | 应用帧 | 最差帧间隔 |
+|---|---|---|---|
+| 直通（默认，照 AIR：PQ 当 sRGB） | `conv=5.91` + `upload=0.67` ≈ **6.6 ms** | 1195 / 20.2 s ≈ 59 fps | 44 ms |
+| `AS_VIDEO_HDR=1`（软解 + 上色） | `sws=12.23` + `map=4.16` + `upload=3.07` ≈ **19.5 ms** | 1156 / 20.2 s ≈ 57 fps | 94 ms |
+| 零拷贝（§16.9，HDR 关时才走） | `copy≈0.26` ≈ **0.3 ms** | 1180 / 20.1 s ≈ 59 fps | 20 ms |
+
+映射本身一开始是**单线程 19.5 ms**（4K 6.1 M 像素、逐像素 3 次查表 + 3×3 矩阵），在一帧
+41 ms 的预算里吃掉一半；`video_hdr.c` 现在按行切成最多 8 块并发（块间无共享，`rows/8 < 64`
+时自动退回单线程），实测降到 **4.2 ms**。sws 那一半（12.2 ms）没有再拆：它是 FFmpeg 自己的
+SIMD 转换，同尺寸 1:1，只做 YUV→RGB48。
+
+**上色前后的画面统计**（`temp/probe-hdr.as`，同一时间点各采样 6000 点，BT.709 luma）：
+
+| | meanR/G/B | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|
+| 直通（默认） | 16.83 / 12.15 / 8.31 | 7 | 34 | 65 | 108 |
+| `AS_VIDEO_HDR=1` | 22.39 / 11.00 / 7.34 | 2 | 39 | 93 | 175 |
+
+方向是「高光拉开、暗部压深」，这正是 HDR 素材在 SDR 上应有的对比度：max 从 108 抬到 175、
+p99 从 65 到 93，整体均值仍在同一量级。**代价说清楚**：这是一条逐通道曲线、不做内容自适应，
+所以很饱和的高光会轻微偏色（不是整体色域裁剪）；HLG 用简化 OOTF（忽略跨通道亮度项，
+手上没有 HLG 素材可标定）。HDR10+ 的**动态**元数据、Dolby Vision、局部（空间可变）
+tone mapping 都没做。
+
+曲线本身有可执行断言：`test/unit/video.ts` 会**用本机 C 编译器编译真正的
+`vendor/video_hdr.c`** 并跑一段驱动，钉住「PQ 黑→0」「单调不减」「100 nits 落在 200–245」
+「1000 nits 不高于 255 且不暗于 100 nits」「18 nits 落在 100–165（暗部不被压没）」
+「gain 生效、非法 gain 被拒」——纯源码 grep 钉不住一条曲线。
+
+复现：
+
+```bash
+AS_VIDEO_HDR=1 AS_VIDEO_STATS=1 ./temp/probe-4k.exe      # 每帧成本 + hdr=pq
+AS_VIDEO_HDR_GAIN=1.3 ./temp/probe-4k.exe                # 觉得偏暗就抬增益
+node --test --test-name-pattern='video' test/unit/*.ts   # 曲线断言
+```
+
 
 
 ---
