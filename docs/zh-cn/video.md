@@ -536,7 +536,7 @@ LGPL（不是 GPL），但会拖进 mpegvideo 编码框架，体积未测，所�
 | `broad` + publish 但去掉 hwaccel | **8.26 MB** | 8 个硬件后端合计 **19 KB** |
 | 软解 H.264 1080p | **4.3 ms/帧**（300 帧 1.30 s user） | 系统 ffmpeg 7.1.1（homebrew），同片源 |
 | 硬解 H.264 1080p（VT） | **1.0 ms/帧**（300 帧 0.30 s user） | 同一二进制的 A/B，3.4× CPU 降幅；**不看 wall clock**（`-f null` 每帧 `hwdownload`） |
-| 解码帧 → 纹理 | YUV 直通 **0.16 ms/帧 @720p** | 见 `yuv-direct-render.md` §8.4；hwaccel 路换成纹理桥，量级相近 |
+| 解码帧 → 纹理 | 软解（CPU 平面，§10.1 ②）YUV 直通 **0.16 ms/帧 @720p**；硬解（§10.1 ③）无上传，只余一次包裹开销 | 见 `yuv-direct-render.md` §8.4。硬解这一档的数字 **V2 才实测**——不能拿 0.16 ms 当硬解值 |
 | 首帧延迟 | 目标 **< 100 ms**（本地文件） | VT/D3D11 设备创建有首帧开销，**未测** |
 
 口径说明（重要，避免把数字用错）：
@@ -597,13 +597,13 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 
 | 端 | 解复用 | 解码 | 编码（publish） | 输出 | 备注 |
 |---|---|---|---|---|---|
-| macOS arm64 | FFmpeg | **VideoToolbox（默认）**：h264、hevc、mpeg1/2/4、h263、prores、vp9；其余软解回退 | `h264_videotoolbox` + `aac`（系统硬编） | `CVPixelBuffer` → `CVMetalTextureCache` → `GrBackendTexture` | arm64 软解走 NEON，无需额外汇编依赖 |
-| Windows x64 | FFmpeg | **D3D11VA（默认）**：h264、hevc、mpeg2、vc1、vp9、av1、wmv3；其余软解回退（DXVA2 留老系统） | `h264_mf` + `aac`（MediaFoundation，**未实机验证**） | `ID3D11Texture2D` → `GrBackendTexture` | 软解 SIMD 需 nasm/yasm（见 `checks.ts`） |
-| Linux | FFmpeg | 软解；VAAPI 可选（h264/hevc/vp9/av1，**未验证**） | `h264_vaapi`（**需 GPU**；无软编兜底 → 缺 render node 时 `publish()` 报错） | `AV_PIX_FMT_YUV420P` → Skia YUV 直通 | 有 ELF 目标即能编 |
+| macOS arm64 | FFmpeg | **VideoToolbox（默认）**：h264、hevc、mpeg1/2/4、h263、prores、vp9；其余软解回退 | `h264_videotoolbox` + `aac`（系统硬编） | `CVPixelBuffer`（NV12）→ `CVMetalTextureCache` 按 plane 给两张 `MTLTexture` → `GrBackendTexture[2]` → **`SkImages::TextureFromYUVATextures`**（零拷贝，§10.2） | arm64 软解走 NEON，无需额外汇编依赖 |
+| Windows x64 | FFmpeg | **D3D11VA（默认）**：h264、hevc、mpeg2、vc1、vp9、av1、wmv3；其余软解回退（DXVA2 留老系统） | `h264_mf` + `aac`（MediaFoundation，**未实机验证**） | `ID3D11Texture2D`（`DXGI_FORMAT_NV12`，Y/UV 是**同一资源的两个 plane slice**）→ 拆成 R8/RG8 两张 → `GrBackendTexture[2]` → **`TextureFromYUVATextures`**（§10.3 的平面切片差异） | 软解 SIMD 需 nasm/yasm（见 `checks.ts`） |
+| Linux | FFmpeg | 软解；VAAPI 可选（h264/hevc/vp9/av1，**未验证**） | `h264_vaapi`（**需 GPU**；无软编兜底 → 缺 render node 时 `publish()` 报错） | 软解：`AV_PIX_FMT_YUV420P` → **`TextureFromYUVAPixmaps`**（每帧上传，§10.1 ②）；VAAPI：`AV_PIX_FMT_VAAPI` → `EGLImage` → 纹理（与 Android 同形，未验证） | 有 ELF 目标即能编 |
 | Web（`--target wasm --package web`） | 浏览器 | **浏览器原生**（`<video>` / WebCodecs） | 浏览器（`MediaRecorder` / WebCodecs）；需 `NetStream.appendBytes` 才能自己产码流 | canvas → WebGL/WebGPU | **不把 FFmpeg 编进 wasm** |
 | WASI（`--target wasm`） | 无 | 无 | 无 | — | **响亮报错**「本后端不支持视频」，不静默降级 |
-| **iOS（预留，未支持 target）** | FFmpeg | **VideoToolbox**（与 macOS 同源，同一套 `videotoolbox` hwaccel） | `h264_videotoolbox` + `aac` | `CVPixelBuffer` → `CVMetalTextureCache` → `GrBackendTexture` | **与 macOS 共用一份 glue**，差别只在设备/权限。AOT 上 iOS 本来禁不了（不能下发可执行码），这条路径只在「编译期已固定」的形态下成立 |
-| **Android（预留，未支持 target）** | FFmpeg | **MediaCodec**（FFmpeg 侧只有编解码器包装，**没有统一的 hwaccel 框架**）；其余软解回退 | `h264_mediacodec`（未验证） | `AHardwareBuffer` → `EGLImage` → `GrBackendTexture` | 需 NDK 编译；**这一端是唯一需要单独写硬件桥的**，不能假定与桌面同形 |
+| **iOS（预留，未支持 target）** | FFmpeg | **VideoToolbox**（与 macOS 同源，同一套 `videotoolbox` hwaccel） | `h264_videotoolbox` + `aac` | 同 macOS：`CVPixelBuffer` → 两张 `MTLTexture` → `TextureFromYUVATextures`（§10.2） | **与 macOS 共用一份 glue**，差别只在设备/权限。AOT 上 iOS 本来禁不了（不能下发可执行码），这条路径只在「编译期已固定」的形态下成立 |
+| **Android（预留，未支持 target）** | FFmpeg | **MediaCodec**（FFmpeg 侧只有编解码器包装，**没有统一的 hwaccel 框架**）；其余软解回退 | `h264_mediacodec`（未验证） | `AHardwareBuffer` → `EGLImage` → GL/`GrBackendTexture` → `TextureFromYUVATextures` | 需 NDK 编译；**这一端是唯一需要单独写硬件桥的**，不能假定与桌面同形 |
 
 > **移动端是「未来要算进去的第六/七端」**（用户 2026-11-12 裁定）：现在**不实现**，但**接口面别写死**。
 > 具体代价：iOS 几乎白送（VT 与 macOS 同一套后端，只多一层权限/生命周期），Android 最难（MediaCodec
@@ -635,11 +635,86 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 
 | 已有资产 | 视频播放怎么用 |
 |---|---|
-| **YUV 直通**（`yuv-direct-render.md`，四端 Skia 都有 `TextureFromYUVAPixmaps`） | 软解路：FFmpeg 输出 `YUV420P` **直接喂纹理**，省掉一次 YUV→RGBA 的 CPU 转换（720p 约 1 ms/帧）。hwaccel 路：帧已在 GPU 侧，这步退化为纹理桥（`CVPixelBuffer`/`ID3D11Texture2D` → `GrBackendTexture`），连上传也省了 |
+| **YUV 直通**（`yuv-direct-render.md`，四端 Skia 都有 `TextureFromYUVAPixmaps`） | **软解路**：FFmpeg 输出 `YUV420P` 走 `SkImages::TextureFromYUVAPixmaps`——省掉 CPU 色彩转换（720p 0.16 ms/帧），但仍**每帧上传三张平面、每帧新建纹理对象**（§10.1 ②）。**硬解路不能复用它**：帧已在 GPU 侧，必须换 `SkImages::TextureFromYUVATextures`（§10.2），换成 Pixmaps 就是白拷一次全帧。两档的差别不是格式，是**帧当前在哪块内存** |
 | `BitmapData` 像素契约（内部 `0xAARRGGBB`） | 需要像素级访问时走「解码 → YUV → 按需物化」，不默认物化 |
 | `vendor/audio_glue.c`（miniaudio） | **音频侧已能解 MP3/FLAC/WAV/Vorbis**；AAC 由 FFmpeg 解成 PCM 后直接喂 miniaudio 的 f32 混音管线，不需要另写音频设备层 |
 | ANE 视频帧链（`getVideoBitmapData`） | 文件播放与 RTC 帧共用同一个「上传纹理」出口，只有上游不同 |
 | 异步 job 表（`as_job_*`，阶段八十九·四十五） | 解复用/解码应挂在同一套后台任务上，不阻塞帧边界；解码器上下文是**长生命周期对象**，不能每帧重建 |
+
+### 10.1 帧的三档形态与三个 Skia 入口
+
+「解码之后怎么上屏」不是一种做法，而是**三个不同入口**，选错不会报错，只会白拷一帧：
+
+| 档 | 帧在哪 | Skia 入口 | 代价 | 现状 |
+|---|---|---|---|---|
+| ① **CPU ARGB** | `BitmapData.pixels`（`setPixels` 写入） | `SkImages::RasterFromPixmapCopy`（`vendor/skia_glue.cc:1413`） | **CPU 堆分配 + 整帧拷贝**成 raster SkImage，绘制时再上传 | 已实现；**不是视频路径**，是像素物化出口 |
+| ② **CPU YUV 平面** | `setYuv420` 的 I420 缓冲 | `SkImages::TextureFromYUVAPixmaps`（`vendor/skia_glue.cc:1424`，`SkImageGanesh.h:233`） | 省掉 CPU 色彩转换，但 Skia **每帧上传 Y/U/V 三张纹理并新建纹理对象**（无「更新已有 YUV 纹理」的公开 API） | 已实现（E20，`--features yuv420`） |
+| ③ **GPU YUV 平面** | hwaccel 的 `CVPixelBuffer` / `ID3D11Texture2D` / `AV_PIX_FMT_VAAPI` | `SkImages::TextureFromYUVATextures`（`SkImageGanesh.h:256`） | **零拷贝**：纹理已是 GPU 资源，Skia 只包一层 + shader 采样；配合 `releaseProc` 还能复用同一块纹理 | 未实现（V2） |
+
+**硬规则：视频帧永远不经过 ①。** `BitmapData`/`pixels` 是 AS3 的像素契约，只有 `getPixels`/`draw`/逐像素读才物化。
+播放路径一旦落到 ①，一帧要走「解码 → CPU 转 ARGB → 写 `pixels` → CPU 拷贝成 raster → 再上传」四次搬运。
+现有 `setYuv420`（②）已经砍掉前两次，硬解（③）再砍掉后两次。
+
+**判据是「帧现在在哪块内存」，不是「什么像素格式」。** 同样是 NV12/I420：在 CPU 侧走 ②，在 GPU 侧走 ③。
+两个入口都在 `SkImageGanesh.h` 里相隔二十余行，混用只表现为「硬解开了但 CPU 还是高」——最容易被当成「硬解没生效」。
+
+`GrYUVABackendTextures` 的形状（`include/gpu/GrYUVABackendTextures.h:91`）是 `SkYUVAInfo` + `GrBackendTexture[3]`，
+而 `PlaneConfig::kY_UV` + `Subsampling::k420` 正是 NV12（`include/core/SkYUVAInfo.h:52`）——videotoolbox 与 d3d11va 的原生输出。
+符号可用性已核实：`libskia.a`（macos-arm64 / wasm）里 `TextureFromYUVATextures` 的两个重载都在。
+
+### 10.2 硬解零拷贝：调用链、生命周期与帧池
+
+macOS / iOS（一份 glue 两端共用）：
+
+```
+AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
+  → CVMetalTextureCacheCreateTextureFromImage(plane 0)  → MTLTexture (R8Unorm)
+  → CVMetalTextureCacheCreateTextureFromImage(plane 1)  → MTLTexture (RG8Unorm)
+  → GrBackendTexture(w, h, mipmapped, GrMtlTextureInfo{tex})        // include/gpu/GrBackendSurface.h:181
+  → GrYUVABackendTextures(SkYUVAInfo{w, h, kY_UV, k420, cs}, tex[2], origin)
+  → SkImages::TextureFromYUVATextures(ctx, yuva, imageColorSpace, releaseProc, releaseCtx)
+  → SkImage  → Canvas.drawImageRect
+```
+
+**生命周期闭环（最容易出花屏的一处）**：`TextureFromYUVATextures` **不复制纹理**，SkImage 存活期间那两张
+`MTLTexture` 必须有效，而其底层是 `CVPixelBuffer` 与 `CVMetalTexture` 包装。三者都要活到 `releaseProc`，
+在其中按创建顺序逆序释放；对应地，`av_frame_unref` / `av_frame_free` **只在 `releaseProc` 之后**才允许。
+常见错法是解完帧立刻 `av_frame_unref`，GPU 还在读 → 花屏或黑帧，且不报错。
+
+**帧池**：VT 的解码 surface 是池化的（通常 4–8 张），SkImage 持有纹理就等于占住一张。所以 `Video`
+的契约必须是「**每帧画完就放 SkImage**」：
+
+- 不要为了「复用」把上一帧 SkImage 留在字段里当当前帧再画一次——那会同时占两张，池子小的时候直接卡住；
+- `pause()` 要留静止帧，此时 SkImage 仍绑着 CVPixelBuffer ⇒ 池少一张。要么接受少一张，要么把最后一帧
+  **拷进一张自有纹理**（一次 GPU blit）再让 VT 回收；后者更稳，`pause()` 长驻时应该走它；
+- `avcodec_receive_frame` 返回 `EAGAIN` 时不能假设「等一会就有」——池耗尽的表现就是阻塞或丢帧，
+  需要「显示端已释放」的回执才能继续喂。
+
+### 10.3 色彩空间与平台差异
+
+**色彩空间必须跟着码流走，不能硬编码。** 现有 `setYuv420` 固定 `kRec601_Limited` 是 ANE 帧的口径，
+文件播放的来源是 `AVFrame.colorspace` / `AVFrame.color_range`，映射到 Skia 枚举（`include/core/SkImageInfo.h:68`）：
+
+| `AVFrame` | `SkYUVColorSpace` |
+|---|---|
+| `AVCOL_SPC_SMPTE170M` / `BT470BG` + `AVCOL_RANGE_MPEG` | `kRec601_Limited` |
+| `AVCOL_SPC_BT709` + `AVCOL_RANGE_MPEG` | `kRec709_Limited` |
+| `AVCOL_SPC_BT2020_NCL` + `AVCOL_RANGE_MPEG` | `kBT2020_8bit_Limited`（10-bit 源走 `kBT2020_10bit_*`） |
+| 任意矩阵 + `AVCOL_RANGE_JPEG` | 对应的 `*_Full` |
+
+这条路不上色彩管理：HDR（PQ/HLG）当前**明确不支持**（§13），BD 素材会把 HLG 当 SDR 画得发灰。
+
+**平台差异（§9 表格里三端写成同形是不成立的）**：
+
+| 平台 | 硬解输出 | 到 `GrBackendTexture` 的差异 |
+|---|---|---|
+| macOS / iOS | `CVPixelBuffer`（`420YpCbCr8BiPlanarVideoRange` = NV12） | `CVMetalTextureCache` **按 plane 各给一张纹理**，直接可用，最省 |
+| Windows | `ID3D11Texture2D`（`DXGI_FORMAT_NV12`） | Y/UV 是**同一资源的两个 plane slice**；`GrBackendTexture` 接的是整张 2D 纹理，**不接 plane slice**。要么用 D3D11.1 的 `Texture2DArray` + plane slice 建两个 SRV，要么先在 GPU 内拆成 R8/RG8（**仍在 GPU 侧，禁止回 CPU**） |
+| Linux VAAPI | `AV_PIX_FMT_VAAPI`（DRM_PRIME） | `EGLImage` → GL 纹理，与 Android 同形；`av_hwframe_map(AV_HWFRAME_MAP_READ)` 失败才是软解回退的信号 |
+| Android（预留） | `AHardwareBuffer` | `EGLImage` → GL 纹理；MediaCodec 是逐帧 surface，生命周期归 codec，不归 SkImage |
+
+这就是 §9 末尾「`backend` 参数必须够抽象」的具体含义：**`frame_to_image` 必须是后端私有实现**，
+不能有一个公共的「两个指针 + 一个 stride」签名——那只能表达 ②（CPU 平面），表达不了 ③ 的三种形状。
 
 ---
 
@@ -648,6 +723,7 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 | 层 | 落点 | 禁止 |
 |---|---|---|
 | C 胶水 | `vendor/video_glue.c`（新）：`as_video_open/read_frame/decode/close`，封装 `AVFormatContext`/`AVCodecContext`，带 `backend`（`auto`/`soft`）与 `formats`（`air`/`broad`/`all`）两个参数；`auto` 内部自己做探测 + 回退 | 在里面做 AS3 语义（`NetStream` 状态机归 codegen）；在胶水里写平台窗口/设备 glue |
+| C 胶水（帧出口） | `as_video_frame_to_image(AVFrame*) -> SkImage*`（同类内）：按帧所在（CPU / GPU）选 §10.1 的 ② 或 ③ 入口；色彩空间从 `AVFrame.colorspace`/`color_range` 读（§10.3）；`releaseProc` 负责帧池回执（§10.2）。`Video` 只吃 `SkImage*` | 把 `AVFrame`/`CVPixelBuffer` 泄进 codegen；在 `emit.ts` 里判断像素格式或平台 |
 | 运行时 | `src/runtime.ts` 的 `as_video_*` 声明 + no-op 桩（无 FFmpeg 的构建要响亮失败，不是静默返回空帧） | 生成 C 里出现 `avformat.h` |
 | AS3 语义 | `src/emit.ts` 的 `NetStream`/`Video` 类：`play/pause/seek/time/client` 回调、`#2126` 等错误号 | 把解码逻辑写进 `emit.ts` |
 | 构建 | `src/build.ts` 清单字段（`link-libs`/`include-paths`/`sources`）+ `checks.ts` 增一行「FFmpeg 头/库存在性」 | 在 CLI 分支另写一套检查 |
@@ -663,7 +739,7 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 |---|---|---|
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
 | V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8） |
-| V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比 |
+| V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
 | V3 | **Windows D3D11VA 后端**（7 个 hwaccel）+ `pause/seek` + 缓冲状态 + `NetStream.Play.*` 事件序列 | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
 | V5 | **publish 输出面（写）**：`NetStream.publish()` + `appendBytes()`（AIR 原生 API，可绕过采集设备直接堆已编码数据）+ `flv` 封装 + 硬编 H.264/AAC + `rtmp`/`rtmps` 推流；构建侧已在 V0 付完（§6.1） | 用 `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` 当收流端做可重复验收；`appendBytes` 路径不依赖任何采集设备；缺硬编的机器必顶报明确错误（不静默） |
@@ -685,6 +761,7 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 | DASH | demuxer 依赖 libxml2（实测 configure 跳过）；HLS 已够用，需要 DASH 就进 `all` 档并引入 libxml2 |
 | 图像序列当视频播 | AIR 用 `Loader`/`BitmapData` 处理静帧，走视频路径是错误模型 |
 | DRM（`DRMContentData`） | AIR 自身在多数平台已不可用 |
+| **HDR（PQ / HLG）** | 本文的上屏路径只做「YUV → sRGB」，不上色彩管理：`SkYUVColorSpace` 只描述矩阵与范围，**不携带 transfer function**，所以 HLG/PQ 会被当 SDR 画得发灰。真要支持得自己接 `AVFrame` 的 `color_trc` + tone mapping，是独立的一层（见 §10.3） |
 | WASI 目标的视频 | 无窗口、无音频设备，做出来也无法验证 |
 
 ---
