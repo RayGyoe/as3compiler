@@ -271,6 +271,16 @@ candidate (`sanitizeCIdent` has already registered the first one), otherwise the
 So `var o:Object` becomes `Object* _o`, a parameter `_this` becomes `__this`, `_once0` becomes `__once0` — while
 the receivers stay literally `o`/`_this` (they are emitted raw and never go through `cIdent`).
 
+**Residual: the escape itself can land on a keyword (measured 2026-11-13).** `w64` → `_w64` → `__w64`, and
+clang's MS-compat mode reads `__w64` as a **keyword** (`error: expected identifier or '('`) while macOS treats
+it as an ordinary identifier — a **Windows-only** compile failure. The hit was the 65th `with` temporary name
+in `examples/with-fn-class-regexp.as` (`as_class* __w64 = &KC_cls;`). Fix: when the candidate lands in
+`C_MS_COMPAT_KEYWORDS` (the `__w64`/`__int8`/`__ptr64`/`__declspec` family, see `symbols.ts`), the escape adds
+a `_` **suffix** instead, i.e. `__w64_`. **Why the generated table cannot cover it**: these spellings are
+**keywords**, not function declarations, so the `-dM -E` / `-ast-dump` sweep never sees them; and `plausible()`
+excludes every `__`-prefixed name anyway (nobody writes `__w64` in AS3). Pinned by two checks in
+`unit: emit/GeneratedNameReservation` (reverting to a plain `_` prefix turns them red) plus
+`examples/with-fn-class-regexp.as`.
 **Red line: only the C spelling changes; the AS3 side must not move at all.** The reflection table
 (`as_prop.name`, the AMF member list, `for-in` keys) stores the **original string**, so `w["o"]`,
 serialization and `describeType` must still see `o` — that is the invariant pinned by

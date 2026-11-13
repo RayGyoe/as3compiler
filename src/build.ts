@@ -178,6 +178,12 @@ export interface BuildConfig {
   // aarch64); it is inert on macOS/wasm. Empty for non-AIR builds (let clang pick
   // its host default).
   architecture: string;
+  // Video backend gate (docs/zh-cn/video.md §5): whether the FFmpeg archives are
+  // part of the link set, which profile they were built as, and which decoder the
+  // runtime asks for. Resolved by `applyVideoGate` in index.ts, never by hand.
+  video: 'auto' | 'on' | 'off';
+  videoFormats: 'air' | 'broad' | 'all';
+  videoBackend: 'auto' | 'soft';
   dry: boolean;
 }
 
@@ -220,6 +226,9 @@ export function defaultBuildConfig(): BuildConfig {
     entitlements: null,
     timestampServer: 'http://timestamp.digicert.com',
     architecture: '',
+    video: 'auto',
+    videoFormats: 'broad',
+    videoBackend: 'auto',
     dry: false,
   };
 }
@@ -257,6 +266,17 @@ interface ManifestFields {
   // library are linked, and a per-target overlay could only desynchronise that
   // from the defines emitted for the shared default.
   'gpu-backend'?: 'auto' | 'd3d12' | 'gl';
+  // ---- video (docs/zh-cn/video.md §5) ----
+  // `video` decides whether the FFmpeg backend is LINKED: "auto" (default) links it
+  // when the program references NetStream/Video, "off" is the escape hatch for
+  // size-critical builds, "on" forces it. `video-formats` names which codec/container
+  // profile the ARCHIVES were built as (`air` | `broad` | `all`) -- a property of what
+  // is on disk, so getting it wrong is a link error, not a silent downgrade.
+  // `video-backend` is the runtime decoder choice; "auto" is the only recommended
+  // value (§5.3), "soft" exists to answer "is this the hardware path?".
+  video?: 'auto' | 'on' | 'off';
+  'video-formats'?: 'air' | 'broad' | 'all';
+  'video-backend'?: 'auto' | 'soft';
   objects?: string[];
   frameworks?: string[];
   exports?: string[];
@@ -329,6 +349,9 @@ const MANIFEST_FIELD_NAMES: Record<keyof ManifestFields | 'targets', true> = {
   'c-flags': true,
   features: true,
   'gpu-backend': true,
+  video: true,
+  'video-formats': true,
+  'video-backend': true,
   objects: true,
   frameworks: true,
   exports: true,
@@ -372,6 +395,7 @@ const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'defines', 'features', 'objects', 'frameworks', 'exports', 'font-urls',
   'preload-paths', 'preload-excludes', 'c-flags',
   'debug-info', 'lto', 'pgo', 'pgo-dir',
+  'video', 'video-formats', 'video-backend',
   'swc-paths',
   'ane-paths', 'ane-platform',
   'bundle-id', 'display-name', 'icon', 'air-icons', 'deployment-target',
@@ -560,6 +584,32 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
       ...cfg.preloadExcludes,
       ...T(m['preload-excludes']).map((p) => resolveFromManifest(manifestPath, p)),
     ];
+  }
+  // ---- video (docs/zh-cn/video.md §5) ----
+  // Validated here rather than accepted loosely: these three strings steer a LINK SET,
+  // so a typo ("video": "autoo") would otherwise fall back to "auto" and quietly link
+  // 8 MB the author did not ask for, or worse, silently NOT link a backend the build
+  // needs (§2.5).
+  if (m.video !== undefined) {
+    const v = m.video === true ? 'on' : m.video === false ? 'off' : m.video;
+    if (v !== 'auto' && v !== 'on' && v !== 'off') {
+      throw new Error(`manifest 'video' must be "auto", "on" or "off" (got ${JSON.stringify(m.video)}) — ${manifestPath}`);
+    }
+    next.video = v;
+  }
+  if (m['video-formats'] !== undefined) {
+    const f = m['video-formats'];
+    if (f !== 'air' && f !== 'broad' && f !== 'all') {
+      throw new Error(`manifest 'video-formats' must be "air", "broad" or "all" (got ${JSON.stringify(f)}) — ${manifestPath}`);
+    }
+    next.videoFormats = f;
+  }
+  if (m['video-backend'] !== undefined) {
+    const b = m['video-backend'];
+    if (b !== 'auto' && b !== 'soft') {
+      throw new Error(`manifest 'video-backend' must be "auto" or "soft" (got ${JSON.stringify(b)}) — ${manifestPath}`);
+    }
+    next.videoBackend = b;
   }
   if (m['bundle-id']) next.bundleId = m['bundle-id'];
   if (m['display-name']) next.displayName = m['display-name'];

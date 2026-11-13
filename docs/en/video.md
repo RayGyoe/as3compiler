@@ -7,7 +7,11 @@
 > (`src/emit.ts:16607`), and `Video.attachNetStream()` is a no-op (`src/emit.ts:16630`). The repository has
 > no demuxer, no video decoder, and no video clock.
 >
-> **Status: design settled (all nine items in §14 were decided on 2026-11-12); implementation not scheduled.**
+> **Status: V1 is implemented and verified (2026-11-13, see §16); hardware decode (V2/V3) and the transport
+> surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
+> point is what motivated every trade-off below; §16 is the authoritative description of the code as it stands:
+> `NetStream` / `Video` / `NetConnection` follow AIR semantics, decode goes through FFmpeg (software), and the
+> 31 assertions in `examples/video/` all pass in a real window.
 > **Final plan**: trimmed FFmpeg (**latest stable tag, currently `n9.0.2`**) as the **single implementation** (§4),
 > with hardware decode as one of its decode backends (macOS `-hwaccel videotoolbox`, Windows `-hwaccel d3d11va`) —
 > not a separate route requiring hand-written platform code. **The decode backend has exactly one setting: `auto`**
@@ -28,7 +32,11 @@
 
 ---
 
-## 1. Current state: `NetStream` is a throwing stub, `Video` is a shell
+## 1. Current state: `NetStream` is a throwing stub, `Video` is a shell (2026-11-12 snapshot)
+
+> **This section is a historical snapshot.** Since 2026-11-13 both statements are obsolete: `NetStream` and
+> `Video` are implemented on top of FFmpeg (§16). The text is kept so the "why link FFmpeg instead of writing
+> a decoder" decision has a starting point to compare against.
 
 Three reproducible facts:
 
@@ -719,7 +727,7 @@ the native manifest carries the FFmpeg `link-libs`, the web manifest does not. T
 | Phase | Content | Acceptance |
 |---|---|---|
 | V0 | **Settle this document + trim measurement**: build each profile, measure linked size, the hwaccel marginal cost, and 1080p throughput for both decode paths | **done 2026-11-12**: numbers in §3/§7; reproducible via `vendor/provision/ffmpeg-static.sh` (tracked) |
-| V1 | **Decode seam + software + the injection gate + three format profiles**: `as_video_*` takes `backend` and `formats`; land `usesVideoCodec` / `video` / `video-formats`; containers `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`, video `h264,hevc,vp9,av1` software, audio `aac,mp3,opus,vorbis,flac`; `onMetaData` + audible audio | `examples/video.as` plays a bundled sample; item-by-item parity with `adl` (`videoWidth/Height`, `time`, `onMetaData`); **format matrix self-test**: at least one clip per container×codec yields both sound and picture; examples that do not touch video keep their size (§5.8) |
+| V1 | **Decode seam + software + the injection gate + three format profiles**: `as_video_*` takes `backend` and `formats`; land `usesVideoCodec` / `video` / `video-formats`; containers `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`, video `h264,hevc,vp9,av1` software, audio `aac,mp3,opus,vorbis,flac`; `onMetaData` + audible audio | `examples/video.as` plays a bundled sample; item-by-item parity with `adl` (`videoWidth/Height`, `time`, `onMetaData`); **format matrix self-test**: at least one clip per container×codec yields both sound and picture; examples that do not touch video keep their size (§5.8)  **Completed 2026-11-13** (implementation status, measured numbers and reproduction: §16) |
 | V2 | **macOS hardware decode + zero-copy presentation**: `videotoolbox` backend covering all 8 hwaccels (h264/hevc/mpeg1/2/4/h263/prores/vp9) + `CVMetalTextureCache` bridge; probe failure falls back silently | A/B on the same source: user CPU, wall clock, bridge cost; forcing VT off must fall back silently rather than produce a black screen; HEVC 1080p run both ways |
 | V3 | **Windows D3D11VA backend** (7 hwaccels) + `pause/seek` + buffering states + the `NetStream.Play.*` event sequence | parity with `adl`; identical behaviour from one `.as` on all three targets (backend differences confined to pixel formats) |
 | V4 | Transport (**read**): `http:` progressive → **HLS** (`hls`+`mpegts`+`crypto`, already in `broad`) → RTMP/RTSP (FFmpeg's native protocols, **no librtmp**) | AIR's `NetStream.Play.*` sequence; HLS live latency/catch-up policy captured as a reproducible test |
@@ -815,7 +823,128 @@ ffmpeg -v verbose -hwaccel videotoolbox -i t.mp4 -f null - 2>&1 | grep -E "Selec
 
 ---
 
-## 16. Reference anchors
+## 16. V1 implementation status and measurements (2026-11-13)
+
+**V1 is in place**: software decode, the injection gate, the `broad` format surface, `onMetaData` and
+audible audio — all measured. This section describes **what the code does now**, not a plan; the
+"throwing stub" in §1 is the 2026-11-12 snapshot, kept so the starting point stays visible.
+
+### 16.1 Where it lives
+
+| Layer | File | Contents |
+|---|---|---|
+| C glue | `vendor/video_glue.c` | `as_video_open/close/tick/state/time/info/frame/seek/pause/resume`; integer handles over a static pool (`AS_VIDEO_MAX` 8 concurrent streams); **knows nothing about the GC or AS3 events**, it is pure FFmpeg |
+| AS3 semantics | `src/emit.ts` | the bodies of `NetConnection`/`NetStream`/`Video`, `netStatus` dispatch, `onMetaData`, `_ns_tpos`/`_ns_vw`/`_ns_vht`, error ids `#2126`/`#2007` |
+| Runtime | `src/runtime.ts` | the `AS_VIDEO_ST_*` bits and the no-FFmpeg stub (`as_video_open` returns `-2` instead of empty frames) |
+| Build | `src/index.ts` + `src/build.ts` | detect whether the program uses `NetStream`/`Video` → decide whether FFmpeg is linked; the `video` / `video-formats` / `video-backend` manifest fields override it |
+| Example | `examples/video/` | `VideoPlayer.as` (windowed, 31 assertions) plus `media/`, seven fixtures of our own (no third-party material) |
+
+**The gate is a build-time decision**, and `NetStream.play()` failure has two entirely different meanings:
+
+- The program uses `NetStream` but this artifact was built without FFmpeg (`video: "off"` or a missed
+  detection): `as_video_open` returns `-2` and `play()` **throws synchronously**
+  `[as3-aot] not implemented by this build: video playback requires an FFmpeg-linked build`.
+  That is a missing capability, not a bad file, so it must be loud.
+- FFmpeg is linked but the file cannot be opened / the container is unsupported: an **asynchronous**
+  `NetStatusEvent` `NetStream.Play.Failed` (`level="error"`, `info.description` carries FFmpeg's reason).
+  This matches `adl`: `play()` returns `void` and never throws on that path.
+
+### 16.2 State machine and frame clock
+
+`NetStream.play()` dispatches `NetStream.Play.Start` + `NetStream.Buffer.Full` synchronously (a local file
+needs no buffering) and **decodes the first frame in `as_video_open`**, so `videoWidth`/`videoHeight` and a
+picture exist immediately after `play()` rather than after a black beat. Everything after that hangs off the
+**frame boundary**: `as_ns_tick()` at the top of `Stage_dispatchFrame()`, the same safe point as timers and
+MovieClips (live NetStreams are GC roots and are advanced one by one there).
+
+`onMetaData` is **asynchronous** (AIR semantics, and what we implement): it reaches the client on the first
+frame boundary after `play()`, not inside the call. The example used to assert it synchronously right after
+`play()` and went red in a real window for that reason — moving the assertions after the first `setTimeout`
+is the honest form (§16.5 records the lesson).
+
+### 16.3 Presentation pacing: a FIFO, not a single slot
+
+Decoding runs at most **80 ms ahead of the clock** (`AS_VIDEO_LEAD_S`), with a budget of 24 packets per frame
+boundary (`AS_VIDEO_TICK_PACKETS`). That alone is not enough; two traps were found by measurement:
+
+1. **The pacing check must come before the read.** Written as "read a packet → decode → break if ahead", every
+   frame boundary still pulled one extra frame. Invisible at 60 fps, but a hand-pumped frame loop (hundreds of
+   ticks per millisecond) consumed a 1.2 s clip in its first dozen ticks.
+2. **Ahead-of-clock frames need more than one slot.** `advance()` keeps demuxing so audio never starves, and
+   **interleaving drags video frames along** (~2 frames per tick on an interleaved clip). A single slot therefore
+   always held the newest frame (~80 ms ahead of the clock) and **never came due**: measured as
+   `NetStream.time` stuck at `0.000` for a whole 0.4 s pump while the slot chased the decoder. An 8-entry FIFO
+   (`AS_VIDEO_QUEUE`) lets the clock pick the frame that belongs there; on overflow the **oldest** frame is
+   dropped (when you are behind real time, the frame the viewer missed is the old one, not the newest).
+
+`as_video_tick` dequeues every frame that has come due and **keeps the last one** — that is what the clock is
+showing.
+
+### 16.4 Container differences (measured)
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| `clip.ts` decoded one frame, `video_frames=1 audio_frames=0`, `time` stuck at 0 | An MPEG-TS `start_time` is a broadcast epoch: `clip.ts` starts at **1.533 s**, so raw pts compared against the 0-based play clock looked "ahead" on the first frame and decoding stopped immediately | Record `v_start` (`st->start_time × time_base`) and subtract it from pts; `NetStream.time` counts from the first frame, not from the timebase epoch |
+| An audio-only stream (`tone.mp3`) segfaulted on its first `play()` | `as_video_drain_video` called `avcodec_receive_frame` with `vc == NULL` | Added a `vc == NULL` guard (an audio stream has no video decoder — the normal path, not an error) |
+| `Play.Stop` never fired (`clip.mp4`) | The end test was "`frame_pts` reaches the container duration", but the last frame sits at 1.133 s in a 1.2 s file — always one frame short | End once the last frame has been on screen for one frame period (`1/fps`, capped at 200 ms) — which is what AIR does (playback ends when the picture has finished) |
+| `endMs=0` in the window (`getTimer()` returned 0 at 1.2 s) | `as_start_ms` was lazily initialised on the **first call**, and this player's first clock read was the end-of-playback stamp, so the difference was always 0 | New `as_clock_init()` at the top of `main()` anchors the epoch at process start; `getTimer()` means "ms since the process started" |
+| `examples/builtin-arity.as` failed to link: `undefined symbol: as_audio_live_open` / `sk_image_delete` | the gate is a **source probe** (deliberately over-inclusive): that example merely names `NetStream`/`Video` as **parameter types**, so it gets the FFmpeg archives while having neither the audio glue nor the Skia glue | `video_glue.c` now carries a compile-time fallback for each (`ASC_HAVE_AUDIO` / `ASC_USE_SKIA`). No audio = the same contract every other `flash.media` build has (the compiler already warned); **no Skia = `as_video_open` refuses** with a real reason (`NetStream.Play.Failed`) instead of decoding into a void and painting black |
+| `--no-video` still printed `+ video: FFmpeg linked` | all four video switches were parsed into `opts.overrides` and then **never copied into `cfg`** (the same dropped-override shape the file already documents for `--ane-platform`) | the CLI override block now copies `video`/`video-formats`/`video-backend`; pinned by `unit: video` |
+| `examples/with-fn-class-regexp.as` did not compile on windows-x64: `error: expected identifier or '('` (its 65th `with` temp, `__w64`) | `cIdent`'s underscore escape can land exactly on an **MS-compat keyword** `__w64` (clang treats it as a keyword; on macOS it is an ordinary identifier — hence a Windows-only red) | a candidate in `C_MS_COMPAT_KEYWORDS` takes a `_` **suffix** instead (`__w64_`); the rule and evidence live in `docs/en/c-naming.md` §7, pinned by `unit: emit/GeneratedNameReservation` |
+
+Audio: decode → `swr` resample to 44.1 kHz mono/stereo → the mixer's live buffer (the same chain `Sound` uses).
+For an **audio-only stream, `NetStream.time` is derived from the samples already written to the mixer** — no
+video frame can fake that number, so "a 1.0 s `tone.mp3` reaches 1.000" is by itself proof that decode +
+resample + mixer write all work.
+
+### 16.5 Measured evidence (Windows x64 / software decode / 2026-11-13)
+
+Headless probe (`temp/video-selftest.as`, pumping `Stage.dispatchFrame()` by hand):
+
+```
+after play: time=0 vw=320 vh=240 codes=NetStream.Play.Start,NetStream.Buffer.Full
+t=0.4s: time=0.400            pixels lit=175 distinct=52
+paused: t0=0.400 t1=0.400
+after resume: time=1.200      codes=...,NetStream.Play.Stop
+flv: time=1.023  video_frames=15 audio_frames=46080 w=320 h=240
+ts : time=1.023  video_frames=15 audio_frames=46080
+mkv: time=1.008  video_frames=15 audio_frames=44084   (VP9 + Opus, 48 kHz to 44.1 kHz)
+mp3: time=1.000  video_frames=0  audio_frames=44100   Play.Stop
+```
+
+Windowed example (`examples/video/VideoPlayer.as`): **all 31 assertions pass**, covering `onMetaData`,
+`pause()` freezing the clock, `Play.Stop`, `time` pinned to the duration, all four containers playing to their
+end state, and the audio-only stream reaching `Play.Stop` with `Video.videoWidth == 0`.
+
+Two diagnostics (troubleshooting only; neither changes control flow):
+
+- `AS_VIDEO_STATS=1` → one `[video] <url> video_frames= audio_frames= w= h= pts=` line per stream on close.
+  The reason is concrete: "did audio actually reach the mixer?" is **not observable from AS3** (AIR has no API
+  for it), so without counters a regression that silently stops writing audio is only catchable by ear.
+- `AS_VIDEO_DEBUG=1` → one `[tick] now= target= cur= qn= q0= eof=` line per frame boundary; both traps in
+  §16.3 were located with it.
+
+Reproduction:
+
+```bash
+# windowed example (run from the repository root; fixture paths are relative to the cwd)
+node src/index.ts examples/video/VideoPlayer.as --manifest examples/video/video.build.json --run
+
+# headless self-test (no window; the frame boundary is pumped by hand)
+node src/index.ts temp/video-selftest.as --manifest examples/video/video.build.json -o temp/video-out/selftest.exe
+AS_VIDEO_STATS=1 ./temp/video-out/selftest.exe
+```
+
+### 16.6 Not done yet (V2 onward)
+
+Hardware decode (`videotoolbox` / `d3d11va`) and the zero-copy texture bridge, buffering states
+(`Buffer.Empty`/`Buffer.Flush`), the transport surface (`http` progressive → HLS → RTMP), and the `publish`
+output side. **Today it is software decode of local files**: `NetStream.play()` accepts `http(s)://` (FFmpeg
+opens it), but there is no HLS live-edge policy or catch-up logic.
+
+---
+
+## 17. Reference anchors
 
 - AS3 reference: [`flash.net.NetStream`](https://airsdk.dev/reference/actionscript/3.0/flash/net/NetStream.html),
   [`flash.media.Video`](https://airsdk.dev/reference/actionscript/3.0/flash/media/Video.html),

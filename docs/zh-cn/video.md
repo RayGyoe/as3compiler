@@ -6,7 +6,10 @@
 > （`src/emit.ts:16607`），`Video.attachNetStream()` 是空函数（`src/emit.ts:16630`）。全仓没有解复用器、
 > 没有视频解码器、没有视频时钟。
 >
-> **本文状态：方案已定稿（§14 全部九项于 2026-11-12 拍板），实现未排期。**
+> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16），V2/V3 硬解与传输面未排期。**
+> §1 是**实现前**的快照（2026-11-12），保留它是因为「起点是什么」决定了后面每条取舍；
+> 现在的代码状态以 §16 为准：`NetStream` / `Video` / `NetConnection` 已按 AIR 语义实现，
+> 解码走 FFmpeg 软解，`examples/video/` 的 31 条断言在真窗口里全绿。
 > **最终方案**：FFmpeg（**最新稳定 tag，现 `n9.0.2`**）裁剪为**唯一实现**（§4），硬件解码是它的一个解码后端
 > （macOS `-hwaccel videotoolbox`、Windows `-hwaccel d3d11va`），不是另一条需要另写平台代码的路线；
 > **解码后端只有一个设置：`auto`**——自己探测硬解、失败自己回退软解，不给人「手选 hw」的档位（§5.3）；
@@ -24,7 +27,11 @@
 
 ---
 
-## 1. 现状：`NetStream` 是抛错桩，`Video` 是空壳
+## 1. 现状：`NetStream` 是抛错桩，`Video` 是空壳（2026-11-12 快照）
+
+> **这一节是历史快照。** 2026-11-13 起这两行描述已经失效：`NetStream` / `Video` 已实现，
+> 解码走 FFmpeg（见 §16）。下面保留原文，是为了让「为什么必须链接 FFmpeg 而不是自研解码器」
+> 这条判断有可对照的起点。
 
 三处事实（可 `grep` 复现）：
 
@@ -738,9 +745,9 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
-| V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8） |
+| V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16） |
 | V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
-| V3 | **Windows D3D11VA 后端**（7 个 hwaccel）+ `pause/seek` + 缓冲状态 + `NetStream.Play.*` 事件序列 | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
+| V3 | **Windows D3D11VA 后端**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— `pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
 | V5 | **publish 输出面（写）**：`NetStream.publish()` + `appendBytes()`（AIR 原生 API，可绕过采集设备直接堆已编码数据）+ `flv` 封装 + 硬编 H.264/AAC + `rtmp`/`rtmps` 推流；构建侧已在 V0 付完（§6.1） | 用 `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` 当收流端做可重复验收；`appendBytes` 路径不依赖任何采集设备；缺硬编的机器必顶报明确错误（不静默） |
 | V6（增强，opt-in） | `all` 档（VVC、`libdav1d`、DASH 需 `libxml2`）、多音轨/字幕轨选择、`StageVideo` | 明确标注为增强，默认不启用 |
@@ -832,7 +839,118 @@ ffmpeg -v verbose -hwaccel videotoolbox -i t.mp4 -f null - 2>&1 | grep -E "Selec
 
 ---
 
-## 16. 参考锚点
+## 16. V1 实现现状与实测（2026-11-13）
+
+**V1 已落地**：软解 + 按需注入门 + `broad` 格式面 + `onMetaData` + 音频出声，全部实测通过。
+本节记录的是**现在代码在做什么**，不是计划——上面 §1 的「抛错桩」是 2026-11-12 的历史快照，
+保留下来是为了说明起点。
+
+### 16.1 落点
+
+| 层 | 文件 | 内容 |
+|---|---|---|
+| C 胶水 | `vendor/video_glue.c` | `as_video_open/close/tick/state/time/info/frame/seek/pause/resume`；整数句柄 + 静态池（`AS_VIDEO_MAX` 8 条并发流）；**不认识 GC、不认识 AS3 事件**，只做 FFmpeg |
+| AS3 语义 | `src/emit.ts` | `NetConnection`/`NetStream`/`Video` 的方法体、`netStatus` 派发、`onMetaData`、`_ns_tpos`/`_ns_vw`/`_ns_vht` 属性、`#2126`/`#2007` 错误号 |
+| 运行时 | `src/runtime.ts` | `AS_VIDEO_ST_*` 状态位与无 FFmpeg 时的桩（`as_video_open` 返回 `-2`，不是返回空帧） |
+| 构建 | `src/index.ts` + `src/build.ts` | 探测「程序里有没有 `NetStream`/`Video`」→ 决定要不要链接 FFmpeg；`video` / `video-formats` / `video-backend` 三个清单字段覆盖它 |
+| 示例 | `examples/video/` | `VideoPlayer.as`（带窗口，31 条断言）+ `media/` 七个自有夹具（非第三方） |
+
+**门是构建期决策**：`NetStream.play()` 的失败分两种，语义完全不同——
+
+- 程序里用到了 `NetStream`，但这份产物没链接 FFmpeg（清单 `video: "off"` 或探测漏了）：
+  `as_video_open` 返回 `-2`，`play()` **同步抛** `[as3-aot] not implemented by this build: video playback requires an FFmpeg-linked build`。
+  这是**能力缺失**，不是文件问题，所以必须响亮。
+- 链接了 FFmpeg，但文件打不开 / 容器不支持：**异步** `NetStatusEvent` `NetStream.Play.Failed`（`level="error"`，
+  `info.description` 带 FFmpeg 的原因）。这与 `adl` 实测一致：`play()` 本身返回 `void`，绝不在这条路上抛。
+
+### 16.2 状态机与帧时钟
+
+`NetStream.play()` 同步派发 `NetStream.Play.Start` + `NetStream.Buffer.Full`（本地文件不需要等缓冲），
+并在 `as_video_open` 里**先解好第一帧**——所以 `play()` 之后立刻就有 `videoWidth/videoHeight` 与画面，
+不是黑等一拍。之后一切都挂在**帧边界**上：`Stage_dispatchFrame()` 开头的 `as_ns_tick()` 与定时器、
+MovieClip 同一个安全点（在飞的 NetStream 是 GC 根，`as_ns_tick` 里逐条推进）。
+
+`onMetaData` 是**异步**的（AIR 口径，也是本实现的行为）：它在 `play()` 之后的第一个帧边界上到达
+客户端，不在 `play()` 调用内。示例里那三条断言曾写在 `play()` 之后同步检查，因此在真窗口里假红——
+把它们挪到第一次 `setTimeout` 之后才是对的（§16.5 记了这次教训）。
+
+### 16.3 上屏节流：一个 FIFO，不是一格抽屉
+
+解码**只跑到时钟前 80 ms**（`AS_VIDEO_LEAD_S`），每帧边界最多 24 个包（`AS_VIDEO_TICK_PACKETS`）。
+但光有「不前跑」不够，还踩了两个坑，都是实测出来的：
+
+1. **节流必须在读包之前判**。写成「读一个包 → 解 → 若已超前就 break」时，每个帧边界仍会多解一帧；
+   60 fps 下无感，但用手推的帧循环（一毫秒几百帧）会把 1.2 s 的片子在前十几拍里解完。
+2. **超前帧不能只留一格**。`advance()` 为了音频不断粮会继续解复用，**音视频交错会把视频帧一起拖走**
+   （一个交错片子每拍会解出约两帧）。单槽永远只装最新的那一帧（≈时钟前 80 ms），于是它**永远不会到期**：
+   实测 `NetStream.time` 在整段 0.4 s 的推进里一直是 `0.000`，而槽里追着解码器跑。
+   改成 8 格 FIFO（`AS_VIDEO_QUEUE`）后，时钟该显示哪帧就取哪帧；队列溢出时**丢最旧的那帧**
+   （落后于实时该丢的是「观众没看到的那一帧」，不是最新一帧）。
+
+`as_video_tick` 每拍把「已到期」的队列帧全部出队、**保留最后一个**——那就是时钟正在显示的画面。
+
+### 16.4 容器差异（实测条目）
+
+| 现象 | 根因 | 处置 |
+|---|---|---|
+| `clip.ts` 只解出 1 帧、`video_frames=1 audio_frames=0`、`time` 恒 0 | MPEG-TS 的 `start_time` 是广播时基：`clip.ts` 从 **1.533 s** 起算，原始 pts 直接和「从 0 起算的播放时钟」比，第一帧就判超前，解码立刻停住 | 记下 `v_start`（`st->start_time × time_base`）并在算 pts 时减掉；`NetStream.time` 从第一帧起算，不是从时基纪元起算 |
+| 纯音频流（`tone.mp3`）第一次 `play()` 直接段错误 | `as_video_drain_video` 拿到 `vc == NULL` 仍去 `avcodec_receive_frame` | 开头加了 `vc == NULL` 守卫（音频流没有视频解码器，这是正常路径，不是错误） |
+| `Play.Stop` 永远不发（`clip.mp4`） | 结束判据写成「`frame_pts` 追平容器时长」，而最后一帧在 1.133 s、文件时长 1.2 s，永远差一个帧间隔 | 改成「最后一帧上屏后再过一个帧周期」（`1/fps`，上限 200 ms）就算结束——这才是 AIR 的行为（画面放完才结束） |
+| 窗口里 `endMs=0`（`getTimer()` 在 1.2 s 时返回 0） | `as_start_ms` 是**首次调用时**懒初始化的，而这个播放器第一次读时钟就是在「播放结束」那一刻，于是差值恒 0 | `main()` 开头新增 `as_clock_init()` 把纪元钉在进程启动；`getTimer()` 的语义本来就是「自进程启动以来的毫秒」 |
+| `examples/builtin-arity.as` 链接失败：`undefined symbol: as_audio_live_open` / `sk_image_delete` | 注入门是**源码探针**（故意过近似）：那个示例只是把 `NetStream`/`Video` 当**形参类型**写着，也照样带上 FFmpeg 归档，而它既没有音频 glue 也没有 Skia glue | `video_glue.c` 给两个依赖各加一组编译期兜底（`ASC_HAVE_AUDIO` / `ASC_USE_SKIA`）。没有音频 = 与其它 `flash.media` 构建同一套契约（编译器已经警告过）；**没有 Skia = `as_video_open` 直接拒绝**并给出真实理由（`NetStream.Play.Failed`），不做「解码进虚空」的静默黑屏 |
+| `--no-video` 仍打印 `+ video: FFmpeg linked` | 四个 video 开关被解析进 `opts.overrides` 后**再没拷进 `cfg`**（与代码里已记录的 `--ane-platform` 同一类漏拷贝） | 在 CLI 覆盖区补上 `video`/`video-formats`/`video-backend` 三条；`unit: video` 钉住 |
+| `examples/with-fn-class-regexp.as` 在 windows-x64 编不过：`error: expected identifier or '('`（第 65 个 `with` 临时名 `__w64`） | `cIdent` 的加下划线逃逸会正好落进 **MS 兼容关键字** `__w64`（clang 认它是关键字；macOS 上只是普通标识符，所以只在 Windows 红） | 落进 `C_MS_COMPAT_KEYWORDS` 时改用后缀 `_`（`__w64_`）；口径与证据写进 `docs/zh-cn/c-naming.md` §7，`unit: emit/GeneratedNameReservation` 钉住 |
+
+音频侧：解码 → `swr` 重采样到 44.1 kHz 单声道/立体声 → 写进混音器的活缓冲（与 `Sound` 同一条链）。
+**纯音频流的 `NetStream.time` 由已写入混音器的采样数决定**——没有视频帧可以「假装」出这个数，
+所以「1.0 s 的 `tone.mp3` 走到 1.000」本身就是解码 + 重采样 + 混音写入整条链的证明。
+
+### 16.5 实测口径（Windows x64 / 软解 / 2026-11-13）
+
+无头探针（`temp/video-selftest.as`，手推 `Stage.dispatchFrame()`）：
+
+```
+after play: time=0 vw=320 vh=240 codes=NetStream.Play.Start,NetStream.Buffer.Full
+t=0.4s: time=0.400            pixels lit=175 distinct=52
+paused: t0=0.400 t1=0.400
+after resume: time=1.200      codes=...,NetStream.Play.Stop
+flv: time=1.023  video_frames=15 audio_frames=46080 w=320 h=240
+ts : time=1.023  video_frames=15 audio_frames=46080
+mkv: time=1.008  video_frames=15 audio_frames=44084   (VP9 + Opus，48 kHz→44.1 kHz)
+mp3: time=1.000  video_frames=0  audio_frames=44100   Play.Stop
+```
+
+真窗口示例（`examples/video/VideoPlayer.as`）：**31 条断言全绿**，含 `onMetaData`、`pause()` 冻钟、
+`Play.Stop`、`time` 收到时长、四条容器各播到终态、纯音频流 `Play.Stop` 且 `Video.videoWidth == 0`。
+
+两个诊断开关（只在排障时开，不影响控制流）：
+
+- `AS_VIDEO_STATS=1` → 每条流关闭时打一行 `[video] <url> video_frames=… audio_frames=… w=… h=… pts=…`。
+  加它的理由很实在：「音频到底有没有写进混音器」在 AS3 里**无法观测**（AIR 也没有 API），
+  没有计数器时，一个悄悄停止写音频的回归只能靠耳朵发现。
+- `AS_VIDEO_DEBUG=1` → 每个帧边界打一行 `[tick] now=… target=… cur=… qn=… q0=… eof=…`，
+  §16.3 那两个坑就是靠它定位的。
+
+复现：
+
+```bash
+# 真窗口示例（从仓库根跑，夹具路径是相对当前目录的）
+node src/index.ts examples/video/VideoPlayer.as --manifest examples/video/video.build.json --run
+
+# 无头自检（不建窗口，手推帧边界）
+node src/index.ts temp/video-selftest.as --manifest examples/video/video.build.json -o temp/video-out/selftest.exe
+AS_VIDEO_STATS=1 ./temp/video-out/selftest.exe
+```
+
+### 16.6 还没做的（V2 起）
+
+硬解（`videotoolbox` / `d3d11va`）与零拷贝纹理桥、缓冲状态（`Buffer.Empty`/`Buffer.Flush`）、
+传输面（`http` 渐进式 → HLS → RTMP）、`publish` 输出面。**当前是纯软解 + 本地文件**：
+`NetStream.play()` 接受 `http(s)://`（FFmpeg 自己打开），但没有 HLS 直播切片策略与追帧逻辑。
+
+---
+
+## 17. 参考锚点
 
 - AS3 语言参考：[`flash.net.NetStream`](https://airsdk.dev/reference/actionscript/3.0/flash/net/NetStream.html)、
   [`flash.media.Video`](https://airsdk.dev/reference/actionscript/3.0/flash/media/Video.html)、

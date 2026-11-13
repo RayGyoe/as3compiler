@@ -7,7 +7,7 @@ import { FILE_DIALOG_RUNTIME } from './file-dialog.ts';
 import { NATIVE_PROCESS_RUNTIME } from './native-process.ts';
 import { NATIVE_DRAG_HEAD, NATIVE_DRAG_BODY } from './native-drag.ts';
 import { FRE_BODY, FRE_HEAD, FRE_STUBS, type AneDescriptor } from './fre.ts';
-import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, setGenPos, codegenBareMessage, checkTypeAnnotation, stmtCompletesNormally } from './symbols.ts';
+import { resolveType, ctypeToString, CodegenError, qualifiedName, sanitizeCIdent, sanitizeFileCIdent, C_FN_MACRO_RESERVED, C_MS_COMPAT_KEYWORDS, setGenPos, codegenBareMessage, checkTypeAnnotation, stmtCompletesNormally } from './symbols.ts';
 import type { CType, MethodInfo, SymbolTable } from './symbols.ts';
 import type { SwcResourceSpec, SwcBake, SwcBakeMorph, SwcBakeMorphGroup } from './swc.ts';
 import type { EmbedResourceSpec } from './embed.ts';
@@ -1545,7 +1545,15 @@ export class Emitter {
     for (;;) {
       const taken = types.has(c) || Emitter.isGeneratedLocalName(c) || (adjusted && this.usedCIdentifiers.has(c));
       if (!taken) break;
+      // Escape with `_` first (the documented `_this` -> `__this` form), but a
+      // `__`-prefixed spelling can BE a keyword: clang's MS-compat mode reserves
+      // `__w64`/`__int8`/`__ptr64`/`__declspec`, so the emitted C did not compile.
+      // Measured: the 65th `with` temp in examples/with-fn-class-regexp.as wanted
+      // `_w64` -> `__w64` -> "expected identifier or '('" on windows-x64, while the
+      // same source compiled on macOS (no MS extensions, plain identifier there).
+      // Such a candidate gains a `_` SUFFIX instead of a third leading underscore.
       c = '_' + c;
+      if (C_MS_COMPAT_KEYWORDS.has(c)) c += '_';
       adjusted = true;
     }
     this.usedCIdentifiers.add(c);
@@ -16558,12 +16566,17 @@ this.line('AS_bake_pend_n = 0;');
     this.line('return dir;');
     this.indent--;
     this.line('}');
-    // ---- flash.net.NetConnection / NetStream + flash.media.Video (stage 110) ----
-    // The transport surface away3d's SimpleVideoPlayer drives. There is no media
-    // transport and no video decoder in this subset: the connection state machine
-    // and the constructor rejections follow AIR exactly (measured with adl 51.4.1,
-    // temp/videoprobe), while the point where a missing decoder becomes observable
-    // (NetStream.play) fails loudly instead of pretending to play.
+    // ---- flash.net.NetConnection / NetStream + flash.media.Video ----
+    // The transport surface away3d's SimpleVideoPlayer drives. Connection state and
+    // the constructor rejections follow AIR exactly (measured with adl 51.4.1,
+    // temp/videoprobe); the decoder behind play() is vendor/video_glue.c (FFmpeg),
+    // linked only when the program plays video (docs/zh-cn/video.md §5). With no
+    // backend linked, play() fails LOUDLY instead of pretending to play (§5.7).
+    //
+    // The registry below is why the state machine is here rather than in the glue:
+    // advancing a stream is an AS3-side decision (which objects exist, when a status
+    // event fires), so one frame hook walks the live streams and the glue stays a
+    // pure C library that knows nothing about events.
     this.line('void NetConnection_ctor(NetConnection* o) {');
     this.indent++;
     this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
@@ -16599,46 +16612,178 @@ this.line('AS_bake_pend_n = 0;');
     this.line('o->client = (Object*)o; gc_write_barrier((void*)o);');
     this.line('o->checkPolicyFile = false;');
     this.line('o->_snd = SoundTransform_new(1.0, 0.0); gc_write_barrier((void*)o->_snd);');
+    this.line('o->_ns_hv = -1; o->_ns_vw = 0; o->_ns_vht = 0;');
+    this.line('o->_ns_dur = 0.0; o->_ns_tpos = 0.0;');
+    this.line('o->_ns_meta = false; o->_ns_failed = false; o->_ns_paused = false; o->_ns_audio = false;');
     // AIR's own rejections, in AIR's order (measured): null connection first.
     this.line('if (connection == NULL) { as_throw(ArgumentError_new((char*)"Error #2007: Parameter connection must be non-null.", 2007)); return; }');
     this.line('if (!connection->_connected) { as_throw(Error_new((char*)"Error #2126: NetConnection object must be connected.", 2126)); return; }');
     this.indent--;
     this.line('}');
     this.line('NetStream* NetStream_new(NetConnection* connection) { NetStream* o = (NetStream*)gc_alloc(GCT_CLASS, sizeof(NetStream)); o->vtable = &NetStream_vt; NetStream_ctor(o, connection); return o; }');
-    this.line('void NetStream_play(void* _this, char* url) { (void)_this; (void)url; as_throw(Error_new((char*)"flash.net.NetStream.play: media transport and FLV decoding are not supported by this subset", 0)); }');
-    this.line('void NetStream_pause(void* _this) { (void)_this; }');
-    this.line('void NetStream_resume(void* _this) { (void)_this; }');
-    this.line('void NetStream_togglePause(void* _this) { (void)_this; }');
+    // ---- live-stream registry (one frame hook advances every playing NetStream) ----
+    // The slots are GC roots: a NetStream held only by this table is still reachable
+    // from user code's point of view (it may be queued for an event), so the marker
+    // must see it. Registering the slot ADDRESS is what gc_root_register wants.
+    this.line(`#define AS_NS_MAX ${8}`);
+    this.line('static NetStream* as_ns_live[AS_NS_MAX];');
+    this.line('static int as_ns_roots_done = 0;');
+    this.line('static void as_ns_unregister(NetStream* o) { for (int i = 0; i < AS_NS_MAX; i++) if (as_ns_live[i] == o) as_ns_live[i] = NULL; }');
+    this.line('static void as_ns_register(NetStream* o) {');
+    this.indent++;
+    this.line('if (!as_ns_roots_done) { as_ns_roots_done = 1; for (int i = 0; i < AS_NS_MAX; i++) gc_root_register((void**)&as_ns_live[i]); }');
+    this.line('for (int i = 0; i < AS_NS_MAX; i++) if (as_ns_live[i] == o) return;');
+    this.line('for (int i = 0; i < AS_NS_MAX; i++) if (as_ns_live[i] == NULL) { as_ns_live[i] = o; return; }');
+    this.indent--;
+    this.line('}');
+    // netStatus: AIR's carrier for Play.Start / Play.Stop / Play.Failed. `info` is a
+    // dynamic Object with code/level (+ description when there is one to give).
+    this.line('static void as_ns_status(NetStream* o, const char* code, const char* level, const char* detail) {');
+    this.indent++;
+    // as_object_new() rather than Object_new(): AS3's `info` is a DYNAMIC object,
+    // and only the internal record has the plain-object vtable that accepts new
+    // keys (Object_new's class instance is sealed, so `info.code = ...` raised
+    // ReferenceError #1056 -- measured on this example before the change).
+    this.line('void* info = as_object_new();');
+    this.line('as_dyn_set((void*)info, "code", as_v_str((char*)code));');
+    this.line('as_dyn_set((void*)info, "level", as_v_str((char*)level));');
+    this.line('if (detail != NULL && detail[0] != 0) as_dyn_set((void*)info, "description", as_v_str((char*)detail));');
+    this.line('NetStatusEvent* ev = NetStatusEvent_new((char*)"netStatus", false, false, info);');
+    this.line('EventDispatcher_dispatchEvent((EventDispatcher*)o, (Event*)ev);');
+    this.indent--;
+    this.line('}');
+    // onMetaData: the first thing a video player reads (width/height/duration drive
+    // Video.videoWidth and the progress bar in AIR). Delivered through `client`,
+    // which defaults to the stream itself -- so a stream nobody hooked answers
+    // nothing, exactly like AIR.
+    this.line('static void as_ns_meta(NetStream* o) {');
+    this.indent++;
+    this.line('void* info = as_object_new();');
+    this.line('as_dyn_set((void*)info, "width", as_v_num((double)o->_ns_vw));');
+    this.line('as_dyn_set((void*)info, "height", as_v_num((double)o->_ns_vht));');
+    this.line('as_dyn_set((void*)info, "duration", as_v_num(o->_ns_dur / 1000.0));');
+    this.line('double fps = 0.0; int w = 0, h = 0, aud = 0; double dur = 0.0;');
+    this.line('as_video_info(o->_ns_hv, &w, &h, &dur, &fps, &aud);');
+    this.line('if (fps > 0 && fps == fps) as_dyn_set((void*)info, "framerate", as_v_num(fps));');
+    this.line('if (aud) as_dyn_set((void*)info, "audiocodecid", as_v_num(1));');
+    this.line('as_value args[1];');
+    this.line('args[0] = as_v_obj(info);');
+    this.line('as_dyn_call((void*)o->client, "onMetaData", args, 1);');
+    this.indent--;
+    this.line('}');
+    // One frame-boundary step for every live stream.
+    this.line('static void as_ns_tick(void) {');
+    this.indent++;
+    this.line('double now = as_now_ms();');
+    this.line('for (int i = 0; i < AS_NS_MAX; i++) {');
+    this.indent++;
+    this.line('NetStream* o = as_ns_live[i];');
+    this.line('if (o == NULL) continue;');
+    this.line('int st = as_video_tick(o->_ns_hv, as_skia_gr_context(), now);');
+    this.line('o->_ns_tpos = as_video_time(o->_ns_hv);');
+    this.line('int w = 0, h = 0, aud = 0; double dur = 0.0;');
+    this.line('as_video_info(o->_ns_hv, &w, &h, &dur, NULL, &aud);');
+    this.line('if (w > 0 && h > 0) { o->_ns_vw = w; o->_ns_vht = h; }');
+    this.line('if (dur > 0.0) o->_ns_dur = dur;');
+    this.line('o->_ns_audio = aud ? true : false;');
+    // onMetaData is delivered once, as soon as there is something true to report.
+    this.line('if (!o->_ns_meta && (o->_ns_vw > 0 || o->_ns_dur > 0.0)) { o->_ns_meta = true; as_ns_meta(o); }');
+    this.line('if (!o->_ns_failed && (st & AS_VIDEO_ST_FAILED)) {');
+    this.indent++;
+    this.line('o->_ns_failed = true;');
+    this.line("const char* msg = as_video_error(o->_ns_hv);");
+    this.line('as_ns_status(o, "NetStream.Play.Failed", "error", (msg != NULL && msg[0]) ? msg : "decoder failed");');
+    this.line('as_ns_unregister(o);');
+    this.indent--;
+    this.line('} else if (st & AS_VIDEO_ST_ENDED) {');
+    this.indent++;
+    this.line('if (o->_ns_dur > 0.0) o->_ns_tpos = o->_ns_dur / 1000.0;');
+    this.line('as_ns_status(o, "NetStream.Play.Stop", "status", "");');
+    this.line('as_ns_unregister(o);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('void NetStream_play(void* _this, char* url) {');
+    this.indent++;
+    this.line('NetStream* o = (NetStream*)_this;');
+    this.line('if (o->_ns_hv >= 0) { as_video_close(o->_ns_hv); o->_ns_hv = -1; as_ns_unregister(o); }');
+    this.line('char err[256]; err[0] = 0;');
+    this.line('int hv = as_video_open(url != NULL ? url : "", "auto", "broad", err, (int)sizeof(err));');
+    // -2 means the BUILD has no video backend (the runtime stub answers it). That is
+    // not a bad file: it is a capability the binary does not have, so it throws.
+    this.line('if (hv == -2) { as_throw(Error_new((char*)"[as3-aot] not implemented by this build: video playback requires an FFmpeg-linked build", 0)); return; }');
+    // Any other failure is a runtime one (missing file, unsupported container), and
+    // AIR reports those asynchronously: NetStatusEvent NetStream.Play.Failed.
+    this.line('if (hv < 0) {');
+    this.indent++;
+    this.line('o->_ns_failed = true;');
+    this.line('o->_ns_hv = -1;');
+    this.line('as_ns_status(o, "NetStream.Play.Failed", "error", err);');
+    this.line('return;');
+    this.indent--;
+    this.line('}');
+    this.line('o->_ns_hv = hv;');
+    this.line('o->_ns_failed = false; o->_ns_meta = false; o->_ns_paused = false;');
+    this.line('int w = 0, h = 0, aud = 0; double dur = 0.0;');
+    this.line('as_video_info(hv, &w, &h, &dur, NULL, &aud);');
+    this.line('o->_ns_vw = w; o->_ns_vht = h; o->_ns_dur = dur; o->_ns_audio = aud ? true : false;');
+    this.line('o->_ns_tpos = 0.0;');
+    this.line('as_video_play(hv, as_now_ms(), o->_snd != NULL ? o->_snd->_st_volume : 1.0);');
+    this.line('as_ns_register(o);');
+    // AIR dispatches Play.Start (and Buffer.Full) before the first frame: the
+    // status is what a player's spinner keys off, so it cannot wait for one.
+    this.line('as_ns_status(o, "NetStream.Play.Start", "status", "");');
+    this.line('as_ns_status(o, "NetStream.Buffer.Full", "status", "");');
+    this.indent--;
+    this.line('}');
+    this.line('void NetStream_pause(void* _this) { NetStream* o = (NetStream*)_this; if (o->_ns_hv < 0 || o->_ns_paused) return; o->_ns_paused = true; as_video_set_paused(o->_ns_hv, 1, as_now_ms()); }');
+    this.line('void NetStream_resume(void* _this) { NetStream* o = (NetStream*)_this; if (o->_ns_hv < 0 || !o->_ns_paused) return; o->_ns_paused = false; as_video_set_paused(o->_ns_hv, 0, as_now_ms()); }');
+    this.line('void NetStream_togglePause(void* _this) { NetStream* o = (NetStream*)_this; if (o->_ns_paused) NetStream_resume(_this); else NetStream_pause(_this); }');
     // seek() without playback does not move AIR's playhead either (measured: time
-    // stays 0), so it is a no-op rather than a fake position update.
-    this.line('void NetStream_seek(void* _this, double offset) { (void)_this; (void)offset; }');
-    this.line('void NetStream_close(void* _this) { (void)_this; }');
+    // stays 0 on a stream that never started), so a stream with no decoder is a
+    // no-op rather than a fake position update.
+    this.line('void NetStream_seek(void* _this, double offset) { NetStream* o = (NetStream*)_this; if (o->_ns_hv < 0) return; as_video_seek(o->_ns_hv, offset, as_now_ms()); o->_ns_tpos = offset; }');
+    this.line('void NetStream_close(void* _this) {');
+    this.indent++;
+    this.line('NetStream* o = (NetStream*)_this;');
+    this.line('as_ns_unregister(o);');
+    this.line('if (o->_ns_hv >= 0) { as_video_close(o->_ns_hv); o->_ns_hv = -1; }');
+    this.line('o->_ns_paused = false; o->_ns_meta = false;');
+    this.indent--;
+    this.line('}');
     this.line('SoundTransform* NetStream_get_soundTransform(void* _this) { return ((NetStream*)_this)->_snd; }');
     // AIR ignores a null assignment and keeps the default transform (measured), so
     // the stored slot is only replaced by a real SoundTransform.
     this.line('void NetStream_set_soundTransform(void* _this, SoundTransform* value) { NetStream* o = (NetStream*)_this; if (value == NULL) return; o->_snd = value; gc_write_barrier((void*)value); }');
-    this.line('double NetStream_get_time(void* _this) { (void)_this; return 0.0; }');
+    this.line('double NetStream_get_time(void* _this) { return ((NetStream*)_this)->_ns_tpos; }');
     // Video: the surface keeps its requested rect (AIR's Video owns width/height
-    // rather than deriving them from content) and never receives frames here.
+    // rather than deriving them from content) and shows the attached stream's frame.
     this.line('void Video_ctor(Video* o, int width, int height) {');
     this.indent++;
     this.line('DisplayObject_ctor((DisplayObject*)o);');
     this.line('o->deblocking = 0; o->smoothing = false;');
     this.line('o->_videoW = width; o->_videoH = height;');
+    this.line('o->_ns = NULL;');
     this.indent--;
     this.line('}');
     this.line('Video* Video_new(int width, int height) { Video* o = (Video*)gc_alloc(GCT_CLASS, sizeof(Video)); o->vtable = &Video_vt; Video_ctor(o, width, height); return o; }');
-    this.line('void Video_attachNetStream(void* _this, NetStream* netStream) { (void)_this; (void)netStream; }');
+    // AIR keeps showing the last frame of a stream that was re-attached over: detaching
+    // (attachNetStream(null)) is what clears the surface. So this stores the pointer
+    // and `clear()` is the only thing that drops frames.
+    this.line('void Video_attachNetStream(void* _this, NetStream* netStream) { Video* o = (Video*)_this; o->_ns = netStream; gc_write_barrier((void*)netStream); }');
     this.line('void Video_attachCamera(void* _this, Object* camera) { (void)_this; (void)camera; }');
-    this.line('void Video_clear(void* _this) { (void)_this; }');
+    this.line('void Video_clear(void* _this) { Video* o = (Video*)_this; o->_ns = NULL; }');
     this.line('double Video_get_width(void* _this) { return (double)((Video*)_this)->_videoW; }');
     this.line('void Video_set_width(void* _this, double value) { ((Video*)_this)->_videoW = (int)value; }');
     this.line('double Video_get_height(void* _this) { return (double)((Video*)_this)->_videoH; }');
     this.line('void Video_set_height(void* _this, double value) { ((Video*)_this)->_videoH = (int)value; }');
-    // videoWidth/videoHeight are the DECODED frame size, which stays 0 without a
-    // decoder (AIR also reports 0 until frames arrive; measured).
-    this.line('int Video_get_videoWidth(void* _this) { (void)_this; return 0; }');
-    this.line('int Video_get_videoHeight(void* _this) { (void)_this; return 0; }');
+    // videoWidth/videoHeight are the DECODED frame size, which is 0 until the first
+    // frame arrives (AIR also reports 0 before then; measured on adl).
+    this.line('int Video_get_videoWidth(void* _this) { Video* o = (Video*)_this; return (o->_ns != NULL) ? o->_ns->_ns_vw : 0; }');
+    this.line('int Video_get_videoHeight(void* _this) { Video* o = (Video*)_this; return (o->_ns != NULL) ? o->_ns->_ns_vht : 0; }');
     this.line('');
     // ---- flash.net / flash.ui (stage 63): URLRequest / URLLoader / Keyboard / Mouse ----
     //
@@ -29072,6 +29217,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the data/exit events they produce. Same frame-boundary contract as the async
     // IO jobs above -- a listener never runs in the middle of another dispatch.
     this.line('as_np_tick();');
+    // Video playback (flash.net.NetStream): decode ahead of the presentation clock at
+    // the SAME safe point as timers and MovieClips, so the frame painted this frame is
+    // the one the clock asked for. It is a no-op loop when nothing plays.
+    this.line('as_ns_tick();');
     // Fire due setTimeout/clearTimeout timers first (AIR drives timers on the
     // same frame clock as ENTER_FRAME), then advance playing MovieClips, then
     // broadcast the enterFrame event.
@@ -30892,6 +31041,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     // wobble flicker between a sharp and a mushy image every frame.
     this.line('void* bd_img = as_bmd_visible_image(bd);');
     this.line('if (bd_img != NULL) as_skia_canvas_draw_image_rect(canvas, bd_img, 0.0, 0.0, (double)bd->width, (double)bd->height, ((Bitmap*)o)->smoothing ? 1 : 0);');
+    this.indent--;
+    this.line('} else if (as_is(o, &Video_vt)) {');
+    this.indent++;
+    // The decoded frame is an SkImage the stream owns; drawing it here and never
+    // keeping it is the §10.2 contract -- the owner releases per frame, so holding
+    // one across frames would pin a second decoder-pool buffer.
+    this.line('Video* vd = (Video*)o;');
+    this.line('NetStream* vns = vd->_ns;');
+    this.line('if (vns != NULL) {');
+    this.indent++;
+    this.line('void* vimg = as_video_frame(vns->_ns_hv);');
+    this.line('if (vimg != NULL) {');
+    this.indent++;
+    // AIR stretches the decoded picture into Video's own rect (width/height are the
+    // surface, not the content) and Video.smoothing picks the sampler -- the same
+    // pairing Bitmap already uses.
+    this.line('as_skia_canvas_draw_image_rect(canvas, vimg, 0.0, 0.0, (double)vd->_videoW, (double)vd->_videoH, vd->smoothing ? 1 : 0);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('} else if (as_is(o, &TextField_vt)) {');
     this.indent++;
@@ -34272,6 +34442,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // The C++ glue overrides operator new (vendor/skia_glue.cc) and needs the
     // runtime's allocation-failure hook before any AS3 code can allocate through
     // it; see as_oom_from_cxx in the preamble.
+    // getTimer() counts from process start; the epoch must exist before any AS3
+    // code runs, or a program that first reads the clock late would see 0 there.
+    this.line('as_clock_init();');
     this.line('as_oom_hook_install();');
     this.line('as_native_drag_init();');
     // Install the AMF3 codec's generated hooks (class member tables, registry
@@ -34453,6 +34626,16 @@ void FileStream_writeObject(void* _this, as_value v) {
         // read + setter write by sequenceValueExpr; emitExpr would only reproduce
         // the invalid `get_prop(...)++` rvalue.
         if (stmt.expr.kind === 'Update' && this.resolveUpdateSetter(stmt.expr.target)) {
+          break;
+        }
+        if (this.isTraceStmt(stmt.expr)) {
+          // Statement position is the one place the per-call flush can be a statement
+          // of its own. A side-effecting argument was already hoisted by the
+          // sequenceValueExpr above, so what remains is the printf and its flush.
+          const te = this.emitExpr(stmt.expr);
+          this.line(`${te.code};`);
+          this.line('fflush(stdout);');
+          this.discardedExprNode = outerDiscarded;
           break;
         }
         const e = this.emitExpr(stmt.expr);
@@ -39657,7 +39840,25 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   private emitTrace(args: Expr[]): string {
-    if (args.length === 0) return 'printf("\\n")';
+    return `printf(${this.traceFormat(args)})`;
+  }
+
+  // `trace` flushes the moment it runs, for the same reason AIR shows a trace line
+  // immediately: a redirected stdout is FULLY buffered (ucrt/glibc), so a windowed
+  // program that is closed, killed or crashes loses every trace it had not yet filled
+  // 4 KB with. Measured during this stage: a windowed run reported nothing at all
+  // after its window was force-closed, with every assertion already written.
+  //
+  // The flush is a SECOND STATEMENT of the trace statement (see the ExprStmt case),
+  // not a comma expression around the printf: `trace` stays a plain `printf(...)`
+  // statement, which is the shape a reader recognizes and the shape the null-string
+  // pins assert, and a statement is where a statement can go.
+  private isTraceStmt(expr: Expr): boolean {
+    return expr.kind === 'Call' && expr.callee.kind === 'Var' && expr.callee.name === 'trace';
+  }
+
+  private traceFormat(args: Expr[]): string {
+    if (args.length === 0) return '"\\n"';
     const formats: string[] = [];
     const vals: string[] = [];
     // Every %s argument goes through as_str_or_null: ucrt treats a null pointer for
@@ -39693,7 +39894,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
     }
     const fmt = formats.join(' ') + '\\n';
-    return `printf("${fmt}"${vals.length ? ', ' + vals.join(', ') : ''})`;
+    return `"${fmt}"${vals.length ? ', ' + vals.join(', ') : ''}`;
   }
 
   // E4X attribute access: expr.@name reads the named attribute as a String

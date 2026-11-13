@@ -10,7 +10,7 @@ import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
 import { FRE_BODY } from '../../src/fre.ts';
-import { SymbolTable, C_RESERVED, C_RESERVED_SCOPE, sanitizeCIdent, sanitizeFileCIdent } from '../../src/symbols.ts';
+import { SymbolTable, C_RESERVED, C_RESERVED_SCOPE, C_MS_COMPAT_KEYWORDS, sanitizeCIdent, sanitizeFileCIdent } from '../../src/symbols.ts';
 import { C_RESERVED_HEADERS } from '../../src/c-reserved.gen.ts';
 import { registerGroup, root, readNorm } from '../harness.ts';
 
@@ -2010,6 +2010,8 @@ function checkEmitGeneratedNameReservation(): string[] {
     else { bad.push(label); console.log(`FAIL  [gname] ${label}`); }
   };
 
+  const emitSrc = readNorm(join(root, 'src', 'emit.ts'));
+  const msKeywords = C_MS_COMPAT_KEYWORDS;
   const c = generateC(parse('class Widget {\n'
     + '  public var o:int;\n'
     + '  public function Widget(o:int, _this:String) { this.o = o; }\n'
@@ -2052,6 +2054,16 @@ function checkEmitGeneratedNameReservation(): string[] {
     /\{ "o", \d+, offsetof\(Widget, _o\)/.test(c));
   check('the AMF member list keeps the AS3 name "o"',
     /static const char\* Widget_amf_members\[\] = \{ "o", NULL \};/.test(c));
+
+  // The escape itself can land on a KEYWORD: `w64` -> `_w64` -> `__w64`, and clang's
+  // MS-compat mode reads `__w64` as a keyword (`error: expected identifier or '('`)
+  // while macOS compiles it as a plain identifier -- a Windows-only red that nothing
+  // in this suite could see until examples/with-fn-class-regexp.as hit it (its 65th
+  // `with` temp). The escape now appends `_` instead in that case.
+  check('the underscore escape refuses to land on an MS-compat keyword',
+    emitSrc.includes("if (C_MS_COMPAT_KEYWORDS.has(c)) c += '_';"));
+  check('the keyword list is not empty and starts with the measured name',
+    msKeywords.has('__w64') && msKeywords.has('__int8') && msKeywords.size >= 10);
 
   console.log(`     [gname] ${ok} check(s) passed`);
   return bad;

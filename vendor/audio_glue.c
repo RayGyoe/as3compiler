@@ -958,6 +958,62 @@ int as_audio_stream_close(int buf, int complete, const void* whole, unsigned int
     as_buf_unlock();
     return ok;
 }
+// ---------------------------------------------------------------------------
+// Live PCM (the audio half of a NetStream, vendor/video_glue.c)
+// ---------------------------------------------------------------------------
+// WHY this is not as_audio_stream_open: that one takes ENCODED BYTES and decodes
+// them itself (MP3 frame by frame, everything else in one pass at COMPLETE). The
+// video path already has decoded PCM -- FFmpeg's audio decoder + swresample -- and
+// neither format belongs to that sniffer. What both directions DO share is the
+// streaming contract the mixer already implements: 'frames' is a live watermark,
+// a voice that reaches it outputs silence instead of ending, and the buffer takes
+// g_buf_lock for a whole mixer block. So a live buffer is that same as_pcm_buf with
+// its rate/channels known from the start and its frames appended as f32.
+int as_audio_live_open(int channels, int rate) {
+    if (channels <= 0 || rate <= 0) return -1;
+    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    int id = g_buf_count++;
+    memset(&g_bufs[id], 0, sizeof(g_bufs[id]));
+    g_bufs[id].used = 1;
+    g_bufs[id].streaming = 1;
+    g_bufs[id].ended = 0;
+    g_bufs[id].fmt = AS_SFMT_BUFFERED;   // never sniffed: the caller IS the decoder
+    g_bufs[id].channels = channels;
+    g_bufs[id].rate = rate;
+    return id;
+}
+
+// Append decoded frames. Returns 1 on success, 0 when the buffer is unknown/ended.
+int as_audio_live_write(int buf, const float* pcm, long long frames) {
+    if (!as_audio_buf_valid(buf) || pcm == NULL || frames <= 0) return 0;
+    as_pcm_buf* b = &g_bufs[buf];
+    if (!b->streaming || b->ended) return 0;
+    as_buf_lock();
+    int ok = as_stream_append_frames(b, pcm, frames, b->channels);
+    as_buf_unlock();
+    return ok;
+}
+
+// Drop everything written so far (NetStream.seek). The voice's cursor is moved by
+// the caller; the watermark restarts at 0 so the next append is frame 0 of the new
+// position rather than the tail of the old one.
+void as_audio_live_rewind(int buf) {
+    if (!as_audio_buf_valid(buf)) return;
+    as_pcm_buf* b = &g_bufs[buf];
+    as_buf_lock();
+    b->frames = 0;
+    as_buf_unlock();
+}
+
+// No more frames will arrive: the next mixer block that reaches the watermark ends
+// the voice (soundComplete semantics, invented here rather than in the glue user).
+void as_audio_live_close(int buf) {
+    if (!as_audio_buf_valid(buf)) return;
+    as_buf_lock();
+    g_bufs[buf].ended = 1;
+    as_buf_unlock();
+}
+
 long long as_audio_buf_frames(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].frames : 0; }
 int as_audio_buf_channels(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].channels : 0; }
 int as_audio_buf_rate(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].rate : 0; }

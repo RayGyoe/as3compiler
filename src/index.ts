@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, runObjectCacheStep, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, runObjectCacheStep, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, hostVendorKey, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
@@ -126,6 +126,7 @@ interface Options {
 const KNOWN_FLAGS: readonly string[] = [
   '-o', '--run', '--dry', '--cc', '--target', '--package', '--manifest', '--air-app',
   '--main-class', '--all-sources', '--include-third-party', '--extdir', '--as-class-path', '--gpu-backend', '--json', '--fix',
+  '--video', '--no-video', '--video-formats', '--video-backend',
   '--check-update', '--verbose', '-v', '--opt', '--debug-info', '--lto', '--pgo', '--pgo-dir',
   '-I', '-L', '-l', '-D', '--features', '--extra-roots', '--framework', '--source', '--swc', '--ane',
   '--ane-platform', '--export', '--cflag', '-w', '--version', '-V', '--help', '-h',
@@ -273,6 +274,14 @@ function parseArgs(argv: string[], doctorMode = false): Options {
     // Parsed (not just stored) so a typo fails here with the list of real names,
     // instead of building the default backend and looking honoured.
     else if (a === '--gpu-backend') opts.gpuBackend = parseGpuBackend(value('--gpu-backend'));
+    // --video / --no-video: force the FFmpeg backend in or out of the link set. The
+    // default is `auto` (probe the sources), and these exist for the two cases the
+    // probe cannot be right about: a size-critical build that knows it never plays
+    // video, and a build whose video use the probe misses.
+    else if (a === '--video') opts.overrides.video = 'on';
+    else if (a === '--no-video') opts.overrides.video = 'off';
+    else if (a === '--video-formats') opts.overrides.videoFormats = parseVideoFormats(value('--video-formats'));
+    else if (a === '--video-backend') opts.overrides.videoBackend = parseVideoBackend(value('--video-backend'));
     else if (a === '--export') push('exports', value('--export'));
     // -V, not -v: -v is doctor's --verbose and has been in the help text since
     // then, so taking it over would be a breaking change for anyone using it.
@@ -470,6 +479,40 @@ function usesTextEngine(texts: string[]): boolean {
   const re = /flash\.text\.|(?:^|[^A-Za-z0-9_.$])(?:TextField|TextFormat|TextLineMetrics|StyleSheet|TextFieldAutoSize|TextFieldType|TextInteractionMode|AntiAliasType|GridFitType|StaticText)(?![A-Za-z0-9_])/;
   for (const t of texts) if (re.test(t)) return true;
   return false;
+}
+
+// Does this program PLAY VIDEO? This decides whether the build links FFmpeg
+// (vendor/video_glue.c + libav*, 4.4–8.3 MB, docs/zh-cn/video.md §3).
+//
+// Same bias as the two probes above (over-inclusive, never silently wrong): a false
+// positive costs link time and size, a false negative is a runtime error the
+// program cannot avoid -- and `video: "off"` is the explicit escape hatch.
+//
+// The markers are the video-path classes ONLY. Bare `Video` is deliberately absent:
+// it is far too common as a user class name (`VideoPlayer`, `VideoEvent`) and would
+// drag FFmpeg into programs that never decode a frame. `NetStream` is the entry
+// everything else goes through, and the fully-qualified `flash.media.Video`
+// spelling covers an import the bare-name rule would otherwise miss.
+function usesVideoCodec(texts: string[]): boolean {
+  const re = /flash\.net\.NetStream|flash\.media\.Video\b|(?:^|[^A-Za-z0-9_.$])(?:NetStream|VideoCodec|StageVideo|attachNetStream)(?![A-Za-z0-9_])/;
+  for (const t of texts) if (re.test(t)) return true;
+  return false;
+}
+
+// `--video-formats air|broad|all`: which codec/container profile the FFmpeg
+// artifacts were built as. Parsed rather than stored so a typo names the real values
+// instead of silently keeping `broad` and linking a set the author did not expect.
+function parseVideoFormats(raw: string): 'air' | 'broad' | 'all' {
+  if (raw === 'air' || raw === 'broad' || raw === 'all') return raw;
+  throw new Error(`--video-formats must be air, broad or all (got "${raw}")`);
+}
+
+// `--video-backend auto|soft`: `auto` is the only recommended value (probe the
+// hardware decoder, fall back to software). `soft` exists to answer "is this the
+// hardware path?" while debugging -- there is no way to hand-pick a hwaccel.
+function parseVideoBackend(raw: string): 'auto' | 'soft' {
+  if (raw === 'auto' || raw === 'soft') return raw;
+  throw new Error(`--video-backend must be auto or soft (got "${raw}")`);
 }
 
 // `as-aot doctor`. The check table lives in src/checks.ts and the rendering in
@@ -830,6 +873,13 @@ async function main(): Promise<void> {
   // success exit code. The default happens to equal the host platform, which is
   // exactly why nothing caught it until a cross-width build was attempted.
   if (opts.overrides.anePlatform) cfg.anePlatform = opts.overrides.anePlatform;
+  // Same shape of bug as --ane-platform above, caught while testing the gate:
+  // --video / --no-video / --video-formats / --video-backend were parsed into
+  // opts.overrides and then never copied, so `--no-video` silently linked FFmpeg
+  // anyway (measured: the same binary, the same "FFmpeg linked" line).
+  if (opts.overrides.video) cfg.video = opts.overrides.video;
+  if (opts.overrides.videoFormats) cfg.videoFormats = opts.overrides.videoFormats;
+  if (opts.overrides.videoBackend) cfg.videoBackend = opts.overrides.videoBackend;
   // Unlike -D (which appends to the manifest's defines), --features REPLACES the
   // set: see resolveFeatures for why.
   if (explicitFeatures) cfg.features = explicitFeatures;
@@ -1094,6 +1144,86 @@ async function main(): Promise<void> {
       );
     } else {
       console.log('   - flash.text: no text in this program -- text engine NOT linked (~12.9 MB smaller)');
+    }
+  }
+
+  // ---- flash.net.NetStream / flash.media.Video: the FFmpeg backend ----
+  // Same three-way shape as the two gates above, with one addition: the video
+  // backend is a LIBRARY (FFmpeg, 4.4–8.3 MB of static archives), so when the
+  // program needs it and the archives are absent the build FAILS instead of
+  // compiling something that throws on the first play() -- the source says it plays
+  // video, the artifact must be able to. `video: "off"` is how a build says it
+  // wants that anyway (docs/zh-cn/video.md §5.3/§5.5).
+  //
+  // Nothing is injected for the wasm targets: the web arm is specified to use the
+  // browser's own <video>/WebCodecs (§9), which this stage does not implement, and
+  // WASI has no window or audio device at all. Both therefore keep ASC_HAVE_VIDEO
+  // unset, and play() answers "not implemented by this build" through the runtime
+  // stub -- loud, per §5.7, instead of a 0-frame black rectangle.
+  {
+    const manifestNamesVideo = cfg.sources.some((p) => basename(p) === 'video_glue.c');
+    const manifestHasVideoDefine = cfg.defines.some((d) => d === 'ASC_HAVE_VIDEO' || d.startsWith('ASC_HAVE_VIDEO='));
+    const wantsVideo = cfg.video === 'on' || manifestNamesVideo || manifestHasVideoDefine ||
+      (cfg.video === 'auto' && usesVideoCodec(featureScanTexts));
+    if (cfg.video === 'off') {
+      if (manifestNamesVideo || manifestHasVideoDefine) {
+        throw new Error("video: \"off\" but the manifest already names vendor/video_glue.c or ASC_HAVE_VIDEO — drop one");
+      }
+      console.log('   - video: turned off by video: "off" -- NetStream.play() will report that this build cannot play video');
+    } else if (!wantsVideo) {
+      console.log('   - video: no NetStream/Video in this program -- FFmpeg NOT linked');
+    } else if (cfg.target === 'wasm') {
+      console.log(
+        '   - video: this program plays video, but the wasm target has no FFmpeg backend by design;\n' +
+        '     NetStream.play() will report that this build cannot play video (docs/zh-cn/video.md §5.4)'
+      );
+    } else {
+      const vendorDir = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
+      const ffDir = resolve(vendorDir, 'ffmpeg');
+      const hostKey = hostVendorKey('native', process.platform, process.arch, cfg.architecture);
+      const libDir = resolve(ffDir, 'lib', hostKey);
+      const incDir = resolve(ffDir, 'include');
+      const ffLibs = ['avformat', 'avcodec', 'swscale', 'swresample', 'avutil'];
+      // The archives are per-profile (video-formats). The header/manifest cannot tell
+      // which one is on disk, so the gate reports the profile the build CLAIMS and the
+      // probe below is what proves the archives are there at all.
+      const libExt = process.platform === 'win32' ? '.lib' : '.a';
+      const missing = ffLibs.filter((l) => !existsSync(resolve(libDir, (process.platform === 'win32' ? '' : 'lib') + l + libExt)));
+      if (missing.length > 0 || !existsSync(incDir)) {
+        throw new Error(
+          `this program plays video but the FFmpeg archives for ${hostKey} are not in vendor/ffmpeg ` +
+          `(missing: ${missing.length > 0 ? missing.join(', ') : 'include/'})\n` +
+          `  build + deploy them with:  bash vendor/provision/ffmpeg-static.sh ${cfg.videoFormats}` +
+          `  (then vendor/provision/${process.platform === 'darwin' ? 'macos.sh --only video' : 'windows.ps1 -Only video'})\n` +
+          `  or build without it:       --no-video  (NetStream.play() will report the missing backend)`
+        );
+      }
+      if (!manifestNamesVideo) cfg.sources.push(resolve(vendorDir, 'video_glue.c'));
+      if (!cfg.includePaths.some((p) => resolve(p) === incDir)) cfg.includePaths.push(incDir);
+      if (!cfg.linkPaths.some((p) => resolve(p) === libDir)) cfg.linkPaths.push(libDir);
+      for (const l of ffLibs) if (!cfg.linkLibs.includes(l)) cfg.linkLibs.push(l);
+      // The system libraries the archives reference on each host. Windows: winsock
+      // (protocols), schannel+ncrypt (https/rtmps), MediaFoundation (the h264_mf
+      // encoder publish uses), strmiids (IID_ICodecAPI), D3D11/DXGI (d3d11va). macOS:
+      // VideoToolbox + CoreVideo/CoreMedia for the hardware path (§9). These are OS
+      // imports, not third-party dependencies, so they are added for the whole target
+      // rather than being something a manifest has to remember.
+      const sysLibs = process.platform === 'win32'
+        ? ['ws2_32', 'secur32', 'crypt32', 'bcrypt', 'ncrypt', 'ole32', 'mfplat', 'mf', 'mfuuid', 'strmiids', 'd3d11', 'dxgi', 'user32']
+        : [];
+      for (const l of sysLibs) if (!cfg.linkLibs.includes(l)) cfg.linkLibs.push(l);
+      if (process.platform === 'darwin') {
+        for (const f of ['VideoToolbox', 'CoreVideo', 'CoreMedia', 'CoreFoundation', 'Security', 'Metal']) {
+          if (!cfg.frameworks.includes(f)) cfg.frameworks.push(f);
+        }
+      }
+      if (!cfg.defines.some((d) => d === 'ASC_HAVE_VIDEO' || d.startsWith('ASC_HAVE_VIDEO='))) cfg.defines.push('ASC_HAVE_VIDEO');
+      // The runtime decoder choice rides in a define, the same way the GPU backend
+      // does: the C side has one compile-time default and one switchable value.
+      cfg.defines.push(`ASC_VIDEO_BACKEND_${cfg.videoBackend.toUpperCase()}=1`);
+      console.log(
+        `   + video: FFmpeg linked (${hostKey}, video-formats ${cfg.videoFormats}, backend ${cfg.videoBackend})`
+      );
     }
   }
 

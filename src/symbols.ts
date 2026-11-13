@@ -373,6 +373,22 @@ export const C_RESERVED = new Set<string>([...C_RESERVED_SEED, ...C_RESERVED_HEA
 // full table is needed only where C has ONE namespace for the whole file.
 export const C_RESERVED_SCOPE = C_RESERVED_SEED;
 
+// MS-compat KEYWORDS: spellings clang/MSVC treat as keywords (not function names),
+// reachable only through `cIdent`'s leading-underscore escape -- `w64` -> `_w64` ->
+// `__w64`. A keyword is not in the header sweep (it is never declared as a
+// function) and the seed's keyword block cannot learn it from `-dM` either, so it
+// needs its own list; `Emitter.cIdent` gives such a candidate a `_` suffix instead
+// of a third leading underscore. Measured on windows-x64: the 65th `with` temp of
+// examples/with-fn-class-regexp.as emitted `as_class* __w64 = ...` and clang
+// answered `error: expected identifier or '('`, while macOS compiled the same
+// source (`__w64` is an ordinary identifier without MS extensions).
+export const C_MS_COMPAT_KEYWORDS = new Set<string>([
+  '__w64', '__int8', '__int16', '__int32', '__int64',
+  '__ptr32', '__ptr64', '__sptr', '__uptr', '__unaligned', '__forceinline',
+  '__declspec', '__cdecl', '__stdcall', '__fastcall', '__thiscall', '__vectorcall',
+  '__asm', '__inline', '__based', '__segment', '__try', '__except', '__finally',
+]);
+
 // FUNCTION-LIKE host macros: a `#define f(a,b) ...` rewrites only a BARE CALL of
 // that exact spelling, never a plain use of the identifier. That makes them a
 // different hazard class from C_RESERVED — and it means the fix belongs in a
@@ -7152,6 +7168,20 @@ export class SymbolTable {
         // The stream's own SoundTransform (volume 1 / pan 0 until assigned), the
         // value AIR reports for a freshly built stream (measured).
         ['_snd', nsf({ kind: 'object', className: 'SoundTransform' })],
+        // ---- playback state (stage V1 of docs/zh-cn/video.md §12) ----
+        // The decoder lives in vendor/video_glue.c and is addressed by an integer
+        // handle (-1 = nothing open), the same shape Sound uses for its PCM buffer:
+        // a GC heap object must not own a malloc'd FFmpeg context, and the handle
+        // survives a collection without being followed by the marker.
+        ['_ns_hv', nsf({ kind: 'int' })],
+        ['_ns_vw', nsf({ kind: 'int' })],     // videoWidth  (decoded frame size)
+        ['_ns_vht', nsf({ kind: 'int' })],    // videoHeight
+        ['_ns_dur', nsf({ kind: 'number' })], // ms, from the container / onMetaData
+        ['_ns_tpos', nsf({ kind: 'number' })],// seconds, the frame on screen
+        ['_ns_meta', nsf({ kind: 'bool' })],  // onMetaData already delivered
+        ['_ns_failed', nsf({ kind: 'bool' })],// Play.Failed already delivered
+        ['_ns_paused', nsf({ kind: 'bool' })],
+        ['_ns_audio', nsf({ kind: 'bool' })], // the file has an audio track
       ]),
       methods: new Map([
         // play() is where this subset's missing media transport becomes
@@ -7227,6 +7257,10 @@ export class SymbolTable {
         ['smoothing', { type: { kind: 'bool' }, init: { kind: 'Bool', value: false }, visibility: 'public', owner: 'Video', isStatic: false, isConst: false }],
         ['_videoW', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Video', isStatic: false, isConst: false }],
         ['_videoH', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Video', isStatic: false, isConst: false }],
+        // The stream whose frames this surface shows (attachNetStream). Object-typed
+        // on purpose: it is a real reference the GC must follow, unlike NetStream's
+        // own decoder handle.
+        ['_ns', { type: { kind: 'object', className: 'NetStream' }, init: null, visibility: 'private', owner: 'Video', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['attachNetStream', vdm({ kind: 'void' }, [greq('netStream', 'NetStream')])],

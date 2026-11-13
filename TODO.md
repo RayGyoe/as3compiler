@@ -1458,8 +1458,9 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 **依据**：异步网络/音视频/键盘鼠标状态查询，独立于几何/事件基础，重活。
 
 - [x] `flash.net`：**URLLoader**（`load()`/`data`/`close`，异步本地文件读取（COMPLETE/IO_ERROR 下一帧 tick），`data` 为 GC 跟踪字符串）、**URLVariables**（`dynamic class`，未声明字符串键属性 + `toString()` 序列化）、**URLRequest**（`url`/`method`/`data`/`contentType`）
-- [ ] `flash.media`：**Sound**（`load`/`play`，依赖后端解码）、**SoundChannel**、**Video**（延后：音频/视频解码后端）
+- [ ] `flash.media`：**Sound**（`load`/`play`，依赖后端解码）、**SoundChannel**、**Video**（V1 已完成 2026-11-13，见下；V2/V3 硬解与传输面仍未排期）
   - **2026-10-06 音频调研完成并立项**（[`docs/zh-cn/audio.md`](docs/zh-cn/audio.md) / [`docs/en/audio.md`](docs/en/audio.md)，**阶段九十六**）：现状是阶段九十三留下的**空壳**（`play()` 恒返回空 `SoundChannel`、`loadCompressedDataFromByteArray`/`stop` 为 no-op），全仓无音频后端与解码器。**关键实测**：vendored SDL2 未编 CoreAudio（`libSDL2.a` 只含 `SDL_dummyaudio.o`，`nm` 零 AudioUnit 符号）⇒ `SDL_OpenAudioDevice` 会成功返回但**永不发声**，故后端点需另选。已裁决后端 = **miniaudio**（单头文件、一处覆盖 CoreAudio + Emscripten Web Audio、内置 MP3 解码）、范围 = **A~D 全量**（`[Embed]` 缺口独立延后）。属**补遗留**非增强。
+  - **2026-11-13 V1 已落地并实测**（[`docs/zh-cn/video.md`](docs/zh-cn/video.md) §16 / [`docs/en/video.md`](docs/en/video.md) §16）：`NetConnection`/`NetStream`/`Video` 的 AIR 面（`play`/`pause`/`resume`/`seek`/`close`、`onMetaData`、`NetStream.Play.Start`/`Buffer.Full`/`Play.Stop`/`Play.Failed`、`Video.attachNetStream` 上屏）已实现，解码走 FFmpeg（`vendor/video_glue.c` 纯 C seam + 生成 C 里的状态机），**按需注入**并有 `video`/`video-formats`/`video-backend` 与 `--video`/`--no-video` 开关；缺口如实保留在 V2（`Buffer.Empty`/`Buffer.Flush` 的完整缓冲状态面、`StageVideo`、`publish`/编码）、V3（Windows D3D11VA 硬解、传输面）与 V4（三端硬解替换软解）
   - **2026-11-11 视频调研完成，未排期**（[`docs/zh-cn/video.md`](docs/zh-cn/video.md) / [`docs/en/video.md`](docs/en/video.md)）：现状是**响亮地零支持**——`NetStream_play()` 直接 `as_throw`「media transport and FLV decoding are not supported」，`Video_attachNetStream()` 是空函数，全仓无解复用器/解码器/视频时钟。**已裁决选型 = FFmpeg 裁剪**（`--disable-everything` + 只留 `mov`/`flv` demuxer 与 `h264`/`aac`/`mp3`/`vp6f` decoder，静态增量 1.5–3 MB 量级）；理由是一套代码覆盖 macOS/Windows/Linux + 格式面一次到位；**但长期应被硬解替换**（V4，`as_video_decode_*` 换实现、AS3 侧不改），三条依据见 `video.md` §4.3：体积对 34 KB 产物是 50–90× 膨胀、专利费归属、**零拷贝**（软解 720p NV12 每帧上传 GPU 约 41 MB/s 且串行在渲染线程）；且平台代码是**两套不是三套**（web 走浏览器、WASI 报错）。**两条必须一起读的约束**：①FFmpeg 是 **LGPL-2.1+**，静态链接分发触发 §6「可重新链接」义务，且 **LGPL 不授予 H.264/AAC 专利许可**（硬解时该风险在 OS 厂商，软解时落回我们自己）；②**web 目标默认不编 FFmpeg**，走浏览器 `<video>`/`WebCodecs`，用清单 `targets.<target>` 分层区分。渲染侧**不需要新工作**：YUV 直通（[`docs/zh-cn/yuv-direct-render.md`](docs/zh-cn/yuv-direct-render.md)）四端都已具备。属**补遗留**（AIR 有、我们没有），`NetStream.publish`（编码）/`StageVideo`/HEVC/AV1/VP9 明确延后或列为增强。
 - [x] `flash.ui`：**Keyboard**（键码常量子集 + `isAccessible`）、**Mouse**（静态 `hide`/`show` + 只读 `cursor`/`supportsCursor`/`supportsNativeCursor`）
 
@@ -21332,6 +21333,24 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
+
+### 阶段三百九十八：视频 V1 —— FFmpeg 解复用/解码 + 生成 C 里的 NetStream/Video 状态机（v0.4.372 → v0.4.373）
+
+- **做了什么**：`flash.net.NetConnection` / `flash.net.NetStream` / `flash.media.Video` 的 AIR 面落地：
+  `play`/`pause`/`resume`/`seek`/`close`、`onMetaData`、`NetStream.Play.Start|Buffer.Full|Play.Stop|Play.Failed`、
+  `Video.attachNetStream` 上屏。解码在 `vendor/video_glue.c`（纯 C 的 FFmpeg seam，整数句柄、不知 GC 与事件），
+  AS3 语义（事件、client 回调、对象生命周期、时钟/节拍）全在 `src/emit.ts` 生成的状态机里；
+  `as_ns_tick()` 挂在帧边界（与 timer/MovieClip 同一点），活着的 NetStream 是 GC 根。
+- **按需链接**：构建层按「程序是否用到 `NetStream`/`Video`」口径探测（刻意过度近似），
+  `video`/`video-formats`/`video-backend` + `--video`/`--no-video` 控制；没有 FFmpeg 后端的构建里
+  `play()` **响亮抛出**「not implemented by this build」，绝不假装在播；坏文件/坏容器走异步 `NetStream.Play.Failed`。
+- **踩过的坑**（详见 [`docs/zh-cn/video.md`](docs/zh-cn/video.md) §16.4）：节奏检查必须在取包**之前**（否则手泵一帧就吃掉整段）；
+  单个 pending 槽改成 8 帧 FIFO（否则 `NetStream.time` 冻在 0）；`v->vc == NULL` 时不许调 `avcodec_receive_frame`（纯音频段错误）；
+  MPEG-TS 的广播起始时间要减掉 `v_start`；`Play.Stop` 用一帧周期（上限 200 ms）容差；`getTimer()` 的 epoch 在 `main` 里就锚定。
+- **验收**：`examples/video/` 31 条断言全绿（mp4/flv/ts/mkv + 纯音频 mp3），`test/unit/video.ts` 20 条源级钉子。
+- 附带修掉一个**Windows 独有**的 codegen 缺陷：标识符下划线转义可能落到 MS 兼容关键字上
+  （第 65 个 `with` 临时量 `w64 → _w64 → __w64`，clang 的 MS 模式把 `__w64` 当关键字），
+  现在 `C_MS_COMPAT_KEYWORDS` 命中再加一个下划线，见 [`docs/zh-cn/c-naming.md`](docs/zh-cn/c-naming.md) §7。
 
 ### 阶段三百九十七：对象缓存 —— 没变的源不必重编（v0.4.371 → v0.4.372）
 

@@ -241,6 +241,14 @@ class Widget {
 否则会自锁死循环。于是 `var o:Object` → `Object* _o`、形参 `_this` → `__this`、`_once0` → `__once0`，
 而接收者仍是字面 `o`/`_this`（它们是**原样发射**的，从不经过 `cIdent`）。
 
+**残余：加下划线可能正好落进关键字（2026-11-13 实测）。** `w64` → `_w64` → `__w64`，而 clang 的
+MS 兼容模式把 `__w64` 当**关键字**（`error: expected identifier or '('`），macOS 上它只是普通标识符——
+于是这是一个**只在 Windows 红**的编译失败。命中者是 `examples/with-fn-class-regexp.as` 的第 65 个
+`with` 临时名（`as_class* __w64 = &KC_cls;`）。修法：候选落进 `C_MS_COMPAT_KEYWORDS`（`__w64`/`__int8`/
+`__ptr64`/`__declspec` 一族，见 `symbols.ts`）时改用**后缀** `_`，即 `__w64_`。**注意表里为什么没有它**：
+这类拼写是**关键字**，不是头文件里的函数声明，`-dM -E`/`-ast-dump` 那一套机器生成方式抓不到；
+而 `__` 前缀的名字又被 `plausible()` 整体排除（没人会在 AS3 里写 `__w64`）。钉住：
+`unit: emit/GeneratedNameReservation` 的两条（改回纯 `_` 前缀即转红）与 `examples/with-fn-class-regexp.as`。
 **红线：只改 C 侧拼写，AS3 侧一个字都不能动。** 反射表（`as_prop.name` / AMF 成员表 / `for-in` 的 key）
 存的是**原字符串**，所以 `w["o"]`、序列化、`describeType` 仍必须看到 `o` —— 这正是
 `examples/ident-collide.as` + `unit: emit/GeneratedNameReservation` 钉住的不变量（改回不保留生成名时

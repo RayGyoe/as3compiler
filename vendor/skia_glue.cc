@@ -1439,6 +1439,41 @@ void* sk_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, 
   return image.release();  // caller owns one ref (or NULL on failure)
 }
 
+// Video decode (vendor/video_glue.c): the SAME entry point as sk_image_from_yuv,
+// but with three things a decoder frame actually has and the ANE path did not:
+//   * per-plane row strides (FFmpeg pads rows to its own alignment, so a decoded
+//     plane is NOT w bytes per row),
+//   * the frame's own colour matrix/range (AVFrame.colorspace/color_range; see
+//     docs/zh-cn/video.md §10.3 -- hard-coding BT.601 limited is the ANE calibration,
+//     not a video file's),
+//   * no assumption of tightly-packed I420, because the caller may hand us a
+//     converted buffer with padding.
+// 'yuvCs' is an SkYUVColorSpace value (0..9). Kept as an int so the C glue never
+// includes Skia headers.
+void* sk_image_from_yuv_strided(void* ctx, const void* y, int sy, const void* u,
+                                int su, const void* v, int sv, int w, int h, int yuvCs) {
+  if (ctx == nullptr || y == nullptr || u == nullptr || v == nullptr) return nullptr;
+  if (w <= 0 || h <= 0 || (w & 1) || (h & 1)) return nullptr;
+  if (yuvCs < 0 || yuvCs > (int)kLastEnum_SkYUVColorSpace) yuvCs = kRec601_Limited_SkYUVColorSpace;
+  SkYUVAInfo info(SkISize::Make(w, h),
+                  SkYUVAInfo::PlaneConfig::kY_U_V,
+                  SkYUVAInfo::Subsampling::k420,
+                  (SkYUVColorSpace)yuvCs);
+  SkPixmap planes[SkYUVAInfo::kMaxPlanes];
+  planes[0] = SkPixmap(SkImageInfo::Make(w, h, kGray_8_SkColorType, kOpaque_SkAlphaType),
+                       y, (size_t)sy);
+  planes[1] = SkPixmap(SkImageInfo::Make(w / 2, h / 2, kGray_8_SkColorType, kOpaque_SkAlphaType),
+                       u, (size_t)su);
+  planes[2] = SkPixmap(SkImageInfo::Make(w / 2, h / 2, kGray_8_SkColorType, kOpaque_SkAlphaType),
+                       v, (size_t)sv);
+  SkYUVAPixmaps pixmaps = SkYUVAPixmaps::FromExternalPixmaps(info, planes);
+  if (!pixmaps.isValid()) return nullptr;
+  // Copies into GPU textures here, so the CPU planes may be released (or reused by
+  // the decoder) the moment this returns -- which is exactly what video_glue does.
+  auto image = SkImages::TextureFromYUVAPixmaps(static_cast<GrRecordingContext*>(ctx), pixmaps);
+  return image.release();  // caller owns one ref (or NULL when there is no GPU context)
+}
+
 void* sk_image_from_file(const char* path) {
   auto data = SkData::MakeFromFileName(path);
   if (!data) return nullptr;

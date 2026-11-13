@@ -568,6 +568,14 @@ static double as_now_ms(void) {
 // the Unix epoch. Subtracting the process start time keeps it within int range
 // (the raw epoch milliseconds would overflow int immediately).
 static double as_start_ms = 0;
+// Anchor the epoch in main(), NOT lazily on the first getTimer() call. A program whose
+// first read of the clock happens seconds in (a player that only stamps the end of
+// playback) used to see getTimer() == 0 at that moment, because the lazy initialisation
+// measured the gap from itself. getTimer() is "ms since the process started", so the
+// start is measured once, at start.
+static void as_clock_init(void) {
+    if (as_start_ms == 0) as_start_ms = as_now_ms();
+}
 static int as_getTimer(void) {
     if (as_start_ms == 0) as_start_ms = as_now_ms();
     return (int)(as_now_ms() - as_start_ms);
@@ -11319,6 +11327,37 @@ extern void* sk_image_from_bytes(const void* data, size_t len);
 // Runtime pixel buffer (straight 0xAARRGGBB uint32 words) -> SkImage copy; the
 // channel-order/alpha reasoning lives in skia_glue.cc next to the read-back.
 extern void* sk_image_from_argb(const void* px, int w, int h);
+// The active GPU backend's GrRecordingContext, or NULL on a CPU-raster/pure-C
+// build. TWO consumers need it: YUV direct render (ASC_USE_YUV420) and the video
+// decoder (vendor/video_glue.c uploads decoded YUV planes straight to a texture),
+// so the getter is declared and defined for EVERY build rather than under the YUV
+// switch -- with no context the video path falls back to one BGRA copy, which is
+// slower but correct (docs/zh-cn/video.md §10.1).
+#ifdef ASC_RENDER_GPU
+extern void* sk_gr_get_context(void);
+#endif
+#ifdef ASC_RENDER_METAL
+extern void* sk_metal_get_context(void);
+#endif
+#ifdef ASC_RENDER_D3D
+extern void* sk_d3d_get_context(void);
+#endif
+#ifdef ASC_RENDER_GL
+extern void* sk_gl_get_context(void);
+#endif
+static inline void* as_skia_gr_context(void) {
+#ifdef ASC_RENDER_GPU
+    return sk_gr_get_context();
+#elif defined(ASC_RENDER_METAL)
+    return sk_metal_get_context();
+#elif defined(ASC_RENDER_D3D)
+    return sk_d3d_get_context();
+#elif defined(ASC_RENDER_GL)
+    return sk_gl_get_context();
+#else
+    return NULL;
+#endif
+}
 #ifdef ASC_USE_YUV420
 // YUV direct render (E20): the C++ glue turns I420 planes into a GPU texture
 // (SkImages::TextureFromYUVAPixmaps, BT.601 video range). The context getters are
@@ -11569,19 +11608,6 @@ static inline void* as_skia_image_from_yuv(void* ctx, const void* y, const void*
     // I420 planes are w*h*1.5 bytes; the image wraps them, it does not copy.
     as_mem_track(img, (w > 0 && h > 0) ? (double)w * (double)h * 1.5 : 0.0, AS_MEM_IMG_OTHER);
     return img;
-}
-static inline void* as_skia_gr_context(void) {
-#ifdef ASC_RENDER_GPU
-    return sk_gr_get_context();
-#elif defined(ASC_RENDER_METAL)
-    return sk_metal_get_context();
-#elif defined(ASC_RENDER_D3D)
-    return sk_d3d_get_context();
-#elif defined(ASC_RENDER_GL)
-    return sk_gl_get_context();
-#else
-    return NULL;
-#endif
 }
 static void as_yuv_cpu_warn(void) {
     static int warned = 0;
@@ -12481,12 +12507,14 @@ static inline void as_skia_paint_set_stroke_params(void* p, int cap, int join, d
 static inline void as_skia_paint_set_color_matrix(void* p, const float* m20) { (void)p; (void)m20; }
 static inline void* as_skia_image_from_file(const char* path) { (void)path; return NULL; }
 static inline void* as_skia_image_from_argb(const void* px, int w, int h) { (void)px; (void)w; (void)h; return NULL; }
+// No Skia means no GPU context either, so the video decoder's texture upload is a
+// no-op here and vendor/video_glue.c takes its BGRA copy path (video.md §10.1).
+static inline void* as_skia_gr_context(void) { return NULL; }
 #ifdef ASC_USE_YUV420
 // Pure-C build has no Skia and no GPU context: YUV direct render cannot produce an
 // image, so the caller (as_bmd_live_image) warns once and renders black — the same
 // loud-but-safe fallback as the CPU-raster+Skia build.
 static inline void* as_skia_image_from_yuv(void* ctx, const void* y, const void* u, const void* v, int w, int h) { (void)ctx; (void)y; (void)u; (void)v; (void)w; (void)h; return NULL; }
-static inline void* as_skia_gr_context(void) { return NULL; }
 static void as_yuv_cpu_warn(void) {
     static int warned = 0;
     if (warned) return;
@@ -19164,6 +19192,59 @@ static as_value as_amf_read_object(const unsigned char* data, size_t len, size_t
     free(r.objs);
     return v;
 }
+
+// ---------- video backend ABI (FFmpeg, vendor/video_glue.c) ----------
+// Same shape as the SQLite seam below: the AS3 NetStream/Video layer is emitted for
+// EVERY build (its constructor rejections and Video's rect are AIR semantics, not
+// backend behaviour), but the demuxer/decoder behind these entry points only exists
+// when the program actually plays video -- then the compiler adds -DASC_HAVE_VIDEO,
+// vendor/video_glue.c and libav* to the link (docs/zh-cn/video.md §5).
+//
+// Without the flag the stubs answer "no backend" and NetStream.play() reports it as
+// an Error, which is the LOUD branch §5.7 asks for -- never a silent black frame.
+// as_video_open's -2 (not -1) is what distinguishes "this build cannot play video"
+// from "this particular file/URL failed to open".
+#define AS_VIDEO_ST_OPEN 1
+#define AS_VIDEO_ST_PLAYING 2
+#define AS_VIDEO_ST_PAUSED 4
+#define AS_VIDEO_ST_ENDED 8
+#define AS_VIDEO_ST_FAILED 16
+#ifdef ASC_HAVE_VIDEO
+extern int as_video_open(const char* url, const char* backend, const char* formats, char* errbuf, int errlen);
+extern void as_video_info(int id, int* w, int* h, double* duration_ms, double* fps, int* has_audio);
+extern void as_video_play(int id, double now_ms, double vol);
+extern void as_video_set_paused(int id, int paused, double now_ms);
+extern double as_video_time(int id);
+extern int as_video_tick(int id, void* grctx, double now_ms);
+extern int as_video_state(int id);
+extern void* as_video_frame(int id);
+extern void as_video_seek(int id, double seconds, double now_ms);
+extern void as_video_close(int id);
+extern const char* as_video_error(int id);
+// The message NetStream.play() throws when a build has no video backend at all.
+#define AS_VIDEO_ABSENT_MSG ""
+#else
+static int as_video_open(const char* url, const char* backend, const char* formats, char* errbuf, int errlen) {
+    (void)url; (void)backend; (void)formats;
+    if (errbuf != NULL && errlen > 0)
+        snprintf(errbuf, (size_t)errlen, "video playback requires an FFmpeg-linked build (docs/zh-cn/video.md 5.7)");
+    return -2;
+}
+static void as_video_info(int id, int* w, int* h, double* duration_ms, double* fps, int* has_audio) {
+    (void)id;
+    if (w) *w = 0; if (h) *h = 0; if (duration_ms) *duration_ms = 0;
+    if (fps) *fps = 0; if (has_audio) *has_audio = 0;
+}
+static void as_video_play(int id, double now_ms, double vol) { (void)id; (void)now_ms; (void)vol; }
+static void as_video_set_paused(int id, int paused, double now_ms) { (void)id; (void)paused; (void)now_ms; }
+static double as_video_time(int id) { (void)id; return 0.0; }
+static int as_video_tick(int id, void* grctx, double now_ms) { (void)id; (void)grctx; (void)now_ms; return AS_VIDEO_ST_FAILED; }
+static int as_video_state(int id) { (void)id; return AS_VIDEO_ST_FAILED; }
+static void* as_video_frame(int id) { (void)id; return NULL; }
+static void as_video_seek(int id, double seconds, double now_ms) { (void)id; (void)seconds; (void)now_ms; }
+static void as_video_close(int id) { (void)id; }
+static const char* as_video_error(int id) { (void)id; return ""; }
+#endif
 
 // ---------- flash.data engine ABI (SQLite) ----------
 // The AS3 flash.data layer (SQLConnection/SQLStatement/SQLResult) is emitted for
