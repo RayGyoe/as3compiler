@@ -21334,6 +21334,83 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
 
+### 阶段四百：V3 第一步——D3D11VA 真正接通，而默认仍是软解（v0.4.374 → v0.4.375）
+
+V3 的第一个目标是把硬解**接通并验证**，而不是“改个开关宣称硬解”。这一步先碰到了一个上游陷阱：
+`n9.0.2` 里 `d3d11va` 与 `d3d11va2` 两个 configure 名字注册的像素格式**与名字暗示相反**
+（`libavcodec/hwconfig.h`）：后者才实现 `AV_PIX_FMT_D3D11`，但解码器把该格式加进候选列表的 `#if`
+用的是**前者**（`h264_slice.c:108-111`、`hevc/hevcdec.c:613`、`av1dec.c:587`、`mpeg12dec.c:811`、
+`vc1dec.c:59`）。于是“只开一个”的两种失败互不相同，均实测：只 `d3d11va` → hw_config 里只有
+`dxva2_vld`/`d3d11va_vld`，`avctx->hwaccel` 始终 NULL、首次 `get_buffer` 失败；只 `d3d11va2` →
+hw_config 有 `pix_fmt=d3d11` 但 `get_format` 收到的仍是 `yuv420p`（格式没进列表，静默留在软解）。
+现在两个都开，探针实测 `[2] device=d3d11va pix_fmt=d3d11 methods=0x3` 且
+`av_hwdevice_ctx_create` 返回 0；`vendor/ffmpeg/lib/windows-{x64,x86}/*.lib` 两个位宽都已重编更新
+（x86 的脚本自带 `ARCH_X86_32` 断言，不会把位宽搞错）。
+
+**运行时**（`vendor/video_glue.c`，仍然纯 C、不碰 Skia/事件层）：`as_video_hw_setup()` 只在编解码器
+自己报告 `HW_DEVICE_CTX` 且设备创建成功时才挂 `hw_device_ctx`；`as_video_get_format()` 优先
+`AV_PIX_FMT_D3D11`，没有就取第一个**非 hwaccel** 格式（返回 `list[0]` 会拿到 `dxva2_vld`，FFmpeg 报
+`does not match the type of the provided device context`）；出帧后 `av_hwframe_transfer_data` + **必填的**
+`av_frame_copy_props`（只分配缓冲不搬 props，漏了则每帧 pts 为 0、`NetStream.time` 冻在 0.000）。
+开关是**显式 opt-in**：`AS_VIDEO_DECODE=hw|d3d11va|auto`；`AS_VIDEO_STATS=1` 多出 `decode=` 与 `hw=`
+（回读耗时）。
+
+**实测结论——默认保持软解，这是实测而不是口味**（同一份 4K HDR10+ 素材、同一支 exe、真窗口、60 Hz、20 s）：
+
+| | 每帧成本 | 应用帧 | 最差帧间隔 |
+|---|---|---|---|
+| 软解（默认，`threads=8`） | `dec≈0` + `conv=6.49` + `upload=0.56` ≈ **7.0 ms** | 1121/19.1 s（58.7 fps） | **44 ms** |
+| 硬解（`d3d11va`） | `hw=11.17` + `conv=3.33` + `upload=0.40` ≈ **14.9 ms** | 1130/19.3 s（58.5 fps） | **103 ms** |
+
+硬解 + 回读在本机**比 8 线程软解慢一倍**，代价全在 `AV_PIX_FMT_D3D11 → 系统内存`（4K P010 一帧
+≈12 MB，含 driver 同步）；而软解那 7 ms 里根本没有解码的份（被线程隐藏）。所以硬解要赢只有
+**不回读**一条路，也就是 sketch 化的 V3 第二步：`ID3D11Device5` + `SHARED_NTHANDLE` 纹理 + fence、
+D3D12 `OpenSharedHandle`、Y/UV 两个 plane 各自 R8/RG8 视图喂 `SkImages::TextureFromYUVATextures`、
+`releaseProc` 逆序释放（见 video.md §10.2 的生命周期闭环）。
+
+**回归面**：`unit: video/` 从 28 钉增到 **33 钉**（两个 d3d11va 名字都在；硬解默认关闭；`get_format`
+回退只取软件格式；回读后 `av_frame_copy_props` 在位；stats 报 `decode=`/`hw=`）。
+`examples/video-headless.as` 在
+软解与 `AS_VIDEO_DECODE=hw` 两种模式下都是 **24 passed, 0 failed**。
+
+### 阶段三百九十九：4K HDR10+ 播不动——四处独立代价，外加一条视频面的假绿（v0.4.373 → v0.4.374）
+
+用户报「选这个视频卡到不行」：`The.Furious.2026.2160p…HDR10+.H.265`，3832×1592 HEVC Main10、
+DDP 5.1 Atmos、20.9 GB、23.976 fps。实测下来**没有一处是「缺硬解」**，是四处各管一段的代价：
+
+1. `AVCodecContext.thread_count` 停在 FFmpeg 默认的 **1**：单线程 4K 10-bit HEVC 是 8.8 ms/帧，
+   正好压在帧边界上。改按 `av_cpu_count()` 开 frame+slice 线程、**上限 8**（frame threading 每线程
+   持一帧 ≈18 MB，32 线程会钉住 ~580 MB）。
+2. CPU 回落路径**转换两次**：先 sws→I420 去喂一个不存在的 GPU 上传，再 sws→BGRA，12 ms + 6 ms/帧。
+   改由 `want_gpu = (grctx != NULL)` 决定**单条**路径。
+3. 示例用 AIR 默认 `Stage.frameRate = 24`，而画面推进挂在帧边界 —— 23.976 的素材每个应用帧只够一帧，
+   任何一次迟到就重复显示 → 结构性抖动。示例改 60；4K 素材窗口循环 **16.5 → 56 fps**。
+4. 窗口是 CPU 光栅（清单没开 `ASC_RENDER_WINGPU`）：4K 帧在 CPU 上缩放、整帧 24 MB 拷进 SDL 纹理，
+   上传 3.0 ms/帧。Windows 清单加 `ASC_RENDER_WINGPU`/`ASC_RENDER_D3D` + `d3d_glue.cc`，YUV 三平面
+   直接进 D3D12 纹理，上传 **0.56 ms/帧**。
+
+修复后连续 20 s：`appFrames=1179 (58.5 fps) worst=46ms`、`video_frames=484 (24.2 fps)`、
+`time` 与墙钟差 0.5% 内、`cost/frame: dec≈0.00 conv=6.13 upload=0.56`。诊断信息加成
+`AS_VIDEO_STATS=1` 的 `cost/frame: dec/conv/upload`（用 `av_gettime_relative`，Windows 的
+`gettimeofday` 有 15.6 ms 地板）。
+
+**顺带修掉一条假绿**（同一轮发现的）：套件里 `video/` 一直报 PASS，但它跑的是**没带清单**的构建
+——窗口开不出来，`showWindow()` 立刻返回，`8 passed, 5 failed` 照样以退出码 0 结束。视频面
+等于零自动覆盖。现在：`examples/video-headless.as`（24 条断言、手推 `Stage.dispatchFrame()`、
+`System.exit` 按失败数结算）进池子并带真清单；`VideoPlayer.as` 是给人用的播放器（自检完窗口不关），
+进 `SKIP_DIRS` 只做 compile+link（与 `audio/`、`native-window.as` 同一手法）。口径见
+[`docs/zh-cn/video.md`](docs/zh-cn/video.md) §16.5/§16.7。
+
+**没做**：把 sws+上传搬进工作线程（`sk_image_from_yuv_strided` 只能在持有帧边界的线程上调，
+要做得让工作线程只产 I420 + 环形缓冲），以及硬解（V2/V3）。当前 6.7 ms/帧的余量够 4K@24。
+`unit: video/` 26 → 28 钉（新增两条钉子：无头回归必须带真清单且 `video` 在 SKIP_DIRS；无头示例
+必须自己结算退出码）。
+
+**回归面**：全量 `node test.ts` 一次跑完 **675 用例 / 662 pass / 10 fail / 3 skip**，10 条红与
+6b4812a 基线**逐条同名**（ane-app、htmltext-metrics、native-shader-probe、socket、stage64、
+stage94d、status-item、text-underline + unit inline/HotPath、desktop/native drag），均为主机/
+工具链差异；新增的 `video-headless.as`、`video/ (compile+link)`、`unit: video/` 全绿。
+
 ### 阶段三百九十八：视频 V1 —— FFmpeg 解复用/解码 + 生成 C 里的 NetStream/Video 状态机（v0.4.372 → v0.4.373）
 
 - **做了什么**：`flash.net.NetConnection` / `flash.net.NetStream` / `flash.media.Video` 的 AIR 面落地：

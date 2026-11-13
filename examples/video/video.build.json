@@ -10,7 +10,8 @@
     "../../vendor/skia_glue.cc",
     "../../vendor/window_glue.cc",
     "../../vendor/audio_glue.c",
-    "../../vendor/video_glue.c"
+    "../../vendor/video_glue.c",
+    "${win:../../vendor/d3d_glue.cc}"
   ],
   "include-paths": [
     "../../vendor/skia",
@@ -87,7 +88,9 @@
   "defines": [
     "ASC_USE_SKIA=1",
     "ASC_USE_WINDOW=1",
-    "ASC_HAVE_AUDIO=1"
+    "ASC_HAVE_AUDIO=1",
+    "${win:ASC_RENDER_WINGPU=1}",
+    "${win:ASC_RENDER_D3D=1}"
   ],
   "objects": []
 }

@@ -232,7 +232,27 @@ case "$PLAT" in
     # Only hwaccels that exist on the d3d side: h263/mpeg1/mpeg4/prores have VideoToolbox
     # hwaccels but no d3d11va/dxva2 counterpart in n9 (hwaccels.h is the reference), so they
     # are deliberately absent rather than requested-and-dropped.
+    #
+    # The suffix is `d3d11va2`, NOT `d3d11va`: in n9.0.2 the two configure names register the
+    # *opposite* pixel formats of what their names suggest (libavcodec/hwconfig.h):
+    #
+    #   #define HWACCEL_D3D11VA2(codec) HW_CONFIG_HWACCEL(1, 1, 0, D3D11,       D3D11VA, ff_..._d3d11va2_hwaccel)
+    #   #define HWACCEL_D3D11VA(codec)  HW_CONFIG_HWACCEL(0, 0, 1, D3D11VA_VLD, NONE,    ff_..._d3d11va_hwaccel)
+    #
+    # i.e. `h264_d3d11va2` is the implementation that handles AV_PIX_FMT_D3D11, and
+    # `h264_d3d11va` the legacy one over AV_PIX_FMT_D3D11VA_VLD.
+    #
+    # BOTH are requested, and that is not belt-and-braces: the decoder-side format list
+    # adds AV_PIX_FMT_D3D11 under the LEGACY macro while the implementation is compiled
+    # under the D3D11VA2 one (libavcodec/h264_slice.c:108-111, hevc/hevcdec.c:613,
+    # av1dec.c:587, mpeg12dec.c:811, vc1dec.c:59 all use CONFIG_*_D3D11VA_HWACCEL for
+    # both entries). With only D3D11VA2 the format is never offered (measured: get_format
+    # received yuv420p only, decode stayed software); with only D3D11VA it is offered and
+    # nothing implements it (measured earlier: avctx->hwaccel stayed NULL and the first
+    # get_buffer died). Enable both, then verify with avcodec_get_hw_config() -- docs
+    # /zh-cn/video.md §16.8 has the probe.
     add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" d3d11va
+    add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" d3d11va2
     add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" dxva2
     add_accel d3d11va
     add_accel dxva2

@@ -28,6 +28,11 @@
 //
 // 没有音频设备的主机（`SoundMixer.areSoundsInaccessible()`）不会静默假装：
 // 音频那组断言整组跳过并**打印原因**，视频那组照跑（AGENTS.md §1.5）。
+//
+// 第五个按钮 **Open file…** 是给人用的：它开原生文件对话框（`File.browseForOpen`，
+// 后端在 vendor/file_dialog_win.cc / file_dialog_macos.mm），选中后把该 File 的
+// nativePath 交给同一个 NetStream 播——**任意**本地音视频文件，不限于夹具。
+// 自检还在跑的时候按下它不会打断自检：选择先记下来，等 summarize() 之后才播。
 import flash.display.Bitmap;
 import flash.display.BitmapData;
 import flash.display.Shape;
@@ -36,9 +41,11 @@ import flash.display.Stage;
 import flash.events.Event;
 import flash.events.MouseEvent;
 import flash.events.NetStatusEvent;
+import flash.filesystem.File;
 import flash.media.SoundMixer;
 import flash.media.SoundTransform;
 import flash.media.Video;
+import flash.net.FileFilter;
 import flash.net.NetConnection;
 import flash.net.NetStream;
 import flash.text.TextField;
@@ -65,6 +72,15 @@ function near(a:Number, b:Number, tol:Number):Boolean {
 var WIN_W:Number = 480;
 var WIN_H:Number = 400;
 var stage:Stage = new Stage();
+// 帧时钟 60Hz，不是 AIR 默认的 24。
+//
+// NetStream 的画面推进挂在**帧边界**（Stage_dispatchFrame 里的 as_ns_tick，和定时器、
+// MovieClip 同一个安全点，docs/zh-cn/video.md §10.2）。所以画面能换帧的最快速度就是
+// Stage.frameRate：24 的默认值对 23.976 的片子只是「刚好每个应用帧出一帧」，任何一次
+// 迟到就显示两遍同一帧，观感是持续抖动；换 60 之后每个片子帧有 2–3 个应用帧可落脚，
+// 4K 素材实测（3832x1592 10-bit HEVC）窗口循环从 16.5 fps 升到 56 fps。
+// 这不是本示例的怪癖：播视频的窗口程序都该把 frameRate 提到 60（§16.5 有实测表）。
+stage.frameRate = 60;
 var VIDEO_W:int = 320;      // 夹具的原生尺寸：Video 的 width/height 是我们给的**表面**尺寸，
 var VIDEO_H:int = 240;      // videoWidth/videoHeight 才是解码出来的画面尺寸（两者必须分开看）
 var CLIP:String = "examples/video/media/clip.mp4";
@@ -136,7 +152,7 @@ ns.addEventListener(NetStatusEvent.NET_STATUS, function(e:NetStatusEvent):void {
 });
 
 // ---------------------------------------------------------------------------
-// UI：Video 本体 + 一行状态 + 四个按钮（点一下就能手验 pause/seek/重播）
+// UI：Video 本体 + 一行状态 + 五个按钮（pause/重播/seek/换容器/开本地文件）
 // ---------------------------------------------------------------------------
 var statusTf:TextField = new TextField();
 function mkTf(size:int, color:uint, y:Number):TextField {
@@ -169,15 +185,26 @@ titleTf.text = "TalkMED AOT video player -- NetStream / Video over FFmpeg";
 var infoTf:TextField = mkTf(12, 0x37474F, 300);
 var posTf:TextField = mkTf(12, 0x00695C, 318);
 var hintTf:TextField = mkTf(11, 0x607D8B, 338);
-hintTf.text = "click the buttons: Pause / Restart / Seek 0.6s / Play FLV -- the picture is the decoded frame";
+hintTf.text = "buttons: Pause / Restart / Seek 0.6s / FLV / Open file... -- the picture is the decoded frame";
 
 var paused:Boolean = false;
+var sourceName:String = "clip.mp4";   // what infoTf shows: the fixture, or the picked file
+function playSource(path:String):void {
+  var cut:int = path.lastIndexOf("/");
+  var cut2:int = path.lastIndexOf("\\");
+  if (cut2 > cut) cut = cut2;
+  sourceName = cut >= 0 ? path.substring(cut + 1) : path;
+  paused = false;
+  meta = null;          // a new file has its own header; "?" until onMetaData
+  codes = [];
+  trace("video-player: play " + path);
+  ns.play(path);
+}
 function doPause():void {
   if (paused) { ns.resume(); paused = false; } else { ns.pause(); paused = true; }
 }
 function doRestart():void {
-  paused = false;
-  ns.play(CLIP);
+  playSource(CLIP);
 }
 function doSeek():void {
   paused = false;
@@ -185,25 +212,63 @@ function doSeek():void {
 }
 var flvMode:Boolean = false;
 function doFlv():void {
-  paused = false;
   flvMode = !flvMode;
-  ns.play(flvMode ? CLIP_FLV : CLIP);
+  playSource(flvMode ? CLIP_FLV : CLIP);
 }
+
+// ---------------------------------------------------------------------------
+// Open file…：原生文件对话框 → 把选中的本地文件交给同一个 NetStream
+// ---------------------------------------------------------------------------
+// AIR 的契约：`File.browseForOpen()` 返回 void；面板关闭后**这个 File 对象本身**
+// 就是选中项（nativePath 已被写入），并在它身上派发 Event.SELECT；取消派发
+// Event.CANCEL（此时对象仍无路径）。面板是原生窗口，跑在别的线程上（Windows）或
+// 由平台模态泵接管（macOS），主帧循环不停——结果在帧边界由 as_file_dialog_tick()
+// 取回，和定时器同一个安全点。
+//
+// 自检还在跑时按下它：只记录、不播。否则用户选的文件会抢走自检正在测的 ns
+// （两条流还要争 AS_VIDEO_MAX 槽位与混音器），把断言搅红。
+var picker:File = new File();
+var pendingOpen:String = null;
+var scriptedDone:Boolean = false;
+
+function doOpen():void {
+  picker.browseForOpen("Choose a video or audio file to play", [
+    new FileFilter("Video / audio",
+      "*.mp4;*.mov;*.m4v;*.flv;*.ts;*.mkv;*.webm;*.mp3;*.m4a;*.aac;*.wav;*.ogg", null),
+    new FileFilter("All files", "*.*", null)
+  ]);
+}
+picker.addEventListener(Event.SELECT, function(e:Event):void {
+  var path:String = picker.nativePath;
+  if (!scriptedDone) {
+    pendingOpen = path;
+    trace("video-player: picked " + path + " -- queued until the scripted checks finish");
+    hintTf.text = "queued: " + picker.name + " (plays when the scripted checks end)";
+    return;
+  }
+  playSource(path);
+  hintTf.text = "playing " + picker.name + " -- Pause / Seek / Open file… still work";
+});
+picker.addEventListener(Event.CANCEL, function(e:Event):void {
+  trace("video-player: file dialog cancelled -- still playing " + sourceName);
+});
 
 stage.addChild(titleTf);
 stage.addChild(video);
 stage.addChild(infoTf);
 stage.addChild(posTf);
 stage.addChild(hintTf);
-stage.addChild(mkButton("Pause", 16, 364, 78, 0x1565C0, function(e:MouseEvent):void { doPause(); }));
-stage.addChild(mkButton("Restart", 100, 364, 78, 0x2E7D32, function(e:MouseEvent):void { doRestart(); }));
-stage.addChild(mkButton("Seek 0.6s", 184, 364, 90, 0x5D4037, function(e:MouseEvent):void { doSeek(); }));
-stage.addChild(mkButton("FLV / MP4", 280, 364, 90, 0x6A1B9A, function(e:MouseEvent):void { doFlv(); }));
+stage.addChild(mkButton("Pause", 16, 364, 70, 0x1565C0, function(e:MouseEvent):void { doPause(); }));
+stage.addChild(mkButton("Restart", 92, 364, 70, 0x2E7D32, function(e:MouseEvent):void { doRestart(); }));
+stage.addChild(mkButton("Seek 0.6s", 168, 364, 82, 0x5D4037, function(e:MouseEvent):void { doSeek(); }));
+stage.addChild(mkButton("FLV / MP4", 256, 364, 82, 0x6A1B9A, function(e:MouseEvent):void { doFlv(); }));
+stage.addChild(mkButton("Open file...", 344, 364, 120, 0xEF6C00, function(e:MouseEvent):void { doOpen(); }));
 
 function updateUi():void {
-  infoTf.text = "time " + ns.time.toFixed(3) + "s / " + (meta != null ? Number(meta.duration).toFixed(2) : "?")
+  infoTf.text = sourceName + "   time " + ns.time.toFixed(3) + "s / "
+    + (meta != null ? Number(meta.duration).toFixed(2) : "?")
     + "s   videoWidth " + video.videoWidth + "x" + video.videoHeight
-    + "   soundTransform vol " + ns.soundTransform.volume;
+    + "   vol " + ns.soundTransform.volume;
   var frac:Number = 0;
   if (meta != null && Number(meta.duration) > 0) frac = ns.time / Number(meta.duration);
   if (frac < 0) frac = 0;
@@ -395,6 +460,16 @@ function summarize():void {
   trace("video-player: " + passed + " passed, " + failed.length + " failed");
   for (var i:int = 0; i < failed.length; i++) trace("video-player: FAILED: " + failed[i]);
   trace(failed.length == 0 ? "video-player: all assertions passed" : "video-player: FAILURES");
+  // From here on the window belongs to the user: the Open-file pick (if one was
+  // made while the checks were still running) plays now, and the buttons act on it.
+  scriptedDone = true;
+  if (pendingOpen != null) {
+    var queued:String = pendingOpen;
+    pendingOpen = null;
+    playSource(queued);
+  } else {
+    hintTf.text = "scripted checks done -- click Open file... to play any local file";
+  }
 }
 
 scriptedChecks();
@@ -402,3 +477,7 @@ scriptedChecks();
 // 阻塞在窗口事件循环里：帧时钟推进定时器，也推进 as_ns_tick() 的解码。
 stage.showWindow(WIN_W, WIN_H, "TalkMED AOT video player");
 trace("video-player: window closed  " + passed + " passed, " + failed.length + " failed");
+// 用户关窗之后才结算状态码：自检有失败就以 1 退出（AGENTS.md §2.5）。这不是本套件
+// 的判据（windowed 示例只做 compile+link，见 test/examples.ts），而是给手跑的人一个
+// 能被脚本抓住的信号——之前红着退出 0，正是「打印了 FAILED 还报 PASS」的那一半。
+if (failed.length > 0) System.exit(1);

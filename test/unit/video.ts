@@ -1,9 +1,10 @@
 // Unit checks: the video surface (flash.net.NetStream / flash.media.Video).
 //
-// The examples suite can only prove "a windowed program plays four fixtures and
-// asserts 31 things"; the invariants below are the ones a mutation breaks
-// silently, and several of them were found by measurement (docs/zh-cn/video.md
-// §16.3/§16.4 records the failure each one prevents). Re-run alone with:
+// The examples suite proves the runtime behaviour end to end (examples/video-headless.as:
+// four containers, the clock, pause/resume, the audio-only stream); the invariants below
+// are the ones a mutation breaks silently, and several of them were found by measurement
+// (docs/zh-cn/video.md §16.3/§16.4/§16.7 records the failure each one prevents). Re-run
+// alone with:
 //   node --test --test-name-pattern='video/' test/unit/*.ts
 
 import { join } from 'node:path';
@@ -86,6 +87,81 @@ function checkVideoSurface(): string[] {
     glue.includes('v->at_end') && glue.includes('1.0 / v->fps') && glue.includes('> 0.2) period = 0.2'));
   check('as_video_state reports ENDED from the flag, not from frame_pts >= duration',
     !/frame_pts \+ 0\.001 >= last/.test(glue));
+
+  // ---- per-frame cost: why a 4K HDR10+ file played at 16 fps (§16.5) ----
+  // Three separate defects sat on the same path, so each gets its own pin.
+  //
+  // (1) Decoder threads. FFmpeg's AVCodecContext defaults thread_count to 1, and a
+  // single thread decoding 3832x1592 10-bit HEVC costs ~8.8 ms per frame *inside the
+  // frame loop*, next to the paint and the timers.
+  check('the video decoder is sized for this CPU, with a cap on frame-thread memory',
+    glue.includes('av_cpu_count()') && glue.includes('v->vc->thread_count = ncpu;') &&
+    glue.includes('if (ncpu > 8) ncpu = 8;') &&
+    glue.includes('FF_THREAD_FRAME | FF_THREAD_SLICE'));
+  // (2) Priming. A thread queue of frames has to be fed before a frame-threaded
+  // decoder emits anything, so one tick's packet budget left videoWidth at 0 right
+  // after play() (measured on clip.mp4 with 8 threads: the 1.2 s file is shorter
+  // than the pipe).
+  check('priming is exempt from the per-tick packet budget',
+    /#define AS_VIDEO_PRIME_PACKETS\s+\d+/.test(glue) &&
+    /if \(v->vs >= 0 && v->n_vframes == 0\) budget = AS_VIDEO_PRIME_PACKETS;/.test(glue));
+  // (3) The CPU-raster fallback used to convert every frame TWICE: one I420 pass to
+  // feed an upload that cannot happen (no GPU context), then BGRA. 6 ms + 6 ms per
+  // 4K frame. The I420 call must therefore sit inside the want_gpu branch and BEFORE
+  // the img == NULL fallback.
+  const present = bodyOf('static int as_video_present');
+  const gpuAt = present.indexOf('if (want_gpu) {');
+  const i420At = present.indexOf('v->sws = sws_getContext');
+  const cpuAt = present.indexOf('if (img == NULL) {');
+  check('the CPU-raster fallback converts straight to BGRA (no throwaway I420 pass)',
+    present.includes('const int want_gpu = (grctx != NULL);') &&
+    gpuAt > 0 && i420At > gpuAt && cpuAt > i420At);
+  check('AS_VIDEO_STATS reports the cost split (decode / convert / upload)',
+    glue.includes('cost/frame: dec=') && glue.includes('t_conv_ms') &&
+    glue.includes('t_upload_ms') && glue.includes('t_dec_ms'));
+
+  // ---- V3 step one: D3D11VA hardware decode (§16.8) ----
+  // Pinned as four separate facts, because three of them fail *silently* if changed:
+  // the hwaccel can be attached and never selected, selected and never used, or used
+  // and lose the frame timestamps -- each with no error, only a different picture.
+  const buildScript = readNorm(join(root, 'vendor', 'provision', 'ffmpeg-static.sh'));
+  check('the FFmpeg recipe enables BOTH d3d11va names (format list and implementation)',
+    buildScript.includes('add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" d3d11va\n') &&
+    buildScript.includes('add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" d3d11va2\n'));
+  check('hardware decode is opt-in, and software stays the default',
+    glue.includes('static int as_video_hw_wanted(void)') &&
+    /if \(want == NULL \|\| want\[0\] == 0\) return 0;/.test(glue) &&
+    glue.includes('strcmp(want, "soft") == 0'));
+  check('get_format falls back to a SOFTWARE format, never to dxva2 against a D3D11 device',
+    glue.includes('AV_PIX_FMT_FLAG_HWACCEL') && glue.includes('if (pick == AV_PIX_FMT_NONE) pick = list[0];'));
+  check('a GPU frame is transferred back and keeps its props (pts/colorspace)',
+    glue.includes('av_hwframe_transfer_data(v->sw_frame, v->frame, 0)') &&
+    glue.includes('av_frame_copy_props(v->sw_frame, v->frame)'));
+  check('AS_VIDEO_STATS says which decoder ran, and what the readback cost',
+    glue.includes('decode=%s') && glue.includes('hw=%.2fms') && glue.includes('t_hw_ms'));
+  // The windowed demo: the video advances at the frame boundary, so the app frame
+  // clock is what decides smoothness (24 Hz on a 23.976 fps file aliases), and the
+  // window itself wants the GPU backend -- CPU raster scaled a 4K frame on the CPU.
+  const videoManifest = readNorm(join(root, 'examples', 'video', 'video.build.json'));
+  check('the windowed demo asks for the GPU window backend on Windows',
+    videoManifest.includes('${win:ASC_RENDER_WINGPU=1}') &&
+    videoManifest.includes('${win:ASC_RENDER_D3D=1}') &&
+    videoManifest.includes('${win:../../vendor/d3d_glue.cc}'));
+  const videoDemo = readNorm(join(root, 'examples', 'video', 'VideoPlayer.as'));
+  check('the demo runs the frame clock at 60 Hz', videoDemo.includes('stage.frameRate = 60;'));
+  // The automated regression is the HEADLESS example (阶段三百九十九). The windowed
+  // player keeps its window open for the user, so the suite can only compile+link it --
+  // and before this split the suite was green while the run printed `8 passed, 5 failed`
+  // (it built without the manifest, the window never opened, exit status was 0). Pinning
+  // the arrangement keeps a future tidy-up from silently deleting the only coverage.
+  const suite = readNorm(join(root, 'test', 'examples.ts'));
+  check('the video regression is headless and wired to the real manifest',
+    suite.includes("'video-headless.as': ['--manifest', join(dir, 'video', 'video.build.json')]") &&
+    /SKIP_DIRS = new Set\(\[[^\]]*'video'\]\)/.test(suite));
+  const headlessDemo = readNorm(join(root, 'examples', 'video-headless.as'));
+  check('the headless video example settles its exit code from its own assertions',
+    headlessDemo.includes('System.exit(failed.length == 0 ? 0 : 1)') &&
+    headlessDemo.includes('stage.dispatchFrame()'));
 
   // ---- the gate's own switches must actually reach the build config ----
   // --video/--no-video/--video-formats/--video-backend were parsed into

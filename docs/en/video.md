@@ -250,6 +250,14 @@ hwaccel, so **the software decoder is already in the binary**. Windows `d3d11va`
 "probe failed → switch back to software" is one backend swap with the demux and parsing code untouched. Doing the
 same fallback with hand-written VT/MF means maintaining two state machines.
 
+> **Where the implementation stands (2026-11-13)**: V1 is **software only** — `video-backend` accepts
+> `auto`/`soft` and they are identical, because `auto` has no hardware backend to probe yet (V2 = macOS VT +
+> `CVMetalTextureCache` zero copy, V3 = Windows D3D11VA). That does not mean "4K cannot play": software 4K
+> 10-bit HEVC measures 8.8 ms/frame on one thread and is fully hidden with 8 threads. The reported "4K stutters
+> to the point of being unwatchable" traced to converting twice + single-threaded decode + a 24 Hz frame clock +
+> CPU raster, measured and fixed item by item in §16.7. What hwaccel buys here is the 6 ms of `conv` and the CPU
+> time, not whether it plays at all.
+
 **The real pitfalls (the original list, nothing removed)**: High profile is not universally decodable
 (10-bit / 4:4:4 will fail — a fallback path is mandatory); parsing `AVCDecoderConfigurationRecord` (SPS/PPS) is
 unavoidable (software decode needs it too, so it is not extra cost); hwaccel `get_format` negotiation **silently
@@ -727,7 +735,7 @@ the native manifest carries the FFmpeg `link-libs`, the web manifest does not. T
 | Phase | Content | Acceptance |
 |---|---|---|
 | V0 | **Settle this document + trim measurement**: build each profile, measure linked size, the hwaccel marginal cost, and 1080p throughput for both decode paths | **done 2026-11-12**: numbers in §3/§7; reproducible via `vendor/provision/ffmpeg-static.sh` (tracked) |
-| V1 | **Decode seam + software + the injection gate + three format profiles**: `as_video_*` takes `backend` and `formats`; land `usesVideoCodec` / `video` / `video-formats`; containers `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`, video `h264,hevc,vp9,av1` software, audio `aac,mp3,opus,vorbis,flac`; `onMetaData` + audible audio | `examples/video.as` plays a bundled sample; item-by-item parity with `adl` (`videoWidth/Height`, `time`, `onMetaData`); **format matrix self-test**: at least one clip per container×codec yields both sound and picture; examples that do not touch video keep their size (§5.8)  **Completed 2026-11-13** (implementation status, measured numbers and reproduction: §16) |
+| V1 | **Decode seam + software + the injection gate + three format profiles**: `as_video_*` takes `backend` and `formats`; land `usesVideoCodec` / `video` / `video-formats`; containers `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`, video `h264,hevc,vp9,av1` software, audio `aac,mp3,opus,vorbis,flac`; `onMetaData` + audible audio | `examples/video.as` plays a bundled sample; item-by-item parity with `adl` (`videoWidth/Height`, `time`, `onMetaData`); **format matrix self-test**: at least one clip per container×codec yields both sound and picture; examples that do not touch video keep their size (§5.8)  **Completed 2026-11-13** (implementation status, measured numbers and reproduction: §16; the cost split of a real 4K source: §16.7) |
 | V2 | **macOS hardware decode + zero-copy presentation**: `videotoolbox` backend covering all 8 hwaccels (h264/hevc/mpeg1/2/4/h263/prores/vp9) + `CVMetalTextureCache` bridge; probe failure falls back silently | A/B on the same source: user CPU, wall clock, bridge cost; forcing VT off must fall back silently rather than produce a black screen; HEVC 1080p run both ways |
 | V3 | **Windows D3D11VA backend** (7 hwaccels) + `pause/seek` + buffering states + the `NetStream.Play.*` event sequence | parity with `adl`; identical behaviour from one `.as` on all three targets (backend differences confined to pixel formats) |
 | V4 | Transport (**read**): `http:` progressive → **HLS** (`hls`+`mpegts`+`crypto`, already in `broad`) → RTMP/RTSP (FFmpeg's native protocols, **no librtmp**) | AIR's `NetStream.Play.*` sequence; HLS live latency/catch-up policy captured as a reproducible test |
@@ -916,6 +924,15 @@ Windowed example (`examples/video/VideoPlayer.as`): **all 31 assertions pass**, 
 `pause()` freezing the clock, `Play.Stop`, `time` pinned to the duration, all four containers playing to their
 end state, and the audio-only stream reaching `Play.Stop` with `Video.videoWidth == 0`.
 
+**Regression surface (corrected in phase 399)**: the assertions the suite runs automatically live in
+`examples/video-headless.as` (24 of them; it pumps `Stage.dispatchFrame()` itself, opens no window, and settles
+its exit code). `examples/video/VideoPlayer.as` is a **player for humans** — it keeps its window open after the
+scripted checks (the Open-file button belongs to the user), so in the suite it is compile+link only
+(`SKIP_DIRS` in `test/examples.ts` contains `video`). This is not tidiness: before that, the suite was
+effectively building it **without its manifest** — the window could not open, `showWindow()` returned
+immediately, the run printed `8 passed, 5 failed` and still reported `PASS video/` because the exit status was
+0. The video surface had no automated coverage at all.
+
 Two diagnostics (troubleshooting only; neither changes control flow):
 
 - `AS_VIDEO_STATS=1` → one `[video] <url> video_frames= audio_frames= w= h= pts=` line per stream on close.
@@ -933,6 +950,9 @@ node src/index.ts examples/video/VideoPlayer.as --manifest examples/video/video.
 # headless self-test (no window; the frame boundary is pumped by hand)
 node src/index.ts temp/video-selftest.as --manifest examples/video/video.build.json -o temp/video-out/selftest.exe
 AS_VIDEO_STATS=1 ./temp/video-out/selftest.exe
+
+# headless **assertions** (this is the unit the suite runs: 24 checks, exit 1 on failure)
+node src/index.ts examples/video-headless.as --manifest examples/video/video.build.json --run
 ```
 
 ### 16.6 Not done yet (V2 onward)
@@ -941,6 +961,128 @@ Hardware decode (`videotoolbox` / `d3d11va`) and the zero-copy texture bridge, b
 (`Buffer.Empty`/`Buffer.Flush`), the transport surface (`http` progressive → HLS → RTMP), and the `publish`
 output side. **Today it is software decode of local files**: `NetStream.play()` accepts `http(s)://` (FFmpeg
 opens it), but there is no HLS live-edge policy or catch-up logic.
+
+### 16.7 A real 4K / 10-bit HDR10+ source: the actual costs and four fixes (measured 2026-11-13)
+
+Source: `The.Furious.2026.2160p...HDR10+.H.265` — 3832x1592 HEVC Main10 (HDR10+), DDP 5.1 Atmos, 20.9 GB,
+23.976 fps. A user reported that picking this file "stutters to the point of being unwatchable", and the
+measurement landed on **four independent costs, none of which was "missing hardware decode"**:
+
+| # | Defect | Measured cost (3832x1592 10-bit) | Fix |
+|---|---|---|---|
+| 1 | `AVCodecContext.thread_count` left at FFmpeg's default **1** (single-threaded decode) | 8.8 ms/frame, spent inside the frame boundary | size frame+slice threads from `av_cpu_count()`, **capped at 8** (frame threading holds one frame per thread ≈18 MB; 32 threads would pin ~580 MB) |
+| 2 | The CPU fallback converted **twice**: sws→I420 to feed a GPU upload that cannot happen, then sws→BGRA | 12 ms + 6 ms/frame | `want_gpu = (grctx != NULL)` selects a **single** route; with no GPU context go straight to BGRA |
+| 3 | The example used AIR's default `Stage.frameRate = 24` while the picture advances at the frame boundary | a 23.976 source gets one film frame per app frame, so any late tick shows the same frame twice → constant judder | `stage.frameRate = 60` in the example; on this source the window loop went **16.5 → 56 fps** |
+| 4 | The window was CPU raster (the manifest never asked for `ASC_RENDER_WINGPU`), so 4K frames were scaled on the CPU and copied whole into the SDL texture | 3.0 ms/frame upload (24 MB BGRA copy) | manifest adds `${win:ASC_RENDER_WINGPU=1}` + `${win:ASC_RENDER_D3D=1}` + `d3d_glue.cc`: the three YUV planes go straight into D3D12 textures, upload **0.56 ms/frame** |
+
+After the fixes (real window, `Stage.frameRate = 60`, 20 s continuous):
+
+```text
+wall=20130ms  time=20.020  appFrames=1179 (58.5 fps)  worst=46ms
+video_frames=484 (24.2 fps)  audio_frames=913030   threads=8
+cost/frame: dec≈0.00ms  conv=6.13ms  upload=0.56ms
+```
+
+`time` tracks the wall clock to within 0.5% (no drift) and `video_frames` matches the source rate (no dropped
+or duplicated frames).
+
+Points, most important first:
+
+- **Software decode was never the slow part**: one thread already does 4K 10-bit HEVC in 8.8 ms/frame
+  (≈114 fps of decode capability) and with 8 threads the visible time inside `receive_frame` drops to zero.
+  The real bottlenecks were "converted twice", "single-threaded inside the frame loop", "24 Hz frame
+  clock" and "CPU raster". So **not shipping hwaccel in V1 does not mean "4K cannot play"** — which also
+  answers "is §12 still at V1?": yes, V1 is complete, hardware decode is V2/V3, and this stutter was not
+  caused by its absence.
+- `conv=6.13 ms` is the sws cost of 10-bit→8-bit I420 (Skia m124's YUV entry takes 8-bit 4:2:0 only;
+  `SkYUVAPixmaps` has no 10-bit plane type). It only disappears with hardware decode / zero-copy (V2/V3)
+  or a 10-bit texture entry. At 23.976 fps that is 15% of one core, which is acceptable today; 4K60 sources
+  would push it to 37%, and the answer there is moving decode+convert to a worker thread.
+- **Frame threading buffers a whole queue before it emits anything**, so the first frame must not be limited
+  by one tick's packet budget or `videoWidth` stays 0 right after `play()`. `AS_VIDEO_PRIME_PACKETS = 240`
+  applies only when `n_vframes == 0` **and** a video stream exists (an audio-only stream stays at
+  `n_vframes == 0` forever and must not spend 240 packets per tick). Measured: the 1.2 s fixture with 8
+  threads printed `after play: vw=0` under the old budget.
+- Memo for windowed programs: **raise `Stage.frameRate` to 60 when playing video**, and give the window a GPU
+  backend. Both only change smoothness, but a 24 Hz frame clock against 23.976 fps content is *structural*
+  judder, not an occasional hitch.
+- Not done: moving sws+upload to a worker thread. `sk_image_from_yuv_strided` needs the GrDirectContext and
+  can only be called on the thread that owns the frame boundary; a real split would have the worker produce
+  I420 into a ring buffer. The current 6.7 ms/frame headroom covers 4K@24, so this waits until 4K@60 sources
+  are the normal case rather than adding a synchronisation layer for a hypothetical future.
+
+### 16.8 V3 step one: D3D11VA is wired up, and the default stays software (measured 2026-11-14)
+
+Two different questions: **"hardware decode works"** and **"hardware decode is faster"**. This section makes
+the first one work, verifiable and reversible, then measures the second on the same 4K source — and it does
+not hold on this host, so the default stays on the software path.
+
+**Two configure names, both required.** In `n9.0.2` they register the opposite pixel formats of what the names
+suggest (`libavcodec/hwconfig.h`):
+
+```c
+#define HWACCEL_D3D11VA2(codec) HW_CONFIG_HWACCEL(1, 1, 0, D3D11,       D3D11VA, ff_..._d3d11va2_hwaccel)
+#define HWACCEL_D3D11VA(codec)  HW_CONFIG_HWACCEL(0, 0, 1, D3D11VA_VLD, NONE,    ff_..._d3d11va_hwaccel)
+```
+
+`h264_d3d11va2` is the implementation that handles `AV_PIX_FMT_D3D11`; `h264_d3d11va` is the legacy
+`AV_PIX_FMT_D3D11VA_VLD` one. But the decoders add `AV_PIX_FMT_D3D11` to their candidate list under the
+**legacy** macro (`h264_slice.c:108-111`, `hevc/hevcdec.c:613`, `av1dec.c:587`, `mpeg12dec.c:811`,
+`vc1dec.c:59`). Enabling only one of them fails in two different ways, both measured:
+
+| Enabled | Result |
+|---|---|
+| `d3d11va` only (the V1 list) | `avcodec_get_hw_config()` reports `dxva2_vld` + `d3d11va_vld` only; `avctx->hwaccel` stays NULL and the first `get_buffer` fails |
+| `d3d11va2` only (first attempt) | hw_config has `pix_fmt=d3d11`, but `get_format` receives `yuv420p` — the format never reaches the list, decode silently stays software |
+| **both** (current) | `get_format -> d3d11`, `decode=d3d11va` |
+
+So the Windows branch of `vendor/provision/ffmpeg-static.sh` requests `d3d11va` **and** `d3d11va2` (plus
+`dxva2`). Always verify a rebuild with `avcodec_get_hw_config()` plus a real `av_hwdevice_ctx_create()`
+instead of trusting the flags: the rebuilt tree now reports `[0] dxva2/dxva2_vld`, `[1] (null)/d3d11va_vld`,
+`[2] d3d11va/d3d11` with `methods=0x3`, and device creation returns 0. `vendor/ffmpeg/lib/windows-x64/*.lib`
+was refreshed (avcodec 13.5 MB, within 28 bytes of the old one), and `windows-x86` was rebuilt the same way
+(avcodec 11.0 MB); the script asserts `ARCH_X86_32`/`ARCH_X86_64` itself so the two trees cannot be silently
+mixed up.
+
+**Runtime, in `vendor/video_glue.c`.** `as_video_hw_setup()` attaches a D3D11 device only when the codec
+itself advertises `AV_HWDEVICE_TYPE_D3D11VA` with `HW_DEVICE_CTX`, and gives up quietly when device creation
+fails. `as_video_get_format()` prefers `AV_PIX_FMT_D3D11` and otherwise takes the first **non-hwaccel**
+format — returning `list[0]` yields `dxva2_vld` against a D3D11 device and FFmpeg rejects it with
+`Invalid setup for format dxva2_vld: does not match the type of the provided device context`. Each frame is
+then transferred back with `av_hwframe_transfer_data()` followed by `av_frame_copy_props()`; the second call
+is mandatory because the transfer allocates a buffer but does not carry props (`libavutil/hwcontext.c:448`),
+and pts/colorspace/color_range live there — without it every frame reports pts 0 and `NetStream.time` freezes.
+Hardware decode is opt-in: `AS_VIDEO_DECODE=hw|d3d11va|auto`; unset or `soft` keeps the CPU path.
+`AS_VIDEO_STATS=1` now prints `decode=soft|d3d11va` and a `hw=…ms` column next to `dec/conv/upload`.
+
+**Why the default stays software** — same 4K source, same binary, real window, `stage.frameRate = 60`,
+20 s continuous, 32-core host:
+
+| | `decode` | Cost per frame | App frames | Worst frame interval | `ns.time` / wall clock |
+|---|---|---|---|---|---|
+| software (default) | soft, `threads=8` | `dec≈0` + `conv=6.49` + `upload=0.56` ≈ **7.0 ms** | 1121 / 19.1 s ≈ **58.7 fps** | **44 ms** | 19.019 / 19.107 |
+| hardware | d3d11va | `hw=11.17` + `conv=3.33` + `upload=0.40` ≈ **14.9 ms** | 1130 / 19.3 s ≈ 58.5 fps | **103 ms** | 19.102 / 19.336 |
+
+Hardware decode plus readback is **twice as slow as the 8-thread software decoder here**, with worse pacing,
+and the cost is entirely the `AV_PIX_FMT_D3D11 → system memory` step (~12 MB per 4K P010 frame, driver
+synchronisation included). Software decode is not spending that 7 ms on decoding at all — the threads hide it.
+
+The only way hardware wins is **not reading back**, which is exactly the hard part of the Windows row in
+§10.2: a `DXGI_FORMAT_NV12` texture keeps Y and UV as two *plane slices* of one resource while
+`GrBackendTexture` takes a whole 2D texture. V3 step two therefore needs (1) a `ID3D11Device5` decode device
+with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures and an `ID3D11Fence`, (2) `OpenSharedHandle` on the D3D12
+side plus fence waits, (3) R8/RG8 views per plane (or `Texture2DArray` + plane slice) feeding
+`GrBackendTextures::MakeD3D` + `SkImages::TextureFromYUVATextures`, and (4) a `releaseProc` that tears
+down views/texture/AVFrame in reverse order (§10.2's lifetime loop) — get that wrong and the picture tears
+without an error. Until then software is the right default; `AS_VIDEO_DECODE=hw` stays as the A/B channel for
+machines whose CPU cannot keep up. `examples/video-headless.as` passes its 24 assertions on both paths.
+
+**Build trap worth knowing:** MSYS2's `make` eats one level of backslash from single-quoted recipe text, so
+FFmpeg's dependency `awk '/including/ { … gsub(/\\/, "/") … }'` reaches awk as an invalid `/\/` and every
+`.o` fails with `syntax error`. The workaround is to write that rule as `gsub(/\\\\/, "/")` (four
+backslashes) in `config.mak` after `configure` — it is generated, so it has to be re-applied on every rebuild.
+Three tools also have to come from three places: `awk`/`sh` from Git for Windows, `make`/`nasm` from
+`/c/msys64/usr/bin`, `lib.exe` from the imported vcvars environment.
 
 ---
 

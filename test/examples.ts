@@ -220,7 +220,19 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as
 // --features yuv420): the directory unit would compile Main.as WITHOUT the
 // yuv420 switch (undefined method 'setYuv420') and --run would open a Metal
 // window. Like air-native it is registered after the pool as compile+link only.
-const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio', 'yuv420-gpu']);
+//
+// `video` is `audio`'s exact twin, and it was a FALSE GREEN until 阶段三百九十九:
+// its player is windowed AND it stays open after the scripted checks (it is a
+// player -- the Open-file button belongs to the user), so the pool's 60 s budget
+// killed it. But the pool also compiled it WITHOUT `examples/video/video.build.json`
+// -- no Skia window, no audio glue, no D3D backend -- and in that shape
+// showWindow() returns immediately, the summary printed `8 passed, 5 failed`, the
+// exit status was 0, and `PASS video/ (VideoPlayer.as)` was reported. A unit that
+// prints FAILED lines and is green is worse than no unit: it also hid that the
+// manifest nobody exercised had grown a Windows-only D3D backend. It is now
+// compile+link only, with the real manifest, and the assertions are a manual
+// windowed run (source header has the command).
+const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio', 'yuv420-gpu', 'video']);
 // The shared AS3 library root (阶段二百五十四). air-native used to VENDOR its
 // third-party sources inside its own source root (examples/air-native/src/com,
 // 352 tracked files), which made a library part of one app and forced this file
@@ -328,6 +340,15 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // runner links the same glue but has no device, so the example branches on
   // SoundMixer.areSoundsInaccessible() and passes either way.
   'audio.as': ['--manifest', join(dir, 'audio.build.json')],
+  // The video seam is the same shape of build-layer choice (阶段三百九十九): the
+  // manifest is what links vendor/video_glue.c + FFmpeg, defines ASC_HAVE_VIDEO and
+  // carries the Windows GPU-window backend. Without it this example can say nothing
+  // about decoding -- `NetStream.play()` would loudly refuse the stream instead
+  // (which is itself pinned in test/unit/video.ts). Headless on purpose: it pumps
+  // Stage.dispatchFrame() itself, so the whole file/container/clock matrix runs in
+  // the pool. The windowed player (examples/video/VideoPlayer.as) is compile+link
+  // only -- see SKIP_DIRS.
+  'video-headless.as': ['--manifest', join(dir, 'video', 'video.build.json')],
   // The menu-bar status item only exists when the build asked for it
   // (`--features tray`, stage 二百六十): without that manifest the same AS3 must
   // fail exactly like AIR (#2012), which is the unit pin's job, not this example's.
@@ -551,6 +572,10 @@ const EXAMPLE_REQUIRES: Record<string, string> = {
   // THIS host). A fresh clone has no such directory, so the unit skips loudly with
   // the command that creates it rather than failing at the linker.
   'native-shader-probe.as': join(dir, '..', 'vendor', 'shader', 'lib'),
+  // The FFmpeg archives are VENDORED per platform (vendor/ffmpeg/lib/<key>) and only
+  // exist where someone ran the provisioning script; the manifest's link-paths would
+  // otherwise fail at the linker instead of saying why.
+  'video-headless.as': join(dir, '..', 'vendor', 'ffmpeg'),
 };
 
 // Why the extension-bearing example units (`ane/`, `ane-app/`) are skipped instead
@@ -865,6 +890,33 @@ test('example: native-window.as (windowed: compile+link only)', async (t) => {
 // from an example rather than a probe.
 // Serial like the two cases above: it compiles the Skia/SDL2/miniaudio glue from
 // source and links ~20 MB of static libraries.
+test('example: video/ (windowed: compile+link only)', async (t) => {
+  // The player, not a test fixture: it runs 31 assertions and then hands the window
+  // to the user (Open file.../Pause/Seek), so there is no exit to wait for. What the
+  // suite can honestly check is that the manifest a USER builds actually compiles and
+  // links -- that is the half the old false green never touched (it built without
+  // this manifest at all, see SKIP_DIRS above). The video-in-window assertions are a
+  // manual run: `node src/index.ts examples/video/VideoPlayer.as
+  // --manifest examples/video/video.build.json -o temp/video-player.exe --run`.
+  const entry = join(dir, 'video', 'VideoPlayer.as');
+  const manifest = join(dir, 'video', 'video.build.json');
+  const fixtures = ['media/clip.mp4', 'media/clip.flv', 'media/clip.ts', 'media/clip.mkv']
+    .map((f) => join(dir, 'video', f));
+  const vendorLibs = ['skia', 'sdl2', 'ffmpeg'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(entry) || !existsSync(manifest) || !fixtures.every((p) => existsSync(p))
+      || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  video/ (needs the Skia/SDL2/FFmpeg vendor libs and examples/video/media/{clip.mp4,clip.flv,clip.ts,clip.mkv})');
+    t.skip('needs vendor/skia, vendor/sdl2, vendor/ffmpeg and the four media fixtures');
+    return;
+  }
+  // Serial, like the three cases above: Skia/SDL2/FFmpeg glue from source and ~20 MB
+  // of static libraries.
+  await runAsync('node', ['src/index.ts', entry,
+    '--manifest', manifest, '-o', scratchOut('video-player')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  video/ (compile+link)');
+});
+
 test('example: audio/ (windowed: compile+link only)', async (t) => {
   const entry = join(dir, 'audio', 'AudioPlayer.as');
   const manifest = join(dir, 'audio', 'player.build.json');

@@ -225,6 +225,12 @@ CPU 内存——那是「出口接错」的开销，不是硬解的开销。真�
 Windows 的 `d3d11va` 同样复用 `h264`。所以「探测失败 → 换回软解」是一次后端切换，demux 与解析代码
 一行不动。自写 VT/MF 要做同样的回退，得自己维护两套状态机。
 
+> **实现现状（2026-11-13）**：V1 是**纯软解**——`video-backend` 只接受 `auto`/`soft`，两者等价，
+> `auto` 目前没有可探测的硬解后端（V2 = macOS VT + `CVMetalTextureCache` 零拷贝，V3 = Windows D3D11VA）。
+> 这不等于「4K 播不动」：软解 4K 10-bit HEVC 实测 8.8 ms/帧（单线程）、8 线程下被完全隐藏，
+> 用户报的「4K 卡到不行」的真实根因是转换两次 + 单线程 + 24 Hz 帧时钟 + CPU 光栅，逐条实测与
+> 修复见 §16.7。硬解在这里买到的是 `conv` 那 6 ms 与 CPU 占用，不是「能不能播」。
+
 **真实坑（原清单保留，一条都不能省）**：High profile 不是到处能解（10-bit / 4:4:4 会失败，必须回退）；
 `AVCDecoderConfigurationRecord`（SPS/PPS）解析绕不开（软解也一样要写，不是硬解独有的成本）；hwaccel 的
 `get_format` 协商失败在部分驱动上是**静默回退**，必须在 `av_hwdevice_ctx_create` 与首帧 `AV_PIX_FMT_*`
@@ -745,7 +751,7 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
-| V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16） |
+| V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16；4K 素材的代价拆分见 §16.7） |
 | V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
 | V3 | **Windows D3D11VA 后端**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— `pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
@@ -923,6 +929,13 @@ mp3: time=1.000  video_frames=0  audio_frames=44100   Play.Stop
 真窗口示例（`examples/video/VideoPlayer.as`）：**31 条断言全绿**，含 `onMetaData`、`pause()` 冻钟、
 `Play.Stop`、`time` 收到时长、四条容器各播到终态、纯音频流 `Play.Stop` 且 `Video.videoWidth == 0`。
 
+**回归面（阶段三百九十九 校正）**：套件里自动跑的断言在 `examples/video-headless.as`（24 条，
+自己推 `Stage.dispatchFrame()`，无窗口，按状态码结算）。`examples/video/VideoPlayer.as` 是**给人用的
+播放器**——自检跑完窗口不关（Open file… 属于用户），所以它在套件里只能 compile+link
+（`test/examples.ts` 的 `SKIP_DIRS` 有 `video`）。这条不是洁癖：在那之前套件跑的其实是**没带清单**的
+构建——窗口开不出来、`showWindow()` 立刻返回，于是打印 `8 passed, 5 failed` 却因为退出码 0 报
+`PASS video/`，视频面等于零自动覆盖。
+
 两个诊断开关（只在排障时开，不影响控制流）：
 
 - `AS_VIDEO_STATS=1` → 每条流关闭时打一行 `[video] <url> video_frames=… audio_frames=… w=… h=… pts=…`。
@@ -940,6 +953,9 @@ node src/index.ts examples/video/VideoPlayer.as --manifest examples/video/video.
 # 无头自检（不建窗口，手推帧边界）
 node src/index.ts temp/video-selftest.as --manifest examples/video/video.build.json -o temp/video-out/selftest.exe
 AS_VIDEO_STATS=1 ./temp/video-out/selftest.exe
+
+# 无头**断言**（套件跑的就是这一条，24 条断言，失败退出 1）
+node src/index.ts examples/video-headless.as --manifest examples/video/video.build.json --run
 ```
 
 ### 16.6 还没做的（V2 起）
@@ -947,6 +963,152 @@ AS_VIDEO_STATS=1 ./temp/video-out/selftest.exe
 硬解（`videotoolbox` / `d3d11va`）与零拷贝纹理桥、缓冲状态（`Buffer.Empty`/`Buffer.Flush`）、
 传输面（`http` 渐进式 → HLS → RTMP）、`publish` 输出面。**当前是纯软解 + 本地文件**：
 `NetStream.play()` 接受 `http(s)://`（FFmpeg 自己打开），但没有 HLS 直播切片策略与追帧逻辑。
+
+### 16.7 4K / 10-bit HDR10+ 素材：真实代价与四道修复（2026-11-13 实测）
+
+素材：`The.Furious.2026.2160p.iTunes.WEB-DL.DDP.5.1.Atmos.HDR10+.H.265-CHDWEB.mkv`——
+3832×1592 HEVC Main10（HDR10+）、DDP 5.1 Atmos、20.9 GB、23.976 fps。用户实测「选择播放这个视频
+卡到不行」，定位下来是**四处互相独立的代价，没有一处是「缺硬解」**：
+
+| # | 缺陷 | 实测代价（3832×1592 10-bit） | 修复 |
+|---|---|---|---|
+| 1 | `AVCodecContext.thread_count` 停在 FFmpeg 默认的 **1**（单线程解码） | 8.8 ms/帧，直接压在帧边界上 | 按 `av_cpu_count()` 开 frame+slice 线程，**上限 8**（frame threading 每线程持一帧 ≈18 MB，32 线程会钉住约 580 MB） |
+| 2 | CPU 回落路径**转换两次**：先 sws→I420 喂一个不存在的 GPU 上传，再 sws→BGRA | 12 ms + 6 ms/帧 | `want_gpu = (grctx != NULL)` 决定**单条**路径；没有 GPU 上下文就直接 sws→BGRA |
+| 3 | 示例用 AIR 默认 `Stage.frameRate = 24`，而画面推进挂在帧边界 | 23.976 的素材每个应用帧只够出一帧，任何一次迟到就重复显示同一帧 → 持续抖动 | 示例 `stage.frameRate = 60`；4K 素材下窗口循环 **16.5 → 56 fps** |
+| 4 | 窗口是 CPU 光栅（清单没开 `ASC_RENDER_WINGPU`），4K 帧在 CPU 上缩放并被整帧拷进 SDL 纹理 | 上传 3.0 ms/帧（BGRA 24 MB 拷贝） | 清单加 `${win:ASC_RENDER_WINGPU=1}` + `${win:ASC_RENDER_D3D=1}` + `d3d_glue.cc`：YUV 三平面直接进 D3D12 纹理，上传 **0.56 ms/帧** |
+
+修复后（真窗口、`Stage.frameRate = 60`、连续 20 s）：
+
+```text
+wall=20130ms  time=20.020  appFrames=1179 (58.5 fps)  worst=46ms
+video_frames=484 (24.2 fps)  audio_frames=913030   threads=8
+cost/frame: dec≈0.00ms  conv=6.13ms  upload=0.56ms
+```
+
+`time` 跟墙钟 0.5% 内（无漂移），`video_frames` 与素材帧率一致（没跳帧也没补帧）。
+
+要点，按重要性：
+
+- **软解本来就不慢**：4K 10-bit HEVC 单线程就是 8.8 ms/帧（≈114 fps 的解码能力），8 线程下解码
+  在 `receive_frame` 上的可见耗时变成 0——它被完全隐藏了。真正的瓶颈是「转换两次」「单线程压在
+  帧边界」「帧时钟 24 Hz」「CPU 光栅」。所以 **V1 不引 hwaccel 不等于「播不动 4K」**（这也回答
+  「§12 是不是还在 V1」：是，V1 已完结，硬解是 V2/V3，而这次卡顿不是硬解缺失造成的）。
+- `conv=6.13 ms` 是 10-bit→8-bit I420 的 sws 代价（Skia m124 的 YUV 入口只吃 8-bit 4:2:0，
+  `SkYUVAPixmaps` 没有 10-bit 平面类型），要等硬解/零拷贝（V2/V3）或一个 10-bit 纹理入口才会消失。
+  按 23.976 fps 算它占单核 15%，所以现在还能接受；60 fps 的 4K 素材会顶到 37%，那时该做的是把
+  解码+转换搬到工作线程（本文暂不做，理由见下）。
+- **frame threading 会「攒够一队才出帧」**：首帧不能被一次 tick 的包预算卡住，否则 `play()` 之后
+  `videoWidth` 仍是 0。`AS_VIDEO_PRIME_PACKETS = 240` 只在 `n_vframes == 0` 且**存在视频流**时
+  生效（纯音频流永远 `n_vframes == 0`，不能每 tick 白花 240 个包）。实测过：1.2 s 的夹具在 8 线程
+  下用旧预算，`after play: vw=0`。
+- 窗口程序的备忘：**播视频把 `Stage.frameRate` 提到 60**，窗口走 GPU 光栅。这两条只影响「好不好看」，
+  但 24 Hz 的帧时钟对 23.976 的素材是**结构性抖动**，不是偶发卡顿。
+- 没做的：把 sws+上传搬到工作线程（`as_video_present` 里的 `sk_image_from_yuv_strided` 依赖
+  GrDirectContext，只能在帧边界所在线程调用，真要做就得让工作线程只产出 I420 并加环形缓冲）。
+  当前 6.7 ms/帧的余量够 4K@24，等 4K@60 素材变成常态再说，避免为「假想的未来」加一层同步。
+
+
+### 16.8 V3 第一步：D3D11VA 硬解接通了，默认仍是软解（2026-11-14 实测）
+
+先把两件事分开：**「硬解能用」与「硬解更快」不是同一件事**。这一节把前者做成能用、可验证、可回退，
+并用同一份 4K 素材量出后者在本机是否成立——结论是不成立，所以默认路径保持软解。
+
+#### 16.8.1 重编 FFmpeg：两个 `d3d11va` 名字必须同时开
+
+`n9.0.2` 里这两个 configure 名字注册的像素格式与名字暗示**相反**（`libavcodec/hwconfig.h`）：
+
+```c
+#define HWACCEL_D3D11VA2(codec) HW_CONFIG_HWACCEL(1, 1, 0, D3D11,       D3D11VA, ff_..._d3d11va2_hwaccel)
+#define HWACCEL_D3D11VA(codec)  HW_CONFIG_HWACCEL(0, 0, 1, D3D11VA_VLD, NONE,    ff_..._d3d11va_hwaccel)
+```
+
+即 `h264_d3d11va2` 才是**实现** `AV_PIX_FMT_D3D11` 的那个，`h264_d3d11va` 是 `AV_PIX_FMT_D3D11VA_VLD`
+的旧接口。但解码器把 `AV_PIX_FMT_D3D11` 加进候选列表的 `#if` 用的是**旧名字**
+（`libavcodec/h264_slice.c:108-111`、`hevc/hevcdec.c:613`、`av1dec.c:587`、`mpeg12dec.c:811`、
+`vc1dec.c:59`）。于是：
+
+| 只开 | 现象（都实测过） |
+|---|---|
+| 只 `d3d11va`（V1 的原始清单） | `avcodec_get_hw_config()` 里只有 `dxva2_vld` 与 `d3d11va_vld`；`avctx->hwaccel` 始终 NULL，第一次 `get_buffer` 就失败 |
+| 只 `d3d11va2`（第一次修正） | hw_config 里有了 `pix_fmt=d3d11`，但 `get_format` 收到的是 `yuv420p`——格式从没进过候选列表，解码静默留在软解 |
+| **两个都开**（现行） | `get_format -> d3d11`，`decode=d3d11va` |
+
+所以 `vendor/provision/ffmpeg-static.sh` 的 Windows 分支同时请求 `d3d11va` 与 `d3d11va2`（外加 `dxva2`）。
+**每次重编都要验证，别信配置**：
+
+```c
+// 探针（temp/hwcfg2.c 的形状）：打印实际注册的 hw_config，再试建设备
+for (int i = 0;; i++) { const AVCodecHWConfig* c = avcodec_get_hw_config(dec, i); if (!c) break;
+  printf("[%d] device=%s pix_fmt=%s methods=0x%x\n", i,
+         av_hwdevice_get_type_name(c->device_type), av_get_pix_fmt_name(c->pix_fmt), c->methods); }
+av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0);  // rc=0 才算通
+```
+
+本机实测（重编后）：`[0] dxva2/dxva2_vld`、`[1] (null)/d3d11va_vld`、`[2] d3d11va/d3d11`，`methods=0x3`
+（`HW_DEVICE_CTX|HW_FRAMES_REF`），`av_hwdevice_ctx_create` 返回 0。
+
+重编后 `vendor/ffmpeg/lib/windows-x64/*.lib` 已更新（avcodec 13.5 MB，与旧版差 28 字节：旧的
+`d3d11va` 换成 `d3d11va2`，净持平）；`windows-x86` 同法重编并更新（avcodec 11.0 MB），脚本自己断言
+`ARCH_X86_32`/`ARCH_X86_64`，所以位宽不会静默错位。
+
+#### 16.8.2 运行时：接上就退不回去，所以做成显式开关
+
+`vendor/video_glue.c` 新增（不碰 Skia，也不碰事件层）：
+
+- `as_video_hw_setup()`：只有编解码器**自己报告**有 `AV_HWDEVICE_TYPE_D3D11VA` 且带 `HW_DEVICE_CTX`
+  时才建 `hw_device_ctx`；设备创建失败就静默留在软解（没有可用 D3D11 的机器也要能播）。
+- `as_video_get_format()`：优先 `AV_PIX_FMT_D3D11`；没有就取列表里第一个**非 hwaccel** 格式。
+  这里踩过：返回 `list[0]` 会拿到 `dxva2_vld`，而挂的是 D3D11 设备，FFmpeg 直接报
+  `Invalid setup for format dxva2_vld: does not match the type of the provided device context`。
+- 出帧后 `av_hwframe_transfer_data(sw_frame, hw_frame, 0)` 落回系统内存，**再** `av_frame_copy_props`。
+  后者不是可选：`av_hwframe_transfer_data` 只分配缓冲、不搬 props（`libavutil/hwcontext.c:448`），
+  而 pts / colorspace / color_range 都在 props 里——漏了它，每帧 pts 都是 0，`NetStream.time` 冻在 0.000。
+- 开关：`AS_VIDEO_DECODE=hw|d3d11va|auto` 才用 GPU；未设或 `soft` 走 CPU。
+- `AS_VIDEO_STATS=1` 多两列：`decode=soft|d3d11va` 与 `hw=…ms`（回读耗时，与 `dec/conv/upload` 并列）。
+
+#### 16.8.3 为什么默认还是软解：同一份 4K 素材，同一支二进制
+
+`temp/probe-4k.as`（真窗口、`stage.frameRate = 60`、连续 20 s、同一台 32 核机器）：
+
+| | `decode` | 每帧成本 | 应用帧 | 最差帧间隔 | `ns.time` / 墙钟 |
+|---|---|---|---|---|---|
+| 软解（默认） | soft，`threads=8` | `dec≈0` + `conv=6.49` + `upload=0.56` ≈ **7.0 ms** | 1121 / 19.1 s ≈ **58.7 fps** | **44 ms** | 19.019 / 19.107 |
+| 硬解 | d3d11va | `hw=11.17` + `conv=3.33` + `upload=0.40` ≈ **14.9 ms** | 1130 / 19.3 s ≈ 58.5 fps | **103 ms** | 19.102 / 19.336 |
+
+结论：**在本机，硬解 + 回读比 8 线程软解慢一倍，帧节奏还更差**。原因不是 D3D11VA 本身，而是
+`AV_PIX_FMT_D3D11 → 系统内存` 那一步：4K P010 一帧约 12 MB，`hw=11.17 ms` 全是这次回读（含 driver 同步）。
+软解那 7 ms 里也没有解码的份——它在 8 个线程里被完全隐藏了。
+
+所以「硬解要赢」只有一个前提：**别回读**。这正好是 §10.2 里 Windows 那一行的难点——`DXGI_FORMAT_NV12`
+的 Y/UV 是同一资源的两个 **plane slice**，而 `GrBackendTexture` 收的是整张 2D 纹理。V3 第二步：
+
+1. 解码设备用 `ID3D11Device5` 建（`D3D11_CREATE_DEVICE_BGRA_SUPPORT`），纹理带
+   `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`，配套 `ID3D11Fence`；
+2. 渲染侧 D3D12 用 `OpenSharedHandle` 拿到同一张纹理 + 共享 fence，等解码完成再画；
+3. Y/UV 两个 plane 各建一张 R8/RG8 视图（或 `Texture2DArray` + plane slice），喂
+   `GrBackendTextures::MakeD3D` + `SkImages::TextureFromYUVATextures`；
+4. SkImage 的 `releaseProc` 里逆序释放视图/纹理/AVFrame（§10.2 的生命周期闭环），否则花屏不报错。
+
+在这条链做完之前，**默认软解是正确的工程选择**；`AS_VIDEO_DECODE=hw` 留给「CPU 解码撑不住、GPU 有余」
+的机器，作为可回退的 A/B 通道（`examples/video-headless.as` 24 项断言在两种模式下都是全绿）。
+
+#### 16.8.4 复现命令与一个构建坑
+
+```bash
+# 重编（必须两个 d3d11va 名字都开）
+bash vendor/provision/ffmpeg-static.sh broad --arch=x64
+# 真素材 A/B（同一支 exe）
+AS_VIDEO_STATS=1 ./temp/probe-4k.exe                    # 软解（默认）
+AS_VIDEO_DECODE=hw AS_VIDEO_STATS=1 ./temp/probe-4k.exe # 硬解
+```
+
+**构建坑（MSYS2 make）**：MSYS2 的 `make` 会把单引号 recipe 里的反斜杠吃掉一层，FFmpeg 生成依赖的
+`awk '/including/ { … gsub(/\\/, "/") … }'` 到 awk 手里变成非法的 `/\/`，于是**每个 .o 都**
+`syntax error`。对策：`configure` 之后把 `config.mak` 里那四处 `gsub(/\\/, "/")` 写成
+`gsub(/\\\\/, "/")`（4 个反斜杠——make 吃掉一层后 awk 才拿到合法的 `\\`）。`config.mak` 是
+`configure` 会覆盖的生成文件，所以每次重编都要重新补。另外三个工具来自三个地方，缺一不可：
+`awk`/`sh` 用 Git for Windows 的、`make`/`nasm` 用 `/c/msys64/usr/bin` 的、`lib.exe` 从 vcvars 环境来。
+
 
 ---
 

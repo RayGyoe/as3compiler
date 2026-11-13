@@ -36,10 +36,13 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/cpu.h>   // av_cpu_count: decoder thread sizing (see as_video_open)
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/time.h>   // av_gettime_relative: monotonic, for the cost counters
+#include <libavutil/hwcontext.h>   // AVBufferRef/hw_device_ctx: GPU decode (see as_video_hw_setup)
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
@@ -113,6 +116,7 @@ static void as_audio_voice_stop(int v) { (void)v; }
 
 #define AS_VIDEO_MAX 8          // concurrent streams across the whole program
 #define AS_VIDEO_TICK_PACKETS 24  // demuxed packets per frame boundary
+#define AS_VIDEO_PRIME_PACKETS 240  // ... unless no frame has come out yet (see advance)
 #define AS_VIDEO_LEAD_S 0.08    // decode video this far ahead of the clock
 #define AS_VIDEO_QUEUE 8        // decoded-but-not-due frames kept for the clock
 #define AS_VIDEO_AUDIO_RATE 44100
@@ -137,6 +141,16 @@ typedef struct {
   AVPacket* pkt;
   AVFrame* frame;
   AVFrame* aframe;
+  // Hardware decode (V3 step 1, video.md §16.8). With a hw_device_ctx the decoder
+  // writes into ID3D11Texture2D slices, and `sw_frame` is where such a frame lands
+  // after av_hwframe_transfer_data -- colour mapping, pts and pacing below stay
+  // unchanged because they keep seeing a system-memory frame. Zero-copy into Skia is
+  // deliberately NOT here: a DXGI_FORMAT_NV12 texture keeps Y and UV as two *plane
+  // slices* of one resource while GrBackendTexture takes a whole 2D texture, so that
+  // route needs the plane split §10.2 describes.
+  AVBufferRef* hw_device;
+  AVFrame* sw_frame;
+  int hw_used;              // 1 once a frame actually came back from the GPU
   struct SwsContext* sws;   // -> packed I420 (only when the source is not 420p)
   struct SwsContext* sws_bgra;  // -> packed BGRA (only on a build with no GPU ctx)
   struct SwrContext* swr;
@@ -192,6 +206,14 @@ typedef struct {
   // never change control flow.
   long long n_vframes;
   long long n_aframes;
+  // Where the per-frame time actually goes. Printed by AS_VIDEO_STATS=1 next to the
+  // counters: "playback stutters" is not diagnosable from AS3, and the split between
+  // decode / colour conversion / GPU upload decides which of the three fixes applies
+  // (more threads, a cheaper sws flag, or moving the work off the frame loop).
+  double t_dec_ms;          // avcodec_receive_frame
+  double t_conv_ms;         // sws_scale to packed I420 (or BGRA on a CPU build)
+  double t_upload_ms;       // sk_image_from_* (CPU planes -> GPU textures)
+  double t_hw_ms;           // av_hwframe_transfer_data (GPU -> system memory)
   char url[512];
   char err[256];
 } as_video;
@@ -234,6 +256,11 @@ static void as_vs_error(as_video* v, const char* what, int rc) {
 // ---------------------------------------------------------------------------
 // Frame -> SkImage (video.md §10.1 route ②: CPU YUV planes for software decode)
 // ---------------------------------------------------------------------------
+// Wall-clock helper for the per-frame cost counters (see as_video).
+// av_gettime_relative is monotonic and microseconds: gettimeofday on Windows has
+// a 15.6 ms floor, which would make a 6 ms conversion look free.
+static double as_video_ms(void) { return (double)av_gettime_relative() / 1000.0; }
+
 static void as_video_drop_image(as_video* v) {
   if (v->image != NULL) { sk_image_delete(v->image); v->image = NULL; }
 }
@@ -246,12 +273,22 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms)
   const int direct = (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P);
   const int cv = as_video_sk_cs(f);
   void* img = NULL;
-  {
+  // Two routes, decided by whether a GPU context exists -- never both. The I420 pass
+  // exists only to feed sk_image_from_yuv_strided, so on a CPU-raster build (grctx
+  // NULL) running it first converted every 4K frame TWICE: once to I420 and then to
+  // BGRA, 6 ms + 12 ms per frame on a 3832x1592 10-bit source. Measured as the whole
+  // reason a 4K file played at ~20 fps in a window with no GPU backend.
+  const int want_gpu = (grctx != NULL);
+  const double t_conv0 = as_video_ms();
+  if (want_gpu) {
     // Try the GPU entry first even with a NULL context: sk_image_from_yuv_strided
     // returns NULL then, and the fallback below decides.
     if (direct) {
+      const double t_up0 = as_video_ms();
       img = sk_image_from_yuv_strided(grctx, f->data[0], f->linesize[0], f->data[1],
                                       f->linesize[1], f->data[2], f->linesize[2], w, h, cv);
+      v->t_upload_ms += as_video_ms() - t_up0;
+      v->t_conv_ms += as_video_ms() - t_conv0;
     } else {
       // NV12 / 422 / 10-bit and friends: one sws pass to I420, then the same
       // entry. Kept as a CPU conversion (not a wrong-colour direct wrap) because
@@ -266,8 +303,11 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms)
         if (v->sws == NULL) return 0;
       }
       sws_scale(v->sws, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, dstride);
+      v->t_conv_ms += as_video_ms() - t_conv0;
+      const double t_up0 = as_video_ms();
       img = sk_image_from_yuv_strided(grctx, v->i420, w, v->i420 + (size_t)w * h, w / 2,
                                       v->i420 + (size_t)w * h * 5 / 4, w / 2, w, h, cv);
+      v->t_upload_ms += as_video_ms() - t_up0;
     }
   }
   if (img == NULL) {
@@ -285,7 +325,10 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms)
     unsigned char* dst[4] = {v->bgra, NULL, NULL, NULL};
     int dstride[4] = {w * 4, 0, 0, 0};
     sws_scale(v->sws_bgra, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, dstride);
+    v->t_conv_ms += as_video_ms() - t_conv0;
+    const double t_up0 = as_video_ms();
     img = sk_image_from_argb(v->bgra, w, h);   // copies; BGRA-ordered words as-is
+    v->t_upload_ms += as_video_ms() - t_up0;
   }
   if (img == NULL) return 0;
   v->w = w;
@@ -370,12 +413,102 @@ static void as_video_audio_out(as_video* v, AVFrame* f) {
 }
 
 // ---------------------------------------------------------------------------
+// Hardware decode: D3D11VA (video.md §12 V3, §16.8)
+// ---------------------------------------------------------------------------
+// What this does and does not buy: the decode moves off the CPU, but every frame is
+// still transferred back to system memory before the colour conversion, so the
+// textures Skia sees are the same as on the software path. Zero-copy needs the plane
+// split described in §10.2 and is a separate step.
+//
+// AS_VIDEO_DECODE=soft forces the software path (A/B diagnosis); unset or "auto"
+// tries the GPU and falls back without failing the stream -- a machine without a
+// usable D3D11 device has to keep playing the file.
+// AS_VIDEO_DECODE=hw|d3d11va|auto opts INTO the GPU decoder; unset or "soft" keeps the
+// software one. The default is software on purpose, and it is a measurement, not a
+// preference: on this host (32 cores, d3d11va live) the 4K HEVC HDR10+ file costs
+// hw=11.25 ms + conv=3.36 ms per frame for the GPU->system-memory transfer and the
+// colour pass, against dec+conv+upload = 6.7 ms per frame for the 8-thread software
+// decoder. The readback is what makes hardware lose -- it exists because zero-copy
+// is not implemented yet (§16.8), and once it is, this default flips.
+static int as_video_hw_wanted(void) {
+  const char* want = getenv("AS_VIDEO_DECODE");
+  if (want == NULL || want[0] == 0) return 0;
+  if (strcmp(want, "soft") == 0 || strcmp(want, "cpu") == 0) return 0;
+  return 1;   // "hw" / "d3d11va" / "auto"
+}
+
+static enum AVPixelFormat as_video_get_format(AVCodecContext* ctx,
+                                             const enum AVPixelFormat* list) {
+  (void)ctx;
+  enum AVPixelFormat pick = AV_PIX_FMT_NONE;
+  for (const enum AVPixelFormat* p = list; *p != AV_PIX_FMT_NONE; p++) {
+    if (*p == AV_PIX_FMT_D3D11) { pick = *p; break; }
+  }
+  // No D3D11 surface offered (unsupported profile, or a build without the hwaccel):
+  // fall back to the first SOFTWARE format, never to another hardware one. Returning
+  // dxva2_vld here is what produced "Invalid setup for format dxva2_vld: does not
+  // match the type of the provided device context" -- the device we attached is
+  // D3D11, and a D3D9 surface cannot come out of it.
+  if (pick == AV_PIX_FMT_NONE) {
+    for (const enum AVPixelFormat* p = list; *p != AV_PIX_FMT_NONE; p++) {
+      const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(*p);
+      if (d == NULL || (d->flags & AV_PIX_FMT_FLAG_HWACCEL) != 0) continue;
+      pick = *p;
+      break;
+    }
+  }
+  if (pick == AV_PIX_FMT_NONE) pick = list[0];
+  if (getenv("AS_VIDEO_DEBUG") != NULL) {
+    fprintf(stderr, "[video] get_format -> %s (device=%s)\n",
+            av_get_pix_fmt_name(pick),
+            ctx->hw_device_ctx != NULL
+                ? av_hwdevice_get_type_name(
+                      ((AVHWDeviceContext*)ctx->hw_device_ctx->data)->type)
+                : "none");
+  }
+  return pick;
+}
+
+// Returns 1 when a D3D11 device was attached to the decoder.
+static int as_video_hw_setup(as_video* v, const AVCodec* dec) {
+  if (!as_video_hw_wanted()) return 0;
+  int have_d3d11 = 0;
+  // Ask the BUILD what it registered instead of assuming: an "--enable-hwaccel=h264_d3d11va"
+  // list produced a build whose only d3d11 entry was the legacy D3D11VA_VLD one, and
+  // nothing but this probe tells them apart (§16.8).
+  for (int i = 0;; i++) {
+    const AVCodecHWConfig* cfg = avcodec_get_hw_config(dec, i);
+    if (cfg == NULL) break;
+    if (cfg->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+        (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0) {
+      have_d3d11 = 1;
+      break;
+    }
+  }
+  if (!have_d3d11) return 0;
+  AVBufferRef* dev = NULL;
+  if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) return 0;
+  v->hw_device = dev;
+  v->vc->hw_device_ctx = av_buffer_ref(dev);
+  v->vc->get_format = as_video_get_format;
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // Opening
 // ---------------------------------------------------------------------------
 static void as_video_free_state(as_video* v) {
   if (getenv("AS_VIDEO_STATS") != NULL && (v->n_vframes > 0 || v->n_aframes > 0)) {
-    fprintf(stderr, "[video] %s video_frames=%lld audio_frames=%lld w=%d h=%d pts=%.3f\n",
-            v->url[0] ? v->url : "?", v->n_vframes, v->n_aframes, v->w, v->h, v->frame_pts);
+    fprintf(stderr,
+            "[video] %s video_frames=%lld audio_frames=%lld w=%d h=%d pts=%.3f "
+            "threads=%d decode=%s cost/frame: dec=%.2fms conv=%.2fms upload=%.2fms hw=%.2fms\n",
+            v->url[0] ? v->url : "?", v->n_vframes, v->n_aframes, v->w, v->h, v->frame_pts,
+            v->vc != NULL ? v->vc->thread_count : 0,
+            v->hw_used ? "d3d11va" : "soft",
+            v->n_vframes > 0 ? v->t_dec_ms / (double)v->n_vframes : 0.0,
+            v->n_vframes > 0 ? v->t_conv_ms / (double)v->n_vframes : 0.0,
+            v->n_vframes > 0 ? v->t_upload_ms / (double)v->n_vframes : 0.0,
+            v->n_vframes > 0 ? v->t_hw_ms / (double)v->n_vframes : 0.0);
   }
   as_video_drop_image(v);
   while (v->qn > 0) { v->qn--; sk_image_delete((void*)v->qimg[v->qn]); }
@@ -389,6 +522,10 @@ static void as_video_free_state(as_video* v) {
   if (v->sws_bgra != NULL) { sws_freeContext(v->sws_bgra); v->sws_bgra = NULL; }
   if (v->frame != NULL) av_frame_free(&v->frame);
   if (v->aframe != NULL) av_frame_free(&v->aframe);
+  if (v->sw_frame != NULL) av_frame_free(&v->sw_frame);
+  // Our own reference only: the decoder context holds its own, and it is released
+  // below by avcodec_free_context.
+  if (v->hw_device != NULL) av_buffer_unref(&v->hw_device);
   if (v->pkt != NULL) av_packet_free(&v->pkt);
   if (v->vc != NULL) avcodec_free_context(&v->vc);
   if (v->ac != NULL) avcodec_free_context(&v->ac);
@@ -406,10 +543,30 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
   // tone.mp3 in a NetStream with no picture).
   if (v->vc == NULL) { if (frames_out != NULL) *frames_out = 0; return 0; }
   for (;;) {
+    const double t_dec0 = as_video_ms();
     int rc = avcodec_receive_frame(v->vc, v->frame);
+    v->t_dec_ms += as_video_ms() - t_dec0;
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
     if (rc < 0) { as_vs_error(v, "video decode", rc); v->failed = 1; break; }
-    if (as_video_present(v, v->frame, grctx, now_ms)) got++;
+    if (v->frame->format == AV_PIX_FMT_D3D11) {
+      // GPU -> system memory. Counted apart from `dec` because it is the price of
+      // NOT doing zero-copy: measured as the `hw=` column of AS_VIDEO_STATS.
+      const double t_hw0 = as_video_ms();
+      if (v->sw_frame == NULL) v->sw_frame = av_frame_alloc();
+      if (v->sw_frame == NULL) { as_vs_error(v, "hwframe", AVERROR(ENOMEM)); v->failed = 1; break; }
+      av_frame_unref(v->sw_frame);
+      rc = av_hwframe_transfer_data(v->sw_frame, v->frame, 0);
+      v->t_hw_ms += as_video_ms() - t_hw0;
+      if (rc < 0) { as_vs_error(v, "hwframe transfer", rc); v->failed = 1; break; }
+      // av_hwframe_transfer_data does NOT copy props (hwcontext.c allocates a plain
+      // buffer and moves it), and pts/colorspace/color_range live there: skip this
+      // and every frame reports pts 0, so NetStream.time freezes at 0.000.
+      av_frame_copy_props(v->sw_frame, v->frame);
+      v->hw_used = 1;
+      if (as_video_present(v, v->sw_frame, grctx, now_ms)) got++;
+    } else if (as_video_present(v, v->frame, grctx, now_ms)) {
+      got++;
+    }
     av_frame_unref(v->frame);
   }
   if (frames_out != NULL) *frames_out = got;
@@ -474,6 +631,15 @@ static void as_video_advance(as_video* v, void* grctx, double target_s, double n
     v->seek_to = -1;
   }
   int budget = AS_VIDEO_TICK_PACKETS;
+  // Priming is exempt from the per-tick budget. A frame-threaded decoder emits
+  // NOTHING until it has been fed a whole thread queue of frames, and interleaved
+  // audio packets eat half the budget, so 24 packets can leave n_vframes at 0 and
+  // videoWidth/Height at 0 right after play() -- measured with 8 threads on
+  // clip.mp4, whose 1.2 s is short enough that the old budget never filled the
+  // pipe. Only the video-having, nothing-decoded-yet case gets the bigger budget;
+  // an audio-only stream must not spend it every tick (it would never be spent:
+  // vs < 0), and steady state stays at one tick's worth.
+  if (v->vs >= 0 && v->n_vframes == 0) budget = AS_VIDEO_PRIME_PACKETS;
   while (budget-- > 0) {
     // PACING IS CHECKED BEFORE THE READ, not after it. A video stream stops feeding
     // as soon as the newest decoded frame is at/past the clock plus the lead:
@@ -585,6 +751,31 @@ int as_video_open(const char* url, const char* backend, const char* formats, cha
     if (v->vc == NULL) { as_video_free_state(v); if (errbuf) snprintf(errbuf, (size_t)errlen, "out of memory"); return -1; }
     avcodec_parameters_to_context(v->vc, st->codecpar);
     v->vc->pkt_timebase = st->time_base;
+    // Decoder threads. FFmpeg's AVCodecContext defaults thread_count to 1, and one
+    // thread decoding 4K HEVC costs ~8.8 ms per frame (measured on a 3832x1592
+    // 10-bit HDR10+ file): half of a 60 Hz frame budget, spent INSIDE the frame
+    // loop that also has to paint and pump timers. 0 means "size it for this CPU"
+    // (frame + slice threads), which is what every player does by default.
+    //
+    // Capped, not left at the CPU count: frame threading keeps one frame per thread
+    // alive, and a decoded 4K 10-bit frame is ~18 MB -- 32 threads would pin ~580 MB
+    // for a stream that decodes far faster than it plays. 8 is past the point where
+    // this decoder stops being the bottleneck (measured below).
+    // Hardware decode first: the thread sizing below is for the SOFTWARE path. A
+    // GPU decoder ignores thread_count, and frame threading there would only add
+    // latency before the first frame -- which the priming exemption exists for.
+    const int hw = as_video_hw_setup(v, dec);
+    if (hw) {
+      v->vc->thread_count = 1;
+    } else {
+      // av_cpu_count is libavutil's own probe (it is what thread_count = 0 would
+      // use), so this file needs no platform headers for it.
+      int ncpu = av_cpu_count();
+      if (ncpu < 1) ncpu = 1;
+      if (ncpu > 8) ncpu = 8;
+      v->vc->thread_count = ncpu;
+      v->vc->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    }
     if ((rc = avcodec_open2(v->vc, dec, NULL)) < 0) {
       as_vs_error(v, dec->name, rc);
       if (errbuf != NULL) snprintf(errbuf, (size_t)errlen, "%s", v->err);
