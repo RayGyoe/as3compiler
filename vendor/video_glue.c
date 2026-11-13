@@ -46,9 +46,12 @@
 #if defined(_WIN32)
 #include <libavutil/hwcontext_d3d11va.h>   // the ID3D11Device behind a d3d11va frame (zero copy)
 #endif
+#include <libavutil/hdr_dynamic_metadata.h>    // AVDynamicHDRPlus (HDR10+, ST 2094-40)
+#include <libavutil/dovi_meta.h>                // AVDOVIMetadata (Dolby Vision RPU)
+#include <libavutil/mastering_display_metadata.h>  // MaxCLL / MaxFALL / mastering peak
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
-#include "video_hdr.h"   // HDR -> SDR tone mapping (video.md §16.10)
+#include "video_hdr.h"   // HDR -> SDR tone mapping (video.md §16.10/§16.11)
 
 #include <math.h>
 #include <stdint.h>   // intptr_t: a hw frame carries its slice index in data[1]
@@ -218,6 +221,17 @@ typedef struct {
   as_hdr* hdr;
   int v_trc;                // codecpar color_trc, the HDR verdict before any frame
   int hdr_pq;               // 1 = PQ, 2 = HLG (for diagnostics)
+  // Dynamic metadata (video.md §16.11). Read once per frame from frame side data and
+  // handed to the curve as two numbers; the per-stream fields below feed AS_VIDEO_STATS
+  // so "did the metadata actually arrive?" is answerable without a debugger.
+  int dv_profile;           // container dvcC/dvvC, 0 = not Dolby Vision
+  int dv_bl_compat;         // dv_bl_signal_compatibility_id: 1 = HDR10 base, 4 = HLG
+  int meta_kind;            // 0 none, 1 HDR10+, 2 Dolby Vision, 3 static (MaxCLL) only
+  float meta_peak;          // nits, scene peak as the metadata declares it
+  float meta_avg;           // nits, mean of the scene's linearised maxRGB
+  float meta_tau;           // the shoulder length the curve then picked
+  double t_meta_ms;         // reading + applying the metadata
+  int meta_traced;          // AS_VIDEO_DEBUG: the one-shot trace was printed
   struct SwrContext* swr;
   unsigned char* i420;      // converted planes buffer (w*h*3/2), NULL when direct
   unsigned char* bgra;
@@ -400,6 +414,47 @@ static int as_video_hdr_kind(int trc) {
   return 0;
 }
 
+// Off by default? No -- reading metadata changes nothing unless tone mapping is on, and
+// when it is on, a curve placed on the scene's real peak is strictly closer to intent
+// than one placed on a constant. AS_VIDEO_HDR_META=0 is there for A/B measurement.
+static int as_video_hdr_meta_wanted(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = getenv("AS_VIDEO_HDR_META");
+    cached = (e == NULL) ? 1 : !(e[0] == '0' || e[0] == 'o' || e[0] == 'O' || e[0] == 'f');
+  }
+  return cached;
+}
+
+// Local tone mapping strength. Default 0 (off): it costs a second pass over the frame,
+// so it is a deliberate choice, not something a default silently spends (§16.11.3).
+static float as_video_hdr_local_k(void) {  static int cached = -1;
+  static float k = 0.0f;
+  if (cached < 0) {
+    const char* e = getenv("AS_VIDEO_HDR_LOCAL");
+    cached = 0;
+    if (e != NULL && !(e[0] == '0' || e[0] == 'o' || e[0] == 'O' || e[0] == 'f')) {
+      k = 0.25f;
+      const char* s = getenv("AS_VIDEO_HDR_LOCAL_K");
+      if (s != NULL) { const double d = atof(s); if (d > 0.0 && d <= 1.0) k = (float)d; }
+      cached = 1;
+    }
+  }
+  return k;
+}
+
+// Two-sided local mapping (bright neighbourhoods compressed) or shadow lift only.
+// Default is lift-only, because the two-sided form measurably dimmed the highlights of
+// the 4K sample's dark frames -- see §16.11.3 for the numbers.
+static int as_video_hdr_local_two_sided(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = getenv("AS_VIDEO_HDR_LOCAL_MODE");
+    cached = (e != NULL && (e[0] == 'b' || e[0] == 'B' || e[0] == '2')) ? 1 : 0;
+  }
+  return cached;
+}
+
 // Build the mapping tables on first use. BT.2020 primaries are assumed when the frame
 // does not say, because every HDR10/HLG delivery is BT.2020; an explicit BT.709 signal
 // is honoured, which keeps the gamut matrix out of the path when it would be wrong.
@@ -408,16 +463,58 @@ static int as_video_hdr_kind(int trc) {
 static as_hdr* as_video_hdr_make(as_video* v, int kind, int is_2020) {
   if (v->hdr != NULL) return v->hdr;
   if (kind == 0) return NULL;
+  // Dolby Vision profile 5 does not carry a PQ base layer: its BL is IPTPQc2, which needs
+  // the RPU reshaping curve and an IPT -> RGB conversion before anything else can be
+  // done. Treating those code values as PQ would produce a plausible-looking but wrong
+  // picture, so the mapping refuses and the stream plays as AIR would (pass-through).
+  // Profile 8.x DOES carry a compatible base layer (HDR10 for 8.1, HLG for 8.4), which
+  // is why only 5 is refused.
+  if (v->dv_profile == 5) {
+    fprintf(stderr,
+            "[video] Dolby Vision profile 5: base layer is IPTPQc2, not PQ; tone "
+            "mapping refused (the picture would be wrong, not merely clipped)\n");
+    return NULL;
+  }
   v->hdr = as_hdr_create(kind, is_2020);
   if (v->hdr == NULL) return NULL;
   v->hdr_pq = kind;
   const char* g = getenv("AS_VIDEO_HDR_GAIN");
   if (g != NULL) as_hdr_set_gain(v->hdr, (float)atof(g));
+  const char* hp = getenv("AS_VIDEO_HLG_PEAK");
+  if (hp != NULL) as_hdr_set_hlg_peak(v->hdr, (float)atof(hp));
+  const float lk = as_video_hdr_local_k();
+  if (lk > 0.0f) {
+    as_hdr_set_local(v->hdr, lk);
+    as_hdr_set_local_mode(v->hdr, as_video_hdr_local_two_sided());
+  }
   if (getenv("AS_VIDEO_DEBUG") != NULL)
-    fprintf(stderr, "[video] hdr: %s -> sRGB, primaries=%s, gain=%s\n",
+    fprintf(stderr, "[video] hdr: %s -> sRGB, primaries=%s, gain=%s, local=%s\n",
             kind == 1 ? "PQ" : "HLG", is_2020 ? "BT.2020->BT.709" : "native",
-            g != NULL ? g : "1");
+            g != NULL ? g : "1",
+            lk > 0.0f ? (as_video_hdr_local_two_sided() ? "both" : "lift") : "off");
   return v->hdr;
+}
+
+// Dynamic metadata (video.md §16.11). FFmpeg already parses both HDR10+ (ST 2094-40) and
+// Dolby Vision RPUs and hands them over as frame side data, so this file only converts
+// them to the two numbers the curve needs -- deliberately numbers, because
+// vendor/video_hdr.c must stay free of FFmpeg headers (that is what makes its colour
+// numbers testable by compiling it alone).
+static double as_video_pq12_nits(int pq12) {
+  // SMPTE ST 2084 inverse EOTF, 12-bit code -> nits (Dolby stores L1/source in PQ).
+  const double m1 = 2610.0 / 16384.0;
+  const double m2 = 2523.0 / 4096.0 * 128.0;
+  const double c1 = 3424.0 / 4096.0;
+  const double c2 = 2413.0 / 4096.0 * 32.0;
+  const double c3 = 2392.0 / 4096.0 * 32.0;
+  double n = (double)pq12 / 4095.0;
+  if (!(n > 0.0)) return 0.0;
+  double p = pow(n, 1.0 / m2);
+  double num = p - c1;
+  if (num < 0.0) num = 0.0;
+  double den = c2 - c3 * p;
+  if (!(den > 0.0)) return 0.0;
+  return 10000.0 * pow(num / den, 1.0 / m1);
 }
 
 static as_hdr* as_video_hdr_ctx(as_video* v, const AVFrame* f) {
@@ -427,6 +524,76 @@ static as_hdr* as_video_hdr_ctx(as_video* v, const AVFrame* f) {
                        f->colorspace == AVCOL_SPC_BT2020_CL ||
                        f->colorspace == AVCOL_SPC_UNSPECIFIED);
   return as_video_hdr_make(v, kind, is_2020);
+}
+
+// Reads whatever dynamic metadata this frame carries and reduces it to the numbers the
+// curve needs. Precedence is Dolby Vision > HDR10+ > static (MaxCLL) > mastering peak:
+// the first two are per-scene and therefore the ones that make an adaptive curve
+// meaningful, while MaxCLL is a whole-title maximum that never adapts.
+static void as_video_meta_read(as_video* v, const AVFrame* f, as_hdr_meta* m) {
+  memset(m, 0, sizeof(*m));
+  m->dv_profile = v->dv_profile;
+  m->dv_bl_compat = v->dv_bl_compat;
+  const AVFrameSideData* sd;
+  if ((sd = av_frame_get_side_data(f, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) != NULL) {
+    const AVMasteringDisplayMetadata* md = (const AVMasteringDisplayMetadata*)sd->data;
+    if (md != NULL && md->has_luminance) m->master_nits = (float)av_q2d(md->max_luminance);
+  }
+  if ((sd = av_frame_get_side_data(f, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) != NULL) {
+    const AVContentLightMetadata* cl = (const AVContentLightMetadata*)sd->data;
+    if (cl != NULL) {
+      m->max_cll_nits = (float)cl->MaxCLL;
+      m->max_fall_nits = (float)cl->MaxFALL;
+    }
+  }
+  float peak = 0.0f, avg = 0.0f;
+  int kind = 0;
+  if (v->dv_profile > 0 &&
+      (sd = av_frame_get_side_data(f, AV_FRAME_DATA_DOVI_METADATA)) != NULL) {
+    const AVDOVIMetadata* dv = (const AVDOVIMetadata*)sd->data;
+    const AVDOVIDmData* l1 = (dv != NULL) ? av_dovi_find_level(dv, 1) : NULL;
+    kind = 2;
+    if (l1 != NULL) {
+      // L1 is per-frame min/max/avg in PQ codes; the whole point of converting through
+      // the EOTF is that a PQ code is not linear in nits.
+      peak = (float)as_video_pq12_nits(l1->l1.max_pq);
+      avg = (float)as_video_pq12_nits(l1->l1.avg_pq);
+    }
+  } else if ((sd = av_frame_get_side_data(f, AV_FRAME_DATA_DYNAMIC_HDR_PLUS)) != NULL) {
+    const AVDynamicHDRPlus* hp = (const AVDynamicHDRPlus*)sd->data;
+    kind = 1;
+    if (hp != NULL && hp->num_windows >= 1) {
+      // maxscl is in units of 0.00001 of PQ peak (1.0 == 10000 nits). MEASURED, not
+      // assumed: on the 4K HDR10+ sample maxscl[2] = 0.03469 while the same stream
+      // declares a 500 nit targeted display, which only lines up at 347 nits under this
+      // scale; under a "relative to the targeted display" reading it would be 17 nits,
+      // i.e. darker than the frame average.
+      for (int wi = 0; wi < hp->num_windows && wi < 3; ++wi) {
+        const AVHDRPlusColorTransformParams* p = &hp->params[wi];
+        for (int c = 0; c < 3; ++c) {
+          const float nit = (float)(av_q2d(p->maxscl[c]) * 10000.0);
+          if (nit > peak) peak = nit;
+        }
+        const float a = (float)(av_q2d(p->average_maxrgb) * 10000.0);
+        if (a > avg) avg = a;
+      }
+      m->tsdl_nits = (float)av_q2d(hp->targeted_system_display_maximum_luminance);
+    }
+  } else if (m->max_cll_nits > 0.0f) {
+    kind = 3;
+    peak = m->max_cll_nits;
+    avg = m->max_fall_nits;
+  }
+  // A stream can carry HDR10+ metadata on every frame and still leave maxscl at zero
+  // (the sample's first frames do exactly that). Fall back rather than pin the curve to
+  // 0 nits, which would flatten the entire picture.
+  if (!(peak > 0.0f)) {
+    if (m->master_nits > 0.0f) peak = m->master_nits;
+    else if (m->max_cll_nits > 0.0f) peak = m->max_cll_nits;
+  }
+  m->kind = kind;
+  m->peak_nits = peak;
+  m->avg_nits = avg;
 }
 
 // Returns 1 when a new image was produced. `grctx` is the backend's
@@ -450,6 +617,32 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
   if (img == NULL && as_video_hdr_wanted() && as_video_hdr_kind(
           f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : v->v_trc) != 0 &&
       as_video_hdr_ctx(v, f) != NULL) {
+    // Dynamic metadata first: it decides the shoulder the frame is mapped through, so it
+    // has to land before the mapping, not after (a curve rebuild is ~0.1 ms and happens
+    // only when a scene actually changes its peak).
+    if (as_video_hdr_meta_wanted()) {
+      const double t_m0 = as_video_ms();
+      as_hdr_meta hm;
+      as_video_meta_read(v, f, &hm);
+      if (hm.kind != 0 || hm.peak_nits > 0.0f) {
+        as_hdr_set_meta(v->hdr, &hm);
+        v->meta_kind = hm.kind;
+        v->meta_peak = hm.peak_nits;
+        v->meta_avg = hm.avg_nits;
+        v->meta_tau = as_hdr_curve_tau(v->hdr);
+      }
+      v->t_meta_ms += as_video_ms() - t_m0;
+      if (!v->meta_traced && getenv("AS_VIDEO_DEBUG") != NULL) {
+        v->meta_traced = 1;
+        fprintf(stderr,
+                "[video] meta: %s peak=%.0fnits avg=%.1fnits cll=%.0f fall=%.0f "
+                "master=%.0f tsdl=%.0f dv=%d.%d -> tau=%.2f\n",
+                hm.kind == 2 ? "dovi" : (hm.kind == 1 ? "hdr10+" : "static"),
+                hm.peak_nits, hm.avg_nits, hm.max_cll_nits, hm.max_fall_nits,
+                hm.master_nits, hm.tsdl_nits, v->dv_profile, v->dv_bl_compat,
+                v->meta_tau);
+      }
+    }
     if (v->rgb48 == NULL) v->rgb48 = (unsigned char*)malloc((size_t)w * (size_t)h * 6);
     if (v->bgra == NULL) v->bgra = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
     if (v->rgb48 == NULL || v->bgra == NULL) return 0;
@@ -872,9 +1065,19 @@ static void as_video_free_state(as_video* v) {
             v->n_vframes > 0 ? v->t_zc_ms / (double)v->n_vframes : 0.0,
             v->hdr_pq == 1 ? "pq" : (v->hdr_pq == 2 ? "hlg" : "none"));
     if (v->hdr_pq != 0) {
-      fprintf(stderr, "       hdr cost/frame: sws=%.2fms map=%.2fms\n",
+      fprintf(stderr,
+              "       hdr dtm=%s local=%s cost/frame: sws=%.2fms map=%.2fms meta=%.3fms\n",
+              v->meta_kind == 2 ? "dovi" : (v->meta_kind == 1 ? "hdr10+" :
+                                             (v->meta_kind == 3 ? "static" : "none")),
+              as_hdr_local_strength(v->hdr) <= 0
+                  ? "off"
+                  : (as_hdr_local_mode(v->hdr) ? "both" : "lift"),
               v->n_vframes > 0 ? v->t_hdr_ms / (double)v->n_vframes : 0.0,
-              v->n_vframes > 0 ? v->t_map_ms / (double)v->n_vframes : 0.0);
+              v->n_vframes > 0 ? v->t_map_ms / (double)v->n_vframes : 0.0,
+              v->n_vframes > 0 ? v->t_meta_ms / (double)v->n_vframes : 0.0);
+      if (v->meta_kind != 0)
+        fprintf(stderr, "       hdr scene: peak=%.0fnits avg=%.1fnits tau=%.2f dtm=%s\n",
+                v->meta_peak, v->meta_avg, v->meta_tau, v->dv_profile > 0 ? "dovi" : "hdr10+");
     }
   }
   as_video_drop_image(v);
@@ -1171,6 +1374,18 @@ int as_video_open(const char* url, const char* backend, const char* formats, cha
       v->has_video = 1;
     }
     v->src_10bit = as_pix_fmt_10bit(st->codecpar->format);
+    // Dolby Vision configuration lives on the container (dvcC/dvvC), not on frames, and
+    // the PROFILE is what decides whether the base layer is PQ-compatible at all -- so it
+    // has to be read before the first frame (§16.11).
+    for (unsigned i = 0; i < st->codecpar->nb_coded_side_data; ++i) {
+      const AVPacketSideData* psd = &st->codecpar->coded_side_data[i];
+      if (psd->type != AV_PKT_DATA_DOVI_CONF || psd->size < sizeof(AVDOVIDecoderConfigurationRecord))
+        continue;
+      const AVDOVIDecoderConfigurationRecord* dc =
+          (const AVDOVIDecoderConfigurationRecord*)psd->data;
+      v->dv_profile = dc->dv_profile;
+      v->dv_bl_compat = dc->dv_bl_signal_compatibility_id;
+    }
     // The transfer function is known from the container, so the HDR verdict is made
     // here rather than at the first frame: a lazy decision would let the first frame go
     // through the un-mapped path (wrong colour, one frame) and, worse, through

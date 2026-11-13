@@ -30,9 +30,23 @@ function checkVideoSurface(): string[] {
   const emitted = [...emitSource.matchAll(/this\.line\('((?:[^'\\]|\\.)*)'\)/g)]
     .map((m) => m[1]).join('\n');
 
+  // A function body, found by brace matching rather than a fixed window: a window silently
+  // truncated the body once the HDR block grew, and the ordering pins below then read -1
+  // as "the anchor is missing".
   const bodyOf = (name: string): string => {
     const at = glue.indexOf(name);
-    return at < 0 ? '' : glue.slice(at, at + 6000);
+    if (at < 0) return '';
+    const open = glue.indexOf('{', at);
+    if (open < 0) return '';
+    let depth = 0;
+    for (let i = open; i < glue.length; i++) {
+      if (glue[i] === '{') depth++;
+      else if (glue[i] === '}') {
+        depth--;
+        if (depth === 0) return glue.slice(open, i + 1);
+      }
+    }
+    return glue.slice(open);
   };
 
   // ---- the build gate has TWO failure meanings, and they must not be merged ----
@@ -338,6 +352,8 @@ function checkVideoSurface(): string[] {
     writeFileSync(drv, `
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
+#include <stdlib.h>
 #include "${join(root, 'vendor', 'video_hdr.h').replace(/\\/g, '/')}"
 static double pq_code(double nits) {
   const double m1 = 2610.0 / 16384.0, m2 = 2523.0 / 4096.0 * 128.0;
@@ -355,14 +371,101 @@ int main(void) {
   int mono = 1, prev = -1;
   for (int c = 0; c <= 65535; c += 97) { int v = as_hdr_map8(h, c); if (v < prev) mono = 0; prev = v; }
   printf("mono=%d\\n", mono);
+  printf("tau_default=%.3f\\n", as_hdr_curve_tau(h));
+  // No metadata: the scene peak is unknown, so the curve stays at the measured default.
+  const int peak367_off = as_hdr_map8(h, (int)(pq_code(367.0) * 65535.0 + 0.5));
   as_hdr_set_gain(h, 2.0f);
   printf("gain18=%d\\n", as_hdr_map8(h, (int)(pq_code(18) * 65535.0 + 0.5)));
   as_hdr_set_gain(h, 0.0f);
   printf("gain_bad_still=%d\\n", as_hdr_map8(h, (int)(pq_code(18) * 65535.0 + 0.5)));
+  as_hdr_set_gain(h, 1.0f);
+  // F1: dynamic metadata moves the shoulder, and only where the scene actually reaches it.
+  as_hdr_meta m;
+  memset(&m, 0, sizeof m);
+  m.kind = 1; m.peak_nits = 367.0f; m.avg_nits = 3.7f; m.master_nits = 1000.0f;
+  as_hdr_set_meta(h, &m);
+  printf("tau367=%.3f\\n", as_hdr_curve_tau(h));
+  printf("peak367=%g\\n", (double)as_hdr_scene_peak(h));
+  printf("meta_kind=%d\\n", as_hdr_meta_kind(h));
+  printf("peak367_on=%d\\n", as_hdr_map8(h, (int)(pq_code(367.0) * 65535.0 + 0.5)));
+  printf("peak367_off=%d\\n", peak367_off);
+  // Below the knee the two curves must agree exactly: an adaptive shoulder that moved the
+  // mid-tones would make the picture pulse between scenes.
+  printf("mid18_on=%d\\n", as_hdr_map8(h, (int)(pq_code(18) * 65535.0 + 0.5)));
+  m.peak_nits = 143.0f; as_hdr_set_meta(h, &m); printf("tau143=%.3f\\n", as_hdr_curve_tau(h));
+  m.peak_nits = 4000.0f; as_hdr_set_meta(h, &m); printf("tau4000=%.3f\\n", as_hdr_curve_tau(h));
+  m.peak_nits = 10000.0f; as_hdr_set_meta(h, &m); printf("tau10000=%.3f\\n", as_hdr_curve_tau(h));
   as_hdr_destroy(h);
+
+  // F2: HLG. At R=G=B the BT.2100 OOTF is exactly the per-channel value (the luminance
+  // of a grey IS that grey), so as_hdr_map8 must agree with the frame path there.
   as_hdr* g = as_hdr_create(2, 1);
   printf("hlg0=%d hlgmid=%d\\n", as_hdr_map8(g, 0), as_hdr_map8(g, 49152));
+  unsigned short cv = 32768;
+  unsigned char src[2 * 6], dst[2 * 4];
+  memset(src, 0, sizeof src);
+  src[0] = cv & 0xff; src[1] = cv >> 8;                 // pixel 0: red only
+  src[6] = cv & 0xff; src[7] = cv >> 8;                 // pixel 1: neutral
+  src[8] = cv & 0xff; src[9] = cv >> 8;
+  src[10] = cv & 0xff; src[11] = cv >> 8;
+  as_hdr_tonemap_rgb48(g, src, 12, dst, 8, 2, 1);
+  printf("hlg_red_b=%d\\n", dst[0]);
+  printf("hlg_red_g=%d\\n", dst[1]);
+  printf("hlg_red_r=%d\\n", dst[2]);
+  printf("hlg_neutral_r=%d\\n", dst[6]);
+  printf("hlg_neutral_g=%d\\n", dst[5]);
+  printf("hlg_neutral_b=%d\\n", dst[4]);
+  printf("hlg_grey_map=%d\\n", as_hdr_map8(g, 32768));
+  as_hdr_set_hlg_peak(g, 400.0f);
+  printf("hlg400_mid=%d\\n", as_hdr_map8(g, 49152));
+  as_hdr_set_hlg_peak(g, 10.0f);
+  printf("hlg_bad_peak=%d\\n", as_hdr_map8(g, 49152));
   as_hdr_destroy(g);
+
+  // F3: local mapping. A flat field must come out identical to the global path (the
+  // operator may not shift exposure when there is no neighbourhood), a dark patch inside
+  // a bright frame must be lifted, and the bright part must be left alone in lift mode.
+  as_hdr* L = as_hdr_create(1, 1);
+  const int w = 256, ht = 128;
+  unsigned char* s2 = (unsigned char*)malloc((size_t)w * ht * 6);
+  unsigned char* d2 = (unsigned char*)malloc((size_t)w * ht * 4);
+  unsigned short brightc = (unsigned short)(pq_code(300.0) * 65535.0 + 0.5);
+  unsigned short darkc = (unsigned short)(pq_code(8.0) * 65535.0 + 0.5);
+  for (int yy = 0; yy < ht; ++yy)
+    for (int xx = 0; xx < w; ++xx) {
+      unsigned short v = (xx < 32) ? darkc : brightc;
+      unsigned char* p = s2 + ((size_t)yy * w + xx) * 6;
+      p[0] = v & 0xff; p[1] = v >> 8; p[2] = v & 0xff; p[3] = v >> 8;
+      p[4] = v & 0xff; p[5] = v >> 8;
+    }
+  as_hdr_tonemap_rgb48(L, s2, w * 6, d2, w * 4, w, ht);
+  printf("gl_dark=%d\\n", d2[(64 * w + 8) * 4 + 2]);
+  printf("gl_light=%d\\n", d2[(64 * w + 200) * 4 + 2]);
+  as_hdr_set_local(L, 0.25f);
+  printf("local_mode=%d\\n", as_hdr_local_mode(L));
+  for (int it = 0; it < 20; ++it) as_hdr_tonemap_rgb48(L, s2, w * 6, d2, w * 4, w, ht);
+  printf("lc_dark=%d\\n", d2[(64 * w + 8) * 4 + 2]);
+  printf("lc_light=%d\\n", d2[(64 * w + 200) * 4 + 2]);
+  printf("lc_gain=%g\\n", (double)as_hdr_last_gain(L));
+  as_hdr_set_local_mode(L, 1);
+  for (int it = 0; it < 20; ++it) as_hdr_tonemap_rgb48(L, s2, w * 6, d2, w * 4, w, ht);
+  printf("both_light=%d\\n", d2[(64 * w + 200) * 4 + 2]);
+  printf("both_mode=%d\\n", as_hdr_local_mode(L));
+  // Flat field: every neighbourhood equals the anchor, so every gain is exactly 1.
+  for (int yy = 0; yy < ht; ++yy)
+    for (int xx = 0; xx < w; ++xx) {
+      unsigned char* p = s2 + ((size_t)yy * w + xx) * 6;
+      p[0] = brightc & 0xff; p[1] = brightc >> 8; p[2] = brightc & 0xff; p[3] = brightc >> 8;
+      p[4] = brightc & 0xff; p[5] = brightc >> 8;
+    }
+  as_hdr_set_local_mode(L, 0);
+  for (int it = 0; it < 20; ++it) as_hdr_tonemap_rgb48(L, s2, w * 6, d2, w * 4, w, ht);
+  printf("flat_local=%d\\n", d2[(64 * w + 100) * 4 + 2]);
+  printf("flat_gain=%g\\n", (double)as_hdr_last_gain(L));
+  as_hdr_set_local(L, 0.0f);
+  printf("local_off=%d\\n", as_hdr_local_strength(L));
+  free(s2); free(d2);
+  as_hdr_destroy(L);
   return 0;
 }
 `);
@@ -399,6 +502,69 @@ int main(void) {
       num('gain18') > at('18') && num('gain_bad_still') === num('gain18'));
     check('HLG shares the same output range',
       num('hlg0') === 0 || out.includes('hlg0=0'));
+
+    // --- F1: HDR10+ / Dolby Vision dynamic metadata drives the shoulder ---
+    // Tau is the shoulder's soft-knee width in reference-white units. Without metadata
+    // it sits at the measured default; a 367-nit scene peak shortens it (the highlights
+    // get to keep their level) and a 4000-nit peak hits the 8.0 clamp (fully soft).
+    check('the default shoulder is the measured 4.0', num('tau_default') === 4);
+    check('a 367-nit scene peak tightens the shoulder',
+      num('tau367') > 1.0 && num('tau367') < 2.0);
+    check('a dim 143-nit scene shortens the shoulder further, a 4000-nit one clamps it',
+      num('tau143') > 0.2 && num('tau143') < 0.6 && num('tau4000') === 8);
+    check('an absurd peak is clamped rather than producing a negative shoulder',
+      num('tau10000') === 8);
+    check('metadata is recorded on the mapper (kind + scene peak)',
+      num('meta_kind') === 1 && num('peak367') > 360 && num('peak367') < 375);
+    // The point of the adaptive shoulder: the peak of the scene lands higher, so a 500-nit
+    // graded highlight is no longer flattened to the same place as a 4000-nit one.
+    check('dynamic metadata lifts the scene peak above the fixed-shoulder result',
+      num('peak367_on') > num('peak367_off'));
+    // ...and it must not touch the mid-tones, or the picture would pulse scene to scene.
+    check('the adaptive shoulder leaves 18 nits exactly where it was',
+      num('mid18_on') === at('18'));
+
+    // --- F2: HLG complete BT.2100 OOTF ---
+    // At R=G=B the OOTF luminance term is the grey's own value, so the frame path and the
+    // per-channel table must agree. A saturated colour must NOT: its luminance is that of
+    // the weighted mix, which is where the cross-channel term shows up.
+    check('HLG is unchanged on the neutral axis (grey = per-channel table)',
+      Math.abs(num('hlg_neutral_r') - num('hlg_grey_map')) <= 1 &&
+      num('hlg_neutral_g') === num('hlg_neutral_r'));
+    // Red-only at 10-bit code 32768. Three candidate answers, all computed by hand from
+    // the spec: full BT.2100 OOTF plus the BT.2020->709 matrix = 218; the old per-channel
+    // gamma (alpha*E^1.2), which never looks at Y = 225; the OOTF with no matrix = 190.
+    // The band is what separates the first from the other two.
+    check('HLG applies the cross-channel OOTF to saturated colour',
+      num('hlg_red_r') >= 210 && num('hlg_red_r') <= 222);
+    // A saturated primary sits above the grey of the same code (BT.2020 red is wider than
+    // BT.709 red, so the matrix has to expand it); an implementation that lost either the
+    // matrix or the OOTF would land on the wrong side of this.
+    check('a saturated primary is expanded above the same code as grey',
+      num('hlg_red_r') > num('hlg_neutral_r'));
+    check('HLG carries no chroma into the other channels',
+      num('hlg_red_g') === 0 && num('hlg_red_b') === 0);
+    check('colours and grey of equal code do not collide (the OOTF is not per-channel)',
+      num('hlg_red_r') !== num('hlg_neutral_r'));
+    check('the HLG nominal peak changes the output, and an absurd peak is rejected',
+      num('hlg400_mid') !== num('hlgmid') && num('hlg_bad_peak') > 0);
+
+    // --- F3: local (spatially varying) tone mapping ---
+    // A dark patch inside an otherwise bright frame: global leaves it at 102, the local
+    // operator lifts it ~25 codes while the bright side stays put (lift-only default).
+    check('local tone mapping lifts a dark region inside a bright frame',
+      num('lc_dark') - num('gl_dark') >= 15);
+    check('lift-only local mapping leaves the bright region alone',
+      Math.abs(num('lc_light') - num('gl_light')) <= 2);
+    check('the default local mode is lift-only', num('local_mode') === 0);
+    check('two-sided mode is available and does compress the bright side',
+      num('both_mode') === 1 && num('both_light') < num('lc_light'));
+    // A flat field has no neighbourhood: every gain must be 1, or the operator would
+    // shift exposure on ordinary content.
+    check('a flat field passes through the local operator unchanged',
+      Math.abs(num('flat_local') - num('gl_light')) <= 2 &&
+      Math.abs(num('flat_gain') - 1) < 0.01);
+    check('local strength 0 turns the pass off', num('local_off') === 0);
     rmSync(dir, { recursive: true, force: true });
   }
 

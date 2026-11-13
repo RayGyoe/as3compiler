@@ -1276,11 +1276,12 @@ point in the file, BT.709 luma):
 The direction is "highlights opened up, shadows pushed down", which is the contrast an
 HDR master is supposed to have on an SDR display: max goes from 108 to 175 and p99 from
 65 to 93 while the overall mean stays in the same range. **The costs, stated plainly**:
-this is a per-channel curve with no content adaptation, so very saturated highlights shift
-hue slightly (it is not a whole-gamut clip); HLG uses a simplified OOTF (the cross-channel
-luminance term is ignored, and there is no HLG sample on this machine to calibrate
-against). HDR10+ **dynamic** metadata, Dolby Vision and local (spatially varying) tone
-mapping are not implemented.
+this version is a per-channel curve with no content adaptation, so very saturated
+highlights shift hue slightly (it is not a whole-gamut clip), and HLG uses a simplified
+OOTF (the cross-channel luminance term is ignored). HDR10+ **dynamic** metadata, Dolby
+Vision and local (spatially varying) tone mapping were not implemented at this point.
+**All three gaps were closed in §16.11** (phase 404); 16.10 stays as the record of what
+was measured then.
 
 The curve itself has an executable assertion: `test/unit/video.ts` **compiles the real
 `vendor/video_hdr.c` with the machine's C compiler** and runs a driver, pinning "PQ black
@@ -1296,6 +1297,200 @@ AS_VIDEO_HDR_GAIN=1.3 ./temp/probe-4k.exe                # brighter, if a title 
 node --test --test-name-pattern='video' test/unit/*.ts   # the curve assertions
 ```
 
+
+### 16.11 Closing §16.10's three gaps: dynamic metadata, Dolby Vision, local mapping, full HLG OOTF (measured 2026-11-14)
+
+§16.10 shipped "one fixed-shoulder per-channel curve". This section turns it into a real
+HDR-to-SDR mapping: **HDR10+ dynamic metadata drives the shoulder**, **Dolby Vision
+metadata is consumed (profile 5 explicitly refused)**, **the full BT.2100 OOTF with its
+cross-channel luminance term**, and **local (spatially varying) tone mapping**. It still
+only enters the hot path with `AS_VIDEO_HDR=1`, and it is still mutually exclusive with
+zero copy (§16.10 item 4).
+
+**Why dynamic metadata is needed at all**: HDR10 carries a single static MaxCLL (this
+sample is a 1000-nit master with a 458-nit CLL), but real shots peak anywhere from 100 to
+800 nits. A fixed shoulder has only two outcomes -- set it for the brightest shot and the
+dark shots flatten; set it for the average and the bright ones clip. HDR10+ reports each
+scene's real peak, so the shoulder can follow the scene.
+
+#### 16.11.1 Reading metadata: priority order and two traps
+
+`as_video_meta_read()` (`video_glue.c`) tries **Dolby Vision -> HDR10+ -> static MaxCLL ->
+mastering `max_luminance`** and stops at the first hit, handing the result over as
+`as_hdr_meta` (**plain numbers; no FFmpeg struct leaks into `video_hdr.c`**).
+
+Trap one: **HDR10+'s `maxscl` must be multiplied by 10000 to get nits**, it is not a
+ratio against `targeted_system_display_maximum_luminance`. On this sample `maxscl≈0.030`
+with `tsdl=500`; scaling by `tsdl` gives 15 nits (absurd), by 10000 gives 366 nits (which
+matches the shot's visible highlights). `average_maxrgb` works the same way and gives
+3.7 nits.
+
+Trap two: **Dolby Vision profile 5 is not PQ and cannot be decoded as PQ**. Its base layer
+is IPTPQc2 (IPT primaries plus PQ), so running it through the BT.2020/PQ matrix shifts
+colours systematically. `as_video_hdr_make()` therefore **refuses to build a mapper** for
+profile 5 and falls back to pass-through (explaining itself under `AS_VIDEO_DEBUG`); the
+profile 8.x BL-compatibility field (`dv_bl_compat`) is diagnostic only. Better an explicit
+non-result than a wrong picture.
+
+Dolby Vision level-1 metadata is **PQ code values**, so it is converted back to nits
+before reaching the shoulder (`as_video_pq12_nits()`).
+
+#### 16.11.2 The shoulder follows the scene: highlights move, mid-tones never do
+
+The shoulder is parametrised by `tau` (soft-knee width, in 100-nit reference-white
+units), solved so the **scene peak lands at output 0.97**: a low peak gives a small `tau`
+(highlights keep their level), a high peak gives a large one (soft compression).
+
+The output table has 16385 entries and takes **0.79 ms** to rebuild (measured), which is
+far too much per frame -- and HDR10+ peaks move on almost every frame (a 1-nit peak change
+already moves `tau` by 0.007). So `tau` is quantised to **0.05** before rebuilding: at a
+367-nit peak the shoulder moves by less than one output code (invisible), while a
+per-frame rebuild becomes one per real scene change. Measured `meta` cost is
+`0.001-0.002 ms/frame` (one rebuild in 20 s).
+
+| Scene peak | `tau` | 367 nits lands at |
+|---|---|---|
+| 143 nits | `0.350` | -- |
+| 367 nits (the measured shot) | `1.377` | 249 (fixed shoulder: 238) |
+| 4000 nits | `8.000` (clamp) | -- |
+| 10000 nits (bad metadata) | `8.000` (clamp) | -- |
+
+**Mid-tones must not move at all**: 18 nits maps to 138 with and without metadata. Moving
+them makes brightness jump between adjacent shots (it reads as auto-exposure pumping),
+which is the classic failure of an adaptive shoulder -- so it has its own assertion.
+
+#### 16.11.3 Local tone mapping: lift-only by default, because two-sided measured wrong
+
+The implementation is a 16x16-block **log-luminance gain map**: per-block mean log2
+luminance -> frame-mean anchor (low-passed in time to stop flicker) -> 3x3 blur ->
+bilinear lookup. The per-pixel gain is `(anchor/Y_block)^k` where `k` is
+`AS_VIDEO_HDR_LOCAL` (0.25 by default). Because the gain depends on the **neighbourhood**
+only, contrast inside a block survives untouched.
+
+The default is **lift-only** (`AS_VIDEO_HDR_LOCAL_MODE=both` enables two-sided). Reason,
+measured on the 4K sample: most shots are "large dark area plus one small bright area",
+and the two-sided operator **dimmed the brightest thing in frame** -- on the same segment
+max fell from 138 to 111 and p99 from 74 to 62, i.e. it removed exactly what HDR has and
+SDR does not. Lift-only leaves the top alone and raises the shadows. Same-frame
+comparison on the synthetic image in the `test/unit/video.ts` driver (256x128, left 32
+columns 8 nits, rest 300 nits):
+
+| | dark block | bright block | flat field |
+|---|---|---|---|
+| global (local off) | 102 | 236 | 236 |
+| lift-only (default) | **127** | 236 | 236 (gain 1.000) |
+| two-sided `both` | 127 | 234 | -- |
+
+A flat field must match the global path **exactly** (gain 1.0): with no neighbourhood
+difference, any shift is exposure drift.
+
+Cost (4K 3832x1592, software decode, same binary):
+
+| Route | Per-frame CPU | App frames |
+|---|---|---|
+| `AS_VIDEO_HDR=1` (global) | `sws=12.29` + `map=4.27` + `upload=2.98` ≈ **19.5 ms** | 488 / 20.19 s ≈ 24 fps |
+| `+ AS_VIDEO_HDR_LOCAL=1` | `sws=12.25` + `map=12.80` + `upload=2.98` ≈ **28.0 ms** | 494 / 20.44 s ≈ 24 fps |
+
+The extra ~8.5 ms is "read the whole frame a second time and interpolate the gain map". It
+still fits inside the 41 ms budget of 23.976 fps, but it is a **second full-frame pass**,
+so it is off by default -- a default should not quietly spend 30% of the frame budget.
+
+#### 16.11.4 HLG: adding the cross-channel luminance term (BT.2100 OOTF)
+
+§16.10's HLG was plain per-channel `alpha*E^1.2`, which **drops the OOTF's luminance term**.
+BT.2100's scene-to-display transform is:
+
+```text
+Y_S = 0.2627 R + 0.6780 G + 0.0593 B      (BT.2020 luma weights, scene light)
+F_D = alpha * Y_S^(gamma-1) * E_S         gamma = 1.2 + 0.42*log10(Lw/1000)
+alpha = Lw / 100                            (100-nit reference white, as in §16.10 item 3)
+```
+
+The point is that `Y_S` is a **mix of all three channels**: a pure-red pixel has only 26%
+of red's value as luma, so its gain is far below what the per-channel form gives.
+`AS_VIDEO_HLG_PEAK` (1000 nits by default) sets `Lw`. Measured (10-bit code 32768, with
+the per-channel answer as a control):
+
+| | output R | note |
+|---|---|---|
+| neutral grey (R=G=B) | 200 | identical to `as_hdr_map8()` (a grey's luma is itself) |
+| pure red, full OOTF + matrix | **218** | this implementation |
+| pure red, per-channel gamma (old) | 225 | no `Y_S` term; the more saturated, the further off |
+| pure red, OOTF without BT.2020->709 | 190 | one gamut step missing |
+
+So the curve cannot be pinned by "monotonic" alone: the neutral axis must match the
+per-channel table **value for value** (otherwise the OOTF is wrong) while a saturated
+primary must land on 218, not 225 (otherwise the luminance term is missing). Both are
+assertions in the unit test.
+
+**When comparing against ffmpeg, remember it uses the per-channel approximation**: on the
+same HLG transcode (`zscale=t=arib-std-b67` of the same frames) our G/B are within 6% of
+ffmpeg's `zscale+tonemap=mobius`, and R is ~30% higher (14.07 vs 10.51) -- exactly the
+difference that term makes. **We are not the outlier here; zscale is missing the term.**
+On top of that, absolute HLG levels depend on the encoder's `Lw`, which is unknowable
+from the transcode chain, so HLG is pinned by structural facts (neutral axis, saturated
+primary) rather than absolute levels.
+
+#### 16.11.5 Cross-check: what this curve actually computes
+
+One frame of the 4K sample at 2.6 s, against three standard ffmpeg operators (same
+frame, BT.709 output):
+
+| Operator | meanR / G / B |
+|---|---|
+| pass-through (AIR-shaped: PQ as sRGB) | 19.87 / 23.77 / 29.55 |
+| `hable` | 9.31 / 23.81 / 34.06 |
+| `mobius` | 12.14 / 31.45 / 45.12 |
+| `reinhard` | 12.84 / 32.53 / 46.69 |
+| **this implementation** (`AS_VIDEO_HDR=1`) | **11.11 / 35.22 / 49.75** |
+
+It lands between `mobius` and `reinhard`, ~10% brighter than `mobius`, so the curve belongs
+to the same family rather than inventing its own normalisation. The pass-through row
+differs from all three (R 1.6-2.1x higher, B 13-35% lower) -- the direct fingerprint of
+painting PQ as sRGB: shadows flattened, variance reduced, white point pulled blue.
+
+#### 16.11.6 Switches and assertions
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AS_VIDEO_HDR` | off | master switch (§16.10) |
+| `AS_VIDEO_HDR_GAIN` | 1.0 | exposure gain |
+| `AS_VIDEO_HDR_META` | on (while HDR is active) | turn off to return to the fixed shoulder |
+| `AS_VIDEO_HLG_PEAK` | 1000 | HLG `Lw` in nits |
+| `AS_VIDEO_HDR_LOCAL` | off | local strength (0-1); 0.25 when enabled |
+| `AS_VIDEO_HDR_LOCAL_MODE` | `lift` | `both` for two-sided |
+| `AS_VIDEO_STATS` | -- | prints `dtm=` (hdr10+/dovi/static/none), `local=`, scene peak/avg/`tau`, `meta` cost |
+| `AS_VIDEO_DEBUG` | -- | prints the route and metadata detail once (`dv=8.4`, `tsdl=500`) |
+
+The unit test (`test/unit/video.ts`, compiling the real `vendor/video_hdr.c`, 90 checks)
+pins: default shoulder 4.0, 367 nits -> 1.0-2.0, 143 -> 0.2-0.6, 4000/10000 -> 8.0 clamp,
+metadata is recorded, the dynamic shoulder lifts 367 nits and **leaves 18 nits exactly
+where it was**; HLG matches the per-channel table value for value on the neutral axis, the
+saturated primary lands in 210-222, a primary carries no chroma, `Lw` applies and an
+absurd value is rejected; local mapping lifts the dark block by >=15 codes, lift-only
+leaves the bright block alone, two-sided does compress it, a flat field has gain 1.000,
+and strength 0 turns the pass off.
+
+#### 16.11.7 Still not done
+
+- **Native HDR presentation**: the swap chain is still 8-bit SDR; there is no
+  `R10G10B10A2_UNORM` + `SetColorSpace1(HDR10_ST2084)` path. Everything in this section is
+  "as correct as possible on an SDR screen", not HDR display output.
+- **DV profile 5 / profile 7 MEL-FEL reconstruction**: profile 5 is refused outright, and
+  profile 7's enhancement layer is not merged.
+- **The full ST 2094-40 adaptive curve of HDR10+** (Bezier plus per-frame tone-mapping
+  parameters): only the derived "scene peak / scene average" pair is used, to drive the
+  local shoulder; the reference per-frame mapping is not replicated.
+- **Local metadata (ST 2094-10), dynamic MaxCLL, percentile statistics.**
+
+Reproduce:
+
+```bash
+AS_VIDEO_HDR=1 AS_VIDEO_STATS=1 AS_VIDEO_DEBUG=1 ./temp/probe-4k.exe   # dtm=hdr10+ ... tau=1.28
+AS_VIDEO_HDR=1 AS_VIDEO_HDR_LOCAL=1 AS_VIDEO_STATS=1 ./temp/probe-4k.exe
+AS_VIDEO_HDR=1 AS_VIDEO_HDR_LOCAL_MODE=both ./temp/probe-4k.exe
+node --test --test-name-pattern='video' test/unit/*.ts
+```
 
 ---
 
