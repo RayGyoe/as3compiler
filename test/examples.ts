@@ -857,19 +857,23 @@ test('example: native-window.as (windowed: compile+link only)', async (t) => {
 //
 // It is WINDOWED and therefore compile+link only: soundComplete is dispatched by
 // as_audio_tick() from the window frame loop, so the example must run inside a real
-// window -- which is also why `audio/` is in SKIP_DIRS above. The 23 self-checks run
-// on a manual windowed launch (`--run`, see the source header for the command).
+// window -- which is also why `audio/` is in SKIP_DIRS above. The 38 self-checks run
+// on a manual windowed launch (`--run`, see the source header for the command);
+// fifteen of them are the filesystem half (File metadata, FileStream read ->
+// loadCompressedDataFromByteArray, createTempFile -> WAV write -> header read back ->
+// deleteFile), which is the only place the flash.filesystem write path is exercised
+// from an example rather than a probe.
 // Serial like the two cases above: it compiles the Skia/SDL2/miniaudio glue from
 // source and links ~20 MB of static libraries.
 test('example: audio/ (windowed: compile+link only)', async (t) => {
   const entry = join(dir, 'audio', 'AudioPlayer.as');
   const manifest = join(dir, 'audio', 'player.build.json');
-  const fixture = join(dir, 'audio', 'clip.mp3');
+  const fixture = join(dir, 'audio', 'movers-vol2.mp3');
   const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
   if (!existsSync(entry) || !existsSync(manifest) || !existsSync(fixture)
       || !vendorLibs.every((p) => existsSync(p))) {
-    console.log('SKIP  audio/ (needs the native Skia/SDL2 vendor libs and examples/audio/clip.mp3)');
-    t.skip('needs vendor/skia, vendor/sdl2 and examples/audio/{AudioPlayer.as,player.build.json,clip.mp3}');
+    console.log('SKIP  audio/ (needs the native Skia/SDL2 vendor libs and examples/audio/movers-vol2.mp3)');
+    t.skip('needs vendor/skia, vendor/sdl2 and examples/audio/{AudioPlayer.as,player.build.json,movers-vol2.mp3}');
     return;
   }
   await runAsync('node', ['src/index.ts', entry,

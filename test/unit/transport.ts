@@ -802,3 +802,80 @@ registerGroup('unit: transport/RequestMethod', checkRequestMethod);
 registerGroup('unit: transport/JobOwnership', checkJobOwnership);
 registerGroup('unit: transport/SharedObjectStore', checkSharedObjectStore);
 registerGroup('unit: transport/LoaderInitContent', checkLoaderInitContent);
+
+// ---- Progressive (play-while-downloading) `Sound.load` over HTTP ----
+// The contract (docs/zh-cn/audio.md §13.6, docs/en/audio.md §13.6): an MP3 whose
+// bytes are still arriving is decoded frame by frame, so `play()` returns a channel
+// immediately instead of throwing `#2068`; `bytesLoaded`/`length` grow while the
+// transfer runs; and the final `length` equals a local whole-file decode of the same
+// file (measured: 1 721 861.224489796 ms both ways, temp/probe-stream.as).
+//
+// These are SOURCE pins, not behavioural ones, because the behaviour needs a real
+// window (`as_async_tick` + the mixer thread) and a network. What they protect are
+// the four details that are easy to "simplify" back into broken:
+//   * the feed reads by ABSOLUTE offset and must not move URLStream's cursor;
+//   * one MP3 frame per decoder call (multi-frame input resets the bit reservoir);
+//   * a streaming voice follows the LIVE watermark, not the frozen end_frame;
+//   * cancel/failure CLOSES the buffer so existing voices can finish.
+function checkProgressiveSound(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [progressive-sound] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [progressive-sound] ${label}`); }
+  };
+  const emit = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const glue = readFileSync(join(root, 'vendor', 'audio_glue.c'), 'utf8');
+  const slice = (src: string, from: string, to: string): string => {
+    const i = src.indexOf(from);
+    if (i < 0) return '';
+    const j = src.indexOf(to, i + from.length);
+    return src.slice(i, j < 0 ? src.length : j);
+  };
+
+  // 1. Feed: absolute-offset re-read, no cursor movement, live byte accounting.
+  const feed = slice(emit, 'static void Sound__feed(void* job) {', 'static void as_net_pre_events(void* job) {');
+  check('Sound__feed exists and reads the body by absolute offset',
+    feed.length > 0 && feed.includes('as_stream_copy(job, (long long)o->_snd_fed,'));
+  check('…and never touches the URLStream read cursor',
+    feed.length > 0 && !feed.includes('consumed'));
+  check('…publishing bytesLoaded/bytesTotal while the transfer runs',
+    feed.includes('o->_snd_bytesLoaded = as_job_len(job);')
+    && feed.includes('o->_snd_bytesTotal = as_job_expected_total(job);'));
+  check('the per-frame hook calls the feed before the events for that frame',
+    emit.includes('Sound__feed(job);'));
+
+  // 2. bytesTotal is the advertised Content-Length, known when the HEAD arrives.
+  const hdr = slice(runtime, 'static size_t as_http_on_header(', 'static struct curl_slist* as_http_add_headers');
+  check('the HTTP header callback records Content-Length into expected_total',
+    hdr.length > 0 && hdr.includes('as_http_content_length_line(ptr, n, &cl)')
+    && hdr.includes('c->job->expected_total = cl;'));
+  check('…and the parser is case-insensitive and bounded to 32 bits',
+    runtime.includes('static int as_http_content_length_line(')
+    && runtime.includes('a = (char)(a - \'A\' + \'a\');')
+    && runtime.includes('(v <= 0xFFFFFFFFULL) ? (unsigned)v : 0u'));
+
+  // 3. Decoder: exactly one frame per call, and the streaming voice follows the
+  //    live watermark so a tail that lands after play() still plays.
+  const pull = slice(glue, 'static int as_stream_mp3_pull(as_pcm_buf* b) {', 'static void as_mp3_wk_drain(');
+  check('the MP3 path hands the decoder ONE frame per call',
+    pull.includes('ma_dr_mp3dec_decode_frame((ma_dr_mp3dec*)b->mp3dec, b->carry + hoff, flen,')
+    && pull.includes('// WHY exactly one frame per call'));
+  check('a streaming voice reads the LIVE watermark, a buffered one its frozen end',
+    glue.includes('long long limit = streaming ? b->frames : vo->end_frame;'));
+
+  // 4. Cancel/failure closes the stream; the buffer itself never advances past what
+  //    was decoded, so a voice drains instead of waiting forever.
+  check('Sound_close() closes the streaming buffer so voices can run out',
+    emit.includes('as_audio_stream_close(o->_snd_buf, 0, NULL, 0);'));
+  check('an ioError closes it too (a body that will never see its tail)',
+    (emit.match(/as_audio_stream_close\(/g) ?? []).length >= 3);
+  check('the buffered (non-progressive) formats are decoded once at close',
+    glue.includes('if (b->fmt == AS_SFMT_BUFFERED) {   // decoded in one pass at COMPLETE'));
+
+  if (ok > 0) console.log(`[progressive-sound] ${ok} progressive-Sound checks passed`);
+  return bad;
+}
+
+registerGroup('unit: transport/ProgressiveSound', checkProgressiveSound);

@@ -16090,7 +16090,7 @@ this.line('AS_bake_pend_n = 0;');
     this.line('return t;');
     this.indent--;
     this.line('}');
-    this.line('void Sound_ctor(Sound* o, URLRequest* stream, SoundLoaderContext* context) { EventDispatcher_ctor((EventDispatcher*)o, NULL); o->_snd_buf = -1; o->_snd_bytesTotal = 0; o->_snd_bytesLoaded = 0; o->_snd_url = NULL; o->_snd_requrl = NULL; o->_snd_buffering = false; o->_snd_inaccessible = false; o->_snd_id3 = ID3Info_new(); o->_snd_xpos = 0; if (stream != NULL) Sound_load((void*)o, stream, context); }');
+    this.line('void Sound_ctor(Sound* o, URLRequest* stream, SoundLoaderContext* context) { EventDispatcher_ctor((EventDispatcher*)o, NULL); o->_snd_buf = -1; o->_snd_bytesTotal = 0; o->_snd_bytesLoaded = 0; o->_snd_url = NULL; o->_snd_requrl = NULL; o->_snd_buffering = false; o->_snd_inaccessible = false; o->_snd_id3 = ID3Info_new(); o->_snd_xpos = 0; o->_snd_fed = 0; if (stream != NULL) Sound_load((void*)o, stream, context); }');
     this.line('ID3Info* ID3Info_new(void) { ID3Info* o = (ID3Info*)gc_alloc(GCT_CLASS, sizeof(ID3Info)); o->vtable = &ID3Info_vt; ID3Info_ctor(o); return o; }');
     this.line('void ID3Info_ctor(ID3Info* o) { Object_ctor((Object*)o); o->songName = NULL; o->artist = NULL; o->album = NULL; o->genre = NULL; o->track = NULL; o->year = NULL; o->comment = NULL; }');
     this.line('void SoundLoaderContext_ctor(SoundLoaderContext* o, double bufferTime, bool checkPolicyFile) { Object_ctor((Object*)o); o->bufferTime = bufferTime; o->checkPolicyFile = checkPolicyFile; }');
@@ -16146,6 +16146,7 @@ this.line('AS_bake_pend_n = 0;');
     this.line('const unsigned char* src = (bytes != NULL) ? (const unsigned char*)bytes->data + off : NULL;');
     this.line('if (bytes != NULL) bytes->position = (int)(off + n);');
     this.line('o->_snd_buf = as_audio_decode(src, n);');
+    this.line('o->_snd_fed = 0;');
     this.line('if (o->_snd_buf < 0) {');
     this.indent++;
     // No decoder in this build: accept the payload and stay silent (see the helper).
@@ -17013,6 +17014,36 @@ this.line('AS_bake_pend_n = 0;');
     // when the transport has recorded one, otherwise the request URL Sound_load
     // stashed -- which is also all a local read ever has.
     this.line('static void Sound__finish(void* job);');
+    this.line('static void Sound__feed(void* job);');
+    // Progressive decode of a URL load. WHY: AIR streams a Sound -- play() returns
+    // a channel while the bytes are still arriving -- but this backend decodes whole
+    // files. The middle ground is to decode AS BYTES LAND: each frame pulls what the
+    // job published since the last frame and appends it to the buffer the voice is
+    // reading (as_audio_stream_feed). A local read has no streaming buffer, so this
+    // is a no-op for it and the whole-image decode at COMPLETE is untouched.
+    this.line('static unsigned char as_snd_feed_buf[65536];');
+    this.line('static void Sound__feed(void* job) {');
+    this.indent++;
+    this.line('Sound* o = (Sound*)as_job_obj(job);');
+    this.line('if (o == NULL || o->_snd_buf < 0 || !as_audio_buf_streaming(o->_snd_buf)) return;');
+    this.line('for (;;) {');
+    this.indent++;
+    // as_stream_copy reads at an ABSOLUTE offset without moving a cursor: the same
+    // body is re-read on every frame, and only _snd_fed says where we got to.
+    this.line('int k = as_stream_copy(job, (long long)o->_snd_fed, as_snd_feed_buf, (int)sizeof(as_snd_feed_buf));');
+    this.line('if (k <= 0) break;');
+    this.line('if (as_audio_stream_feed(o->_snd_buf, as_snd_feed_buf, (unsigned int)k) < 0) break;');
+    this.line('o->_snd_fed += (unsigned int)k;');
+    this.indent--;
+    this.line('}');
+    // A progressive load reports its transfer while it is still running: bytesLoaded
+    // grows with the body and bytesTotal is the advertised Content-Length (0 until
+    // the response states one). Without this a download indicator would sit at 0/0
+    // until the last byte arrived -- the one moment it stops being useful.
+    this.line('o->_snd_bytesLoaded = as_job_len(job);');
+    this.line('o->_snd_bytesTotal = as_job_expected_total(job);');
+    this.indent--;
+    this.line('}');
     this.line('static void as_net_pre_events(void* job) {');
     this.indent++;
     // Uploads have their own ordering (progress BEFORE the response head) and
@@ -17023,6 +17054,10 @@ this.line('AS_bake_pend_n = 0;');
     this.line('if (as_job_finish(job) == (void*)Sound__finish) {');
     this.indent++;
     this.line('Sound* so = (Sound*)obj;');
+    // Bytes that landed since the last frame become playable PCM before the events
+    // for this frame are reported, so a PROGRESS listener already sees a sound that
+    // can be played (audio.md §13.6).
+    this.line('Sound__feed(job);');
     this.line('if (so->_snd_url == NULL) {');
     this.indent++;
     this.line('const char* fu = as_job_eff_url(job);');
@@ -17234,11 +17269,18 @@ this.line('AS_bake_pend_n = 0;');
     this.line('static void Sound__finish(void* job) {');
     this.indent++;
     this.line('Sound* o = (Sound*)as_job_obj(job);');
+    // Pull the tail (the last chunk can land between the final frame pre-pass and
+    // the finish thunk).
+    this.line('Sound__feed(job);');
     // The OPEN / PROGRESS sequence is the shared flash.net pre-pass: a load that
     // finished before any frame tick still reports them, in order, exactly once.
     this.line('as_net_pre_events(job);');
     this.line('if (as_job_failed(job)) {');
     this.indent++;
+    // A progressive buffer that will never see its tail has to be CLOSED, not left
+    // waiting: a voice parked at the watermark would otherwise never finish and
+    // soundComplete could never fire (the load failed, but the channel exists).
+    this.line('if (o->_snd_buf >= 0 && as_audio_buf_streaming(o->_snd_buf)) as_audio_stream_close(o->_snd_buf, 0, NULL, 0);');
     this.line('char* msg = as_job_error_text(job, (char*)"Sound.load: network URLs are not supported in this build (no HTTP backend linked)", (char*)"Sound load failed");');
     // Measured on adl (round 10): a Sound.load that fails reports errorID 2032
     // ("Stream Error") with the shared "Error #N: <sentence>. URL: <url>" text,
@@ -17289,7 +17331,23 @@ this.line('AS_bake_pend_n = 0;');
     // Decode on the AS3 thread at the frame boundary, exactly as
     // loadCompressedDataFromByteArray does: AIR decodes a Sound synchronously and
     // the terminate event is COMPLETE, not "still buffering".
+    // A URL load was already decoded progressively (Sound__feed), so all that is
+    // left is to close the stream -- and to notice a payload that was not decodable
+    // at all. Everything else (a local read, an embedded Sound) decodes here.
+    //
+    // Handing the whole body to close() covers the two cases progressive decode
+    // cannot deliver: a format that is not MP3 (decoded in one pass now that every
+    // byte is here, exactly like a local load) and an MP3 that never produced a
+    // single frame (free format, which the frame-header rule does not recognise).
+    this.line('if (o->_snd_buf >= 0 && as_audio_buf_streaming(o->_snd_buf)) {');
+    this.indent++;
+    this.line('if (!as_audio_stream_close(o->_snd_buf, 1, as_job_bytes(job), total)) o->_snd_buf = -1;');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
     this.line('o->_snd_buf = as_audio_decode(as_job_bytes(job), total);');
+    this.indent--;
+    this.line('}');
     // No decoder in this build: the payload was fetched fine and there is nothing to
     // judge it against, so the load finishes (COMPLETE) and the silence shows up at
     // play() time -- see as_snd_accept_undecoded. Reporting #2032 here would blame the
@@ -17342,10 +17400,18 @@ this.line('AS_bake_pend_n = 0;');
     // Sound.url must still resolve (to the absolute file URL) once the load
     // completes.
     this.line('o->_snd_requrl = as_job_strdup(url);');
+    this.line('o->_snd_fed = 0;');
     this.line('if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {');
     this.indent++;
+    // Progressive: open a streaming buffer BEFORE the transfer starts, and submit
+    // the append-in-place job so Sound__feed can decode what has landed so far.
+    // play() therefore returns a channel right away and starts as soon as the first
+    // frames are decoded -- which is what AIR does and what a whole-file decode at
+    // COMPLETE cannot do (that threw #2068 for a play() issued mid-load).
+    this.line('int sb = as_audio_stream_open();');
+    this.line('if (sb >= 0) o->_snd_buf = sb;');
     this.line('net_req r; net__prepare_request(stream, &r);');
-    this.line('void* j = as_async_submit_http((void*)o, Sound__finish, (char*)r.url, r.method, stream->userAgent, stream->contentType, (char*)r.headers, r.body, r.body_len, 1, stream->followRedirects ? 1 : 0, stream->idleTimeout, stream->manageCookies ? 1 : 0);');
+    this.line('void* j = as_async_submit_http_stream((void*)o, Sound__finish, (char*)r.url, r.method, stream->userAgent, stream->contentType, (char*)r.headers, r.body, r.body_len, stream->followRedirects ? 1 : 0, stream->idleTimeout, stream->manageCookies ? 1 : 0);');
     this.line('if (j != NULL) as_job_set_net_events(j);');
     this.line('return;');
     this.indent--;
@@ -17365,6 +17431,11 @@ this.line('AS_bake_pend_n = 0;');
     // opened."), i.e. it is not a silent no-op. Only a transfer still in flight
     // is cancelable.
     this.line('if (!as_async_cancel((void*)_this)) as_throw(Error_new((char*)"Error #2029: This URLStream object does not have a stream opened.", 2029));');
+    // The transfer is cancelled, so the progressive decode has seen its last byte:
+    // close the stream so any playing voice runs out instead of waiting for data
+    // that will never arrive. Frames already decoded stay playable (AIR also keeps
+    // what has been buffered).
+    this.line('{ Sound* o = (Sound*)_this; if (o->_snd_buf >= 0 && as_audio_buf_streaming(o->_snd_buf)) as_audio_stream_close(o->_snd_buf, 0, NULL, 0); }');
     this.indent--;
     this.line('}');
     this.line('');
@@ -18358,9 +18429,11 @@ this.line('AS_bake_pend_n = 0;');
     // separator is '/' there and '\\' on Windows (where '/' is also accepted).
     //
     // A relative path is normalised too -- ".." only cancels a real name, never
-    // another ".." -- which is what a host path expects even though AIR rejects
-    // such a path outright with #2004 (our acceptance of it is the registered
-    // deviation of TODO #240).
+    // another ".." -- which is what a host path expects. AIR rejects such a path
+    // outright with #2004 and so do we, but the GATE is the entry point
+    // (File_new / the nativePath setter, stage 323, docs/zh-cn/filesystem.md
+    // §11.5); this helper stays purely lexical, so do not read its tolerance as
+    // an accepted deviation -- there is none left to register.
     //
     // The result is always a fresh GC string: callers keep it across further
     // allocations. The output can never be longer than the input plus one byte
@@ -18838,8 +18911,10 @@ static char* as_file_working_dir(void) {
     this.line('}');
     this.line('// The inverse of the above, and the only place a URL becomes a path. A string');
     this.line('// that names none of the three schemes is already a native path (absolute or');
-    this.line('// relative) and is returned as-is, which keeps every existing caller -- and the');
-    this.line('// documented deviation that allows a relative nativePath -- working.');
+    this.line('// relative) and is returned as-is, so the "is this absolute?" decision stays in');
+    this.line('// one place: File_new throws #2004 for a relative path (stage 323 closed the old');
+    this.line('// deviation, see docs/zh-cn/filesystem.md §11.5) while callers such as');
+    this.line('// Sound.load/URLLoader may still hand a relative path to fopen().');
     this.line('static char* as_local_path_from_url(const char* url) {');
     this.indent++;
     this.line('if (url == NULL) return NULL;');
@@ -18868,9 +18943,12 @@ static char* as_file_working_dir(void) {
     // AIR's constructor takes a URL as well as a native path -- measured on 51.4.1:
     // new File(file.url) round-trips "app-storage:/..." back to the same nativePath,
     // and "file:///..." likewise. Either form is then normalised exactly like the
-    // setter below (measured: new File("/tmp//a/../b") is "/tmp/b"). A RELATIVE
-    // path is accepted and kept, which is where this build's documented deviation
-    // lives (AIR rejects one with #2004, see TODO #240); it is normalised too.
+    // setter below (measured: new File("/tmp//a/../b") is "/tmp/b").
+    //
+    // File_ctor itself does NOT police absoluteness: it is the raw slot filler. The
+    // public gate is File_new above, which answers a relative path with #2004 just
+    // like adl (stage 323, docs/zh-cn/filesystem.md §11.5) -- do not read this
+    // function's tolerance as a documented deviation, it was closed.
     this.line('if (path != NULL && (strncmp(path, "file://", 7) == 0 || strncmp(path, "app-storage:", 12) == 0 || strncmp(path, "app:", 4) == 0)) path = as_local_path_from_url(path);');
     this.line('o->_nativePath = (path != NULL) ? as_path_norm(path) : NULL; gc_write_barrier((void*)o->_nativePath);');
     this.indent--;

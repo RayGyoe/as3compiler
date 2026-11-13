@@ -97,6 +97,33 @@ typedef struct {
     int rate;
     int used;
     as_id3 id3;
+    // ---- streaming (Sound.load of a URL whose bytes are still arriving) ----
+    // Everything below is 0 for a fully decoded image, which keeps the static
+    // path bit-identical to what it was: streaming == 0 means "frames is final",
+    // and the mixer then uses the voice's frozen end_frame exactly as before.
+    int streaming;          // 1 = built by as_audio_stream_open
+    int ended;              // 1 = no more frames will ever be appended
+    int fmt;                // AS_SFMT_*: what the first bytes turned out to be
+    long long cap;          // allocated frames (streaming only)
+    void* mp3dec;           // AS_SFMT_MP3: ma_dr_mp3dec*, fed frame by frame
+    unsigned char* carry;   // undecoded tail bytes the next frame needs
+    long long carry_len;
+    long long carry_cap;
+    // First bytes of the stream, kept only so the ID3 tag can be parsed once the
+    // transfer ends (a tag is at the head; 64 KB covers one with artwork).
+    unsigned char* head;
+    int head_len;
+    int head_cap;
+    // MPEG nominal-length walk over the bytes as they arrive. The whole-image
+    // decode pads a stream up to its nominal length (as_mp3_nominal_frames) and a
+    // progressive load must report the SAME length for the same file -- otherwise
+    // the same MP3 has one duration over http and another from disk. A window of
+    // unprocessed bytes is enough because only frame headers are examined.
+    unsigned char* wk_buf;
+    long long wk_len;
+    long long wk_pos;
+    long long wk_skip;   // bytes of an ID3v2 tag still to skip
+    long long wk_samples;
 } as_pcm_buf;
 
 static as_pcm_buf g_bufs[64];
@@ -457,10 +484,11 @@ static void as_id3_parse(const unsigned char* b, unsigned size, as_id3* out) {
 }
 
 // Decode a compressed file image (MP3/WAV/FLAC) held in memory into float32 PCM.
-// Synchronous, exactly like Sound.loadCompressedDataFromByteArray (audio.md §5):
-// the caller gets a buffer id, or -1 with the reason in as_audio_last_error().
-int as_audio_decode(const void* data, unsigned int size) {
-    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+// This is the engine behind both as_audio_decode (below) and the buffered half of
+// the streaming seam: the caller gets a malloc'd interleaved buffer it owns plus
+// its shape, or -1 with the reason in as_audio_last_error().
+static int as_decode_image(const void* data, unsigned int size, float** outp, long long* framesp,
+                           int* chp, int* ratep) {
     if (data == NULL || size == 0) return -1;
     ma_decoder dec;
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 0, 0);
@@ -515,11 +543,26 @@ int as_audio_decode(const void* data, unsigned int size) {
             got = nominal;
         }
     }
+    *outp = pcm;
+    *framesp = got;
+    *chp = channels;
+    *ratep = (int)dec.outputSampleRate > 0 ? (int)dec.outputSampleRate : 44100;
+    return 1;
+}
+
+// Decode a whole image into a fresh registry buffer. Synchronous, exactly like
+// Sound.loadCompressedDataFromByteArray (audio.md §5).
+int as_audio_decode(const void* data, unsigned int size) {
+    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    float* pcm = NULL;
+    long long got = 0;
+    int channels = 0, rate = 0;
+    if (!as_decode_image(data, size, &pcm, &got, &channels, &rate)) return -1;
     int id = g_buf_count++;
     g_bufs[id].data = pcm;
-    g_bufs[id].frames = got;
+    g_bufs[id].frames = got;   // final: a decoded image is born 'ended' by default (0)
     g_bufs[id].channels = channels;
-    g_bufs[id].rate = (int)dec.outputSampleRate > 0 ? (int)dec.outputSampleRate : 44100;
+    g_bufs[id].rate = rate;
     g_bufs[id].used = 1;
     as_id3_parse((const unsigned char*)data, size, &g_bufs[id].id3);
     return id;
@@ -561,6 +604,360 @@ int as_audio_register_pcm(const float* pcm, long long frames, int channels, int 
 }
 
 int as_audio_buf_valid(int buf) { return buf >= 0 && buf < g_buf_count && g_bufs[buf].used; }
+
+// ---------------------------------------------------------------------------
+// Streaming PCM (Sound.load of a URL whose bytes are still arriving)
+// ---------------------------------------------------------------------------
+// WHY this exists: a Sound whose bytes are still in flight used to have NO PCM at
+// all -- Sound.load decoded once, when the transfer ENDED -- so a play() during the
+// load had nothing to hand the mixer and threw #2068. AIR returns a channel and
+// starts as data arrives (progressive download). The buffer below is the same
+// as_pcm_buf as a decoded image; the difference is that its frame count is a
+// WATERMARK published under g_buf_lock:
+//
+//   * the AS3 thread appends frames (and may realloc 'data'),
+//   * the audio thread holds the lock for the whole block of a streaming voice, so
+//     it can never mix through a pointer that stopped being the live one,
+//   * a voice that reaches the watermark does NOT end the sound: it outputs silence
+//     until more frames land (the moving 'frames' is the entire signal).
+//
+// MP3 is decoded frame by frame AS IT ARRIVES (ma_dr_mp3dec). Every other format is
+// decoded once at COMPLETE (as_decode_image over the whole body) -- one pass over
+// bytes that are all present by then. play() still returns a channel for those
+// during the load (the voice waits at the first frame); they are simply not
+// progressive, which audio.md §13.6 states outright instead of implying otherwise.
+enum { AS_SFMT_NONE = 0, AS_SFMT_MP3 = 1, AS_SFMT_BUFFERED = 2 };
+#define AS_STREAM_HEAD 65536        // kept for the ID3 parse at close (tag with artwork)
+#define AS_MP3_WK_BUF  16384        // window for the nominal-length walk
+
+static ma_mutex g_buf_lock;
+static int g_buf_lock_ready = 0;
+static void as_buf_lock(void) {
+    if (!g_buf_lock_ready) {
+        if (ma_mutex_init(&g_buf_lock) != MA_SUCCESS) return;  // unlocked: no device thread
+        g_buf_lock_ready = 1;
+    }
+    ma_mutex_lock(&g_buf_lock);
+}
+static void as_buf_unlock(void) {
+    if (g_buf_lock_ready) ma_mutex_unlock(&g_buf_lock);
+}
+
+// Frame header -> total frame length and sample count. Shared by the progressive
+// pull loop and the nominal-length walk so both agree on where frames start.
+static int as_mp3_hdr(const unsigned char* p, int* flen, int* fsamples) {
+    if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return 0;
+    int ver = (p[1] >> 3) & 3;    // 3 = MPEG-1, 2 = MPEG-2, 0 = MPEG-2.5
+    int layer = (p[1] >> 1) & 3;  // 1 = layer III
+    int brIdx = (p[2] >> 4) & 0xF;
+    int srIdx = (p[2] >> 2) & 3;
+    int pad = (p[2] >> 1) & 1;
+    if (layer != 1 || brIdx == 0 || brIdx == 15 || srIdx == 3) return 0;
+    int len;
+    if (ver == 3) {
+        len = (144000 * as_mp3_br_v1l3[brIdx]) / as_mp3_sr_v1[srIdx] + pad;
+        *fsamples = 1152;
+    } else {
+        len = (72000 * as_mp3_br_v2l3[brIdx]) / as_mp3_sr_v2[srIdx] + pad;
+        *fsamples = 576;
+    }
+    if (len <= 4) return 0;
+    *flen = len;
+    return 1;
+}
+
+// Reserve room for 'need' frames. Caller holds g_buf_lock, so the realloc cannot
+// race the mixer.
+static int as_stream_reserve(as_pcm_buf* b, long long need) {
+    if (need <= b->cap) return 1;
+    long long cap = (b->cap > 0) ? b->cap : 262144;
+    while (cap < need) cap *= 2;
+    int ch = b->channels > 0 ? b->channels : 1;
+    float* nd = (float*)realloc(b->data, (size_t)cap * (size_t)ch * sizeof(float));
+    if (nd == NULL) return 0;
+    b->data = nd;
+    b->cap = cap;
+    return 1;
+}
+
+// Append decoded frames, converting channels if the stream's channel count changed
+// mid-file (an MP3 stream may switch mono/stereo).
+static int as_stream_append_frames(as_pcm_buf* b, const float* src, long long frames, int ch) {
+    if (frames <= 0) return 1;
+    if (ch <= 0) ch = 1;
+    if (b->channels == 0) b->channels = ch;
+    if (!as_stream_reserve(b, b->frames + frames)) return 0;
+    float* dst = b->data + (size_t)b->frames * (size_t)b->channels;
+    if (ch == b->channels) {
+        memcpy(dst, src, (size_t)frames * (size_t)ch * sizeof(float));
+    } else if (ch == 1) {
+        for (long long i = 0; i < frames; i++) { dst[i * 2] = src[i]; dst[i * 2 + 1] = src[i]; }
+    } else {
+        for (long long i = 0; i < frames; i++) dst[i] = 0.5f * (src[i * 2] + src[i * 2 + 1]);
+    }
+    b->frames += frames;   // publish the new watermark
+    return 1;
+}
+
+static void as_stream_take_head(as_pcm_buf* b, const unsigned char* p, int n) {
+    if (b->head_len >= AS_STREAM_HEAD || n <= 0) return;
+    int room = AS_STREAM_HEAD - b->head_len;
+    if (n > room) n = room;
+    if (b->head == NULL) {
+        b->head = (unsigned char*)malloc(AS_STREAM_HEAD);
+        if (b->head == NULL) return;
+        b->head_cap = AS_STREAM_HEAD;
+    }
+    memcpy(b->head + b->head_len, p, (size_t)n);
+    b->head_len += n;
+}
+
+// MP3 or not, from the first bytes. An ID3v2 tag means MP3: the tag is handed to
+// the decoder verbatim (dr_mp3 skips leading junk by scanning for a frame sync,
+// exactly as an in-memory whole-file decode does).
+static void as_stream_sniff(as_pcm_buf* b) {
+    if (b->fmt != AS_SFMT_NONE || b->head == NULL || b->head_len < 4) return;
+    const unsigned char* p = b->head;
+    if ((p[0] == 'I' && p[1] == 'D' && p[2] == '3') || (p[0] == 0xFF && (p[1] & 0xE0) == 0xE0)) {
+        b->fmt = AS_SFMT_MP3;
+    } else {
+        b->fmt = AS_SFMT_BUFFERED;
+        // Nothing to keep: the whole body is still in the job and is decoded in one
+        // pass at COMPLETE.
+        free(b->carry);
+        b->carry = NULL;
+        b->carry_len = 0;
+        b->carry_cap = 0;
+    }
+}
+
+static int as_stream_mp3_pull(as_pcm_buf* b);
+
+// Decode whole frames out of the carry queue. Caller holds g_buf_lock.
+static int as_stream_mp3_pull(as_pcm_buf* b) {
+    if (b->mp3dec == NULL) {
+        b->mp3dec = calloc(1, sizeof(ma_dr_mp3dec));
+        if (b->mp3dec == NULL) return 0;
+        ma_dr_mp3dec_init((ma_dr_mp3dec*)b->mp3dec);
+    }
+    float tmp[MA_DR_MP3_MAX_FREE_FORMAT_FRAME_SIZE * 2];
+    for (;;) {
+        if (b->carry_len < 4) break;
+        long long hoff = 0;
+        int flen = 0, fsamples = 0;
+        while (hoff + 4 <= b->carry_len) {   // resync byte by byte, like the walker
+            if (as_mp3_hdr(b->carry + hoff, &flen, &fsamples)) break;
+            hoff++;
+        }
+        if (flen <= 0) {
+            // No header in the window: keep the three trailing bytes that could
+            // still be the beginning of one, drop the junk.
+            if (b->carry_len > 3) {
+                memmove(b->carry, b->carry + (b->carry_len - 3), 3);
+                b->carry_len = 3;
+            }
+            break;
+        }
+        if (b->carry_len - hoff < (long long)flen) break;   // whole frame not here yet
+        // WHY exactly one frame per call: ma_dr_mp3dec_decode_frame() only takes its
+        // fast path when the buffer it is handed IS the frame (or the following
+        // header matches it byte for byte). A multi-frame buffer whose neighbour
+        // header differs -- which CBR does on every padding-bit flip -- makes it
+        // reset its decoder state, and a reset decoder cannot resolve a frame whose
+        // main_data_begin points into the bit reservoir: measured on
+        // movers-vol2.mp3, 739 frames came back as 0 samples that way. One frame at
+        // a time decodes all 65915 of them, identical to a whole-image decode.
+        ma_dr_mp3dec_frame_info info;
+        memset(&info, 0, sizeof(info));
+        int frames = ma_dr_mp3dec_decode_frame((ma_dr_mp3dec*)b->mp3dec, b->carry + hoff, flen,
+                                              tmp, &info);
+        if (frames > 0) {
+            int ch = info.channels > 0 ? info.channels : 1;
+            if (b->channels == 0) {
+                b->channels = ch;
+                b->rate = info.sample_rate > 0 ? info.sample_rate : 44100;
+            }
+            if (!as_stream_append_frames(b, tmp, frames, ch)) return 0;
+        }
+        // Advance by the header-declared length, never by what the decoder claims: a
+        // frame it rejects must not stall the stream.
+        long long consumed = hoff + (long long)flen;
+        if (consumed >= b->carry_len) {
+            b->carry_len = 0;
+        } else {
+            memmove(b->carry, b->carry + consumed, (size_t)(b->carry_len - consumed));
+            b->carry_len -= consumed;
+        }
+    }
+    return 1;
+}
+
+// Incremental nominal-length walk (see the wk_* fields in as_pcm_buf).
+// Same rules as as_mp3_nominal_frames, one window at a time: resync to the next
+// 0xFF Ex header, count a header whose body runs past the end only when the stream
+// is over (that is what the whole-image walk does), skip an ID3v2 tag wholesale.
+static void as_mp3_wk_drain(as_pcm_buf* b, int final) {
+    if (b->wk_buf == NULL) return;
+    for (;;) {
+        long long avail = b->wk_len - b->wk_pos;
+        if (avail <= 0) break;
+        if (b->wk_skip > 0) {
+            long long k = (avail < b->wk_skip) ? avail : b->wk_skip;
+            b->wk_pos += k;
+            b->wk_skip -= k;
+            if (b->wk_skip > 0) break;
+            avail = b->wk_len - b->wk_pos;
+        }
+        if (avail < 4) break;
+        int flen = 0, fsamples = 0;
+        if (!as_mp3_hdr(b->wk_buf + b->wk_pos, &flen, &fsamples)) {
+            b->wk_pos++;   // not a frame header: resync one byte at a time
+            continue;
+        }
+        if (avail < flen) {
+            if (!final) break;                 // wait for the rest of the frame
+            b->wk_samples += fsamples;         // a header at the very end still counts
+            b->wk_pos += flen;
+            break;
+        }
+        b->wk_samples += fsamples;
+        b->wk_pos += flen;
+    }
+    if (b->wk_pos > 0) {   // slide the unprocessed tail back to the front
+        long long rest = b->wk_len - b->wk_pos;
+        if (rest > 0) memmove(b->wk_buf, b->wk_buf + b->wk_pos, (size_t)rest);
+        b->wk_len = rest;
+        b->wk_pos = 0;
+    }
+}
+
+static void as_mp3_wk_feed(as_pcm_buf* b, const unsigned char* p, long long n, int final) {
+    if (b->wk_buf == NULL) {
+        b->wk_buf = (unsigned char*)malloc(AS_MP3_WK_BUF);
+        if (b->wk_buf == NULL) return;
+        // Skip an ID3v2 tag exactly like the whole-image walker does.
+        if (b->head != NULL && b->head_len >= 10 && b->head[0] == 'I' && b->head[1] == 'D' &&
+            b->head[2] == '3') {
+            b->wk_skip = 10 + (((long long)(b->head[6] & 0x7F) << 21) |
+                               ((long long)(b->head[7] & 0x7F) << 14) |
+                               ((long long)(b->head[8] & 0x7F) << 7) |
+                               (long long)(b->head[9] & 0x7F));
+        }
+    }
+    while (n > 0) {
+        if (b->wk_len >= AS_MP3_WK_BUF) {
+            as_mp3_wk_drain(b, 0);
+            if (b->wk_len >= AS_MP3_WK_BUF) return;
+        }
+        long long space = AS_MP3_WK_BUF - b->wk_len;
+        long long k = (n < space) ? n : space;
+        memcpy(b->wk_buf + b->wk_len, p, (size_t)k);
+        b->wk_len += k;
+        p += k;
+        n -= k;
+        as_mp3_wk_drain(b, 0);
+    }
+    if (final) as_mp3_wk_drain(b, 1);
+}
+
+// Order a fresh streaming buffer. Returns the buffer id, or -1 when the registry is
+// full. The caller (Sound.load) owns it until the transfer ends.
+int as_audio_stream_open(void) {
+    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    int id = g_buf_count++;
+    memset(&g_bufs[id], 0, sizeof(g_bufs[id]));
+    g_bufs[id].used = 1;
+    g_bufs[id].streaming = 1;
+    return id;   // rate/channels unknown until the first frame decodes
+}
+
+int as_audio_buf_streaming(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].streaming : 0; }
+int as_audio_buf_ended(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].ended : 1; }
+
+int as_audio_stream_feed(int buf, const void* data, unsigned int n) {
+    if (!as_audio_buf_valid(buf)) return -1;
+    as_pcm_buf* b = &g_bufs[buf];
+    if (!b->streaming || b->ended) return -1;
+    const unsigned char* p = (const unsigned char*)data;
+    if (p == NULL || n == 0) return 0;
+    as_buf_lock();
+    as_stream_take_head(b, p, (int)n);
+    if (b->fmt == AS_SFMT_NONE) as_stream_sniff(b);
+    if (b->fmt == AS_SFMT_BUFFERED) {   // decoded in one pass at COMPLETE
+        as_buf_unlock();
+        return 1;
+    }
+    if (b->carry_len + (long long)n > b->carry_cap) {
+        long long cap = (b->carry_cap > 0) ? b->carry_cap : 65536;
+        while (cap < b->carry_len + (long long)n) cap *= 2;
+        unsigned char* nc = (unsigned char*)realloc(b->carry, (size_t)cap);
+        if (nc == NULL) { as_buf_unlock(); return -1; }
+        b->carry = nc;
+        b->carry_cap = cap;
+    }
+    memcpy(b->carry + b->carry_len, p, n);
+    b->carry_len += (long long)n;
+    int rc = as_stream_mp3_pull(b) ? 1 : -1;
+    as_mp3_wk_feed(b, p, (long long)n, 0);
+    as_buf_unlock();
+    return rc;
+}
+
+// End the stream. 'whole'/'wholeLen' is the COMPLETE body (NULL on cancel/failure);
+// it is what a non-progressive format is decoded from, in one pass, exactly like a
+// local load -- and what an MP3 falls back to when not a single frame decoded
+// (free-format MP3, which the frame-header rule above does not recognise).
+// Returns 0 when nothing playable came out (Sound__finish turns that into #2032).
+int as_audio_stream_close(int buf, int complete, const void* whole, unsigned int wholeLen) {
+    if (!as_audio_buf_valid(buf)) return 0;
+    as_pcm_buf* b = &g_bufs[buf];
+    if (!b->streaming) return 1;
+    int ok = 1;
+    as_buf_lock();
+    if (!b->ended) {
+        if (b->fmt == AS_SFMT_MP3 && b->frames > 0) {
+            as_stream_mp3_pull(b);
+            // Pad up to the nominal length, exactly like a whole-image decode: the
+            // same file must read one duration whichever way it arrived. (The gap is
+            // the Xing/Info frame plus the encoder's own truncation -- audio, not an
+            // error, which is why AIR counts it.)
+            as_mp3_wk_feed(b, NULL, 0, 1);
+            if (b->wk_samples > b->frames && b->rate > 0 &&
+                b->wk_samples - b->frames < (long long)b->rate * 10) {
+                long long ch = b->channels > 0 ? b->channels : 1;
+                float* np = (float*)realloc(b->data, (size_t)b->wk_samples * (size_t)ch * sizeof(float));
+                if (np != NULL) {
+                    memset(np + (size_t)b->frames * (size_t)ch, 0,
+                           (size_t)(b->wk_samples - b->frames) * (size_t)ch * sizeof(float));
+                    b->data = np;
+                    b->frames = b->wk_samples;
+                    b->cap = b->wk_samples;
+                }
+            }
+        } else if (complete && whole != NULL && wholeLen > 0) {
+            float* pcm = NULL;
+            long long frames = 0;
+            int ch = 0, rate = 0;
+            if (as_decode_image(whole, wholeLen, &pcm, &frames, &ch, &rate) > 0) {
+                free(b->data);
+                b->data = pcm;
+                b->frames = frames;
+                b->cap = frames;
+                b->channels = ch;
+                b->rate = rate;
+            } else {
+                ok = 0;
+            }
+        } else {
+            ok = (b->frames > 0);   // cancelled: keep what has been decoded
+        }
+        if (b->head != NULL) as_id3_parse(b->head, (unsigned)b->head_len, &b->id3);
+        else if (whole != NULL && wholeLen > 0) as_id3_parse((const unsigned char*)whole, wholeLen, &b->id3);
+        b->ended = 1;
+    }
+    as_buf_unlock();
+    return ok;
+}
 long long as_audio_buf_frames(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].frames : 0; }
 int as_audio_buf_channels(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].channels : 0; }
 int as_audio_buf_rate(int buf) { return as_audio_buf_valid(buf) ? g_bufs[buf].rate : 0; }
@@ -591,18 +988,24 @@ int as_audio_play(int buf, double startMs, int loops, double vol, double ltl, do
     }
     if (v < 0) return -1;
     as_voice* vo = &g_voices[v];
-    long long start_frame = (long long)(startMs / 1000.0 * (double)g_bufs[buf].rate);
+    // A streaming buffer may not have decoded its first frame yet, so its rate can
+    // still be 0 ("unknown"): fall back to the mixing rate, which is what the rate
+    // will be for the overwhelming majority of progressive MP3. A real 48 kHz
+    // stream corrects itself below, because a streaming voice recomputes 'step'
+    // from the live rate on every block instead of using this frozen copy.
+    int rate0 = g_bufs[buf].rate > 0 ? g_bufs[buf].rate : AS_AUDIO_DEVICE_RATE;
+    long long start_frame = (long long)(startMs / 1000.0 * (double)rate0);
     if (start_frame < 0) start_frame = 0;
     // startTime at or past the end: the voice is already over, so it finishes on
     // the first mix block instead of playing. (adl 51.4.1 HANGS on
     // play(length) -- measured -- and reproducing a hang is not an option.)
-    if (start_frame > g_bufs[buf].frames) start_frame = g_bufs[buf].frames;
+    if (!g_bufs[buf].streaming && start_frame > g_bufs[buf].frames) start_frame = g_bufs[buf].frames;
     vo->buf = buf;
     vo->start_frame = start_frame;
     vo->end_frame = g_bufs[buf].frames;
     vo->pass = 0;
     vo->loops = loops < 0 ? 0 : loops;
-    vo->step = (double)g_bufs[buf].rate / (double)AS_AUDIO_DEVICE_RATE;
+    vo->step = (double)rate0 / (double)AS_AUDIO_DEVICE_RATE;
     vo->vol = vol;
     vo->ltl = ltl;
     vo->ltr = ltr;
@@ -657,7 +1060,12 @@ double as_audio_voice_pos_ms(int v) {
     // position inside the current pass because the cursor restarts at
     // start_frame on every pass.
     long long c = atomic_load(&vo->cursor);
-    double ms = (double)c * 1000.0 / (double)g_bufs[vo->buf].rate;
+    // A streaming buffer's rate is 0 until its first frame decodes; dividing by it
+    // would report NaN. "Nothing played yet" is 0 ms, which is also what the
+    // cursor says.
+    int rate = g_bufs[vo->buf].rate;
+    if (rate <= 0) return 0.0;
+    double ms = (double)c * 1000.0 / (double)rate;
     return ms < 0.0 ? 0.0 : ms;
 }
 
@@ -720,9 +1128,10 @@ const char* as_audio_last_error(void) { return g_error[0] ? g_error : NULL; }
 // ---------------------------------------------------------------------------
 
 static double as_audio_buf_sample(const as_pcm_buf* b, long long frame, int ch) {
+    if (b->data == NULL || b->frames <= 0) return 0.0;
     if (frame < 0) frame = 0;
     if (frame >= b->frames) frame = b->frames - 1;
-    if (b->channels == 1) return (double)b->data[frame];
+    if (b->channels <= 1) return (double)b->data[frame];
     if (ch >= b->channels) ch = b->channels - 1;
     return (double)b->data[frame * (long long)b->channels + ch];
 }
@@ -740,6 +1149,21 @@ static void as_audio_mix(ma_device* dev, void* out, const void* in, ma_uint32 fr
         if (vo->state != AS_AUDIO_VOICE_PLAYING) continue;
         if (vo->buf < 0 || !as_audio_buf_valid(vo->buf)) { vo->state = AS_AUDIO_VOICE_FINISHED; continue; }
         const as_pcm_buf* b = &g_bufs[vo->buf];
+        // A streaming buffer holds the lock for the whole block: the AS3 thread may
+        // realloc 'data' at any time, and the mixer cannot run on a pointer that
+        // stops being the live one mid-block.
+        int streaming = b->streaming;
+        if (streaming) as_buf_lock();
+        // A streaming voice's end is the LIVE watermark, not the length frozen at
+        // play() time (that was 0 when the transfer had only just started).
+        long long limit = streaming ? b->frames : vo->end_frame;
+        int live = streaming && !b->ended;
+        // The rate is only known once the first frame is decoded, so a streaming
+        // voice takes its resampling ratio from the live buffer each block (a
+        // 48 kHz stream must not be played at the 44.1 kHz ratio frozen at play()).
+        double step = streaming
+            ? (double)(b->rate > 0 ? b->rate : AS_AUDIO_DEVICE_RATE) / (double)AS_AUDIO_DEVICE_RATE
+            : vo->step;
         double cursor = (double)atomic_load(&vo->cursor);
         // Peaks are the maxima of the block being mixed, NOT a running maximum:
         // measured on adl, a sound whose mid-play leftPeak was 0.5029 reported
@@ -748,10 +1172,16 @@ static void as_audio_mix(ma_device* dev, void* out, const void* in, ma_uint32 fr
         double peak_r = 0.0;
         int finished = 0;
         for (ma_uint32 i = 0; i < frames; i++) {
-            if (cursor >= (double)vo->end_frame) {
+            if (cursor >= (double)limit) {
+                // Streaming and not ended: hold the cursor where the data stops and
+                // output silence for the rest of the block. The sound is NOT over --
+                // the next append moves the watermark and the voice carries on from
+                // exactly this frame.
+                if (live) break;
                 if (vo->pass < vo->loops) {
                     vo->pass++;
                     cursor = (double)vo->start_frame;
+                    limit = streaming ? b->frames : vo->end_frame;
                 } else {
                     finished = 1;
                     break;
@@ -761,9 +1191,11 @@ static void as_audio_mix(ma_device* dev, void* out, const void* in, ma_uint32 fr
             double frac = cursor - (double)f0;
             double sl = as_audio_buf_sample(b, f0, 0);
             double sr = as_audio_buf_sample(b, f0, 1);
-            if (b->channels == 1) {
+            if (b->channels <= 1) {
                 sl = sr = as_audio_buf_sample(b, f0, 0);
-            } else {
+            } else if (f0 + 1 < limit) {
+                // Interpolation needs the NEXT frame; at the watermark that frame is
+                // not written yet, so the last one is held instead of read.
                 double sl2 = as_audio_buf_sample(b, f0 + 1, 0);
                 double sr2 = as_audio_buf_sample(b, f0 + 1, 1);
                 sl += (sl2 - sl) * frac;
@@ -777,9 +1209,10 @@ static void as_audio_mix(ma_device* dev, void* out, const void* in, ma_uint32 fr
             if (pr > peak_r) peak_r = pr;
             o[(size_t)i * 2] += (float)l;
             o[(size_t)i * 2 + 1] += (float)r;
-            cursor += vo->step;
+            cursor += step;
         }
         atomic_store(&vo->cursor, (long long)cursor);
+        if (streaming) as_buf_unlock();
         if (peak_l > 1.0) peak_l = 1.0;
         if (peak_r > 1.0) peak_r = 1.0;
         atomic_store(&vo->peak_l, peak_l);

@@ -448,24 +448,55 @@ cd temp/demosound && ./Probe
 **编译期嵌入**的 mp3。看起来像覆盖的那三条钉子读的是第三方 Starling 示例的 `AssetManager.as`
 （断言的是 Starling 自己的类，不是本编译器），已随外部夹具在阶段一百九十八 删除。
 
-**夹具**：`examples/audio/clip.mp3` —— README 里那份产品视频的**完整音轨**，用 ffmpeg 拆出并
-重编为 MP3。它是**自有**的：不依赖任何可能被重新克隆成别的形状的第三方树，故钉子读它不会被
-别人的编辑悄悄改掉底。
+**夹具**：`examples/audio/movers-vol2.mp3` —— Cambridge English 的 Movers Sample Listening Test vol2
+录音（**用户 2026-11-13 指定换上的**）。它是**第三方**素材：换之前那份是仓库**自有**的（TalkMED 产品视频
+的完整音轨，118 s / 1.89 MB / 128 kbps 立体声），随本次更换一并删除（仍在 git 历史里）。
+
+> 由此而来的那个约束：**所有数字都是对这一个文件实测的**，换音频必须重测——不只是重编。
+> 另外它长得多也大得多（28.7 分钟 / 13.7 MB），所以「读字节再解码」那组自检只解**前缀** 512KB：
+> 整曲解码后常驻约 300 MB PCM，而解码结果登记在音频注册表里不归还，自检再整曲解一遍会让
+> 进程常驻两份。也正因为它是**单声道**，`extract()` 的「恒转 44100Hz 立体声」规则终于被真实
+> 单声道源验到了。
 
 | 实测项 | 值 |
 |---|---|
-| 字节数 | `1 890 142`（播放器自检里也硬写着这个数，两处必须一致，钉子比的是**两者相符**） |
-| 时长 | `118.1 s`（`Sound.length` 报 `118125.71 ms`，见下） |
-| 编码 | MPEG-1 Layer III，128 kbps，44 100 Hz，立体声（ID3v2.3 标签之后偏移 132 处首帧同步 `FF FB 90 00`） |
-| 标签 | ID3v2.3：TIT2 `TalkMED AOT audio fixture` / TPE1 `TalkMED` / TALB `as3compiler examples` |
-| 容器残留 | **无**（ffmpeg 会把 mp4 的 `major_brand` / `Remotion` 抄成 TXXX 帧，已清掉；钉子钉住其缺席） |
+| 字节数 | `13 710 403`（播放器自检里也硬写着这个数，两处必须一致，钉子比的是**两者相符**） |
+| 时长 | `1 721.86 s`（65 915 帧 × 1152/44100，`Sound.length` 报 `1721861.2245 ms`） |
+| 编码 | MPEG-1 Layer III，64 kbps，44 100 Hz，**单声道**（ID3v2.3 标签长度 73，音频起于偏移 83，首帧同步 `FF FB 50 C0`） |
+| 标签 | ID3v2.3：只有 `TRCK=1` / `TYER=2013` / `TENC=Fraunhofer IIS MP3 v04.01.02 (fast)`；**没有** TIT2/TPE1/TALB（故 `songName`/`artist`/`album` 读出来是 `null`，自检钉的正是这一点） |
 
-`Sound.length` 的单位是**毫秒**，且它是 MPEG 的「名义时长」（帧数 × 1152/44100），比容器时长多约
-26 ms —— 与 `adl` 同口径（§13.2 的表里那只 6686 字节的 mp3 也报 `417.959…ms`）。
+`Sound.length` 的单位是**毫秒**，且它是 MPEG 的「名义时长」（帧数 × 1152/44100）——与 `adl` 同口径
+（§13.2 的表里那只 6686 字节的 mp3 也报 `417.959…ms`）。
 
 **示例**：`examples/audio/AudioPlayer.as` —— 窗口内可播放/暂停/停止、±10% 音量、±10 s 拖动、
-路径框换文件（`FileReference.browse` / `File.browseForOpen` 在本后端无实现，那两个成员会响亮报
-「不支持」，故用可编辑输入框代替真对话框 —— 真能换文件，且不是假装的对话框）。
+**原生文件面板**换文件（`File.browseForOpen`：macOS Cocoa / Windows `IFileDialog`，见
+[desktop-file-interaction.md](desktop-file-interaction.md)），也可在输入框里贴路径或 http(s) 地址再点 `Load`。
+2026-11-13 起它同时是**文件**能力的载体：
+`Bytes` 按钮用 `FileStream` 把整个文件读成字节再 `Sound.loadCompressedDataFromByteArray` 解码，
+`Save WAV` 按钮从 `extract` 的 PCM 用 `FileStream` 写出一份**真能播的 16-bit PCM WAV**。
+
+**网络地址是单独一条路，不是文件那条路的变体**（2026-11-13 补回）：面板只能给回**本地路径**，
+所以 `http(s)://` 地址只能在输入框里贴，再点 `Load`。两者在 `loadFrom()` 里分叉：
+本地走 `clip.url` + `File` 那一整套；远程直接 `new URLRequest(地址)`，且**不做** `File` 视图——
+`new File("https://…")` 是 `#2004`（File 只活在本地文件系统里），所以 `Bytes`/`Save WAV` 对远程源
+如实报错而不是抛异常。
+
+为此 `player.build.json` 里加了 `ASC_HAVE_CURL=1` + 静态 `vendor/curl`（`curl`/`nghttp2`/Windows 的
+TLS 导入库，macOS 另加 `Security`/`SystemConfiguration` 框架，照 [compile.md](compile.md) §3.4.4 的清单）。
+没链接 HTTP 后端的构建不静默：`Sound.load` 远程会报 `network URLs are not supported in this build`。
+
+**两个实测口径**（都关系到「贴个地址就能播」的体验）：
+
+1. **远程不排空 `tickTimers()`** —— `tickTimers` 的等法是 `as_async_tick_wait`，会把窗口冻到下载完
+   （这份 13.7 MB 要十几秒）；远程改成交给窗口帧循环里**非阻塞**的 `as_async_tick()` 逐帧推进，
+   下载期间界面照旧刷新、进度可见，`COMPLETE` 到的那一帧再补齐 `length`/id3。
+2. **下载中就能 `play()`** —— MP3 是**渐进式**解码的（见 §13.6）：`loadFrom()` 在 `load()` 之后直接
+   `startPlay(0)`，第一批帧到手就出声。非 MP3 格式没有渐进解码，`play()` 仍抛 `#2068`，示例据此
+   `try/catch` 回退到「COMPLETE 再起播」，并在界面上写明该格式不是渐进式的 —— 不假装能提前出声。
+
+`File` 的构造器与 `nativePath` setter 都只收**绝对**路径（相对路径抛 `#2004`，与 `adl` 一致，
+见 [filesystem.md](filesystem.md) §11.5），所以默认的相对路径先用
+`File.workingDirectory.resolvePath()` 解成绝对——面板给回来的路径本来就是绝对的，两者走同一条分支。
 
 **为什么必须是窗口**：`soundComplete` 由 `as_audio_tick()` 在**帧边界**派发，而它只被
 `Stage_dispatchFrame` 调用 —— 离屏的 `tickTimers()` / `tickFrame()` **不驱动**它。所以「播到结束」
@@ -478,24 +509,73 @@ node src/index.ts examples/audio/AudioPlayer.as \
      --manifest examples/audio/player.build.json --run
 ```
 
-**脚本化自检 23 条**（开窗后由帧时钟推进，`trace` 打印汇总）：
+**脚本化自检 38 条**（开窗后由帧时钟推进，`trace` 打印汇总）：
 
 | 组 | 覆盖 |
 |---|---|
 | 载入面 | `bytesTotal` / `bytesLoaded` / `url` / `isBuffering` / `length` / `id3` 三项 |
 | 播放面 | 通道返回、位置前进、暂停释放通道并记住位置、续播、音量 clamp 与作用到活通道、拖动落点 |
+| 文件面 | `exists` / `size` / `name` / `extension` / `url` / `parent`；`FileStream` 读全文件（13 710 403 B），再用其中 512KB 前綴 `loadCompressedDataFromByteArray`（按 64kbps 反算出 ~65.5s）；`createTempFile` → 写 WAV → 逐字段读回 `RIFF`/`fmt `/`data` → `deleteFile` |
 | 终态 | 0.5 s 切片（`extract` 出来的**真音频**）的 `soundComplete`、`stop()` 后的通道状态 |
 
 **无设备主机不会假装**：`SoundMixer.areSoundsInaccessible()` 为真时播放断言整组跳过并**打印原因**，
 解码/长度/id3 那组照跑（§1.5）。想要确定性计时的 CI 可设 `ASC_AUDIO_NULL=1`（miniaudio 的 Null
 后端：无硬件、位置照常前进）。
 
-**一条踩坑记（量测方法本身）**：用中文输入法在那个路径框里打字时，字母会先进 IME 的**组词态** ——
-`keyDown` 照常到达（keyCode/charCode 都对）但 `edit.text` 不变、也没有 `textInput`，**必须回车确认**
+**一条踩坑记（量测方法本身）**：用中文输入法在一个可编辑 `TextField` 里打字时，字母会先进 IME 的
+**组词态** —— `keyDown` 照常到达（keyCode/charCode 都对）但 `edit.text` 不变、也没有 `textInput`，**必须回车确认**
 才产生 `SDL_TEXTINPUT`。只看「敲了字母没反应」会把它误判成「键盘通道坏了」；本阶段曾据此在
 `vendor/window_glue.cc` 加过一个 `FOCUS_GAINED → SDL_StartTextInput()` 的补丁，A/B 实测（冷启动与
 失焦回焦两轮）证明 SDL 自己就管这件事（其头文件自述桌面平台在 video init 时已隐式开启文本输入），
 补丁已删除，并留了钉子防重加（`test/unit/text-input.ts`）。
+
+---
+
+### 13.6 渐进式（边下边播）MP3：`play()` 在下载中就能出声（阶段二百二十五，2026-11-13）
+
+**背景**：上一版之前本后端只有**整文件解码**——`Sound.load(远程 URL)` 要等整个 body 到手才解，所以
+下载中 `play()` 只能抛 `#2068: Invalid sound.`（空 Sound 的契约）。AIR 不是这样：它对流式载入的
+Sound 立刻返回通道、数据够了就出声。这条差异是真缺陷（不是 AIR 未定义行为），所以正面补上。
+
+**按格式分岔，且不假装统一**：
+
+| 输入 | 行为 |
+|---|---|
+| 远程 **MP3** | **边到边解**：每帧把新到的字节喂给解码器；`play()` 在 `load()` 之后立刻返回通道，第一批帧到手就出声，之后随下载继续补 |
+| 远程**其他格式**（wav/flac/ogg…） | **不是**渐进式：整包到手才解一次，`play()` 在此之前仍抛 `#2068`。示例在 `try/catch` 里回退到「COMPLETE 再起播」，界面写清该格式不是渐进式的 |
+| 本地文件 | 与以前一样：读 + 解是一次异步任务，`tickTimers()` 排空后即已解码 |
+
+**实现要点**（每条都踩过）：
+
+- `Sound__feed` 每帧用 `as_stream_copy(job, offset, …)` **按绝对偏移**重读 job 的 body，只由 `_snd_fed`
+  记「已经喂到哪」；它**不移动** URLStream 那条路的 `consumed` 游标（同一个 job 有两套读者）。
+- MP3 帧必须**一次一帧**喂 `ma_dr_mp3dec_decode_frame()`：一次喂多帧会破坏解码器的 bit reservoir
+  状态并丢帧。
+- 混音线程读的是**活的**帧水位，不是 `play()` 那一刻冻住的 `end_frame`；否则下载填进来的尾巴永远不播。
+  缓冲的写入与混音线程之间有互斥保护，`play()` 之后才到的帧不会被读到半截。
+- 失败/取消（ioError、`close()`）要把流式缓冲**关掉**并封上尾巴，让已经起播的声音播完手上的帧就结束，
+  而不是永远等一个不会到的尾巴。
+
+**实测**（`temp/probe-stream.as`，13.7 MB 传输；`ASC_AUDIO_NULL=1`）：
+
+```
+play@0 -> channel length=0 buffering=true          # load() 之后立刻 play()，不再是 #2068
++1500ms  loaded=0/13710403        length=0
++3000ms  loaded=884727/13710403   length=111098.8   pos=1416.4  lengthGrew=true
+mid-load play(1000) -> channel                     # 下载中重新起播也成立
+COMPLETE at +25948ms length=1721861.224489796 bytes=13710403
+```
+
+`length` 两端相等是关键口径：远程渐进解出来的 `1 721 861.2245 ms` 与本地整文件解码**完全一致**
+（同一份 MP3 的名义时长，按帧数算，不是估的）。
+
+`bytesTotal` 是同一轮补上的第二处：以前它要等传输结束才写（下载期间恒 0），现在 `as_http_on_header`
+一看到 `Content-Length` 就记下来，所以下载中就能报 `884727/13710403 (6%)`。分块传输（响应里没有该头）
+仍报 0 —— AIR 同样「不确定」。
+
+**示例**：远程载入后 `loadFrom()` 直接 `startPlay(0)`；界面每帧刷新 `bytes / len / downloading %`，所以
+「贴个地址点 Load」看到的就是**边下边播**，`COMPLETE` 之后 `length` 落到 `1 721 861 ms`、id3 补齐。
+整体脚本化自检仍是 38 条（远程启动时那三组夹具断言**整组跳过**并打印原因，见「启动」一段）。
 
 ---
 

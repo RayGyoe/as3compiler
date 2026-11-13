@@ -11,7 +11,7 @@
   "include-paths": [
     "../../vendor/skia",
     "../../vendor/sdl2/include/${host}",
-    "${win:../../vendor/curl/include}"
+    "../../vendor/curl/include"
   ],
   "link-libs": [
     "skia",
@@ -54,12 +54,19 @@
     "${win:uuid}",
     "${win:setupapi}",
     "${win:shell32}",
-    "${win:dinput8}"
+    "${win:dinput8}",
+    "curl",
+    "nghttp2",
+    "${win:crypt32}",
+    "${win:ws2_32}",
+    "${win:secur32}",
+    "${win:bcrypt}",
+    "${win:iphlpapi}"
   ],
   "link-paths": [
     "../../vendor/skia/lib/${host}",
     "../../vendor/sdl2/lib/${host}",
-    "${win:../../vendor/curl/lib/${host}}"
+    "../../vendor/curl/lib/${host}"
   ],
   "frameworks": [
     "CoreFoundation",
@@ -76,12 +83,16 @@
     "Metal",
     "QuartzCore",
     "CoreAudio",
-    "AudioToolbox"
+    "AudioToolbox",
+    "Security",
+    "SystemConfiguration"
   ],
   "defines": [
     "ASC_USE_SKIA=1",
     "ASC_USE_WINDOW=1",
-    "ASC_HAVE_AUDIO=1"
+    "ASC_HAVE_AUDIO=1",
+    "ASC_HAVE_CURL=1",
+    "CURL_STATICLIB=1"
   ],
   "objects": []
 }

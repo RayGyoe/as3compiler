@@ -2571,6 +2571,10 @@ export class SymbolTable {
         // the last extract() stopped" (language reference), so the Sound carries
         // the position. Counted in samples, like length/startPosition.
         ['_snd_xpos', sndF({ kind: 'int' })],
+        // How many bytes of a still-arriving HTTP body have been handed to the
+        // progressive decoder (see Sound__feed). The job keeps the whole response,
+        // so this offset is what stops each frame from re-feeding it.
+        ['_snd_fed', sndF({ kind: 'uint' })],
       ]),
       methods: new Map([
         ['play', sndm({ kind: 'object', className: 'SoundChannel' }, [

@@ -3397,6 +3397,15 @@ static void as_mc_tick(void) {
 #ifdef ASC_HAVE_AUDIO
 extern int as_audio_decode(const void* data, unsigned int size);
 extern int as_audio_register_pcm(const float* pcm, long long frames, int channels, int rate);
+// Progressive decode of a still-downloading URL (Sound.load(URLRequest)):
+// as_audio_stream_open() hands out a buffer that can be appended to, fed, and
+// finally closed. A streaming buffer publishes its frame count as a watermark so a
+// voice can start before the transfer ends (see audio_glue.c).
+extern int as_audio_stream_open(void);
+extern int as_audio_stream_feed(int buf, const void* data, unsigned int n);
+extern int as_audio_stream_close(int buf, int complete, const void* whole, unsigned int wholeLen);
+extern int as_audio_buf_streaming(int buf);
+extern int as_audio_buf_ended(int buf);
 extern int as_audio_buf_valid(int buf);
 extern long long as_audio_buf_frames(int buf);
 extern int as_audio_buf_channels(int buf);
@@ -3427,6 +3436,11 @@ extern void as_audio_shutdown(void);
 // when it cannot play, so the reason is visible rather than inferred.
 static inline int as_audio_decode(const void* d, unsigned int s) { (void)d; (void)s; return -1; }
 static inline int as_audio_register_pcm(const float* p, long long f, int c, int r) { (void)p; (void)f; (void)c; (void)r; return -1; }
+static inline int as_audio_stream_open(void) { return -1; }
+static inline int as_audio_stream_feed(int b, const void* d, unsigned int n) { (void)b; (void)d; (void)n; return -1; }
+static inline int as_audio_stream_close(int b, int c, const void* w, unsigned int n) { (void)b; (void)c; (void)w; (void)n; return 0; }
+static inline int as_audio_buf_streaming(int b) { (void)b; return 0; }
+static inline int as_audio_buf_ended(int b) { (void)b; return 1; }
 static inline int as_audio_buf_valid(int b) { (void)b; return 0; }
 static inline long long as_audio_buf_frames(int b) { (void)b; return 0; }
 static inline int as_audio_buf_channels(int b) { (void)b; return 0; }
@@ -13139,6 +13153,31 @@ static size_t as_http_on_data(char* ptr, size_t size, size_t nmemb, void* userp)
 // buffer resets there: every intermediate redirect response is dropped and what
 // the thunk parses is the FINAL response's header block — which is what AIR
 // reports in HTTPStatusEvent.responseHeaders.
+// Is this header line "Content-Length: <digits>"? Matched case-insensitively so
+// a server's odd casing still yields the number, and '\\n'/CRLF are both fine
+// because everything after the value is ignored.
+static int as_http_content_length_line(const char* p, size_t n, unsigned* out) {
+    static const char name[] = "content-length:";
+    size_t i = 0;
+    if (n < sizeof(name) - 1) return 0;
+    for (i = 0; i < sizeof(name) - 1; i++) {
+        char a = p[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != name[i]) return 0;
+    }
+    while (i < n && (p[i] == ' ' || p[i] == '\\t')) i++;
+    if (i >= n || p[i] < '0' || p[i] > '9') return 0;
+    {
+        unsigned long long v = 0;
+        while (i < n && p[i] >= '0' && p[i] <= '9') {
+            if (v <= 0xFFFFFFFFULL) v = v * 10ULL + (unsigned long long)(p[i] - '0');
+            i++;
+        }
+        *out = (v <= 0xFFFFFFFFULL) ? (unsigned)v : 0u;
+    }
+    return 1;
+}
+
 static size_t as_http_on_header(char* ptr, size_t size, size_t nmemb, void* userp) {
     as_http_ctx* c = (as_http_ctx*)userp;
     size_t n = size * nmemb;
@@ -13147,6 +13186,17 @@ static size_t as_http_on_header(char* ptr, size_t size, size_t nmemb, void* user
         if (c->hdr.buf != NULL) c->hdr.buf[0] = '\\0';
     } else if (!as_http_sink_append(&c->hdr, ptr, n)) {
         return 0;
+    }
+    // A progressive transfer's bytesTotal is the advertised Content-Length, and
+    // AIR reports it as soon as the response head lands -- not at the end of the
+    // body. Recording it here is what makes a Sound's bytesLoaded/bytesTotal mean
+    // something DURING the download (before this, both read 0 until the last byte,
+    // which is the one moment a progress indicator stops being useful). The final
+    // publish in as_http_run writes the same number again, so a chunked response
+    // (no such header) still ends up with 0.
+    if (c->job != NULL) {
+        unsigned cl = 0;
+        if (as_http_content_length_line(ptr, n, &cl)) c->job->expected_total = cl;
     }
     return n;
 }
@@ -15757,6 +15807,26 @@ static int as_stream_read(void* job, void* dst, int n) {
     size_t k = ((size_t)n < avail) ? (size_t)n : avail;
     if (k > 0 && dst != NULL) memcpy(dst, j->bytes + j->consumed, k);
     j->consumed += k;
+#ifdef ASC_ASYNC_THREADS
+    AS_JOB_UNLOCK(&as_job_lock);
+#endif
+    return (int)k;
+}
+
+// Copy up to 'n' bytes at an ABSOLUTE offset out of the job's live body, WITHOUT
+// moving the read cursor. Sound.load's progressive decode keeps its own feed offset
+// (the body of a transfer still in flight is re-read every frame, and it is not a
+// URLStream -- 'consumed' is none of its business). Bytes past the watermark simply
+// read short, which is how the caller learns "nothing new yet".
+static int as_stream_copy(void* job, long long off, void* dst, int n) {
+    as_job* j = (as_job*)job;
+    if (j == NULL || n <= 0 || off < 0) return 0;
+#ifdef ASC_ASYNC_THREADS
+    AS_JOB_LOCK(&as_job_lock);
+#endif
+    size_t avail = ((size_t)off < j->len) ? (j->len - (size_t)off) : 0;
+    size_t k = ((size_t)n < avail) ? (size_t)n : avail;
+    if (k > 0 && dst != NULL && j->bytes != NULL) memcpy(dst, j->bytes + (size_t)off, k);
 #ifdef ASC_ASYNC_THREADS
     AS_JOB_UNLOCK(&as_job_lock);
 #endif

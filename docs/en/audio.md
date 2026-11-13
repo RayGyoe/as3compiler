@@ -475,27 +475,63 @@ reaches it: `examples/audio.as` feeds **synthesized PCM** to `loadPCMFromByteArr
 pins reading a third-party Starling sample's `AssetManager.as` — they asserted Starling's own classes,
 not this compiler, and went away with the external fixtures in stage 198.
 
-**Fixture**: `examples/audio/clip.mp3` — the **full audio track** of the product video in the README,
-demuxed and re-encoded to MP3 with ffmpeg. It is **self-owned**: no third-party tree that could be
-re-cloned into a different shape can shift what the pins read.
+**Fixture**: `examples/audio/movers-vol2.mp3` — Cambridge English's Movers Sample Listening Test vol2
+(the user swapped it in on 2026-11-13). It is **third-party** content: the previous fixture was repo-owned
+(the TalkMED product video's full audio track, 118 s / 1.89 MB / 128 kbps stereo) and was removed with
+this swap (it survives in git history).
+
+> The constraint that follows: **every number here was measured from this one file**, so swapping the
+audio means re-measuring, not just recompiling. It is also much longer and larger (28.7 min / 13.7 MB),
+> which is why the byte-path self-check decodes only a 512 KB **prefix**: a full decode of this file
+> occupies ~300 MB of PCM and decoded buffers are registered in the audio table without ever being
+> freed, so a second whole-file decode would leave the process holding two copies. Being **mono** is a
+> bonus — `extract()`'s "always 44.1 kHz stereo" rule is finally exercised on a real mono source.
 
 | Measured | Value |
 |---|---|
-| Size | `1 890 142` bytes (the player's own self-check hard-codes this too; the pin compares the **two against each other**) |
-| Duration | `118.1 s` (`Sound.length` reports `118125.71 ms`, see below) |
-| Encoding | MPEG-1 Layer III, 128 kbps, 44 100 Hz, stereo (first frame sync `FF FB 90 00` at offset 132, after the ID3v2.3 tag) |
-| Tags | ID3v2.3: TIT2 `TalkMED AOT audio fixture` / TPE1 `TalkMED` / TALB `as3compiler examples` |
-| Container leftovers | **none** (ffmpeg copies the mp4's `major_brand` / `Remotion` into TXXX frames unless told not to; cleaned, and their absence is pinned) |
+| Size | `13 710 403` bytes (the player's own self-check hard-codes this too; the pin compares the **two against each other**) |
+| Duration | `1 721.86 s` (65 915 frames × 1152/44100; `Sound.length` reports `1721861.2245 ms`) |
+| Encoding | MPEG-1 Layer III, 64 kbps, 44 100 Hz, **mono** (ID3v2.3 tag is 73 bytes, audio starts at offset 83, first frame sync `FF FB 50 C0`) |
+| Tags | ID3v2.3: only `TRCK=1` / `TYER=2013` / `TENC=Fraunhofer IIS MP3 v04.01.02 (fast)`; **no** TIT2/TPE1/TALB — hence `songName`/`artist`/`album` read as `null`, which is exactly what the self-check pins |
 
-`Sound.length` is in **milliseconds**, and it is MPEG's *nominal* duration (frames × 1152/44100), about
-26 ms more than the container duration — the same reading `adl` gives (§13.2's 6686-byte mp3 reports
-`417.959…ms` for the same reason).
+`Sound.length` is in **milliseconds**, and it is MPEG's *nominal* duration (frames × 1152/44100) — the same
+reading `adl` gives (§13.2's 6686-byte mp3 reports `417.959…ms` for the same reason).
 
-**Example**: `examples/audio/AudioPlayer.as` — a window with play/pause/stop, ±10% volume, ±10 s seek
-and a path box that loads another file. `FileReference.browse` / `File.browseForOpen` are **not
-implemented** in this backend (those members report themselves loudly as unsupported), so the file is
-chosen by typing a path instead of a real dialog — it genuinely swaps files, and it is not a pretend
-dialog.
+**Example**: `examples/audio/AudioPlayer.as` — a window with play/pause/stop, ±10% volume, ±10 s seek,
+**the native file panel** for swapping files (`File.browseForOpen`: macOS Cocoa / Windows
+`IFileDialog`; see [desktop-file-interaction.md](desktop-file-interaction.md)), and an entry box that
+takes a path or an `http(s)` URL followed by `Load`. Since 2026-11-13 it also
+carries the **filesystem** half: `Bytes` reads the whole file with `FileStream` and decodes it through
+`Sound.loadCompressedDataFromByteArray`, and `Save WAV` turns `extract`'s PCM into a **real, playable
+16-bit PCM WAV** with `FileStream`.
+
+**A network address is a separate route, not a variant of the file route** (restored 2026-11-13): a panel
+can only return a **local path**, so an `http(s)://` address has to be typed into the entry box and
+committed with `Load`. `loadFrom()` forks on that: local goes through `clip.url` + `File`, remote goes
+straight to `new URLRequest(url)` with **no** `File` view at all — `new File("https://…")` is `#2004`
+(a `File` only lives on the local filesystem), so `Bytes` / `Save WAV` report that honestly instead of
+throwing.
+
+That is why `player.build.json` now carries `ASC_HAVE_CURL=1` plus static `vendor/curl` (`curl` /
+`nghttp2` / the Windows TLS import libs, and `Security` / `SystemConfiguration` frameworks on macOS — the
+list from [compile.md](compile.md) §3.4.4). A build without the HTTP backend does not fail silently:
+`Sound.load` on a remote URL reports `network URLs are not supported in this build`.
+
+**Two measured details** behind "paste an address and it plays":
+
+1. **Remote loads do not drain `tickTimers()`** — that wait is `as_async_tick_wait`, which freezes the
+   window until the transfer ends (tens of seconds for this 13.7 MB file). Remote loads are instead
+   advanced by the frame loop's **non-blocking** `as_async_tick()`, so the UI keeps refreshing while the
+   download runs; `length` and the id3 fields are filled in on the `COMPLETE` frame.
+2. **`play()` works during the download** — MP3 is decoded **progressively** (§13.6): `loadFrom()` calls
+   `startPlay(0)` right after `load()` and sound comes as soon as the first frames land. Other formats
+   have no progressive decoder, so `play()` still throws `#2068`; the example catches that and falls back
+   to "play on COMPLETE", saying so in the UI — it never pretends those formats can start early.
+
+`File`'s constructor and `nativePath` setter take **absolute** paths only (a relative one throws
+`#2004`, matching `adl` — [filesystem.md](filesystem.md) §11.5), so the default relative path is first
+resolved with `File.workingDirectory.resolvePath()`. What the panel hands back is already absolute, so
+both arrive the same way.
 
 **Why it must be a window**: `soundComplete` is dispatched by `as_audio_tick()` at the **frame
 boundary**, which only `Stage_dispatchFrame` calls — the offscreen `tickTimers()` / `tickFrame()` do
@@ -509,12 +545,13 @@ node src/index.ts examples/audio/AudioPlayer.as \
      --manifest examples/audio/player.build.json --run
 ```
 
-**23 scripted self-checks** (driven by the frame clock once the window is up; `trace` prints the summary):
+**38 scripted self-checks** (driven by the frame clock once the window is up; `trace` prints the summary):
 
 | Group | Coverage |
 |---|---|
 | Load | `bytesTotal` / `bytesLoaded` / `url` / `isBuffering` / `length` / the three `id3` fields |
 | Playback | channel returned, position advances, pause releases the channel and remembers the position, resume, volume clamp and its effect on the live channel, seek landing |
+| Files | `exists` / `size` / `name` / `extension` / `url` / `parent`; `FileStream` reads the whole file (13 710 403 B), then a 512 KB **prefix** of it goes through `loadCompressedDataFromByteArray` (~65.5 s at 64 kbps); `createTempFile` → write a WAV → read `RIFF`/`fmt `/`data` back field by field → `deleteFile` |
 | Terminal | `soundComplete` for a 0.5 s slice of **real audio** taken with `extract`, and the channel state after `stop()` |
 
 **A host with no audio device is not faked**: when `SoundMixer.areSoundsInaccessible()` is true the
@@ -522,7 +559,7 @@ playback assertions are skipped as a group with the **reason printed**, while th
 group still runs (§1.5). `ASC_AUDIO_NULL=1` (miniaudio's Null backend: no hardware, position still
 advances) gives a CI deterministic timing.
 
-**A trap in the measuring method itself**: typing into that path box under a CJK input method puts the
+**A trap in the measuring method itself**: typing into an editable `TextField` under a CJK input method puts the
 letters into the IME's **composition** — `keyDown` still arrives with the right keyCode/charCode, but
 `edit.text` does not change and no `textInput` fires; the user must **commit with Enter** before
 `SDL_TEXTINPUT` is produced. Reading "I typed a letter and nothing happened" as "the keyboard channel
@@ -530,6 +567,62 @@ is broken" is wrong; on that reading a `FOCUS_GAINED → SDL_StartTextInput()` p
 `vendor/window_glue.cc`. An A/B measurement (cold start, and lost-then-regained focus) showed SDL
 handles this by itself — its own header states desktop platforms start text input implicitly at video
 init — so the patch was removed and a pin keeps it from coming back (`test/unit/text-input.ts`).
+
+---
+
+### 13.6 Progressive (play-while-downloading) MP3 (stage 225, 2026-11-13)
+
+**Background**: until this change the backend only decoded whole files, so `Sound.load(remote URL)` had no
+PCM until the entire body arrived and `play()` during the download could only throw
+`Error #2068: Invalid sound.` (the empty-Sound contract). AIR does not behave that way: it returns a
+channel for a still-loading Sound and starts when it has enough data. Since that is a real defect on our
+side (not an AIR-undefined area), it is fixed head-on rather than documented as a divergence.
+
+**Split by format, with no pretending**:
+
+| Input | Behaviour |
+|---|---|
+| Remote **MP3** | decoded **as bytes land**: each frame feeds the new bytes to the decoder, `play()` returns a channel immediately after `load()`, sound comes with the first decoded frames and keeps filling in as the download continues |
+| Remote **other formats** (wav/flac/ogg…) | **not** progressive: decoded once when the whole body arrives, so `play()` before that still throws `#2068`. The example catches it and falls back to "play on COMPLETE", and says in the UI that the format is not progressive |
+| Local files | unchanged: read + decode is one async job, already decoded once `tickTimers()` drains |
+
+**Implementation points** (each one was learned the hard way):
+
+- `Sound__feed` re-reads the job body by **absolute offset** with `as_stream_copy(job, offset, …)` and
+  only `_snd_fed` records how far the decoder got. It does **not** move the `consumed` cursor of the
+  `URLStream` path — one job has two readers.
+- An MP3 frame must be handed to `ma_dr_mp3dec_decode_frame()` **one frame per call**: feeding several
+  frames at once corrupts the decoder's bit reservoir state and loses frames.
+- The mixer reads the **live** frame watermark, not the `end_frame` frozen at `play()` time; otherwise a
+  tail that arrives during the download would never play. Writes into the buffer are protected against
+  the mixer thread, so a frame appended after `play()` is never read half-written.
+- Failure/cancellation (ioError, `close()`) **closes** the streaming buffer and seals its tail, so voices
+  already playing finish what they have instead of waiting forever for data that will never come.
+
+**Measured** (`temp/probe-stream.as`, 13.7 MB transfer, `ASC_AUDIO_NULL=1`):
+
+```
+play@0 -> channel length=0 buffering=true          # play() right after load(), no #2068
++1500ms  loaded=0/13710403        length=0
++3000ms  loaded=884727/13710403   length=111098.8   pos=1416.4  lengthGrew=true
+mid-load play(1000) -> channel                     # restarting mid-download works too
+COMPLETE at +25948ms length=1721861.224489796 bytes=13710403
+```
+
+The key contract is that `length` agrees at both ends: the progressively decoded remote copy reports
+`1 721 861.2245 ms`, **identical** to a local whole-file decode of the same MP3 (the nominal duration from
+the frame count, not an estimate).
+
+`bytesTotal` is the second half of the same fix: it used to be written only when the transfer ended (0
+for the whole download). `as_http_on_header` now records `Content-Length` the moment the response head
+arrives, so the download reports `884727/13710403 (6%)` as it runs. A chunked response (no such header)
+still reports 0 — which is also AIR's "indeterminate".
+
+**Example**: after a remote load `loadFrom()` calls `startPlay(0)` directly, and the UI refreshes
+`bytes / len / downloading %` every frame — so "paste an address and press Load" now really is
+play-while-downloading, and `COMPLETE` settles `length` at `1 721 861 ms` and fills in the id3 fields. The
+scripted self-checks stay at 38: on a remote startup the three fixture groups are skipped as a whole, with
+the reason printed (see the startup block).
 
 ---
 

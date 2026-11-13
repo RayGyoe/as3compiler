@@ -642,7 +642,7 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` is a conversion, `new Vector.<T>(length)` is a construction
 - `examples/vector-dynamic.as` — `Vector.<*>` and dynamic access on a `*` receiver
 - `examples/embed.as` — `[Embed]` assets (image/byte/audio → `Bitmap`/`ByteArray`/`Sound` subclasses)
-- `examples/audio/` — a UI audio player: `Sound.load` of an **encoded file** + `SoundChannel` + `soundComplete` (needs Skia/SDL2/miniaudio, see `docs/en/audio.md` §13.5)
+- `examples/audio/` — a UI audio player and filesystem demo: `Sound.load` of an **encoded file**, `SoundChannel` + `soundComplete`, the native `File.browseForOpen` panel, `FileStream` both ways (file → bytes → `loadCompressedDataFromByteArray`; PCM → a real 16-bit WAV), and an `http(s)://` source that **plays while it downloads** (progressive MP3 decode; needs Skia/SDL2/miniaudio + the curl backend, see `docs/en/audio.md` §13.5–§13.6)
 - `examples/strcoerce.as` — implicit object → string coercion
 - `examples/flash-net-layered.build.example.json` — a minimal example of per-target manifest layering (not a `.as`; for build-layer assertions)
 - `examples/reflection-name.as` — the numeric caliber of reflection names (value window / negative zero / `Dictionary` / `Vector.<interface>` element names)

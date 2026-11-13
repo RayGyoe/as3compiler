@@ -731,7 +731,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` 是转换、`new Vector.<T>(length)` 是构造
 - `examples/vector-dynamic.as` — `Vector.<*>` 与 `*` 接收者的动态访问
 - `examples/embed.as` — `[Embed]` 资源（图片/字节/音频 → `Bitmap`/`ByteArray`/`Sound` 子类）
-- `examples/audio/` — 带 UI 的音频播放器：`Sound.load` 的**编码文件加载** + `SoundChannel` + `soundComplete`（需 Skia/SDL2/miniaudio，见 `docs/zh-cn/audio.md` §13.5）
+- `examples/audio/` — 带 UI 的音频播放器 + 文件示例：`Sound.load` 的**编码文件加载**、`SoundChannel` + `soundComplete`、原生 `File.browseForOpen` 面板，`FileStream` 的两个方向（文件 → 字节 → `loadCompressedDataFromByteArray`；PCM → 一份真的 16-bit WAV），以及 **边下边播**的 `http(s)://` 源（MP3 渐进式解码）（需 Skia/SDL2/miniaudio + curl 后端，见 `docs/zh-cn/audio.md` §13.5–§13.6）
 - `examples/strcoerce.as` — 对象 → 字符串的隐式强转
 - `examples/flash-net-layered.build.example.json` — 构建清单按目标分层的最小示例（非 `.as`，供构建层断言）
 - `examples/reflection-name.as` — 反射名的数值口径（值域窗口 / 负零 / `Dictionary` / `Vector.<接口>` 元素名）
