@@ -324,6 +324,9 @@ typedef struct {
   float anchor_log;
   float local_k;
   int local_lift_only;
+  // Native-HDR pass only: multiplier from the module's own reference (1.0 = 100 nits)
+  // to the window's white level (1.0 = white_nits). Zero on the SDR pass.
+  float white_inv;
 } hdr_job;
 
 // ---------------------------------------------------------------------------
@@ -393,6 +396,26 @@ static inline float hdr_local_gain(const hdr_job* j, float dlog) {
   return g_lgain[i];
 }
 
+// Half-precision encode for the native-HDR pass. Straight bit assembly rather than a
+// lookup table: the wire format is 1-5-10 and the values here are display linear light
+// in [0, ~50], i.e. nowhere near half's subnormal or overflow territory, so the only
+// thing that matters is the rounding of the mantissa.
+static inline unsigned short hdr_f2h(float f) {
+  unsigned int u;
+  memcpy(&u, &f, sizeof(u));
+  const unsigned int sign = (u >> 16) & 0x8000u;
+  int exp = (int)((u >> 23) & 0xffu) - 127;
+  unsigned int man = u & 0x7fffffu;
+  if (exp < -14) return (unsigned short)sign;  // below half's range: 0
+  if (exp > 15) return (unsigned short)(sign | 0x7bffu);  // saturate instead of inf
+  // Round to nearest on the 13 bits that get dropped.
+  const unsigned int drop = man & 0x1fffu;
+  man >>= 13;
+  if (drop > 0x1000u || (drop == 0x1000u && (man & 1u))) man += 1u;
+  if (man == 0x400u) { man = 0; exp += 1; if (exp > 15) return (unsigned short)(sign | 0x7bffu); }
+  return (unsigned short)(sign | ((unsigned int)(exp + 15) << 10) | man);
+}
+
 // ---------------------------------------------------------------------------
 // Row kernels
 // ---------------------------------------------------------------------------
@@ -412,6 +435,30 @@ static void hdr_map_rows(const hdr_job* j, int y0, int y1) {
       d[1] = hdr_out8(j->own, G, j->gain);
       d[2] = hdr_out8(j->own, R, j->gain);
       d[3] = 255;
+    }
+  }
+}
+
+// Native HDR: same decode and gamut matrix, then stop. No shoulder (the display maps to
+// its own peak), no local gain (the source is already the graded picture), no OETF (the
+// swapchain IS linear light). The only scaling is 100 nits -> the window's white level,
+// which is what makes SDR and HDR content share one screen at the right relative level.
+static void hdr_map_rows_f16(const hdr_job* j, int y0, int y1) {
+  const float k = j->gain * j->white_inv;
+  for (int y = y0; y < y1; ++y) {
+    const unsigned char* s = j->src + (size_t)y * (size_t)j->sstride;
+    unsigned char* d = j->dst + (size_t)y * (size_t)j->dstride;
+    unsigned short* h = (unsigned short*)d;
+    for (int x = 0; x < j->w; ++x, s += 6, h += 4) {
+      float r, g, b;
+      hdr_linear(j, s, &r, &g, &b);
+      const float R = j->m[0] * r + j->m[1] * g + j->m[2] * b;
+      const float G = j->m[3] * r + j->m[4] * g + j->m[5] * b;
+      const float B = j->m[6] * r + j->m[7] * g + j->m[8] * b;
+      h[0] = hdr_f2h(R * k);
+      h[1] = hdr_f2h(G * k);
+      h[2] = hdr_f2h(B * k);
+      h[3] = hdr_f2h(1.0f);
     }
   }
 }
@@ -461,7 +508,7 @@ static void hdr_map_rows_local(const hdr_job* j, int y0, int y1, float* gsum) {
 // Threading
 // ---------------------------------------------------------------------------
 
-enum { kJobMap, kJobAccum, kJobMapLocal };
+enum { kJobMap, kJobAccum, kJobMapLocal, kJobMapF16 };
 
 typedef struct {
   int kind;
@@ -473,6 +520,7 @@ typedef struct {
 static void hdr_slice_run(hdr_slice* s) {
   if (s->kind == kJobMap) hdr_map_rows(s->job, s->y0, s->y1);
   else if (s->kind == kJobAccum) hdr_accum_rows(s->job, s->y0, s->y1);
+  else if (s->kind == kJobMapF16) hdr_map_rows_f16(s->job, s->y0, s->y1);
   else hdr_map_rows_local(s->job, s->y0, s->y1, &s->gain_sum);
 }
 
@@ -516,7 +564,7 @@ static float hdr_run_pass(int kind, const hdr_job* job, int rows) {
       sl[i].y0 = rows * i / n;
       sl[i].y1 = rows * (i + 1) / n;
       sl[i].gain_sum = 0.0f;
-      if (kind != kJobMap) {
+      if (kind != kJobMap && kind != kJobMapF16) {
         sl[i].y0 = (sl[i].y0 / HDR_BLOCK) * HDR_BLOCK;
         sl[i].y1 = (sl[i].y1 + HDR_BLOCK - 1) / HDR_BLOCK * HDR_BLOCK;
         if (sl[i].y1 > rows) sl[i].y1 = rows;
@@ -798,5 +846,32 @@ int as_hdr_tonemap_rgb48(as_hdr* h, const unsigned char* src, int sstride,
 
   const float gain_sum = hdr_run_pass(kJobMapLocal, &job, rows);
   h->last_gain = gain_sum / (float)(w * rows);
+  return 1;
+}
+int as_hdr_tonemap_rgb48_f16(as_hdr* h, const unsigned char* src, int sstride,
+                             unsigned char* dst, int dstride, int w, int rows,
+                             float white_nits) {
+  if (h == NULL || src == NULL || dst == NULL) return 0;
+  if (w <= 0 || rows <= 0) return 0;
+  if (!(white_nits > 0.0f) || !isfinite(white_nits)) return 0;
+  const float* lin = hdr_lin_table(h->kind);
+  if (lin == NULL) return 0;
+
+  hdr_job job;
+  memset(&job, 0, sizeof(job));
+  job.own = h;
+  job.lin = lin;
+  job.hg = (h->kind == 2) ? h->hlg_gain : NULL;
+  job.m = h->src_2020 ? k_2020_to_709 : k_identity;
+  job.lw = h->src_2020 ? k_lum_2020 : k_lum_709;
+  job.gain = h->gain;
+  job.white_inv = HDR_REF_WHITE / white_nits;
+  job.src = src;
+  job.dst = dst;
+  job.sstride = sstride;
+  job.dstride = dstride;
+  job.w = w;
+  h->last_gain = 1.0f;
+  hdr_run_pass(kJobMapF16, &job, rows);
   return 1;
 }

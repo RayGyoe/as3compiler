@@ -68,6 +68,10 @@
 
 #include "include/core/SkSurface.h"
 #include "include/core/SkCanvas.h"
+// The HDR present pass composites through a colour matrix (a pure gain); the matrix type
+// itself lives in the effects headers, not in core.
+#include "include/core/SkColorFilter.h"
+#include "include/effects/SkColorMatrix.h"
 // GrD3DTextureResourceInfo's GrBackendRenderTarget wrapper carries a
 // sk_sp<SkColorSpace>, so SkColorSpace must be a complete type where the surface
 // is wrapped (the classic SkRefCnt.h "incomplete type" error otherwise).
@@ -86,6 +90,7 @@
 // safe here: the redefinitions happen once, before any Skia declaration is parsed.
 #include "include/gpu/d3d/GrD3DBackendContext.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -198,12 +203,70 @@ static double d3d_now_ms(void) {
 // other's, because the SkColorType is what tells Skia how to interpret the bytes.
 #define SK_D3D_SWAPCHAIN_FORMAT DXGI_FORMAT_R8G8B8A8_UNORM
 
+// Native HDR (docs/zh-cn/video.md §16.12). Two formats carry HDR to a Windows
+// display and DXGI allows exactly one colour space per format:
+//
+//   R16G16B16A16_FLOAT + RGB_FULL_G10_NONE_P709  = scRGB   (1.0 == 80 nits)
+//   R10G10B10A2_UNORM  + RGB_FULL_G2084_NONE_P2020 = HDR10  (PQ, 1.0 == 10000 nits)
+//
+// scRGB is the one this backend can implement correctly rather than approximately.
+// Skia's colour management decodes sRGB sources into linear light and blends there,
+// which is what an F16 linear surface wants and what a 10-bit PQ surface cannot have
+// (its stored codes are PQ, so every blend would happen in a perceptual curve). The
+// measured consequence for HDR10 is that Skia maps white to the FULL 10000 nits with
+// no SDR-white concept at all -- so a white UI rect would ask the display for 10000
+// nits. With scRGB the same white lands at 1.0 and the whole SDR/HDR relationship is
+// one multiply, which this file applies at present time.
+#define SK_D3D_HDR_FORMAT DXGI_FORMAT_R16G16B16A16_FLOAT
+// scRGB's own definition: stored 1.0 is 80 nits. Not a tunable.
+#define SK_D3D_HDR_NITS_PER_UNIT 80.0
+// SDR white level on an HDR display. 203 nits is BT.2408 graphics white, which is
+// also roughly what Windows picks for "SDR content brightness" by default; measured
+// against this GPU's panel (500 nit peak) it keeps a white document white and still
+// leaves ~2.5x headroom for highlights. ASC_HDR_WHITE overrides it.
+#define SK_D3D_HDR_WHITE_DEFAULT 203.0f
+
+// HDR request. ASC_HDR=1 turns it on; there is no auto-detect on purpose — the
+// display's own HDR state belongs to the user (Windows' HDR toggle), and a window that
+// silently changes its pixel format is exactly the kind of "helpful" surprise that
+// makes a colour pipeline impossible to audit. ASC_HDR_WHITE overrides the SDR white
+// level in nits. Both are read once.
+static int g_hdr_req = -1;
+static float g_hdr_white = SK_D3D_HDR_WHITE_DEFAULT;
+
+static int d3d_hdr_requested(void) {
+  if (g_hdr_req >= 0) return g_hdr_req;
+  g_hdr_req = 0;
+  const char* on = getenv("ASC_HDR");
+  if (on != nullptr && on[0] != '\0' && !(on[0] == '0' && on[1] == '\0')) g_hdr_req = 1;
+  const char* wh = getenv("ASC_HDR_WHITE");
+  if (wh != nullptr && wh[0] != '\0') {
+    const float v = (float)atof(wh);
+    // Below scRGB's own 80 nits a "lift" would be a darkening; above 1000 nothing has
+    // headroom left. Outside that the number is a typo, not a preference.
+    if (v >= SK_D3D_HDR_NITS_PER_UNIT && v <= 1000.0f) g_hdr_white = v;
+    else fprintf(stderr, "d3d_glue: ASC_HDR_WHITE=%.1f outside [%.0f,1000], keeping %.0f\n",
+                 (double)v, SK_D3D_HDR_NITS_PER_UNIT, (double)g_hdr_white);
+  }
+  return g_hdr_req;
+}
+
 typedef struct {
   int used;
   HWND hwnd;
   gr_cp<IDXGISwapChain3> swapchain;
   gr_cp<ID3D12Resource> buffers[SK_D3D_NUM_FRAMES];
   sk_sp<SkSurface> surfaces[SK_D3D_NUM_FRAMES];
+  // HDR: 1 when this window presents an scRGB swapchain. Then `surfaces[]` are the
+  // F16 back buffers (the present targets) and every draw goes to `draw` -- an
+  // offscreen F16 surface in the same linear space -- which sk_gpu_flush composites
+  // into the back buffer with the SDR-white gain. One extra full-screen blit is what
+  // buys an exact white level; see the note above SK_D3D_HDR_WHITE_DEFAULT.
+  int hdr;
+  float hdr_white;
+  sk_sp<SkSurface> draw;
+  // HDR frames actually composited through `draw` (ASC_HDR_STATS).
+  long hdr_frames;
   unsigned int buffer_index;
   // CPU/GPU sync: the back buffer at `buffer_index` may still be in use by the GPU
   // until the fence reaches that frame's value (see sk_gpu_begin_frame).
@@ -471,6 +534,12 @@ static int d3d_init_shared(void) {
 // the old surfaces must be dropped first (their GrBackendRenderTargets wrap those
 // resources).
 static int d3d_setup_surfaces(D3DWin* w) {
+  // The format is the window's, not a constant: an HDR window presents F16 and draws
+  // through an offscreen in the same space (see SK_D3D_HDR_FORMAT).
+  const DXGI_FORMAT fmt = w->hdr ? SK_D3D_HDR_FORMAT : SK_D3D_SWAPCHAIN_FORMAT;
+  const SkColorType ct = w->hdr ? kRGBA_F16_SkColorType : kRGBA_8888_SkColorType;
+  const sk_sp<SkColorSpace> cs = w->hdr ? SkColorSpace::MakeSRGBLinear() : nullptr;
+  w->draw.reset();
   for (int i = 0; i < SK_D3D_NUM_FRAMES; ++i) {
     w->surfaces[i].reset();
     w->buffers[i].reset();
@@ -493,7 +562,7 @@ static int d3d_setup_surfaces(D3DWin* w) {
     // D3D12WindowContext_win.cpp reference) and protected is kNo.
     GrD3DTextureResourceInfo info(nullptr, nullptr,
                                   D3D12_RESOURCE_STATE_PRESENT,
-                                  SK_D3D_SWAPCHAIN_FORMAT,
+                                  fmt,
                                   1, 1, 0, GrProtected::kNo);
     // NOT the (resource, ...) constructor: that one ADOPTS the bare pointer without
     // AddRef while its destructor still Releases (see the ownership note below), so
@@ -504,10 +573,24 @@ static int d3d_setup_surfaces(D3DWin* w) {
     GrBackendRenderTarget rt(w->width, w->height, info);
     w->surfaces[i] = SkSurfaces::WrapBackendRenderTarget(g_context.get(), rt,
                                                          kTopLeft_GrSurfaceOrigin,
-                                                         kRGBA_8888_SkColorType,
-                                                         nullptr, nullptr);
+                                                         ct, cs, nullptr);
     if (w->surfaces[i] == nullptr) {
-      fprintf(stderr, "d3d_glue: WrapBackendRenderTarget failed for back buffer %d\n", i);
+      fprintf(stderr, "d3d_glue: WrapBackendRenderTarget failed for back buffer %d%s\n", i,
+              w->hdr ? " (F16)" : "");
+      return 0;
+    }
+  }
+  if (w->hdr) {
+    // The frame is composed here, in linear light, and blitted once into the back
+    // buffer at present time. Premultiplied because every draw blends (Skia stores
+    // premul; linear premul compositing is the correct one) and the app clears the
+    // whole frame every tick, so nothing here needs to survive a frame.
+    const SkImageInfo info = SkImageInfo::Make(w->width, w->height, kRGBA_F16_SkColorType,
+                                               kPremul_SkAlphaType, cs);
+    w->draw = SkSurfaces::RenderTarget(g_context.get(), skgpu::Budgeted::kYes, info);
+    if (w->draw == nullptr) {
+      fprintf(stderr, "d3d_glue: HDR offscreen F16 render target %dx%d unavailable\n",
+              w->width, w->height);
       return 0;
     }
   }
@@ -526,33 +609,87 @@ static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {
   D3D_OK_OR_WARN(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
   if (factory.get() == nullptr) return 0;
 
-  DXGI_SWAP_CHAIN_DESC1 sd = {};
-  sd.BufferCount = SK_D3D_NUM_FRAMES;
-  sd.Width = (UINT)cw;
-  sd.Height = (UINT)ch;
-  sd.Format = SK_D3D_SWAPCHAIN_FORMAT;
-  sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-  sd.Scaling = DXGI_SCALING_NONE;
-  sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-  sd.SampleDesc.Count = 1;
+  const int want_hdr = d3d_hdr_requested();
+  w->hdr = 0;
+  w->hdr_white = g_hdr_white;
+  for (int attempt = 0; attempt < (want_hdr ? 2 : 1); ++attempt) {
+    // attempt 0 = what was asked for, attempt 1 = the SDR fallback.
+    const int hdr = want_hdr && attempt == 0;
 
-  gr_cp<IDXGISwapChain1> swapchain;
-  D3D_OK_OR_WARN(factory->CreateSwapChainForHwnd(g_queue.get(), hwnd, &sd, nullptr,
-                                                 nullptr, &swapchain));
-  if (swapchain.get() == nullptr) {
-    fprintf(stderr, "d3d_glue: CreateSwapChainForHwnd failed\n");
-    return 0;
+    DXGI_SWAP_CHAIN_DESC1 sd = {};
+    sd.BufferCount = SK_D3D_NUM_FRAMES;
+    sd.Width = (UINT)cw;
+    sd.Height = (UINT)ch;
+    sd.Format = hdr ? SK_D3D_HDR_FORMAT : SK_D3D_SWAPCHAIN_FORMAT;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.Scaling = DXGI_SCALING_NONE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.SampleDesc.Count = 1;
+
+    gr_cp<IDXGISwapChain1> swapchain;
+    D3D_OK_OR_WARN(factory->CreateSwapChainForHwnd(g_queue.get(), hwnd, &sd, nullptr,
+                                                   nullptr, &swapchain));
+    if (swapchain.get() == nullptr) {
+      if (hdr) {
+        fprintf(stderr, "d3d_glue: HDR swapchain (R16G16B16A16_FLOAT) unavailable; "
+                        "falling back to SDR\n");
+        fflush(stderr);
+        continue;
+      }
+      fprintf(stderr, "d3d_glue: CreateSwapChainForHwnd failed\n");
+      return 0;
+    }
+    D3D_OK_OR_WARN(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
+    D3D_OK_OR_WARN(swapchain->QueryInterface(IID_PPV_ARGS(&w->swapchain)));
+    if (w->swapchain.get() == nullptr) return 0;
+
+    if (hdr) {
+      // DXGI pairs each format with exactly the colour spaces it can carry (measured:
+      // F16 accepts scRGB and refuses HDR10; R10G10B10A2 accepts HDR10 and refuses
+      // scRGB). CheckColorSpaceSupport is the only honest source for that, so ask
+      // before presenting: a swapchain whose colour space was never set is an SDR
+      // surface that happens to hold F16, which reads as "washed out and clamped".
+      UINT support = 0;
+      const HRESULT chr = w->swapchain->CheckColorSpaceSupport(
+          DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &support);
+      const HRESULT shr = SUCCEEDED(chr) &&
+                                  (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+                              ? w->swapchain->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
+                              : E_FAIL;
+      if (FAILED(shr)) {
+        fprintf(stderr,
+                "d3d_glue: scRGB colour space not accepted (check=0x%08lx support=0x%lx "
+                "set=0x%08lx); falling back to SDR\n",
+                (unsigned long)chr, (unsigned long)support, (unsigned long)shr);
+        fflush(stderr);
+        w->swapchain.reset();
+        continue;
+      }
+      w->hdr = 1;
+    }
+
+    w->hwnd = hwnd;
+    w->width = cw;
+    w->height = ch;
+    w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+
+    if (!d3d_setup_surfaces(w)) {
+      if (hdr) {
+        // An F16 back buffer that Skia cannot wrap (or no F16 offscreen) must not take
+        // the window down with it: drop the swapchain and retry as SDR once.
+        fprintf(stderr, "d3d_glue: HDR surfaces unavailable; falling back to SDR\n");
+        fflush(stderr);
+        w->hdr = 0;
+        w->draw.reset();
+        w->swapchain.reset();
+        continue;
+      }
+      w->swapchain.reset();
+      return 0;
+    }
+    break;
   }
-  D3D_OK_OR_WARN(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
-  D3D_OK_OR_WARN(swapchain->QueryInterface(IID_PPV_ARGS(&w->swapchain)));
   if (w->swapchain.get() == nullptr) return 0;
-
-  w->hwnd = hwnd;
-  w->width = cw;
-  w->height = ch;
-  w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
-
-  if (!d3d_setup_surfaces(w)) { w->swapchain.reset(); return 0; }
 
   // Fence values start high so they stand out in a PIX capture (Skia's reference
   // does the same); only their ordering matters.
@@ -724,8 +861,10 @@ int sk_gpu_init(int win_id, void* native_handle) {
   gpu_trace("surfaces");
 
   g_d3d[win_id].used = 1;
-  fprintf(stderr, "d3d_glue: window %d bound to %dx%d R8G8B8A8 swapchain\n",
-          win_id, g_d3d[win_id].width, g_d3d[win_id].height);
+  fprintf(stderr, "d3d_glue: window %d bound to %dx%d %s swapchain%s\n",
+          win_id, g_d3d[win_id].width, g_d3d[win_id].height,
+          g_d3d[win_id].hdr ? "R16G16B16A16_FLOAT scRGB" : "R8G8B8A8",
+          g_d3d[win_id].hdr ? " (SDR white lifted at present)" : "");
   return 1;
 }
 
@@ -754,10 +893,12 @@ void sk_gpu_destroy(int win_id) {
         WaitForSingleObjectEx(w->fence_event, INFINITE, FALSE);
       }
       w->surfaces[i].reset();
-      // A flip-model swapchain requires its back-buffer references to be gone
-      // before ResizeBuffers — and before the swapchain itself is released here.
       w->buffers[i].reset();
     }
+    // The offscreen frame surface is device memory and goes with the rest.
+    w->draw.reset();
+    w->hdr = 0;
+    w->hdr_frames = 0;
     if (w->fence_event != NULL) CloseHandle(w->fence_event);
     w->fence.reset();
     w->swapchain.reset();
@@ -884,7 +1025,7 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
       rhr = E_OUTOFMEMORY;
     } else {
       rhr = w->swapchain->ResizeBuffers(0, (UINT)width, (UINT)height,
-                                        SK_D3D_SWAPCHAIN_FORMAT, 0);
+                                        w->hdr ? SK_D3D_HDR_FORMAT : SK_D3D_SWAPCHAIN_FORMAT, 0);
     }
     if (FAILED(rhr)) {
       fprintf(stderr, "d3d_glue: ResizeBuffers to %dx%d failed: 0x%08lx\n",
@@ -933,7 +1074,7 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
   }
   w->fence_values[w->buffer_index] = current + 1;
 
-  SkSurface* s = w->surfaces[w->buffer_index].get();
+  SkSurface* s = w->hdr ? w->draw.get() : w->surfaces[w->buffer_index].get();
   if (s == nullptr) return nullptr;
 
   if (getenv("ASC_S3D_STATS") != NULL) {
@@ -964,6 +1105,25 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
 //
 // ASC_GPU_DUMP   = output .bmp path (no dump unless set)
 // ASC_GPU_DUMP_AT = frame index to dump (default 30: the demo has its assets loaded)
+// Half -> float, for the HDR dump. RK-limited (the values here are display linear in
+// [0, ~64], so subnormals and infinities are not part of the contract).
+static float d3d_half_to_float(unsigned short h) {
+  const int sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+  float v;
+  if (exp == 0) v = (float)man * (1.0f / 16777216.0f);
+  else v = (float)(man | 0x400) * (float)ldexp(1.0, exp - 25);
+  return sign ? -v : v;
+}
+
+// Linear light -> 8-bit sRGB code, clamped. Same curve the SDR path's surface applies.
+static unsigned char d3d_linear_to_srgb8(float v) {
+  if (!(v > 0.0f)) return 0;
+  if (v >= 1.0f) return 255;
+  const float s = v <= 0.0031308f ? 12.92f * v : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+  const int i = (int)(s * 255.0f + 0.5f);
+  return (unsigned char)(i < 0 ? 0 : (i > 255 ? 255 : i));
+}
+
 static void d3d_dump_backbuffer(D3DWin* w) {
   const char* out = getenv("ASC_GPU_DUMP");
   if (out == nullptr || out[0] == '\0') return;
@@ -978,8 +1138,11 @@ static void d3d_dump_backbuffer(D3DWin* w) {
   if (bb == nullptr) { fprintf(stderr, "ASC_GPU_DUMP: no back buffer\n"); fflush(stderr); return; }
   const UINT width = (UINT)w->width, height = (UINT)w->height;
   if (width == 0 || height == 0) { fprintf(stderr, "ASC_GPU_DUMP: zero size\n"); fflush(stderr); return; }
-  // CopyTextureRegion only accepts a 256-byte-aligned row pitch.
-  const UINT rowPitch = (width * 4u + 255u) & ~255u;
+  // CopyTextureRegion only accepts a 256-byte-aligned row pitch. The HDR back buffer is
+  // 8 bytes per pixel, so the pitch and the BMP conversion below both follow the format
+  // rather than assuming 4.
+  const UINT bpp = w->hdr ? 8u : 4u;
+  const UINT rowPitch = (width * bpp + 255u) & ~255u;
 
   gr_cp<ID3D12CommandAllocator> alloc;
   gr_cp<ID3D12GraphicsCommandList> list;
@@ -1018,7 +1181,7 @@ static void d3d_dump_backbuffer(D3DWin* w) {
   D3D12_TEXTURE_COPY_LOCATION dst = {};
   dst.pResource = rb.get();
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  dst.PlacedFootprint.Footprint.Format = SK_D3D_SWAPCHAIN_FORMAT;
+  dst.PlacedFootprint.Footprint.Format = w->hdr ? SK_D3D_HDR_FORMAT : SK_D3D_SWAPCHAIN_FORMAT;
   dst.PlacedFootprint.Footprint.Width = width;
   dst.PlacedFootprint.Footprint.Height = height;
   dst.PlacedFootprint.Footprint.Depth = 1;
@@ -1062,18 +1225,74 @@ static void d3d_dump_backbuffer(D3DWin* w) {
     memcpy(hdr + 34, &dataBytes, 4);
     fwrite(hdr, 1, sizeof hdr, f);
     const unsigned char* px = (const unsigned char*)mapped;
+    // HDR: the back buffer holds scRGB linear half floats (1.0 == 80 nits), which no
+    // image viewer can show. Scale to the SDR white level, clamp, and encode with the
+    // sRGB OETF so the BMP is a faithful "what SDR would have looked like" preview.
+    // The numeric check is separate (ASC_HDR_STATS + test/unit/video.ts), because a
+    // preview that looks right can still be metres off in linear light.
+    const float hdrGain = (float)SK_D3D_HDR_NITS_PER_UNIT / (w->hdr_white > 0.0f ? w->hdr_white : 1.0f);
     for (UINT y = 0; y < height; ++y) {
       const unsigned char* row = px + (SIZE_T)y * rowPitch;
+      const unsigned short* hr = (const unsigned short*)row;
       for (UINT x = 0; x < width; ++x) {
-        // R8G8B8A8 in memory -> B,G,R in the file.
-        const unsigned char bgr[3] = { row[x * 4 + 2], row[x * 4 + 1], row[x * 4 + 0] };
+        unsigned char bgr[3];
+        if (w->hdr) {
+          const float r = d3d_half_to_float(hr[x * 4 + 0]) * hdrGain;
+          const float g = d3d_half_to_float(hr[x * 4 + 1]) * hdrGain;
+          const float b = d3d_half_to_float(hr[x * 4 + 2]) * hdrGain;
+          bgr[0] = d3d_linear_to_srgb8(b);
+          bgr[1] = d3d_linear_to_srgb8(g);
+          bgr[2] = d3d_linear_to_srgb8(r);
+        } else {
+          // R8G8B8A8 in memory -> B,G,R in the file.
+          bgr[0] = row[x * 4 + 2];
+          bgr[1] = row[x * 4 + 1];
+          bgr[2] = row[x * 4 + 0];
+        }
         fwrite(bgr, 1, 3, f);
       }
       const unsigned char pad[3] = { 0, 0, 0 };
       if (rowBytes > width * 3u) fwrite(pad, 1, rowBytes - width * 3u, f);
     }
     fclose(f);
-    fprintf(stderr, "d3d_glue: ASC_GPU_DUMP wrote %s (%ux%u)\n", out, width, height);
+    fprintf(stderr, "d3d_glue: ASC_GPU_DUMP wrote %s (%ux%u)%s\n", out, width, height,
+            w->hdr ? " [HDR preview: linear -> sRGB at the SDR white level]" : "");
+    if (w->hdr) {
+      // The numbers behind the preview. A headless run needs these: an F16 buffer that
+      // was never written, one written in the wrong space, and a correct one all look
+      // like a plausible BMP after the sRGB encode above. Reported per horizontal band
+      // (thirds) as well as overall, so a test pattern can be checked band by band.
+      double sum = 0.0, mx = 0.0;
+      double bsum[3] = {0, 0, 0}, bmax[3] = {0, 0, 0};
+      long n = 0, bn[3] = {0, 0, 0};
+      for (UINT y = 0; y < height; y += 7) {
+        const unsigned short* row = (const unsigned short*)((const unsigned char*)mapped + (SIZE_T)y * rowPitch);
+        const UINT band = (UINT)((UINT64)y * 3u / (height > 0 ? height : 1u));
+        const UINT bi = band > 2u ? 2u : band;
+        for (UINT x = 0; x < width; x += 7) {
+          for (int c = 0; c < 3; ++c) {
+            const float v = d3d_half_to_float(row[x * 4 + c]);
+            if (!(v > 0.0f)) continue;
+            sum += (double)v;
+            if ((double)v > mx) mx = (double)v;
+            bsum[bi] += (double)v;
+            if ((double)v > bmax[bi]) bmax[bi] = (double)v;
+            ++n;
+            ++bn[bi];
+          }
+        }
+      }
+      const double mean = n > 0 ? sum / (double)n : 0.0;
+      fprintf(stderr, "d3d_glue: HDR linear mean=%.4f (%.1f nits) max=%.4f (%.1f nits) white=%.0f\n",
+              mean, mean * SK_D3D_HDR_NITS_PER_UNIT, mx, mx * SK_D3D_HDR_NITS_PER_UNIT,
+              (double)w->hdr_white);
+      for (int i = 0; i < 3; ++i) {
+        const double bm = bn[i] > 0 ? bsum[i] / (double)bn[i] : 0.0;
+        fprintf(stderr, "d3d_glue: HDR band%d mean=%.4f (%.1f nits) max=%.4f (%.1f nits)\n",
+                i, bm, bm * SK_D3D_HDR_NITS_PER_UNIT, bmax[i],
+                bmax[i] * SK_D3D_HDR_NITS_PER_UNIT);
+      }
+    }
   }
   rb->Unmap(0, nullptr);
 }
@@ -1092,6 +1311,40 @@ void sk_gpu_flush(int win_id) {
   if (w == nullptr || g_context == nullptr) return;
   SkSurface* s = w->surfaces[w->buffer_index].get();
   if (s == nullptr) return;
+
+  if (w->hdr && w->draw != nullptr) {
+    // One full-screen composite, in linear light, from the F16 frame surface to the
+    // swapchain's F16 back buffer. It is a multiply (SDR white 1.0 -> white/80) and
+    // nothing else: no gamut matrix (both are BT.709), no transfer function (both are
+    // linear), no tone curve (the display owns that).
+    //
+    // The multiply is a kModulate draw of a solid LINEAR-tagged colour, NOT an
+    // SkColorFilters::Matrix gain: measured on this Skia build, the matrix filter
+    // clamps its output to [0,1], so 203-nit white came out as exactly 1.0 (= 80 nits)
+    // and every highlight above it was cut -- the silent "looks HDR, is SDR" failure
+    // this path must never have. Measured side by side on an F16 linear destination
+    // (temp/hdrgain.cc): filter white=1.0000, kModulate white=2.5371 (= 203 nits),
+    // grey 0.2157 -> 0.5474 in both. The colour must be tagged linear too; an untagged
+    // SkColor4f is read as sRGB-encoded and 2.5375 would arrive as 8.65.
+    SkCanvas* cv = s->getCanvas();
+    sk_sp<SkImage> frame = w->draw->makeImageSnapshot();
+    if (frame != nullptr) {
+      const float gain = w->hdr_white / (float)SK_D3D_HDR_NITS_PER_UNIT;
+      SkPaint paint;
+      paint.setBlendMode(SkBlendMode::kSrc);   // replace, not blend: the buffer is stale
+      cv->drawImage(frame, 0.0f, 0.0f, SkSamplingOptions(), &paint);
+      SkPaint scale;
+      scale.setBlendMode(SkBlendMode::kModulate);
+      scale.setColor(SkColor4f{gain, gain, gain, 1.0f}, SkColorSpace::MakeSRGBLinear().get());
+      cv->drawRect(SkRect::MakeWH((SkScalar)w->width, (SkScalar)w->height), scale);
+      w->hdr_frames++;
+      if (getenv("ASC_HDR_STATS") != nullptr && (w->hdr_frames % 120) == 0) {
+        fprintf(stderr, "d3d_glue: hdr frames=%ld white=%.0fnits gain=%.4f\n",
+                w->hdr_frames, (double)w->hdr_white, (double)gain);
+        fflush(stderr);
+      }
+    }
+  }
 
   GrFlushInfo info;
   g_context->flush(s, SkSurfaces::BackendSurfaceAccess::kPresent, info);
@@ -1265,5 +1518,20 @@ void sk_gpu_draw_texture(void* canvas, void* d3dTexture, int w, int h,
   paint.setBlendMode(SkBlendMode::kSrc);
   c->drawImageRect(img, dst, SkSamplingOptions(SkFilterMode::kLinear, SkMipmapMode::kNone), &paint);
 }
+
+// --- Native HDR seam (docs/zh-cn/video.md §16.12) ---------------------------
+//
+// The video path asks these two before it decodes a frame: if the window presents an
+// scRGB swapchain, HDR video must arrive as linear F16 at this white level, NOT as
+// tone-mapped 8-bit. Asking the presenter instead of an env var keeps the two sides
+// from disagreeing after an HDR fallback (unsupported format, device-lost rebuild).
+int sk_gpu_hdr_active(void) {
+  for (int i = 0; i < SK_D3D_MAX_WINDOWS; ++i) {
+    if (g_d3d[i].used && g_d3d[i].hdr) return 1;
+  }
+  return 0;
+}
+
+float sk_gpu_hdr_white(void) { return g_hdr_white; }
 
 }  // extern "C"

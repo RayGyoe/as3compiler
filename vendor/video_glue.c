@@ -85,6 +85,22 @@
 extern void* sk_image_from_yuv_strided(void* ctx, const void* y, int sy, const void* u,
                                        int su, const void* v, int sv, int w, int h, int yuvCs);
 extern void* sk_image_from_argb(const void* px, int w, int h);
+// Native HDR output (docs/zh-cn/video.md §16.12): linear F16 for an scRGB swapchain.
+extern void* sk_image_from_f16(const void* px, int w, int h);
+#endif
+
+// HDR presentation exists only on the D3D12 backend (it is the one that owns a Windows
+// swapchain and can set an scRGB colour space). Everywhere else these answer "no HDR",
+// which keeps the SDR tone-mapping route the only route -- exactly as before §16.12.
+#if defined(ASC_RENDER_D3D) && ASC_RENDER_D3D && defined(ASC_USE_SKIA)
+extern int sk_gpu_hdr_active(void);
+extern float sk_gpu_hdr_white(void);
+#else
+static int sk_gpu_hdr_active(void) { return 0; }
+static float sk_gpu_hdr_white(void) { return 0.0f; }
+#endif
+
+#ifdef ASC_USE_SKIA
 // Refcount release without a Skia header: sk_image_delete is the C wrapper that
 // exists for exactly this caller (skia_glue.cc).
 extern void sk_image_delete(void* image);
@@ -126,6 +142,10 @@ static void* sk_image_from_yuv_strided(void* ctx, const void* y, int sy, const v
   return NULL;
 }
 static void* sk_image_from_argb(const void* px, int w, int h) { (void)px; (void)w; (void)h; return NULL; }
+static void* sk_image_from_f16(const void* px, int w, int h) { (void)px; (void)w; (void)h; return NULL; }
+// sk_gpu_hdr_active/white are NOT redefined here: the block above already answers
+// "no HDR" for every non-D3D build, and a second definition breaks the plain
+// no-Skia build with a hard redefinition error.
 static void sk_image_delete(void* image) { (void)image; }
 #endif
 
@@ -218,6 +238,10 @@ typedef struct {
   // Skia's YUV shader has no place to insert a transfer-function decode.
   struct SwsContext* sws_rgb48;
   unsigned char* rgb48;
+  // Native HDR (window presents scRGB): the same RGB48 goes straight to RGBA16F linear
+  // light instead of through the SDR tone map. Separate buffer because its row is twice
+  // as wide as the BGRA one.
+  unsigned char* rgba16;
   as_hdr* hdr;
   int v_trc;                // codecpar color_trc, the HDR verdict before any frame
   int hdr_pq;               // 1 = PQ, 2 = HLG (for diagnostics)
@@ -609,12 +633,17 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
   const double t_conv0 = as_video_ms();
   void* img = pre_img;
   // HDR first, and it overrides every GPU route: Skia's YUV shader converts YCbCr to
-  // RGB but has nowhere to decode PQ/HLG or map BT.2020 into BT.709, so a tone-mapped
-  // frame has to be RGB before it reaches Skia. sws gives us 16-bit RGB (the 10 bits of
-  // a P010 source survive), the mapping produces BGRA, and that uploads like any raster
-  // image. `pre_img` cannot coexist with this: the zero-copy attempt is gated off
-  // entirely while v->hdr is set (see as_video_drain_video).
-  if (img == NULL && as_video_hdr_wanted() && as_video_hdr_kind(
+  // RGB but has nowhere to decode PQ/HLG or map BT.2020 into BT.709, so an HDR frame has
+  // to be RGB before it reaches Skia. sws gives us 16-bit RGB (the 10 bits of
+  // a P010 source survive), and from there the destination decides the encoding: an
+  // scRGB window gets linear F16 (nothing is mapped -- the display maps), an SDR window
+  // gets the tone-mapped BGRA of §16.10/§16.11 (only when AS_VIDEO_HDR opts in).
+  // `pre_img` cannot coexist with this: the zero-copy attempt is gated off entirely
+  // while v->hdr is set (see as_video_drain_video), and an HDR window never asks for
+  // zero-copy either for the same reason -- Skia's YUV path cannot carry PQ.
+  if (img == NULL &&
+      (as_video_hdr_wanted() || sk_gpu_hdr_active()) &&
+      as_video_hdr_kind(
           f->color_trc != AVCOL_TRC_UNSPECIFIED ? f->color_trc : v->v_trc) != 0 &&
       as_video_hdr_ctx(v, f) != NULL) {
     // Dynamic metadata first: it decides the shoulder the frame is mapped through, so it
@@ -644,8 +673,18 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
       }
     }
     if (v->rgb48 == NULL) v->rgb48 = (unsigned char*)malloc((size_t)w * (size_t)h * 6);
-    if (v->bgra == NULL) v->bgra = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
-    if (v->rgb48 == NULL || v->bgra == NULL) return 0;
+    // Which output depends on the WINDOW, not on this file's opinion: an scRGB swapchain
+    // takes linear light, an SDR one takes tone-mapped 8-bit. Decided per frame because a
+    // window can fall back to SDR behind our back (unsupported format, device-lost rebuild).
+    const int window_hdr = sk_gpu_hdr_active();
+    if (window_hdr) {
+      if (v->rgba16 == NULL) v->rgba16 = (unsigned char*)malloc((size_t)w * (size_t)h * 8);
+      if (v->rgba16 == NULL) return 0;
+    } else {
+      if (v->bgra == NULL) v->bgra = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
+      if (v->bgra == NULL) return 0;
+    }
+    if (v->rgb48 == NULL) return 0;
     if (v->sws_rgb48 == NULL) {
       v->sws_rgb48 = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h,
                                     AV_PIX_FMT_RGB48LE, SWS_BILINEAR, NULL, NULL, NULL);
@@ -664,12 +703,26 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
     sws_scale(v->sws_rgb48, (const uint8_t* const*)f->data, f->linesize, 0, h, rdst, rstride);
     const double t_map0 = as_video_ms();
     v->t_hdr_ms += t_map0 - t_conv0;
-    if (!as_hdr_tonemap_rgb48(v->hdr, v->rgb48, w * 6, v->bgra, w * 4, w, h)) return 0;
-    v->t_map_ms += as_video_ms() - t_map0;
-    v->t_conv_ms += as_video_ms() - t_conv0;
-    const double t_up0 = as_video_ms();
-    img = sk_image_from_argb(v->bgra, w, h);
-    v->t_upload_ms += as_video_ms() - t_up0;
+    if (window_hdr) {
+      // No shoulder, no local map, no SDR OETF: the display does its own tone mapping and
+      // anything compressed here would be compressed twice. Only the white level is ours.
+      if (!as_hdr_tonemap_rgb48_f16(v->hdr, v->rgb48, w * 6, v->rgba16, w * 8, w, h,
+                                    sk_gpu_hdr_white())) {
+        return 0;
+      }
+      v->t_map_ms += as_video_ms() - t_map0;
+      v->t_conv_ms += as_video_ms() - t_conv0;
+      const double t_up0 = as_video_ms();
+      img = sk_image_from_f16(v->rgba16, w, h);
+      v->t_upload_ms += as_video_ms() - t_up0;
+    } else {
+      if (!as_hdr_tonemap_rgb48(v->hdr, v->rgb48, w * 6, v->bgra, w * 4, w, h)) return 0;
+      v->t_map_ms += as_video_ms() - t_map0;
+      v->t_conv_ms += as_video_ms() - t_conv0;
+      const double t_up0 = as_video_ms();
+      img = sk_image_from_argb(v->bgra, w, h);
+      v->t_upload_ms += as_video_ms() - t_up0;
+    }
   }
   // Two routes, decided by whether a GPU context exists -- never both. The I420 pass
   // exists only to feed sk_image_from_yuv_strided, so on a CPU-raster build (grctx
@@ -917,6 +970,9 @@ static int as_video_zc_available(void* grctx, void* dev11, int w, int h, int ten
 #if AS_VIDEO_ZC
   if (grctx == NULL || dev11 == NULL) return 0;
   if (!as_video_zc_wanted()) return 0;
+  // An HDR window changes what the decoder's frames have to become (linear F16 through
+  // the CPU mapping), so the zero-copy route has nothing it can deliver there.
+  if (sk_gpu_hdr_active()) return 0;
   return sk_video_d3d_probe(grctx, dev11, w > 0 ? w : 16, h > 0 ? h : 16, ten_bit);
 #else
   (void)grctx; (void)dev11; (void)w; (void)h; (void)ten_bit;
@@ -1003,9 +1059,14 @@ static void as_video_maybe_upgrade(as_video* v, void* grctx) {
   if (v->vc == NULL || v->vdec == NULL || v->vs < 0) return;
   const int mode = as_video_decode_mode();
   if (mode == 0) { v->decided = 1; return; }
-  // HDR tone mapping keeps the CPU decode: the mapping has to happen on CPU anyway
-  // (§16.10 -- Skia cannot do it), so the GPU route would add the readback on top.
-  if (as_video_hdr_wanted() && as_video_hdr_kind(v->v_trc) != 0) { v->decided = 1; return; }
+  // HDR keeps the CPU decode: on an SDR window the tone mapping happens on CPU anyway
+  // (§16.10 -- Skia cannot do it), and on an HDR window the frames must become linear
+  // F16 through the same CPU mapping. Either way the GPU route would only add a readback
+  // on top (measured: hardware + transfer 13.4 ms against software's 6.6 ms, §16.8.3).
+  if ((as_video_hdr_wanted() || sk_gpu_hdr_active()) && as_video_hdr_kind(v->v_trc) != 0) {
+    v->decided = 1;
+    return;
+  }
   // Without a renderer there is no question to answer yet: stay undecided, so a
   // windowed app that paints its first frame later can still take the GPU. A headless
   // program simply never upgrades (and never pays for a device).
@@ -1093,6 +1154,7 @@ static void as_video_free_state(as_video* v) {
   if (v->sws_rgb48 != NULL) { sws_freeContext(v->sws_rgb48); v->sws_rgb48 = NULL; }
   if (v->hdr != NULL) { as_hdr_destroy(v->hdr); v->hdr = NULL; }
   if (v->rgb48 != NULL) { free(v->rgb48); v->rgb48 = NULL; }
+  if (v->rgba16 != NULL) { free(v->rgba16); v->rgba16 = NULL; }
   if (v->frame != NULL) av_frame_free(&v->frame);
   if (v->aframe != NULL) av_frame_free(&v->aframe);
   if (v->sw_frame != NULL) av_frame_free(&v->sw_frame);
@@ -1139,7 +1201,7 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
                 v->frame->width, v->frame->height, as_video_ten_bit(v->frame));
       }
       if (grctx != NULL && v->frame->data[0] != NULL && as_video_zc_wanted() &&
-          v->hdr == NULL) {
+          v->hdr == NULL && !sk_gpu_hdr_active()) {
         const double t_z0 = as_video_ms();
         zc_img = sk_video_d3d_image(grctx, (void*)v->frame->data[0],
                                     (int)(intptr_t)v->frame->data[1],

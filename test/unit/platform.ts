@@ -670,8 +670,19 @@ function checkBackendParity(): string[] {
     gpuSeam.every((n) => metalDefs.has(n)));
   check('d3d_glue.cc implements every sk_gpu_* the generated C can reference',
     gpuSeam.every((n) => d3dDefs.has(n)));
-  check('...and neither backend invents a sk_gpu_* outside that seam',
-    [...metalDefs, ...d3dDefs].every((n) => gpuSeam.includes(n)));
+  // 例外只有 HDR 上屏的那两个（video.md §16.12）：它们**不被生成的 C 引用**，
+  // 而是视频接缝（vendor/video_glue.c）每帧问窗口「你现在是不是 HDR」。
+  // 只有 D3D12 后端有 scRGB 交换链，所以 metal_glue.mm 不实现它们是对的——
+  // 其余构建由 video_glue.c 的 static 桩回答「不是 HDR」，SDR 路径逐字节不变。
+  const HDR_SEAM = ['sk_gpu_hdr_active', 'sk_gpu_hdr_white'];
+  check('...and the only sk_gpu_* outside that seam is the HDR status pair',
+    [...metalDefs, ...d3dDefs].every((n) => gpuSeam.includes(n) || HDR_SEAM.includes(n)));
+  check('metal_glue.mm invents no HDR status (its builds answer SDR through the stub)',
+    HDR_SEAM.every((n) => !metalDefs.has(n)));
+  const videoGlue = readFileSync(join(root, 'vendor', 'video_glue.c'), 'utf8');
+  check('non-D3D builds answer "not HDR" through a static stub in video_glue.c',
+    /static int sk_gpu_hdr_active\(void\) \{ return 0; \}/.test(videoGlue)
+    && /static float sk_gpu_hdr_white\(void\) \{ return 0\.0f; \}/.test(videoGlue));
 
   if (ok > 0) console.log(`[backendparity] ${ok} cross-backend seam checks passed`);
   return bad;

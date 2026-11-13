@@ -271,6 +271,51 @@ function checkVideoSurface(): string[] {
   check('the Windows video manifest compiles the zero-copy seam',
     manifestWithSeam.includes('"${win:../../vendor/video_d3d.cc}"'));
 
+  // ---- native HDR presentation (video.md §16.12) ----
+  // An scRGB swapchain is a promise the GPU can keep and the pixels still be wrong: the
+  // measured "looks HDR, is SDR" failure was an SkColorFilters::Matrix gain, which clamps
+  // its output at 1.0, so 203-nit white came out as 80 nits and every highlight above it
+  // was cut. These pins keep the shape that was measured to work (kModulate of a
+  // LINEAR-tagged colour) and keep the SDR default byte-identical.
+  const d3d = readNorm(join(root, 'vendor', 'd3d_glue.cc'));
+  check('HDR presentation is opt-in and defaults off',
+    d3d.includes('static int d3d_hdr_requested(void)') &&
+    d3d.includes('getenv("ASC_HDR")') &&
+    d3d.includes('static int g_hdr_req = -1;'));
+  check('the HDR request is a request, not a verdict: it falls back to SDR',
+    d3d.includes('DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709') &&
+    d3d.includes('CheckColorSpaceSupport'));
+  check('the HDR swapchain is F16 scRGB, which is what DXGI accepts for scRGB',
+    d3d.includes('#define SK_D3D_HDR_FORMAT DXGI_FORMAT_R16G16B16A16_FLOAT') &&
+    d3d.includes('kRGBA_F16_SkColorType') &&
+    d3d.includes('SkColorSpace::MakeSRGBLinear()'));
+  check('SDR white is lifted by a linear multiply, not a colour-matrix filter',
+    d3d.includes('SkBlendMode::kModulate') &&
+    d3d.includes('SkColorSpace::MakeSRGBLinear().get()') &&
+    !/setColorFilter\(SkColorFilters::Matrix/.test(d3d));
+  check('the present gain is white/80 (scRGB stores 1.0 == 80 nits)',
+    d3d.includes('#define SK_D3D_HDR_NITS_PER_UNIT 80.0') &&
+    d3d.includes('w->hdr_white / (float)SK_D3D_HDR_NITS_PER_UNIT'));
+  check('the window answers whether it is HDR, so video cannot disagree with it',
+    d3d.includes('int sk_gpu_hdr_active(void)') && d3d.includes('float sk_gpu_hdr_white(void)'));
+  // The video side: HDR frames become linear F16 for an scRGB window and tone-mapped
+  // BGRA for an SDR one, and the decision is asked every frame (a window can fall back
+  // to SDR behind our back after a device-lost rebuild).
+  check('video output form follows the window, not an env var',
+    glue.includes('const int window_hdr = sk_gpu_hdr_active();') &&
+    glue.includes('as_hdr_tonemap_rgb48_f16(v->hdr, v->rgb48, w * 6, v->rgba16, w * 8, w, h,') &&
+    glue.includes('img = sk_image_from_f16(v->rgba16, w, h);') &&
+    glue.includes('img = sk_image_from_argb(v->bgra, w, h);'));
+  check('an HDR window is enough to take the HDR route (no AS_VIDEO_HDR needed)',
+    glue.includes('(as_video_hdr_wanted() || sk_gpu_hdr_active())'));
+  const skglue = readNorm(join(root, 'vendor', 'skia_glue.cc'));
+  check('the decoded HDR frame is tagged sRGB-linear so it is not encoded twice',
+    skglue.includes('void* sk_image_from_f16(const void* px, int w, int h)') &&
+    /SkImageInfo::Make\(w, h, kRGBA_F16_SkColorType, kUnpremul_SkAlphaType,\s*\n?\s*SkColorSpace::MakeSRGBLinear\(\)\)/.test(skglue));
+  check('a build without the D3D presenter answers "not HDR", not "unknown"',
+    glue.includes('static int sk_gpu_hdr_active(void) { return 0; }') &&
+    glue.includes('static float sk_gpu_hdr_white(void) { return 0.0f; }'));
+
   // ---- the adaptive default (V3 step 3, video.md §16.9.6) ----
   // Software is no longer the default answer, it is the default START: open() primes a
   // frame in software (the black-beat guarantee needs it and there is no renderer yet),
@@ -324,9 +369,9 @@ function checkVideoSurface(): string[] {
     glue.includes('v->v_trc = st->codecpar->color_trc;') &&
     !glue.includes('src_10bit && as_video_hdr'));
   check('zero copy is off while tone mapping is on (Skia cannot map, so RGB is required)',
-    /as_video_zc_wanted\(\) &&\n          v->hdr == NULL/.test(glue));
+    /as_video_zc_wanted\(\) &&\n          v->hdr == NULL && !sk_gpu_hdr_active\(\)/.test(glue));
   check('tone mapping keeps the CPU decode (GPU would add the readback on top)',
-    glue.includes('if (as_video_hdr_wanted() && as_video_hdr_kind(v->v_trc) != 0) { v->decided = 1; return; }'));
+    glue.includes('if ((as_video_hdr_wanted() || sk_gpu_hdr_active()) && as_video_hdr_kind(v->v_trc) != 0) {'));
   check('the mapping input is 16-bit RGB, so a 10-bit source keeps its bits',
     glue.includes('AV_PIX_FMT_RGB48LE') && glue.includes('sws_setColorspaceDetails') &&
     glue.includes('SWS_CS_BT2020'));
@@ -360,6 +405,14 @@ static double pq_code(double nits) {
   const double c1 = 3424.0 / 4096.0, c2 = 2413.0 / 4096.0 * 32.0, c3 = 2392.0 / 4096.0 * 32.0;
   double p = pow(nits / 10000.0, m1);
   return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+// IEEE half -> double, for reading the F16 present buffer back in the probe.
+static double half_at(const unsigned char* p) {
+  const unsigned short h = (unsigned short)(p[0] | (p[1] << 8));
+  const int sign = (h >> 15) & 1, exp = (h >> 10) & 0x1f, man = h & 0x3ff;
+  double v = exp == 0 ? (double)man * (1.0 / 16777216.0)
+                      : (double)(man | 0x400) * ldexp(1.0, exp - 25);
+  return sign ? -v : v;
 }
 int main(void) {
   as_hdr* h = as_hdr_create(1, 1);
@@ -466,6 +519,38 @@ int main(void) {
   printf("local_off=%d\\n", as_hdr_local_strength(L));
   free(s2); free(d2);
   as_hdr_destroy(L);
+
+  // F4: native HDR presentation (docs §16.12). as_hdr_tonemap_rgb48_f16 must produce
+  // LINEAR light in units of the SDR white level -- no shoulder, no OETF, and nothing
+  // clamped: on a 203-nit white level a 1000-nit patch is 4.93, which is the whole
+  // point of an scRGB swapchain (1.0 == 80 nits, so 4.93 == 394 nits after the
+  // window's own gain). A curve here would compress highlights the display is about to
+  // map itself, and a clamp would silently turn "HDR" into 8-bit SDR.
+  {
+    as_hdr* F = as_hdr_create(1, 1);
+    unsigned char fsrc[3 * 6], fdst[3 * 8];
+    memset(fsrc, 0, sizeof fsrc);
+    memset(fdst, 0, sizeof fdst);
+    const double fnits[3] = {100.0, 203.0, 1000.0};
+    for (int i = 0; i < 3; ++i) {
+      const unsigned short v = (unsigned short)(pq_code(fnits[i]) * 65535.0 + 0.5);
+      for (int c = 0; c < 3; ++c) {
+        fsrc[i * 6 + c * 2] = (unsigned char)(v & 0xff);
+        fsrc[i * 6 + c * 2 + 1] = (unsigned char)(v >> 8);
+      }
+    }
+    as_hdr_tonemap_rgb48_f16(F, fsrc, 18, fdst, 24, 3, 1, 203.0f);
+    for (int i = 0; i < 3; ++i) {
+      printf("f16_%d=%g\\n", (int)fnits[i], (double)half_at(fdst + i * 8));
+    }
+    // A second white level must move the whole picture by exactly the ratio: this is
+    // what keeps video and 2D chrome on the same scale when ASC_HDR_WHITE changes.
+    as_hdr_tonemap_rgb48_f16(F, fsrc, 18, fdst, 24, 3, 1, 100.0f);
+    printf("f16w100_203=%g\\n", (double)half_at(fdst + 8));
+    printf("f16_badwhite=%d\\n", as_hdr_tonemap_rgb48_f16(F, fsrc, 18, fdst, 24, 3, 1, 0.0f));
+    printf("f16_badargs=%d\\n", as_hdr_tonemap_rgb48_f16(NULL, fsrc, 18, fdst, 24, 3, 1, 203.0f));
+    as_hdr_destroy(F);
+  }
   return 0;
 }
 `);
@@ -565,6 +650,19 @@ int main(void) {
       Math.abs(num('flat_local') - num('gl_light')) <= 2 &&
       Math.abs(num('flat_gain') - 1) < 0.01);
     check('local strength 0 turns the pass off', num('local_off') === 0);
+    // Native HDR present (§16.12): linear light in SDR-white units, nothing clamped.
+    // The three source patches are PQ code values that decode to exactly 100/203/1000
+    // nits, so the stored values are nits/white with no curve in between.
+    check('the F16 present pass stores nits/white (100 nits on a 203-nit white) ',
+      Math.abs(num('f16_100') - 100 / 203) < 0.01);
+    check('SDR white lands on 1.0 in the F16 present buffer',
+      Math.abs(num('f16_203') - 1.0) < 0.01);
+    check('highlights above SDR white are NOT clamped (>1.0 survives)',
+      num('f16_1000') > 4.5 && num('f16_1000') < 5.4);
+    check('the whole buffer scales with the requested white level',
+      Math.abs(num('f16w100_203') - 203 / 100) < 0.02);
+    check('an invalid white level and a NULL context are refused, not guessed',
+      num('f16_badwhite') === 0 && num('f16_badargs') === 0);
     rmSync(dir, { recursive: true, force: true });
   }
 

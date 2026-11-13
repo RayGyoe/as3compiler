@@ -1436,8 +1436,8 @@ alpha = Lw / 100                            (100 nits 参考白，同 §16.10 �
 
 #### 16.11.7 仍然没做的
 
-- **原生 HDR 上屏**：交换链仍是 8-bit SDR，没有 `R10G10B10A2_UNORM` + `SetColorSpace1(HDR10_ST2084)`
-  的路径。这一节全部是「SDR 屏幕上尽量正确」，不是 HDR 显示。
+- **原生 HDR 上屏**：这一节的交换链仍是 8-bit SDR。真正的 HDR 上屏在 §16.12（scRGB F16），
+  并且**不是**这条 SDR 映射路径的延续——那条路径的整条曲线在上屏侧不存在。
 - **DV profile 5 / 7 的 MEL-FEL 重建**：profile 5 明确拒绝，profile 7 的增强层不合并。
 - **HDR10+ 的完整 ST 2094-40 自适应曲线**（Bezier + 逐帧 tone-mapping 参数）：目前只取「场景峰值 /
   场景均值」两个派生量驱动本地肩部，不复刻参考处理器的逐帧映射。
@@ -1450,6 +1450,144 @@ AS_VIDEO_HDR=1 AS_VIDEO_STATS=1 AS_VIDEO_DEBUG=1 ./temp/probe-4k.exe   # dtm=hdr
 AS_VIDEO_HDR=1 AS_VIDEO_HDR_LOCAL=1 AS_VIDEO_STATS=1 ./temp/probe-4k.exe
 AS_VIDEO_HDR=1 AS_VIDEO_HDR_LOCAL_MODE=both ./temp/probe-4k.exe
 node --test --test-name-pattern='video' test/unit/*.ts
+```
+
+### 16.12 原生 HDR 上屏：scRGB F16 交换链 + 线性光管线（2026-11-14 实测）
+
+§16.10/§16.11 是「HDR 素材在 SDR 屏幕上尽量正确」。这一节是**真的 HDR 显示**：窗口用
+`DXGI_FORMAT_R16G16B16A16_FLOAT` 交换链 + `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`（scRGB），
+画面以**线性光**写入，SDR 白点由我们自己抬到指定 nits，HDR 视频帧**不再经过肩部/OETF**——
+显示器自己做它自己的映射。**默认关闭**，`ASC_HDR=1` 才开。
+
+#### 16.12.1 为什么是 scRGB F16，不是 HDR10/PQ
+
+本机（RTX 4090 D / `\.\DISPLAY1`，`maxLum=496.8` nits、8 bpc）对每个交换链格式实测：
+
+| 格式 | SDR G22/P709 | scRGB G10/P709 | HDR10 G2084/P2020 | G22/P2020 |
+|---|---|---|---|---|
+| `R8G8B8A8_UNORM` (28) | ✓ | `SetColorSpace1` 失败 | ✓ | ✓ |
+| `R10G10B10A2_UNORM` (24) | ✓ | 失败 | ✓ | ✓ |
+| `R16G16B16A16_FLOAT` (10) | 失败 | ✓ | 失败 | 失败 |
+
+也就是说 **F16 只接受 scRGB，10-bit 只接受 PQ**——两条路互斥，不能「10-bit + scRGB」。
+选 scRGB 的理由不是「更亮」，是**它和 Skia 的颜色管理是同一套语言**：scRGB 是线性光，
+`1.0 == 80 nits`，HDR 视频解码后本来就是线性值，Skia 的 F16 表面也是线性值，两边不用
+任何转换就能对上；而 PQ 目标表面的「1.0」是 10000 nits，SDR 的白色在缓冲里会是 0.58 左右，
+整个 2D 显示列表都得跟着变，并且任何一次漏标色空间就是**整屏发灰或过曝**。
+
+#### 16.12.2 上屏结构：先画到离屏 F16，再一次性乘以白点
+
+HDR 窗口的每帧路径（`vendor/d3d_glue.cc`）：
+
+1. `sk_gpu_begin_frame()` 返回**离屏 F16 表面**（`SkColorSpace::MakeSRGBLinear()`）的 canvas，
+   而不是后缓冲的。生成 C 照旧 `clear` + 画整个显示列表（`ASC_window_render`）。
+2. `sk_gpu_flush()` 把这个表面 `kSrc` 贴到后缓冲，再用 `kModulate` 乘一遍常量颜色
+   `gain = hdr_white / 80`——默认 `ASC_HDR_WHITE=203`，所以 SDR 白在缓冲里是 **2.5375**。
+3. `Present(1, 0)`。
+
+**这里踩了一个必须记住的坑**：先做的是 `SkColorFilters::Matrix` 增益，实测**它把输出夹到
+`[0,1]`**，于是 203 nit 的白在缓冲里是 **1.0（= 80 nits）**，所有高于 SDR 白的高光全被切掉——
+这正是「看起来像 HDR、其实是 SDR」的静默降级。实测对照（`temp/hdrgain.cc`，F16 线性目标）：
+
+| 手段 | 白 | 灰（sRGB 0.5） |
+|---|---|---|
+| 无增益（对照） | 1.0000 | 0.2157 |
+| `SkColorFilters::Matrix` | **1.0000**（被夹） | 0.5474 |
+| `kModulate` + **线性标注**的常量色 | **2.5371** | 0.5474 |
+| `SkRuntimeEffect` shader | 2.5371 | 0.5474 |
+
+选 `kModulate`（一次全屏填充，不需要 shader）。第二个坑：常量颜色**必须**带
+`SkColorSpace::MakeSRGBLinear()` 标注，否则未标注的 `SkColor4f{2.5375,…}` 会被当成 sRGB
+编码值做 EOTF，2.5375 会变成 **8.65**。
+
+#### 16.12.3 视频侧：线性 F16，不压高光
+
+HDR 窗口里的 HDR 视频**不再走** `as_hdr_tonemap_rgb48()`（SDR 映射），改走
+`as_hdr_tonemap_rgb48_f16()`（`vendor/video_hdr.c`）：只做「解码传输函数 + BT.2020→BT.709 +
+除以白点」，**没有肩部、没有局部映射、没有 sRGB OETF、不夹顶**。存进去的值是 `nits / 白点`，
+所以 `1.0 == 配置的 SDR 白`，高于它的高光原样留着（显示器自己映射）。
+
+这条决定是「不要二次压缩」：SDR 路径的曲线是为「目标只有 250 个码」设计的，而 HDR 上屏的
+目标是**显示器自己的峰值**，压两遍会让高光变成一坨灰。也因此**HDR 与零拷贝互斥**这条规矩
+扩展到上屏侧：Skia 的 YUVA 路径没有地方放传输函数，HDR 窗口里零拷贝探针直接返回 0，
+解码留在 CPU（`as_video_maybe_upgrade` 同样被门住）。
+
+「哪个输出形态」**每帧问窗口**（`sk_gpu_hdr_active()`），不是问环境变量：窗口可能因为
+格式不支持、设备丢失重建而自己回落到 SDR，这时候视频必须跟着回落成 8-bit 映射画面，
+否则就是「线性值当 sRGB 显示」的整屏发暗。
+
+#### 16.12.4 实测（本机，读数来自 `ASC_GPU_DUMP` 的 presented 后缓冲）
+
+**2D 探针**（320x240 窗口，三条横带 `#FFFFFF` / `#808080` / `#000000`）：
+
+```text
+d3d_glue: window 0 bound to 320x240 R16G16B16A16_FLOAT scRGB swapchain (SDR white lifted at present)
+d3d_glue: HDR linear mean=1.5853 (126.8 nits) max=2.5371 (203.0 nits) white=203
+```
+
+`max = 2.5371` 正是 `203 / 80`：SDR 白落在设计值上，灰带 `0.5474 = 0.2157 × 2.5375` 一分不差。
+同一程序的 SDR 版本（不设 `ASC_HDR`）依旧输出 `255 / 128 / 0`，**逐码不变**。
+
+**视频探针**：自制 10-bit PQ 测试片（640x360、25 帧、三带 = 100 / 203 / 1000 nits、HEVC
+`lossless=1`，`temp/pqbands.mkv`），HDR 窗口播放，读后缓冲：
+
+```text
+HDR band0 mean=1.2246 ( 98.0 nits)   ← 源 100 nits
+HDR band1 mean=2.4922 (199.4 nits)   ← 源 203 nits
+HDR band2 mean=12.2188 (977.5 nits)  ← 源 1000 nits
+```
+
+三条带的比例 2.035 / 4.902 与源的 2.03 / 4.926 相差 0.5% 以内，且**1000 nits 带的值远大于 1.0**
+（12.2 = 977 nits 存进 F16）——这正是 SDR 映射路径给不出来的东西。
+
+绝对值低 ~2% 的原因**不在我们的核**：`temp/pqprobe.c` 直接把同一批 PQ 码喂给
+`as_hdr_tonemap_rgb48_f16()`，得 `0.49268 / 1.00000 / 4.92578`（= 100/203/1000 ÷ 203，误差
+<0.02%）。差额出在 **swscale 的 10-bit limited→full 拉伸**：同一帧 sws 给
+`33163 / 37932 / 49111`（code 0.506035 / 0.578805 / 0.749386），zscale 给
+`33280 / 38016 / 49280`（0.507820 / 0.580087 / 0.751965），而源码值应为
+`0.508078 / 0.580689 / 0.751827`。**sws 短 0.4% 码值，zscale 短 0.03%**——PQ 的斜率把它放大到
+~2% nits。0.4% 码值在屏幕上看不出来，但这意味着「视频链路的绝对 nits 读数」不能当基准，
+要比绝对值请比条带**比例**，或者以 zscale 为准。
+
+另一个必须验的性质**白点不变性**：`ASC_HDR_WHITE` 从 100 改到 400，后缓冲里视频带的绝对
+nits 读数应当**完全不变**（因为存的 `nits/白点` 与上屏增益 `白点/80` 相消）：
+
+| `ASC_HDR_WHITE` | band0 | band1 | band2 |
+|---|---|---|---|
+| 100 | 97.9 | 199.2 | 977.5 |
+| 203 | 98.0 | 199.4 | 977.5 |
+| 400 | 97.9 | 199.2 | 977.5 |
+
+（差异只是半浮点量化。变的只有 SDR 2D 内容的亮度，那是这个参数的用途。）
+
+#### 16.12.5 边界与未做
+
+- **可见的 HDR 需要 Windows 进入 HDR 模式**。本机 `DXGI_OUTPUT_DESC1` 目前报
+  `colorSpace=SDR G22/P709`、`bpc=8`，虽然能创建 F16 scRGB 交换链，但显示器端仍按 SDR 解释。
+  实现侧的像素级验证（上面的读数）不依赖这一点，**观感**上的「高光真的更亮」依赖用户打开
+  Windows HDR 开关——那是用户的选择，**不自动改**。
+- **HDR 是进程级模式**：`sk_gpu_hdr_active()` 是「本进程里有 HDR 窗口」。多窗口程序若一个窗口
+  拿到 scRGB、另一个回落到 SDR，视频帧只能有一种编码，落到 SDR 窗口里会是「线性值当 sRGB」
+  （整屏偏暗）。单窗口程序不受影响；多窗口 + 混合显示器的情况目前**没有**按窗口产出两份帧，
+  这条留在遗留表。
+- **回落到 SDR 的分支在本机不可达**：本适配器 `CheckColorSpaceSupport`/`SetColorSpace1` 都成功，
+  所以「F16/scRGB 谈不下来就退 SDR」这条只能靠代码审阅 + 不设 `ASC_HDR` 的 SDR 路径等价性来
+  保障；换一台不支持 scRGB 的机器才能实测到。
+- `as_hdr_tonemap_rgb48_f16()` 仍走 CPU（sws RGB48 + 逐像素半浮点编码），4K 源上比 SDR 映射
+  略便宜（少了肩部查表和 OETF，但多了半浮点打包），**未做逐帧实测表**，不进性能结论。
+
+复现：
+
+```bash
+# 2D：SDR 白点是否落在 203 nits（max 应为 2.5371）
+ASC_HDR=1 ASC_GPU_DUMP_AT=0 ASC_GPU_DUMP=temp/hdr.bmp ./temp/hdrwin.exe
+# 视频：自制 PQ 三带片，看 band0/1/2 的 nits 与「>1.0 高光存活」
+ASC_HDR=1 ASC_GPU_DUMP_AT=1 ASC_GPU_DUMP=temp/pq.bmp ./temp/hdrvid.exe
+# 白点不变性：改 ASC_HDR_WHITE，帧内绝对 nits 读数不变
+ASC_HDR=1 ASC_HDR_WHITE=100 ASC_GPU_DUMP_AT=1 ./temp/hdrvid.exe
+# 核本身的精确性（不经 sws）
+clang -O0 -I vendor -o temp/pqprobe.exe temp/pqprobe.c vendor/video_hdr.c && ./temp/pqprobe.exe
+node --test --test-name-pattern='video' test/unit/*.ts      # 105 条
 ```
 
 ---

@@ -21334,6 +21334,64 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
 
+### 阶段四百零五：原生 HDR 上屏——scRGB F16 交换链 + 线性光管线（v0.4.379 → v0.4.380）
+
+阶段四百零三/四百零四把 HDR 映射成了 **SDR 像素**（在 SDR 窗口里「尽量好看」），本阶段做的是
+另一件事：**让窗口本身变成 HDR**，把线性光交给系统。仍然 opt-in（`ASC_HDR=1`），仍然与零拷贝
+互斥。详见 `docs/zh-cn/video.md` §16.12。
+
+**落地形状**（`vendor/d3d_glue.cc` / `vendor/skia_glue.cc` / `vendor/video_glue.c` / `vendor/video_hdr.c`）：
+
+- 交换链改 `DXGI_FORMAT_R16G16B16A16_FLOAT` + `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709`（scRGB），
+  先 `CheckColorSpaceSupport` 再 `SetColorSpace1`，**拿不到就回 SDR**——不许出现「看着像 HDR、
+  实则被钳死」的第三种状态。表面按 `kRGBA_F16_SkColorType` + `SkColorSpace::MakeSRGBLinear()` 建，
+  绘制进离屏线性 F16；`sk_gpu_flush()` 用 `kSrc` 拷到后备缓冲，再用**线性标签**的
+  `SkColor4f{gain,gain,gain,1}` 以 `kModulate` 整屏乘一次（`gain = hdr_white / 80`）。
+- 视频接缝新增 `as_hdr_tonemap_rgb48_f16()`（**无曲线**：不做肩部、不做局部映射、不做 sRGB OETF、
+  不在 1.0 以上钳制；只把 nits 存成 `nits / white`）与 `sk_image_from_f16()`。
+  `as_video_zc_available()` 在 HDR 窗口下回 0，`as_video_maybe_upgrade()` 不翻硬解——HDR 帧必须
+  经 CPU 变成线性 F16，硬解 + 回读更慢。
+- 窗口新增两个问句 `sk_gpu_hdr_active()` / `sk_gpu_hdr_white()`，视频**每帧**问一次而不是读环境变量：
+  scRGB 协商失败或设备丢失重建后 HDR 会掉回 SDR，读 env 会写错帧格式。
+
+**两个实测反例决定形状**：
+
+1. **`SkColorFilters::Matrix` 做不了 SDR 白点增益**——它在 F16 线性目标上把输出钳到 `[0,1]`。
+   `temp/hdrgain.cc` 三条对照：无增益 `white=1.0000 grey=0.2157`、Matrix `white=1.0000 grey=0.5474`、
+   `kModulate` 线性色 `white=2.5371 grey=0.5474`。Matrix 那条**静默**把 203 nit 白变成 80 nit，
+   并切掉 1.0 以上所有高光——正是「看起来有 HDR 其实没有」的典型假绿。
+2. **常量增益色必须打线性标签**：未打标签的 `SkColor4f{2.5375,…}` 被当作 sRGB 编码值，
+   实际乘出的白点是 `8.65` 而不是 `2.5371`。
+
+**实测**（本机 320×240 / 640×360 窗口，`ASC_GPU_DUMP` + 数值统计；BMP 只是人眼预览，断言一律看数值）：
+
+- 2D 探针 `temp/hdrwin.as`：`HDR linear mean=1.5853 (126.8 nits) max=2.5371 (203.0 nits) white=203`，
+  与 `203/80 = 2.5375` 对齐。
+- 视频探针 `temp/hdrvid.as` + 无损 PQ 片 `temp/pqbands.mkv`（源 100/203/1000 nit 三带）：实测
+  `98.0 / 199.4 / 977.5` nit，比值 2.035 / 4.902 对源 2.03 / 4.926 差 <0.5%；1000 nit 带读出 **12.2**
+  （远大于 1.0），证明高光真的活着、没被 tone map 掉。绝对值偏低约 2% 来自 swscale 10-bit
+  有限范围→全范围拉伸（按 zscale 为准则吻合），与 HDR 内核无关。
+- 白点无关性：`ASC_HDR_WHITE` 取 100/203/400 时视频带读数不变（存 `nits/white` 与上屏
+  `white/80` 相消），只有 SDR 2D 内容亮度随它变。
+- **SDR 路径逐字节不变**：不带 `ASC_HDR` 时交换链仍是 `R8G8B8A8`，三带探针 dump 仍是 `255 / 128 / 0`。
+
+**顺手修掉的一条真 bug**：`vendor/video_glue.c` 在「既没 Skia 也没 D3D」的构建里把
+`sk_gpu_hdr_active/white` 的 static 桩定义了两遍，`builtin-arity.as` 这类**纯 C 但链了
+`flash.media`** 的程序直接 `redefinition of 'sk_gpu_hdr_active'` 编不过（上一轮全量因此多了
+两条红）。桩只留一处；`unit: platform/BackendParity` 从「两个后端不许发明 seam 外的 `sk_gpu_*`」
+换成本轮更准确的表述：**只允许 HDR 那一对，且只许 D3D12 侧实现、metal 侧必须没有、
+非 D3D 由 `video_glue.c` 的 static 桩回答「不是 HDR」**——同一条不变量，换成按名字白名单 + 
+按后端分列。
+
+**边界（如实报明）**：本机输出报 `colorSpace=SDR G22/P709, bpc=8`——GPU 能建 F16 scRGB 交换链、
+像素级测量全过，但**屏幕上的肉眼 HDR** 还要 Windows/驱动把显示切到 HDR 模式。这不是实现缺陷，
+也不该由我们替用户拨那个开关（所以默认关）。多窗口混排 HDR/SDR 目前是**进程级**单一帧格式，
+登记为遗留。
+
+**回归面**：全量 `node test.ts` `675 tests / 662 pass / 10 fail / 3 skipped`，红的 10 条与既有基线
+**逐个同名**（`htmltext-metrics`/`native-shader-probe`/`socket`/`stage64`/`stage94d`/`status-item`/
+`text-underline`/`ane-app`/`inline/HotPath`/`desktop/native drag`）；`unit: video/` 105 钉全绿。
+
 ### 阶段四百零四：HDR 面的四个缺口——动态元数据、DV、局部映射、完整 HLG OOTF（v0.4.378 → v0.4.379）
 
 阶段四百零三交付的是一条**固定肩部的逐通道曲线**，当时文档明确写着「HDR10+ 动态元数据、

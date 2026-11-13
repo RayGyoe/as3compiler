@@ -1473,9 +1473,9 @@ and strength 0 turns the pass off.
 
 #### 16.11.7 Still not done
 
-- **Native HDR presentation**: the swap chain is still 8-bit SDR; there is no
-  `R10G10B10A2_UNORM` + `SetColorSpace1(HDR10_ST2084)` path. Everything in this section is
-  "as correct as possible on an SDR screen", not HDR display output.
+- **Native HDR presentation**: this section's swap chain is still 8-bit SDR. Real HDR
+  presentation is §16.12 (scRGB F16), and it is **not** a continuation of this SDR
+  mapping path -- that path's entire curve is absent on the present side.
 - **DV profile 5 / profile 7 MEL-FEL reconstruction**: profile 5 is refused outright, and
   profile 7's enhancement layer is not merged.
 - **The full ST 2094-40 adaptive curve of HDR10+** (Bezier plus per-frame tone-mapping
@@ -1490,6 +1490,165 @@ AS_VIDEO_HDR=1 AS_VIDEO_STATS=1 AS_VIDEO_DEBUG=1 ./temp/probe-4k.exe   # dtm=hdr
 AS_VIDEO_HDR=1 AS_VIDEO_HDR_LOCAL=1 AS_VIDEO_STATS=1 ./temp/probe-4k.exe
 AS_VIDEO_HDR=1 AS_VIDEO_HDR_LOCAL_MODE=both ./temp/probe-4k.exe
 node --test --test-name-pattern='video' test/unit/*.ts
+```
+
+### 16.12 Native HDR presentation: scRGB F16 swap chain + a linear-light pipeline (measured 2026-11-14)
+
+§16.10/§16.11 are "HDR material as correct as possible on an SDR screen". This section is
+**real HDR display**: the window presents through a `DXGI_FORMAT_R16G16B16A16_FLOAT` swap
+chain with `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709` (scRGB), the picture is written as
+**linear light**, our SDR white point is lifted to a chosen number of nits, and HDR video
+frames **skip the shoulder/OETF entirely** -- the display does its own mapping. It is
+**off by default**; `ASC_HDR=1` turns it on.
+
+#### 16.12.1 Why scRGB F16 and not HDR10/PQ
+
+Measured on this machine (RTX 4090 D, `\.\DISPLAY1`, `maxLum=496.8` nits, 8 bpc), per
+swap-chain format:
+
+| Format | SDR G22/P709 | scRGB G10/P709 | HDR10 G2084/P2020 | G22/P2020 |
+|---|---|---|---|---|
+| `R8G8B8A8_UNORM` (28) | yes | `SetColorSpace1` fails | yes | yes |
+| `R10G10B10A2_UNORM` (24) | yes | fails | yes | yes |
+| `R16G16B16A16_FLOAT` (10) | fails | yes | fails | fails |
+
+So **F16 accepts only scRGB and 10-bit only accepts PQ** -- the two are mutually exclusive;
+"10-bit + scRGB" does not exist. scRGB was chosen not because it is brighter but because
+**it speaks the same language as Skia's colour management**: scRGB is linear light where
+`1.0 == 80 nits`, a decoded HDR frame is already linear, and a Skia F16 surface is linear,
+so no conversion is needed anywhere. A PQ destination would instead mean "1.0 == 10000
+nits", SDR white would sit near 0.58 in the buffer, the whole 2D display list would have to
+move with it, and any single untagged draw would wash out or blow out the frame.
+
+#### 16.12.2 The present structure: draw into an offscreen F16, then multiply once
+
+Per-frame path for an HDR window (`vendor/d3d_glue.cc`):
+
+1. `sk_gpu_begin_frame()` returns the canvas of the **offscreen F16 surface**
+   (`SkColorSpace::MakeSRGBLinear()`), not the back buffer's. The generated C still clears
+   and draws the whole display list (`ASC_window_render`).
+2. `sk_gpu_flush()` blits that surface into the back buffer with `kSrc`, then multiplies it
+   by a constant colour with `kModulate`: `gain = hdr_white / 80`. With the default
+   `ASC_HDR_WHITE=203`, SDR white is **2.5375** in the buffer.
+3. `Present(1, 0)`.
+
+**A trap worth remembering:** the first version used an `SkColorFilters::Matrix` gain, and
+it **clamps its output to `[0,1]`**. 203-nit white therefore landed at **1.0 (= 80 nits)**
+and every highlight above SDR white was cut -- exactly the silent "looks HDR, is SDR"
+degradation. Measured side by side (`temp/hdrgain.cc`, F16 linear destination):
+
+| Primitive | white | grey (sRGB 0.5) |
+|---|---|---|
+| no gain (control) | 1.0000 | 0.2157 |
+| `SkColorFilters::Matrix` | **1.0000** (clamped) | 0.5474 |
+| `kModulate` + **linearly tagged** colour | **2.5371** | 0.5474 |
+| `SkRuntimeEffect` shader | 2.5371 | 0.5474 |
+
+`kModulate` was chosen (one full-screen fill, no shader). Second trap: the constant colour
+**must** be tagged `SkColorSpace::MakeSRGBLinear()`, because an untagged `SkColor4f{2.5375,…}`
+is read as sRGB-encoded and 2.5375 arrives as **8.65**.
+
+#### 16.12.3 The video side: linear F16, no highlight compression
+
+HDR video in an HDR window does **not** go through `as_hdr_tonemap_rgb48()` (the SDR map).
+It goes through `as_hdr_tonemap_rgb48_f16()` (`vendor/video_hdr.c`), which only does
+"decode the transfer function + BT.2020 -> BT.709 + divide by the white point": **no
+shoulder, no local map, no sRGB OETF, no clamp**. What it stores is `nits / white`, so
+`1.0 == the configured SDR white` and highlights above it survive (the display maps them).
+
+That is a deliberate "do not compress twice": the SDR curve exists because the target has
+~250 codes, while an HDR present targets the **display's own peak**. Hence the "HDR and
+zero-copy are mutually exclusive" rule extends to the present side: Skia's YUVA path has
+nowhere to put a transfer function, so in an HDR window the zero-copy probe answers 0 and
+the decode stays on the CPU (`as_video_maybe_upgrade` is gated the same way).
+
+**Which output form** is asked of the window **every frame** (`sk_gpu_hdr_active()`), not of
+an env var: a window can fall back to SDR by itself (unsupported format, device-lost
+rebuild), and the video must then fall back to the 8-bit mapped picture -- otherwise linear
+values would be shown as if they were sRGB and the frame would be dark.
+
+#### 16.12.4 Measurements (this machine; read from the `ASC_GPU_DUMP` presented back buffer)
+
+**2D probe** (320x240 window, three horizontal bands `#FFFFFF` / `#808080` / `#000000`):
+
+```text
+d3d_glue: window 0 bound to 320x240 R16G16B16A16_FLOAT scRGB swapchain (SDR white lifted at present)
+d3d_glue: HDR linear mean=1.5853 (126.8 nits) max=2.5371 (203.0 nits) white=203
+```
+
+`max = 2.5371` is exactly `203 / 80`: SDR white lands on the designed value, and the grey
+band reads `0.5474 = 0.2157 x 2.5375`. The same program without `ASC_HDR` still produces
+`255 / 128 / 0` -- **code-identical**.
+
+**Video probe**: a purpose-built 10-bit PQ test clip (640x360, 25 frames, three bands =
+100 / 203 / 1000 nits, HEVC `lossless=1`, `temp/pqbands.mkv`) played into an HDR window:
+
+```text
+HDR band0 mean=1.2246 ( 98.0 nits)   <- source 100 nits
+HDR band1 mean=2.4922 (199.4 nits)   <- source 203 nits
+HDR band2 mean=12.2188 (977.5 nits)  <- source 1000 nits
+```
+
+The band ratios 2.035 / 4.902 match the source's 2.03 / 4.926 to within 0.5%, and the
+**1000-nit band is far above 1.0** (12.2 stored into F16) -- exactly what the SDR mapping
+path cannot produce.
+
+The absolute values being ~2% low is **not our kernel**: `temp/pqprobe.c` feeds the same
+PQ codes straight into `as_hdr_tonemap_rgb48_f16()` and gets
+`0.49268 / 1.00000 / 4.92578` (= 100/203/1000 divided by 203, error < 0.02%). The gap comes
+from **swscale's 10-bit limited->full stretch**: for the same frame sws gives
+`33163 / 37932 / 49111` (codes 0.506035 / 0.578805 / 0.749386), zscale gives
+`33280 / 38016 / 49280` (0.507820 / 0.580087 / 0.751965), and the source codes are
+`0.508078 / 0.580689 / 0.751827`. **sws is 0.4% short in code value, zscale 0.03%** -- PQ's
+slope amplifies that to ~2% in nits. 0.4% of a code is invisible on screen, but it means
+absolute nits readouts from the video chain are not a reference: compare **ratios** of test
+bands, or treat zscale as the reference.
+
+The other property that had to be verified is **white-point invariance**: changing
+`ASC_HDR_WHITE` from 100 to 400 must leave the video bands' absolute nits readout
+**unchanged** (the stored `nits/white` and the present gain `white/80` cancel):
+
+| `ASC_HDR_WHITE` | band0 | band1 | band2 |
+|---|---|---|---|
+| 100 | 97.9 | 199.2 | 977.5 |
+| 203 | 98.0 | 199.4 | 977.5 |
+| 400 | 97.9 | 199.2 | 977.5 |
+
+(The differences are half-float quantisation. Only the brightness of SDR 2D content changes,
+which is what the parameter is for.)
+
+#### 16.12.5 Boundaries and open items
+
+- **Visible HDR needs Windows in HDR mode.** This machine's `DXGI_OUTPUT_DESC1` currently
+  reports `colorSpace=SDR G22/P709`, `bpc=8`: the F16 scRGB swap chain can be created, but
+  the display still interprets it as SDR. The pixel-level verification above does not depend
+  on that; the *perceived* "highlights are really brighter" does, and that is the user's
+  Windows HDR switch -- **never changed automatically**.
+- **HDR is a process-wide mode**: `sk_gpu_hdr_active()` means "some window in this process is
+  HDR". In a multi-window app where one window gets scRGB and another falls back to SDR, a
+  video frame can only have one encoding, so it would be "linear shown as sRGB" (dark) in
+  the SDR window. Single-window apps are unaffected; producing two encodings per frame for
+  mixed-monitor setups is **not** implemented and is on the open list.
+- **The SDR fallback branch is unreachable here**: `CheckColorSpaceSupport`/`SetColorSpace1`
+  both succeed on this adapter, so "fall back to SDR if scRGB cannot be negotiated" is
+  covered only by code review plus the equivalence of the SDR path when `ASC_HDR` is unset;
+  it needs a machine without scRGB support to be measured.
+- `as_hdr_tonemap_rgb48_f16()` still runs on the CPU (sws to RGB48 + per-pixel half encode).
+  On a 4K source it is slightly cheaper than the SDR map (no shoulder lookup, no OETF, but
+  half-float packing), **no per-frame table was measured**, so it carries no performance claim.
+
+Reproduce:
+
+```bash
+# 2D: does SDR white land on 203 nits (max should be 2.5371)?
+ASC_HDR=1 ASC_GPU_DUMP_AT=0 ASC_GPU_DUMP=temp/hdr.bmp ./temp/hdrwin.exe
+# video: the PQ three-band clip, band0/1/2 nits and ">1.0 highlights survive"
+ASC_HDR=1 ASC_GPU_DUMP_AT=1 ASC_GPU_DUMP=temp/pq.bmp ./temp/hdrvid.exe
+# white-point invariance: change ASC_HDR_WHITE, in-frame absolute nits stay the same
+ASC_HDR=1 ASC_HDR_WHITE=100 ASC_GPU_DUMP_AT=1 ./temp/hdrvid.exe
+# the kernel itself, without sws
+clang -O0 -I vendor -o temp/pqprobe.exe temp/pqprobe.c vendor/video_hdr.c && ./temp/pqprobe.exe
+node --test --test-name-pattern='video' test/unit/*.ts      # 105 checks
 ```
 
 ---

@@ -46,6 +46,8 @@
 #include "include/core/SkBitmap.h"
 #include "include/core/SkData.h"
 #include "include/core/SkPixmap.h"
+// sk_image_from_f16 tags its image sRGB-linear so the HDR window does not encode it twice
+#include "include/core/SkColorSpace.h"
 #include "include/core/SkFontMgr.h"
 #include "include/core/SkTypeface.h"
 #include "include/core/SkSpan.h"
@@ -1411,6 +1413,21 @@ void* sk_image_from_argb(const void* px, int w, int h) {
   if (px == nullptr || w <= 0 || h <= 0) return nullptr;
   SkImageInfo info = SkImageInfo::Make(w, h, kBGRA_8888_SkColorType, kUnpremul_SkAlphaType);
   sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(SkPixmap(info, px, (size_t)w * 4));
+  return image.release();  // caller owns one ref (or NULL on failure)
+}
+
+// Linear-light F16 view of a decoded HDR frame (docs/zh-cn/video.md §16.12).
+// The colour space is not decoration: the runtime's HDR window draws into an
+// sRGB-LINEAR surface, and tagging the image with the same space is what tells Skia
+// there is nothing to convert. Without it Skia treats the values as sRGB-encoded, the
+// linear ones get encoded a second time, and the picture comes out washed out. Values
+// above 1.0 are the HDR highlights and must survive the copy untouched -- which is why
+// this is kUnpremul and not premultiplied (alpha is 1.0 everywhere anyway).
+void* sk_image_from_f16(const void* px, int w, int h) {
+  if (px == nullptr || w <= 0 || h <= 0) return nullptr;
+  SkImageInfo info = SkImageInfo::Make(w, h, kRGBA_F16_SkColorType, kUnpremul_SkAlphaType,
+                                       SkColorSpace::MakeSRGBLinear());
+  sk_sp<SkImage> image = SkImages::RasterFromPixmapCopy(SkPixmap(info, px, (size_t)w * 8));
   return image.release();  // caller owns one ref (or NULL on failure)
 }
 

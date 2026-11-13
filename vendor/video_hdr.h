@@ -51,6 +51,16 @@ void as_hdr_destroy(as_hdr* h);
 int as_hdr_tonemap_rgb48(as_hdr* h, const unsigned char* src, int sstride,
                          unsigned char* dst, int dstride, int w, int rows);
 
+// Same source, but straight to native HDR: RGBA16F in BT.709 linear light where
+// 1.0 == white_nits. Used when the window presents an scRGB swapchain, in which case
+// the DISPLAY does the mapping to its own peak and anything compressed here would be
+// compressed twice. So this path applies no shoulder, no local map, no sRGB OETF and no
+// clamp: decode, BT.2020 -> BT.709, scale to the window's white level. Values above 1.0
+// are the highlights and must stay above 1.0.
+int as_hdr_tonemap_rgb48_f16(as_hdr* h, const unsigned char* src, int sstride,
+                             unsigned char* dst, int dstride, int w, int rows,
+                             float white_nits);
+
 // Diagnostic: what one 16-bit source code maps to, on the same path the loop takes
 // (for HLG this is the neutral-grey value; the cross-channel term is identity there).
 int as_hdr_map8(const as_hdr* h, int code);
