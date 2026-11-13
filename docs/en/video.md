@@ -7,8 +7,8 @@
 > (`src/emit.ts:16607`), and `Video.attachNetStream()` is a no-op (`src/emit.ts:16630`). The repository has
 > no demuxer, no video decoder, and no video clock.
 >
-> **Status: V1 is implemented and verified (2026-11-13, see §16); hardware decode (V2/V3) and the transport
-> surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
+> **Status: V1 is implemented and verified (2026-11-13, see §16); V3 hardware decode and its zero-copy path are
+> wired up and measured (2026-11-14, see §16.8/§16.9); V2 and the transport surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
 > point is what motivated every trade-off below; §16 is the authoritative description of the code as it stands:
 > `NetStream` / `Video` / `NetConnection` follow AIR semantics, decode goes through FFmpeg (software), and the
 > 31 assertions in `examples/video/` all pass in a real window.
@@ -1069,13 +1069,10 @@ synchronisation included). Software decode is not spending that 7 ms on decoding
 
 The only way hardware wins is **not reading back**, which is exactly the hard part of the Windows row in
 §10.2: a `DXGI_FORMAT_NV12` texture keeps Y and UV as two *plane slices* of one resource while
-`GrBackendTexture` takes a whole 2D texture. V3 step two therefore needs (1) a `ID3D11Device5` decode device
-with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE` textures and an `ID3D11Fence`, (2) `OpenSharedHandle` on the D3D12
-side plus fence waits, (3) R8/RG8 views per plane (or `Texture2DArray` + plane slice) feeding
-`GrBackendTextures::MakeD3D` + `SkImages::TextureFromYUVATextures`, and (4) a `releaseProc` that tears
-down views/texture/AVFrame in reverse order (§10.2's lifetime loop) — get that wrong and the picture tears
-without an error. Until then software is the right default; `AS_VIDEO_DECODE=hw` stays as the A/B channel for
-machines whose CPU cannot keep up. `examples/video-headless.as` passes its 24 assertions on both paths.
+`GrBackendTexture` takes a whole 2D texture. **That chain is now built** in the shape §16.9.2 describes
+(zero copy measures 0.24 ms/frame with a 20 ms worst frame interval), so "software is the default" is no
+longer a conclusion — only a deliberate step that has not been flipped yet (§16.9.6).
+`examples/video-headless.as` passes its 24 assertions on both paths.
 
 **Build trap worth knowing:** MSYS2's `make` eats one level of backslash from single-quoted recipe text, so
 FFmpeg's dependency `awk '/including/ { … gsub(/\\/, "/") … }'` reaches awk as an invalid `/\/` and every
@@ -1083,6 +1080,100 @@ FFmpeg's dependency `awk '/including/ { … gsub(/\\/, "/") … }'` reaches awk 
 backslashes) in `config.mak` after `configure` — it is generated, so it has to be re-applied on every rebuild.
 Three tools also have to come from three places: `awk`/`sh` from Git for Windows, `make`/`nasm` from
 `/c/msys64/usr/bin`, `lib.exe` from the imported vcvars environment.
+
+### 16.9 V3 step two: zero copy lands, and hardware decode finally beats software (measured 2026-11-14)
+
+§16.8's conclusion was that hardware plus readback costs twice what software costs, and the entire cost is the
+`AV_PIX_FMT_D3D11 → system memory` hop. This step removes the hop: the decoded slice is split, inside the GPU,
+into one whole Y texture and one whole UV texture, and handed straight to Skia's YUV shader.
+
+#### 16.9.1 Same 4K HDR10+ source, same binary, real window at 60 Hz, 20 s continuous
+
+Source: `The.Furious.2026 … HDR10+ H.265` (3832×1592, P010, 23.976 fps).
+
+| Route | CPU cost per frame | App frames | Worst frame interval | Frames shown |
+|---|---|---|---|---|
+| software (8 threads, default) | `conv=5.91` + `upload=0.67` ≈ **6.6 ms** | 1181 / 20.1 s ≈ 58.8 fps | **44 ms** | 484 |
+| hardware + readback | `hw=9.59` + `conv=3.37` + `upload=0.42` ≈ **13.4 ms** | 1189 ≈ 59.4 fps | **98 ms** | 487 |
+| **hardware + zero copy** | `copy=0.24` + `conv=0.02` ≈ **0.27 ms** | 1198 ≈ 59.9 fps | **20 ms** | 484 |
+
+`copy` is CPU-side submission only (D3D11 blit, fence, command recording); the real GPU work (two plane
+copies over ~9 MB) is asynchronous and does not appear in that number. A 20 ms worst interval at 60 Hz means
+every frame finished before the next one was due.
+
+#### 16.9.2 The chain: four stages, each with a reason
+
+Implemented in `vendor/video_d3d.cc` (Windows/D3D12 only). `vendor/video_glue.c` sees only
+`sk_video_d3d_image()` / `sk_video_d3d_stats()` / `sk_video_d3d_forget()` — integer and pointer handles, so the
+FFmpeg seam still knows nothing about Skia.
+
+1. **Decoded slice → our own shared staging texture (D3D11 `CopySubresourceRegion`).** Handing the decoder's
+texture to D3D12 directly is not an option: `hwcontext_d3d11va.c` allocates a `D3D11_BIND_DECODER` array with
+no sharing flags, and DXVA does not promise a shareable decode surface. Copying to a same-format (NV12/P010)
+shared texture is a VRAM blit — about 9 MB at 4K.
+2. **Ordering by a shared fence** (`ID3D11Device5::CreateFence(D3D11_FENCE_FLAG_SHARED)` → `ID3D12Fence::Wait`).
+`Flush()` plus polling would either stall the CPU or let D3D12 sample an unfinished picture.
+3. **Split the two planes into whole textures on the D3D12 side** (`CopyTextureRegion`, source subresource 0 for
+the plane index and `SubresourceIndex 1` for chroma; R8 / R8G8, or R16 / R16G16 for 10-bit). This is the direct
+consequence of `GrBackendTexture` wrapping a whole 2D texture, and the whole reason `video_d3d.cc` exists.
+P010 stores its 10 bits left-justified in 16, so `R16_UNORM` normalises to exactly value/1023 — no shift and no
+swscale.
+4. **Hand it to Skia**: `SkImages::TextureFromYUVATextures(ctx, GrYUVABackendTextures(SkYUVAInfo(kY_UV, k420, cs)), …)`,
+with the textures reported in `D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE` — the same contract as
+`sk_gpu_draw_texture`: Skia tracks texture state itself, so both sides must agree on it.
+
+#### 16.9.3 Colour: two independent pieces of evidence, not "it looks right"
+
+| Source | software (reference) | hardware + readback | **hardware + zero copy** |
+|---|---|---|---|
+| `clip.mp4` (8-bit) meanR/G/B | 120.9 / 126.14 / 130.13 (distinct 764) | **identical** | **identical** |
+| `clip10.mp4` (P010, BT.2020 PQ) meanR/G/B | 20.79 / 22.82 / 25.81 | 20.79 / 22.82 / 25.81 | 20.06 / 23.19 / 24.54 |
+| the same content transcoded to 8-bit (`clip8.mp4`, software) | 20.18 / 22.97 / 24.63 | — | — |
+
+On 8-bit the three routes agree sample for sample (same mean *and* same distinct-colour count). On 10-bit,
+zero copy is 0.12 / 0.22 / 0.09 away from the 8-bit transcode of the same content while the readback route is
+0.61 / 0.15 / 1.18 away — **zero copy is closer to the truth**, because the reference path first swscales P010
+down to 8-bit I420 and then still interprets it with the 10-bit matrix (`kBT2020_10bit_Limited`); matrix and
+bit depth already disagreed there. (`temp/probe-color.as` is the tool: play to the end so the last frame
+holds, then `BitmapData.draw` + `getPixel32` sampling.)
+
+#### 16.9.4 Four traps, all found by measurement
+
+1. **`D3D11_RESOURCE_MISC_SHARED_NTHANDLE` must be paired with `D3D11_RESOURCE_MISC_SHARED`.** Alone it makes
+`CreateTexture2D` return `E_INVALIDARG` for both NV12 (0x67) and P010 (0x68). The first failure looks like
+"video formats cannot be shared" — they can; the flag combination was wrong.
+2. **The texture ring must match the decode queue, not "two frames in flight".** `AS_VIDEO_QUEUE = 8` keeps
+decoded frames that are ahead of the clock, each holding an SkImage. A two-slot ring starved 14 of 31 frames
+and fell back to readback, which made the whole exercise pointless. It is 10 slots now, created on demand
+(0.1 MB per slot at 320×240).
+3. **`TextureReleaseProc` needs an epoch.** Skia may call it after the stream closed (the display list still
+holds the image); by then the table entry can belong to another device, and clearing `in_use` would let a
+texture be rewritten under Skia. The callback carries the `Stream::epoch` it was issued under and does nothing
+when they disagree.
+4. **Forget the table entry before the D3D11 device is released.** The table is keyed by device pointer; once
+FFmpeg frees the device the address can be reused, and a stale entry means a dead immediate context.
+`as_video_free_state` drops images first, then calls `sk_video_d3d_forget(v->hw_dev11)`, then
+`av_buffer_unref(&v->hw_device)`.
+
+#### 16.9.5 Switches and defaults
+
+- Zero copy is compiled in **only on Windows with the D3D12 backend and `ASC_USE_SKIA`** (`video_d3d.cc` is a
+`${win:…}` source in `examples/video/video.build.json`). Every other build gets a static stub returning NULL,
+so nothing changes for it.
+- `AS_VIDEO_ZC=0|off` turns it off at runtime (for A/B); it is on by default.
+- **The default decoder is still software**; `AS_VIDEO_DECODE=hw` opts into the GPU. The reason is no longer
+speed — it is that "may I default to hardware" needs an adaptive decision (§16.9.6).
+- `AS_VIDEO_STATS=1` now reports three decode states — `soft`, `d3d11va-readback`, `d3d11va-zero-copy` — plus
+`zc=<frames>` and `starved=<count>`.
+
+#### 16.9.6 What has to be true before hardware becomes the default
+
+Zero copy needs a D3D12 device plus a working shared texture and fence. None of that is known at `open` time
+(the GPU context may only exist at the first frame), so making hardware the default now would land machines
+where hardware works but zero copy does not on the *slower* side: readback is 13.4 ms against software's
+6.6 ms. The missing piece is a first-frame check that re-opens the stream in software once (and stops trying)
+when the seam returns NULL despite a GPU context; only then does the default become `auto`.
+Until that lands, `AS_VIDEO_DECODE=hw` is an explicit choice.
 
 ---
 

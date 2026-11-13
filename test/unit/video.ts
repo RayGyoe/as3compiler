@@ -114,7 +114,10 @@ function checkVideoSurface(): string[] {
   const i420At = present.indexOf('v->sws = sws_getContext');
   const cpuAt = present.indexOf('if (img == NULL) {');
   check('the CPU-raster fallback converts straight to BGRA (no throwaway I420 pass)',
-    present.includes('const int want_gpu = (grctx != NULL);') &&
+    // Since V3 step 2 the same branch also has to skip conversion when a pre-made GPU
+    // image arrives (`pre_img`), so the guard carries both conditions; the ordering
+    // invariant it pins is unchanged.
+    /const int want_gpu = \(grctx != NULL\)( && \(img == NULL\))?;/.test(present) &&
     gpuAt > 0 && i420At > gpuAt && cpuAt > i420At);
   check('AS_VIDEO_STATS reports the cost split (decode / convert / upload)',
     glue.includes('cost/frame: dec=') && glue.includes('t_conv_ms') &&
@@ -195,6 +198,57 @@ function checkVideoSurface(): string[] {
   check('the clock epoch is anchored at program start',
     RUNTIME_PREAMBLE.includes('static void as_clock_init(void)') &&
     emitted.includes('as_clock_init();'));
+
+  // ---- zero copy (V3 step 2, video.md §16.9) ----
+  // The route only exists on Windows, and every step of it protects a measurement:
+  // the readback route costs 9.6 ms/frame on a 4K P010 source, so it is worth a lot of
+  // machinery -- but only if the machinery stays honest about what it did.
+  const zc = readNorm(join(root, 'vendor', 'video_d3d.cc'));
+  check('the zero-copy seam is D3D-gated with NULL fallbacks (other builds still link)',
+    glue.includes('#if defined(ASC_RENDER_D3D) && ASC_RENDER_D3D && defined(ASC_USE_SKIA)') &&
+    glue.includes('static void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,'));
+  check('the staging texture carries BOTH share flags (SHARED_NTHANDLE alone is E_INVALIDARG)',
+    zc.includes('D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE'));
+  check('the staging texture is shared through IDXGIResource1::CreateSharedHandle',
+    zc.includes('CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE'));
+  // The plane split is the whole reason video_d3d.cc exists: a GrBackendTexture wraps a
+  // whole 2D texture, and Y/UV are two plane slices of one NV12 resource.
+  check('the planes are split into whole textures by plane subresource',
+    zc.includes('list->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, &box)') &&
+    zc.includes('srcLoc.SubresourceIndex = 1;'));
+  check('8-bit planes are R8 / R8G8, 10-bit are R16 / R16G16 (P010 is left-justified)',
+    zc.includes('ten_bit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM') &&
+    zc.includes('ten_bit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM'));
+  check('the handoff is ordered by a shared fence, not a Flush',
+    zc.includes('CreateFence(0, D3D11_FENCE_FLAG_SHARED') &&
+    zc.includes('queue->Wait(s->fence12.get(), value)'));
+  check('Skia receives YUVA textures in the state it tracks',
+    zc.includes('SkImages::TextureFromYUVATextures(') &&
+    zc.includes('SkYUVAInfo::PlaneConfig::kY_UV') &&
+    zc.includes('D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE'));
+  // Measured with a two-slot ring: 14 of 31 frames starved and fell back to the readback
+  // route, because video_glue keeps up to AS_VIDEO_QUEUE decoded-but-not-due images alive.
+  check('the ring is sized for the decode queue, not for two frames in flight',
+    /constexpr int kSlots = (\d+);/.test(zc) &&
+    Number(/constexpr int kSlots = (\d+);/.exec(zc)![1]) >= 10);
+  // A release callback can outlive its stream; without the epoch it would clear a live
+  // slot in an entry that a new device already owns.
+  check('Skia\'s release callback is epoch-checked',
+    zc.includes('t->stream->epoch == t->epoch') && zc.includes('s->epoch++'));
+  check('the zero-copy attempt precedes the readback and both remain',
+    glue.indexOf('zc_img = sk_video_d3d_image(') > 0 &&
+    glue.indexOf('zc_img = sk_video_d3d_image(') < glue.indexOf('av_hwframe_transfer_data(v->sw_frame') &&
+    glue.includes('av_hwframe_transfer_data(v->sw_frame, v->frame, 0)'));
+  check('the table entry is dropped before FFmpeg releases the device',
+    glue.indexOf('sk_video_d3d_forget(v->hw_dev11)') > 0 &&
+    glue.indexOf('sk_video_d3d_forget(v->hw_dev11)') < glue.indexOf('av_buffer_unref(&v->hw_device)'));
+  check('AS_VIDEO_STATS separates zero-copy frames from readback frames',
+    glue.includes('d3d11va-zero-copy') && glue.includes('zc=%lld starved=%lld'));
+  check('a hardware frame\'s 10-bit-ness is read from its frames context',
+    glue.includes('hf->sw_format == AV_PIX_FMT_P010LE'));
+  const manifestWithSeam = readNorm(join(root, 'examples', 'video', 'video.build.json'));
+  check('the Windows video manifest compiles the zero-copy seam',
+    manifestWithSeam.includes('"${win:../../vendor/video_d3d.cc}"'));
 
   console.log(`[video] ${ok} check(s) passed`);
   return bad;

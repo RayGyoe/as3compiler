@@ -43,10 +43,14 @@
 #include <libavutil/samplefmt.h>
 #include <libavutil/time.h>   // av_gettime_relative: monotonic, for the cost counters
 #include <libavutil/hwcontext.h>   // AVBufferRef/hw_device_ctx: GPU decode (see as_video_hw_setup)
+#if defined(_WIN32)
+#include <libavutil/hwcontext_d3d11va.h>   // the ID3D11Device behind a d3d11va frame (zero copy)
+#endif
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
 #include <math.h>
+#include <stdint.h>   // intptr_t: a hw frame carries its slice index in data[1]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +84,33 @@ extern void* sk_image_from_argb(const void* px, int w, int h);
 // Refcount release without a Skia header: sk_image_delete is the C wrapper that
 // exists for exactly this caller (skia_glue.cc).
 extern void sk_image_delete(void* image);
+#endif
+
+// Zero copy (V3 step 2, video.md §16.9): hand the D3D11 decoder slice straight to
+// the renderer's D3D12 device instead of reading it back. Only the Windows D3D12
+// backend has an implementation (vendor/video_d3d.cc); everywhere else the compile
+// silently has no such symbol and the measured CPU route stays the only route.
+#if defined(ASC_RENDER_D3D) && ASC_RENDER_D3D && defined(ASC_USE_SKIA)
+#define AS_VIDEO_ZC 1
+extern void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
+                                int ten_bit, int yuv_cs);
+extern void sk_video_d3d_stats(long long* frames, long long* starved);
+extern void sk_video_d3d_forget(void* d3d11_device);
 #else
+#define AS_VIDEO_ZC 0
+static void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
+                                int ten_bit, int yuv_cs) {
+  (void)ctx; (void)tex; (void)slice; (void)w; (void)h; (void)ten_bit; (void)yuv_cs;
+  return NULL;
+}
+static void sk_video_d3d_stats(long long* frames, long long* starved) {
+  if (frames != NULL) *frames = 0;
+  if (starved != NULL) *starved = 0;
+}
+static void sk_video_d3d_forget(void* d3d11_device) { (void)d3d11_device; }
+#endif
+
+#if !defined(ASC_USE_SKIA)
 static void* sk_image_from_yuv_strided(void* ctx, const void* y, int sy, const void* u,
                                        int su, const void* v, int sv, int w, int h, int yuvCs) {
   (void)ctx; (void)y; (void)sy; (void)u; (void)su; (void)v; (void)sv; (void)w; (void)h; (void)yuvCs;
@@ -151,6 +181,14 @@ typedef struct {
   AVBufferRef* hw_device;
   AVFrame* sw_frame;
   int hw_used;              // 1 once a frame actually came back from the GPU
+  // Zero copy (V3 step 2): a hardware frame that went decoder -> D3D12 textures ->
+  // SkImage without ever touching system memory. `zc_used` is what AS_VIDEO_STATS
+  // reports as `zc=`, so a stream that quietly fell back to the readback route is
+  // visible as such instead of looking like a win.
+  int zc_used;
+  long long n_zc;
+  double t_zc_ms;
+  void* hw_dev11;           // identity of the D3D11 device behind hw_device (see below)
   struct SwsContext* sws;   // -> packed I420 (only when the source is not 420p)
   struct SwsContext* sws_bgra;  // -> packed BGRA (only on a build with no GPU ctx)
   struct SwrContext* swr;
@@ -227,6 +265,24 @@ static as_video g_videos[AS_VIDEO_MAX];
 // Full before Limited for each matrix, and the *_Limited_* names are the ones a
 // broadcast file actually carries. Unknown + unspecified falls back to the same
 // BT.601 limited pair the ANE path uses, which is what an untagged SD file means.
+// 10-bit detection that works for BOTH frame kinds. A system-memory frame says so in
+// f->format; a hardware frame's format is AV_PIX_FMT_D3D11 and the real pixel layout
+// lives in its frames context (sw_format). Looking only at f->format classified a
+// P010 hardware frame as 8-bit, which chose the 8-bit BT.2020 matrix -- a colour
+// error, not a performance one.
+static int as_video_ten_bit(const AVFrame* f) {
+  if (f->format == AV_PIX_FMT_YUV420P10LE || f->format == AV_PIX_FMT_YUV420P10BE ||
+      f->format == AV_PIX_FMT_P010LE || f->format == AV_PIX_FMT_P010BE)
+    return 1;
+  if (f->hw_frames_ctx != NULL) {
+    const AVHWFramesContext* hf = (const AVHWFramesContext*)f->hw_frames_ctx->data;
+    if (hf != NULL && (hf->sw_format == AV_PIX_FMT_P010LE || hf->sw_format == AV_PIX_FMT_P010BE ||
+                       hf->sw_format == AV_PIX_FMT_YUV420P10LE))
+      return 1;
+  }
+  return 0;
+}
+
 static int as_video_sk_cs(const AVFrame* f) {
   int full = (f->color_range == AVCOL_RANGE_JPEG);
   switch (f->colorspace) {
@@ -235,7 +291,7 @@ static int as_video_sk_cs(const AVFrame* f) {
     case AVCOL_SPC_BT2020_NCL:
     case AVCOL_SPC_BT2020_CL:
       // 10-bit sources pick the 10-bit pair; the 8-bit one is the common case.
-      if (f->format == AV_PIX_FMT_YUV420P10LE || f->format == AV_PIX_FMT_YUV420P10BE)
+      if (as_video_ten_bit(f))
         return full ? 6 : 7;
       return full ? 4 : 5;
     case AVCOL_SPC_SMPTE170M:
@@ -265,20 +321,36 @@ static void as_video_drop_image(as_video* v) {
   if (v->image != NULL) { sk_image_delete(v->image); v->image = NULL; }
 }
 
+// Zero copy on/off. On by default *when the build and the device support it*, because
+// the seam already returned NULL when they do not -- so the only thing this switch has
+// to express is a deliberate opt-OUT (AS_VIDEO_ZC=0), which is what an A/B measurement
+// needs.
+static int as_video_zc_wanted(void) {
+  static int cached = -1;
+  if (cached < 0) {
+    const char* e = getenv("AS_VIDEO_ZC");
+    cached = (e == NULL) ? 1 : !(e[0] == '0' || e[0] == 'o' || e[0] == 'O' || e[0] == 'f');
+  }
+  return cached;
+}
+
 // Returns 1 when a new image was produced. `grctx` is the backend's
-// GrRecordingContext (NULL on a pure-CPU raster build).
-static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms) {
+// GrRecordingContext (NULL on a pure-CPU raster build). `pre_img` is a frame that some
+// other route already produced as a GPU texture (the zero-copy seam): when it is set,
+// no conversion happens here at all -- this function only timestamps and queues it.
+static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
+                            void* pre_img) {
   const int w = f->width, h = f->height;
   if (w <= 0 || h <= 0) return 0;
   const int direct = (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P);
   const int cv = as_video_sk_cs(f);
-  void* img = NULL;
+  void* img = pre_img;
   // Two routes, decided by whether a GPU context exists -- never both. The I420 pass
   // exists only to feed sk_image_from_yuv_strided, so on a CPU-raster build (grctx
   // NULL) running it first converted every 4K frame TWICE: once to I420 and then to
   // BGRA, 6 ms + 12 ms per frame on a 3832x1592 10-bit source. Measured as the whole
   // reason a 4K file played at ~20 fps in a window with no GPU backend.
-  const int want_gpu = (grctx != NULL);
+  const int want_gpu = (grctx != NULL) && (img == NULL);
   const double t_conv0 = as_video_ms();
   if (want_gpu) {
     // Try the GPU entry first even with a NULL context: sk_image_from_yuv_strided
@@ -489,6 +561,19 @@ static int as_video_hw_setup(as_video* v, const AVCodec* dec) {
   AVBufferRef* dev = NULL;
   if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) return 0;
   v->hw_device = dev;
+  // The ID3D11Device behind it, kept as an identity for the zero-copy seam's table
+  // (video_d3d.cc). It is NOT retained here: FFmpeg owns the device, and the entry is
+  // dropped BEFORE this stream releases it (see as_video_free_state) so the two sides
+  // never disagree about its lifetime.
+#if AS_VIDEO_ZC
+  {
+    const AVHWDeviceContext* hwc = (const AVHWDeviceContext*)dev->data;
+    if (hwc != NULL && hwc->type == AV_HWDEVICE_TYPE_D3D11VA) {
+      const AVD3D11VADeviceContext* d3d = (const AVD3D11VADeviceContext*)hwc->hwctx;
+      if (d3d != NULL) v->hw_dev11 = (void*)d3d->device;
+    }
+  }
+#endif
   v->vc->hw_device_ctx = av_buffer_ref(dev);
   v->vc->get_format = as_video_get_format;
   return 1;
@@ -499,16 +584,21 @@ static int as_video_hw_setup(as_video* v, const AVCodec* dec) {
 // ---------------------------------------------------------------------------
 static void as_video_free_state(as_video* v) {
   if (getenv("AS_VIDEO_STATS") != NULL && (v->n_vframes > 0 || v->n_aframes > 0)) {
+    long long zc_frames = 0, zc_starved = 0;
+    sk_video_d3d_stats(&zc_frames, &zc_starved);
     fprintf(stderr,
             "[video] %s video_frames=%lld audio_frames=%lld w=%d h=%d pts=%.3f "
-            "threads=%d decode=%s cost/frame: dec=%.2fms conv=%.2fms upload=%.2fms hw=%.2fms\n",
+            "threads=%d decode=%s zc=%lld starved=%lld cost/frame: dec=%.2fms conv=%.2fms "
+            "upload=%.2fms hw=%.2fms copy=%.2fms\n",
             v->url[0] ? v->url : "?", v->n_vframes, v->n_aframes, v->w, v->h, v->frame_pts,
             v->vc != NULL ? v->vc->thread_count : 0,
-            v->hw_used ? "d3d11va" : "soft",
+            v->zc_used ? "d3d11va-zero-copy" : (v->hw_used ? "d3d11va-readback" : "soft"),
+            zc_frames, zc_starved,
             v->n_vframes > 0 ? v->t_dec_ms / (double)v->n_vframes : 0.0,
             v->n_vframes > 0 ? v->t_conv_ms / (double)v->n_vframes : 0.0,
             v->n_vframes > 0 ? v->t_upload_ms / (double)v->n_vframes : 0.0,
-            v->n_vframes > 0 ? v->t_hw_ms / (double)v->n_vframes : 0.0);
+            v->n_vframes > 0 ? v->t_hw_ms / (double)v->n_vframes : 0.0,
+            v->n_vframes > 0 ? v->t_zc_ms / (double)v->n_vframes : 0.0);
   }
   as_video_drop_image(v);
   while (v->qn > 0) { v->qn--; sk_image_delete((void*)v->qimg[v->qn]); }
@@ -523,6 +613,11 @@ static void as_video_free_state(as_video* v) {
   if (v->frame != NULL) av_frame_free(&v->frame);
   if (v->aframe != NULL) av_frame_free(&v->aframe);
   if (v->sw_frame != NULL) av_frame_free(&v->sw_frame);
+  // Drop the zero-copy table entry BEFORE FFmpeg releases the device it names: every
+  // image of this stream is already gone (drop_image and the queue above), so Skia's
+  // release callbacks have run, and a device that is later re-created at the same
+  // address must not inherit this entry's command context and textures.
+  if (v->hw_dev11 != NULL) { sk_video_d3d_forget(v->hw_dev11); v->hw_dev11 = NULL; }
   // Our own reference only: the decoder context holds its own, and it is released
   // below by avcodec_free_context.
   if (v->hw_device != NULL) av_buffer_unref(&v->hw_device);
@@ -549,6 +644,36 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
     if (rc < 0) { as_vs_error(v, "video decode", rc); v->failed = 1; break; }
     if (v->frame->format == AV_PIX_FMT_D3D11) {
+      // Zero copy first (V3 step 2, video.md §16.9): decoder texture -> D3D12 plane
+      // textures -> SkImage, never through system memory. NULL is a normal answer and
+      // the readback below is the fallback -- no GPU backend, both texture slots still
+      // referenced by Skia, a driver that refused the shared staging texture.
+      void* zc_img = NULL;
+      if (getenv("AS_VIDEO_DEBUG") != NULL) {
+        static int zc_trace = 0;
+        if (!zc_trace) {
+          zc_trace = 1;
+          fprintf(stderr, "[zc] build=%d grctx=%p data0=%p want=%d w=%d h=%d ten=%d\n",
+                  AS_VIDEO_ZC, grctx, v->frame->data[0], as_video_zc_wanted(),
+                  v->frame->width, v->frame->height, as_video_ten_bit(v->frame));
+        }
+      }
+      if (grctx != NULL && v->frame->data[0] != NULL && as_video_zc_wanted()) {
+        const double t_z0 = as_video_ms();
+        zc_img = sk_video_d3d_image(grctx, (void*)v->frame->data[0],
+                                    (int)(intptr_t)v->frame->data[1],
+                                    v->frame->width, v->frame->height,
+                                    as_video_ten_bit(v->frame), as_video_sk_cs(v->frame));
+        v->t_zc_ms += as_video_ms() - t_z0;
+        if (zc_img != NULL) {
+          v->n_zc++;
+          v->zc_used = 1;
+          v->hw_used = 1;
+          if (as_video_present(v, v->frame, grctx, now_ms, zc_img)) got++;
+          av_frame_unref(v->frame);
+          continue;
+        }
+      }
       // GPU -> system memory. Counted apart from `dec` because it is the price of
       // NOT doing zero-copy: measured as the `hw=` column of AS_VIDEO_STATS.
       const double t_hw0 = as_video_ms();
@@ -563,8 +688,8 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
       // and every frame reports pts 0, so NetStream.time freezes at 0.000.
       av_frame_copy_props(v->sw_frame, v->frame);
       v->hw_used = 1;
-      if (as_video_present(v, v->sw_frame, grctx, now_ms)) got++;
-    } else if (as_video_present(v, v->frame, grctx, now_ms)) {
+      if (as_video_present(v, v->sw_frame, grctx, now_ms, NULL)) got++;
+    } else if (as_video_present(v, v->frame, grctx, now_ms, NULL)) {
       got++;
     }
     av_frame_unref(v->frame);

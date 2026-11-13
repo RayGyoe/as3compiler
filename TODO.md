@@ -21334,6 +21334,49 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
 
+### 阶段四百零一：V3 第二步——零拷贝（D3D11 解码切片 → D3D12 平面纹理 → Skia YUVA）（v0.4.375 → v0.4.376）
+
+阶段四百把硬解接通了，量出的结论是「硬解 + 回读 = 软解的两倍代价」，代价全在
+`AV_PIX_FMT_D3D11 → 系统内存`（4K P010 一帧 ≈12 MB、`hw=9.59 ms`）。这一步把回读从链路上拿掉。
+
+**链路**（新文件 `vendor/video_d3d.cc`，Windows/D3D12 only；对 `video_glue.c` 只暴露三个
+整数/指针接口，FFmpeg 的 C 接缝仍然不认识 Skia）：
+
+1. 解码切片 → 自己的共享 staging（`CopySubresourceRegion`，同格式 blit ≈9 MB）。
+   不直接共享解码纹理：`hwcontext_d3d11va.c` 用 `D3D11_BIND_DECODER` 分配 Texture2DArray、不带共享标志。
+2. `ID3D11Device5::CreateFence(D3D11_FENCE_FLAG_SHARED)` → `ID3D12Fence::Wait`：GPU 侧排序，不阻塞 CPU。
+3. D3D12 `CopyTextureRegion` 把两个 plane 拆成**整张**纹理（R8/R8G8；10-bit 为 R16/R16G16）。
+   `GrBackendTexture` 只收整张 2D 纹理，而 NV12 的 Y/UV 是同一资源的两个 plane slice —— 这是本文件存在的全部理由。
+   P010 的 10 bit 左对齐存在 16 位里，`R16_UNORM` 归一化后正好是值/1023，不需要移位也不需要 swscale。
+4. `SkImages::TextureFromYUVATextures` + `GrYUVABackendTextures(kY_UV, k420)`，纹理状态报
+   `PIXEL_SHADER_RESOURCE`（与 `sk_gpu_draw_texture` 同一条契约）。
+
+**实测**（同一份 4K HDR10+ 素材、同一支 exe、真窗口 60 Hz、连续 20 s）：
+
+| 路径 | 每帧 CPU 成本 | 应用帧 | 最差帧间隔 | 上屏帧数 |
+|---|---|---|---|---|
+| 软解（8 线程） | `conv=5.91` + `upload=0.67` ≈ 6.6 ms | 1181/20.1 s ≈ 58.8 fps | **44 ms** | 484 |
+| 硬解 + 回读 | `hw=9.59` + `conv=3.37` + `upload=0.42` ≈ 13.4 ms | 1189 ≈ 59.4 fps | **98 ms** | 487 |
+| **硬解 + 零拷贝** | `copy=0.24` + `conv=0.02` ≈ **0.27 ms** | 1198 ≈ 59.9 fps | **20 ms** | 484 |
+
+**颜色不是「看着对」**：8-bit 素材三条路的逐采样点 mean 完全相同（120.9/126.14/130.13、distinct 764）；
+10-bit P010 与「同内容 8-bit 转码」的差，零拷贝 0.12/0.22/0.09、回读 0.61/0.15/1.18 —— 零拷贝**更接近真值**
+（参考路径先把 P010 sws 降到 8-bit，却仍按 10-bit 矩阵解释）。取证工具 `temp/probe-color.as`：
+播到片尾定格再 `BitmapData.draw` + `getPixel32` 采样。
+
+**四个坑（都实测）**：`D3D11_RESOURCE_MISC_SHARED_NTHANDLE` 必须配 `D3D11_RESOURCE_MISC_SHARED`（单独写
+对 NV12/P010 都是 `E_INVALIDARG`，很容易误判成「视频格式不能共享」）；纹理环要跟 `AS_VIDEO_QUEUE=8`
+对齐而不是双缓冲（两格实测 31 帧里 14 帧饿死退回回读）；`TextureReleaseProc` 必须带 epoch（流关闭后
+回调仍可能来，那时表项可能已属于另一台设备）；表项必须在释放 D3D11 设备**之前** `forget`（指针键会被复用）。
+
+**开关与默认**：零拷贝随 `ASC_RENDER_D3D` 编进来，`AS_VIDEO_ZC=0` 关；`AS_VIDEO_STATS=1` 的 `decode=`
+分三态（`soft`/`d3d11va-readback`/`d3d11va-zero-copy`）并多 `zc=`/`starved=` 两列。**默认解码仍是软解**：
+「什么时候可以默认硬解」需要首帧自适应（零拷贝拿不到就软解重开一次），见 video.md §16.9.6 的下一步。
+
+**回归面**：`unit: video/` 47 钉（新增 13 钉钉零拷贝链路的每一环与四个坑）；`examples/video-headless.as`
+24 断言在软解与 `AS_VIDEO_DECODE=hw` 两种模式全绿；`examples/video/VideoPlayer.as` 31 断言全绿（窗口内
+实际走零拷贝上屏）。
+
 ### 阶段四百：V3 第一步——D3D11VA 真正接通，而默认仍是软解（v0.4.374 → v0.4.375）
 
 V3 的第一个目标是把硬解**接通并验证**，而不是“改个开关宣称硬解”。这一步先碰到了一个上游陷阱：

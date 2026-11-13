@@ -6,7 +6,7 @@
 > （`src/emit.ts:16607`），`Video.attachNetStream()` 是空函数（`src/emit.ts:16630`）。全仓没有解复用器、
 > 没有视频解码器、没有视频时钟。
 >
-> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16），V2/V3 硬解与传输面未排期。**
+> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16）；V3 硬解 + 零拷贝已接通（2026-11-14，见 §16.8/§16.9）；V2 与传输面未排期。**
 > §1 是**实现前**的快照（2026-11-12），保留它是因为「起点是什么」决定了后面每条取舍；
 > 现在的代码状态以 §16 为准：`NetStream` / `Video` / `NetConnection` 已按 AIR 语义实现，
 > 解码走 FFmpeg 软解，`examples/video/` 的 31 条断言在真窗口里全绿。
@@ -753,7 +753,7 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
 | V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16；4K 素材的代价拆分见 §16.7） |
 | V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
-| V3 | **Windows D3D11VA 后端**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— `pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
+| V3 | **Windows D3D11VA 后端 + 零拷贝上屏**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— 解码与零拷贝已完成（§16.8、§16.9），默认仍软解待自适应；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
 | V5 | **publish 输出面（写）**：`NetStream.publish()` + `appendBytes()`（AIR 原生 API，可绕过采集设备直接堆已编码数据）+ `flv` 封装 + 硬编 H.264/AAC + `rtmp`/`rtmps` 推流；构建侧已在 V0 付完（§6.1） | 用 `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` 当收流端做可重复验收；`appendBytes` 路径不依赖任何采集设备；缺硬编的机器必顶报明确错误（不静默） |
 | V6（增强，opt-in） | `all` 档（VVC、`libdav1d`、DASH 需 `libxml2`）、多音轨/字幕轨选择、`StageVideo` | 明确标注为增强，默认不启用 |
@@ -1080,17 +1080,13 @@ av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0);  // rc=0 
 软解那 7 ms 里也没有解码的份——它在 8 个线程里被完全隐藏了。
 
 所以「硬解要赢」只有一个前提：**别回读**。这正好是 §10.2 里 Windows 那一行的难点——`DXGI_FORMAT_NV12`
-的 Y/UV 是同一资源的两个 **plane slice**，而 `GrBackendTexture` 收的是整张 2D 纹理。V3 第二步：
-
-1. 解码设备用 `ID3D11Device5` 建（`D3D11_CREATE_DEVICE_BGRA_SUPPORT`），纹理带
-   `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`，配套 `ID3D11Fence`；
-2. 渲染侧 D3D12 用 `OpenSharedHandle` 拿到同一张纹理 + 共享 fence，等解码完成再画；
-3. Y/UV 两个 plane 各建一张 R8/RG8 视图（或 `Texture2DArray` + plane slice），喂
-   `GrBackendTextures::MakeD3D` + `SkImages::TextureFromYUVATextures`；
-4. SkImage 的 `releaseProc` 里逆序释放视图/纹理/AVFrame（§10.2 的生命周期闭环），否则花屏不报错。
+的 Y/UV 是同一资源的两个 **plane slice**，而 `GrBackendTexture` 收的是整张 2D 纹理。
+**这条链已按 §16.9.2 的形态做完了**（零拷贝实测每帧 0.24 ms、最差帧间隔 20 ms），
+在那之前「默认软解」只是当时的权衡，不再是结论。
 
 在这条链做完之前，**默认软解是正确的工程选择**；`AS_VIDEO_DECODE=hw` 留给「CPU 解码撑不住、GPU 有余」
 的机器，作为可回退的 A/B 通道（`examples/video-headless.as` 24 项断言在两种模式下都是全绿）。
+默认是否翻成硬解，见 §16.9.5 的实测与 §16.9.6 的下一步。
 
 #### 16.8.4 复现命令与一个构建坑
 
@@ -1108,6 +1104,91 @@ AS_VIDEO_DECODE=hw AS_VIDEO_STATS=1 ./temp/probe-4k.exe # 硬解
 `gsub(/\\\\/, "/")`（4 个反斜杠——make 吃掉一层后 awk 才拿到合法的 `\\`）。`config.mak` 是
 `configure` 会覆盖的生成文件，所以每次重编都要重新补。另外三个工具来自三个地方，缺一不可：
 `awk`/`sh` 用 Git for Windows 的、`make`/`nasm` 用 `/c/msys64/usr/bin` 的、`lib.exe` 从 vcvars 环境来。
+
+### 16.9 V3 第二步：零拷贝接上了，硬解终于比软解快（2026-11-14 实测）
+
+§16.8 的结论是「硬解 + 回读 = 软解的两倍代价」，代价全在 `AV_PIX_FMT_D3D11 → 系统内存` 那一步。
+这一步把回读从链路上拿掉：解码出的切片在 GPU 内被拆成 Y/UV 两张整纹理，直接进 Skia 的 YUV 着色器。
+
+#### 16.9.1 同一份 4K HDR10+ 素材、同一支二进制、真窗口 60 Hz、连续 20 s
+
+素材：`The.Furious.2026 … HDR10+ H.265`（3832×1592、P010、23.976 fps）。
+
+| 路径 | 每帧 CPU 成本 | 应用帧 | 最差帧间隔 | 上屏帧数 |
+|---|---|---|---|---|
+| 软解（8 线程，默认） | `conv=5.91` + `upload=0.67` ≈ **6.6 ms** | 1181 / 20.1 s ≈ 58.8 fps | **44 ms** | 484 |
+| 硬解 + 回读 | `hw=9.59` + `conv=3.37` + `upload=0.42` ≈ **13.4 ms** | 1189 ≈ 59.4 fps | **98 ms** | 487 |
+| **硬解 + 零拷贝** | `copy=0.24` + `conv=0.02` ≈ **0.27 ms** | 1198 ≈ 59.9 fps | **20 ms** | 484 |
+
+`copy` 是纯 CPU 侧的提交开销（D3D11 blit、fence、命令录制），真正的 GPU 工作（约 9 MB 的两次 plane 拷贝）
+是异步的，不进这个数。最差帧间隔 20 ms 对 60 Hz 也就是「每一帧都在下一帧到之前画完」。
+
+#### 16.9.2 链路：四个环节，每一环都有它的理由
+
+实现在 `vendor/video_d3d.cc`（Windows/D3D12 only），对 `vendor/video_glue.c` 只暴露
+`sk_video_d3d_image()` / `sk_video_d3d_stats()` / `sk_video_d3d_forget()` 三个整数/指针接口，
+继续保持「FFmpeg 的 C 接缝里不认识 Skia」这条规矩。
+
+1. **解码切片 → 自己的共享 staging（D3D11，`CopySubresourceRegion`）**。
+   不直接开放解码纹理是有原因的：FFmpeg 的 `hwcontext_d3d11va.c` 用 `D3D11_BIND_DECODER` 分配
+   整块 Texture2DArray，**不带共享标志**，DXVA 也不保证解码面能共享。所以拷到一张同格式（NV12/P010）的
+   共享纹理上，这一步是显存内 blit，4K 约 9 MB。
+2. **共享 fence 排序**（`ID3D11Device5::CreateFence(D3D11_FENCE_FLAG_SHARED)` → `ID3D12Fence::Wait`）。
+   不能用 `Flush()` + 轮询：那要么阻塞 CPU，要么在 D3D12 侧读到未完成的画面。
+3. **D3D12 侧把两个 plane 拆成两张整纹理**（`CopyTextureRegion`，源子资源 0=Y / 1=UV，
+   目标 R8 / R8G8，10-bit 则是 R16 / R16G16）。这是 `GrBackendTexture` 只收整张 2D 纹理的直接后果，
+   也是 `video_d3d.cc` 存在的全部意义。P010 的 10 bit 是左对齐存在 16 位里，`R16_UNORM` 归一化后
+   恰好就是 10-bit 值 / 1023——不需要移位，也不需要 swscale。
+4. **喂 Skia**：`SkImages::TextureFromYUVATextures(ctx, GrYUVABackendTextures(SkYUVAInfo(kY_UV, k420, cs)), …)`，
+   纹理交给 Skia 时报的状态是 `D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE`（和
+   `sk_gpu_draw_texture` 同一条契约：Skia 自己跟踪纹理状态，两边必须口径一致）。
+
+#### 16.9.3 颜色：两条独立证据，不靠「看起来对」
+
+| 素材 | 软解（参考） | 硬解+回读 | **硬解+零拷贝** |
+|---|---|---|---|
+| `clip.mp4`（8-bit）meanR/G/B | 120.9 / 126.14 / 130.13（distinct 764） | **完全相同** | **完全相同** |
+| `clip10.mp4`（P010，BT.2020 PQ）meanR/G/B | 20.79 / 22.82 / 25.81 | 20.79 / 22.82 / 25.81 | 20.06 / 23.19 / 24.54 |
+| 同内容的 8-bit 转码（`clip8.mp4`，软解） | 20.18 / 22.97 / 24.63 | — | — |
+
+8-bit 三条路逐采样点一致（同一帧的 mean 与 distinct 数完全相同）。10-bit 上零拷贝与「同内容 8-bit 转码」
+的差是 0.12 / 0.22 / 0.09，而回读路径差 0.61 / 0.15 / 1.18——**零拷贝更接近真值**，因为参考路径先把
+P010 用 sws 降到 8-bit I420，却仍按 10-bit 矩阵（`kBT2020_10bit_Limited`）解释，矩阵与位深本就不匹配。
+（`temp/probe-color.as` 是这条对比的取证工具：播到片尾定格再 `BitmapData.draw` + `getPixel32` 采样。）
+
+#### 16.9.4 四个坑（都是实测踩出来的，不是推测）
+
+1. **`D3D11_RESOURCE_MISC_SHARED_NTHANDLE` 必须配 `D3D11_RESOURCE_MISC_SHARED`**：
+   只写前者，`CreateTexture2D` 对 NV12(0x67) 与 P010(0x68) 都返回 `E_INVALIDARG`。第一次失败时
+   很容易误判成「视频格式不能共享」——不是，格式无关。
+2. **纹理环大小要跟解码队列对齐，不是「双缓冲」**：`video_glue.c` 的 `AS_VIDEO_QUEUE = 8` 会把
+   解码超前于时钟的帧留在 FIFO 里，每帧都持着一张 SkImage。两格环实测 31 帧里 14 帧「饿死」退回回读，
+   等于白做。现在 10 格，按需创建（320×240 只花 0.1 MB/格）。
+3. **`TextureReleaseProc` 必须带 epoch**：Skia 可能在流关闭之后才回调（显示列表还持有图片），
+   那时表项可能已经属于另一台设备，回调会把在用槽位标成空闲 → 纹理被重写、画面撕裂。
+   现在回调携带发牌时的 `Stream::epoch`，对不上就什么都不做。
+4. **表项要在释放 D3D11 设备之前 `forget`**：表以设备指针为键，设备被 FFmpeg 释放后地址可能被
+   新设备复用，留着旧表项就等于拿着一个死的 immediate context。`as_video_free_state` 里
+   先丢弃图像、再 `sk_video_d3d_forget(v->hw_dev11)`、最后 `av_buffer_unref(&v->hw_device)`。
+
+#### 16.9.5 开关与默认
+
+- 零拷贝**只在 Windows + D3D12 后端 + `ASC_USE_SKIA`** 编译进来（`video_d3d.cc` 写在
+  `examples/video/video.build.json` 的 `${win:…}` 里）；其他构建里 `sk_video_d3d_image` 是静态
+  兜底函数，返回 NULL，**不改变任何行为**。
+- 运行时 `AS_VIDEO_ZC=0|off` 关掉零拷贝（做 A/B 用）；默认开。
+- **默认解码仍是软解**：`AS_VIDEO_DECODE=hw` 才走 GPU。理由不是零拷贝不快，而是「什么时候可以
+  默认硬解」需要一条自适应判断——见 §16.9.6。
+- `AS_VIDEO_STATS=1` 的 `decode=` 列现在区分三态：`soft` / `d3d11va-readback` /
+  `d3d11va-zero-copy`，并多两列 `zc=<帧数>` `starved=<饿死次数>`。
+
+#### 16.9.6 下一步：默认翻成硬解的条件
+
+零拷贝存在的前提是「有 D3D12 设备、共享纹理与共享 fence 都建得起来」。这三件事在 `open` 时都还
+不知道（GPU 上下文可能到第一帧才存在），所以现在不做自适应默认，免得落到「硬解可用但零拷贝不可用」
+的机子上反而比软解慢一倍（回读 13.4 ms vs 软解 6.6 ms）。
+要做的是：首帧若零拷贝返回 NULL 且存在 GPU 上下文，就用软解**重开**该流（一次性代价），
+之后不再尝试；这条做出来才把默认翻成 `auto`。在此之前，`AS_VIDEO_DECODE=hw` 是显式选择。
 
 
 ---

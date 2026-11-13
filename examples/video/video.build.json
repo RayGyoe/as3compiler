@@ -11,7 +11,8 @@
     "../../vendor/window_glue.cc",
     "../../vendor/audio_glue.c",
     "../../vendor/video_glue.c",
-    "${win:../../vendor/d3d_glue.cc}"
+    "${win:../../vendor/d3d_glue.cc}",
+    "${win:../../vendor/video_d3d.cc}"
   ],
   "include-paths": [
     "../../vendor/skia",
