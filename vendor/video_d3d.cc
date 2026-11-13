@@ -387,6 +387,68 @@ void zc_fail(Stream* s, const char* why) {
 
 // --- entry point ----------------------------------------------------------
 
+// Called by video_glue.c BEFORE it commits to a GPU decoder: "could a frame from a
+// D3D11 device of this size and format actually reach Skia on this machine?"
+//   ctx     GrRecordingContext* (Skia, from the display list)
+//   dev11   the ID3D11Device behind the proposed hw_device_ctx
+//   w, h    the coded size; ten_bit picks P010 over NV12
+// Returns 1 when the whole route is live: a shared D3D12 device+queue exists, the
+// entry initialises (ID3D11Device5, shared fence, command list) AND a shared staging
+// texture plus one plane pair can be created. It leaves the entry initialised, so the
+// first frame reuses it rather than paying twice.
+//
+// Why a probe and not a try-and-see-at-the-first-frame: hardware decode plus READBACK
+// costs 13.4 ms/frame against software's 6.6 ms (§16.8.3), so committing to the GPU
+// without this answer would be a pessimisation on every machine where the handoff
+// does not work (no GPU context, old driver, device lost). Answering it here keeps the
+// default safe -- one decision, before any packet is decoded, no stream restart.
+extern "C" int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit) {
+  if (ctx == nullptr || dev11 == nullptr || w <= 0 || h <= 0) return 0;
+  if ((w & 1) || (h & 1)) return 0;
+  ID3D12Device* dev12 = sk_d3d_shared_device();
+  ID3D12CommandQueue* queue = sk_d3d_shared_queue();
+  if (dev12 == nullptr || queue == nullptr) return 0;
+
+  ID3D11Device* dev = (ID3D11Device*)dev11;
+  Stream* s = nullptr;
+  Stream* empty = nullptr;
+  for (int i = 0; i < kMaxStreams; ++i) {
+    Stream* e = &g_streams[i];
+    if (e->used && e->dev11_key == dev) {
+      if (e->dev12_key != dev12) zc_reset(e);
+      else { s = e; break; }
+    }
+    if (!e->used && empty == nullptr) empty = e;
+  }
+  if (s == nullptr) {
+    if (empty == nullptr) return 0;
+    s = empty;
+    s->used = 1;
+    if (!zc_init(s, dev)) { zc_reset(s); return 0; }
+  }
+  if (s->failed) return 0;
+
+  const DXGI_FORMAT sfmt = ten_bit ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+  if (!zc_make_stage(s, nullptr, sfmt, w, h)) {
+    zc_fail(s, "shared staging texture (probe)");
+    return 0;
+  }
+  const DXGI_FORMAT yfmt = ten_bit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+  const DXGI_FORMAT uvfmt = ten_bit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
+  Slot* slot = &s->slots[0];
+  if (slot->y.get() == nullptr &&
+      (!zc_make_plane(dev12, slot->y, yfmt, w, h) ||
+       !zc_make_plane(dev12, slot->uv, uvfmt, w / 2, h / 2))) {
+    zc_fail(s, "plane textures (probe)");
+    return 0;
+  }
+  if (getenv("AS_VIDEO_DEBUG") != nullptr) {
+    fprintf(stderr, "[zc] probe ok: %dx%d ten_bit=%d\n", w, h, ten_bit);
+    fflush(stderr);
+  }
+  return 1;
+}
+
 // Called by video_glue.c for a frame whose format is AV_PIX_FMT_D3D11.
 //   ctx      GrRecordingContext* (Skia, from the display list)
 //   tex      the frame's ID3D11Texture2D* (a Texture2DArray; `slice` picks the frame)
@@ -438,7 +500,12 @@ extern "C" void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int 
     if (!e->used && empty == nullptr) empty = e;
   }
   if (s == nullptr) {
-    if (empty == nullptr) { dev11->Release(); return nullptr; }
+    if (empty == nullptr) {
+      if (getenv("AS_VIDEO_DEBUG") != nullptr)
+        fprintf(stderr, "[zc] no free stream entry (kMaxStreams=%d)\n", kMaxStreams);
+      dev11->Release();
+      return nullptr;
+    }
     s = empty;
     s->used = 1;
     if (!zc_init(s, dev11)) {
@@ -593,6 +660,10 @@ extern "C" void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int 
       static_cast<GrRecordingContext*>(ctx), yuva, nullptr, zc_release_cb, token);
   dev11->Release();
   if (img == nullptr) {
+    // Only the first frame is worth a line: a driver that refuses the wrap refuses it
+    // every time, and this is a diagnostic, not a log.
+    if (getenv("AS_VIDEO_DEBUG") != nullptr && s->frames == 0)
+      fprintf(stderr, "[zc] TextureFromYUVATextures returned null\n");
     slot->in_use = 0;
     delete token;
     return nullptr;

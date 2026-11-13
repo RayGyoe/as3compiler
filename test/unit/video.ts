@@ -131,10 +131,14 @@ function checkVideoSurface(): string[] {
   check('the FFmpeg recipe enables BOTH d3d11va names (format list and implementation)',
     buildScript.includes('add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" d3d11va\n') &&
     buildScript.includes('add_hwaccels "h264 hevc mpeg2video vc1 vp9 av1 wmv3" d3d11va2\n'));
-  check('hardware decode is opt-in, and software stays the default',
-    glue.includes('static int as_video_hw_wanted(void)') &&
-    /if \(want == NULL \|\| want\[0\] == 0\) return 0;/.test(glue) &&
-    glue.includes('strcmp(want, "soft") == 0'));
+  // Superseded by the adaptive default above: what has to stay true is that the
+  // SOFTWARE decoder is reachable (forced, or the fallback) and that the GPU is never
+  // chosen without the zero-copy probe.
+  check('the software route is always available, by flag and by fallback',
+    glue.includes('static int as_video_decode_mode(void)') &&
+    glue.includes('strcmp(want, "soft") == 0') &&
+    glue.includes('if (!hw) {') &&
+    glue.includes('return as_video_open_vdec(v, 0);'));
   check('get_format falls back to a SOFTWARE format, never to dxva2 against a D3D11 device',
     glue.includes('AV_PIX_FMT_FLAG_HWACCEL') && glue.includes('if (pick == AV_PIX_FMT_NONE) pick = list[0];'));
   check('a GPU frame is transferred back and keeps its props (pts/colorspace)',
@@ -249,6 +253,44 @@ function checkVideoSurface(): string[] {
   const manifestWithSeam = readNorm(join(root, 'examples', 'video', 'video.build.json'));
   check('the Windows video manifest compiles the zero-copy seam',
     manifestWithSeam.includes('"${win:../../vendor/video_d3d.cc}"'));
+
+  // ---- the adaptive default (V3 step 3, video.md §16.9.6) ----
+  // Software is no longer the default answer, it is the default START: open() primes a
+  // frame in software (the black-beat guarantee needs it and there is no renderer yet),
+  // then the first frame boundary answers the real question and re-opens on the GPU
+  // only when the zero-copy probe passes. Each pin below is one way for that to go
+  // silently wrong: a default that quietly became "always hardware" (twice the cost
+  // with readback), an upgrade that never happens (the measured win is unreachable),
+  // or a second device per stream (two table entries, and the 4-entry table ran out on
+  // the third NetStream -- measured).
+  const mode = /static int as_video_decode_mode\(void\) \{([\s\S]*?)\n\}/.exec(glue)?.[1] ?? '';
+  check('an unset AS_VIDEO_DECODE means AUTO, not software',
+    mode.includes('return 2;') && mode.includes('strcmp(want, "auto") != 0'));
+  check('soft/cpu still force the CPU decoder',
+    mode.includes('strcmp(want, "soft") == 0') && mode.includes('strcmp(want, "cpu") == 0') &&
+    mode.includes('return 0;'));
+  check('open() still primes a frame, so play() then draw is not black',
+    glue.includes('as_video_advance(v, NULL, 0.0, -1.0);'));
+  check('the GPU upgrade is gated on a passing zero-copy probe',
+    glue.includes('const int ok = as_video_zc_available(grctx, v->hw_dev11, v->w, v->h, v->src_10bit);') &&
+    glue.includes('as_video_hw_detach(v);   // drops the device AND its table entry'));
+  check('the upgrade waits for a renderer, then never asks twice',
+    glue.includes('if (v->decided || v->failed) return;') &&
+    glue.includes('if (grctx == NULL) return;') && glue.includes('v->decided = 1;'));
+  check('the upgrade rewinds through the seek path (the prime is the only re-decode)',
+    glue.includes('v->seek_to = 0.0;'));
+  check('one D3D11 device per stream: the reopen reuses the probe device',
+    glue.includes('AVBufferRef* dev = v->hw_device;') &&
+    !glue.includes('probe_dev'));
+  check('the probe leaves its entry initialised for the first real frame',
+    zc.includes('zc_make_stage(s, nullptr, sfmt, w, h)') &&
+    /extern "C" int sk_video_d3d_probe\(void\* ctx, void\* dev11, int w, int h, int ten_bit\)/.test(zc));
+  check('a build without the D3D seam still answers the probe (with 0)',
+    glue.includes('static int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit)') &&
+    glue.includes('return 0;'));
+  // Audio-only streams have no video context at all: the gate must not stop them.
+  check('the "decoder not open" gate only applies to streams with video',
+    glue.includes('if (v->vs >= 0 && !v->vc_open) return;'));
 
   console.log(`[video] ${ok} check(s) passed`);
   return bad;

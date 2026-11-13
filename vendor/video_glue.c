@@ -94,6 +94,7 @@ extern void sk_image_delete(void* image);
 #define AS_VIDEO_ZC 1
 extern void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
                                 int ten_bit, int yuv_cs);
+extern int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit);
 extern void sk_video_d3d_stats(long long* frames, long long* starved);
 extern void sk_video_d3d_forget(void* d3d11_device);
 #else
@@ -102,6 +103,10 @@ static void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
                                 int ten_bit, int yuv_cs) {
   (void)ctx; (void)tex; (void)slice; (void)w; (void)h; (void)ten_bit; (void)yuv_cs;
   return NULL;
+}
+static int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit) {
+  (void)ctx; (void)dev11; (void)w; (void)h; (void)ten_bit;
+  return 0;
 }
 static void sk_video_d3d_stats(long long* frames, long long* starved) {
   if (frames != NULL) *frames = 0;
@@ -178,6 +183,18 @@ typedef struct {
   // deliberately NOT here: a DXGI_FORMAT_NV12 texture keeps Y and UV as two *plane
   // slices* of one resource while GrBackendTexture takes a whole 2D texture, so that
   // route needs the plane split §10.2 describes.
+  // Deferred decoder open (video.md §16.9.6). The decoder is NOT opened by
+  // as_video_open(): whether hardware pays off depends on whether ZERO COPY works, and
+  // that answer needs a GrRecordingContext, which does not exist until the frame loop
+  // hands one in. Opening at the first tick instead makes the decision once, before any
+  // packet is consumed -- no stream restart, no duplicated NetStatus events, no lost
+  // first frames. `vdec` is the build's decoder; `vc_open` says the context was opened.
+  const AVCodec* vdec;
+  int vc_open;              // the decoder context is open
+  int decided;              // the software/hardware question has been answered (or skipped)
+  int src_10bit;            // codecpar says 10-bit: the probe's staging format
+  int hw_refused;           // AUTO asked for the GPU and fell back to software
+  int zc_traced;            // AS_VIDEO_DEBUG: the per-stream zero-copy trace was printed
   AVBufferRef* hw_device;
   AVFrame* sw_frame;
   int hw_used;              // 1 once a frame actually came back from the GPU
@@ -281,6 +298,17 @@ static int as_video_ten_bit(const AVFrame* f) {
       return 1;
   }
   return 0;
+}
+
+// The same question asked of a codecpar format, i.e. before any frame exists: the
+// zero-copy probe has to pick NV12 or P010 for its staging texture at the first tick,
+// and guessing 8-bit for a 10-bit stream would build the wrong plane formats.
+// Descriptor depth (not a format list) so a 12-bit format answers truthfully too.
+static int as_pix_fmt_10bit(int fmt) {
+  if (fmt == AV_PIX_FMT_NONE) return 0;
+  const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((enum AVPixelFormat)fmt);
+  if (d == NULL) return 0;
+  return d->comp[0].depth > 8 ? 1 : 0;
 }
 
 static int as_video_sk_cs(const AVFrame* f) {
@@ -502,11 +530,14 @@ static void as_video_audio_out(as_video* v, AVFrame* f) {
 // colour pass, against dec+conv+upload = 6.7 ms per frame for the 8-thread software
 // decoder. The readback is what makes hardware lose -- it exists because zero-copy
 // is not implemented yet (§16.8), and once it is, this default flips.
-static int as_video_hw_wanted(void) {
+// 0 = software, 1 = hardware forced, 2 = decide from what this machine can do.
+// Unset is AUTO, not software: §16.9 made software-vs-hardware a question with a
+// measured answer, so the default has to be "answer it", not "always software".
+static int as_video_decode_mode(void) {
   const char* want = getenv("AS_VIDEO_DECODE");
-  if (want == NULL || want[0] == 0) return 0;
-  if (strcmp(want, "soft") == 0 || strcmp(want, "cpu") == 0) return 0;
-  return 1;   // "hw" / "d3d11va" / "auto"
+  if (want != NULL && (strcmp(want, "soft") == 0 || strcmp(want, "cpu") == 0)) return 0;
+  if (want != NULL && want[0] != 0 && strcmp(want, "auto") != 0) return 1;   // hw/d3d11va
+  return 2;
 }
 
 static enum AVPixelFormat as_video_get_format(AVCodecContext* ctx,
@@ -541,9 +572,11 @@ static enum AVPixelFormat as_video_get_format(AVCodecContext* ctx,
   return pick;
 }
 
-// Returns 1 when a D3D11 device was attached to the decoder.
-static int as_video_hw_setup(as_video* v, const AVCodec* dec) {
-  if (!as_video_hw_wanted()) return 0;
+// Create the D3D11 device this stream would decode into, and report the ID3D11Device
+// behind it (the zero-copy probe needs that identity). Returns NULL when the build or
+// the driver cannot provide one -- such a machine must still play video, in software.
+static AVBufferRef* as_video_hw_create(const AVCodec* dec, void** dev11_out) {
+  if (dev11_out != NULL) *dev11_out = NULL;
   int have_d3d11 = 0;
   // Ask the BUILD what it registered instead of assuming: an "--enable-hwaccel=h264_d3d11va"
   // list produced a build whose only d3d11 entry was the legacy D3D11VA_VLD one, and
@@ -557,10 +590,9 @@ static int as_video_hw_setup(as_video* v, const AVCodec* dec) {
       break;
     }
   }
-  if (!have_d3d11) return 0;
+  if (!have_d3d11) return NULL;
   AVBufferRef* dev = NULL;
-  if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) return 0;
-  v->hw_device = dev;
+  if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) return NULL;
   // The ID3D11Device behind it, kept as an identity for the zero-copy seam's table
   // (video_d3d.cc). It is NOT retained here: FFmpeg owns the device, and the entry is
   // dropped BEFORE this stream releases it (see as_video_free_state) so the two sides
@@ -570,13 +602,145 @@ static int as_video_hw_setup(as_video* v, const AVCodec* dec) {
     const AVHWDeviceContext* hwc = (const AVHWDeviceContext*)dev->data;
     if (hwc != NULL && hwc->type == AV_HWDEVICE_TYPE_D3D11VA) {
       const AVD3D11VADeviceContext* d3d = (const AVD3D11VADeviceContext*)hwc->hwctx;
-      if (d3d != NULL) v->hw_dev11 = (void*)d3d->device;
+      if (d3d != NULL && dev11_out != NULL) *dev11_out = (void*)d3d->device;
     }
   }
 #endif
-  v->vc->hw_device_ctx = av_buffer_ref(dev);
-  v->vc->get_format = as_video_get_format;
+  return dev;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred decoder open: the software/hardware decision (video.md §16.9.6)
+// ---------------------------------------------------------------------------
+
+// Is a hardware frame going to reach the screen WITHOUT a readback? That is the only
+// shape in which the GPU wins: hardware plus av_hwframe_transfer_data measured
+// 13.4 ms/frame against software's 6.6 ms on the same 4K HDR10+ file (§16.8.3).
+static int as_video_zc_available(void* grctx, void* dev11, int w, int h, int ten_bit) {
+#if AS_VIDEO_ZC
+  if (grctx == NULL || dev11 == NULL) return 0;
+  if (!as_video_zc_wanted()) return 0;
+  return sk_video_d3d_probe(grctx, dev11, w > 0 ? w : 16, h > 0 ? h : 16, ten_bit);
+#else
+  (void)grctx; (void)dev11; (void)w; (void)h; (void)ten_bit;
+  return 0;
+#endif
+}
+
+// Release whatever as_video_open_vdec() attached, in the order close uses: forget the
+// zero-copy entry (it names the device), then drop our reference to the device.
+static void as_video_hw_detach(as_video* v) {
+  if (v->vc != NULL) { av_buffer_unref(&v->vc->hw_device_ctx); v->vc->get_format = NULL; }
+  if (v->hw_dev11 != NULL) { sk_video_d3d_forget(v->hw_dev11); v->hw_dev11 = NULL; }
+  if (v->hw_device != NULL) av_buffer_unref(&v->hw_device);
+}
+
+// (Re)build and open the video decoder. `want_hw` is a REQUEST: a device that cannot be
+// created, or a decoder that refuses the stream, falls back to software. Returns 1 when
+// the context is open, 0 when the stream is undecodable (v->err says why).
+//
+// Every open goes through here, including the one at the first frame boundary that
+// turns AUTO's software start into a GPU stream: the software-vs-hardware question
+// needs a GrRecordingContext (§16.9.6) and open() does not have one yet.
+static int as_video_open_vdec(as_video* v, int want_hw) {
+  avcodec_free_context(&v->vc);
+  v->vc = avcodec_alloc_context3(v->vdec);
+  if (v->vc == NULL) { v->failed = 1; snprintf(v->err, sizeof(v->err), "out of memory"); return 0; }
+  AVStream* st = v->fc->streams[v->vs];
+  avcodec_parameters_to_context(v->vc, st->codecpar);
+  v->vc->pkt_timebase = st->time_base;
+  int hw = 0;
+  if (want_hw) {
+    // Reuse the device the caller already created (the AUTO probe makes one before it
+    // commits, and two devices per stream would mean two zero-copy table entries per
+    // stream -- measured: the 4-entry table ran out on the third NetStream).
+    AVBufferRef* dev = v->hw_device;
+    if (dev == NULL) dev = as_video_hw_create(v->vdec, &v->hw_dev11);
+    if (dev != NULL) {
+      v->hw_device = dev;
+      v->vc->hw_device_ctx = av_buffer_ref(dev);
+      v->vc->get_format = as_video_get_format;
+      // A GPU decoder ignores thread_count; frame threading would only add latency
+      // before the first frame.
+      v->vc->thread_count = 1;
+      hw = 1;
+    }
+  }
+  if (!hw) {
+    // av_cpu_count is libavutil's own probe (what thread_count = 0 would use), so this
+    // file needs no platform headers for it. Capped because frame threading keeps one
+    // 4K 10-bit frame (~18 MB) alive per thread.
+    int ncpu = av_cpu_count();
+    if (ncpu < 1) ncpu = 1;
+    if (ncpu > 8) ncpu = 8;
+    v->vc->thread_count = ncpu;
+    v->vc->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+  }
+  int rc = avcodec_open2(v->vc, v->vdec, NULL);
+  if (rc < 0) {
+    if (!hw) {
+      as_vs_error(v, v->vdec->name, rc);
+      return 0;
+    }
+    // A GPU decoder can refuse the stream (a profile the driver will not take). That
+    // is not a reason to lose the file: rebuild the context and open it in software.
+    as_video_hw_detach(v);
+    v->hw_refused = 1;
+    return as_video_open_vdec(v, 0);
+  }
+  v->vc_open = 1;
   return 1;
+}
+
+// Turn AUTO's software start into a GPU stream at the first frame boundary, when (and
+// only when) the frame can reach the screen without a readback.
+//
+// Why there IS a software start: as_video_open() primes one frame so that play() ->
+// BitmapData.draw is not a black beat, and it cannot ask the GPU question there (no
+// renderer exists yet). So the prime happens in software, and this function -- running
+// before the frame loop has painted anything -- re-opens the decoder on the GPU and
+// asks the normal seek path to rewind to the start. One decode is redone, the stream is
+// never restarted, and NetStatus/onMetaData are untouched.
+static void as_video_maybe_upgrade(as_video* v, void* grctx) {
+  if (v->decided || v->failed) return;
+  if (v->vc == NULL || v->vdec == NULL || v->vs < 0) return;
+  const int mode = as_video_decode_mode();
+  if (mode == 0) { v->decided = 1; return; }
+  // Without a renderer there is no question to answer yet: stay undecided, so a
+  // windowed app that paints its first frame later can still take the GPU. A headless
+  // program simply never upgrades (and never pays for a device).
+  if (grctx == NULL) return;
+  v->decided = 1;
+
+  if (mode == 2) {
+    // Ask before committing: without zero-copy the GPU route costs twice what the
+    // 8-thread CPU decoder costs, so "hardware" on its own is not an improvement.
+    // The device created here is KEPT for the reopen below -- creating a throwaway
+    // one would leave a second zero-copy table entry per stream behind.
+    v->hw_device = as_video_hw_create(v->vdec, &v->hw_dev11);
+    if (v->hw_device == NULL) {
+      v->hw_refused = 1;
+      if (getenv("AS_VIDEO_DEBUG") != NULL)
+        fprintf(stderr, "[video] auto: no usable D3D11VA device, staying in software\n");
+      return;
+    }
+    const int ok = as_video_zc_available(grctx, v->hw_dev11, v->w, v->h, v->src_10bit);
+    if (!ok) {
+      v->hw_refused = 1;
+      as_video_hw_detach(v);   // drops the device AND its table entry
+      if (getenv("AS_VIDEO_DEBUG") != NULL)
+        fprintf(stderr, "[video] auto: zero-copy unavailable, staying in software\n");
+      return;
+    }
+  }
+  if (!as_video_open_vdec(v, 1)) return;    // open_vdec already fell back or failed
+  if (v->hw_device == NULL) { v->hw_refused = 1; return; }
+  // The primed frame came from the software decoder, and so did the audio already in
+  // the live buffer: rewind through the normal seek path so nothing is decoded twice.
+  v->seek_to = 0.0;
+  if (getenv("AS_VIDEO_DEBUG") != NULL)
+    fprintf(stderr, "[video] auto: upgraded to GPU decode (%dx%d, %s)\n", v->w, v->h,
+            v->src_10bit ? "P010" : "NV12");
 }
 
 // ---------------------------------------------------------------------------
@@ -649,14 +813,11 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
       // the readback below is the fallback -- no GPU backend, both texture slots still
       // referenced by Skia, a driver that refused the shared staging texture.
       void* zc_img = NULL;
-      if (getenv("AS_VIDEO_DEBUG") != NULL) {
-        static int zc_trace = 0;
-        if (!zc_trace) {
-          zc_trace = 1;
-          fprintf(stderr, "[zc] build=%d grctx=%p data0=%p want=%d w=%d h=%d ten=%d\n",
-                  AS_VIDEO_ZC, grctx, v->frame->data[0], as_video_zc_wanted(),
-                  v->frame->width, v->frame->height, as_video_ten_bit(v->frame));
-        }
+      if (getenv("AS_VIDEO_DEBUG") != NULL && !v->zc_traced) {
+        v->zc_traced = 1;
+        fprintf(stderr, "[zc] %s build=%d grctx=%p data0=%p want=%d w=%d h=%d ten=%d\n",
+                v->url, AS_VIDEO_ZC, grctx, v->frame->data[0], as_video_zc_wanted(),
+                v->frame->width, v->frame->height, as_video_ten_bit(v->frame));
       }
       if (grctx != NULL && v->frame->data[0] != NULL && as_video_zc_wanted()) {
         const double t_z0 = as_video_ms();
@@ -734,11 +895,12 @@ static int as_video_next_packet(as_video* v) {
 // AS_VIDEO_TICK_PACKETS) or the file ends. Called from open (target 0) and tick.
 static void as_video_advance(as_video* v, void* grctx, double target_s, double now_ms) {
   if (v->failed) return;
+  if (v->vs >= 0 && !v->vc_open) return;   // undecodable stream: open_vdec set the reason
   if (v->seek_to >= 0) {
     int64_t ts = (int64_t)(v->seek_to * (double)AV_TIME_BASE);
     if (av_seek_frame(v->fc, -1, ts, AVSEEK_FLAG_BACKWARD) < 0) v->seek_to = -1;
     else {
-      if (v->vc != NULL) avcodec_flush_buffers(v->vc);
+      if (v->vc_open && v->vc != NULL) avcodec_flush_buffers(v->vc);
       if (v->ac != NULL) avcodec_flush_buffers(v->ac);
       as_video_drop_image(v);
       while (v->qn > 0) { v->qn--; sk_image_delete((void*)v->qimg[v->qn]); }
@@ -876,33 +1038,23 @@ int as_video_open(const char* url, const char* backend, const char* formats, cha
     if (v->vc == NULL) { as_video_free_state(v); if (errbuf) snprintf(errbuf, (size_t)errlen, "out of memory"); return -1; }
     avcodec_parameters_to_context(v->vc, st->codecpar);
     v->vc->pkt_timebase = st->time_base;
-    // Decoder threads. FFmpeg's AVCodecContext defaults thread_count to 1, and one
-    // thread decoding 4K HEVC costs ~8.8 ms per frame (measured on a 3832x1592
-    // 10-bit HDR10+ file): half of a 60 Hz frame budget, spent INSIDE the frame
-    // loop that also has to paint and pump timers. 0 means "size it for this CPU"
-    // (frame + slice threads), which is what every player does by default.
-    //
-    // Capped, not left at the CPU count: frame threading keeps one frame per thread
-    // alive, and a decoded 4K 10-bit frame is ~18 MB -- 32 threads would pin ~580 MB
-    // for a stream that decodes far faster than it plays. 8 is past the point where
-    // this decoder stops being the bottleneck (measured below).
-    // Hardware decode first: the thread sizing below is for the SOFTWARE path. A
-    // GPU decoder ignores thread_count, and frame threading there would only add
-    // latency before the first frame -- which the priming exemption exists for.
-    const int hw = as_video_hw_setup(v, dec);
-    if (hw) {
-      v->vc->thread_count = 1;
-    } else {
-      // av_cpu_count is libavutil's own probe (it is what thread_count = 0 would
-      // use), so this file needs no platform headers for it.
-      int ncpu = av_cpu_count();
-      if (ncpu < 1) ncpu = 1;
-      if (ncpu > 8) ncpu = 8;
-      v->vc->thread_count = ncpu;
-      v->vc->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+    // Opened in SOFTWARE here even when the user asked for nothing in particular:
+    // the prime below is what makes play() -> BitmapData.draw show a picture, and it
+    // happens before any renderer exists. AUTO upgrades at the first frame boundary
+    // once it can ask the zero-copy question (as_video_maybe_upgrade). A forced "hw"
+    // starts on the GPU right away -- that is an explicit request, not a guess.
+    v->vdec = dec;
+    // What CAN be known without decoding is the geometry, and it must be reported now:
+    // NetStream.videoWidth is expected right after play(), and AIR answers it from the
+    // stream parameters, not from a decoded frame.
+    if (st->codecpar->width > 0 && st->codecpar->height > 0) {
+      v->w = st->codecpar->width;
+      v->h = st->codecpar->height;
+      v->got_meta = 1;
+      v->has_video = 1;
     }
-    if ((rc = avcodec_open2(v->vc, dec, NULL)) < 0) {
-      as_vs_error(v, dec->name, rc);
+    v->src_10bit = as_pix_fmt_10bit(st->codecpar->format);
+    if (!as_video_open_vdec(v, as_video_decode_mode() == 1)) {
       if (errbuf != NULL) snprintf(errbuf, (size_t)errlen, "%s", v->err);
       as_video_free_state(v);
       return -1;
@@ -942,7 +1094,10 @@ int as_video_open(const char* url, const char* backend, const char* formats, cha
     return -1;
   }
   v->used = 1;
-  // Prime: one frame in hand, so play() -> draw is not a black beat.
+  // Prime: one frame in hand, so play() -> draw is not a black beat. This is a
+  // SOFTWARE decode even under AUTO; if the first frame boundary then finds a usable
+  // zero-copy route, as_video_maybe_upgrade() re-opens the decoder on the GPU and
+  // rewinds through the seek path, so exactly this one decode is repeated.
   as_video_advance(v, NULL, 0.0, -1.0);
   if (v->image != NULL) {
     v->got_meta = 1;
@@ -1048,6 +1203,9 @@ int as_video_tick(int id, void* grctx, double now_ms) {
   as_video* v = &g_videos[id];
   if (v->failed) return AS_VIDEO_ST_FAILED;
   if (v->paused_at_ms != 0) return as_video_state(id);
+  // First frame boundary: this is where AUTO can finally answer its one question.
+  // Runs before the clock re-anchor so the seek it may trigger is not chased.
+  as_video_maybe_upgrade(v, grctx);
   if (v->clock0_ms < 0) v->clock0_ms = now_ms;   // re-anchor after a seek
   double target = (now_ms - v->clock0_ms) / 1000.0;
   if (v->duration_ms > 0 && target > v->duration_ms / 1000.0 + 0.25)

@@ -1161,19 +1161,50 @@ FFmpeg frees the device the address can be reused, and a stale entry means a dea
 `${win:…}` source in `examples/video/video.build.json`). Every other build gets a static stub returning NULL,
 so nothing changes for it.
 - `AS_VIDEO_ZC=0|off` turns it off at runtime (for A/B); it is on by default.
-- **The default decoder is still software**; `AS_VIDEO_DECODE=hw` opts into the GPU. The reason is no longer
-speed — it is that "may I default to hardware" needs an adaptive decision (§16.9.6).
-- `AS_VIDEO_STATS=1` now reports three decode states — `soft`, `d3d11va-readback`, `d3d11va-zero-copy` — plus
+- **The default decoder is adaptive** (`AS_VIDEO_DECODE` unset = `auto`): hardware when zero copy works,
+software when it does not — see §16.9.6 for the test and the moment it runs. `soft`/`cpu` force the CPU;
+`hw`/`d3d11va` force the GPU (and do not require zero copy).
+- `AS_VIDEO_STATS=1` reports three decode states — `soft`, `d3d11va-readback`, `d3d11va-zero-copy` — plus
 `zc=<frames>` and `starved=<count>`.
 
-#### 16.9.6 What has to be true before hardware becomes the default
+#### 16.9.6 The adaptive default: start in software, decide at the first frame boundary
 
-Zero copy needs a D3D12 device plus a working shared texture and fence. None of that is known at `open` time
-(the GPU context may only exist at the first frame), so making hardware the default now would land machines
-where hardware works but zero copy does not on the *slower* side: readback is 13.4 ms against software's
-6.6 ms. The missing piece is a first-frame check that re-opens the stream in software once (and stops trying)
-when the seam returns NULL despite a GPU context; only then does the default become `auto`.
-Until that lands, `AS_VIDEO_DECODE=hw` is an explicit choice.
+The difficulty is that the two answers arrive at different times: whether to use the GPU is known at `open`,
+while whether ZERO COPY works depends on a `GrRecordingContext`, which does not exist yet at `open`. Hence:
+
+1. **`open` always starts in software** and **primes one frame**. The prime is not optional: right after
+`play()`, `BitmapData.draw` must not be black (a pinned regression), and there is no renderer yet to decide
+with.
+2. **At the first frame boundary** (`as_video_tick` receives a non-NULL `grctx`) the question is answered:
+create the D3D11 device → create the shared staging texture plus one plane pair (`sk_video_d3d_probe`) →
+only if all of that succeeds is the decoder **re-opened** as D3D11VA. One `av_seek_frame` returns to the
+head of the file through the normal seek path (drop image, clear queue, `as_audio_live_rewind`), so the
+only repeated work is that single primed frame — **the stream is never restarted**, and the
+`NetStatus`/`onMetaData` sequence is untouched.
+3. Probe fails, device cannot be created, or the decoder refuses the stream (a profile the driver will not
+take) ⇒ stay in software with `hw_refused=1` (`AS_VIDEO_DEBUG` prints which one). Asked once per stream;
+a program with no renderer (the headless example) never asks.
+
+Two counter-examples shaped this:
+
+- **Committing to the GPU at `open` is wrong**: on a machine without a renderer it lands on "hardware works,
+zero copy does not", i.e. readback — measured 13.4 ms/frame against software's 6.6 ms, an optimisation that
+makes things twice as slow.
+- **One device per stream, not two**: the device created by the probe must be the one the decoder uses. An
+earlier version released it, re-opened, and created a second one — which cost **two zero-copy table entries
+per stream**, so the 4-entry table filled up on the third `NetStream` (measured: `[zc] no free stream
+entry`, and that stream silently fell back to readback).
+
+Three routes with one binary ("default" = no `AS_VIDEO_*` set):
+
+| | CPU cost per frame | App frames | Worst frame interval | Frames shown |
+|---|---|---|---|---|
+| 4K HDR10+ default (= zero copy) | `copy=0.26` + `conv=0.02` ≈ **0.28 ms** | 1180 / 20.1 s ≈ 58.7 fps | 32 ms | 475 |
+| 4K HDR10+ `AS_VIDEO_DECODE=soft` | ≈ 6.6 ms | ≈ 58.8 fps | 44 ms | 484 |
+| `examples/video-headless.as` default (no window ⇒ software) | — | — | — | 24 assertions green |
+
+With no window there is no D3D11 device at all: `grctx == NULL` leaves the decision undecided (not
+"software"), so a headless program pays nothing and a windowed app that paints later still gets the GPU.
 
 ---
 

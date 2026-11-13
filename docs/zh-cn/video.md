@@ -753,7 +753,7 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
 | V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16；4K 素材的代价拆分见 §16.7） |
 | V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
-| V3 | **Windows D3D11VA 后端 + 零拷贝上屏**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— 解码与零拷贝已完成（§16.8、§16.9），默认仍软解待自适应；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
+| V3 | **Windows D3D11VA 后端 + 零拷贝上屏 + 自适应默认**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— 解码、零拷贝与自适应默认均已完成（§16.8、§16.9）；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
 | V5 | **publish 输出面（写）**：`NetStream.publish()` + `appendBytes()`（AIR 原生 API，可绕过采集设备直接堆已编码数据）+ `flv` 封装 + 硬编 H.264/AAC + `rtmp`/`rtmps` 推流；构建侧已在 V0 付完（§6.1） | 用 `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` 当收流端做可重复验收；`appendBytes` 路径不依赖任何采集设备；缺硬编的机器必顶报明确错误（不静默） |
 | V6（增强，opt-in） | `all` 档（VVC、`libdav1d`、DASH 需 `libxml2`）、多音轨/字幕轨选择、`StageVideo` | 明确标注为增强，默认不启用 |
@@ -1086,7 +1086,8 @@ av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0);  // rc=0 
 
 在这条链做完之前，**默认软解是正确的工程选择**；`AS_VIDEO_DECODE=hw` 留给「CPU 解码撑不住、GPU 有余」
 的机器，作为可回退的 A/B 通道（`examples/video-headless.as` 24 项断言在两种模式下都是全绿）。
-默认是否翻成硬解，见 §16.9.5 的实测与 §16.9.6 的下一步。
+默认是否翻成硬解：**已经翻了**——`AS_VIDEO_DECODE` 未设即自适应（能零拷贝就硬解），
+判据与时点见 §16.9.6；缓存本机实测三路对照也在那里。
 
 #### 16.8.4 复现命令与一个构建坑
 
@@ -1177,18 +1178,42 @@ P010 用 sws 降到 8-bit I420，却仍按 10-bit 矩阵（`kBT2020_10bit_Limite
   `examples/video/video.build.json` 的 `${win:…}` 里）；其他构建里 `sk_video_d3d_image` 是静态
   兜底函数，返回 NULL，**不改变任何行为**。
 - 运行时 `AS_VIDEO_ZC=0|off` 关掉零拷贝（做 A/B 用）；默认开。
-- **默认解码仍是软解**：`AS_VIDEO_DECODE=hw` 才走 GPU。理由不是零拷贝不快，而是「什么时候可以
-  默认硬解」需要一条自适应判断——见 §16.9.6。
-- `AS_VIDEO_STATS=1` 的 `decode=` 列现在区分三态：`soft` / `d3d11va-readback` /
+- **默认解码是自适应**（`AS_VIDEO_DECODE` 未设 = `auto`）：能零拷贝就硬解，不能就软解，判据与
+  时点见 §16.9.6。`soft`/`cpu` 强制软解，`hw`/`d3d11va` 强制硬解（不要求零拷贝）。
+- `AS_VIDEO_STATS=1` 的 `decode=` 列区分三态：`soft` / `d3d11va-readback` /
   `d3d11va-zero-copy`，并多两列 `zc=<帧数>` `starved=<饿死次数>`。
 
-#### 16.9.6 下一步：默认翻成硬解的条件
+#### 16.9.6 自适应默认：软解起步、首个帧边界翻牌
 
-零拷贝存在的前提是「有 D3D12 设备、共享纹理与共享 fence 都建得起来」。这三件事在 `open` 时都还
-不知道（GPU 上下文可能到第一帧才存在），所以现在不做自适应默认，免得落到「硬解可用但零拷贝不可用」
-的机子上反而比软解慢一倍（回读 13.4 ms vs 软解 6.6 ms）。
-要做的是：首帧若零拷贝返回 NULL 且存在 GPU 上下文，就用软解**重开**该流（一次性代价），
-之后不再尝试；这条做出来才把默认翻成 `auto`。在此之前，`AS_VIDEO_DECODE=hw` 是显式选择。
+判定难点在于**两件事的答案出现在不同时刻**：硬解开不开在 `open`，零拷贝能不能用要看
+`GrRecordingContext`（窗口渲染上下文），而 `open` 时它根本不存在。所以：
+
+1. **`open` 一律软解开解**并**预解一帧**。预解不是可选项：`play()` 之后立刻
+   `BitmapData.draw` 必须不是黑的（这条是回归钉），而那时没有渲染器可供判定。
+2. **第一个帧边界**（`as_video_tick` 拿到非 NULL 的 `grctx`）回答那个问题：建 D3D11 设备 →
+   建共享 staging + 一对平面纹理（`sk_video_d3d_probe`）→ 全通才把解码器**重开**成 D3D11VA。
+   一次 `av_seek_frame` 回到片子开头（复用正常 seek 路径：丢图、清队列、`av_audio_live_rewind`），
+   所以重复的只有那一帧预解，且**流不重开**、`NetStatus`/`onMetaData` 序列不变。
+3. 探针不过、设备建不出来、或解码器不接（驱动不支持该 profile）⇒ 留在软解，`hw_refused=1`
+   （`AS_VIDEO_DEBUG` 会打印原因）。每流只问一次；没有渲染器的程序（无头示例）永远不问。
+
+两个反例决定了这个形状：
+
+- **不能在 `open` 直接硬解**：在没有渲染器的机器上会落到「硬解可用、零拷贝不可用」= 回读，
+  实测 13.4 ms/帧，比软解的 6.6 ms 慢一倍，等于把优化做成负优化。
+- **不能每流建两台设备**：探针里建的设备必须留着给真正的解码器用。早期版本探后释放、
+  重开再造一台，结果是**每流吃掉两个零拷贝表项**，4 项的表在第三个 `NetStream` 上就满了
+  （实测：`[zc] no free stream entry`，该流静默退回回读）。
+
+同一支 exe 的三条路（“默认”即不设任何 `AS_VIDEO_*`）：
+
+| | 每帧 CPU 成本 | 应用帧 | 最差帧间隔 | 上屏 |
+|---|---|---|---|---|
+| 4K HDR10+ 默认（= 零拷贝） | `copy=0.26` + `conv=0.02` ≈ **0.28 ms** | 1180 / 20.1 s ≈ 58.7 fps | 32 ms | 475 |
+| 4K HDR10+ `AS_VIDEO_DECODE=soft` | ≈ 6.6 ms | ≈ 58.8 fps | 44 ms | 484 |
+| `examples/video-headless.as` 默认（无窗口 ⇒ 软解） | — | — | — | 24 断言全绿 |
+
+无窗口时不会去建 D3D11 设备：`grctx == NULL` 就不升级，判定保持未决，无头程序一分钱不花。
 
 
 ---
