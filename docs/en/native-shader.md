@@ -28,10 +28,12 @@
 > landed in stage 358 (§6.11) — wasm consumes the GLSL ES 3.00 source verbatim while native still goes
 > through glslang + SPIRV-Cross; **M7 Ultra-Water alignment** landed on the engine side in
 > `apps/ocean-m34` (86 passes/frame, 7 self-checks all PASS).
-> **Still not done**: **M5 D3D12/HLSL** (float `DXGI_FORMAT` + native HLSL compilation in `stage3d_d3d.cc`),
-> and `sampler2DShadow` comparison sampling for depth textures (the contract currently stands at "depth =
-> render attachment"). Work breakdown and per-item as-built notes (including the four real defects exposed
-> during landing) are in [`native-shader-plan.md`](native-shader-plan.md).
+> **M5 D3D12/HLSL** has landed and been accepted on real hardware (2026-11-14, §6.12): the
+> same `shader-m30` passes all 15 checks and reads back `#804020` in an AOT Windows build.
+> **Still not done**: `sampler2DShadow` comparison sampling for depth textures (the contract
+> stands at "depth = render attachment"), and offscreen MSAA on this backend (§6.10, rejected
+> loudly). Work breakdown and per-item as-built notes are in
+> [`native-shader-plan.md`](native-shader-plan.md).
 
 ---
 
@@ -582,6 +584,92 @@ line noting that edges stay single-sampled.
 
 ---
 
+### 6.12 The D3D12/HLSL passthrough arm (M5, 2026-11-14)
+
+The third arm of the native channel: the same GLSL ES 3.00 source on `stage3d_d3d.cc`, through
+glslang -> SPIR-V -> SPIRV-Cross -> **HLSL** -> `D3DCompile`. **Acceptance**: an AOT Windows build of
+`apps/shader-m30` passes all 15 checks, and `drawToBitmapData` reads back `#804020` at the centre and
+`#31190c` three-eighths across -- the two sample points of `uColor.rgb * vUV.x`, bit-identical to the
+Metal arm.
+
+**Why the channel needs only two new things.** A native program is an ordinary `S3DProg`: `s3d_compile`
+keys and caches it by the same FNV-1a source hash, it goes through the same PSO cache, the same
+`TEXCOORD{slot}` input layout and the same `register(b0)` root signature, and what `D3DCompile` receives
+(`vs_main`/`fs_main` plus HLSL text) has exactly the shape the AGAL path already produces. The one thing
+AGAL had for free is a 256-register file whose lanes the compiler knew at build time, so the additions are
+exactly two:
+
+- **the byte offsets inside `$Globals`**, answered by `D3DReflect` (`s3d_native_reflect_stage` plus
+  `s3d_native_resolve` joining by name). Hand-computed offsets are not an option: HLSL packs a cbuffer by
+  its own rules (a `float3` is followed by a float, matrix rows are 16-byte aligned), so a guessed offset
+  compiles, samples the wrong lane, and reports nothing at all;
+- **one staged block per stage** (a whole `S3D_CB_REGION`), memcpy'd into the bump allocator shared with
+  the AGAL path before the frame's first draw. Sharing one allocator is deliberate: the two channels never
+  draw at the same time.
+
+`s3d_native_layout` is mandatory on this backend (on Metal the bindings are already baked into
+`[[buffer(N)]]` and it is a no-op), but all it has to do is match names to offsets; `s3d_native_uniform`
+matches on `(kind == uniform, stage, slot)`, writes, and clamps to the variable's byte size.
+
+**Five real defects, all of the "compiles and produces the wrong/empty picture" kind** (each measured):
+
+1. **Combined image-sampler bindings all collapse to 0.** Every sampler
+   `build_combined_image_samplers` creates carries no binding decoration in OpenGL mode, and
+   `spvc_hlsl_resource_binding` is keyed on `(set, binding)` -- so two textures were pinned to the same
+   `t1`. Fix: `set_decoration(SpvDecorationBinding, i)` before generation, then set
+   `srv/sampler.register_binding` from the same `i`.
+2. **GLSL ES 3.00 attributes carry no Location decoration.** glslang only emits one for
+   `layout(location=N)`, and `spvc_compiler_get_decoration` answers 0 for a missing decoration -- so
+   `in vec3 aPos; in vec2 aUV;` reflected as **aPos=0 and aUV=0** while SPIRV-Cross actually wrote
+   `aPos : TEXCOORD0, aUV : TEXCOORD1`. A host binding streams by the reflected slot fed one stream twice.
+   Fix: a **two-pass** location pinner before code generation (collect the undecorated inputs ranked by
+   SPIR-V id, then write them all; a one-pass version makes the just-ranked input look decorated).
+3. **HLSL matrices must be declared `row_major` (the expensive one).** SPIRV-Cross translates GLSL
+   `M * v` into `mul(v, M)`, which is only equivalent when the matrix arrives **transposed**; this project
+   (and the Metal arm, the AGAL arm, three.js convention) uploads **column-major** bytes, so the product
+   silently became `M^T v`. An identity-ish quad matrix hides it; a real camera matrix pushes the scene out
+   of clip space: **empty frame, no `D3DCompile` error, PSO builds fine, every uniform reads back
+   correct**. Three probes pin it down: `uColor` into the fragment shader -> correct pixel; replace the
+   vertex position with `vec4(aPos*0.5, 1.0)` (no matrices) -> picture returns immediately; read `M[3].z`
+   and `M[2].z` -> values all correct. Fix: add `row_major` to the HLSL matrix **declaration** lines in the
+   shim (data and multiplication untouched), so the same column-major bytes read as the transposed matrix
+   and `mul(v, M)` becomes `M * v`. The AS-side contract then matches the Metal arm exactly, and nested
+   products stay consistent (HLSL's `mul(A, B)` is the logical product whatever the storage class is).
+4. **`skia.lib` bundles its own SPIRV-Cross.** `llvm-ar t` lists
+   `spirv_cross.spirv_{glsl,msl,hlsl,reflect,...}.obj`, so linking it beside our freshly built
+   `spirv-cross-glsl.lib` dies on `duplicate symbol: spirv_cross::CompilerGLSL::emit_resources`. Skia has
+   **no** `spirv_cross_c.obj` (the C dispatcher is not in it), so the fix is
+   `-DSPIRV_CROSS_NAMESPACE_OVERRIDE=asc_spvc` in `build-tools/shader/build-win.sh`: our C++ backends move
+   into the `asc_spvc` namespace while the `extern "C"` `spvc_*` entry points (absent from Skia) are
+   unaffected. `src/build.ts` compiles the shim with the same define.
+5. **The PSO's `RTVFormats[0]` must be the target's real DXGI format.** The native channel can create a
+   target in any format (§6.1 layer 2), and `CreateGraphicsPipelineState` **fails** -- not warns -- when
+   `RTVFormats[0]` disagrees with the bound view. The cache key therefore carries the full `DXGI_FORMAT`
+   instead of a half-float/8-bit boolean.
+
+**Capability edges (registered, never silent)**:
+
+| Item | State on this backend |
+|---|---|
+| Colour attachments | **One.** `s3d_native_use` refuses `ncolor > 1` up front and says so (the PSO binds a single RTV, so a program declaring `SV_Target1` cannot be built at all) |
+| `setRenderTargetSamples` | **Reports unsupported**, targets stay single-sampled (multisampling needs a multisampled resource plus a resolve pass interleaved with the pass chain, not a per-texture switch) |
+| `generateMipmaps` | D3D12 has no blit-style generation (D3D11's `GenerateMips` is gone), so it is a **CPU box filter plus per-level upload**, 4-byte BGRA8 only; other formats are reported rather than half-filled (a half-built chain lets a mip-sampling draw read uninitialised levels) |
+| Explicit `cbuffer` | Only loose uniforms in `$Globals` (b0); the shim lifts explicit blocks to b8+, which this backend has no slot for -> reported, not dropped |
+| Depth textures | Render attachment only (same rule as the rest of the project); no `sampler2DShadow` comparison sampling |
+| Float/integer targets | Supported (`s3d_create_texture_fmt` fmt ids 0..10 -> DXGI); the PSO is chosen per real format |
+
+**Build side**: `build-tools/shader/build-win.sh` takes `ARCH=32|64` (-> `windows-x86` / `windows-x64`),
+and Windows archives must be named `NAME.lib` (**no `lib` prefix**, because MSVC's `-lNAME` appends
+`.lib`). Two other pieces of one-link-list-four-hosts housekeeping: (1) this build folds glslang's
+`MachineIndependent` / `GenericCodeGen` / `OSDependent` into `glslang.lib`, while the macOS archive set
+keeps a **one-member stub archive** for each (`libMachineIndependent.a` is literally `stub.cpp.o`) -- do
+the same, or any list that names the whole set (such as `examples/native-shader-probe.build.json`) dies on
+Windows with `could not open 'MachineIndependent.lib'` before a single symbol is resolved; (2) that example
+manifest pinned `../vendor/shader/lib/macos-arm64` and needed a separate zlib on Windows -- it is now
+`${host}` plus `${win:z}`, so one manifest works on all four hosts.
+
+---
+
 ## 7. AS side (asaot3d) work list
 
 The AS side is the engine: wire the compiler's pipe into a three.js-style author API. This section first
@@ -756,6 +844,320 @@ detour, not the goal (`AGENTS.md` §0: do not detour).
 
 ---
 
+### 7.10 First real client: `apps/nyc-m36` (as-built, 2026-11-14)
+
+`shader-m30` proved the channel runs; nyc-m36 proves **a real scene — 39 meshes, 365k triangles, a material
+switch every draw — runs through it**. The shape is *mirror, don't rewrite*: `CityNativeSet` keeps each
+`MeshStandardMaterial` original, `mirror()` builds a `ShaderMaterial` with the same fields, and `sync()` copies
+the originals' fields into uniforms every frame (in-place `put3`, no allocation). `City.setNight()` keeps
+mutating the originals; the mirrors only consume that output.
+
+**Four real defects hit while wiring it** (all of the "drew, but drew something else" kind — none was a compile
+or link error):
+
+1. **mip drop 94 → 0: AGAL's `t0..t7` rebind stomps the native samplers.** `Context3D_submit` resumes the AGAL
+   program's sampler table by rebinding `t0..t7`; a native draw goes through the same submit point, so the
+   freshly bound native textures were replaced with what the AGAL program believed. The fix splits the submit
+   point into `Context3D_submit_ex(..., int keepTextures)` and passes `1` from the native draw (in `src/emit.ts`).
+2. **Native → AGAL shader pollution: `$Globals` read as `vc[]`.** The first AGAL draw after a native one read
+   the previous frame's native constant block as the AGAL register file, producing a screenful of wrong colour
+   that then recovered.
+3. **The expensive one: making "native drew" a persistent flag hands the AGAL lazy compile a mid-sequence fire
+   order.** To skip `$Globals`, an `as_s3d_native_drawn` static was added inside `Context3D_submit_ex` and
+   consumed by `Context3D_submit`. But a native draw enters `submit_ex` **directly**, the flag was never
+   cleared, so the AGAL lazy compile fired **halfway through the same draw sequence** — walking the only
+   `nativeMode = 0` in `s3d_compile` — and **30 of 31 city draws fell back to AGAL semantics**: 3 fps, half the
+   picture wrong. The correct fix invalidates the AGAL cache inside the native draw instead: gate the lazy
+   compile on `!keepTextures` and drop `self->context->gpuProgram = NULL;` at the end. Measured after the fix:
+   `draws 251 nat1 155` per frame, first-frame pattern `0 0 111…1 0 1 0…` = one AGAL sky draw → 30 native city
+   draws → the remaining AGAL traffic/crowd/sky.
+4. **`uAlphaTest` was delivered but the fragment stage ignored it.** Proven by a live histogram
+   (`uAlphaTest … [('0', 140), ('0.45', 15)]` — only leaves0/1/2 are 0.45); adding
+   `if (alpha < uAlphaTest) discard;` removed the leaves' hard edges.
+
+**Two non-defects, recorded so nobody re-litigates them:**
+
+- **The ground bbox `[-8000,8000]²` with z=0 is not a bug**: `PlaneGeometry(16000,16000,1,1)` is a plane in
+  **local XY**; `mesh.rotation.x = -Math.PI*0.5` lays it flat. The probe reads local coordinates.
+- **`[nmat] color=undefined` is not a bug**: `uniforms["uColor"].value` is a `Vector.<Number>` (written by
+  `put3`), so `.x` is undefined; the upload still sends three floats via `_toNumbers`.
+
+**One root cause behind two "open defects", now fixed (the most expensive item in this section).** The
+symptoms were: 1.5 fps (the same scene in pure AGAL: 59.9), the building **adjacent to the camera at street
+level not appearing**, and occasional huge black wedges on the roofline. All three pointed at
+`S3D_MAX_PROGRAMS`, which was **16** while nyc-m36 keeps **35** programs alive in one frame (24–31 native
+materials plus the AGAL programs that frame still draws with). The LRU therefore **evicted the whole pool
+every frame**:
+
+- `s3d_compile` re-ran `D3DCompile` 35 times per frame and `s3d_select_pso` re-created the pipeline 35 times
+  per frame ⇒ 1.5 fps;
+- a slot was recycled **within the same frame**, and `s3d_prog_release` freed the blob / PSO of the program
+  that was still being drawn ⇒ that draw vanished (the near building, and the stray black triangles).
+
+The discriminator is one field: `comp=` in `S3DDRAW` (`c->statCompiles`) **grew by exactly 35 every frame**.
+Raising the cap to **96** stops it at 35; measured **59 fps**, and the near building plus the wedges went
+away along with the eviction. The pool is a static array (~4.3 KB of PSO-variant cache per slot), so the cap
+is **memory, not time**: 96 slots ≈420 KB per context, and it costs nothing until programs exist.
+
+**What the 9 remaining AGAL draws are.** The native channel mirrors `MeshStandardMaterial`; the sky dome,
+billboards, lamp heads, subway entrances and crowns are `MeshBasicMaterial` (unlit) — they must not go through
+PBR, and AGAL's basic program is their correct home. `calls=` counts AGAL draws only, so 50 → 19 → 9 as the
+channel took over is a **decrease**, not "the native channel is unused".
+
+**Two more real defects, fixed while wiring traffic and crowd:**
+
+- **Traffic and crowd never joined the native set.** `CityNative.install()` walked `_city.root` only, while
+  `Traffic`/`Crowd` create their meshes slightly later in the same frame — so their `MeshStandardMaterial`s
+  kept drawing through AGAL (most of the measured 19 AGAL draws per frame). The walk is now
+  `CityNative.addTree(set, root)`, called again once those roots exist.
+- **Dynamic geometry allocated a `VertexBuffer3D` every frame.** `_ensureBuffers` / `_ensureAttributeBuffer`
+  used to recreate on any version bump, and the car/pedestrian arrays change **every frame** ⇒ one D3D12
+  resource creation per mesh per frame. Now the same-size case re-uploads in place and only a size change
+  rebuilds.
+- AS3 trap worth recording: material dedup needs a `Dictionary`, **not `{}`** — Object keys are coerced to
+  strings, so every material landed in one `"[object Object]"` slot (measured: `install()` reported 1).
+
+**Instrumentation kept in the tree** (all behind env vars): `ASC_S3D_DUMP=1` prints
+`S3DNAT`/`S3DNATUP`/`S3DDRAW`/`S3DU`/`S3DB`/`S3DF`/`S3DL`/`S3DM`/`S3DV`/`mip-drop`;
+`ASC_NATIVE_DUMP_BINDINGS=1` prints `[pin]`/`[bindings]`. To isolate one mesh, filter by `mesh.name` prefix
+inside `NativeShaderRenderer._drawShaderMaterial` and give each mesh a constant colour (`[pcol]`); **always
+confirm the screenshot came from the process this run started** — a leftover window turns "bit-identical A/B"
+into a false conclusion.
+
+---
+
+
+### 7.11 Wrap-up: the non-PBR materials join the native channel too (`calls=0`, 2026-11-14)
+
+After §7.10 the frame still had nine AGAL draws: sky dome, billboards (LED walls), lamp heads,
+subway mouths and the Empire State crown. All of them are `MeshBasicMaterial`, so the first call
+was to leave them on AGAL "because they need no lighting". That call was wrong, and the reason is
+the state machine rather than image quality: alternating AGAL and native draws inside one frame
+means every switch back re-enters `Context3D_submit`, which rebinds the AGAL program's t0..t7,
+re-validates sampler flags and can fire the AGAL lazy compile -- exactly the accident that cost
+3 fps in the previous stage (§7.10 defect 2). With the last nine draws on the native path the
+frame has a single renderer, and `calls=0 / tris=0` becomes the cleanest possible proof that
+nothing fell back.
+
+The shape: `CityNative` gains `UNLIT_VS`/`UNLIT_FS`; `CityNativeSet` gains
+`mirrorBasic(MeshBasicMaterial)` plus a separate `basicMaterials` list (a lit mirror needs twenty
+uniforms, an unlit one nine -- folding them into one loop turns `sync()` into a `hasOwnProperty`
+sieve). `CityNative.addTree()` now takes both kinds, and `NycM36` walks `_scene` once after
+traffic and crowd have had their first `update(0)` (the sky dome hangs off `_scene`, not
+`_city.root`; `mirror()` dedups on the source material, so re-walking the city is a no-op).
+
+**Readings** (preset 1 street at 15:30 / preset 2 Times Square at 21:30): `calls=0 tris=0`,
+**59.7 fps / 62.9 fps**, 43 native materials (32 lit + 11 unlit), `comp` no longer grows,
+zero `mip-drop` lines. At night the three LED walls (green/yellow/blue), the lit shopfronts and
+the lit facades all emit correctly.
+
+**Pitfalls hit (all real defects, none of them configuration)**:
+
+1. **ACES must not be applied to the unlit pass.** The first version copied the lit tail
+   (fog -> ACES(exposure) -> sRGB) and the sky immediately washed out: the same pixel went from
+   `(166,195,217)` to `(199,219,233)`, losing about thirty code values of blue. These surfaces
+   carry colours that are *already* display-referred (the sky gradient is painted straight into a
+   BitmapData, the LED walls and shop fascia are sRGB bitmaps, a lamp head is one flat value), so
+   tone-mapping them is a second exposure. Straight multiply + fog mix + direct output restores
+   pixel-for-pixel equality with the pre-migration frame. Related: the unlit FS must **not**
+   declare `uExposure` -- the compiler drops unused uniforms and
+   `as_shader_set_uniform_vec` throws `ArgumentError 2008` for a name that is not there.
+2. **Anchor-shape lesson: include the const name when patching shader source.** I anchored on
+   `uniform float uExposure; + out vec4 fragColor; + const float PI` to rewrite the unlit shader,
+   but the lit FS contains the identical three lines earlier in the file, so `index()` hit the lit
+   one and deleted its helpers and `main` (symptom: only sky colour on screen, `calls=0` yet no
+   lit draw at all). Recovery used the copy taken for the HLSL probe
+   (`temp/shc-city/city_shaders.h`), and was only accepted after a pixel check: 6/6 sampled lit
+   points byte-identical to the pre-migration frame.
+3. Rebuilding the lit FS had one more detail: `acesFilmic` does **not** carry a `1/0.6` pre-scale
+   (`uExposure` already receives `exposure/0.6`). Adding the pre-scale "because three.js puts it
+   in the operator" measured 1.5x too bright in the midtones (47->72); removing it restored the
+   baseline immediately.
+
+### 7.12 Environment probe: the specular half of IBL, for free from the sky dome (2026-11-14)
+
+nyc-m36 carried a self-imposed rule for a long time: the README said metalness must stay 0 because
+the build has no environment map. That was true in the AGAL era -- an equirectangular lookup meant
+hand-writing a spherical reprojection in AGAL and spending a sampler slot that was already gone.
+Once the native channel exists the rule is pure inertia: `CityNative.FS` can write any GLSL, and a
+`reflect` plus one `atan/acos` is all it takes.
+
+Three steps, all on the AS3 side:
+
+1. The sky dome's own `BitmapData` is already equirectangular (`SphereGeometry` uvs are longitude/
+   latitude), so it is bound as `uEnvMap` directly -- no separate bake for reflections.
+2. `CityNative.FS` adds a specular term after the diffuse: `reflect(-V, N)` ->
+   `(atan(R.z,R.x)/2pi+0.5, acos(R.y)/pi)` -> `srgbToLinear(texture(uEnvMap, euv).rgb)`, times
+   `F_Schlick(f0, N.V)`.
+3. `CityNativeSet.sync()` writes `uEnvMap` / `uHasEnv` / `uEnvIntensity` every frame; the handle comes
+   from `SkyRig.skyTexture` (a new getter) and is re-assigned per frame so a sky repaint follows.
+
+`calls` stays 0: the probe is the 21st uniform of the same native program, not a second draw path.
+
+Three measured boundaries -- do not step on them:
+
+- **The probe supplies the specular half only, never irradiance.** An earlier build added
+  `diffuse * 0.35` and lifted the whole-frame mean from 46 to 54: in three.js IBL and `AmbientLight`
+  are separate inputs, while here both come from the same sky, so that counted the ambient twice.
+- **Metalness cannot borrow energy from the probe.** Raising the curtain wall to metalness 0.55
+  dropped the frame mean **46 -> 31**: the half of the diffuse that `albedo * (1 - metalness)` takes
+  away cannot be repaid by one unblurred sample. Glass therefore keeps `metalness = 0` and gets its
+  sheen from `roughness` (0.42 -> 0.30).
+- **`envIntensity` keys off roughness only.** `0.06 + 0.94 * (1-roughness)^2`: glass at 0.30 gets
+  0.52, masonry at 0.92 gets 0.066, asphalt at 0.90 gets 0.07. The 0.06 baseline was 0.12 until every
+  brick wall picked up a grey-blue veil.
+
+The asphalt numbers are measured, not guessed (same camera, same hour; whole-frame mean, reference
+`ref-default.png` = 61):
+
+| asphalt roughness / metalness | frame mean | reading |
+|---|---|---|
+| 0.62 / 0.16 | 61 | the avenue washed out white: Fresnel is 1 at grazing angles and half the road is grazing |
+| 0.78 / 0.05 | 35 (**bogus**, see below) | -- |
+| 0.90 / 0.03 | 60 | wet without blowing out, still picks up sky at grazing angles |
+
+**The instrument trap that inverts conclusions:** if a Windows Security dialog is parked on top
+while you screenshot, the whole window is darkened by a **~0.58 multiplicative factor** -- sky
+`(156,150,139)->(94,93,90)`, brick `(43,48,50)->(25,28,29)`, road `(180,179,175)->(104,105,103)`, all
+the same ratio. "Raising roughness made it darker" is a false reading under that. Procedure: bring the
+target process to the foreground with `SetForegroundWindow`, confirm no modal dialog, then read the
+mean; when comparing single pixels, also sample a region the renderer cannot affect (e.g. HUD
+background) and check whether it moved by the same ratio.
+
+### 7.13 Native shadow pass: an R32F shadow map, and the canyon finally has building shade (2026-11-14)
+
+After §7.11 brought the unlit surfaces into the native channel, one engine gap dominated nyc-m36:
+**no sun shadows**. Half the reference (slop-newyork) image is the slice of building shadow thrown
+across the road; our road averaged 155 against the reference's 55 -- the light/dark relationship was
+inverted. The old AGAL shadow pass fails on D3D12 because **the fs4 binding never lands**: the lookup
+returns one position-independent constant (bias / normalBias sweeps left the frame byte-identical, see
+TODO stage 411). With the demo no longer on AGAL, the shadow becomes the native channel's own render
+target. New file: `apps/nyc-m36/src/city/CityShadow.as`.
+
+**Why R32F.** `Context3DNative.createTexture(w, h, "r32f", true, false)` makes a renderable
+`R32_FLOAT` surface; `s3d_select_pso` keys the pipeline on the target's **full DXGI format**, so the
+depth program gets its own R32F PSO for free. One float per texel IS the light-space depth -- no AGAL
+RG packing, no 8-bit banding (256 levels over a 3 km ortho range is ~12 m per step, i.e. acne on every
+wall). This is a direct dividend of the native channel over AGAL.
+
+**Conventions verified against source, not guessed.** The engine's `Matrix4.makeOrthographic` is
+Stage3D **[0,1] depth, Y-up NDC**; `stage3d_d3d.cc` uses a positive viewport height (no shader Y flip)
+and an RT's texel (0,0) is its **top-left**. So NDC (nx,ny) lands at uv ((nx+1)/2, (1-ny)/2): the bias
+matrix's **Y column = -0.5**, the same top-left convention as Metal (the note in
+`AGALRenderer._setShadowBiasMatrix`); the Z column stays identity (depth is already [0,1], do not
+remap). The old path broke on the binding, **not on this math**.
+
+**Implementation notes:**
+
+- Two position-only programs: `SOLID` writes only `gl_FragCoord.z`; `CUTOUT` samples the base-color
+  alpha for alphaTest (otherwise every tree casts a solid rectangle). The VS declares only `uLightMVP`
+  (= shadowVP * modelWorld, uploaded per caster) and **no auto uniform**, so the pass does not depend
+  on the renderer having a current camera -- it runs in `updateFrame`, before `render()`.
+- The light camera reuses `sun.shadow.camera` (the ortho frame `SkyRig.setFocus` already sized for the
+  shot), sits at the sun and looks at its target.
+- Solid casters cull front faces (store the far wall of a closed box so its lit face does not
+  self-shadow); double-sided leaf quads render both faces.
+- `CityNative.FS`'s `shadowTerm`: offset the world position along the normal by `normalBias` (world
+  units) before projecting, nudge the compared depth by a constant `bias`, soften with **3x3 PCF**;
+  the map itself is **point-sampled** (interpolating two depths across a silhouette is wrong), the
+  softening comes from averaging nine binary comparisons. Only the sun term is shadowed (the fill is
+  the shadowless sky stand-in); outside the light frame the term is 1, and fog hides the cascade edge.
+- **`sun.castShadow` stays false forever** -- that flag drives AGALRenderer's own (broken-on-D3D12)
+  prepass; the panel's `shadows` knob drives CityShadow. Keeping them apart is what keeps `calls=` 0.
+  `NycPanelState.shadows` now defaults to **true**.
+
+**Measured (same viewpoint, grey mean; `calls=0 tris=0` unchanged):**
+
+| view | reading |
+|---|---|
+| street, day | road **155 -> 88**, with lateral structure: left (sunlit) ~108, right (building shade) ~65, a clean diagonal shadow edge; contact shadows under cars |
+| helicopter aerial | towers throw long crisp shadows across the grid; neighbouring roofs carry shadow shapes |
+| Times Square night 21.5h | no regression; lit windows / LED walls / shopfronts intact |
+
+**The spatial structure** is what decisively separates a real shadow from the old bug's
+"constant everywhere". All three views log `[CityShadow] native R32F shadow map 2048x2048, 16
+casters` (the city is welded geometry: 16 = building chunks + car bodies + crowd).
+
+**Still owed:** tree canopies do not cast (`leaves`/`trunks` have `castShadow=false`, a content gap);
+the shaded road at ~65 is still brighter than the reference's ~32 (an ambient/fill balance issue, not
+a shadow bug); the road's planar reflection is not done.
+
+### 7.14 Planar reflection on the road: a mirror camera plus a screen-space lookup (2026-11-15)
+
+The environment probe of §7.12 can only supply the **sky half** of a specular term -- there are no
+buildings, no lane markings and no tail lights in it. The reference's wet street is made of exactly
+those, so the last piece is a **real mirror pass**: `apps/nyc-m36/src/city/CityReflection.as`.
+
+**The structure in one line.** A genuine mirror camera (position and forward reflected across
+`y = 0`) renders the whole scene into a **half-resolution** RGBA8 target; `CityNative.FS` fetches it
+on the asphalt at `gl_FragCoord.xy / uResolution` and blends it in by Fresnel. The half resolution
+does not shift anything (the uv is normalised), it only blurs more -- which is what a rough wet road
+wants anyway.
+
+**Why no texture matrix is needed.** The road **is** the mirror plane `y = 0`. Any point P on that
+plane projects to the **same pixel** in the real camera and in its reflection (a reflection fixes
+every point of the plane), so the mirror target is already aligned and the screen uv can be used
+directly.
+
+**Why a lookAt camera instead of a reflection matrix.** Reflecting `camera.matrixWorld` across
+`y = 0` yields a left-handed frame (determinant -1) which **flips the winding of every face**, and
+would need a per-pass cull flip in `render()`. A real right-handed camera instead (position
+reflected, `up` reflected to `(0,-1,0)`, looking at the reflected forward point) sees the scene from
+below with correct winding, and `render()` culls it exactly like any other camera.
+
+**No feedback.** While the mirror pass draws, the road's own `uHasReflection` is forced to 0 -- else
+it would sample the very target it is drawing into.
+
+**Display-space blend.** The mirror target has already been tone-mapped and sRGB-encoded by the
+**same** `CityNative.FS`, so the blend happens **after** the tone map (mix in sRGB); otherwise the
+reflection would be mapped twice.
+
+**Wet asphalt is not a mirror -- two deliberate non-idealities:**
+
+- **Vertical smear**: four extra taps offset along `uv.y` (weights 0.2/0.2/0.1/0.1), the offset
+growing up to 3x with `vDepth`. The micro-roughness of a wet surface stretches a reflection along
+the view direction, and at standing height that direction **is vertical** on screen.
+- **Wetness mask**: two octaves of a value noise over `world.xz` (`smoothstep(0.34,0.72)` -> 0.30..1.0).
+  It uses **world** coordinates, not screen ones: a screen-space pattern swims as the camera moves.
+
+**The double count that had to go.** The road carried both the environment probe's specular term
+*and* the planar reflection, and both approximate the **same reflected sky** -- the probe term was
+counted twice. So `envW = 0` whenever `uHasReflection != 0`; the probe now serves only the surfaces
+with no mirror pass (i.e. all the rest). Same discipline as §7.12's "probe supplies the specular
+half, never add diffuse", one term further along.
+
+**A content trap fixed along the way.** The base colour `0x4a4e52` in `CityTextures.asphalt()` is
+**dead code**: the 2x2 noise loop right after it covers the whole 128x128 with
+`scaleColor(0x5d6063, k)`, which is why changing the base measured as *no change at all*. The
+literal that actually reaches the texture is the one in the loop, now `0x4b4f53`.
+
+**Measured (one 65,194-pixel road mask, taken from the reflection-on/off difference; `calls=0
+tris=0` unchanged):**
+
+| configuration | road mean | frame mean |
+|---|---|---|
+| no reflection, probe on, albedo `0x4b` | 57.0 | 56.4 |
+| no albedo contribution (black map), probe on | 41.9 | 55.7 |
+| reflection + probe (double count), strength 0.60 | 40.7 | 55.4 |
+| **final: reflection + `envW=0`, strength 0.45, blur 0.0046** | **36.3** | **55.3** |
+| night, Times Square 21.5h | 31.6 | 46.4 |
+
+The reference (golden hour) road sits around 35..59. **The black-map row is the decisive evidence**:
+a road with a black albedo still reads 41.9, so most of the original brightness came from the
+**albedo-independent probe specular**, not from sun-plus-albedo. That is also why nudging the asphalt
+colour alone did nothing (81.8 -> 79.7), and why dropping the probe took the road from 57 to 40 in
+one step.
+
+**Switches**: besides the panel's `shadows`, `R` now toggles `reflection on/off` (HUD line);
+`_reflectionOn` defaults true. First frame traces `[CityReflection] native planar reflection
+693x411 (half of 1386x823)`.
+
+**Still owed:** the reference street lies entirely in building shade (low sun, warm grazing light)
+while our default 15:30 puts the sun at 37.9 deg with the street in direct light -- that is a
+**lighting-rig balance** (sun elevation / colour temperature / ambient ratio), not a defect of the
+reflection or the shadow; and facade window recesses, fire escapes, road patches/cracks/manholes are
+still low-poly **content**.
+
 ## 8. Red line: AOT-only, reported honestly on the AIR side
 
 **This chain cannot run on AIR (adl)** — Adobe's `Context3D` has neither float RT nor GLSL3 passthrough. Hence:
@@ -795,7 +1197,7 @@ loudly** instead of showing a silent black screen. The landed shape is harder th
 |---|---|---|---|---|
 | **P1 · Metal only** | glslang+SPIRV-Cross into `build-tools/`; `--features native-shader` registered; `stage3d_glue.mm` gains float RT + MRT + native MSL compile; `NativeShaderRenderer` + `ShaderMaterial` | a program on screen | Metal | ✅ **M1+M2+M3 path done**: `apps/shader-m30` reads back centre `#804020` bit-exact. Not via `xcrun metal` (no offline toolchain on this machine, §3.4) but via the runtime `newLibraryWithSource:` path |
 | **P2 · the free web point** | `stage3d_webgl.cc` passes GLSL ES 3.00 through + `EXT_color_buffer_float`; the same `ShaderMaterial` runs under `--target wasm` | the same image in a browser, zero cross-compilation | WebGL2 | ✅ **landed 2026-11-03** (stage 358) — `--features native-shader` now lists both `native` and `wasm`; the two arms take different compile inputs (source verbatim vs glslang+SPIRV-Cross) |
-| **P3 · D3D12** | `stage3d_d3d.cc` gains float `DXGI_FORMAT` + native HLSL compilation | on screen on Windows | D3D12 | ❌ not done (SPIRV-Cross's HLSL half is already linked) |
+| **P3 · D3D12** | `stage3d_d3d.cc` gains float `DXGI_FORMAT` + native HLSL compilation | on screen on Windows | D3D12 | ✅ landed 2026-11-14 (§6.12; `shader-m30` 15 checks PASS, pixel `#804020`) |
 | **P4 · Ultra-Water alignment** | caustics / atmosphere LUT / underwater / foam / buoyancy, ported and compared item by item | close to the three.js reference on every item | all three | ✅ **landed (engine side)** — `asaot3d/apps/ocean-m34`: 4-cascade FFT + atmosphere LUT + caustics + planar reflection + deferred surface + spray + underwater shafts + composite, 86 passes/frame, 7 self-checks all PASS (`asaot3d/three-api-design.md` §39). Residuals against the three.js reference (direct specular 3.4x too bright, fog lift too weak) are recorded in `three-api-design.md` §29.8 / §30.7 and belong to the engine side, not the compiler DoD |
 
 **Why batch 1 is Metal only**: this machine is macOS + Metal, MSL and GLSL ES 3.00 are syntactically close, so the

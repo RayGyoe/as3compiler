@@ -7115,9 +7115,22 @@ export class SymbolTable {
         ['compress', baym({ kind: 'void' }, [{ name: 'algorithm', type: 'String', defaultValue: { kind: 'Str', value: 'zlib' }, isRest: false }])],
         ['uncompress', baym({ kind: 'void' }, [{ name: 'algorithm', type: 'String', defaultValue: { kind: 'Str', value: 'zlib' }, isRest: false }])],
         ['clear', baym({ kind: 'void' }, [])],
+        // AIR 51 base64 codec (RFC 4648 §4), measured on adl 51.4.1
+        // (temp/b64probe): toBase64 encodes the WHOLE buffer regardless of
+        // position and never moves it; writeBase64 appends at position and
+        // returns the number of new bytes. Both reject malformed input with
+        // ArgumentError #1508 and null with TypeError #2007.
+        ['toBase64', baym({ kind: 'string' }, [])],
+        ['writeBase64', baym({ kind: 'uint' }, [{ name: 'base64', type: 'String', defaultValue: null, isRest: false }])],
       ]),
       staticFields: new Map(),
-      staticMethods: new Map(),
+      staticMethods: new Map([
+        // AIR 51: equivalent to new ByteArray() + writeBase64(); the returned
+        // array's position sits at the END (measured, temp/b64probe T13).
+        ['createFromBase64', { returnType: { kind: 'object', className: 'ByteArray' }, params: [
+          { name: 'base64', type: 'String', defaultValue: null, isRest: false },
+        ], owner: 'ByteArray', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
+      ]),
       getters: new Map([
         // bytesAvailable is declared uint on IDataInput (and the C getter returns
         // unsigned), unlike `length`, which AIR types as int.

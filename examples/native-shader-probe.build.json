@@ -8,7 +8,8 @@
     "../vendor/shader/include"
   ],
   "link-paths": [
-    "../vendor/shader/lib/macos-arm64"
+    "../vendor/shader/lib/${host}",
+    "${win:../vendor/curl/lib/${host}}"
   ],
   "link-libs": [
     "spirv-cross-msl",
@@ -24,6 +25,7 @@
     "MachineIndependent",
     "GenericCodeGen",
     "OSDependent",
-    "glslang-default-resource-limits"
+    "glslang-default-resource-limits",
+    "${win:z}"
   ]
 }

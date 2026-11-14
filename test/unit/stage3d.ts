@@ -309,6 +309,42 @@ function checkStage3dDssCache(): string[] {
   return bad;
 }
 
+// The D3D12 program pool (阶段四百零七). nyc-m36 keeps 35 programs live in one
+// frame -- 24-31 native materials plus the AGAL programs the same frame still
+// draws with (the unlit sky/billboards) -- and the pool used to hold 16. The LRU
+// then evicted the entire set every frame, so s3d_compile re-ran DXC and
+// s3d_select_pso re-created the pipeline 35 times per frame: measured 1.5 fps
+// against 59.9 for the same scene in pure AGAL, and meshes whose program slot was
+// recycled mid-frame dropped out of the picture (the "building that is not
+// there"). The cap is memory (each slot is ~4.3 KB of PSO-variant cache), not
+// time, so it must stay comfortably above a real scene's live program count.
+function checkStage3dProgramPool(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const d3d = readFileSync(join(root, 'vendor', 'stage3d_d3d.cc'), 'utf8');
+  const m = d3d.match(/#define S3D_MAX_PROGRAMS (\d+)/);
+  check('the program pool is declared once', m != null);
+  check('the program pool holds a real scene (>= 64 live programs)',
+    m != null && parseInt(m[1], 10) >= 64);
+  // The eviction path must stay an LRU rather than a refusal, and the compile
+  // cache must key on both identity AND source hash (Program3D.upload can hand the
+  // same slot new bytecode).
+  check('eviction picks the oldest stamp instead of failing the draw',
+    /if \(c->nprogs < S3D_MAX_PROGRAMS\)/.test(d3d)
+    && /\.stamp < c->progs\[idx\]\.stamp\) idx = i;/.test(d3d));
+  check('a compile-cache hit requires the same source hash',
+    /\.srcHash == h && c->progs\[idx\]\.vs != NULL/.test(d3d));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/program-pool', checkStage3dProgramPool);
 registerGroup('stage3d/texture-upload', checkStage3dTextureUpload);
 registerGroup('stage3d/mip-semantics', checkStage3dMipSemantics);
 registerGroup('stage3d/dss-cache', checkStage3dDssCache);
@@ -1900,8 +1936,14 @@ function checkStage3dTextureFormats(): string[] {
     && /c->bvars\[i\]\.fmtKey == fmtKey && c->bvars\[i\]\.ncolor == ncolor/.test(metal)
     && /c->bvars\[idx\]\.fmtKey = fmtKey;/.test(metal)
     && /c->bvars\[idx\]\.ncolor = ncolor;/.test(metal));
+  // (E6/M5 阶段四百零六) The key widened again, from the half/8-bit boolean to the
+  // target's FULL DXGI format: the native channel can create a render target in any
+  // format (R32G32B32A32_FLOAT, R32_FLOAT...), and CreateGraphicsPipelineState fails
+  // outright -- not warns -- when RTVFormats[0] disagrees with the bound view.
   check('D3D12 uses R16G16B16A16_FLOAT and keys the PSO on the target format',
-    /DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d) && /RTVFormats\[0\] = rtfHalf \? DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d));
+    /DXGI_FORMAT_R16G16B16A16_FLOAT/.test(d3d)
+    && /const int rtfFmt = \(tgt != NULL\) \? \(int\)tgt->format : 0;/.test(d3d)
+    && /pd\.RTVFormats\[0\] = \(rtfFmt != 0\) \? \(DXGI_FORMAT\)rtfFmt : DXGI_FORMAT_B8G8R8A8_UNORM;/.test(d3d));
   check('WebGL creates GL_RGBA16F and narrows the readback',
     /GL_RGBA16F/.test(gl) && /s3d_readback_half/.test(gl));
   check('every backend exports the same three new entry points',

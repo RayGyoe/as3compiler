@@ -21894,3 +21894,333 @@ stage94d、status-item、text-underline + unit inline/HotPath、desktop/native d
 
 **回归面**：`unit: build/objpath` 从 19 钉增到 26 钉（键的边界：`-o` 不入键、`-D`/`-O`/源码字节入键；
 编译步可缓存而链接步不可；缓存目录与 scratch 并列而非其内）。全量 `node test.ts` 见下轮汇总。
+
+### 阶段四百零八：环境探针 —— 天穹贴图当 IBL 的镜面半边（v0.4.383 → v0.4.384）
+
+nyc-m36 从立项起就写着「本构建没有环境贴图，所以 `metalness` 恒为 0」。在 AGAL 年代这是对的
+（等距柱状采样要自己写球面反投影，还要抢已满的 sampler 槽）；原生通道打通之后这条只剩惯性。
+
+**做法**（全部 AS3 侧，`calls` 仍为 0）：天穹那张 `BitmapData` 本身就是等距柱状的，直接当
+`uEnvMap`；`CityNative.FS` 在漫反射之后加 `reflect(-V,N)` → `atan/acos` 取 uv →
+`srgbToLinear(texture(uEnvMap, euv).rgb)` → 乘 `F_Schlick(f0, N·V)`；`CityNativeSet.sync()` 每帧
+写 `uEnvMap`/`uHasEnv`/`uEnvIntensity`，句柄来自新加的 `SkyRig.skyTexture` getter。
+
+**三条实测边界**（详见 `docs/zh-cn/native-shader.md` §7.12）：
+
+- 探针只给镜面半边。加 `diffuse * 0.35` 那版整帧均值 46 → 54：three.js 里 IBL 与 `AmbientLight`
+  是两个输入，这里同源，等于环境光算两遍。
+- `metalness` 不能靠探针补能量：玻璃调到 0.55 后整帧 **46 → 31**（`albedo*(1-metalness)` 拿走的
+  漫反射，单次无 mip 采样补不回来）。玻璃仍 `metalness = 0`，靠 `roughness` 0.42 → 0.30 拿光泽。
+- `envIntensity = 0.06 + 0.94*(1-roughness)²`，只看 roughness（玻璃 0.52 / 砖石 0.066）。
+
+**路面取值是量出来的**：0.62/0.16 → 整帧 61 但整条大道洗白（掠射角 Fresnel 恒为 1）；
+0.90/0.03 → 60，湿而不过曝。参考版 `ref-default.png` 整帧均值 61。
+
+**一个会给出反向结论的仪器坑**：截图时若有 Windows 安全中心弹窗压在最上层，整个窗口被系统按
+≈0.58 的乘性系数统一压暗（天空/砖墙/路面比例一致）。判据：先 `SetForegroundWindow` 目标进程、
+确认无模态弹窗，再读均值；比单点像素时同时看 HUD 底色是否同比变化。
+
+**顺带修掉的构建阻塞**：`src/runtime.ts:15114` 的 C 注释里用了反引号（`` `const char*` ``），
+而该文件被 Node 当 TypeScript 解析，模板字符串立刻语法错误（`ERR_INVALID_TYPESCRIPT_SYNTAX`），
+整条编译器无法启动。已去掉反引号——**C 注释里不要出现反引号**这条老规矩对 runtime.ts 同样成立。
+
+### 阶段四百零九：车的尾灯与树冠的第二层（v0.4.384 → v0.4.385）
+
+nyc-m36 的车一直是「一个盒子 + 一个玻璃盒 + 一个底裙」，树一直是「3 张交叉 billboard + 1 张
+水平盖」。两处都不是几何量的问题，而是**夜景里少一层自发光、白天里少一层体积**。
+
+- **尾灯**：`Traffic` 新增 `_tail`（`DynMesh(CAR_COUNT)`）+ `_tailMat`（`emissive 0xff2612`），
+  每车一条横跨车尾的灯条（`CAR_W * 0.78 × 0.13 × 0.05`），位置由行驶方向算：
+  `z - dir * (CAR_L * 0.5)`。**故意做成一条而不是左右两盏**——`DynMesh` 是 16 位索引，每车多一个
+  slot 就把顶点数翻倍，而 30 m 外两条灯本来就读成一条红带。`Traffic.setNight(v)` 与
+  `City.setNight()` 的信号灯同口径：`0.25 + v * 2.35`（白天 0.25 只是"它是红的"，夜里 2.6 才像光源）。
+- **树冠分层**：canopy 从 1 层 3 张交叉 billboard 变成 **2 层**（上层半径 ×0.74、高度 ×0.80、
+  抬升 0.62 个 half-height，并整体旋 60°）。单层的问题不是三角形不够，而是**四张平面共用一个
+  法线**：光源从一侧来时整片叶子同亮度，轮廓没有肩线。代价每树 8 → 14 三角形（全城约 1.7 万）。
+
+实测：时代广场 21:30 夜景 `temp/nat57-tail-night.png` 中右侧车列的尾部有明亮橙红横条；
+第五大道 15:30 `temp/nat59-park.png` 中右侧行道树的树冠出现上下两簇、轮廓有层次。两处 `calls=0`。
+
+### 阶段四百一十：D3D12 阴影图 —— 排查记录与下一步（未修，v0.4.385）
+
+**这一阶段只推进了定位，没有修好，HUD 的「D3D12 map bug」提示保留。**
+
+已核对、已排除：
+
+- **后端没有阴影代码**：`stage3d_d3d.cc` 里 grep `shadow` 零命中。阴影全在 AS 层
+  `seam/asaot/three/AGALRenderer.as`（`_renderShadowPass` / `_shadowProgram` / `_shadowAlphaProgram`），
+  深度以 `[0,1]` **打包写进颜色**（`fc1 = (255, 1/255, 0, 1)`），因此依赖 RT 的颜色通路而非深度纹理。
+- **清屏语义是对的**：`s3d_clear` 是延迟清屏（记下颜色/掩码，由下一次 draw 消费），消费点
+  `s3d_draw` 用 `s3d_cur_target(c)->rtvSlot` 清颜色、用 `renderOverride ? rtDepth : depth` 清深度。
+  shadow pass 的 `clear(1,1,1,1, 1.0, 0, 3)`（白 = 最远）能被正确执行，不是「没清成 0」。
+- **D3D12 的 RT 限制**：`s3d_native_set_targets` 只绑第一个颜色附件，且调用方的 depth 纹理不会被
+  直接绑定——`s3d_set_render_target` 自建一张同尺寸私有 D24S8。所以「深度写进颜色」这条路
+  是唯一可用的，但深度测试用的是另一张纹理，**两者若不同步就会整体误判**。
+
+下一轮的第一件事（不要重走上面的路）：
+
+1. **用源码而不是合成按键打开阴影**。本轮试过 `features`/`build.json` 清空 + `send_keys.ps1 -Keys "g"`：
+   AGAL 路径确实跑起来了（`calls=51 tris=398411`），但 HUD 仍写 `shadows off`，日志
+   `shadows=0` —— 合成按键没能触发 `G`。**直接在 `NycM36.as` 里写 `sun.castShadow = true;` 再构建**
+   才可靠（`temp/shot.sh` 就是靠改字面量的同一手法）。
+2. **`_setShadowBiasMatrix()` 的 `e[5] = -0.5` 是 Metal 的约定**（注释写明：Metal 的 framebuffer 原点在
+   左上，NDC 的 y 向上，所以 y 列取负）。D3D12 的 RT 采样是否也如此**未验证**——A/B 只需把
+   `-0.5` 改 `+0.5` 重编一次。本轮改过但没能在阴影打开的状态下观察，已还原。
+3. **只修阴影图还不够**：`CityNative.FS` **完全没有 shadow 项**，全原生通道下（`calls=0`）即使
+   阴影图正确也不会在画面上出现。完整修复 = 阴影图 + 给 `CityNative.FS` 加 shadow 采样
+   （原生侧不受 AGAL 的 8 个 sampler 槽限制，可另开 `uShadowMap` + `uShadowMatrix`），
+   并用 `shadowPass` 期间把遮挡体再画一遍。
+
+已知判据：沥青开/关阴影 `(19,29,42)` vs `(96,98,102)` —— 开阴影时整条街被压到 0.2 倍，
+即「全部 texel 都判定为遮挡」，不是偏一点点的 bias 问题。
+
+### 阶段四百一十一：nyc-m36 只走原生通道；阴影「全遮挡」结论被推翻（v0.4.385 → v0.4.386）
+
+**用户决定：这个 demo 不再考虑 AGAL。** `NycM36.onCityData` 里的
+`if (hasNativeChannel()) { ... } else { log("absent, AGAL draws it") }` 改成**缺特性就抛错**：
+没有第二个渲染器可回退，静默回退只会在同一个名字下悄悄换一张图。
+
+**推翻了一条旧结论。** 旧记录写「D3D12 上的阴影图渲染为完全遮挡：`castShadow` 打开后太阳项整帧
+乘 0，沥青 `(19,29,42)` vs `(96,98,102)`；清屏色 1.0 与 0.0 产出逐位相同的帧」。本轮复测：
+
+- **那个结论是在阴影从未真正开启时取的。** `NycM36` 的帧循环每帧执行
+  `if (_sky.sun.castShadow != s.shadows) _sky.sun.castShadow = s.shadows;`，而
+  `NycPanelState.shadows` 初始为 `false` —— 改 `SkyRig` 里的 `sun.castShadow = true`、或者用
+  `send_keys.ps1 -Keys "g"` 合成按键，都会在第一帧被面板状态覆盖回 `false`。**这两条路本轮都试过，
+  HUD 一直写 `shadows off`。** 把面板状态也置 `true` 之后，阴影才第一次真正跑起来。
+- 真正跑起来后：整帧均值 **46 → 30**，即 shadow 项平均约 **0.4 倍**，**不是 0**。
+- `shadow.bias` `-0.0012 → -0.006`、`normalBias` `0.45 → 3.0`：整帧**逐位不变**。
+- bias 矩阵的 y 列 `-0.5`（为 Metal 的 top-left framebuffer 约定而写）改 `+0.5`：均值 `30 → 31`。
+
+也就是说：**lookup 返回的是一个与位置无关的恒定值**，所以任何 bias 都推不动它。问题不在深度精度、
+不在自遮挡、也不在 UV 方向，而在**采样本身没有拿到那张图**（AGAL 路径把阴影图绑到 fs4）。
+既然这个 demo 不再走 AGAL，修复路径随之改变：**阴影要做成原生通道的一个渲染目标**，
+由 `CityNative.FS` 采样（原生侧不受 AGAL 的 8 个 sampler 槽约束，也不需要挤 fs4）。
+
+**本轮已落地的两处**：
+1. 删除 AGAL 回退（见上）。实测 `44 materials native`、`calls=0 tris=0`。
+2. 把上面这条陷阱写进 `NycPanelState.shadows` 与 `SkyRig` 的注释——**不要再用「改源码 castShadow」
+   或「合成按键」的方式做阴影实验**，面板状态才是模型，帧循环是唯一写入者（R105 的同一条纪律）。
+
+### 阶段四百一十四：原生 shadow pass —— R32F 阴影图接通，街谷有了楼影（v0.4.388 → v0.4.389）
+
+**阶段四百一十一留下的下一步本轮做完了。** 阴影不再走 AGAL 的 fs4，而是原生通道自己的一张
+渲染目标：新增 `apps/nyc-m36/src/city/CityShadow.as`，每帧把遮挡体渲进一张 **R32F** 图，
+`CityNative.FS` 按名字采样 `uShadowMap`。三处实测视图全部通过，`calls=0 tris=0` 不变。
+
+**为什么是 R32F 而不是 AGAL 的 BGRA8 打包。** `Context3DNative.createTexture(w,h,"r32f",true,false)`
+造一张可渲染的 `R32_FLOAT` 面，`s3d_select_pso` 把 RT 的**完整 DXGI 格式**编进 PSO key，于是深度
+程序自动拿到自己的 R32F PSO。一个 texel 一个 float 就是光空间深度本身：不用 RG 打包、没有 8-bit
+条带——3 km 正交范围上 256 级约等于 12 m 一步，那会在每面墙上长痤疮。AGAL 当年打包是因为 BGRA8
+是它唯一可渲染的格式，原生通道不受这个限制。
+
+**约定是查源码确认的，不是猜的。** 引擎 `Matrix4.makeOrthographic` 是 Stage3D **[0,1] 深度、Y-up NDC**；
+D3D12 viewport 高度为正（不做 shader Y 翻转），RT 的 texel (0,0) 在**左上**。所以 NDC (nx,ny) 落在
+uv ((nx+1)/2,(1-ny)/2)：bias 矩阵的 **Y 列取 -0.5**，与 Metal 的 top-left 约定完全一致（AGALRenderer
+`_setShadowBiasMatrix` 注释里那条）；Z 列保持单位——深度已经是 [0,1]，不能再 remap。旧 AGAL 路径
+坏在 fs4 绑定没落地，**不是这套数学**。
+
+**实现要点**：
+- 两个 position-only 程序：`SOLID`（只写 `gl_FragCoord.z`）与 `CUTOUT`（采 base-color 的 alpha 做
+  alphaTest，否则每棵树投一个实心矩形——AGAL `_shadowAlphaProgram` 的原生对应物）。VS 只声明
+  `uLightMVP`（= shadowVP * modelWorld，逐 caster 上传），**不声明任何 auto uniform**，于是 pass 不依赖
+  renderer 当前相机——它在 `updateFrame` 里、`render()` 之前跑。
+- 光相机复用 `sun.shadow.camera`（`SkyRig.setFocus` 已按镜头尺寸调好正交框），坐在太阳位置 lookAt
+  target，与 AGALRenderer 同一套 `LightShadow.updateMatrices` 数学。
+- 固体 caster 剔**正面**（存封闭盒的远壁深度， lit 面不自遮挡）；DoubleSide 叶片两面都画。
+- `CityNative.FS` 的 `shadowTerm`：世界位置沿法线偏 `normalBias`（世界单位）再投影，常数 `bias` 微调
+  比较深度，**3×3 PCF** 软化。图本身**点采样**（跨轮廓插值两个深度是错的），软化靠九次二值比较平均。
+  只遮太阳项，fill 是无影的天空替身。光框外返回 1（lit），雾遮住级联边界。
+- **`sun.castShadow` 永远保持 false**：那是 AGALRenderer 自己（D3D12 上坏的）shadow prepass 的开关；
+  面板 `shadows` 旋钮驱动的是 CityShadow。两者分开，`calls=` 才能保持 0。`NycPanelState.shadows`
+  默认改为 **true**（demo 出厂带阴影），`G` 键只写模型、`applyPanel` 唯一写入场景。
+
+**实测（同机位灰阶均值）**：
+- 街景白天：路面 **155 → 88**，且横向有结构——左（向阳）~108、右（楼影）~65，一条干净的斜向阴影边；
+  车底有接地影。参考版路面 ~55，旧无阴影版 ~155。**有空间结构**这一点决定性地证明 lookup 与位置相关
+  （旧 bug 是处处恒定）。
+- 航拍（helicopter）：塔楼在网格上投出长而清晰的影子，邻楼屋顶有影形——参考版「半张图是太阳影」
+  的那一刀补上了。
+- 夜景（Times Square 21.5h）：无回归，亮窗 / LED 墙 / 底商正常，`night 1`。
+- 三视图均 `calls=0 tris=0`，`[CityShadow] native R32F shadow map 2048x2048, 16 casters`（城市是焊接
+  网格，16 个 caster = 楼块 + 车身 + 人群；树冠 `castShadow=false` 是内容缺口，另计）。
+
+**面板标签**去掉「(D3D12 map bug)」，HUD 改 `shadows on (native)`。`stage3d/` 单元组 25 绿。
+
+**仍欠**：树冠不投影（`leaves`/`trunks` 的 `castShadow=false`）；阴影里的路面 ~65 仍比参考 ~32 亮
+（那是 ambient/fill 的整体配光，不是阴影 bug，留待配平）；路面的 planar reflection 未做
+（**已于阶段四百一十五 落地**）。
+
+### 阶段四百一十五：路面 planar reflection —— 镜像相机 RT + 屏幕空间采样（v0.4.389 → v0.4.390）
+
+**参考版湿路面里的楼体、白线、车灯，环境探针给不了**——那里面只有天空。所以最后一块是**真镜面
+pass**：新增 `apps/nyc-m36/src/city/CityReflection.as`，一台真实右手镜像相机把整个场景渲进一张
+半分辨率 RGBA8 目标，`CityNative.FS` 在沥青上按 `gl_FragCoord.xy / uResolution` 取回。
+
+**三条不靠猜的结论：**
+- **不需要纹理矩阵**：路面本身就是镜面 `y=0`，平面上任一点在真实相机与镜像相机里投到**同一像素**，
+  镜像目标已经对齐，直接取屏幕 uv。
+- **不能用反射矩阵**：`matrixWorld` 关于 `y=0` 反射是行列式 -1 的左手系，**翻转所有面绕序**，得给
+  `render()` 加 per-pass 剔除翻转。改用真右手相机（位置反射、`up→(0,-1,0)`、看向反射后的前向点）
+  就绕序正确，剔除逻辑一行不动。
+- **混合必须在色调映射之后**：镜像目标已被**同一个** FS 做过 ACES + sRGB，先混再映射等于映射两遍。
+
+**湿沥青不是镜子，两处必需的非理想化**：沿 `uv.y` 的 4 个额外采样（权重 .2/.2/.1/.1，随 `vDepth`
+放大至 3 倍）做竖直拉糊；`world.xz` 上两倍频程值噪声做湿斑掩码（**世界**坐标，屏幕坐标噪声会随
+相机游动）。防反馈：镜像 pass 期间路面 `uHasReflection` 置 0。
+
+**必须去掉的双重计数**：路面原来同时吃「环境探针镜面项」和「平面反射」，而两者近似的是**同一份被
+反射的天空**。`uHasReflection != 0` 时 `envW = 0`，探针只服务没有镜面 pass 的表面。
+
+**一个内容陷阱**：`CityTextures.asphalt()` 的底色 `0x4a4e52` 是**死代码**——紧随的 2×2 噪声循环用
+`scaleColor(0x5d6063,k)` 把 128×128 全覆盖了，难怪改底色测出「毫无变化」。生效的是循环里的字面量，
+已改 `0x4b4f53`。
+
+**实测（同一 65,194 像素路面掩码 = 反射开/关差分；`calls=0 tris=0` 不变）：**
+
+| 配置 | 路面 | 整帧 |
+|---|---|---|
+| 无反射、探针在、反照率 `0x4b` | 57.0 | 56.4 |
+| 黑贴图（无反照率贡献）、探针在 | 41.9 | 55.7 |
+| 反射 + 探针（双重计数）、强度 0.60 | 40.7 | 55.4 |
+| **最终：反射 + `envW=0`、强度 0.45、模糊 0.0046** | **36.3** | **55.3** |
+| 夜景 Times Square 21.5h | 31.6 | 46.4 |
+
+黑贴图那行是关键证据：**反照率无关的探针镜面项占了原亮度的绝大部分**，这才是「单改沥青颜色没用」
+（81.8→79.7）与「关掉探针一次从 57 掉到 40」的原因。参考版路面约 35~59。
+
+夜景路面映出亮窗与 LED 灯牌（绿/黄/蓝竖条），与参考版「湿街」一致。新增 `R` 键开关（HUD 一行），
+`_reflectionOn` 默认 true；首帧 trace `[CityReflection] native planar reflection 693x411`。
+
+**仍欠**：参考版街道整体处于楼影里（低太阳、暖色斜光），我们默认 15:30 / 太阳 37.9° 把街道直射
+——这是**配光**（太阳高度、色温、ambient 配比）不是反射或阴影缺陷；楼体窗洞/消防梯/路面补丁裂缝
+井盖等**内容细节**仍是低模；树冠不投影。
+
+### 阶段四百一十六：AIR 51 `ByteArray` Base64 三件套（v0.4.390 → v0.4.391）✅ 已完成
+
+**依据**：TalkMED 会议 Windows 端 WebSocket 清理计划 v4（`WEBSOCKET-MIGRATION-PLAN.md` C1）：
+`Config.getEncryptMeetingId` 用 hurlant `Base64.encodeByteArray` 给 `aes_room_id` 编码，删掉
+hurlant 96 个冗余文件后需要 AIR 51 原生的 `ByteArray.toBase64()` 接手。官方文档标注三个 API
+均为 **AIR 51 新增**（RFC 4648 §4），但 `toBase64` 的 position 语义、`writeBase64` 的填充/错误
+行为都未写明 ⇒ 先探针后实现。
+
+**adl 51.4.1 实测**（`temp/b64probe/Probe.as` → `out.txt`，trace 被吞故写文件）：
+
+- `toBase64()` 编码**整个缓冲**，无视 `position`（pos=1/3/末尾都得 `Zm9v`）且**不移动** position；
+  空数组 → `""`；`f/fo/foo` → `Zg==/Zm8=/Zm9v`；256 字节 → 344 字符、无 CR/LF、含 `+/`。
+- `writeBase64(s)` 在 position 处写入并推进 position/length，返回**新增字节数**；`""` → 0。
+- **接受无填充尾组**：`"Zg"` → 1 字节、`"Zm9vZg"` → 4；但 `"Zg="`/`"Zm9v="`/`"Zg==="`/`"A"`
+  都抛 **`ArgumentError #1508: The value specified for argument base64 is invalid.`**；
+  含 `\n`/空格/非法字符同样 #1508。
+- **失败是原子的**：先 writeByte(0x41) 再 writeBase64("Zm9v!!!!") 抛错后 len=1 pos=1，无部分写入。
+- `null` 参数（writeBase64 与 createFromBase64 都是）→ **`TypeError #2007: Parameter base64 must be non-null.`**。
+- `ByteArray.createFromBase64("Zm9v")` → len=3 **pos=3（停在末尾）**；`"")` → len=0 pos=0；`"!!!!"` → #1508。
+
+**实现**：`src/symbols.ts` ByteArray classMap 补 `toBase64`/`writeBase64` 与 staticMethods
+`createFromBase64`（分派由符号表驱动，无需改分派逻辑）；`src/emit.ts` 在 `ByteArray_clear` 后
+新增 `as_b64_alphabet`/`as_b64_val`/`as_b64_decoded_len`（整串校验：≤2 个尾部 `=`、有填充必须
+凑满末组、rem==1 拒绝、无填充尾组放行）+ 三个 C 函数；writeBase64 **先整串校验再动缓冲**
+（对齐原子性），createFromBase64 = new + writeBase64（position 自然停末尾）。
+
+**验收**：`examples/base64.as`（全部断言来自实测）AOT `--run` 全绿；**同一份断言代码包成
+Sprite 在 adl 51.4.1 跑也全绿**（`temp/ab-b64.cjs`，A/B 一致）；单元组
+`unit: bytearray-amf/ByteArrayBase64` 11/11，mutation 两处（toBase64 改读 position、填充规则
+pads>2 改 pads>3）均被抓红后恢复；`bytearray-amf/` 全组 5/5。示例层自动发现（readdir）。
+本机 `cc` 不在 PATH，示例用 `--cc "C:/Program Files/LLVM/bin/clang.exe"` 验证；全量回归待
+有 cc 的环境/CI 兑底。
+
+### 阶段四百一十七：`scripts/js2as.ts` 受限 JS→AS3 转译器 + 三个语义缺口（v0.4.391 → v0.4.393）
+
+**起因**：nyc-m36 对着 Web 版（`mrdoob/slop-newyork`）做视觉对齐，而 Web 版的城市生成、交通、
+行人、镜头这些**纯算法**文件会持续变动。手工重抄 AS3 端口既慢又易错，于是把「翻译」这一步固定
+成一个工具：**白名单子集 + 按名拒绝（带 `行:列`）+ 输出回灌编译器 parser 自检**。
+
+**为什么只做「第二档粒度」**（四层障碍只有第一层是语言问题）：TSL 节点图里的 compute/storage
+buffer/MRT/间接绘制是**后端能力缺口**（`s3d_native_set_targets` 只绑单一颜色附件）；`InstancedMesh`
+与 16 位索引是几何语义；资产本来就是数据。所以工具只吃「不碰 WebGPU/TSL/compute」的文件，
+渲染仍手写。
+
+**子集**：`var/let/const`（`let`→`var`）、函数（含默认参数）、`if/for/while/do/switch`、
+对象/数组字面量、算术/比较/逻辑/位运算/`?:`/`typeof`、模板字符串、`Math.*`。拒绝并带位置的：
+箭头函数、`class`、展开/剩余、`for-of`、解构、`**`、可选链、`async/await/yield`、`arguments`、
+`import/export`、多行模板（行号必须存活）。`of` 只在 `for (` 头里被拒（普通标识符放行）。
+
+**改写**：`console.*`→`trace`；`process.hrtime.bigint()`→`(new Date().getTime() * 1000000)`
+（**非单调**，只有「两次读数相减」等价，如实写在文档里）；模板字符串在**词法之前**按字符串展开
+（编译器没有模板 token，也不该为 JS 专有特性动编译器）。
+
+**不做类型推断，且是实测决定的**：先实现了「所有写入可证为数值的绑定标 `Number`」，实测
+——`nbody` 390 ms vs 394 ms（2000 步，噪声内）；纯算术循环（2000 万次 `s += i*0.5`）两版都是
+7 ms 且与 node 相同。`-O2` 已把 `as_value` 装箱内联掉，**400× 全部来自动态成员访问**
+（`b[i].x` 的字符串键查表）。要治必须做**对象形状推断**（typed class / `Vector.<T>`），那是全程序
+分析加语义风险，与「宁缺不错」冲突 ⇒ **该段代码已删**（不是暂缓），结论写进文档：
+热循环手写带类型端口，转译器负责正确性与冷路径。
+
+**实测（5 个基准校验和逐位一致）**：
+
+| 基准 | node | 转译产物 | 倍率 | 手写 AS 端口 |
+|---|---:|---:|---:|---:|
+| `fib(40)` | 536 ms | 1092 ms | 2.0× | 212 ms |
+| `nbody`（2000 步） | 1 ms | 390 ms | ≈390× | 500 万步 199 ms |
+| `mandelbrot` | 87 ms | 753 ms | 8.7× | — |
+| `strings` | 91 ms | 214 ms | 2.4× | — |
+| `array` | 18 ms | 21294 ms | 1183× | — |
+
+倍率与「动态成员/元素访问密度」强相关（`fib` 只有标量算术、`array` 每步都在 `*` 数组上
+`a[i]`），这一列是**选型依据**而非缺陷清单。`benchmarks/oop/oop.js` 是 `class` 写法，按名拒绝。
+
+**顺带修掉两个「AS3 合法但编译不过」的缺口**（按 §0 从根上修，不在工作区绕）：
+1. **`*` 槽上的 `++`/`--`**：此前发射 `(g_x++)` → clang `cannot increment value of type
+   'as_value'`。现在展开为 `x = as_v_num(Number(x) ± 1)`，**后缀式的值取 ToNumber(旧值)**
+   （`"5"++` 得 `5`、槽变 `6`；非数字串得 `NaN`）；语句位置与 `for` 更新子句（值被丢弃处）
+   不留无用临时变量（`emitFor` 的两条路径都补了 discarded 标记）。
+2. **`const x:* = 5;`**：此前发射 `static const as_value g_x = as_v_num(5);`，C 的 static
+   初始化器必须是编译期常量。现在「C 类型即使字面量也需要构造调用」的槽（`*` = `as_value`）
+   一律按运行期初始化：声明给默认值、初始化在 `main()` 里按源码顺序跑一次，与既有
+   `static const d = new Dictionary()` 同一条通路（`isStaticConstSlot` 统一了 class 静态字段、
+   模块级 const、cinit 收集与 GC 根四处判定）；`int/Number/String` 字面量仍是真 C 静态常量，
+   生成的 C 不变。
+
+**验收**：`examples/dynamic-inc.as`（15 条断言，AOT `--run` 全绿）；`test/unit/js2as.ts` 三组
+（refusals 41 / rewrites 18 / benchmarks 9 文件）全绿并注册进 `test/unit.ts`；单元层
+`node --test test/unit/*.ts` **358 例 355 绿 3 红**，3 红为本机既有基线
+（`inline/HotPath`、`desktop/native drag`、`platform/DeviceLost`），与本次改动无关。
+文档：`docs/zh-cn/js2as.md` + `docs/en/js2as.md`。
+
+**第二轮：把子集扩到能吃下真实上游文件。** 语料是 `temp/slop-newyork/js/`（24 个文件 34k 行）。
+第一版子集下**一个文件都过不了**；补上三处后首个真文件打通：
+
+| 新增 | 形状 | 忠实性依据 |
+|---|---|---|
+| 箭头函数 → AS3 匿名函数 | `(a, b) => expr` → `(function (a:*, b:*):* { return expr; })` | AS3 **有**匿名函数；唯一译不了的是 `this`（箭头词法 / AS3 调用接收者），那种按名拒绝 |
+| 对象/数组解构 | `const {x, z: sz} = o` → `const x:* = o.x, sz:* = o.z`；`[p, , q]` 洞按位跳过 | 属性/下标读取是同一个操作；右值非裸标识符时先落 `__d0` 保证**只求值一次** |
+| 形参解构 | `f({a, b}, c)` → `f(__p0:*, c:*)` + 函数体开头拆解 | 走位不变，调用契约不变 |
+| 默认值 | `{ a = 5 }` → `(typeof o.a === "undefined") ? 5 : o.a` | 默认只在 `undefined` 触发（`null` 不触发），编译器没有 `undefined` 标识符 |
+| `export` 剥离 | `export function f` → `function f`；`export { f };` 整句清空但**保留该行** | 单文件产物没有模块边界；`import` 仍然拒绝（非自包含） |
+
+**首个真文件 A/B**：`js/vehicle-physics.js`（162 行，0 import / 0 class）→ 163 行 AS3 → 追加
+A/B 夹具（**整数化打印**，× 1000/1e6 后 `Math.round`，避开 Number→String 格式差异）→
+`node src/index.ts temp/vp2-run.as --run` 与 `node temp/ab-veh.mjs` **14 行逐位一致**
+（8 个 contact/resolve 夹具 + 6 个 swept 夹具，含不接触与 NaN 路径）。
+
+**缺口③（这一轮最要紧的发现）：三目 `?:` 把一侧按另一侧的静态类型强转。** 第一版 A/B 里
+`contact.x` 全印 0，而 `resolveVehicleContact` **内部**用同一字段算出的 `closing` 却完全正确 ——
+差别只在「读出来再算」这一步，于是定位到 `unifyType(any, int)` 取 `int`、`convert` 把 `any`
+侧 unbox 成 int：`v == null ? 0 : v`（0.974）**静默返回 0**，`true ? 0 : "x"` 把 0 串成 `"0"`。
+这正是 `&&`/`||` 早已按红线处理过的同一错误（条件运算符同样只返回**被选中一侧的值**）。
+现在与 `&&`/`||` 共用同一道门：只有同 kind 或都数值才共享 C 类型，否则两侧装箱；`null` 臂
+交给 `unifyType` 原有精确规则（G16 的 `? null : Bitmap` 不受影响，既有钉全存活）。
+
+**验收**：`test/unit/js2as.ts` 三组（refusals 59 / rewrites 36 / benchmarks 9 文件）全绿；
+新增 `unit: logical/TernaryOperand` 6 条源级钉；`examples/dynamic-inc.as` 加 5 条三目断言；
+单元层 358 例 355 绿 3 红（`inline/HotPath`、`desktop/native drag`、`platform/DeviceLost`，
+本机既有基线）。
+
+**边界（写进文档，不粉饰）**：`pedestrian-routes.js` 卡在对象展开 `{...extra}`、
+`building-collision.js` 卡在 `for...of`、`traffic.js` 有 103 处解构 / 31 箭头 / 9 import。
+用途是**冷路径算法核对**，不是替换渲染逻辑（`src/city/*.as` 是带类型实现，全 `*` 转译在
+每帧热路径上慢几个数量级）。
+
+**仍未做**：对象形状推断（热路径唯一出路）、闭包捕获逃逸分析、`for-of` 自动改写（对象上
+「遍历值还是键」取决于类型，猜错即语义错误）、对象展开 `{...x}`（要 `Object.assign` 语义）、
+多文件模块。

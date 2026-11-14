@@ -51,6 +51,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12shader.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 
@@ -84,7 +85,14 @@ extern "C" {
 // Starling painter issues far fewer than this).
 #define S3D_DRAWS_PER_FRAME 512
 #define S3D_DESCS_PER_FRAME (S3D_DRAWS_PER_FRAME * S3D_MAX_TEX)
-#define S3D_MAX_PROGRAMS 16
+// nyc-m36 measured 35 programs live in one frame (31 native materials + the AGAL
+// programs the same frame still uses). With the old cap of 16 the LRU evicted the
+// whole set every frame: s3d_compile then re-ran DXC and s3d_select_pso rebuilt the
+// pipeline 35 times per frame -- measured as `comp` growing by exactly 35 per frame
+// and 1.5 fps against 59.9 for the same scene in pure AGAL. The pool is a static
+// array of S3DProg (each ~4.3 KB of PSO-variant cache), so this cap is memory, not
+// time: 96 slots is ~420 KB per context and costs nothing until programs exist.
+#define S3D_MAX_PROGRAMS 96
 #define S3D_MAX_PSOVAR 16
 #define S3D_MAX_RTV 64
 #define S3D_MAX_DSV 16
@@ -111,6 +119,17 @@ extern "C" {
 #define S3D_CB_REGION 4096
 #define S3D_CB_BYTES (S3D_CB_REGION * S3D_DRAWS_PER_FRAME)
 #define S3D_KEY_CAP 256
+// Native channel tables. 24 declared slots is well beyond what the shim emits (the
+// ocean's biggest program has 11) and 64 `$Globals` variables per stage likewise.
+// Native slot table. 64, not 24: the table is one entry per (name, kind, stage) of a
+// whole PAIR -- attributes, the vertex stage's auto matrices, every loose uniform of
+// both stages and every sampler. The city's lit material is 3 + 3 + 20 + 2 = 28, so
+// a 24-entry table silently dropped the last four (`uFogNear`, `uFogFar`,
+// `uFogColor`, `uExposure`) and the frame came out fogged to black: the offsets were
+// never resolved, the staged block kept its zeros, and smoothstep(0, 0, depth) is 1
+// everywhere. It matches S3D_MAX_NRV, the D3DReflect side of the same table.
+#define S3D_MAX_NVAR 64
+#define S3D_MAX_NRV 64
 
 // The live-program slots: `live` is one of these, an index into progs[], or
 // S3D_LIVE_KEYLESS for a program compiled with no Program3D identity to cache
@@ -206,6 +225,28 @@ typedef struct {
   unsigned long stamp;
 } S3DProg;
 
+// One declared slot as the shader compiler reported it (asc_shader_binding).
+// `kind` is ASC_SHADER_BINDING_UNIFORM (1), SAMPLER (2) or ATTRIBUTE (3).
+typedef struct {
+  char name[64];
+  int kind;
+  int stage;    // 0 vertex, 1 fragment
+  int slot;     // uniform: the compiler's enum slot; sampler: the tN/sN register
+  UINT offset;  // uniform: byte offset inside `$Globals`, filled by the reflection
+  UINT bytes;
+  int found;
+} S3DNativeVar;
+
+// One variable of `$Globals` as D3DReflect sees it. The offset is the AUTHORITY:
+// HLSL packs a cbuffer by its own rules (a float3 is followed by a float, matrix
+// rows are 16-byte aligned), so a hand-computed offset reads the wrong lanes
+// without failing to compile.
+typedef struct {
+  char name[48];
+  UINT offset;
+  UINT bytes;
+} S3DNativeRVar;
+
 typedef struct {
   ID3D12Resource* buf;     // UPLOAD heap: written by the CPU, read by the IA
   int ub;                  // which pooled buffer owns `buf` (see S3DUploadBuf)
@@ -300,6 +341,20 @@ typedef struct S3DContext {
 
   // --- current render state (Stage3D is a state machine) ---
   int live;                        // S3D_LIVE_*, or an index into progs[]
+  // --- native shader channel (Context3DNative) ---
+  // A native program IS an ordinary S3DProg: s3d_compile keys and caches it exactly
+  // like an AGAL program, and s3d_select_pso builds its pipeline from the same draw
+  // state. These fields carry the part AGAL's fixed register file used to give for
+  // free -- where each NAMED uniform sits inside the implicit `$Globals` cbuffer,
+  // plus the staged copy of that block per stage.
+  int nativeMode;
+  int nativeNColor;
+  S3DNativeVar nvar[S3D_MAX_NVAR];    // slots the shim declared for this program
+  int nnvar;
+  S3DNativeRVar nrv[2][S3D_MAX_NRV];  // D3DReflect's view of each stage's `$Globals`
+  int nrvn[2];
+  UINT nglobalsSize[2];
+  unsigned char nstage[2][S3D_CB_REGION];  // CPU staging of each stage's `$Globals`
   S3DProg progs[S3D_MAX_PROGRAMS];
   int nprogs;
   S3DProg keyless;
@@ -714,8 +769,13 @@ static int s3d_make_root_sig(S3DContext* c) {
 
 // ---- textures --------------------------------------------------------------
 
+// `forced` overrides the historic two-format choice (BGRA8 / RGBA16F / D24S8): the
+// native channel can ask for any DXGI format (a float FFT atlas, R32F, R8...), and
+// the format is part of the RESOURCE descriptor, so it cannot be changed later.
+// DXGI_FORMAT_UNKNOWN keeps every pre-existing caller's behaviour.
 static S3DTexture* s3d_make_texture_fmt(S3DContext* c, int w, int h, int mips, int faces,
-                                        int isRT, int isDepth, int fmtHalf) {
+                                        int isRT, int isDepth, int fmtHalf,
+                                        DXGI_FORMAT forced) {
   if (w <= 0 || h <= 0) return NULL;
   if (mips < 1) mips = 1;
   if (faces != 6) faces = 1;
@@ -732,8 +792,11 @@ static S3DTexture* s3d_make_texture_fmt(S3DContext* c, int w, int h, int mips, i
   // (sampler-only and render-target alike). The format is part of the RESOURCE
   // descriptor -- immutable -- so it cannot be changed after creation; the drawing
   // side picks it up through the PSO key (s3d_select_pso).
-  t->format = isDepth ? DXGI_FORMAT_D24_UNORM_S8_UINT
-                      : (fmtHalf ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM);
+  t->format = forced != DXGI_FORMAT_UNKNOWN
+                  ? forced
+                  : (isDepth ? DXGI_FORMAT_D24_UNORM_S8_UINT
+                             : (fmtHalf ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                        : DXGI_FORMAT_B8G8R8A8_UNORM));
 
   D3D12_RESOURCE_DESC d = {};
   d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -752,7 +815,7 @@ static S3DTexture* s3d_make_texture_fmt(S3DContext* c, int w, int h, int mips, i
   D3D12_CLEAR_VALUE cv = {};
   D3D12_CLEAR_VALUE* cvp = NULL;
   if (isDepth) {
-    cv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    cv.Format = t->format;   // D3D12: the clear value's format must match the resource's
     cv.DepthStencil.Depth = 1.0f;
     cv.DepthStencil.Stencil = 0;
     cvp = &cv;
@@ -806,7 +869,7 @@ static S3DTexture* s3d_make_texture_fmt(S3DContext* c, int w, int h, int mips, i
 // except the rgbaHalfFloat paths wants.
 static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int faces,
                                     int isRT, int isDepth) {
-  return s3d_make_texture_fmt(c, w, h, mips, faces, isRT, isDepth, 0);
+  return s3d_make_texture_fmt(c, w, h, mips, faces, isRT, isDepth, 0, DXGI_FORMAT_UNKNOWN);
 }
 
 // A texture object outlives a shared-device rebuild at the AS3 level. Revive its
@@ -820,7 +883,8 @@ static int s3d_revive_texture(S3DContext* c, S3DTexture* t) {
   if (SUCCEEDED(hr) && owner == c->device) return 1;
   S3DTexture* fresh = s3d_make_texture_fmt(c, t->width, t->height, t->mips, t->faces,
                                           t->isRT, t->isDepth,
-                                          t->format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+                                          t->format == DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                          t->format);
   if (fresh == NULL) return 0;
   t->res = fresh->res;
   t->owner = c;
@@ -1066,6 +1130,10 @@ static void s3d_prog_release(S3DProg* e) {
 // stays with the render-target binding code further down.
 static S3DTexture* s3d_cur_target(S3DContext* c);
 
+// Defined with the native channel further down; every native draw stages its
+// `$Globals` through it before the pipeline is picked.
+static int s3d_native_upload_globals(S3DContext* c);
+
 // Build (or fetch) the pipeline for the state currently recorded on the context.
 // The key is the WHOLE draw state -- see the file header for why D3D12 needs this
 // where Metal had a separate MTLDepthStencilState.
@@ -1089,8 +1157,12 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   // The render target's pixel format is baked into the PSO (RTVFormats[0]), so a
   // draw into an RGBA16F (Context3DTextureFormat.RGBA_HALF_FLOAT) target needs its
   // own pipeline; D3D12 fails the draw outright on a mismatch.
+  // The RT's FULL DXGI format, not a half/8-bit boolean: the native channel can
+  // create a render target in any format (R32G32B32A32_FLOAT, R32_FLOAT...), and
+  // CreateGraphicsPipelineState fails outright when RTVFormats[0] disagrees with
+  // the view the pass binds.
   const S3DTexture* tgt = s3d_cur_target(c);
-  const int rtfHalf = (tgt != NULL && tgt->format == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 1 : 0;
+  const int rtfFmt = (tgt != NULL) ? (int)tgt->format : 0;
 
   char sk[S3D_KEY_CAP];
   snprintf(sk, sizeof sk,
@@ -1113,7 +1185,7 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
            c->blendSource ? c->blendSource : "",
            c->blendDest ? c->blendDest : "",
            streamSig,
-           rtfHalf);
+           rtfFmt);
 
   for (int i = 0; i < pr->npso; i++) {
     if (strcmp(pr->pso[i].key, sk) == 0) {
@@ -1231,7 +1303,7 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   pd.IBStripCutValue = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1;
-  pd.RTVFormats[0] = rtfHalf ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+  pd.RTVFormats[0] = (rtfFmt != 0) ? (DXGI_FORMAT)rtfFmt : DXGI_FORMAT_B8G8R8A8_UNORM;
   pd.DSVFormat = dsNeeded ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
   pd.SampleDesc.Count = 1;
   pd.NodeMask = 0;
@@ -1775,6 +1847,22 @@ int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices
   // Convert straight into the pooled buffer. The old code malloc'd a float copy first,
   // and at megabytes of vertices per frame that malloc + memcpy was itself a visible
   // part of the frame.
+  if (s3d_env("ASC_S3D_DUMP") && stream == 0 && components == 3) {
+    static int pn = 0;
+    if (pn < 40) {
+      pn++;
+      float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+      for (size_t q = 0; q < n; q += 3) {
+        for (int k = 0; k < 3; k++) {
+          const float v = (float)data[q + (size_t)k];
+          if (v < lo[k]) lo[k] = v;
+          if (v > hi[k]) hi[k] = v;
+        }
+      }
+      fprintf(stderr, "S3DV nv=%d x[%.0f,%.0f] y[%.0f,%.0f] z[%.0f,%.0f]\n",
+              numVertices, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+    }
+  }
   S3DUploadBuf* b = s3d_acquire_upload(c, (UINT)(n * sizeof(float)));
   if (b == NULL) return 0;
   float* dst = (float*)b->map;
@@ -1789,7 +1877,14 @@ int s3d_upload_vertex(void* ctx, int stream, const double* data, int numVertices
   return 1;
 }
 
+static unsigned s3d_dbg_max_index = 0;
+static int s3d_dbg_num_indices = 0;
 int s3d_upload_index(void* ctx, const uint32_t* data, int numIndices) {
+  {
+    unsigned mx = 0;
+    for (int q = 0; q < numIndices; q++) if (data[q] > mx) mx = data[q];
+    s3d_dbg_max_index = mx; s3d_dbg_num_indices = numIndices;
+  }
   if (ctx == NULL || numIndices <= 0 || data == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
   const size_t nbytes = (size_t)numIndices * sizeof(uint32_t);
@@ -1930,7 +2025,7 @@ static int s3d_upload_region_half(S3DContext* c, S3DTexture* t, int w, int h, co
 void* s3d_texture_from_pixels_half(void* ctx, int width, int height, const void* rgba) {
   if (ctx == NULL || width <= 0 || height <= 0 || rgba == NULL) return NULL;
   S3DContext* c = (S3DContext*)ctx;
-  S3DTexture* t = s3d_make_texture_fmt(c, width, height, 1, 1, 0, 0, 1);
+  S3DTexture* t = s3d_make_texture_fmt(c, width, height, 1, 1, 0, 0, 1, DXGI_FORMAT_UNKNOWN);
   if (t == NULL) return NULL;
   if (!s3d_upload_region_half(c, t, width, height, rgba)) {
     s3d_free_texture(c, t);
@@ -1958,6 +2053,11 @@ void* s3d_texture_from_pixels(void* ctx, int width, int height, const uint32_t* 
     return NULL;
   }
   t->hasChain = 0;   // freshly uploaded level 0 only
+  if (s3d_env("ASC_S3D_DUMP")) {
+    static int fn = 0;
+    if (fn < 40) { fn++;
+      fprintf(stderr, "S3DF p=%p w=%d h=%d mips=%d\n", (void*)t, width, height, t->mips); }
+  }
   return (void*)t;
 }
 
@@ -1987,7 +2087,14 @@ void s3d_texture_upload_level(void* ctx, void* tex, int level, int lw, int lh,
   // (whole-source rescale). This is what makes away3d's MipmapGenerator work: it
   // re-uses ONE full-size scratch bitmap, re-scaling level i into that bitmap's
   // top-left (W>>i)x(H>>i) rectangle before upload (MipmapGenerator.as).
-  if (s3d_upload_region(c, t, level, lw, lh, src, srcW)) t->hasChain = 1;
+  int okr = s3d_upload_region(c, t, level, lw, lh, src, srcW);
+  if (s3d_env("ASC_S3D_DUMP")) {
+    static int ln = 0;
+    if (ln < 400) { ln++;
+      fprintf(stderr, "S3DL p=%p lvl=%d lw=%d lh=%d mips=%d tw=%d ok=%d\n",
+              (void*)t, level, lw, lh, t->mips, t->width, okr); }
+  }
+  if (okr) t->hasChain = 1;
 }
 
 void* s3d_upload_cube_texture(void* ctx, int unit, int size, const uint32_t* const* argb) {
@@ -2059,6 +2166,10 @@ int s3d_compile(void* ctx, void* key, const char* vs_hlsl, const char* fs_hlsl,
                 char* errbuf, int errbuf_size) {
   if (ctx == NULL || vs_hlsl == NULL || fs_hlsl == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
+  // Any program switch leaves the other channel: the native uniform model (named
+  // `$Globals` slots) and the AGAL one (a 256-register file) are not interchangeable,
+  // and a draw that mixed them would read whatever the other stage last staged.
+  c->nativeMode = 0;
   // FNV-1a over both sources: the Program3D pointer alone is not enough, because
   // Stage3D lets the SAME Program3D be re-uploaded with new bytecode
   // (Program3D.upload), which must recompile rather than silently reuse the stale
@@ -2372,6 +2483,10 @@ int s3d_draw(void* ctx, int numTriangles) {
   if (c->numStreams == 0) return 0;
 
   const int dsNeeded = s3d_ds_needed(c);
+  // Native draws have no AGAL register file: their constants are the staged
+  // `$Globals` block, copied into a fresh region of the same buffer the AGAL path
+  // uses (see s3d_native_upload_globals).
+  if (c->nativeMode && !s3d_native_upload_globals(c)) return 0;
   ID3D12PipelineState* pso = s3d_select_pso(c, pr);
   if (pso == NULL) return 0;
   if (!s3d_batch_begin(c)) return 0;
@@ -2407,14 +2522,24 @@ int s3d_draw(void* ctx, int numTriangles) {
   if (!c->clearColor && !c->clearDepth && !c->clearStencil) c->clearPending = 0;
 
   if (s3d_env("ASC_S3D_DUMP")) {
-    fprintf(stderr, "S3DDRAW(d3d) tris=%d streams=%d depth=(%s,w=%d) cull=%s blend=(%s,%s) "
-                    "cmask=%d%d%d%d cbV=%u cbF=%u\n", numTriangles, c->numStreams,
+    static int dn = 0;
+    if (dn < 60) { dn++;
+      fprintf(stderr, "S3DM nv0=%d comp0=%d nv1=%d ni=%d maxIdx=%u tris=%d\n",
+              c->streams[0].numVertices, c->streams[0].components,
+              c->streams[1].numVertices, s3d_dbg_num_indices,
+              s3d_dbg_max_index, numTriangles); }
+  }
+  if (s3d_env("ASC_S3D_DUMP")) {
+    fprintf(stderr, "S3DDRAW(d3d) nat=%d tris=%d streams=%d depth=(%s,w=%d) cull=%s blend=(%s,%s) "
+                    "cmask=%d%d%d%d cbV=%u cbF=%u comp=%lu\n", c->nativeMode, numTriangles, c->numStreams,
             c->depthCompare ? c->depthCompare : "null", c->depthWrite,
             c->cullMode ? c->cullMode : "null",
             c->blendSource ? c->blendSource : "null",
             c->blendDest ? c->blendDest : "null",
             c->colorMaskR, c->colorMaskG, c->colorMaskB, c->colorMaskA,
-            (unsigned)c->cbOffV, (unsigned)c->cbOffF);
+            (unsigned)c->cbOffV, (unsigned)c->cbOffF,
+            (unsigned long)c->statCompiles);
+    fflush(stderr);
   }
 
   c->list->SetGraphicsRootSignature(c->rootSig);
@@ -2546,6 +2671,448 @@ void s3d_flush_all_async(void) {
   for (int i = 0; i < s3d_live_n; i++) s3d_flush_async(s3d_live[i]);
 }
 
+// ---- native shader channel (Context3DNative, HLSL/D3D12) --------------------
+//
+// The native channel needs almost nothing the AGAL path does not already have: both
+// hand the backend pre-compiled HLSL blobs (s3d_compile keys and caches them by
+// Program3D identity), both declare stage inputs as TEXCOORD{slot} (s3d_select_pso),
+// both read constants from register(b0) per stage (s3d_make_root_sig), and both draw
+// through the same pipeline cache and constant-region bump allocator. What AGAL got
+// for free is a fixed 256-register constant file whose lane numbers the compiler
+// already knew.
+//
+// So the additions are exactly two:
+//   * the byte offset of every NAMED uniform inside the implicit `$Globals` block,
+//     answered by D3DReflect. Computing it by hand is not an option: HLSL packs a
+//     cbuffer by its own rules (a float3 is followed by a float, matrix rows are
+//     16-byte aligned), so a guessed offset compiles, samples the wrong lanes, and
+//     reports nothing at all;
+//   * one staged copy of that block per stage, memcpy'd into a fresh constant region
+//     before each draw.
+//
+// Colour attachments: exactly one. The pipeline binds a single RTV, so a program
+// declaring SV_Target1 could not be built at all -- s3d_native_use refuses such a
+// program up front rather than failing later inside CreateGraphicsPipelineState.
+
+// Defined with the render-target section further down the file, and needed here first.
+void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil);
+int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain);
+static int s3d_readback_into(S3DContext* c, S3DTexture* src, uint8_t* out);
+
+static void s3d_native_reflect_stage(S3DContext* c, ID3DBlob* blob, int stage) {
+  c->nrvn[stage] = 0;
+  c->nglobalsSize[stage] = 0;
+  if (blob == NULL) return;
+  ID3D12ShaderReflection* refl = NULL;
+  const HRESULT hr = D3DReflect(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                __uuidof(ID3D12ShaderReflection), (void**)&refl);
+  if (FAILED(hr) || refl == NULL) {
+    fprintf(stderr, "stage3d_d3d: D3DReflect failed for the %s stage (0x%08lx); native "
+                    "uniforms cannot be located\n",
+            stage == 0 ? "vertex" : "fragment", (unsigned long)hr);
+    fflush(stderr);
+    return;
+  }
+  D3D12_SHADER_DESC sd = {};
+  refl->GetDesc(&sd);
+  for (UINT i = 0; i < sd.ConstantBuffers; i++) {
+    ID3D12ShaderReflectionConstantBuffer* cb = refl->GetConstantBufferByIndex(i);
+    D3D12_SHADER_BUFFER_DESC bd = {};
+    if (cb == NULL || FAILED(cb->GetDesc(&bd)) || bd.Name == NULL) continue;
+    // Loose uniforms land in the compiler's implicit `$Globals`, which is the root
+    // signature's b0 for that stage. An explicitly declared block would need its own
+    // root parameter -- the shim lifts those to b8+ and this channel has no slot for
+    // them, so they are reported instead of silently dropped.
+    if (!s3d_streq(bd.Name, "$Globals")) {
+      fprintf(stderr, "stage3d_d3d: native %s stage declares cbuffer '%s'; explicit uniform "
+                      "blocks are not wired on this backend yet (only loose uniforms at b0)\n",
+              stage == 0 ? "vertex" : "fragment", bd.Name);
+      fflush(stderr);
+      continue;
+    }
+    c->nglobalsSize[stage] = bd.Size;
+    if (bd.Size > (UINT)S3D_CB_REGION) {
+      fprintf(stderr, "stage3d_d3d: native %s stage `$Globals` is %u bytes but one constant "
+                      "region holds %u -- uniforms past the limit read garbage\n",
+              stage == 0 ? "vertex" : "fragment", (unsigned)bd.Size, (unsigned)S3D_CB_REGION);
+      fflush(stderr);
+    }
+    for (UINT v = 0; v < bd.Variables && c->nrvn[stage] < S3D_MAX_NRV; v++) {
+      ID3D12ShaderReflectionVariable* rv = cb->GetVariableByIndex(v);
+      D3D12_SHADER_VARIABLE_DESC vd = {};
+      if (rv == NULL || FAILED(rv->GetDesc(&vd)) || vd.Name == NULL) continue;
+      S3DNativeRVar* dst = &c->nrv[stage][c->nrvn[stage]++];
+      snprintf(dst->name, sizeof dst->name, "%s", vd.Name);
+      dst->offset = vd.StartOffset;
+      dst->bytes = vd.Size;
+    }
+    if (bd.Variables > S3D_MAX_NRV) {
+      fprintf(stderr, "stage3d_d3d: native %s stage `$Globals` has %u variables; the channel "
+                      "tracks %d\n", stage == 0 ? "vertex" : "fragment",
+              (unsigned)bd.Variables, S3D_MAX_NRV);
+      fflush(stderr);
+    }
+  }
+  refl->Release();
+}
+
+// Join the shim's declared slots with the reflected offsets. Called from both entry
+// points (the emitted code declares the layout BEFORE it calls s3d_native_use), so
+// either order ends up with resolved offsets.
+static void s3d_native_resolve(S3DContext* c) {
+  for (int i = 0; i < c->nnvar; i++) {
+    S3DNativeVar* v = &c->nvar[i];
+    v->found = 0;
+    if (v->kind != 1) continue;
+    const int st = (v->stage == 0) ? 0 : 1;
+    for (int k = 0; k < c->nrvn[st]; k++) {
+      if (!s3d_streq(c->nrv[st][k].name, v->name)) continue;
+      v->offset = c->nrv[st][k].offset;
+      v->bytes = c->nrv[st][k].bytes;
+      v->found = 1;
+      break;
+    }
+  }
+}
+
+void s3d_native_layout(void* ctx, const char* const* names, const int* kinds,
+                       const int* stages, const int* slots, const int* base_types,
+                       const int* components, const int* sizes, int count) {
+  if (ctx == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  // base_types / components / sizes describe the GLSL types, which is what the
+  // shim needs for its own ABI; the byte layout here comes from D3DReflect, so
+  // those three are deliberately unused rather than a second source of truth.
+  (void)base_types; (void)components; (void)sizes;
+  // Called from the emitted code before EVERY draw, so this reports once: a
+  // truncated table is a property of the program, not of the frame, and per-draw
+  // fprintf+fflush on 31 materials measured 1.5 fps.
+  if (count > S3D_MAX_NVAR) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "stage3d_d3d: native program declares %d slots; this backend tracks %d\n",
+              count, S3D_MAX_NVAR);
+      fflush(stderr);
+    }
+    count = S3D_MAX_NVAR;
+  }
+  c->nnvar = 0;
+  for (int i = 0; i < count; i++) {
+    S3DNativeVar* v = &c->nvar[c->nnvar++];
+    memset(v, 0, sizeof *v);
+    snprintf(v->name, sizeof v->name, "%s", (names && names[i]) ? names[i] : "");
+    v->kind = kinds ? kinds[i] : 0;
+    v->stage = (stages && stages[i] == 0) ? 0 : 1;
+    v->slot = slots ? slots[i] : 0;
+  }
+  s3d_native_resolve(c);
+}
+
+int s3d_native_use(void* ctx, const char* vs, const char* fs, int ncolor,
+                   char* err, int errcap) {
+  if (ctx == NULL || vs == NULL || fs == NULL) return 0;
+  S3DContext* c = (S3DContext*)ctx;
+  if (ncolor > 1) {
+    const char* msg = "this backend binds one colour attachment; the program declares more";
+    if (err && errcap > 0) snprintf(err, errcap, "stage3d_d3d: %s", msg);
+    fprintf(stderr, "stage3d_d3d: native program: %s\n", msg);
+    fflush(stderr);
+    return 0;
+  }
+  // Program identity for the compile cache is the translated vertex text the caller
+  // owns (GC never moves it and one NativeProgram3D has exactly one), exactly as on
+  // Metal. s3d_compile clears nativeMode, so it is set afterwards: a half-configured
+  // context that then drew with the AGAL uniform model would read garbage lanes.
+  if (!s3d_compile(ctx, (void*)vs, vs, fs, err, errcap)) {
+    // Leave nativeMode set: the caller throws on the 0 return, and falling back to
+    // AGAL would draw the previous program's semantics.
+    c->nativeMode = 1;
+    return 0;
+  }
+  c->nativeMode = 1;
+  c->nativeNColor = (ncolor < 1) ? 1 : ncolor;
+  S3DProg* pr = s3d_live_prog(c);
+  if (pr != NULL) {
+    s3d_native_reflect_stage(c, pr->vs, 0);
+    s3d_native_reflect_stage(c, pr->ps, 1);
+  }
+  s3d_native_resolve(c);
+  // A fresh program starts with a zeroed block: a uniform the caller never sets
+  // reads zeros, exactly like AGAL's register file.
+  memset(c->nstage, 0, sizeof c->nstage);
+  if (s3d_env("ASC_S3D_DUMP")) {
+    fprintf(stderr, "S3DNAT(d3d) globals=%u/%u slots=%d\n",
+            (unsigned)c->nglobalsSize[0], (unsigned)c->nglobalsSize[1], c->nnvar);
+    for (int i = 0; i < c->nnvar; i++)
+      fprintf(stderr, "  %-24s kind=%d stage=%d slot=%d off=%u bytes=%u found=%d\n",
+              c->nvar[i].name, c->nvar[i].kind, c->nvar[i].stage, c->nvar[i].slot,
+              (unsigned)c->nvar[i].offset, (unsigned)c->nvar[i].bytes, c->nvar[i].found);
+    fflush(stderr);
+  }
+  return 1;
+}
+
+// Copy both staged blocks into the frame's constant buffer, one fresh region each.
+// The AGAL bump allocator is shared on purpose: the two channels never draw at the
+// same time, and one allocator means a region cannot be live for both.
+static int s3d_native_upload_globals(S3DContext* c) {
+  const int slot = c->slot;
+  for (int st = 0; st < 2; st++) {
+    const int isFrag = (st == 1);
+    if (!s3d_ensure_cb(c, slot, isFrag, S3D_CB_BYTES)) return 0;
+    UINT* cur = isFrag ? &c->cbCurF : &c->cbCurV;
+    if (*cur + (UINT)S3D_CB_REGION > (UINT)S3D_CB_BYTES) {
+      // Same wrap the AGAL path does, with the same consequence: the draws after it
+      // may read a region an earlier draw of this frame wrote.
+      static int warned = 0;
+      if (!warned) {
+        warned = 1;
+        fprintf(stderr, "stage3d_d3d: constant regions exhausted (%d draws in one frame) -- "
+                        "reusing the first region; later draws may read stale constants\n",
+                S3D_DRAWS_PER_FRAME);
+        fflush(stderr);
+      }
+      *cur = 0;
+    }
+    const UINT off = *cur;
+    *cur = off + (UINT)S3D_CB_REGION;
+    // The FIRST upload of a frame happens before anything opens the batch, so this
+    // is the only thing keeping the CPU from overwriting a region the GPU may still
+    // be reading (identical reasoning to s3d_upload_constants).
+    s3d_wait_slot(c, slot);
+    char* base = (char*)(isFrag ? c->fcMap[slot] : c->vcMap[slot]);
+    if (base == NULL) return 0;
+    // The whole region, not just the block: a lane the shader declares and the
+    // caller never sets must read zero, not the previous draw's constants.
+    memcpy(base + off, c->nstage[st], (size_t)S3D_CB_REGION);
+    if (isFrag) c->cbOffF = off; else c->cbOffV = off;
+    if (s3d_env("ASC_S3D_DUMP")) {
+      const float* b = (const float*)c->nstage[st];
+      if (!isFrag) {
+        fprintf(stderr, "S3DNATUP vs off=%u", (unsigned)off);
+        for (int q = 0; q < 48; q++) fprintf(stderr, " %g", b[q]);
+        fprintf(stderr, "\n");
+      } else {
+      fprintf(stderr, "S3DNATUP %s off=%u", isFrag ? "fs" : "vs", (unsigned)off);
+      for (int q = 0; q < 48; q++) fprintf(stderr, " %g", b[q]);
+      fprintf(stderr, "\n");
+      fflush(stderr);
+      }
+    }
+  }
+  return 1;
+}
+
+void s3d_native_uniform(void* ctx, int stage, int slot, const float* f, int nfloats) {
+  if (ctx == NULL || f == NULL || nfloats <= 0) return;
+  S3DContext* c = (S3DContext*)ctx;
+  const int st = (stage == 0) ? 0 : 1;
+  S3DNativeVar* v = NULL;
+  for (int i = 0; i < c->nnvar; i++) {
+    if (c->nvar[i].kind == 1 && c->nvar[i].stage == st && c->nvar[i].slot == slot) {
+      v = &c->nvar[i];
+      break;
+    }
+  }
+  if (v == NULL || !v->found) {
+    // Once per run: a uniform fxc eliminated as unused is legitimate and a name
+    // mismatch is not, and from here the two are indistinguishable -- so say it
+    // once rather than per frame.
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "stage3d_d3d: native uniform %s slot %d is not in the %s stage's "
+                      "`$Globals` -- the write is dropped (unused-and-eliminated, or a "
+                      "stale shim name table)\n",
+              v ? v->name : "(undeclared)", slot, st == 0 ? "vertex" : "fragment");
+      fflush(stderr);
+    }
+    return;
+  }
+  if (s3d_env("ASC_S3D_DUMP")) {
+    static int dbgn = 0;
+    if (strcmp(v->name, "uAlphaTest") == 0 && f[0] != 0.0f && dbgn < 8) {
+      dbgn++;
+      fprintf(stderr, "S3DU uAlphaTest slot=%d off=%u bytes=%u nf=%d v0=%g\n",
+              slot, (unsigned)v->offset, (unsigned)v->bytes, nfloats, f[0]);
+    }
+  }
+  UINT n = (UINT)nfloats * 4u;
+  if (v->bytes != 0 && n > v->bytes) n = v->bytes;   // the block cannot hold more
+  if ((UINT)v->offset + n > (UINT)S3D_CB_REGION) return;
+  memcpy(c->nstage[st] + v->offset, f, n);
+}
+
+void s3d_native_bind_texture(void* ctx, int stage, int slot, void* tex) {
+  if (ctx == NULL || tex == NULL) return;
+  // D3D12's descriptor table is ONE index space visible to both stages (see
+  // s3d_make_root_sig), so a tN a vertex shader reads and the same tN a fragment
+  // shader reads are the same descriptor. `stage` is therefore only the compiler's.
+  (void)stage;
+  s3d_bind_texture(ctx, slot, tex, ((S3DTexture*)tex)->hasChain);
+}
+
+void s3d_native_set_sampler_state(void* ctx, int stage, int unit, int filter, int wrap, int mip) {
+  (void)stage;
+  s3d_set_sampler_state_i(ctx, unit, filter, wrap, mip);
+}
+
+void s3d_native_set_targets(void* ctx, void** colors, int ncolors, void* depth) {
+  if (ctx == NULL) return;
+  if (colors == NULL || ncolors <= 0) {
+    s3d_set_render_target(ctx, NULL, 0);   // back to the back buffer
+    return;
+  }
+  if (ncolors > 1) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "stage3d_d3d: native pass binds %d colour attachments; this backend "
+                      "binds one (the rest are ignored)\n", ncolors);
+      fflush(stderr);
+    }
+  }
+  // The caller's depth TEXTURE is not bound as such: s3d_set_render_target creates a
+  // private D24S8 of the target's size, which is what the AGAL RTT path renders
+  // against. Only its PRESENCE matters here (a pass that asked for depth gets it).
+  s3d_set_render_target(ctx, colors[0], depth != NULL);
+}
+
+// ---- native textures -------------------------------------------------------
+
+// The shim's format ids, mapped onto DXGI. Ids follow Context3DNative's own enum
+// (see stage3d_glue.mm's s3d_fmt_from_id): 0 BGRA8, 1 RGBA32F, 2 R32F, 3 RG32F,
+// 4 RGBA16F, 5 R16F, 6 RG16F, 7 R11G11B10F, 8 R8, 9 D32F, 10 D16.
+static DXGI_FORMAT s3d_dxgi_from_fmt_id(int id) {
+  switch (id) {
+    case 0:  return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case 1:  return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case 2:  return DXGI_FORMAT_R32_FLOAT;
+    case 3:  return DXGI_FORMAT_R32G32_FLOAT;
+    case 4:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 5:  return DXGI_FORMAT_R16_FLOAT;
+    case 6:  return DXGI_FORMAT_R16G16_FLOAT;
+    case 7:  return DXGI_FORMAT_R11G11B10_FLOAT;
+    case 8:  return DXGI_FORMAT_R8_UNORM;
+    case 9:  return DXGI_FORMAT_D32_FLOAT;
+    case 10: return DXGI_FORMAT_D16_UNORM;
+    default: return DXGI_FORMAT_UNKNOWN;
+  }
+}
+
+// D3D12 has no blit-style mip generation: D3D11's GenerateMips helper was dropped
+// from the API, and the alternatives are a compute pass or a per-level render pass.
+// So the chain is built on the CPU -- read level 0 back, box-filter it down, upload
+// each level -- which is exact, needs no shader, and cannot collide with whatever
+// program and render target the frame has live at the time.
+//
+// It is deliberately limited to 4-byte BGRA8 surfaces, because that is the only
+// layout s3d_readback_into produces; a float-format chain is REPORTED rather than
+// half-filled, since a mip-sampling draw would then read uninitialised levels (the
+// AIR-faithful behaviour for a chain-less texture is to drop the draw entirely --
+// see the gate in s3d_draw -- so "some levels exist" is the worst of both worlds).
+void s3d_generate_mips(void* ctx, void* tex) {
+  if (ctx == NULL || tex == NULL) return;
+  S3DContext* c = (S3DContext*)ctx;
+  S3DTexture* t = (S3DTexture*)tex;
+  if (t->mips <= 1) return;
+  if (!s3d_revive_texture(c, t)) return;
+  if (t->format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "stage3d_d3d: generateMipmaps: format %d is not generated on this "
+                      "backend (only 8-bit BGRA8 is); the levels above 0 stay uninitialised\n",
+              (int)t->format);
+      fflush(stderr);
+    }
+    return;
+  }
+  const UINT pitch = s3d_align256((UINT)t->width * 4u);
+  uint8_t* src = (uint8_t*)malloc((size_t)pitch * (size_t)t->height);
+  if (src == NULL) return;
+  if (!s3d_readback_into(c, t, src)) { free(src); return; }
+  int pw = t->width, ph = t->height;
+  UINT spitch = pitch;
+  for (int lv = 1; lv < t->mips; lv++) {
+    const int nw = pw > 1 ? pw / 2 : 1;
+    const int nh = ph > 1 ? ph / 2 : 1;
+    uint32_t* dst = (uint32_t*)malloc((size_t)nw * (size_t)nh * 4u);
+    if (dst == NULL) break;
+    for (int y = 0; y < nh; y++) {
+      const int y0 = (ph > 1) ? y * 2 : 0;
+      const int y1 = (ph > 1) ? (y0 + 1 < ph ? y0 + 1 : y0) : y0;
+      for (int x = 0; x < nw; x++) {
+        const int x0 = (pw > 1) ? x * 2 : 0;
+        const int x1 = (pw > 1) ? (x0 + 1 < pw ? x0 + 1 : x0) : x0;
+        uint32_t acc[4] = {0, 0, 0, 0};
+        const int xs[2] = {x0, x1};
+        const int ys[2] = {y0, y1};
+        for (int k = 0; k < 4; k++) {
+          const int px = xs[k & 1], py = ys[k >> 1];
+          const uint8_t* p = src + (size_t)py * spitch + (size_t)px * 4u;
+          acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; acc[3] += p[3];
+        }
+        uint8_t* q = (uint8_t*)&dst[(size_t)y * (size_t)nw + (size_t)x];
+        q[0] = (uint8_t)(acc[0] / 4); q[1] = (uint8_t)(acc[1] / 4);
+        q[2] = (uint8_t)(acc[2] / 4); q[3] = (uint8_t)(acc[3] / 4);
+      }
+    }
+    s3d_upload_region(c, t, lv, nw, nh, dst, nw);
+    free(src);
+    src = (uint8_t*)dst;
+    spitch = (UINT)nw * 4u;
+    pw = nw;
+    ph = nh;
+  }
+  free(src);
+}
+
+int s3d_set_target_samples(void* ctx, void* tex, int samples) {
+  if (ctx == NULL || tex == NULL) return 0;
+  // Per-target multisampling needs a multisampled resource plus a resolve pass, and
+  // every texture this backend creates is created single-sampled (SampleDesc.Count=1
+  // in s3d_make_texture_fmt). Reporting 0 is the honest answer: the caller (the
+  // generated Context3DNative.setRenderTargetSamples) turns it into a diagnostic
+  // instead of a silently ignored quality knob. `samples <= 1` is the state we are
+  // already in, so it succeeds.
+  if (samples <= 1) return 1;
+  static int warned = 0;
+  if (!warned) {
+    warned = 1;
+    fprintf(stderr, "stage3d_d3d: setRenderTargetSamples(%d) is not supported on this "
+                    "backend -- targets stay single-sampled\n", samples);
+    fflush(stderr);
+  }
+  return 0;
+}
+
+void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId,
+                             int renderable, int mipmapped) {
+  if (ctx == NULL || width <= 0 || height <= 0) return NULL;
+  S3DContext* c = (S3DContext*)ctx;
+  const DXGI_FORMAT fmt = s3d_dxgi_from_fmt_id(fmtId);
+  if (fmt == DXGI_FORMAT_UNKNOWN) {
+    fprintf(stderr, "stage3d_d3d: native texture format id %d has no D3D12 mapping\n", fmtId);
+    fflush(stderr);
+    return NULL;
+  }
+  const int isDepth = (fmtId == 9 || fmtId == 10);
+  // "mipmapped" means the resource CARRIES a full chain (level 0 is what the app
+  // writes; further levels are its own uploads). A texture created without one and
+  // then sampled with a mip filter drops the draw -- see s3d_draw's AIR gate.
+  int mips = 1;
+  if (mipmapped) {
+    int m = width > height ? width : height;
+    while (m > 1) { m >>= 1; mips++; }
+  }
+  S3DTexture* t = s3d_make_texture_fmt(c, width, height, mips, 1, renderable ? 1 : 0,
+                                       isDepth, 0, fmt);
+  if (t != NULL) t->hasChain = (mips > 1) ? 1 : 0;
+  return (void*)t;
+}
+
 // ---- readback --------------------------------------------------------------
 
 // Copy one texture into a READBACK-heap buffer and memcpy the rows out. Returns 1
@@ -2668,7 +3235,8 @@ void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf
   // A render-target texture is created with ALLOW_RENDER_TARGET and an RTV slot:
   // drawTriangles renders into it while it is the render override, and setTextureAt
   // can later sample it as fsN.
-  return (void*)s3d_make_texture_fmt(c, width, height, 1, 1, 1, 0, isHalf ? 1 : 0);
+  return (void*)s3d_make_texture_fmt(c, width, height, 1, 1, 1, 0, isHalf ? 1 : 0,
+                                     DXGI_FORMAT_UNKNOWN);
 }
 
 // Bytes of texture this backend will attempt in ONE allocation: what is left of the
@@ -2740,6 +3308,12 @@ void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil) {
 // Bind an existing render-target texture as fragment sampler fs{unit} (no pixel
 // upload -- the texture already holds rendered content).
 int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
+  if (s3d_env("ASC_S3D_DUMP") && tex != NULL) {
+    static int bn = 0;
+    if (bn < 10) { bn++; S3DTexture* bt = (S3DTexture*)tex;
+      fprintf(stderr, "S3DB unit=%d passed=%d hasChain=%d mips=%d w=%d h=%d p=%p\n",
+              unit, hasChain, bt->hasChain, bt->mips, bt->width, bt->height, (void*)bt); }
+  }
   if (ctx == NULL || unit < 0 || unit >= S3D_MAX_TEX || tex == NULL) return 0;
   S3DContext* c = (S3DContext*)ctx;
   if (!s3d_revive_texture(c, (S3DTexture*)tex)) return 0;

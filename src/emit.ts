@@ -3210,7 +3210,7 @@ export class Emitter {
     for (const [cname, info] of this.symbols.classes) {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
-        const t = f.isConst && this.isConstExpr(f.init) ? this.constTypeName(f.type) : this.cTypeName(f.type);
+        const t = f.isConst && this.isStaticConstSlot(f.type, f.init) ? this.constTypeName(f.type) : this.cTypeName(f.type);
         this.line(`static ${t} ${this.memberCName(cname, fname)};`);
       }
     }
@@ -5231,7 +5231,7 @@ export class Emitter {
     for (const [cname, info] of this.symbols.classes) {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
-        if (f.isConst && this.isConstExpr(f.init)) continue;
+        if (f.isConst && this.isStaticConstSlot(f.type, f.init)) continue;
         if (f.init) this.cinitClasses.add(cname);
       }
     }
@@ -5272,7 +5272,7 @@ export class Emitter {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
         this.currentClass = cname;
-        if (f.isConst && this.isConstExpr(f.init)) {
+        if (f.isConst && this.isStaticConstSlot(f.type, f.init)) {
           const init = this.platformStaticConst(cname, fname)
             ?? (f.init ? this.convertImplicit(this.emitExpr(f.init), f.type) : this.defaultInit(f.type));
           this.line(`static ${this.constTypeName(f.type)} ${this.memberCName(cname, fname)} = ${init};`);
@@ -5305,6 +5305,19 @@ export class Emitter {
       case 'Num': case 'Str': case 'Bool': case 'Null': return true;
       default: return false;
     }
+  }
+
+  // A `static const` C slot needs a *compile-time* initializer, and there are two
+  // ways to lose that: the initializer being a runtime expression (isConstExpr), or
+  // the slot's C type needing a constructor call even for a literal -- `*` is an
+  // `as_value`, whose only spelling is `as_v_num(...)` / `as_v_str(...)`. The second
+  // one used to be missed, so `const N:* = 5;` emitted `static const as_value g_N =
+  // as_v_num(5);` and clang rejected the whole program ("initializer element is not
+  // a compile-time constant"). Such a slot is declared non-const and written once
+  // before any use, exactly like `static const d = new Dictionary()`.
+  private isStaticConstSlot(ctype: CType, init: Expr | null): boolean {
+    if (ctype.kind === 'any') return false;
+    return this.isConstExpr(init);
   }
 
   // GC permanent user roots (stage 57): emit gc_mark_user_roots(), which marks
@@ -6913,7 +6926,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     for (const [cname, info] of this.symbols.classes) {
       for (const [fname, f] of info.staticFields) {
         if (f.owner !== cname) continue;
-        if (f.isConst && this.isConstExpr(f.init)) continue; // compile-time literal const, never a GC object
+        if (f.isConst && this.isStaticConstSlot(f.type, f.init)) continue; // compile-time literal const, never a GC object
         const m = this.gcMarkExpr(this.memberCName(cname, fname), f.type);
         if (m) this.line(m);
       }
@@ -25144,6 +25157,120 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('void ByteArray_clear(void* _this) { ByteArray* o = (ByteArray*)_this; o->length = 0; o->position = 0; }');
+    // ---- AIR 51 base64 codec (RFC 4648 §4) ----
+    // Measured on adl 51.4.1 (temp/b64probe/out.txt):
+    //  - toBase64 encodes the WHOLE buffer (position is ignored) and never
+    //    moves position; empty -> "", '=' padding, no line breaks.
+    //  - writeBase64 appends at position and returns the new byte count; it
+    //    accepts an unpadded final quantum ("Zg" -> 1 byte) but rejects
+    //    wrong/extra padding, whitespace and stray '=' with ArgumentError
+    //    #1508 -- atomically: nothing is written when validation fails.
+    //  - null argument -> TypeError #2007 (both entry points).
+    //  - createFromBase64 = new + writeBase64, position left at the end.
+    this.line('static const char as_b64_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";');
+    this.line('static int as_b64_val(int c) {');
+    this.indent++;
+    this.line('if (c >= \'A\' && c <= \'Z\') return c - \'A\';');
+    this.line('if (c >= \'a\' && c <= \'z\') return c - \'a\' + 26;');
+    this.line('if (c >= \'0\' && c <= \'9\') return c - \'0\' + 52;');
+    this.line('if (c == \'+\') return 62;');
+    this.line('if (c == \'/\') return 63;');
+    this.line('return -1;');
+    this.indent--;
+    this.line('}');
+    this.line('static void as_throw_b64_invalid(void) {');
+    this.indent++;
+    this.line('as_throw(ArgumentError_new((char*)"Error #1508: The value specified for argument base64 is invalid.", 1508));');
+    this.indent--;
+    this.line('}');
+    // Whole-string validation; returns the decoded byte count, or -1 when the
+    // input is malformed. Padding rules measured on adl: 0/1/2 trailing '='
+    // only, and a padded string must complete its final quantum ("Zg==" ok,
+    // "Zg=" not); an unpadded final quantum of 2 or 3 chars is accepted.
+    this.line('static int as_b64_decoded_len(const char* s) {');
+    this.indent++;
+    this.line('int n = (int)strlen(s);');
+    this.line('int pads = 0;');
+    this.line('while (pads < n && s[n - 1 - pads] == \'=\') pads++;');
+    this.line('if (pads > 2) return -1;');
+    this.line('int body = n - pads;');
+    this.line('int rem = body % 4;');
+    this.line('if (rem == 1) return -1;');
+    this.line('if (pads > 0 && rem != 4 - pads) return -1;');
+    this.line('for (int i = 0; i < body; i++) if (as_b64_val((unsigned char)s[i]) < 0) return -1;');
+    this.line('return (body / 4) * 3 + (rem == 2 ? 1 : rem == 3 ? 2 : 0);');
+    this.indent--;
+    this.line('}');
+    this.line('char* ByteArray_toBase64(void* _this) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('int n = o->length;');
+    this.line('if (n <= 0) return as_str_empty();');
+    this.line('char* r = (char*)as_str_alloc((size_t)(((n + 2) / 3) * 4) + 1);');
+    this.line('const unsigned char* p = (const unsigned char*)o->data;');
+    this.line('int i = 0, j = 0;');
+    this.line('for (; i + 2 < n; i += 3) {');
+    this.indent++;
+    this.line('unsigned v = ((unsigned)p[i] << 16) | ((unsigned)p[i + 1] << 8) | (unsigned)p[i + 2];');
+    this.line('r[j++] = as_b64_alphabet[(v >> 18) & 63];');
+    this.line('r[j++] = as_b64_alphabet[(v >> 12) & 63];');
+    this.line('r[j++] = as_b64_alphabet[(v >> 6) & 63];');
+    this.line('r[j++] = as_b64_alphabet[v & 63];');
+    this.indent--;
+    this.line('}');
+    this.line('if (n - i == 1) {');
+    this.indent++;
+    this.line('unsigned v = (unsigned)p[i] << 16;');
+    this.line('r[j++] = as_b64_alphabet[(v >> 18) & 63];');
+    this.line('r[j++] = as_b64_alphabet[(v >> 12) & 63];');
+    this.line('r[j++] = \'=\'; r[j++] = \'=\';');
+    this.indent--;
+    this.line('} else if (n - i == 2) {');
+    this.indent++;
+    this.line('unsigned v = ((unsigned)p[i] << 16) | ((unsigned)p[i + 1] << 8);');
+    this.line('r[j++] = as_b64_alphabet[(v >> 18) & 63];');
+    this.line('r[j++] = as_b64_alphabet[(v >> 12) & 63];');
+    this.line('r[j++] = as_b64_alphabet[(v >> 6) & 63];');
+    this.line('r[j++] = \'=\';');
+    this.indent--;
+    this.line('}');
+    this.line('r[j] = 0;');
+    this.line('return r;');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned ByteArray_writeBase64(void* _this, char* base64) {');
+    this.indent++;
+    this.line('ByteArray* o = (ByteArray*)_this;');
+    this.line('if (base64 == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter base64 must be non-null.", 2007)); return 0; }');
+    // Validate the WHOLE string before touching the buffer: adl writes nothing
+    // when the input is malformed (temp/b64probe T19).
+    this.line('int outLen = as_b64_decoded_len(base64);');
+    this.line('if (outLen < 0) { as_throw_b64_invalid(); return 0; }');
+    this.line('if (outLen == 0) return 0;');
+    this.line('as_ba_grow_pos(o, outLen);');
+    this.line('unsigned char* dst = (unsigned char*)o->data + o->position;');
+    this.line('int body = (int)strlen(base64);');
+    this.line('while (body > 0 && base64[body - 1] == \'=\') body--;');
+    this.line('int acc = 0, bits = 0, j = 0;');
+    this.line('for (int i = 0; i < body; i++) {');
+    this.indent++;
+    this.line('acc = (acc << 6) | as_b64_val((unsigned char)base64[i]);');
+    this.line('bits += 6;');
+    this.line('if (bits >= 8) { bits -= 8; dst[j++] = (unsigned char)((acc >> bits) & 0xFF); }');
+    this.indent--;
+    this.line('}');
+    this.line('o->position += outLen;');
+    this.line('if (o->position > o->length) o->length = o->position;');
+    this.line('return (unsigned)outLen;');
+    this.indent--;
+    this.line('}');
+    this.line('ByteArray* ByteArray_createFromBase64_static(char* base64) {');
+    this.indent++;
+    this.line('ByteArray* o = ByteArray_new();');
+    this.line('ByteArray_writeBase64(o, base64);');
+    this.line('return o;');
+    this.indent--;
+    this.line('}');
     this.line('void ByteArray_compress(void* _this, char* algorithm) {');
     this.indent++;
     this.line('ByteArray* o = (ByteArray*)_this; if (o->length == 0) return;');
@@ -34406,7 +34533,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           : (v.init ? this.probeExprType(v.init) : { kind: 'int' });
       this.moduleScope.set(v.name, ctype);
       const cn = this.moduleCName(v.name);
-      if (v.isConst && this.isConstExpr(v.init)) {
+      if (v.isConst && this.isStaticConstSlot(ctype, v.init)) {
         this.moduleConsts.add(v.name);
         const e = this.emitExpr(v.init!);
         this.line(`static ${this.constTypeName(ctype)} ${cn} = ${this.convertImplicit(e, ctype)};`);
@@ -34811,7 +34938,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       // A runtime-initialized const (e.g. `const d = new Dictionary()`) still
       // needs its initializer to run once in main(); compile-time-literal const
       // was already initialized at file scope.
-      if (!this.isConstExpr(stmt.init)) {
+      if (!this.moduleConsts.has(stmt.name)) {
         this.sequenceValueExpr(stmt.init!, true, true);
         const e = this.emitExpr(stmt.init!);
         const ctype = this.moduleScope.get(stmt.name)!;
@@ -34823,14 +34950,14 @@ void FileStream_writeObject(void* _this, as_value v) {
       // Multi-declarator module-level const: emit each runtime-initialized member.
       let anyRuntime = false;
       for (const d of stmt.decls) {
-        if (this.moduleScope.has(d.name) && !this.isConstExpr(d.init)) {
+        if (this.moduleScope.has(d.name) && !this.moduleConsts.has(d.name)) {
           anyRuntime = true;
           break;
         }
       }
       if (anyRuntime) {
         for (const d of stmt.decls) {
-          if (this.moduleScope.has(d.name) && !this.isConstExpr(d.init)) {
+          if (this.moduleScope.has(d.name) && !this.moduleConsts.has(d.name)) {
             this.sequenceValueExpr(d.init!, true, true);
             const e = this.emitExpr(d.init!);
             const ctype = this.moduleScope.get(d.name)!;
@@ -34871,7 +34998,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         // literal const is already initialized there, a runtime-initialized one
         // (e.g. `const d = new Dictionary()`) needs one assignment here.
         if (this.functionScope === null && this.moduleScope.has(stmt.name)) {
-          if (!this.isConstExpr(stmt.init)) {
+          if (!this.moduleConsts.has(stmt.name)) {
             const ctype = this.moduleScope.get(stmt.name)!;
             const e = this.emitExpr(stmt.init!);
             this.line(`${this.moduleCName(stmt.name)} = ${this.convertImplicit(e, ctype)};`);
@@ -34900,7 +35027,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         for (const d of stmt.decls) {
           if (d.init) this.sequenceValueExpr(d.init, true, true);
           if (this.functionScope === null && this.moduleScope.has(d.name)) {
-            if (d.init && !this.isConstExpr(d.init)) {
+            if (d.init && !this.moduleConsts.has(d.name)) {
               const ctype = this.moduleScope.get(d.name)!;
               const e = this.emitExpr(d.init);
               this.line(`${this.moduleCName(d.name)} = ${this.convertImplicit(e, ctype)};`);
@@ -35593,7 +35720,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     const cond = stmt.cond ? this.condExpr(this.emitExpr(stmt.cond)) : '';
     if (condPrelude.length === 0 && updPrelude.length === 0) {
       this.continueTargets.push({ depth, label: null, used: false });
-      const update = stmt.update ? this.emitExpr(stmt.update).code : '';
+      // The update slot discards the value; marking it keeps an `as_value` target's
+      // increment from carrying a scratch temp that nothing reads (-Wunused-value).
+      let update = '';
+      if (stmt.update) {
+        const outerUpdDiscarded = this.discardedExprNode;
+        this.discardedExprNode = stmt.update;
+        update = this.emitExpr(stmt.update).code;
+        this.discardedExprNode = outerUpdDiscarded;
+      }
       this.line(`for (${init}; ${cond ? this.clauseParens(cond) : ''}; ${update}) {`);
       this.indent++;
       this.emitStmt(stmt.body);
@@ -35619,7 +35754,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     // setter write by the sequencing pass; emitExpr would only reproduce the
     // invalid `get_prop(...)++` rvalue (same rule as the `ExprStmt` case).
     if (stmt.update && !(stmt.update.kind === 'Update' && this.resolveUpdateSetter(stmt.update.target))) {
+      // The update slot discards the expression's value (C has nowhere to put it),
+      // so mark it the same way an ExprStmt does: an increment of an `as_value`
+      // target then emits only the read-modify-write store, without a scratch temp
+      // nobody reads (-Wunused-value).
+      const outerUpdDiscarded = this.discardedExprNode;
+      this.discardedExprNode = stmt.update;
       const e = this.emitExpr(stmt.update);
+      this.discardedExprNode = outerUpdDiscarded;
       this.line(e.discard ? `(void)(${e.code});` : `${e.code};`);
     }
     this.indent--;
@@ -37690,6 +37832,27 @@ void FileStream_writeObject(void* _this, as_value v) {
             discard: true,
           };
         }
+        // A DYNAMIC target (`*`, i.e. an `as_value` slot) is not a C lvalue either.
+        // `x++` on one used to fall through to the generic `(x++)` below, which clang
+        // rejects outright -- "cannot increment value of type 'as_value'" -- so an
+        // AS3-legal program simply did not compile. The operator's meaning is a
+        // read-modify-write through ToNumber (ES3 §11.3.1/§11.4.1): the slot ends up
+        // holding a Number, and the value of a postfix use is ToNumber(old). The read
+        // goes through `Number(x)` for the same reason the container branch above
+        // does -- the slot may hold the STRING "5", which must become 5 then 6.
+        if (o.type.kind === 'any') {
+          const numT: CType = { kind: 'number' };
+          const sign = expr.op === '++' ? '+' : '-';
+          const store0 = this.emitAssign(this.indexUpdateStore(expr.target, expr.op));
+          if (this.discardedExprNode !== null && this.discardedExprNode === expr) {
+            // Statement position: the pre-increment value is unobservable, and a
+            // scratch temp that nobody reads is a -Wunused-variable warning.
+            return { code: store0.code, type: numT };
+          }
+          const t = this.tmpName('upd');
+          this.line(`${this.cTypeName(numT)} ${t} = ${this.convert(this.emitExpr(this.toNumberAst(expr.target)), numT)};`);
+          return { code: `(${store0.code}, ${expr.prefix ? `(${t} ${sign} 1)` : t})`, type: numT };
+        }
         const code = expr.prefix ? `(${expr.op}${o.code})` : `(${o.code}${expr.op})`;
         return { code, type: o.type };
       }
@@ -37698,9 +37861,23 @@ void FileStream_writeObject(void* _this, as_value v) {
         const c = this.emitExpr(expr.cond);
         const tRaw = this.emitExpr(expr.then);
         const eRaw = this.emitExpr(expr.else);
-        const type = this.unifyType(tRaw.type, eRaw.type);
-        const t = this.convert(tRaw, type);
-        const e = this.convert(eRaw, type);
+        // Same gate as `&&`/`||`: only same-kind and numeric pairs may share one
+        // C type. Unifying anything else coerces the SURVIVING arm into the other
+        // arm's static type, which is a silent semantic error (a conditional
+        // returns the chosen operand's value, it does not convert it). Measured:
+        //   `v == null ? 0 : v` with v = 0.974   -> 0    (int truncation)
+        //   `true ? 0 : "x"`                     -> "0"  (stringification)
+        // A `null` arm is left to unifyType, whose rules there are already exact
+        // (G16: `? null : Bitmap` must return the pointer, `? null : 5` must box).
+        const numeric = (t: CType): boolean => t.kind === 'int' || t.kind === 'uint'
+          || t.kind === 'number' || t.kind === 'int64' || t.kind === 'uint64';
+        const shareType = tRaw.type.kind === eRaw.type.kind
+          || (numeric(tRaw.type) && numeric(eRaw.type))
+          || tRaw.type.kind === 'null' || eRaw.type.kind === 'null'
+          || tRaw.type.kind === 'void' || eRaw.type.kind === 'void';
+        const type: CType = shareType ? this.unifyType(tRaw.type, eRaw.type) : { kind: 'any' };
+        const t = shareType ? this.convert(tRaw, type) : this.boxExpr(tRaw);
+        const e = shareType ? this.convert(eRaw, type) : this.boxExpr(eRaw);
         return { code: `(${this.condExpr(c)} ? ${t} : ${e})`, type };
       }
 
@@ -38595,9 +38772,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     }
     if (a.kind === 'any' || b.kind === 'any') {
       if (a.kind === 'any' && b.kind === 'any') return { kind: 'any' };
-      // `any` unboxes to the concrete branch's type at runtime (e.g. a record
-      // field read vs. a statically-typed SimpleTimeline); keep the concrete one.
-      return a.kind === 'any' ? b : a;
+      // `any` must NOT be narrowed to the other arm's static type: the surviving
+      // value is whichever arm ran, and `convert` would coerce it (unbox to int
+      // truncates, unbox to a class throws #1034). Measured: `v == null ? 0 : v`
+      // with v = 0.974 answered 0, i.e. a silent truncation on every
+      // `cond ? <int literal> : <dynamic value>` -- the same red line as `&&`/`||`
+      // (which already box both sides when the kinds differ).
+      //   A `void` arm keeps the old behaviour: there is no value to box.
+      const other = a.kind === 'any' ? b : a;
+      if (other.kind === 'void') return a.kind === 'any' ? b : a;
+      return { kind: 'any' };
     }
     // The numeric family: a ternary joining int64 with int64 keeps int64 (same
     // kind, above), but any MIX of numeric kinds -- including int64 with uint64 --

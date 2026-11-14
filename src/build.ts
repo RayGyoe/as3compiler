@@ -1379,8 +1379,10 @@ export function shaderFeatureLibs(cfg: BuildConfig): string[] | null {
     .split('\n')
     .map((l) => l.trim())
     .filter((l) => l.length > 0 && !l.startsWith('#'))
-    // libglslang.a -> glslang: the linker wants the bare name.
-    .map((l) => l.replace(/^lib/, '').replace(/\.a$/, ''));
+    // libglslang.a -> glslang: the linker wants the bare name. The Windows tree
+    // spells them NAME.lib with no prefix, and both are normalised here so the
+    // SAME link-order.txt text is valid on every host.
+    .map((l) => l.replace(/^lib/, '').replace(/\.(a|lib)$/, ''));
 }
 
 export function shaderFeatureArgs(cfg: BuildConfig): string[] {
@@ -1388,7 +1390,11 @@ export function shaderFeatureArgs(cfg: BuildConfig): string[] {
   if (libs === null) return [];
   const root = shaderVendorRoot();
   const dir = resolve(root, 'lib', hostVendorKey('native', process.platform, process.arch, cfg.architecture));
-  const out = ['-I', resolve(root, 'include'), '-L', dir];
+  // Skia's archive embeds its own SPIRV-Cross copy, so ours is renamed out of the way
+  // to keep the two from defining the same symbols (see build-tools/shader/build-win.sh;
+  // the archives are built with the identical define, and the spvc_* C entry points are
+  // extern "C" and therefore unaffected).
+  const out = ['-I', resolve(root, 'include'), '-DSPIRV_CROSS_NAMESPACE_OVERRIDE=asc_spvc', '-L', dir];
   for (const l of libs) out.push('-l', l);
   return out;
 }

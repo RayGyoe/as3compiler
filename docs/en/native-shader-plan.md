@@ -371,6 +371,31 @@ PASS**, the centre pixel `#804020` = `uColor.rgb * 0.5` exactly, and `#361b0e` a
 
 ---
 
+### 5.7 M5 · D3D12 backend (as-built, 2026-11-14) ✅
+
+**There is exactly one current reference**: [`native-shader.md`](native-shader.md) §6.12. What stays here is
+only "how it differs from the design draft" and "defects exposed while landing", so a second list cannot
+drift.
+
+| Item | What the draft assumed | What actually landed |
+|---|---|---|
+| Identity of a native program | intuition says "a second kind of program object" | **an ordinary `S3DProg`**: same `s3d_compile`, same PSO cache, same `TEXCOORD{slot}` input layout; only two additions -- reflected `$Globals` offsets and one staged block per stage |
+| `s3d_native_layout` | assumed needed on all three backends | Metal: no-op (bindings baked into `[[buffer(N)]]`); **D3D12: mandatory** (match names to offsets); WebGL2: mandatory (look locations up by name) |
+| Colour attachments | designed around MRT | this backend **binds one RTV**, so `ncolor > 1` is refused up front in `s3d_native_use` and reported |
+| Format surface | `int isHalf` | `s3d_create_texture_fmt` takes fmt ids 0..10 -> DXGI, and the PSO key carries the **full `DXGI_FORMAT`** |
+| `generateMipmaps` / `setRenderTargetSamples` | treated as switches | D3D12 has no blit-style generation -> CPU box filter (BGRA8 only) plus per-level upload; MSAA reports unsupported, targets stay single-sampled |
+
+**Five real defects** (details in §6.12, each measured): (1) combined image-sampler bindings all collapse to 0,
+so two textures were pinned to the same `t1`; (2) GLSL ES 3.00 attributes carry no Location decoration, so
+reflection read aPos and aUV as both 0 (fixed by a two-pass pinner); (3) **HLSL matrices must be
+`row_major`** -- otherwise `mul(v, M)` silently becomes `M^T v`: empty frame, zero errors, every uniform
+reading back correct; (4) `skia.lib` bundles its own SPIRV-Cross, so the link dies on duplicate symbols until
+ours moves to `-DSPIRV_CROSS_NAMESPACE_OVERRIDE=asc_spvc`; (5) `CreateGraphicsPipelineState` **fails
+outright** when `RTVFormats[0]` disagrees with the bound view.
+
+**Acceptance**: `asaot3d/apps/shader-m30/build.sh aot` on Windows: 15 checks PASS, centre pixel `#804020`,
+three-eighths across `#31190c`.
+
 ## 6. Acceptance commands per milestone
 
 ```bash

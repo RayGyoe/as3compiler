@@ -116,9 +116,13 @@ registerGroup('native-shader/', checkNativeShader);
 //      default one (the "silent downgrade" §0 forbids).
 //   3. The five s3d_native_* entry points must be DECLARED in the preamble.
 //      Undeclared is not benign in C99: it is `call to undeclared function`.
-//   4. A native draw goes through Context3D_submit, the same sync point an AGAL
+//   4. A native draw goes through Context3D_submit_ex, the same sync point an AGAL
 //      draw uses; calling s3d_draw directly skips the vertex-upload step and the
-//      glue returns on `numStreams == 0` without drawing anything.
+//      glue returns on `numStreams == 0` without drawing anything. It must pass
+//      `keepTextures = 1`: the AGAL branch of that function rebinds t0..t7 from the
+//      AGAL program's sampler table, which would overwrite the samplers the native
+//      draw just bound (the mip-drop bug). The 5th argument is the back face
+//      override (culling is applied by the caller's state).
 const INDEX_SRC = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
 
 export function checkNativeShaderBuildInputs(): string[] {
@@ -149,8 +153,9 @@ export function checkNativeShaderBuildInputs(): string[] {
   }
 
   const emit = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
-  if (!emit.includes('Context3D_submit(self->context, indexBuffer, numTriangles, 1)')) {
-    bad.push('emit.ts: the native draw must go through Context3D_submit (vertex uploads live there)');
+  if (!emit.includes('Context3D_submit_ex(self->context, indexBuffer, numTriangles, 1, 1)')) {
+    bad.push('emit.ts: the native draw must go through Context3D_submit_ex(..., keepTextures=1) '
+             + '(vertex uploads live there, and the AGAL t0..t7 rebind must stay off)');
   }
   if (!emit.includes('Context3DNative_fromContext_static')) {
     bad.push('emit.ts: Context3DNative needs the fromContext factory (a Class value is not constructible)');

@@ -350,6 +350,27 @@ void asc_shader_program_free(AscShaderProgram* p);
 
 ---
 
+### 5.7 M5 · D3D12 后端（as-built，2026-11-14）✅
+
+**现行口径只有一份**：[`native-shader.md`](native-shader.md) §6.12。这里只留「与设计期草稿的偏差」和
+「落地时暴露的缺陷」两栏，避免第二份会漂移的清单。
+
+| 项 | 设计期草稿怎么说 | 实际怎么落 |
+|---|---|---|
+| 原生程序的身份 | 直觉上要「另一套程序对象」 | **就是普通 `S3DProg`**：同一个 `s3d_compile`、同一套 PSO 缓存、同一套 `TEXCOORD{slot}` 输入布局；只多两样——`$Globals` 的反射偏移与每 stage 一份暂存块 |
+| `s3d_native_layout` | 以为三个后端都要 | Metal 是 no-op（绑定烘进 `[[buffer(N)]]`），**D3D12 必修**（按名字对偏移），WebGL2 必修（按名字查 location） |
+| 颜色附件 | 按 MRT 设计 | 本后端**只绑一个 RTV**，`ncolor > 1` 在 `s3d_native_use` 里 upfront 拒绝并报明 |
+| 格式面 | `int isHalf` | `s3d_create_texture_fmt` 收 fmt id 0..10 → DXGI，PSO 键带**完整 `DXGI_FORMAT`** |
+| `generateMipmaps` / `setRenderTargetSamples` | 当「开关」 | D3D12 没有 blit 式生成 → CPU box filter（仅 BGRA8）+ 逐级上传；MSAA 报明不支持、目标恒单采样 |
+
+**五个真缺陷**（详见 §6.12，每条都有实测记录）：① 联合 image-sampler 的 binding 全塌成 0 → 两张纹理同钉 `t1`；
+② GLSL ES 3.00 的 attribute 无 Location 装饰 → 反射把 aPos/aUV 都读成 0（两遍 pinner）；
+③ **HLSL 矩阵必须 `row_major`** → 否则 `mul(v, M)` 静默变成 `Mᵀv`，整帧全黑且零报错、uniform 读回全对；
+④ `skia.lib` 自带 SPIRV-Cross → 链接重复符号，用 `-DSPIRV_CROSS_NAMESPACE_OVERRIDE=asc_spvc` 让两份共存；
+⑤ PSO 的 `RTVFormats[0]` 与绑定 view 不一致时 `CreateGraphicsPipelineState` **直接失败**。
+
+**验收**：`asaot3d/apps/shader-m30/build.sh aot` 在 Windows 上 15 项 PASS、中心像素 `#804020`、3/8 处 `#31190c`。
+
 ## 6. 里程碑验收命令
 
 ```bash

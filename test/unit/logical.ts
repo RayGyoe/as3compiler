@@ -129,5 +129,42 @@ export function checkStringTruthiness(): string[] {
   return bad;
 }
 
+export function checkTernaryOperandPassThrough(): string[] {
+  const { bad, check } = makeCheck('ternary');
+
+  // ── A conditional returns the CHOSEN OPERAND'S VALUE; it does not convert it into
+  // the other arm's static type. Unifying an `any` arm with a concrete one emitted a
+  // runtime unbox on the pass-through side, which is a silent semantic error:
+  // measured `v == null ? 0 : v` with v = 0.974 -> 0 (and `true ? 0 : "x"` -> "0").
+  const numArm = mainOf('var v:* = 0.974;\nvar r:* = (v == null ? 0 : v);\ntrace(r);\n');
+  check('an int arm beside a dynamic arm is BOXED, not unified into int',
+    numArm.includes('? as_v_num((double)(0)) : g_v)'));
+  check('the dynamic arm is passed through with no unbox call',
+    !/as_(int|num|str_val|arr|obj)\w*\(g_v\)/.test(numArm));
+
+  const strArm = mainOf('var r:* = (true ? 0 : "x");\ntrace(r);\n');
+  check('an int arm is not stringified by a String arm',
+    strArm.includes('(true ? as_v_num((double)(0)) : as_v_str("x"))'));
+
+  // ── The null arm keeps unifyType's exact rules (G16): the scalar pair boxes, and a
+  // pointer pair keeps the pointer, so `? null : obj` still returns the object.
+  const nullScalar = mainOf('var r:* = (true ? null : 42);\ntrace(r);\n');
+  check('`? null : 42` boxes both arms (null must survive as a value)',
+    nullScalar.includes('(true ? as_v_null() : as_v_num((double)(42)))'));
+
+  // ── The concrete fast paths must SURVIVE: same-kind and numeric pairs still share
+  // one C type with no boxing, which is why the gate exists in the first place.
+  const intInt = mainOf('var i:int = 1;\nvar j:int = 2;\nvar r:int = (i > 0 ? i : j);\ntrace(r);\n');
+  check('`int ?: int` stays a bare C ternary',
+    intInt.includes('((g_i > 0) ? g_i : g_j)') && !intInt.includes('as_v_num'));
+
+  const mixNum = mainOf('var i:int = 1;\nvar d:Number = 2.5;\nvar r:Number = (i > 0 ? i : d);\ntrace(r);\n');
+  check('`int ?: Number` promotes to double without boxing',
+    mixNum.includes('((g_i > 0) ? ((double)(g_i)) : g_d)') && !mixNum.includes('as_value'));
+
+  return bad;
+}
+
 registerGroup('unit: logical/OperandPassThrough', checkLogicalOperandPassThrough);
 registerGroup('unit: logical/StringTruthy', checkStringTruthiness);
+registerGroup('unit: logical/TernaryOperand', checkTernaryOperandPassThrough);

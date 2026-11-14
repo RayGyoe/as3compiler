@@ -20,8 +20,9 @@
 > 作附件）由 `apps/shader-m31` 的 13 项补验（阶段三百五十五）；**M4 Web 直通**已落地（阶段三百五十八，
 > 见 §6.11）——wasm 直接吃 GLSL ES 3.00 源，native 仍走 glslang+SPIRV-Cross；**M7 Ultra-Water 对齐**
 > 在引擎侧由 `apps/ocean-m34` 落地（86 pass/帧、7 条自检全 PASS）。
-> **仍未做**：**M5 D3D12/HLSL**（`stage3d_d3d.cc` 的 float `DXGI_FORMAT` + 原生 HLSL 编译），以及深度
-> 纹理的 `sampler2DShadow` 比较采样（契约暂定为「深度 = 渲染附件」）。
+> **M5 D3D12/HLSL** 已落地并真机验收（2026-11-14，见 §6.12）：Windows AOT 构建下同一个 `shader-m30`
+> 15 项 PASS、中心像素 `#804020`。**仍未做**：深度纹理的 `sampler2DShadow` 比较采样（契约暂定为
+> 「深度 = 渲染附件」），以及本后端的离屏 MSAA（§6.10，报明拒绝）。
 > 施工图与逐条 as-built（含落地时暴露的四个真缺陷）见 [`native-shader-plan.md`](native-shader-plan.md)。
 
 ---
@@ -569,6 +570,78 @@ wasm 不链 `glslang`/`SPIRV-Cross`、native 在有档案时仍编 shim。
 
 ---
 
+### 6.12 D3D12/HLSL 直通臂（M5，2026-11-14）
+
+原生通道的第三条臂：`stage3d_d3d.cc` 上同一份 GLSL ES 3.00，走 glslang → SPIR-V → SPIRV-Cross →
+**HLSL** → `D3DCompile`。**验收**：Windows AOT 构建下 `apps/shader-m30` 15 项 PASS，`drawToBitmapData`
+读回中心 `#804020`、3/8 处 `#31190c`（`uColor.rgb * vUV.x` 的两个采样点），与 Metal 臂逐位同色。
+
+**通道为什么只需要两样新东西。** 原生程序就是一个普通的 `S3DProg`：`s3d_compile` 用同一套 FNV-1a
+源哈希缓存、同一套 PSO 缓存、同一套 `TEXCOORD{slot}` 输入布局、同一套 `register(b0)` 根签名，`D3DCompile`
+拿到的输入（`vs_main`/`fs_main` + HLSL 文本）与 AGAL 档完全同形。AGAL 有而我们没有的只有「256 个寄存器
+的槽位是编译期已知的」这一件事，于是新增的正好两项：
+
+- **`$Globals` 的字节偏移**，由 `D3DReflect` 回答（`s3d_native_reflect_stage` + `s3d_native_resolve` 按名字
+  对齐）。手算不可行：HLSL 的 cbuffer 有自己的打包规则（`float3` 后面紧跟一个 float、矩阵行 16 字节对齐），
+  猜出来的偏移「编译过、采样到别的 lane、一声不响」。
+- **每 stage 一份暂存块**（`S3D_CB_REGION` 一整片），每帧第一次画之前整体 memcpy 进与 AGAL 共享的
+  bump allocator。两通道共用同一个分配器是有意的：它们从不同时绘制。
+
+`s3d_native_layout` 在本后端是**必修**（Metal 侧 `[[buffer(N)]]` 已烘进源码，是 no-op），但只需按名字
+对上偏移；`s3d_native_uniform` 按 `(kind == uniform, stage, slot)` 命中后写入、并夹到该变量的字节数。
+
+**五个真缺陷，全部属于「编译过、结果错/空」这一类**（每个都有实测记录）：
+
+1. **联合 image-sampler 的 binding 全塌成 0。** `spvc_compiler_build_combined_image_samplers` 生成的
+   每个 combined image-sampler 在 OpenGL 模式下都**没有** binding 装饰，而 `spvc_hlsl_resource_binding`
+   以 `(set, binding)` 为键——两张纹理于是被钉到同一个 `t1`。修法是生成前先
+   `set_decoration(SpvDecorationBinding, i)`，再按同一个 `i` 设 `srv/sampler.register_binding`。
+2. **GLSL ES 3.00 的 attribute 没有 Location 装饰。** glslang 不给（`layout(location=N)` 才给），而
+   `spvc_compiler_get_decoration` 对缺失的装饰返回 0，于是 `in vec3 aPos; in vec2 aUV;` 反射成 **aPos=0
+   且 aUV=0**，而 SPIRV-Cross 实际写的是 `aPos : TEXCOORD0, aUV : TEXCOORD1`——宿主按反射的 slot 绑流，
+   两条流喂了同一份数据。修法是**生成前两遍**钉 location（先收集未装饰输入的 SPIR-V id 排名，再统一写入；
+   一遍版会让被排到的那个看起来「已装饰」）。
+3. **HLSL 矩阵必须声明 `row_major`（最贵的一个）。** SPIRV-Cross 把 GLSL 的 `M * v` 译成
+   `mul(v, M)`，只有当矩阵以**转置**形式到达时才等价；而本项目（以及 Metal 臂、AGAL 臂、three.js 约定）
+   上传的都是**列主序**字节，于是乘积静默变成 `Mᵀv`。四边形那种「各分量一致」的矩阵看不出差别，
+   换成真实相机矩阵就把整个场景推出裁剪空间：**整帧全黑、D3DCompile 不报错、PSO 建成功、uniform 读回
+   全对**。判据是三个探针：`uColor` 进片元着色器→像素正确；把顶点位置换成 `vec4(aPos*0.5,1.0)`
+   （不读矩阵）→立刻出画面；读 `M[3].z`、`M[2].z` 三个元素→数值全对。修法是在 shim 里把 HLSL 的
+   矩阵**声明行**加上 `row_major`（不改数据、不改乘法）：同一份列主序字节于是被读作转置矩阵，
+   `mul(v, M)` 变成 `M * v`，AS 侧的契约与 Metal 臂完全一致，嵌套乘积也自洽（HLSL 的 `mul(A,B)`
+   无论存储类都是逻辑乘积）。
+4. **`skia.lib` 自带一份 SPIRV-Cross。** `llvm-ar t` 能看到 `spirv_cross.spirv_{glsl,msl,hlsl,reflect,...}.obj`，
+   与我们新编的 `spirv-cross-glsl.lib` 一链就 `duplicate symbol: spirv_cross::CompilerGLSL::emit_resources`。
+   Skia **没有** `spirv_cross_c.obj`（C 分发器不在里面），所以修法是在 `build-tools/shader/build-win.sh`
+   里加 `-DSPIRV_CROSS_NAMESPACE_OVERRIDE=asc_spvc`：我们那份 C++ 后端改名进 `asc_spvc` 命名空间，
+   `extern "C"` 的 `spvc_*` 入口不受影响（Skia 没有），两份因此可以共存。`src/build.ts` 编 shim 时
+   带同一个宏。
+5. **PSO 的 `RTVFormats[0]` 必须是目标真实的 DXGI 格式。** 原生通道能建任意格式的目标（§6.1 层 2），
+   而 `CreateGraphicsPipelineState` 在 `RTVFormats[0]` 与绑定的 view 不一致时**直接失败**——不是警告。
+   缓存键里因此带完整的 `DXGI_FORMAT`，不再是「半浮点 / 8 位」的布尔。
+
+**能力边界（如实登记，不静默）**：
+
+| 项 | 本后端状态 |
+|---|---|
+| 颜色附件 | **一个**。`s3d_native_use` 在 `ncolor > 1` 时 upfront 拒绝并报明（PSO 只绑一个 RTV，声明 `SV_Target1` 的程序根本建不出来） |
+| `setRenderTargetSamples` | **报明不支持**，目标恒为单采样（多重采样要多重采样资源 + resolve pass，与 pass 链交织，不是逐贴图开关） |
+| `generateMipmaps` | D3D12 没有 blit 式生成（D3D11 的 `GenerateMips` 已删），走 **CPU box filter + 逐级上传**，只支持 4 字节 BGRA8；其他格式报明、不半填（半填会让 mip 采样读到未初始化层级） |
+| 显式 `cbuffer` | 只支持松散 uniform 落 `$Globals`（b0）。shim 把显式块抬到 b8+，本后端无对应槽位 → 报明而非丢弃 |
+| 深度纹理 | 仅作渲染附件（与全项目口径一致），不做 `sampler2DShadow` 比较采样 |
+| 浮点/整数目标 | 支持（`s3d_create_texture_fmt` 的 fmt id 0..10 → DXGI），PSO 按真实格式分档 |
+
+**构建侧**：`build-tools/shader/build-win.sh` 收 `ARCH=32|64`（→ `windows-x86` / `windows-x64`），
+Windows 档案必须叫 `NAME.lib`（**不带 `lib` 前缀**，MSVC 的 `-lNAME` 会自己补 `.lib`）。另有两处
+「链接清单只有一份、四个宿主都得成立」的收尾：① glslang 的 `MachineIndependent` / `GenericCodeGen` /
+`OSDependent` 在本构建里并进了 `glslang.lib`，而 macOS 的档案集为它们各留了一个**单成员 stub 档案**
+（`libMachineIndependent.a` 就是 `stub.cpp.o`）——照做，否则任何按名字列全集的清单（如
+`examples/native-shader-probe.build.json`）在 Windows 上会以 `could not open 'MachineIndependent.lib'`
+死在一个符号都没解析之前；② 该示例清单原来把 `../vendor/shader/lib/macos-arm64` 写死，Windows 上
+还得另给 zlib——现在改 `${host}` + `${win:z}`，一份清单四个宿主通用。
+
+---
+
 ## 7. AS 侧（asaot3d）要动的清单
 
 AS 侧是「引擎」，把编译器暴露的管道接成 three.js 风格的作者 API。本节先回答文档此前**没说清**的一件事：
@@ -730,7 +803,269 @@ E6 落地后，**FFT 的归属从「被迫 CPU」翻转为「可以 GPU」**：
 - **第三批（对齐 Ultra-Water 全家桶）**：caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力（CPU 采样水面
   高度），逐一搬。
 
+### 7.10 首个真实客户端：`apps/nyc-m36`（as-built，2026-11-14）
+
+`shader-m30` 证明的是「通道能跑」，nyc-m36 证明的是「**一个 39 个网格、36 万三角形、每帧换材质**的真实
+场景能跑」。做法是**镜像而非重写**：`CityNativeSet` 持有每个 `MeshStandardMaterial` 原件，`mirror()`
+建一个同名字段的 `ShaderMaterial`，`sync()` 每帧把原件字段抄进 uniform（原地 `put3`，不分配），
+`City.setNight()` 继续改原件，镜像只消费其结果。
+
+**接通过程中的四个真缺陷**（都是「画了，但画成别的样子」，没有一个是编译或链接错误）：
+
+1. **mip 掉档 94 → 0：AGAL 的 `t0..t7` 重绑踩掉原生采样器。** `Context3D_submit` 里有一段按 AGAL 程序
+   的采样器表重绑 `t0..t7` 的逻辑；原生绘制走同一个提交点，于是刚绑好的原生纹理被改写成 AGAL 程序
+   以为的贴图。修法是把提交点拆成 `Context3D_submit_ex(..., int keepTextures)`，原生绘制传 `1`
+   （`temp/patch_keep_tex.py` 的结论，现已在 `src/emit.ts`）。
+2. **原生 → AGAL 的着色器污染：`$Globals` 被当成 `vc[]` 读。** 首个原生绘制之后的第一条 AGAL 绘制
+   会把上一帧的原生常量块当作 AGAL 的寄存器文件，画面出现整片错色，随后恢复。
+3. **最贵的一个：把「原生已绘制」做成持久标志，等于让 AGAL 懒编译在原生序列中途开火。**
+   为了跳过 `$Globals`，曾在 `Context3D_submit_ex` 里加 `as_s3d_native_drawn` 静态开关并由
+   `Context3D_submit` 消费。结果是：原生绘制**直接进** `submit_ex`，标记被置位后没人复位，
+   于是**同一条绘制序列中途**触发了 AGAL 的懒编译——`s3d_compile` 里唯一一处 `nativeMode = 0`
+   被走到，**31 条城市绘制里 30 条被打回 AGAL 语义**，帧率 3 fps、画面半对半错。
+   正确做法是**在原生绘制内直接让 AGAL 缓存失效**：`!keepTextures` 门控懒编译，
+   原生绘制末尾 `self->context->gpuProgram = NULL;`。修完实测每帧 `draws 251 nat1 155`，
+   首帧模式 `0 0 111…1 0 1 0…` 即「1 条 AGAL 天穹 → 30 条原生城市 → 其余 AGAL 交通/人群/天穹」。
+4. **`uAlphaTest` 送对了，但着色器没用它。** 用活体直方图确认（`fs dumps … uAlphaTest histogram
+   [('0', 140), ('0.45', 15)]`，只有 leaves0/1/2 是 0.45），片元里补上
+   `if (alpha < uAlphaTest) discard;` 后树叶的硬边消失。
+
+**已澄清的两个假缺陷**（记下来省下一次误判）：
+
+- **地平面 bbox 是 `[-8000,8000]²` 且 z=0 不是 bug**：`PlaneGeometry(16000,16000,1,1)` 是 **XY 平面**
+  的局部坐标，`mesh.rotation.x = -Math.PI*0.5` 才把它放平；探针读的是局部值。
+- **`[nmat] color=undefined` 不是 bug**：`uniforms["uColor"].value` 是 `Vector.<Number>`（`put3`
+  写的），`.x` 自然 undefined；上传走 `_toNumbers` 仍是 3 个 float。
+
+**一个根因串起两个「公开缺陷」，已修（这是本节最贵的一条）。** 现象曾是：1.5 fps（同场景纯 AGAL
+59.9 fps）、街面近景里紧邻相机的那栋楼不出现、屋顶偶发巨大黑色楔形。三条都指向 `S3D_MAX_PROGRAMS`
+——它当时是 **16**，而 nyc-m36 一帧里活着的程序是 **35** 个（24~31 个原生材质 + 同帧仍在用的 AGAL
+程序）。于是 LRU **每帧把整个池驱逐一遍**：
+
+- `s3d_compile` 每帧重跑 35 次 `D3DCompile`，`s3d_select_pso` 重跑 35 次 `CreateGraphicsPipelineState`
+  ⇒ 1.5 fps；
+- 槽位在**一帧之内**被回收再用，正在绘制的那个程序它的 blob / PSO 被 `s3d_prog_release` 释放
+  ⇒ 那一条 draw 消失在画面上（近景那栋楼、以及偶发的巨大黑色三角形）。
+
+判据是一行探针：`S3DDRAW` 的 `comp=`（`c->statCompiles`）**每帧增长正好 35**。把上限提到 **96**
+之后 `comp` 停在 35 不再增长，实测 **59 fps**，近景楼与屋顶楔形一起消失。池是静态数组
+（每槽 ≈4.3 KB 的 PSO 变体缓存），**上限是内存不是时间**，96 槽 ≈420 KB/context，未用时不花钱。
+
+**AGAL 那 9 条绘制是什么。** 原生通道镜像的是 `MeshStandardMaterial`；天穹、广告牌、灯头、地铁口、
+冠顶这些是 `MeshBasicMaterial`（unlit），本来就不该走 PBR，AGAL 的 basic 程序是它们的正确归宿。
+`calls=` 只统计 AGAL 绘制，所以接上原生后它从 50 → 19 → 9 是**下降**，不是「没用原生」。
+
+**另外两处真缺陷（顺带修掉，都在接交通/人群时暴露）**：
+
+- **交通与人群根本没进原生集。** `CityNative.install()` 只遍历 `_city.root`，而 `Traffic`/`Crowd` 的
+  mesh 在同一帧稍后才创建 —— 它们的 `MeshStandardMaterial` 于是继续走 AGAL（实测每帧 19 条 AGAL
+  绘制里，车与行人占大头）。修法是把遍历抽成 `CityNative.addTree(set, root)`，在这两个 root 建好后
+  再 join。
+- **动态几何每帧新建一个 `VertexBuffer3D`。** `_ensureBuffers` / `_ensureAttributeBuffer` 原来是
+  「version 变了就新建」，而车与人的顶点数组**每帧都在变** ⇒ 每帧每网格一次 D3D12 资源创建。改成
+  「尺寸不变就 `uploadFromVector` 原地重传，只有尺寸变了才重建」。
+- 顺带一个 AS3 陷阱：材质去重必须用 `Dictionary`，**不能用 `{}`** —— Object 的 key 会被转成字符串，
+  所有材质都落进同一个 `"[object Object]"` 槽（实测 `install()` 报 1 个材质、整城共用一个镜像）。
+
+**取证工具箱**（都留在树里，用环境变量开关）：`ASC_S3D_DUMP=1` 打 `S3DNAT`/`S3DNATUP`/`S3DDRAW`/`S3DU`/
+`S3DB`/`S3DF`/`S3DL`/`S3DM`/`S3DV`/`mip-drop`；`ASC_NATIVE_DUMP_BINDINGS=1` 打 `[pin]`/`[bindings]`。
+隔离某个网格的办法是 `NativeShaderRenderer._drawShaderMaterial` 里按 `mesh.name` 前缀过滤，
+以及给每个网格一个常量色（`[pcol]` 实验）；**注意截图必须确认进程是本次启动的**——残留窗口会让
+「A/B 逐位相同」变成假结论。
+
+### 7.11 收尾：把「非 PBR」也接进原生通道（`calls=0`，2026-11-14）
+
+§7.10 之后帧里还剩 9 条 AGAL 绘制：天穹、广告牌（LED 墙）、灯头、地铁口、冠顶。它们全是
+`MeshBasicMaterial`，所以一开始被当成「不需要原生」而留下。这个判断是错的，理由不是画质而是
+**状态机**：AGAL 与原生在同帧交替时，每次切回 AGAL 都要重进 `Context3D_submit`，那条路径会重绑
+AGAL 程序的 t0..t7、重校验 sampler 标志，还可能触发 AGAL 的 lazy compile —— 上一阶段 3 fps 的
+事故就是这么来的（§7.10 缺陷 2）。把最后 9 条也接上之后，帧内只有**一个**渲染器，
+`calls=0 / tris=0` 也成了「没有回退」的最干净证据。
+
+做法是给 `CityNative` 加一对 `UNLIT_VS`/`UNLIT_FS`，给 `CityNativeSet` 加
+`mirrorBasic(MeshBasicMaterial)` 与一个独立的 `basicMaterials` 列表（lit 镜像 20 个 uniform，
+unlit 只要 9 个，混在一个循环里会让 sync 变成一堆 `hasOwnProperty`）。`CityNative.addTree()`
+现在两类材质都收，`NycM36` 改成在车流/人群首次 `update(0)` 之后对 `_scene` 走一遍
+（天穹挂在 `_scene` 而不是 `_city.root`，一次全场景遍历把它也带上；`mirror()` 按源材质去重，
+重复遍历是幂等的）。
+
+**读数**（preset 1 街面 15:30 / preset 2 时代广场 21:30）：`calls=0 tris=0`、
+**59.7 fps / 62.9 fps**、43 个材质原生（32 lit + 11 unlit）、`comp` 不再增长、`mip-drop` 0 行。
+夜间 LED 墙（绿/黄/蓝三块）、底商亮窗、亮窗立面全部正常自发光。
+
+**踩到的坑（都是真缺陷，不是配置）**：
+
+1. **ACES 不能用在 unlit 通路。** 第一版照抄 lit 的尾部（fog → ACES(exposure) → sRGB），
+   天穹立刻被洗白：同一像素从 `(166,195,217)` 变成 `(199,219,233)`，蓝色掉了约 30 个码值。
+   原因是这些表面的颜色**本来就是显示参考的最终像素**（天穹渐变是直接画进 BitmapData 的，
+   LED 墙与底商 fascia 是 sRGB 位图，灯头是一个平值），对它们做色调映射等于二次曝光。改成
+   「直乘 + 雾混合、直接输出」后与迁移前逐像素一致；顺带 unlit FS **不要声明 `uExposure`** ——
+   编译器会把未使用 uniform 剪掉，`as_shader_set_uniform_vec` 对不存在的名字会抛 `ArgumentError 2008`。
+2. **同步经验：改 shader 源码时锚点必须包含 const 名字。** 我用
+   `uniform float uExposure; + out vec4 fragColor; + const float PI` 三段做锚点去改 unlit，
+   而 lit FS 里这三行**一模一样**且出现更早，`index()` 命中的是 lit，结果把 lit 的 helper 与
+   main 整段删掉了（表现为整屏只剩天空色、`calls=0` 但 lit 全不画）。恢复靠的是当初给 HLSL
+   探针抽出来的副本 `temp/shc-city/city_shaders.h`，恢复后用像素比对验证：lit 区域 6/6 采样点
+   与迁移前**逐字节相同**，才敢认为等价。
+3. 恢复 lit FS 时有第二处细节：`acesFilmic` **不带** `1/0.6` 预缩放（`uExposure` 传的就是
+   `exposure/0.6`）。我一度照「three.js 源码把 1/0.6 写进算子」加了进去，实测中间调整体亮
+   1.5 倍（47→72），去掉后立即与基准一致。
+
 ---
+
+---
+
+### 7.12 环境探针：用天穹贴图当 IBL 的镜面半边（2026-11-14）
+
+nyc-m36 长期有一条自缚：README 写着「本构建没有环境贴图，所以 `metalness` 恒为 0」。在没有
+原生通道的年代这是对的——AGAL 里做等距柱状采样要自己写球面反投影，还要挤进已经用满的 sampler
+槽。原生通道打通之后这条约束只剩惯性：`CityNative.FS` 可以任意写 GLSL，一次 `reflect` + 一次
+`atan/acos` 就够。
+
+**实现只有三步**，全部落在 AS3 侧：
+
+1. 天穹那张 `BitmapData` 本身就是等距柱状的（`SphereGeometry` 的 uv 已经是经纬度），直接当
+   `uEnvMap` 用——**不为反射单独烘焙一张贴图**。
+2. `CityNative.FS` 在漫反射之后加镜面项：`reflect(-V, N)` → `(atan(R.z,R.x)/2π+0.5,
+   acos(R.y)/π)` → `srgbToLinear(texture(uEnvMap, euv).rgb)`，乘 `F_Schlick(f0, N·V)`。
+3. `CityNativeSet.sync()` 每帧写 `uEnvMap` / `uHasEnv` / `uEnvIntensity`；`uEnvMap` 的句柄来自
+   `SkyRig.skyTexture`（新加 getter），逐帧赋值以跟随天穹重绘。
+
+`calls` 仍是 0：探针是同一张原生程序的第 21 个 uniform，不是第二条绘制路径。
+
+**三个实测出来的边界，别踩：**
+
+- **探针只能给镜面半边，不能给辐照度。** 加 `diffuse * 0.35` 那一版整帧均值从 46 抬到 54：
+  three.js 里 IBL 与 `AmbientLight` 是两个独立输入，我们这里两者都源自同一片天，等于把环境光
+  算了两遍。只保留 Fresnel 加权的镜面项。
+- **`metalness` 不能靠探针补能量。** 直觉上「有环境图了就把玻璃 metalness 调到 0.55」，实测整帧
+  均值 **46 → 31**：`diffuse = albedo * (1 - metalness)` 拿走的那半份漫反射，一张无 mip 链的单
+  次采样补不回来。结论是玻璃仍走 `metalness = 0`，靠 `roughness`（0.42 → 0.30）拿到光泽。
+- **`envIntensity` 只看 `roughness`，不看 `metalness`。** `0.06 + 0.94 * (1-roughness)²`：玻璃 0.30
+  拿到 0.52，砖石 0.92 只拿 0.066，路面 0.90 拿 0.07。基线从 0.12 降到 0.06 是因为 0.12 会让每面
+  砖墙都蒙一层灰蓝。
+
+**路面的取值是量出来的，不是猜的**（同机位、同时刻，整帧均值 / 参考版 `ref-default.png` = 61）：
+
+| asphalt roughness / metalness | 整帧均值 | 观感 |
+|---|---|---|
+| 0.62 / 0.16 | 61 | 整条大道洗白：掠射角 Fresnel 恒等于 1，而路面有一半是掠射 |
+| 0.78 / 0.05 | 35（**假读数**，见下） | — |
+| 0.90 / 0.03 | 60 | 湿但不过曝，掠射角仍有天光 |
+
+**踩过的仪器坑（会直接给出反向结论）：** 截图时若有一个 Windows 安全中心弹窗压在最上层，整个
+窗口会被系统按 **≈0.58 的乘性系数**统一压暗——天空 `(156,150,139)→(94,93,90)`、砖墙
+`(43,48,50)→(25,28,29)`、路面 `(180,179,175)→(104,105,103)`，比例一致。此时「把 roughness 调高
+反而更暗」这种结论完全是假的。判据：**先 `SetForegroundWindow` 目标进程、确认没有模态弹窗，再
+读均值**；只比较单点像素时务必同时看一个已知不受渲染影响的区域（如 HUD 底色）是否同比变化。
+
+### 7.13 原生 shadow pass：R32F 阴影图，街谷有了楼影（2026-11-14）
+
+§7.11 把非 PBR 也接进原生通道后，nyc-m36 只剩一块引擎缺口最显眼：**没有太阳影**。参考版
+（slop-newyork）半张图是楼影落在路面上那一刀，我们路面均值 155、参考 55——明暗关系整个反了。
+旧的 AGAL shadow pass 在 D3D12 上坏在 **fs4 绑定没落地**：lookup 返回一个与位置无关的恒定值
+（bias / normalBias 扫描整帧逐位不变，见 TODO 阶段四百一十一）。既然 demo 不再走 AGAL，阴影就
+做成原生通道自己的渲染目标。新增 `apps/nyc-m36/src/city/CityShadow.as`。
+
+**为什么是 R32F。** `Context3DNative.createTexture(w, h, "r32f", true, false)` 造一张可渲染的
+`R32_FLOAT` 面；`s3d_select_pso` 把 RT 的**完整 DXGI 格式**编进 PSO key，深度程序自动拿到自己的
+R32F PSO。一个 texel 一个 float 就是光空间深度本身——不用 AGAL 那套 RG 打包，也没有 8-bit 条带
+（3 km 正交范围上 256 级 ≈ 12 m 一步，会在每面墙上长痤疮）。这是原生通道相对 AGAL 的直接红利。
+
+**约定查源码确认，不猜。** 引擎 `Matrix4.makeOrthographic` 是 Stage3D **[0,1] 深度、Y-up NDC**；
+`stage3d_d3d.cc` 的 viewport 高度为正（不做 shader Y 翻转），RT texel (0,0) 在**左上**。于是 NDC
+(nx,ny) 落在 uv ((nx+1)/2, (1-ny)/2)：bias 矩阵 **Y 列 = -0.5**，与 Metal 的 top-left 约定一致
+（`AGALRenderer._setShadowBiasMatrix` 注释那条）；Z 列保持单位（深度已 [0,1]，不能再 remap）。
+旧路径坏在绑定，**不是这套数学**。
+
+**实现要点：**
+
+- 两个 position-only 程序：`SOLID` 只写 `gl_FragCoord.z`；`CUTOUT` 采 base-color alpha 做 alphaTest
+  （否则每棵树投一个实心矩形）。VS 只声明 `uLightMVP`（= shadowVP * modelWorld，逐 caster 上传），
+  **不声明任何 auto uniform**，所以 pass 不依赖 renderer 当前相机——它在 `updateFrame` 里、`render()`
+  之前跑。
+- 光相机复用 `sun.shadow.camera`（`SkyRig.setFocus` 已按镜头调好正交框），坐在太阳位置 lookAt target。
+- 固体 caster 剔正面（存封闭盒远壁深度，lit 面不自遮挡）；DoubleSide 叶片两面都画。
+- `CityNative.FS` 的 `shadowTerm`：世界位置沿法线偏 `normalBias`（世界单位）再投影，常数 `bias` 微调
+  比较深度，**3×3 PCF** 软化；图本身**点采样**（跨轮廓插值两个深度是错的），软化靠九次二值比较平均。
+  只遮太阳项（fill 是无影天空替身）；光框外返回 1，雾遮住级联边界。
+- **`sun.castShadow` 永远 false**——那是 AGALRenderer 自己（D3D12 上坏的）prepass 的开关；面板
+  `shadows` 旋钮驱动 CityShadow。两者分开，`calls=` 才保持 0。`NycPanelState.shadows` 默认改 **true**。
+
+**实测（同机位灰阶均值，`calls=0 tris=0` 不变）：**
+
+| 视图 | 读数 |
+|---|---|
+| 街景白天 | 路面 **155 → 88**，横向有结构：左（向阳）~108、右（楼影）~65，一条干净斜向阴影边；车底接地影 |
+| 航拍 helicopter | 塔楼在网格上投出长而清晰的影子，邻楼屋顶有影形 |
+| 夜景 Times Square 21.5h | 无回归，亮窗 / LED / 底商正常 |
+
+**有空间结构**这一点决定性地区分了「真阴影」与旧 bug 的「处处恒定」。三视图均
+`[CityShadow] native R32F shadow map 2048x2048, 16 casters`（城市是焊接网格，16 = 楼块 + 车身 + 人群）。
+
+**仍欠：** 树冠不投影（`leaves`/`trunks` 的 `castShadow=false`，内容缺口）；阴影里路面 ~65 仍比参考
+~32 亮（ambient/fill 整体配光问题，不是阴影 bug）；路面 planar reflection 未做。
+
+### 7.14 路面 planar reflection：镜像相机 + 屏幕空间采样，湿沥青成型（2026-11-15）
+
+§7.12 的环境探针只能给**天空那一半**的镜面项——路面里没有楼、没有白线、没有车灯。参考版
+（slop-newyork）的湿路面恰恰靠这些成立，所以最后一块是**真镜面 pass**：新增
+`apps/nyc-m36/src/city/CityReflection.as`。
+
+**一句话结构。** 一台真实的镜像相机（位置与朝向关于 `y = 0` 反射）把整个场景渲进一张**半分辨率**
+RGBA8 目标；`CityNative.FS` 在沥青上按 `gl_FragCoord.xy / uResolution` 取回这张图，按 Fresnel
+混进去。半分辨率不影响对齐（uv 是归一化的），只是更糊一点——对粗糙湿路面正好。
+
+**为什么不需要纹理矩阵。** 路面**本身就是镜面** `y = 0`。平面上任意一点 P 在真实相机与其镜像
+相机里投到**同一个像素**（反射固定平面上的每一点），所以镜像目标已经对齐，取屏幕 uv 即可。
+
+**为什么用 lookAt 相机而不是反射矩阵。** 把 `camera.matrixWorld` 关于 `y = 0` 反射会得到
+行列式 -1 的左手系，**翻转所有面的绕序**，需要给 `render()` 加 per-pass 剔除翻转；改成真正的
+右手相机（位置反射、`up` 反射成 `(0,-1,0)`、看向反射后的前向点）后，它就从下方看场景、绕序
+正确，`render()` 的剔除完全照旧。
+
+**防反馈。** 绘制镜像 pass 期间路面自己的 `uHasReflection` 置 0，否则它会在渲染这张图的同时
+采样这张图。
+
+**显示空间混合。** 镜像目标已被**同一个** `CityNative.FS` 做过色调映射与 sRGB 编码，所以混合
+放在**色调映射之后**（在 sRGB 里 mix），否则反射会被映射两次。
+
+**湿沥青不是镜子——两处必需的非理想化：**
+
+- **竖直拉糊**：4 个额外采样沿 `uv.y` 偏移（权重 0.2/0.2/0.1/0.1），偏移量随 `vDepth` 放大到 3 倍。
+  湿路面的微粗糙会把反射沿视线方向拉伸，而站立视高下这个方向在屏幕上**就是竖直**的。
+- **湿斑掩码**：`world.xz` 上两个倍频程的值噪声（`smoothstep(0.34,0.72)` → 0.30~1.0）。用**世界**
+  坐标而不是屏幕坐标：屏幕空间噪声会随相机滑动而「游」。
+
+**必须去掉的一处双重计数。** 路面同时有「环境探针的镜面项」和「平面反射」，而两者近似的是**同一份
+被反射的天空**——探针那一项才算两遍。所以 `uHasReflection != 0` 时 `envW = 0`，探针只服务没有
+镜面 pass 的表面（其余全部）。这与 §7.12「探针只给镜面半边、不加 diffuse」是同一条纪律，只是
+又超出了一项。
+
+**顺带修掉的一个内容陷阱。** `CityTextures.asphalt()` 的底色 `0x4a4e52` 是**死代码**：紧随其后的
+2×2 噪声循环用 `scaleColor(0x5d6063, k)` 把整张 128×128 **全覆盖**了，改底色测出来「毫无变化」。
+真正生效的是循环里的字面量，已改为 `0x4b4f53`。
+
+**实测（同一 65,194 像素路面掩码 = 反射开/关的差分，`calls=0 tris=0` 不变）：**
+
+| 配置 | 路面均值 | 整帧均值 |
+|---|---|---|
+| 无反射，探针在，反照率 `0x4b` | 57.0 | 56.4 |
+| 无反照率贡献（黑贴图），探针在 | 41.9 | 55.7 |
+| 反射 + 探针（双重计数），强度 0.60 | 40.7 | 55.4 |
+| **最终：反射 + `envW=0`，强度 0.45，模糊 0.0046** | **36.3** | **55.3** |
+| 夜景 Times Square 21.5h | 31.6 | 46.4 |
+
+参考版（golden hour）路面约 35~59。**「无反照率贡献」那一行是关键证据**：黑贴图的路面仍有 41.9，
+说明原亮度的绝大部分来自**与反照率无关的探针镜面项**，而不是太阳+反照率。这也是为什么单改沥青
+颜色测不出变化（81.8 → 79.7），以及为什么关掉探针后路面一次从 57 掉到 40。
+
+**开关**：面板 `shadows` 之外新增 `R` 键 → `reflection on/off`（HUD 一行）；`_reflectionOn` 默认
+true。首帧 trace `[CityReflection] native planar reflection 693x411 (half of 1386x823)`。
+
+**仍欠：** 参考版街道整体处于楼影里（低太阳、暖色斜光），我们默认 15:30 太阳高度 37.9°，街道被
+直射——这是**配光**（太阳高度/色温/ambient 配比）而不是反射或阴影的缺陷；另外楼体窗洞、消防梯、
+路面补丁/裂缝/井盖等**内容细节**仍是低模。
 
 ## 8. 红线：AOT-only，AIR 侧如实报明
 
@@ -768,7 +1103,7 @@ E6 落地后，**FFT 的归属从「被迫 CPU」翻转为「可以 GPU」**：
 |---|---|---|---|---|
 | **P1 · Metal 单后端起步** | glslang+SPIRV-Cross 入 `build-tools/`；`--features native-shader` 注册；`stage3d_glue.mm` 增 float RT + MRT + 原生 MSL 编译；`NativeShaderRenderer` + `ShaderMaterial` | AOT-macOS 出画面，float RT 可渲可读，MSL **真编译** | Metal | ✅ **M3 + M6 已验收**：`shader-m30` 15 项 PASS、像素 `#804020`/`#361b0e`。验收方式从 `xcrun metal` 改运行期 `newLibraryWithSource:`（§3.4：本机无离线工具链） |
 | **P2 · Web 免费点** | `stage3d_webgl.cc` 直通 GLSL ES 3.00 + `EXT_color_buffer_float`；同一套 `ShaderMaterial` 跑 `--target wasm` | 浏览器出同一画面，零交叉编译 | WebGL2 | ✅ 2026-11-03 落地，见 §6.11 |
-| **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 | ❌ 未做（SPIRV-Cross 的 HLSL 半边库已链好） |
+| **P3 · D3D12** | `stage3d_d3d.cc` 增 float `DXGI_FORMAT` + 原生 HLSL 编译 | Windows 出画面 | D3D12 | ✅ 2026-11-14 落地（§6.12；`shader-m30` 15 项 PASS、像素 `#804020`） |
 | **P4 · Ultra-Water 对齐** | caustics / 大气 LUT / 水下 / 泡沫 / 漂浮物浮力，逐项搬 + 对拍 | 与 three.js 参考逐项接近 | 三端 | ✅ **已落地（引擎侧）**：`asaot3d/apps/ocean-m34` 完成 Ultra-Water 全量对齐（4 级 FFT + 大气 LUT + caustics + 平面反射 + 延迟水面 + spray + 水下光柱 + 合成，86 pass/帧，7 条自检全 PASS，见 `asaot3d/three-api-design.md` §39），起点是 `ocean-m32` 的 Tessendorf FFT（256²×2 cascade、顶点纹理取值位移、MRT 位移+法线、高度读回 ±1.6 m）。**与 three.js 参考的残余**（直接光镜面项偏亮 3.4×、雾抬升偏弱）记在 `three-api-design.md` §29.8 / §30.7，属引擎侧账，不占编译器 DoD |
 
 **第一批只落 Metal** 的理由成立：本机 macOS + Metal，MSL 与 GLSL ES 3.00 语法接近，先把

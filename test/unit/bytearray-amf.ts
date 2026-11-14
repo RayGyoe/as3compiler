@@ -301,6 +301,71 @@ function checkByteArrayIndex(): string[] {
 
 registerGroup('unit: bytearray-amf/IndexForm', checkByteArrayIndex);
 
+// ---- AIR 51 base64 codec (C1 of the TalkMED WebSocket cleanup plan) ----
+// Semantics measured on adl 51.4.1 (temp/b64probe/out.txt) and A/B'd with the
+// same assertion body under adl (temp/ab-b64.cjs): toBase64 encodes the WHOLE
+// buffer regardless of position and never moves it; writeBase64 validates the
+// whole string BEFORE writing (atomic #1508), accepts unpadded final quanta,
+// and null is #2007; createFromBase64 leaves position at the end.
+function checkByteArrayBase64(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [b64] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [b64] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.utils.ByteArray;\n' +
+    'var b:ByteArray = new ByteArray();\n' +
+    'var s:String = b.toBase64();\n' +
+    'var n:uint = b.writeBase64("Zm9v");\n' +
+    'var c2:ByteArray = ByteArray.createFromBase64(s);\n')).c;
+
+  check('instance calls route to ByteArray_toBase64 / ByteArray_writeBase64',
+    c.includes('ByteArray_toBase64(') && c.includes('ByteArray_writeBase64('));
+  check('the static call routes to ByteArray_createFromBase64_static',
+    c.includes('ByteArray_createFromBase64_static('));
+
+  const enc = c.split('char* ByteArray_toBase64(void* _this) {')[1]?.split('unsigned ByteArray_writeBase64')[0] ?? '';
+  check('toBase64 reads the whole buffer via length, never position',
+    enc.includes('int n = o->length;') && !enc.includes('o->position'));
+  check('toBase64 emits RFC 4648 padding for 1/2-byte tails',
+    enc.includes("r[j++] = '='; r[j++] = '=';") && /r\[j\+\+\] = '=';/.test(enc));
+
+  const dec = c.split('unsigned ByteArray_writeBase64(void* _this, char* base64) {')[1]?.split('ByteArray* ByteArray_createFromBase64_static')[0] ?? '';
+  check('writeBase64 validates the whole string before growing the buffer (atomic #1508)',
+    dec.indexOf('as_b64_decoded_len(base64)') >= 0
+    && dec.indexOf('as_b64_decoded_len(base64)') < dec.indexOf('as_ba_grow_pos'));
+  check('null is TypeError #2007 with the measured text',
+    dec.includes('Error #2007: Parameter base64 must be non-null.'));
+  check('malformed input is ArgumentError #1508 with the measured text',
+    c.includes('Error #1508: The value specified for argument base64 is invalid.'));
+  const val = c.split('static int as_b64_decoded_len(const char* s) {')[1]?.split('char* ByteArray_toBase64')[0] ?? '';
+  check('padding rules: at most 2 pads, a padded string completes its quantum, rem==1 rejected',
+    val.includes('if (pads > 2) return -1;')
+    && val.includes('if (rem == 1) return -1;')
+    && val.includes('if (pads > 0 && rem != 4 - pads) return -1;'));
+  check('unpadded final quanta are accepted (no whole-string %4 requirement)',
+    !val.includes('n % 4') && val.includes('(body / 4) * 3 + (rem == 2 ? 1 : rem == 3 ? 2 : 0)'));
+  const crt = c.split('ByteArray* ByteArray_createFromBase64_static(char* base64) {')[1]?.split('}')[0] ?? '';
+  check('createFromBase64 is new + writeBase64 (position ends at length by construction)',
+    crt.includes('ByteArray_new()') && crt.includes('ByteArray_writeBase64(o, base64)'));
+
+  const ex = readFileSync(join(root, 'examples', 'base64.as'), 'utf8');
+  check('the example pins the measured position / atomicity / padding goldens',
+    ex.includes('"pos=1 still encodes whole buffer"')
+    && ex.includes('"toBase64 must not move position (end)"')
+    && ex.includes('"bad[" + k + "] must not write anything"')
+    && ex.includes('"unpadded 2-char quantum"')
+    && ex.includes('"createFromBase64 layout"')
+    && ex.includes('"roundtrip bytes"'));
+
+  if (ok > 0) console.log(`[b64] ${ok} base64 checks passed`);
+  return bad;
+}
+
+registerGroup('unit: bytearray-amf/ByteArrayBase64', checkByteArrayBase64);
+
 registerGroup('unit: bytearray-amf/ByteArrayAmf', checkByteArrayAmf);
 registerGroup('unit: bytearray-amf/ByteArraySurface', checkByteArraySurface);
 registerGroup('unit: bytearray-amf/AmfMemberOrder', checkAmfMemberOrder);

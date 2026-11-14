@@ -1,0 +1,16 @@
+# Static archives resolve left to right: consumers before providers.
+# Windows spelling: NAME.lib, no "lib" prefix, because MSVC's -lNAME -> NAME.lib.
+glslang
+SPIRV
+MachineIndependent
+GenericCodeGen
+OSDependent
+glslang-default-resource-limits
+spirv-cross-c
+spirv-cross-hlsl
+spirv-cross-msl
+spirv-cross-glsl
+spirv-cross-cpp
+spirv-cross-reflect
+spirv-cross-util
+spirv-cross-core
