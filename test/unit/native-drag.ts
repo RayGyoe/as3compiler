@@ -59,7 +59,9 @@ target.addEventListener(NativeDragEvent.NATIVE_DRAG_EXIT,function(e:NativeDragEv
 target.addEventListener(NativeDragEvent.NATIVE_DRAG_DROP,function(e:NativeDragEvent):void {
  drops++;check(e.cancelable && NativeDragManager.dragInitiator==null,'external source');
  var files:Array=e.clipboard.getData('fileList') as Array;
- check(files.length==2 && files[0] is File && File(files[0]).nativePath=='/tmp/中文 # %.txt','unicode file list');
+ var sep:String=String.fromCharCode(92);
+ var np:String=(files!=null && files.length>0 && files[0] is File)?File(files[0]).nativePath:"";
+ check(files.length==2 && files[0] is File && (np.indexOf("/")>=0?np=="/tmp/中文 # %.txt":np==sep+"tmp"+sep+"中文 # %.txt"),'unicode file list');
  check(e.clipboard.getData('text')=='hello 中文','text');
  check(e.clipboard.getData('url')=='https://example.org/','url');
 });

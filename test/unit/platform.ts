@@ -2162,14 +2162,16 @@ function checkDeviceLost(): string[] {
     /void s3d_shared_device_lost\(void\)[\s\S]{0,900}?c->queue = NULL;/.test(s3d) &&
     /void s3d_shared_device_rebuilt\(void\)[\s\S]{0,1200}?\*c = \*fresh;/.test(s3d) &&
     /s3d_unregister_ctx\(fresh\);/.test(s3d));
-  // Four revive points, not three: the three original use sites (the 8-bit upload
-  // region, setRenderToTexture's target, bind_texture's sampler) plus the 16-bit
-  // upload region that rgbaHalfFloat added (stage three-hundred-fifty-one). A new
-  // texture USE that skips revive would keep pointing at the removed device.
+  // Five revive points, every one of them a texture USE that would otherwise keep
+  // pointing at a removed device: the 8-bit upload region (s3d_upload_region), the
+  // 16-bit upload region rgbaHalfFloat added (s3d_upload_region_half, stage
+  // three-hundred-fifty-one), s3d_generate_mips, setRenderToTexture's target and
+  // bind_texture's sampler. The count is deliberately exact: a new use site has to
+  // either add a revive or be caught here.
   check('the composite and later texture uses reject or revive previous-device resources',
     /res->GetDevice\(IID_PPV_ARGS\(&owner\)\)/.test(d3d) &&
     /owner.get\(\) != g_device.get\(\)/.test(d3d) &&
-    (s3d.match(/s3d_revive_texture\(c,\s*/g) ?? []).length === 4);
+    (s3d.match(/s3d_revive_texture\(c,\s*/g) ?? []).length === 5);
 
   // ---- the teardown branches on "is the device actually gone", and parks ----
   check('the GPU-state drop takes "the device is gone" as an argument',

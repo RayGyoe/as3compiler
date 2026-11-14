@@ -20,7 +20,14 @@ var scratch:File = File.createTempDirectory();
 var f:File = scratch.resolvePath("stage64_test.txt");
 check(f is File && f is EventDispatcher, "File is EventDispatcher");
 check(f.nativePath == scratch.nativePath + File.separator + "stage64_test.txt", "File nativePath stored");
-check(f.url == "file://" + f.nativePath, "File url is file:// + path");
+// AIR's url is a URI, so it is not literally "file://" + nativePath on Windows: a
+// drive path becomes file:///C:/dir/name (three slashes, backslashes turned into
+// forward slashes), while a POSIX absolute path stays file:///dir/name. Asserted
+// per host, which also pins the backslash translation -- the POSIX-only spelling
+// of this check is what kept stage64 red on win32.
+var urlWant:String = (f.nativePath.charAt(0) == "/" ? "file://" : "file:///")
+                   + f.nativePath.split("\\").join("/");
+check(f.url == urlWant, "File url is a file:// URI of nativePath (got " + f.url + ")");
 // A leftover from an earlier run that threw mid-way (this example deletes its
 // file at the end, so an aborted run leaves one behind) would fail the
 // fresh-path assertion below for the wrong reason -- and does so only on the

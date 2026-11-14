@@ -713,10 +713,26 @@ const HOST_STATE_FILES = new Set([
   'move-to-trash.as',
 ]);
 
+// Examples whose build asks for a HOST-SPECIFIC feature. Elsewhere the compiler's
+// answer is already correct and loud -- `--features tray` refuses with "feature
+// 'tray' needs a darwin host: the status item is an NSStatusItem (AppKit)" -- and
+// test/unit pins that wording, so treating the refusal as a failing unit would
+// report the right behaviour as a bug. The unit skips instead, with the reason.
+const EXAMPLE_HOSTS: Record<string, string> = {
+  'status-item.as': 'darwin',
+};
+
 function registerFileExample(name: string): void {
   const required = EXAMPLE_REQUIRES[name];
   const out = scratchOut(name);
   test(`example: ${name}`, async (t) => {
+    const needHost = EXAMPLE_HOSTS[name];
+    if (needHost && process.platform !== needHost) {
+      const why = `needs a ${needHost} host (this one is ${process.platform})`;
+      console.log(`SKIP  ${name} (${why})`);
+      t.skip(why);
+      return;
+    }
     if (SYMLINK_NEEDS_FIXTURE.has(name) && symlinkSkipReason !== null) {
       console.log(`SKIP  ${name} (${symlinkSkipReason})`);
       t.skip(symlinkSkipReason);

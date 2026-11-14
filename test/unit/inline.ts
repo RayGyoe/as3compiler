@@ -102,7 +102,12 @@ function toolchainEmitsCanaries(): boolean {
 // Mach-O prefixes C symbols with '_' (ELF does not), and both emit local labels
 // that start with 'L' (LBB0_8:) or '.L' -- neither is a function boundary.
 function functionBody(asm: string, symbol: string): string | null {
-  const lines = asm.split('\n');
+  // Split on \r?\n: the assembler file is CRLF on a Windows checkout, and a
+  // trailing \r is invisible to the label rule but not to `$` -- with `.*` unable
+  // to cross \r (it is a line terminator for JS), `name:  # comment\r` failed to
+  // match while a bare `name:\r` matched, so the boundary scan skipped every
+  // function header and ran to the end of the file.
+  const lines = asm.split(/\r?\n/);
   const header = new RegExp(`^_?${symbol}:`);
   const start = lines.findIndex((l) => header.test(l));
   if (start < 0) return null;
@@ -114,7 +119,14 @@ function functionBody(asm: string, symbol: string): string | null {
   // worse, made the REVERSE assertion pass vacuously (any 7000-line slice contains
   // some function's canary). Hence: allow the trailing comment, and exclude the
   // assembler's own `l`-prefixed locals (`lJTI*`, `l_*.str`) alongside `.L*`/`L*`.
-  const fnLabel = /^(?!\.?[Ll](?:JTI|_)?)(?:_|[A-Za-z])[A-Za-z0-9_$.]*:\s*(?:;.*)?$/;
+  //
+  // The comment marker is per-target, and getting it wrong is the same bug in the
+  // other direction: the COFF/MSVC assembly clang emits on Windows annotates a
+  // function with `# @name` (the platform's own `.seh_proc`/`.seh_endproc` wrappers
+  // never match the `;`-only form), so a `;`-only rule ran main's body to the end of
+  // the FILE and counted every other function's calls -- 4 stray `as_v_to_number`
+  // calls in a loop that has none.
+  const fnLabel = /^(?!\.?[Ll](?:JTI|_)?)(?:_|[A-Za-z])[A-Za-z0-9_$.]*:\s*(?:[;#].*)?$/;
   let end = lines.length;
   for (let j = start + 1; j < lines.length; j++) { if (fnLabel.test(lines[j])) { end = j; break; } }
   return lines.slice(start, end).join('\n');
