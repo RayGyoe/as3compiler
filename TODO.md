@@ -20306,7 +20306,17 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
-> **2026-11-06 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /
+> **2026-11-15 追加（阶段四百一十八：Windows 全量回归清零）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变。这一轮清掉的是「本机 Windows 上红、`adl`/macOS 口径下本来就是对的」那些——按 §1.5 的
+> 硬判据它们是**遗留缺陷**（`adl` 跑得对我们跑不出/跑错），且同阶段修净 ⇒ 按表头「已完成项一经落地即从
+> 本表移出」不入表。**唯一还留着、且与本表已有的「`_sans`/`_serif` 行高」那行同源的**是：三个通用
+> 设备字体别名（`_typewriter`/`_sans`/`_serif`）的字面表按 macOS 写死（Monaco/Helvetica/Times New
+> Roman），Windows 上这些族名多数不存在 ⇒ Skia 回落到系统默认字体。它需要**平台化字面表 + 文本类示例
+> 双端全量复验**，一并进那一行，不单独登记。**教训**：这批红里有 4 条（`status-item`、`inline/HotPath`、
+> `native drag`、`platform/DeviceLost`）**根因都不在实现里**——前两条是「平台本来就该拒绝」和「测试切
+> 汇编的方式假设了 ELF/GAS」；后两条是断言写成了单平台形态与并行轨改了计数但钉没跟。红的时候先问
+> 「这个断言本身是不是只在一个平台上成立」，比顺着失败文案改实现便宜得多。
+ 追加（阶段三百七十七：Windows 路径编码 seam + 桌面后端默认接入）**：**新登记 0 行 / 改写 1 行 /
 > 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表 **92 项**（`未开始` 70 → **69**，`部分完成`
 > 20 → **21**，`调研完成` 1 不变）。改写的是「`File` 家族的原生对话框…仍缺」一行：对话框那半已完成并真机
 > 验证，行内只剩卷枚举与 `download`/`upload`。本阶段修净的路径编码错配按 §1.5 硬判据是**遗留缺陷**且同阶段
@@ -22224,3 +22234,53 @@ A/B 夹具（**整数化打印**，× 1000/1e6 后 `Math.round`，避开 Number�
 **仍未做**：对象形状推断（热路径唯一出路）、闭包捕获逃逸分析、`for-of` 自动改写（对象上
 「遍历值还是键」取决于类型，猜错即语义错误）、对象展开 `{...x}`（要 `Object.assign` 语义）、
 多文件模块。
+
+### 阶段四百一十八：Windows 全量回归清零（v0.4.393 → v0.4.394）
+
+**起点**：WebSocket 服务端与两条并行轨落盘（`2a11d12` / `4159358`）之后，本机 `node test.ts` 是
+**687 tests / 683 pass / 0 fail**（4 skipped），但那次推送前披露过的 10 条 Windows 红是既有账。
+这一轮逐条按**根因**修，不是放宽断言。
+
+**红线：先做 HEAD 归因，再动手**。`git worktree add --detach temp/wt-head HEAD` 跑一遍同一批用例，
+把「并行轨/环境既有」与「本轨引入」分开：`platform/DeviceLost` 在 HEAD 绿、当前树红（并行 native-shader
+改了 `vendor/stage3d_d3d.cc` 的 revive 点），其余 9 条在 HEAD 同样红 ⇒ 只有 1 条是本地回归，
+9 条是既存欠账。**不做这一步就会去改自己没碰过的代码。**
+
+**逐条根因与落点**：
+
+| 症状 | 真根因 | 落点 |
+|---|---|---|
+| `stage94d.as`：`us-ascii` 里 `'é'` 编码成 `'e'` | Windows `WideCharToMultiByte` 的 **best-fit 映射**（AIR/iconv 写 `?`） | `src/runtime.ts`：不可表示的代码页一律带 `WC_NO_BEST_FIT_CHARS` + 默认字符 `?` |
+| `native-shader-probe.as`：`'zlib.h' file not found` | 清单已列 `z` 时 `windowsZlibArgs()` 直接返回 `[]`，把**头文件路径**一起丢了 | `src/build.ts`：拆成 `windowsZlibIncludeArgs()`（永远给 `-I`）与库路径两半；多步编译的 `compileCommon` 也要带 `-I`（`clang -c` 看不到链接行的 include） |
+| `ane-app`：D3D 符号未定义 | `--air-app` 的 Windows 链集缺 `d3d12`/`d3dcompiler` | `src/air-app.ts`：**只在 `onWin && visible`** 加（离屏链集必须干净，`air-app/OffscreenLinkSet` 钉住） |
+| `emit/EmptyStringTerminator` | 空串路径手写 `as_str_alloc(1)`，运行时钉禁止这种裸写法 | `src/runtime.ts`：走 `as_str_empty()` |
+| `htmltext-metrics.as`：尾空行多算 1 px | `tops[]` 由 baseline−ascent 反推，Windows 上空行的 baseline 与行盒差 1 px | `vendor/skia_text_glue.cc` 的 `sk_textlayout_line_metrics()`：`tops` 改成**行盒高度前缀和** |
+| `text-underline.as`：`y=15` 那行不见了 | 设备字体 `_typewriter` 在 macOS 是 Monaco，Windows 上没有 | `examples/text-underline.as`：显式用 `Courier New`，下划线行位/步进/前进全部**由活度量推导**，不再写死 macOS 数值 |
+| `stage64.as`：`File.url` 不等于 `"file://" + nativePath` | 断言才是 POSIX 形态——AIR 的 `url` 是 URI，盘符路径是 `file:///C:/dir/name`（三条斜杠、反斜杠转正斜杠） | `examples/stage64.as`：按宿主分支构造期望值，顺带把反斜杠翻译钉住 |
+| `status-item.as` 红 | 编译器的报错本身是对的（`needs a darwin host`），Windows 上它就是不该跑 | `test/examples.ts`：`EXAMPLE_HOSTS`，非本机平台的示例 `t.skip()` 并打印原因 |
+| `inline/HotPath`：`main` 里 4 次 `ToNumber` | 不是 codegen —— 测试切函数体只认 `; @name`，而 COFF 用 `# @name`，且按 `
+` 切 CRLF 会把 `main` 拉到文件尾 | `test/unit/inline.ts`：`/
+?
+/` 切分 + 两种注释标记都认 |
+| native drag：期望 `/tmp/...`，实得 `	mp\...` | 断言写成 POSIX 形态 | `test/unit/native-drag.ts`：用 `String.fromCharCode(92)` 避开 AS3 词法的反斜杠，按返回值里有没有 `/` 分支断言 |
+| `platform/DeviceLost` | 并行轨多了 `s3d_generate_mips` 这第 5 个 revive 点，钉还数到 4 | `test/unit/platform.ts`：钉改 5 并写清「计数是刻意的，新增使用点必须加 revive 或被这里抓住」 |
+
+**走过的弯路（留证据，防复发）**：
+
+1. **全局改设备字体别名**：把 `_typewriter`/`_sans` 在 Windows 上映射成 `Courier New`/`Arial`，
+   单看 `text-underline` 是绿的，但一次跑出 **22 红**（文本度量、`swc-*`、`autosize-metrics` 全被
+   动到）。已整体回退——**别名是跨平台契约，不是单平台补丁位**。若将来要按平台建表，必须先把
+   「文本类示例全量双端复验」列进同一阶段。
+2. **给 `as_v_to_number()` 拆快慢两半**：这是照着失败信息猜的，改完 `HotPath` 照样红；真正原因在
+   测试的汇编切片。已回退，不留无用复杂化。
+3. **`File.separator` / `File.userDirectory` 在探针构建里报「未声明」**：这类「编译器自己有但示例
+   构建里拿不到」的成员，别当跨平台断言的地基。
+
+**Windows 上仍与 macOS 不一致、但不属于本轮的东西**：`_typewriter`/`_sans`/`_serif` 三个通用别名
+的字面表还是按 macOS（Monaco/Helvetica/Times New Roman）写死的，Windows 上这三个族名多数不存在 ⇒
+Skia 回落到系统默认字体。这与「遗留待开发」里 `_sans`/`_serif` 行高那行**同源**，需要一次平台化
+的字面表 + 文本类示例全量复验，故另立阶段，不夹在这轮清零里。
+
+**验收**：`node test.ts` → **687 tests / 683 pass / 0 fail / 4 skipped**（`exit=0`），
+`status-item.as` 以 `SKIP ... needs a darwin host (this one is win32)` 呈现而不是假绿。
+版本 `v0.4.393 → v0.4.394`。
