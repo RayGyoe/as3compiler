@@ -218,7 +218,8 @@ diffing line by line**, re-run after rebasing onto the new base (`1c1914c`): 0 n
 byte-identical before and after. Pins: `unit: runtime/ArraySortMerge` + `unit: runtime/DoubleToStringBinary` + `unit: emit/ValueClassCoercion`.
 The 5 further divergences the gate surfaced (`Array.sort(flag)` ignores every bit flag, dynamic-receiver `Number.toString()` returns `null`,
 the 17-digit cap in the fixed-fraction branch breaks round-trips, extreme `String()` forms, `toFixed` half-way rounding direction) are each
-rowed in the `TODO.md` left-over table.
+rowed in the `TODO.md` left-over table (the `toFixed` half-way direction has since been **resolved in stage 419** — half-up on the exact
+binary expansion plus the bugzilla513039 leading-zero truncation, see [`as3-semantics.md`](docs/en/as3-semantics.md) §3.9; the rest remain).
 
 **Leaf-class ordinary-method devirtualization (stage 321)**: within the closed compilation set, an ordinary
 instance-method call whose static receiver has no subclasses now calls the nearest-wins `m.owner` implementation
@@ -641,6 +642,7 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
 - `examples/textformat-merge.as` — `TextFormat`'s "unset means keep" per-field merge, the copy-returning getter, insert-time binding
 - `examples/bytearray-index.as` — the full semantics of the `ByteArray` index form
 - `examples/base64.as` — AIR 51 `ByteArray.toBase64`/`writeBase64`/`createFromBase64` (position semantics, unpadded final quanta, atomic #1508, #2007)
+- `examples/tofixed-round.as` — `Number.toFixed`'s AIR rounding contract (stage 419): half-up on the exact binary expansion (`2.5→3`, `0.25→0.3`, `2.675→2.67`, `99.995→100.00`), the bugzilla513039 leading-zero truncation (`0.5→0`, `0.05→0.0`), sign rules (`-0.05→-0.0`, `-0→0.00`), carry into the integer part, `0.1` at 20 places, `1e21`, NaN/±Infinity, and dynamic `*`/`Object`-slot receivers — 38 assertions, all measured against adl 51.4.1
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` is a conversion, `new Vector.<T>(length)` is a construction
 - `examples/vector-dynamic.as` — `Vector.<*>` and dynamic access on a `*` receiver
 - `examples/embed.as` — `[Embed]` assets (image/byte/audio → `Bitmap`/`ByteArray`/`Sound` subclasses)

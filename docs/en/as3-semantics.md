@@ -383,6 +383,24 @@ AIR — `in` queries the receiver's wrapper-class member surface, the same membe
 static `Number/int/uint`/`Boolean` paths share these tables with the dynamic `as_in_v` (`examples/in-primitive.as`
 matches adl verbatim).
 
+**7. `toFixed` rounds half-up on the exact binary expansion, with leading-zero truncation (stage 419, avmplus
+source + adl 51.4.1).** Three earlier rounds (314 / 344 / 350) reverse-engineered from decimal strings and
+concluded "neither banker's nor half-up, the rule cannot be named"; this round obtained the avmplus source
+(`core/MathUtils.cpp` `convertDoubleToString`/`kFixedFraction` + `core/d2a.cpp`) and settled three rules:
+① AVM2 rounds on the double's **exact value**, not on the decimal literal — every double is a finite-digit
+binary rational, `snprintf("%.1100f")` prints its exact expansion on UCRT/glibc/musl, and rounding that digit
+string half-up (carry when the first discarded digit is `>= '5'`) explains `2.675→2.67`, `9.995→9.99` (true
+value just below the tie) and `2.5→3`, `0.25→0.3` (exact tie goes up); ② **bugzilla513039**: when `|v|<1` and
+every requested place is a leading zero, rounding is **disabled** (`kFixedFraction`'s
+`if (precision == 0 && exp10 != 0) round = false;`), explaining `0.5.toFixed(0)→0`, `0.05.toFixed(1)→0.0`;
+③ the sign comes from the original value (`-0.05.toFixed(1)→-0.0`), while `-0` itself normalizes to `0`.
+`as_num_toFixed` implements exactly these three rules; **all 693 cells of the dual-end matrix agree**
+(`temp/tofixed3/`), pinned by `examples/tofixed-round.as` + `unit: prim/PrimMethods`. **Leftover**: for huge
+values (`Number.MAX_VALUE`) AIR's D2A emits only about "shortest round-trip digits + precision" significant
+digits and zero-pads the rest (with an off-by-one/two), while we emit every exact digit — a separate
+"significant-digit truncation" behavior that needs a port of D2A's BigInteger stopping bounds, registered
+separately (same D2A root as the "number parsing/formatting extremes" row, different surface).
+
 
 ### 3.10 Generated C compiles with zero default warnings (stage 364, clang default diagnostics + mxmlc 51.4.1)
 

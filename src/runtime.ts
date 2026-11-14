@@ -7689,12 +7689,75 @@ static void as_check_precision(int precision) {
 // the minus sign.
 static double as_clear_neg_zero(double v) { return v == 0.0 ? 0.0 : v; }
 
+// toFixed is NOT printf's half-to-even. AIR (avmplus MathUtils::convertDoubleToString,
+// DTOSTR_FIXED) generates the decimal digits of the EXACT binary value with the
+// D2A digit generator (core/d2a.cpp) and rounds HALF-UP on the first discarded
+// digit -- '(2.5).toFixed(0)' is "3", '(0.125).toFixed(2)' is "0.13" -- with one
+// compatibility quirk (bugzilla513039, on for every SWF version AIR 51 runs):
+// when |v| < 1 and ALL requested decimal places are leading zeros, the rounding
+// step is disabled entirely, so the answer is plain truncation -- '(0.5).toFixed(0)'
+// is "0", '(0.005).toFixed(2)' is "0.00", '(0.05).toFixed(1)' is "0.0" even though
+// the true value 0.05000000000000000277... sits above the tie. The sign of a
+// negative value survives a round-to-zero ('(-0.05).toFixed(1)' is "-0.0"), but
+// an input of -0 itself prints unsigned. Measured on adl 51.4.1, temp/tofixed3
+// (693-cell dual-arm matrix, all agree; the original 25 half-even disagreements
+// are exactly the two rules above).
+//
+// Every double is a dyadic rational, so its decimal expansion is FINITE (at most
+// 1074 fractional digits, Number.MIN_VALUE) and '%.1100f' prints it exactly on
+// every libc we target (UCRT/glibc/musl all round correctly and zero-pad) -- that
+// exact digit string is what D2A's BigInteger path produces, so rounding it
+// half-up reproduces AIR without porting the generator.
 static char* as_num_toFixed(double v, int digits) {
     if (isnan(v)) return "NaN";
     if (isinf(v)) return v > 0 ? "Infinity" : "-Infinity";
     as_check_fixed_digits(digits);
-    char* r = as_str_alloc(128);
-    snprintf(r, 128, "%.*f", digits, as_clear_neg_zero(v));
+    int neg = (v < 0.0);
+    if (neg) v = -v;
+    // -0.0 is not < 0.0, so it skips the negate above; normalize it to +0.0 or
+    // snprintf would print a stray '-' that we then copy into the result.
+    v = as_clear_neg_zero(v);
+    char exact[1500];
+    snprintf(exact, sizeof exact, "%.1100f", v);
+    char* dot = strchr(exact, '.');
+    int ilen = (int)(dot - exact);
+    const char* frac = dot + 1;
+    // bugzilla513039: |v| < 1 with every requested place a leading zero => no
+    // rounding at all (the leading-zero loop consumes the precision budget and
+    // then sets round = false in convertDoubleToString's kFixedFraction arm).
+    int trunc = (ilen == 1 && exact[0] == '0');
+    if (trunc) {
+        for (int i = 0; i < digits; i++) {
+            if (frac[i] != '0') { trunc = 0; break; }
+        }
+    }
+    char buf[512];
+    int k = 0;
+    if (neg) buf[k++] = '-';
+    int istart = k;
+    memcpy(buf + k, exact, ilen); k += ilen;
+    if (digits > 0) {
+        buf[k++] = '.';
+        memcpy(buf + k, frac, digits); k += digits;
+    }
+    buf[k] = 0;
+    if (!trunc && frac[digits] >= '5') {
+        // Half-up carry, walking back over the decimal point into the integer
+        // part (0.999 -> 1.00, 9.5 -> 10).
+        int i = k - 1;
+        while (i >= istart) {
+            if (buf[i] == '.') { i--; continue; }
+            if (buf[i] != '9') { buf[i]++; break; }
+            buf[i] = '0'; i--;
+        }
+        if (i < istart) {
+            memmove(buf + istart + 1, buf + istart, k - istart + 1);
+            buf[istart] = '1';
+            k++;
+        }
+    }
+    char* r = as_str_alloc(k + 1);
+    memcpy(r, buf, k + 1);
     return r;
 }
 static char* as_num_toExponential(double v, int digits) {

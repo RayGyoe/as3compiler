@@ -233,7 +233,9 @@ App Hang 的直接原因。换为**自底向上稳定归并**（不能换 `qsort
 三方比对 ⇒ 新修好 0 / 新弄坏 0 / 62 处既存分歧改前改后逐字相同（差分集 `temp/perf-b3/`，钉子
 `unit: runtime/ArraySortMerge` + `unit: runtime/DoubleToStringBinary` + `unit: emit/ValueClassCoercion`）。
 门禁顺带量出的 5 条既存分歧（`Array.sort(flag)` 把位标志全忽略、动态接收者的 `Number.toString()` 返 `null`、
-定长小数 17 位上限弄断 round-trip、次正规/DBL_MAX 表示、`toFixed` 平半舍入方向）已逐条入 `TODO.md` 遗留表。
+定长小数 17 位上限弄断 round-trip、次正规/DBL_MAX 表示、`toFixed` 平半舍入方向）已逐条入 `TODO.md` 遗留表
+（其中 `toFixed` 平半舍入方向已于**阶段四百一十九修净**——精确二进制展开上的半上入 + bugzilla513039 前导零截断，
+见 [`as3-semantics.md`](docs/zh-cn/as3-semantics.md) §3.9；其余仍在表）。
 
 **渲染器三处每帧实错（阶段三百一十五）**：库层修完后，「AOT 比 AIR 还卡」在**聊天面板**这一路仍然成立
 （夹具 `output/perf/chat/`，同一份 `.as` 分别 `adl` 与 AOT，进程 CPU/帧为口径）：每项 **20.0 µs vs AIR 2.9**，
@@ -730,6 +732,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/textformat-merge.as` — `TextFormat` 的「未设则保持」逐字段合并、返回副本的 getter、插入时绑定
 - `examples/bytearray-index.as` — `ByteArray` 下标形式的完整语义
 - `examples/base64.as` — AIR 51 `ByteArray.toBase64`/`writeBase64`/`createFromBase64`（position 语义、无填充尾组、#1508 原子性、#2007）
+- `examples/tofixed-round.as` — `Number.toFixed` 的 AIR 舍入契约（阶段四百一十九）：精确二进制展开上的半上入（`2.5→3`、`0.25→0.3`、`2.675→2.67`、`99.995→100.00`）、bugzilla513039 前导零截断（`0.5→0`、`0.05→0.0`）、符号规则（`-0.05→-0.0`、`-0→0.00`）、进位入整数部分、`0.1` 的 20 位、`1e21`、NaN/±Infinity，以及动态 `*`/`Object` 槽接收者 —— 38 条断言，全部与 adl 51.4.1 逐字相同
 - `examples/vector-coerce.as` — `Vector.<T>(arrayLike)` 是转换、`new Vector.<T>(length)` 是构造
 - `examples/vector-dynamic.as` — `Vector.<*>` 与 `*` 接收者的动态访问
 - `examples/embed.as` — `[Embed]` 资源（图片/字节/音频 → `Bitmap`/`ByteArray`/`Sound` 子类）

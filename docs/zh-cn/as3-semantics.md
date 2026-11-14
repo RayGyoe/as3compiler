@@ -455,6 +455,19 @@ true、`"name"` 为 false），`toString()` 是常量 `"function Function() {}"`
 `as_bool_has_member`/`as_fn_has_member` 与 `as_str_has_member` 同形，`as_in_v` 按 box tag 分派，静态
 `Number/int/uint`/`Boolean` 路径与动态 `as_in_v` 共用这些表（`examples/in-primitive.as` 与 adl 逐字一致）。
 
+**7. `toFixed` 的舍入方向是「精确二进制展开上的半上入 + 前导零截断」（阶段四百一十九 · avmplus 源码 + adl 51.4.1 实测）。**
+此前三轮（三百一十四 / 三百四十四 / 三百五十）凭十进制串反推，结论是「既非银行家也非半上入、规则不可命名」；
+本轮拿到 avmplus 源码（`core/MathUtils.cpp` 的 `convertDoubleToString`/`kFixedFraction` + `core/d2a.cpp`）定案三条：
+① AVM2 在 double 的**精确值**上舍入，不是在十进制字面量上——每个 double 都是有限位二进有理数，
+`snprintf("%.1100f")` 在 UCRT/glibc/musl 上都把它的精确展开打印出来，对其做半上入（首个被丢弃位 `>= '5'` 进位），
+解释 `2.675→2.67`、`9.995→9.99`（真值略低于平局）与 `2.5→3`、`0.25→0.3`（精确平局向上）；
+② **bugzilla513039**：`|v|<1` 且所请求位全是前导零时**禁用舍入**（`kFixedFraction` 的
+`if (precision == 0 && exp10 != 0) round = false;`），解释 `0.5.toFixed(0)→0`、`0.05.toFixed(1)→0.0`；
+③ 符号由原值决定（`-0.05.toFixed(1)→-0.0`），`-0` 本身归一成 `0`。`as_num_toFixed` 按这三条实现，
+**693 格双端矩阵全一致**（`temp/tofixed3/`），钉 `examples/tofixed-round.as` + `unit: prim/PrimMethods`。
+**残留**：大数（`Number.MAX_VALUE`）AIR 的 D2A 只给约「最短往返位数 + precision」个有效位再补零（带 off-by-one/two），
+我们给全部精确位——这是独立的「有效位截断」行为，需移植 D2A 的 BigInteger 停止边界，已另登记（与「数值解析/格式化极值」行同源但面不同）。
+
 ### 3.10 生成 C 的默认警告集归零（阶段三百六十四 · clang 默认诊断 + mxmlc 51.4.1 实测）
 
 一份 41.4 万行的真实产物（`bin-aot/TalkMED Meeting.c`）用 `clang -O2` 编译时报了 **725 条警告**。它们

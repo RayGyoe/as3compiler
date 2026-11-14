@@ -8,7 +8,7 @@ trace("abc".replace("x", "y"));        // abc（无匹配，原样返回）
 // 2) Number.toFixed：定点，digits 位小数。
 trace((1/3).toFixed(2));               // 0.33
 trace((3.14159).toFixed(3));           // 3.142
-trace((2.5).toFixed(0));               // 2（或 3，依舍入方式）
+trace((2.5).toFixed(0));               // 3（AIR 半上入，见 as_num_toFixed / tofixed-round.as）
 
 // 3) Number.toExponential：科学计数法，去指数前导零。
 trace((1234.5678).toExponential(2));   // 1.23e+3

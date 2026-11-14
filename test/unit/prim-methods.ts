@@ -107,6 +107,25 @@ const emitSource = readFileSync(join(root, 'src', 'emit.ts'), 'utf8').replace(/\
   check('a negative zero prints unsigned',
     flatPre.includes('static double as_clear_neg_zero(double v) { return v == 0.0 ? 0.0 : v; }'));
 
+  // ---- toFixed is AIR half-up on the exact expansion, not printf half-even ----
+  // AIR (avmplus MathUtils::convertDoubleToString, DTOSTR_FIXED) rounds the EXACT
+  // binary expansion half-up and disables rounding when every requested place is a
+  // leading zero (bugzilla513039). Measured on adl 51.4.1, temp/tofixed3 (693 cells).
+  check('toFixed no longer uses printf half-to-even ("%.*f")',
+    !flatPre.includes('snprintf(r, 128, "%.*f", digits,'));
+  check('toFixed rounds the exact binary expansion (%.1100f), half-up on the first discarded digit',
+    flatPre.includes('snprintf(exact, sizeof exact, "%.1100f", v);')
+    && flatPre.includes("if (!trunc && frac[digits] >= '5') {"));
+  check('toFixed disables rounding when every requested place is a leading zero (bugzilla513039)',
+    flatPre.includes("int trunc = (ilen == 1 && exact[0] == '0');"));
+  check('toFixed normalizes -0 before expanding so no stray sign is copied',
+    flatPre.includes('int neg = (v < 0.0);') && flatPre.includes('v = as_clear_neg_zero(v);'));
+  const exTf = readFileSync(join(root, 'examples', 'tofixed-round.as'), 'utf8');
+  check('the toFixed example fixes the AIR half-up + leading-zero-truncation contract',
+    exTf.includes('2.5 -> 3 (half-up, not half-even)')
+    && exTf.includes('0.5 -> 0 (truncation, not 1)')
+    && exTf.includes('negative round-to-zero keeps the sign'));
+
   // ---- integer radix conversion is exact at any magnitude ----
   check('the radix converter uses 2^32 limbs, not a 64-bit cast',
     flatPre.includes('limbs[nl++] = (uint32_t)(x - q * 4294967296.0);'));
