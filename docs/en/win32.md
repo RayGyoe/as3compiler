@@ -486,7 +486,13 @@ and the **step-by-step procedure for migrating an existing ANE into AOT** are in
 
 The macOS-only `metal_glue.mm` / `objc` / Cocoa `framework` entries are all dropped on Windows; `src/build.ts`'s
 `-lm`/`-lz` go to zero on win32 (`m.lib`/`z.lib` do not exist on Windows); `AS_HAVE_ICONV=0` (`<iconv.h>` is
-not in the CRT, so non-UTF charsets **loudly** throw, the same contract as wasm).
+not in the CRT), but **that is not a charset gap**: under `_WIN32` the runtime uses the OS code-page
+converter (`MultiByteToWideChar`/`WideCharToMultiByte` in `src/runtime.ts`, `as_multibyte_win_{decode,encode}`),
+which covers every ANSI code page AIR names (`gbk`/`gb2312`=936, `big5`=950, `shift-jis`=932, `euc-kr`=949,
+`cp125x`, `iso-8859-x`, `us-ascii`=20127, `macintosh`=10000) and shares the byte<->string policy with the
+arithmetic UTF-16 path. **Encoding must pass `WC_NO_BEST_FIT_CHARS` with default char `?`**: without it the
+system silently turns `'é'` in `us-ascii` into `'e'`, where AIR and iconv write `'?'` (pinned by
+`examples/stage94d.as`). Only names missing from that table **loudly** throw, the same contract as wasm).
 
 ### 3.1.1 The Second Window Backend: WGL/OpenGL (`--gpu-backend gl`)
 

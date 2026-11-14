@@ -482,7 +482,7 @@ web 侧 `web_glue.cc` 把字节直接塞进 `ImageData`（RGBA），而 wasm 构
 
 macOS 专属的 `metal_glue.mm` / `objc` / Cocoa `framework` 项在 Windows 上全部去掉；
 `src/build.ts` 的 `-lm`/`-lz` 在 win32 归零（`m.lib`/`z.lib` 在 Windows 不存在）；
-`AS_HAVE_ICONV=0`（`<iconv.h>` 不在 CRT 里，非 UTF 字符集**响亮**抛错，与 wasm 口径一致）。
+`AS_HAVE_ICONV=0`（`<iconv.h>` 不在 CRT 里），但**非 UTF 字符集不等于是缺口**：`_WIN32` 下走系统自己的代码页转换器 `MultiByteToWideChar`/`WideCharToMultiByte`（`src/runtime.ts` 的 `as_multibyte_win_{decode,encode}`），覆盖 AIR 会用的每一条 ANSI 代码页（`gbk`/`gb2312`=936、`big5`=950、`shift-jis`=932、`euc-kr`=949、`cp125x`、`iso-8859-x`、`us-ascii`=20127、`macintosh`=10000），字节↔串策略与算术 UTF-16 路径共用一套。**编码必须带 `WC_NO_BEST_FIT_CHARS` + 默认字符 `?`**：不加时系统会把 `us-ascii` 里的 `'é'` 悄悄写成 `'e'`，而 AIR 与 iconv 都写 `'?'`（`examples/stage94d.as` 钉住）。只有这张表里没有的名字才**响亮**抛错（与 wasm 口径一致）。
 
 ### 3.1.1 第二个窗口后端：WGL/OpenGL（`--gpu-backend gl`）
 

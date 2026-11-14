@@ -9818,15 +9818,186 @@ static unsigned char* as_multibyte_iconv_encode(const char* s, const char* iconv
     return out;
 }
 #endif
+// ---- UTF-16 <-> UTF-8 without iconv --------------------------------------------
+//
+// The UTF-16 family is the non-UTF-8 charset that matters most in practice: it is
+// what 'unicode'/'utf-16' mean, and it is what a BOM-less text export produces. It
+// must therefore NOT sit behind AS_HAVE_ICONV -- the Windows CRT has no <iconv.h>
+// at all, so a win32 build used to reject writeMultiByte(.., 'unicode') outright.
+// Both directions are plain code-point arithmetic, which is the difference between
+// this and the CJK code pages we deliberately refuse to hand-roll (AGENTS.md 2.9):
+// nothing here is a table.
+//
+// Decoding is lossy in exactly the way the other paths are: a lone surrogate (a
+// truncated or byte-swapped stream) is skipped instead of aborting, matching the
+// 'AIR never throws out of readMultiByte' measurements recorded above.
+static int as_utf16_is_be(const char* name) { return name != NULL && strcmp(name, "UTF-16BE") == 0; }
+static char* as_multibyte_utf16_decode(const unsigned char* data, unsigned len, const char* name) {
+    const int be = as_utf16_is_be(name);
+    // One UTF-16 unit yields at most three UTF-8 bytes, so len/2*3+1 is an upper
+    // bound even before surrogate pairs (two units, four bytes) are considered.
+    char* out = as_str_alloc((size_t)len / 2 * 3 + 1);
+    size_t j = 0;
+    unsigned i = 0;
+    while (i + 1 < len) {
+        unsigned u = be ? (((unsigned)data[i] << 8) | data[i + 1])
+                        : (((unsigned)data[i + 1] << 8) | data[i]);
+        i += 2;
+        unsigned cp = u;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            if (i + 1 >= len) break;                       // truncated pair
+            unsigned lo = be ? (((unsigned)data[i] << 8) | data[i + 1])
+                             : (((unsigned)data[i + 1] << 8) | data[i]);
+            if (lo < 0xDC00 || lo > 0xDFFF) continue;      // lone high surrogate
+            cp = 0x10000u + ((u - 0xD800u) << 10) + (lo - 0xDC00u);
+            i += 2;
+        } else if (u >= 0xDC00 && u <= 0xDFFF) {
+            continue;                                      // lone low surrogate
+        }
+        if (cp < 0x80) {
+            out[j++] = (char)cp;
+        } else if (cp < 0x800) {
+            out[j++] = (char)(0xC0 | (cp >> 6));
+            out[j++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            out[j++] = (char)(0xE0 | (cp >> 12));
+            out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[j++] = (char)(0x80 | (cp & 0x3F));
+        } else {
+            out[j++] = (char)(0xF0 | (cp >> 18));
+            out[j++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[j++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[j++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    out[j] = 0;
+    return out;
+}
+// Caller frees the returned buffer. Malformed UTF-8 is skipped byte by byte --
+// the same policy as every other encoder here.
+static unsigned char* as_multibyte_utf16_encode(const char* s, const char* name, unsigned* out_len) {
+    const int be = as_utf16_is_be(name);
+    const size_t n = s == NULL ? 0 : strlen(s);
+    unsigned char* out = (unsigned char*)malloc(n * 2 + 2);
+    *out_len = 0;
+    if (out == NULL) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < n; ) {
+        unsigned char b = (unsigned char)s[i];
+        unsigned cp, extra;
+        if (b < 0x80) { cp = b; extra = 0; }
+        else if ((b & 0xE0) == 0xC0) { cp = b & 0x1Fu; extra = 1; }
+        else if ((b & 0xF0) == 0xE0) { cp = b & 0x0Fu; extra = 2; }
+        else if ((b & 0xF8) == 0xF0) { cp = b & 0x07u; extra = 3; }
+        else { i++; continue; }
+        if (i + extra >= n) break;
+        bool ok = true;
+        for (unsigned k = 1; k <= extra; k++) {
+            unsigned char c = (unsigned char)s[i + k];
+            if ((c & 0xC0) != 0x80) { ok = false; break; }
+            cp = (cp << 6) | (c & 0x3Fu);
+        }
+        if (!ok) { i++; continue; }
+        i += (size_t)extra + 1;
+        unsigned lo = 0;
+        int pair = 0;
+        if (cp > 0xFFFF) {
+            cp -= 0x10000u;
+            lo = 0xDC00u | (cp & 0x3FFu);
+            cp = 0xD800u | (cp >> 10);
+            pair = 1;
+        }
+        if (be) { out[j++] = (unsigned char)(cp >> 8); out[j++] = (unsigned char)(cp & 0xFF); }
+        else    { out[j++] = (unsigned char)(cp & 0xFF); out[j++] = (unsigned char)(cp >> 8); }
+        if (pair) {
+            if (be) { out[j++] = (unsigned char)(lo >> 8); out[j++] = (unsigned char)(lo & 0xFF); }
+            else    { out[j++] = (unsigned char)(lo & 0xFF); out[j++] = (unsigned char)(lo >> 8); }
+        }
+    }
+    *out_len = (unsigned)j;
+    return out;
+}
+// ---- Legacy code pages on Windows ----------------------------------------------
+//
+// win32 has no iconv, but it does have the code-page converter the OS itself uses,
+// which covers every ANSI code page AIR names (gbk=936, big5=950, shift-jis=932,
+// euc-kr=949, cp125x, iso-8859-x, us-ascii=20127, macintosh=10000). Going through
+// UTF-16 means the byte<->string policy (including the lossy skip of lone
+// surrogates) is shared with the arithmetic UTF-16 path above instead of being a
+// second implementation. This is the same 'link the system, do not hand-roll a
+// table' call as the iconv branch on POSIX (AGENTS.md 2.9).
+#if !AS_HAVE_ICONV && defined(_WIN32)
+static UINT as_charset_win_cp(const char* name) {
+    if (name == NULL) return 0;
+    if (strcmp(name, "US-ASCII") == 0) return 20127;
+    if (strcmp(name, "ISO-8859-1") == 0) return 28591;
+    if (strcmp(name, "MACINTOSH") == 0) return 10000;
+    if (strcmp(name, "GB2312") == 0 || strcmp(name, "GBK") == 0) return 936;
+    if (strcmp(name, "BIG5") == 0) return 950;
+    if (strcmp(name, "SHIFT_JIS") == 0) return 932;
+    if (strcmp(name, "EUC-KR") == 0) return 949;
+    if (strncmp(name, "ISO-8859-", 9) == 0 && name[9] >= '1' && name[9] <= '9' && name[10] == 0)
+        return (UINT)(28590 + (name[9] - '0'));
+    if (strncmp(name, "CP", 2) == 0 && name[2] >= '0' && name[2] <= '9') return (UINT)atoi(name + 2);
+    return 0;  // unknown to this path: caller reports it loudly
+}
+static char* as_multibyte_win_decode(const unsigned char* data, unsigned len, const char* name) {
+    UINT cp = as_charset_win_cp(name);
+    if (cp == 0) return NULL;
+    if (len == 0) { char* e = as_str_empty(); return e; }
+    int wlen = MultiByteToWideChar(cp, 0, (const char*)data, (int)len, NULL, 0);
+    if (wlen <= 0) return NULL;
+    WCHAR* wbuf = (WCHAR*)malloc(sizeof(WCHAR) * (size_t)wlen);
+    if (wbuf == NULL) return NULL;
+    int got = MultiByteToWideChar(cp, 0, (const char*)data, (int)len, wbuf, wlen);
+    if (got <= 0) { free(wbuf); return NULL; }
+    char* out = as_multibyte_utf16_decode((const unsigned char*)wbuf, (unsigned)got * 2, "UTF-16LE");
+    free(wbuf);
+    return out;
+}
+static unsigned char* as_multibyte_win_encode(const char* s, const char* name, unsigned* out_len) {
+    UINT cp = as_charset_win_cp(name);
+    if (cp == 0 || s == NULL) return NULL;
+    unsigned wbytes = 0;
+    unsigned char* w = as_multibyte_utf16_encode(s, "UTF-16LE", &wbytes);
+    if (w == NULL) return NULL;
+    // WC_NO_BEST_FIT_CHARS is what turns an unrepresentable character into '?'
+    // instead of a look-alike: WITHOUT it Windows maps é to 'e' (measured on this
+    // host, and pinned by examples/stage94d.as), while AIR and iconv both write
+    // '?'. The flag is invalid for the UTF-8 code pages, which never need it.
+    const DWORD flags = (cp == 65001 || cp == 54936) ? 0 : WC_NO_BEST_FIT_CHARS;
+    char def = '?';
+    BOOL used = FALSE;
+    int blen = WideCharToMultiByte(cp, flags, (const WCHAR*)w, (int)(wbytes / 2), NULL, 0, &def, &used);
+    if (blen <= 0) { free(w); return NULL; }
+    unsigned char* out = (unsigned char*)malloc((size_t)blen);
+    if (out == NULL) { free(w); return NULL; }
+    int got = WideCharToMultiByte(cp, flags, (const WCHAR*)w, (int)(wbytes / 2), (char*)out, blen, &def, &used);
+    free(w);
+    if (got <= 0) { free(out); return NULL; }
+    *out_len = (unsigned)got;
+    return out;
+}
+#endif
 // Decode a byte range named by an AS3 charset (the readMultiByte path). Note
 // that the ByteArray/stream endian property does NOT influence this -- see
 // as_charset_resolve.
 static char* as_multibyte_decode(const unsigned char* data, unsigned len, const char* charSet) {
     char name[64];
     if (as_charset_resolve(charSet, name, sizeof name) == 0) return as_multibyte_utf8_decode(data, len);
+    // UTF-16 first: it is pure arithmetic here, so it must work even where iconv
+    // does not exist (win32, wasi, emscripten).
+    if (strcmp(name, "UTF-16LE") == 0 || strcmp(name, "UTF-16BE") == 0)
+        return as_multibyte_utf16_decode(data, len, name);
 #if AS_HAVE_ICONV
     return as_multibyte_iconv_decode(data, len, name);
 #else
+#if defined(_WIN32)
+    {
+        char* win = as_multibyte_win_decode(data, len, name);
+        if (win != NULL) return win;
+    }
+#endif
     as_throw_charset_unsupported(name);
     return as_multibyte_utf8_decode(data, len);
 #endif
@@ -9844,9 +10015,17 @@ static unsigned char* as_multibyte_encode(const char* s, const char* charSet, un
         *out_len = (unsigned)n;
         return out;
     }
+    if (strcmp(name, "UTF-16LE") == 0 || strcmp(name, "UTF-16BE") == 0)
+        return as_multibyte_utf16_encode(s, name, out_len);
 #if AS_HAVE_ICONV
     return as_multibyte_iconv_encode(s, name, out_len);
 #else
+#if defined(_WIN32)
+    {
+        unsigned char* win = as_multibyte_win_encode(s, name, out_len);
+        if (win != NULL) return win;
+    }
+#endif
     as_throw_charset_unsupported(name);
     return NULL;
 #endif
