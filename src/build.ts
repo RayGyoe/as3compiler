@@ -1438,14 +1438,28 @@ function uniqueLinkLibs(libs: readonly string[]): string[] {
 
 export function windowsZlibArgs(cfg: BuildConfig): string[] {
   if (process.platform !== 'win32' || cfg.target !== 'native') return [];
-  if (cfg.linkLibs.includes('z')) return [];
   const vendor = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'vendor');
   const libDir = hostVendorKey('native', 'win32', process.arch, cfg.architecture);
-  return [
-    '-I', resolve(vendor, 'curl', 'include'),
-    '-L', resolve(vendor, 'curl', 'lib', libDir),
-    '-l', 'z',
-  ];
+  // The HEADER path is needed whenever the generated C includes <zlib.h>, which it
+  // does unconditionally on every non-WASI target -- and `link-libs` cannot supply
+  // it, because link-libs is not include-paths. Only the library half (-L/-l z) is
+  // skipped when the config already names `z` (it then controls the position itself).
+  // Measured: examples/native-shader-probe.build.json lists ${win:z} and died at
+  // `fatal error: 'zlib.h' file not found` until the two halves were split.
+  const args = windowsZlibIncludeArgs(cfg);
+  if (cfg.linkLibs.includes('z')) return args;
+  return [...args, '-L', resolve(vendor, 'curl', 'lib', libDir), '-l', 'z'];
+}
+
+// The header-only half of windowsZlibArgs. A single-step build (`clang file.c -o exe`,
+// the shape of every example without a manifest) picks the -I up from the link args
+// above, but the MULTI-STEP path compiles with `clang -c` first -- and there the
+// include has to sit on the compile step or the generated C cannot find zlib.h.
+// Both paths therefore ask this one function.
+export function windowsZlibIncludeArgs(cfg: BuildConfig): string[] {
+  if (process.platform !== 'win32' || cfg.target !== 'native') return [];
+  const vendor = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'vendor');
+  return ['-I', resolve(vendor, 'curl', 'include')];
 }
 
 interface HostTemplate {
@@ -2150,6 +2164,10 @@ export function buildCompileSteps(cfg: BuildConfig, cPath: string, outPath: stri
   const compileCommon: string[] = [...nativeTargetFlags(cfg), cfg.opt, ...perfFlags(cfg), ...fpFlags(cfg), ...debugInfoFlags(cfg)];
   for (const d of effectiveDefines(cfg)) compileCommon.push('-D', d);
   for (const p of cfg.includePaths) compileCommon.push('-I', p);
+  // Windows has no system zlib, and the generated C includes <zlib.h> unconditionally:
+  // the header path must reach the COMPILE step here (the single-step path gets it
+  // from windowsZlibArgs on the link line, which `clang -c` never sees).
+  compileCommon.push(...windowsZlibIncludeArgs(cfg));
   for (const f of cfg.cFlags) compileCommon.push(f);
 
   const steps: string[][] = [];

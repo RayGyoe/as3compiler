@@ -3237,8 +3237,14 @@ function checkWindowsZlib(): string[] {
       a[0] === '-I' && a[1].includes('curl') && a[1].endsWith('include') &&
       a[2] === '-L' && a[3].includes('curl') && a[3].includes('windows-x64') &&
       a[4] === '-l' && a[5] === 'z');
-    check('a manifest that already lists z is not duplicated',
-      windowsZlibArgs(cfg({ linkLibs: ['z'] })).length === 0);
+    // A manifest that names z gets the HEADER path but no second -l z: link-libs is
+    // not include-paths, so it cannot supply the -I itself, and dropping the -I
+    // along with the library is what kept a manifest build from compiling the
+    // generated C at all (examples/native-shader-probe.build.json, ${win:z}).
+    const listed = windowsZlibArgs(cfg({ linkLibs: ['z'] }));
+    check('a manifest that already lists z still gets the header path, without a duplicate -l z',
+      listed.length === 2 && listed[0] === '-I' && listed[1].endsWith('include') &&
+      !listed.includes('-l') && !listed.includes('-L'));
     check('wasm never asks',
       windowsZlibArgs(cfg({ target: 'wasm' })).length === 0);
     // The compile command must carry it, and -l z must land AFTER the source file
