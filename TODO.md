@@ -20541,6 +20541,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 > **2026-11-08 追加（GC 小对象空闲块查找 O(1)，v0.4.358）**：**移出 1 行 / 改写 0 行 / 新登记 0 行**。`gc_find_block()` 的小对象请求在原 `floor` 类最多探测 **8 个节点**，未命中即从 `ceil(size / GC_SMALL_ALIGN)` 类继续，消除同类过小块的无界扫描并尽量保持旧地址复用顺序；`size >= GC_SMALL_MAX` 显式进入 mid 链，big 仍只查 big 链。初版漏掉 mid 分派导致 768B 请求反复开段；直接从 ceil 类起查又因保守栈扫描下的保留集变化使 `gc_alloc_threshold.as` 新增红（after **1,764,040**，旧算法 **1,025,200**；单节点探测仍 **1,348,128**）。这些中间结果均未计为完成。最终同机 A/B（`temp/perf/gcfindblock.as`，各 30000 次目标分配）：旧算法基线/小空闲块淹没 **4/8348 ms**，最终算法 **4/6 ms**；`unit: runtime/GcSizeClasses` **12/12**、全部 `gc_` 端到端示例 **8/8**，未放宽原测试。最终全量 `node test.ts`（`temp/perf/regress-final3.log`）为 **656 tests / 634 pass / 19 fail / 3 skipped**，19 红与既有基线逐项相同，新增失败 **0**。原始 Bench3/`pt_8000` 源文件当前不在工作树，未重测其 <50 ms 验收判据。
 > **2026-11-08 追加（static 每帧固定成本旧项收口）**：**移出 1 行 / 改写 0 行 / 新登记 0 行**。阶段三百一十五登记的旧根因路径已被后续阶段实际移除：阶段三百六十二加入静止窗口 dirty-key + Present skip（当时实测 `presentskip=512/512`），阶段三百七十又彻底删除 `as_render_fp` 每帧整树哈希并改用 `ASC_dirty_epoch`。本轮重建丢失的 static 夹具（`temp/framecost/Static.as`，静态 TextField + Bitmap、600 帧、无显示树写入），当前版本再次得到 `presentskip=512`、`keychg=0/0/0/1`，确认逻辑帧继续且光栅/Present 被跳过。本机外置进程 CPU 采样波动为 0.112–1.302 ms/帧，原始 AIR 夹具也不在工作树，故**不声称复测出新的 AOT/AIR ≤3× 比值**；本行收口依据是旧根因路径已删除及现有静止跳帧证据，不是虚构一组新性能数字。
 >
+> **2026-11-14 追加（阶段四百零八：`air.net.WebSocket` 原生客户端）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表 **86 → 87 行**（`未开始` 62 → **63**，含 `未开始 / D43b` 1 行；`部分完成` 20 不变）。**新登记的 1 行**是 `startServer(socket)`——客户端那一半（握手交给 `CURLOPT_CONNECT_ONLY=2`，分帧/掩码/分片重组/close 码归运行时）已全部落地并在 Node 真服务器上跑通，服务端缺的**只是握手**：在已接受的 `Socket` 上算 `Sec-WebSocket-Accept`，再复用同一套帧编解码。本轮只登记不改，因为真正的难点不在算法而在**数据面归属**（`as_sock` 的 poll 循环 vs worker 线程，两条路不能各读一半）。**本阶段修净的不占表**：`wss://` 在真机对 `wss://ws.postman-echo.com/raw` 实测 101 + echo 回环、`advapi32` 漏链（`CryptAcquireContext`/`CryptCreateHash` 在 advapi32 而非 crypt32）、顶层脚本 `import air.net.WebSocket` 后 `var w:WebSocket` 报 `unknown type` —— 都是「`adl` 跑得对我们跑不出」，同阶段落地。**顺带记一条口径**：curl 的 `curl_ws_*` 帧层与 `CURLWS_RAW_MODE` 都**不能**当我们的帧层用（前者不暴露 FIN，后者拒绝它自己为自动 PONG 发出的带 flags 发送，两条都有探针），今后遇到「第三方库已经有这个协议」的判断，先验「它暴露的抽象粒度够不够」，不是验「它有没有这个功能」。
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
 | **`toFixed` 对 `.5` 的舍入方向与 AIR 不同** | 未开始（2026-10-28 阶段三百一十四 量到；2026-10-31 阶段三百四十四 27 例；2026-11-01 阶段三百五十 补 84 格双端矩阵，**残差已收窄到 `|v|<1`**，规则仍不可命名） | AIR 的 `toFixed` 既不是银行家也不是半上入。**84 格矩阵**（`temp/tofixed2/`：28 个值 × `f=0/1/2`，`adl` 落 `out.txt`、我们落 `our.txt`）读出 13 格不同，**全部落在 `|v| < 1`**：`|v| ≥ 1` 的 60 格（含 `2.5→3`、`10.5→11`、`2.675→2.67`、`1.255→1.25`、`1234.5678→1235`）**与我们完全一致**。`|v| < 1` 的分歧只有两类：① `f=0` 且小数 ≥ 0.5 时 AIR **一律给 0**（`0.5/0.55/0.75/0.85/0.95/0.5000000000000001` 全为 `0`，即截断），而 `f≥1` 时同样落在十进制平局的 `0.25→0.3`、`0.75→0.8` 反而**进位**；② 真值只是**刚刚越过**平局一位的（`0.05` 真值 `0.05000000000000000277`、`0.85` 真值 `0.85000000000000008882`、`0.125` 在 `f=1`）AIR **不进位**，而 `0.125` 在 `f=2` 又进位成 `0.13`。**任何单一十进制规则都解释不了**：`0.05` 与 `0.25` 在 15/16 位十进制视图下形状完全相同（都是「cut 后面恰好是 5、再无尾数」）却一个向下一个向上；`0.125` 在 `f=1` 向下、`f=2` 向上；`0.5.toFixed(0)` 向下而 `2.5.toFixed(0)` 向上（同一平局、仅剩「`|v|<1`」这一条共同点）。已排除：`printf` 半偶（那是我们现在的实现，60 格 `|v|≥1` 全靠它撑住）、单精度中转（`0.05f*10+0.5` → 1，与 AIR 的 0 相反）、「先转 15 位最短十进制再按十进制舍」（解释不了 `0.05` vs `0.25`）、十进制串层半偶（解释不了 `0.25→0.3`） | **仍然别动**，但下一轮不必重做本轮：矩阵与两端读数已在 `temp/tofixed2/`（`probe.as` 是同一份源码；`out.txt`=adl、`our.txt`=我们），13 格分歧清单直接用 `diff out.txt our.txt` 取。动手的前置条件是拿到**avmplus 的 `toFixed` 实现源码**（AIR SDK 不带源，仓库里也没有）：本轮的读数证明它不是「某条十进制规则」，而是带着 `|v|<1` 专用分支/精度损失的实现细节，凭读数反推已到极限。若拿不到源码，另一条可行路线是**只改 `|v|<1` 的 `f=0` 分支**（13 格分歧里 5 格是这一类，且规则明确：截断），收益有限但零风险；**禁止**为了对齐 `2.5→3` 而把整体改成半上入——那会让现在正确的 `0.5→0`/`0.05→0.0`/`0.85→0.8` 与 60 格 `|v|≥1` 一起翻红 |
@@ -20629,6 +20630,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 | `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | **部分完成**（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
 | **`transparent=false` 的 `BitmapData`：adl 在 `getPixel32()`/`getPixels()` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的 alpha** | 未开始（2026-11-05 阶段三百七十四 的像素 oracle 量到） | `temp/vidcopy/` 的 DUMP 直接可见：同一份 `setPixels` 输入，adl 读回 `FF030201`、AOT 读回 `04030201`（低三字节相同）。这是本轮改动**之前**就存在的分歧——逐格循环与新的 bulk 路径给出同一个值，所以不是修 `setPixels` 引入的。影响面：`transparent=false` 的位图如果被写进非 255 的 alpha（ANE 帧的 alpha 恒为 255，所以 meeting 客户端的摄像头预览不受影响），AOT 下会整块半透明、AIR 下不透明。`examples/bitmap-setpixels-endian.as` 用的是 `transparent=false` 但源 alpha 恰好 255，所以既有钉子没有暴露它。 | 两条路选一条：① 在**写入侧**强制（`setPixels`/`setPixel32`/`fillRect`/`copyPixels`/`draw` 等所有入口，`!transparent` 时把 alpha 压成 255）；② 在**读取侧**强制（`getPixel32`/`getPixels` 时屏蔽）。AIR 到底是哪一侧还没测——这决定 `BitmapData` 内部是否允许存在带 alpha 的像素（会连带影响 `draw()` 的合成与 `Bitmap.bitmapData` 上屏）。**动手前先补一组双端探针**：`transparent=false` 位图 `setPixel32(0,0,0x80FF0000)` 之后，(a) `getPixel32` 读回什么、(b) `BitmapData.draw` 到另一张图上得到什么、(c) 作为 `Bitmap` 上屏后采样到什么。三处一致才敢选侧。 |
+| **`WebSocket.startServer(socket:Socket)` 只报明、不落地**（`#2031 "WebSocket server mode is not implemented by this runtime."`） | 未开始（2026-11-14 阶段四百零八 落地 `air.net.WebSocket` 客户端时登记） | 客户端的握手/分帧/掩码/分片重组/close 码已全部落地（`docs/zh-cn/flash-net.md` §7A），服务端缺的**只是握手那一半**：在已接受的 `Socket` 上读 `Sec-WebSocket-Key`、算 `SHA-1(key + 258EAFA5-E914-47DA-95CA-C5AB0DC85B11)` → base64 回 `Sec-WebSocket-Accept`，之后可直接复用同一套 `as_ws_parse_frames`/`as_ws_send_frame`（服务端帧不掩码）。难点不在算法而在**归属**：`Socket` 的数据面归 `as_sock` 注册表的 poll 循环，而 WebSocket 的数据面归 worker 线程，两条路要么合并要么移交，不能各读一半 | 先定「`startServer` 后该 socket 从注册表摘除、交给 worker」这一条，再补 SHA-1（vendored curl 只带了 `Curl_sha256`，**没有导出 sha1**；可用自写的 40 行实现或链 `bcrypt` 的 `BCryptHashData`）；验收用 `temp/wsnative/server.cjs` 的角色反转（AS3 当服务端、Node 当客户端） |
 
 
 
@@ -21333,6 +21335,189 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
+
+### 阶段四百零八：`air.net.WebSocket`——原生 WebSocket 客户端，不再需要 ANE（v0.4.382 → v0.4.383）
+
+真实项目（talkmed-meeting）的 WebSocket 一直靠一个第三方 ANE（websocketpp + OpenSSL 的
+`com.vsdevelop.air.extension.websocket`）。本阶段把它变成运行时能力：`air.net.WebSocket`（AIR 51）
++ `flash.events.WebSocketEvent`，传输直接复用**已经链进来的 vendored 静态 curl**（8.11.1，
+`http(s)://` 与 `ws(s)://` 共用 Windows Schannel / macOS SecureTransport），因此不需要原生扩展、
+不需要额外分发 DLL。现行口径见 [`docs/zh-cn/flash-net.md`](docs/zh-cn/flash-net.md) §7A。
+
+**为什么握手归 curl、分帧归运行时**（两条都是实测，不是推测）：curl 的 `curl_ws_*` 帧层**不暴露
+FIN 位**——分片消息的中间 CONTINUATION 帧与最后一帧在 `curl_ws_frame` 里完全同形
+（`CURLWS_CONT` + `bytesleft == 0`，探针 `temp/wsnative/frag_probe.c`），而 RFC 6455 §5.4 要求
+端点重组后才交付、AIR 也是这么做的；它的 `CURLWS_RAW_MODE` 更自相矛盾（`curl_ws_recv` 仍解析帧，
+并对服务端 PING 自动调 `curl_ws_send(..., CURLWS_PONG)`，而 raw 模式明确拒绝带 flags 的发送，
+探针 `temp/wsnative/rawprobe2.c`——会 ping 的服务端能让 raw 客户端直接断线）。所以只保留
+`CURLOPT_CONNECT_ONLY=2` 做握手（校验响应、建好 TLS），数据面走 `curl_easy_send`/`curl_easy_recv`，
+帧编解码（掩码、分片重组、控制帧、close 码、64MB 上限）全在运行时（`src/runtime.ts`）。
+
+**线程与帧边界**：`curl_easy_send/recv` 是阻塞调用，AS3 线程绝不能压在线上 ⇒ 每连接一个 worker
+线程独占到连接结束，**从不触碰 AS3/GC**，结果只往锁保护的队列放 `as_ws_msg`，由帧边界的
+`as_ws_dispatch()` 变成事件（与 `as_sock_dispatch` 同一契约，`as_ws_wait(10)` 在 `tickTimers()` 里、
+真帧边界传 0）。`AS_WS_FAILED` 是唯一终点：传输失败先置 `w->error` 再推同一个 opcode-8 CLOSE，
+于是 `as_ws_dispatch()` 只有一条拆除路径。
+
+**构建侧**：CLI 与 `--air-app` 的联网探测都认 `air.net.WebSocket`（只讲 WebSocket 的程序不会漏链
+`curl`/`nghttp2`）；Windows 还补了 `advapi32`——`CryptAcquireContext`/`CryptCreateHash` 在 advapi32
+而不是 crypt32，缺它时 curl 的 schannel/sha256 对象直接 lld-link 未定义符。wasm 目标不注入，构建期
+印一行说明、运行期 `connect()` 异步报 `#2031`（响亮失败，不是静默）。类键用消毒全限定名
+`air_net_WebSocket`（`air.*` 不在 `flash.*` 命名空间），顶层脚本的 `program.imports` 也写进全局
+短名表（否则 `var w:WebSocket` 报 `unknown type`）。
+
+**验收**：`examples/websocket.as`（自包含客户端契约：默认值、`#2007`/`#2147`/`#2082`/`#1508` 参数错误、
+连接前静默无操作、拒绝连接的异步 `#2031` + host 文案 + 仍派 CLOSE、关闭后 `#2002`、`startServer`
+的具名缺口）全绿；`test/unit/websocket.ts` 的 `websocket-roundtrip/` 用 Node http 服务器（真 SHA-1
+accept、真掩码、真分片、真 close 码）跑通 握手 → TEXT → BINARY → 分片重组 → 对端 close `4001`
+进 `closeReason`，并断言子协议头值 `chat.v1, chat.v2`、服务端 PING 被传输层 PONG 回；
+`websocket/` 组 38 钉钉源码形状（错误文案、props 表不 trace `_ws`、分帧属运行时、
+`ASC_HAVE_CURL` 挂载、`advapi32`）。`wss://` 在真机对 `wss://ws.postman-echo.com/raw` 实测
+握手 101 + 掩码文本 echo 成功（`temp/wsnative/wssprobe.c`、`temp/wsrt/wss.as`）。
+
+**具名缺口**（记入遗留表）：① `startServer(socket)` 未实现——服务端要在已接受的 `Socket` 上自行算
+`Sec-WebSocket-Accept`（SHA-1(key+GUID) → base64）再复用同一套帧编解码；② 本地 TLS 自签服务器
+没有进回归——那要暴露「关掉证书校验」的开关，本运行时不做；③ `bytesTotal`/`protocol` 的服务端选择
+值 curl 不回报（与 adl 实测的服务端不选时行为一致）。
+
+### 阶段四百零七：原生通道的第一个真实客户端——nyc-m36 接上 D3D12/HLSL（v0.4.381 → v0.4.382）
+
+阶段四百零六证明的是「通道能跑」（`apps/shader-m30` 15 项 PASS）；这一阶段证明的是「**一个 39 网格、
+36 万三角形、每帧换材质**的真实场景能跑」。`asaot3d/apps/nyc-m36` 从「全 AGAL」变成默认带
+`features = native-shader`：城市 31 个网格走 D3D12/HLSL（`calls=19 tris=142720`），交通/人群/天穹/
+广告牌留 AGAL；删掉 `features` 立即回到 AGAL（`calls=50 tris=365933`，与 AIR 读数逐位相同）。
+
+**做法是镜像而非重写**：`CityNativeSet` 握住每个 `MeshStandardMaterial` 原件，`mirror()` 建同名字段的
+`ShaderMaterial`，`sync()` 每帧把原件字段抄进 uniform（原地 `put3`，不分配）。`City.setNight()`、
+面板滑杆继续改原件，镜像只消费结果——一个真值来源，两条绘制路径。夜景/亮灯/雾/曝光在全通道下都对。
+
+**四个真缺陷**（都是「画了，但画成别的样子」，没有一个编译/链接错误）：
+
+1. **mip 掉档 94 → 0：AGAL 的 `t0..t7` 重绑踩掉原生采样器。** `Context3D_submit` 按 AGAL 程序的采样器
+   表重绑 `t0..t7`，原生绘制走同一提交点，刚绑好的原生纹理被改写。修法：提交点拆成
+   `Context3D_submit_ex(..., int keepTextures)`，原生绘制传 `1`。
+2. **原生 → AGAL 污染：`$Globals` 被当 `vc[]` 读**，首个原生绘制之后的第一条 AGAL 绘制吃掉上一帧的
+   原生常量块，整片错色后自愈。
+3. **最贵的一个：把「原生已绘制」做成持久标志 ⇒ AGAL 懒编译在原生序列中途开火。** 为跳过 `$Globals`
+   曾加 `as_s3d_native_drawn` 静态开关并由 `Context3D_submit` 消费；但原生绘制**直接进** `submit_ex`，
+   标记无人复位，于是**同一条序列中途**走到 `s3d_compile` 里唯一的 `nativeMode = 0`，
+   **31 条城市绘制里 30 条被打回 AGAL 语义**（3 fps、半对半错）。正确做法：`!keepTextures` 门控懒编译，
+   原生绘制末尾 `gpuProgram = NULL`。修完实测 `draws 251 nat1 155`，首帧模式
+   `0 0 111…1 0 1 0…`＝1 条 AGAL 天穹 → 30 条原生城市 → 其余 AGAL。
+4. **`uAlphaTest` 送对了但片元没用它。** 活体直方图确认只有 leaves0/1/2 是 0.45，补
+   `if (alpha < uAlphaTest) discard;` 后树叶硬边消失。
+
+**两个假缺陷（记下来省下一次误判）**：地平面 bbox `[-8000,8000]²` 且 z=0 是 `PlaneGeometry` 的**局部**
+XY 坐标（`rotation.x = -π/2` 才放平）；`[nmat] color=undefined` 是因为 `uniforms["uColor"].value` 是
+`Vector.<Number>`（`put3` 写的），上传仍走 `_toNumbers` 给 3 个 float。
+
+**收尾时的一个根因串起三个症状（已修，这是本阶段最贵的一条）**：1.5 fps（同场景纯 AGAL 59.9 fps）、
+街面近景里紧邻相机的那栋楼不出现、屋顶偶发巨大黑色楔形。三者都指向 `S3D_MAX_PROGRAMS` 只有 **16**，
+而本 demo 一帧里活着的程序是 **35** 个（24~31 原生材质 + 同帧仍在用的 AGAL 程序）——LRU **每帧把整个池
+驱逐一遍**：`s3d_compile` 每帧重跑 35 次 `D3DCompile`、`s3d_select_pso` 每帧重建 35 次 PSO（1.5 fps），
+且槽位在**一帧之内**被回收再用时 `s3d_prog_release` 释放了正在绘制的那个程序的 blob/PSO（该 draw 从画面
+消失）。判据：`S3DDRAW` 的 `comp=`（`c->statCompiles`）**每帧增长正好 35**。上限提到 **96** 后 `comp`
+停在 35、实测 **59 fps**，近景楼与屋顶楔形同时消失。池是静态数组（每槽 ≈4.3 KB），**上限是内存不是
+时间**。`unit: stage3d/program-pool` 新增 4 钉把这个下界钉住。
+
+**AGAL 剩下的 9 条绘制是什么**：天穹/广告牌/灯头/地铁口/冠顶都是 `MeshBasicMaterial`（unlit），本就不该
+走 PBR。`calls=` 只统计 AGAL 绘制，50 → 19 → 9 是**下降**。
+
+**顺带修掉两处真缺陷**：① `CityNative.install()` 只遍历 `_city.root`，而 `Traffic`/`Crowd` 的 mesh 同帧
+稍后才建 ⇒ 它们的 `MeshStandardMaterial` 一直留在 AGAL（19 条里的大头）；抽成 `CityNative.addTree()` 补进去。
+② `_ensureBuffers`/`_ensureAttributeBuffer` 原来「version 变了就新建 `VertexBuffer3D`」，而车与人的顶点
+**每帧都在变** ⇒ 每帧每网格一次 D3D12 资源创建；改成同尺寸原地重传。另记一条 AS3 陷阱：材质去重必须用
+`Dictionary` 而非 `{}`（Object 的 key 会被转成字符串，所有材质落进同一个 `"[object Object]"` 槽——
+实测 `install()` 只报 1 个材质）。
+
+**验收读数**（preset 1 街面 / preset 2 夜间时代广场）：**59 fps / 58.6 fps**，`calls=9 tris=6640`
+（AGAL 只剩 unlit 的 9 条），城市 24 个材质 + 交通人群 10 个材质共 34 个镜像走原生，`comp` 首帧 35 后
+不再增长，`mip-drop` 0 行。
+
+**第二批（同日收尾）**：最后 9 条 AGAL 绘制（天穹 / LED 广告牌 / 灯头 / 地铁口 / 冠顶，
+全是 `MeshBasicMaterial`）也接进原生通道 —— `UNLIT_VS`/`UNLIT_FS` +
+`CityNativeSet.mirrorBasic()` + 独立的 `basicMaterials` 列表，`addTree()` 两类材质都收，
+`NycM36` 在车流/人群首次 `update(0)` 后对 `_scene` 走一遍（天穹挂在 `_scene` 而非 `_city.root`）。
+读数 `calls=0 tris=0`（AGAL 计数归零 = 无回退的最硬证据）、43 个材质原生（32 lit + 11 unlit）、
+街面 59.7 fps / 夜间时代广场 62.9 fps。两条真缺陷记入文档 §7.11：**unlit 不能过 ACES**
+（把天穹洗白 30 码值，且不能声明 `uExposure`）；**改 shader 源码的锚点必须含 const 名**
+（`uExposure+out vec4+const float PI` 在 lit FS 里更早出现，误删了 lit 的 helper 与 main，
+靠 `temp/shc-city/city_shaders.h` 副本恢复，并用像素 6/6 逐字节相同验证等价）。
+
+**回归面**：`unit: native-shader/` 61 钉全绿（其中一条把「原生绘制必须走提交点」重钉为
+`Context3D_submit_ex(..., keepTextures=1)` 并注释了两条理由）；`unit: stage3d/*` 24 钉 +
+新增 `stage3d/program-pool` 4 钉全绿；全量 `node test.ts` **676 tests / 663 pass / 10 fail**，
+那 10 条与既有环境基线（native-drag、HotPath、DeviceLost、socket、htmltext-metrics、stage64/94d、
+status-item、text-underline、ane-app）逐条一致。树里的取证钩子按环境变量开关保留
+（`ASC_S3D_DUMP` / `ASC_NATIVE_DUMP_BINDINGS`），逐网格调试代码已清除。
+
+### 阶段四百零六：M5 D3D12/HLSL 直通臂——原生通道第三条腿（v0.4.380 → v0.4.381）
+
+E6 原生着色器直通此前只有 Metal（M3）和 WebGL2（M4）两条臂，Windows 构建链着 SPIRV-Cross 的 HLSL
+半边却**没有通道**：`stage3d_d3d.cc` 没有 `s3d_native_*`，`s3d_create_texture_fmt` / `set_target_samples` /
+`generate_mips` 三个入口干脆不存在（链接期直接 undeclared）。本阶段把 M5 落地，验收是
+`asaot3d/apps/shader-m30` 在 Windows AOT 下 15 项 PASS、`drawToBitmapData` 中心 `#804020`、3/8 处
+`#31190c`——与 Metal 臂逐位同色。现行口径见 [`docs/zh-cn/native-shader.md`](docs/zh-cn/native-shader.md)
+§6.12（英文 [`docs/en/native-shader.md`](docs/en/native-shader.md) §6.12），施工记录见
+[`docs/zh-cn/native-shader-plan.md`](docs/zh-cn/native-shader-plan.md) §5.7。
+
+**通道形状**（`vendor/stage3d_d3d.cc`，约 +700 行）：原生程序**就是普通 `S3DProg`**——同一个
+`s3d_compile`（FNV-1a 源哈希缓存）、同一套 `s3d_select_pso`、同一套 `TEXCOORD{slot}` 输入布局、
+同一套 `register(b0)` 根签名。新增只有两样：`D3DReflect` 给出的 `$Globals` 字节偏移（手算不可行：
+HLSL 的 cbuffer 打包规则会让猜测值「编译过、采样到别的 lane、一声不响」），以及每 stage 一份
+`S3D_CB_REGION` 暂存块，每帧首次绘制前 memcpy 进与 AGAL 共享的 bump allocator（两通道从不同时绘制）。
+`s3d_native_layout` 在本后端**必修**（Metal 侧 `[[buffer(N)]]` 已烘进源码，是 no-op）。
+
+**五个真缺陷，全是「编译过、结果错/空」那一类**：
+
+1. **联合 image-sampler 的 binding 全塌成 0**。`build_combined_image_samplers` 在 OpenGL 模式下不给
+   生成的 sampler 任何 binding 装饰，而 `spvc_hlsl_resource_binding` 以 `(set, binding)` 为键——两张
+   纹理因此被钉到同一个 `t1`。修法：生成前 `set_decoration(SpvDecorationBinding, i)`，再按同一个
+   `i` 设 `srv/sampler.register_binding`。
+2. **GLSL ES 3.00 的 attribute 没有 Location 装饰**。glslang 只对 `layout(location=N)` 给，而
+   `spvc_compiler_get_decoration` 对缺失装饰返回 0——`in vec3 aPos; in vec2 aUV;` 反射成 **aPos=0 且
+   aUV=0**，而 SPIRV-Cross 实际写 `aPos : TEXCOORD0, aUV : TEXCOORD1`；宿主按反射槽位绑流 = 两条流
+   喂同一份数据。修法：**两遍**钉 location（先按 SPIR-V id 排名收集未装饰输入，再统一写入；一遍版
+   会让刚被排到的那个看起来「已装饰」，两个都落到 0）。
+3. **HLSL 矩阵必须声明 `row_major`（最贵的一个）**。SPIRV-Cross 把 `M * v` 译成 `mul(v, M)`，只在
+   矩阵**转置**到达时等价；本项目（以及 Metal 臂、AGAL 臂、three.js 约定）上传的是**列主序**字节，
+   乘积于是静默变成 `Mᵀv`。四边形那种矩阵看不出差别，真相机矩阵把整场景推出裁剪空间：**整帧全黑、
+   `D3DCompile` 不报错、PSO 建成功、每个 uniform 读回都对**。三个探针定位：`uColor` 进片元 → 像素正确；
+   顶点位置换成 `vec4(aPos*0.5, 1.0)`（不读矩阵）→ 立刻出画面；读 `M[3].z`/`M[2].z` → 数值全对。
+   修法：shim 里给 HLSL 矩阵**声明行**加 `row_major`（数据与乘法都不动），同一份列主序字节被读作转置
+   矩阵，`mul(v, M)` 变回 `M * v`，AS 侧契约与 Metal 臂一致；嵌套乘积也自洽（HLSL 的 `mul(A,B)` 无论
+   存储类都是逻辑乘积）。
+4. **`skia.lib` 自带一份 SPIRV-Cross**（`spirv_cross.spirv_{glsl,msl,hlsl,reflect,…}.obj`），与新编的
+   `spirv-cross-*.lib` 一链就是 `duplicate symbol: spirv_cross::CompilerGLSL::emit_resources`。Skia
+   **没有** `spirv_cross_c.obj`（C 分发器不在里面），所以给 `build-win.sh` 加
+   `-DSPIRV_CROSS_NAMESPACE_OVERRIDE=asc_spvc`：我们那份 C++ 后端搬进 `asc_spvc`，`extern "C"` 的
+   `spvc_*` 入口不受影响，两份共存。`src/build.ts` 编 shim 带同一宏。
+5. **PSO 的 `RTVFormats[0]` 必须是目标真实 DXGI 格式**。原生通道能建任意格式目标，
+   `CreateGraphicsPipelineState` 在格式与绑定 view 不一致时**直接失败**（不是警告）；缓存键因此带完整
+   `DXGI_FORMAT`，不再是「半浮点/8 位」的布尔。
+
+**边界如实登记**：单颜色附件（`ncolor > 1` upfront 拒绝）、`setRenderTargetSamples` 报明不支持
+（目标恒单采样）、`generateMipmaps` 走 CPU box filter + 逐级上传且只支持 BGRA8（D3D12 没有 blit 式
+生成，D3D11 的 `GenerateMips` 已删；其他格式报明而不是半填）、显式 `cbuffer` 未接线（只有松散 uniform
+落 `$Globals`/b0）。
+
+**构建侧**：`build-tools/shader/build-win.sh` 收 `ARCH=32|64`（→ `windows-x86` / `windows-x64`），
+Windows 档案必须叫 `NAME.lib`（无 `lib` 前缀，MSVC 的 `-lNAME` 自己补 `.lib`）；`vendor/shader/lib/`
+现在四个目录：`macos-arm64` / `wasm` / `windows-x64` / `windows-x86`。收尾时还补了两处
+「链接清单只有一份、四个宿主都得成立」的缺口：① glslang 的 `MachineIndependent` / `GenericCodeGen` /
+`OSDependent` 在本构建里并进了 `glslang.lib`，但 macOS 档案集为每个都留了一个**单成员 stub 档案**
+（`libMachineIndependent.a` 就是 `stub.cpp.o`）——照做，否则任何按名字列全集的清单会在 Windows 上以
+`could not open 'MachineIndependent.lib'` 死在一个符号都没解析之前（`examples/native-shader-probe.as`
+就是这么红的）；② 该示例清单把 `../vendor/shader/lib/macos-arm64` 写死、且在 Windows 上还缺 zlib，
+改成 `${host}` + `${win:z}` 后一份清单四宿主通用。
+
+**回归面**：全量 `node test.ts` **662 绿 / 10 红**（红的是本机既有的环境项：manifest 缺
+`${win:d3d12/dxgi/d3dcompiler}` 引起的 lld-link 未定义符、字体度量、socket、本机缺 `cc` 类）；
+本轮修绿了两条：`stage3d/texture-formats`（PSO 键从 `rtfHalf` 改成完整 `DXGI_FORMAT` 后钉子没跟上，
+已按新口径重钉）与 `example: native-shader-probe.as`。`apps/shader-m30`（AOT，D3D12）16 项 PASS。
+
+> 本机跑回归要把一个 `cc`/`c++` 放进 PATH（`C:\Program Files\LLVM\bin` 只有 `clang`/`clang++`，
+> 而默认编译器名是 `cc`；同一台机器上 `vendor/shader` 的档案也已就位）。
 
 ### 阶段四百零五：原生 HDR 上屏——scRGB F16 交换链 + 线性光管线（v0.4.379 → v0.4.380）
 

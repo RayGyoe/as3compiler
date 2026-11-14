@@ -162,7 +162,11 @@ function detectStage3D(asFiles: string[]): boolean {
 function detectNetworking(asFiles: string[]): boolean {
   for (const f of asFiles) {
     try {
-      if (readFileSync(f, 'utf8').includes('URLRequest')) return true;
+      const text = readFileSync(f, 'utf8');
+      // air.net.WebSocket is a networking user too: its transport is the same
+      // static libcurl archive (curl_ws_*), so an app that only speaks WebSocket
+      // must still get ASC_HAVE_CURL and the curl link line.
+      if (text.includes('URLRequest') || text.includes('air.net.WebSocket')) return true;
     } catch {
       // unreadable file: skip
     }

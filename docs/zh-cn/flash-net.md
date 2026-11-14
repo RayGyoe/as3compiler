@@ -1521,6 +1521,96 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
 
 ---
 
+## 7A. `air.net.WebSocket`（阶段四百零六；AIR 51）
+
+> 这一节是 `air.net.WebSocket` / `flash.events.WebSocketEvent` 的唯一详细口径。
+> 实测来源是 adl 51.4.1 探针（`temp/wsapi/out-adl*.txt`），**实测优先于文档**：
+> 文档没说清的地方（`close()` 后到底派不派事件、`data` 是 String 还是 ByteArray）一律照实测。
+
+### 7A.1 能力表
+
+| 成员 | 状态 |
+|---|---|
+| `new WebSocket()` | ✅ `EventDispatcher` 子类 |
+| `connect(url:String, protocols:Vector.<String> = null)` | ✅ `ws://` / `wss://`；`protocols` 逐项拼成**一个** `Sec-WebSocket-Protocol` 头值（`"a, b"`，空项跳过） |
+| `sendMessage(format:uint, data:*)` | ✅ `fmtTEXT`/`fmtPING`/`fmtPONG` 要 `String`，`fmtBINARY` 要 `ByteArray`；未知 format **静默丢弃**（实测） |
+| `close(code:uint = 0)` | ✅ 发 close 帧（`code` 落在 2 字节 payload），等对端回 close 后派 `Event.CLOSE` |
+| `startServer(socket:Socket)` | ⚠️ **未实现**，抛 `#2031 "… WebSocket server mode is not implemented by this runtime."`（服务端需要自己算 `Sec-WebSocket-Accept`，见 §7A.4） |
+| `protocol`（读写） | ✅ 保留**应用设定值**；libcurl 不回报服务端选中的子协议，实测 adl 在服务端不选时也返回应用设定的值/`null` |
+| `closeReason`（只读） | ✅ 对端 close 帧的状态码，对端未带码时为 `-1` |
+| `fmtTEXT=1` / `fmtBINARY=2` / `fmtCLOSE=8` / `fmtPING=9` / `fmtPONG=10` | ✅ 静态常量（值即线上 opcode） |
+| `WebSocketEvent.DATA = "websocketData"` | ✅ `data` **恒为 `ByteArray`**（TEXT 也是），`position` 留在**末尾**；`stringData` 仅 TEXT 有值，其余 `null`；`format` 为 `uint` |
+
+### 7A.2 传输口径（为什么不是 ANE，也不是 curl 的 ws_* 帧层）
+
+- **不需要原生扩展**：vendored 静态 curl（8.11.1）已经编进 native 产物，`http(s)://` 与 `ws(s)://`
+  共用同一套 TLS（Windows Schannel / macOS SecureTransport）。`--air-app` 的联网探测与 CLI 的
+  `air.net.WebSocket` 探测都会挂上 `ASC_HAVE_CURL` + `curl`/`nghttp2`，只有 WebSocket 的程序
+  不会漏链。
+- **握手归 curl，分帧归运行时**。`CURLOPT_CONNECT_ONLY=2` 跑完 HTTP upgrade（校验响应、建好 TLS）
+  后把连接交出来，数据面走 `curl_easy_send`/`curl_easy_recv`。
+  **为什么不用 `curl_ws_*` 帧层**（两条都是实测，不是推测）：
+  1. 它**不暴露 FIN 位**——分片消息的中间 CONTINUATION 帧与**最后**一帧在
+     `curl_ws_frame` 里长得一模一样（都是 `CURLWS_CONT` + `bytesleft == 0`，探针
+     `temp/wsnative/frag_probe.c`），而 RFC 6455 §5.4 要求端点**重组后**才交给应用，
+     AIR 也是这么做的（一次 `websocketData`）。想靠 `bytesleft` 判消息结束会把一条消息拆成多条事件。
+  2. 它的 raw 模式**自相矛盾**：`curl_ws_recv` 仍会解析帧，并对服务端 PING 自动调
+     `curl_ws_send(..., CURLWS_PONG)`，而 raw 模式明确拒绝带 flags 的发送
+     （`ws_send, raw mode: fragsize and flags cannot be non-zero`，探针 `temp/wsnative/rawprobe2.c`）——
+     任何会 ping 的服务端都能让 raw 模式客户端断线。
+- **每连接一个 worker 线程**：`curl_easy_send/recv` 是阻塞调用，AS3 线程绝不能压在线上。worker
+  独占到连接结束，且**从不触碰 AS3/GC**：结果只往锁保护的队列里放 `as_ws_msg`，由帧边界的
+  `as_ws_dispatch()` 变成事件（与 `as_sock_dispatch` 同一契约）。
+- **分帧细节**：客户端帧**必须掩码**（§5.3，xorshift32 由时钟播种）；服务端帧不掩码但仍按掩码读；
+  控制帧必须 `FIN=1` 且 ≤125 字节；PING 由传输层自动 PONG（curl 不再代劳）；收到 close 帧回 close
+  并上报码值；未知 opcode / 无主的 CONTINUATION / >64MB 消息一律按传输失败处理。
+- **`wss://` 已实测**：`wss://ws.postman-echo.com/raw` 握手 `101`、掩码文本 echo 回环成功
+  （`temp/wsnative/wssprobe.c` 与 `temp/wsrt/wss.as`）。本地 TLS 自签服务器**没有**做进回归——
+  那需要暴露「关掉证书校验」的开关，本运行时不做（与 `SecureSocket` 不静默明文同一条口径）。
+- **`air.*` 包的类键**：`air.net.WebSocket` 不是 `flash.*`，所以 C 侧类键是消毒后的全限定名
+  `air_net_WebSocket`，`import air.net.WebSocket` 经 `buildImportAlias` 解析；顶层脚本没有
+  逐文件 import 上下文，故 `program.imports` 也写进全局短名表（否则 `var w:WebSocket` 报
+  `unknown type 'WebSocket'`）。
+- **`_ws` 是借来的句柄**（与 `Socket._sock` 同构）：属性表只 trace `_protocol`，不 trace `_ws`；
+  `as_ws_mark_roots()` 把 `obj`（AS3 对象）注册为**永久根**，所以应用忘了引用也照样收事件。
+
+### 7A.3 错误与状态（全部对照 adl 实测）
+
+| 场景 | 结果 |
+|---|---|
+| `connect(null)` | 同步 `TypeError #2007 "Error #2007: Parameter url must be non-null."` |
+| `connect("http://…")` / `connect("")` | 同步 `ArgumentError #2147 "Error #2147: Forbidden protocol in URL <url>."`（空串同样落到这条） |
+| 已连接时再 `connect()` | 同步 `Error #2082 "Error #2082: Connect failed because the object is already connected."` |
+| `sendMessage` 类型不符 | 同步 `ArgumentError #1508`（TEXT/PING/PONG 要 String，BINARY 要 ByteArray） |
+| 未知 `format` | **静默丢弃**（实测；不抛也不发） |
+| 连接前 `sendMessage`/`close` | **静默无操作**（不抛） |
+| 连接失败（拒绝/非 101/证书失败） | **异步** `ioError`：`errorID=2031`、`text="Error #2031: Socket Error. URL: <host>"`（只有 host，无 scheme/端口）；随后**仍派 `Event.CLOSE`** |
+| 失败或已关闭后再 `sendMessage`/`close` | `Error #2002 "Error #2002: Operation attempted on invalid socket."` |
+| `startServer(socket)` | `#2031`（服务端模式未实现，文案见 §7A.1） |
+| 后端缺失（wasm / 无 curl 构建） | `connect()` **不会静默**：同样异步 `ioError #2031`；CLI 在构建期印一行 `websocket: no transport` 之类的说明 |
+
+### 7A.4 验收
+
+```sh
+node src/index.ts examples/websocket.as --run        # 客户端契约（无服务器）
+node --test --test-name-pattern='websocket' test/unit/*.ts   # 形状钉 + 真服务器回环
+```
+
+- `examples/websocket.as` 是**自包含**的客户端契约：默认值、四个参数错误、连接前的静默无操作、
+  拒绝连接的异步 `#2031`（含 host 文案与「仍派 CLOSE」）、关闭后的 `#2002`、`startServer` 的
+  具名缺口。**它刻意不含线上回环**——那需要一个服务器，而本子集的 `ServerSocket` 只在 POSIX
+  目标可用（§7.3 末条），Windows 上会在最需要验证的构建里跳过。
+- `test/unit/websocket.ts` 的 `websocket-roundtrip/` 用 Node 的 http 服务器（真 SHA-1 accept、
+  真掩码、真分片、真 close 码）驱动同一套 seam，断言：握手 → TEXT → BINARY → **分片重组** →
+  对端 close `4001` 进 `closeReason`、`data` 是 ByteArray 且 BINARY 的 `stringData` 为 `null`、
+  子协议头值 `chat.v1, chat.v2`、服务端 PING 被传输层 PONG 回。`websocket/` 组则钉住源码形状
+  （错误文案、props 表不 trace `_ws`、分帧是运行时自己的、`ASC_HAVE_CURL` 挂载、`advapi32`）。
+- **服务端模式（`startServer`）是具名缺口**：它要在已接受的 `Socket` 上自行完成
+  `SHA-1(key + GUID)` → base64 的 `Sec-WebSocket-Accept` 握手，再复用同一套帧编解码。
+  这就是 `TODO.md` 遗留表里的那一条，不是「碰巧没做」。
+
+---
+
 ## 8. 明确不做 / 延后的边界
 
 | 项 | 判断 |
@@ -1529,6 +1619,7 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
 | `certificateError` 可 `preventDefault()` 放行 | ⏸ 延后（无 UI 承载证书交互），失败落 `ioError` |
 | `URLRequestDefaults.setLoginCredentialsForHost` | ⏸ 延后（认证场景） |
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **已做，见 §7**（`SecureSocket` 只到 API 面 + 诚实失败：TLS 状态机未实现，`isSupported=false`） |
+| `air.net.WebSocket` | ✅ **已做，见 §7A**（客户端；`startServer()` 是具名缺口，登记在 `TODO.md` 遗留表） |
 | `DatagramSocket`（UDP） | ⏸ 延后（与 TCP 底座不同：无连接、无 `flush` 语义、`send()` 自带目标地址） |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*`/RTMP | ❌ 不做（依赖 FMS / 音视频，超出范围） |
 | `FileReference`/`FileReferenceList`（文件上传/下载对话框） | ⏸ 延后（依赖原生文件对话框） |

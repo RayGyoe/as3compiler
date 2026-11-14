@@ -8645,6 +8645,11 @@ static void as_file_dialog_mark_roots(void);
 static void as_np_mark_roots(void);
 static void as_native_drag_mark_roots(void);
 static void as_sock_mark_roots(void);
+// air.net.WebSocket queue and live AS3 objects. Same forward-declaration
+// shape as the socket walk above: the real implementation sits in the
+// WebSocket section further down, and the stub branch at the end of the
+// preamble defines it too, so the declaration stays unconditional.
+static void as_ws_mark_roots(void);
 static void as_audio_mark_roots(void);
 // Native-extension roots: the AS3 ExtensionContext objects a live FREContext
 // points at, plus every FREObject handle the running extension call created.
@@ -8669,6 +8674,7 @@ static void gc_mark_internal_roots(void) {
     as_np_mark_roots();
     as_native_drag_mark_roots();
     as_sock_mark_roots();
+    as_ws_mark_roots();
     as_audio_mark_roots();
     as_fre_mark_ctx_roots();
     if (as_exception_boxed) gc_mark_value(as_exception_v);
@@ -15419,6 +15425,808 @@ static void as_sock_mark_roots(void) {
     }
 }
 
+// ---- air.net.WebSocket seam (docs/zh-cn/flash-net.md §4.6) -----------------
+//
+// The RFC 6455 CLIENT rides the vendored static libcurl (curl 8.11.1), so an app
+// that speaks WebSocket needs NO native extension: the same archive and the same
+// TLS (Schannel / SecureTransport) that already serve http(s)://. curl does the
+// HANDSHAKE (CURLOPT_CONNECT_ONLY=2 runs the HTTP upgrade, validates the response
+// and leaves TLS set up) and the runtime does the FRAMING -- the split exists
+// because curl's ws_* API cannot express the end of a fragmented message and its
+// raw mode rejects the very same API it uses to auto-answer pings (both measured,
+// see the codec below).
+//
+// Why a thread per connection instead of the socket registry's select() loop:
+// curl_easy_send/curl_easy_recv are BLOCKING calls on the easy handle, and the AS3
+// thread must never block on the wire. One worker owns the handle end to end
+// (handshake, send queue, receive loop) and NEVER touches AS3: results are
+// published as as_ws_msg nodes into a lock-protected queue, and as_ws_dispatch()
+// (emit.ts) turns them into events at the frame boundary. That is the same split
+// the socket registry uses - transport state here, AS3 objects there - and it is
+// what keeps libcurl outside the GC's world entirely.
+//
+// The registry/queue half compiles on EVERY target: without a curl backend or
+// without threads the seam still exists and still reports a failed connect
+// (AS_WS_FAILED + an ioError message), because "this build cannot speak
+// WebSocket" must be a loud, asynchronous failure and not a silent no-op (§1.5).
+
+#define AS_WS_IDLE       0
+#define AS_WS_CONNECTING 1
+#define AS_WS_OPEN       2
+#define AS_WS_FAILED     3
+#define AS_WS_CLOSED     4
+
+// Opcodes on the worker -> AS3 queue. TEXT/BINARY/CLOSE keep the wire numbers
+// (they are AS3's fmtTEXT/fmtBINARY/fmtCLOSE too); OPEN is ours. CLOSE is the
+// TERMINAL message of a connection in every case -- a transport failure sets
+// w->error first and then pushes the same CLOSE, so as_ws_dispatch() has exactly
+// one teardown path and never has to chase messages that can no longer arrive.
+#define AS_WS_MSG_OPEN   0
+
+struct as_ws_msg { struct as_ws_msg* next; int opcode; int len; unsigned char* data; };
+
+typedef struct as_ws {
+    void* obj;                 // the AS3 WebSocket; a GC pointer (as_ws_mark_roots)
+    volatile int state;
+    volatile int stop;         // AS3 asked for a close: send it, then wind down
+    int close_code;            // peer's close code, -1 when the frame carried none
+    int started;
+    char* url;                 // malloc'd copies: this struct is NOT a GC object
+    char* host;
+    char* protocol;
+    char* error;               // ioError text, set once by the first failure
+    struct as_ws_msg* q_head;  // worker -> AS3
+    struct as_ws_msg* q_tail;
+    struct as_ws_msg* s_head;  // AS3 -> worker
+    struct as_ws_msg* s_tail;
+#ifdef ASC_ASYNC_THREADS
+#ifdef _WIN32
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+#endif
+} as_ws;
+
+#ifdef ASC_ASYNC_THREADS
+static as_jm_t as_ws_lock =
+#ifdef _WIN32
+    SRWLOCK_INIT;
+#else
+    PTHREAD_MUTEX_INITIALIZER;
+#endif
+#ifdef _WIN32
+static CONDITION_VARIABLE as_ws_cv = CONDITION_VARIABLE_INIT;
+#else
+static pthread_cond_t as_ws_cv = PTHREAD_COND_INITIALIZER;
+#endif
+#define AS_WS_LOCK()   AS_JOB_LOCK(&as_ws_lock)
+#define AS_WS_UNLOCK() AS_JOB_UNLOCK(&as_ws_lock)
+#define AS_WS_WAKE()   AS_JOB_WAKE_ALL(&as_ws_cv)
+#else
+#define AS_WS_LOCK()   do {} while (0)
+#define AS_WS_UNLOCK() do {} while (0)
+#define AS_WS_WAKE()   do {} while (0)
+#endif
+
+static as_ws** as_wss = NULL;
+static int as_ws_count = 0;
+static int as_ws_cap = 0;
+
+static char* as_ws_mcopy(const char* s) {
+    if (s == NULL) return NULL;
+    size_t n = strlen(s);
+    char* d = (char*)malloc(n + 1);
+    if (d != NULL) { if (n > 0) memcpy(d, s, n); d[n] = '\\0'; }
+    return d;
+}
+
+static as_ws* as_ws_new(void* obj) {
+    as_ws* w = (as_ws*)calloc(1, sizeof(as_ws));
+    if (w == NULL) return NULL;
+    w->obj = obj;
+    w->state = AS_WS_IDLE;
+    w->close_code = -1;
+    if (as_ws_count == as_ws_cap) {
+        int grow = as_ws_cap == 0 ? 4 : as_ws_cap * 2;
+        as_ws** np = (as_ws**)realloc(as_wss, (size_t)grow * sizeof(as_ws*));
+        if (np == NULL) { free(w); return NULL; }
+        as_wss = np;
+        as_ws_cap = grow;
+    }
+    as_wss[as_ws_count++] = w;
+    return w;
+}
+
+// Detach from the AS3 object. The struct stays valid until as_ws_reap() sees the
+// worker finished, so a dispatch pass may still read close_code from it.
+static void as_ws_forget(as_ws* w) {
+    if (w == NULL) return;
+    w->obj = NULL;
+    for (int i = 0; i < as_ws_count; i++) if (as_wss[i] == w) as_wss[i] = NULL;
+}
+
+static void as_ws_reap(void) {
+    int keep = 0;
+    for (int i = 0; i < as_ws_count; i++) {
+        as_ws* w = as_wss[i];
+        if (w == NULL) continue;
+        int done = !w->started
+            || w->state == AS_WS_FAILED || w->state == AS_WS_CLOSED || w->stop;
+        if (done && w->obj == NULL) {
+#ifdef ASC_ASYNC_THREADS
+            // Bounded: the worker exits only after draining its queues.
+#ifdef _WIN32
+            if (w->thread != NULL) { WaitForSingleObject(w->thread, 2000); CloseHandle(w->thread); }
+#else
+            if (w->started) pthread_join(w->thread, NULL);
+#endif
+#endif
+            free(w->url); free(w->host); free(w->protocol); free(w->error);
+            while (w->q_head != NULL) { struct as_ws_msg* m = w->q_head; w->q_head = m->next; free(m->data); free(m); }
+            while (w->s_head != NULL) { struct as_ws_msg* m = w->s_head; w->s_head = m->next; free(m->data); free(m); }
+            free(w);
+            continue;
+        }
+        as_wss[keep++] = w;
+    }
+    as_ws_count = keep;
+}
+
+static void as_ws_mark_roots(void) {
+    for (int i = 0; i < as_ws_count; i++) {
+        if (as_wss[i] != NULL && as_wss[i]->obj != NULL) gc_mark_ptr(as_wss[i]->obj);
+    }
+}
+
+static int as_ws_any(void) { return as_ws_count > 0; }
+static int as_ws_total(void) { return as_ws_count; }
+static as_ws* as_ws_at(int i) { return (i >= 0 && i < as_ws_count) ? as_wss[i] : NULL; }
+
+static int as_ws_in_flight(void) {
+    for (int i = 0; i < as_ws_count; i++) {
+        as_ws* w = as_wss[i];
+        if (w != NULL && w->state == AS_WS_CONNECTING) return 1;
+    }
+    return 0;
+}
+
+static void as_ws_push_locked(as_ws* w, int opcode, const unsigned char* data, int len) {
+    struct as_ws_msg* m = (struct as_ws_msg*)malloc(sizeof(struct as_ws_msg));
+    if (m == NULL) return;
+    m->next = NULL;
+    m->opcode = opcode;
+    m->len = len;
+    m->data = NULL;
+    if (len > 0) {
+        m->data = (unsigned char*)malloc((size_t)len);
+        if (m->data == NULL) { free(m); return; }
+        memcpy(m->data, data, (size_t)len);
+    }
+    if (w->q_tail != NULL) w->q_tail->next = m; else w->q_head = m;
+    w->q_tail = m;
+}
+
+static void as_ws_push(as_ws* w, int opcode, const unsigned char* data, int len) {
+    AS_WS_LOCK();
+    as_ws_push_locked(w, opcode, data, len);
+    AS_WS_WAKE();
+    AS_WS_UNLOCK();
+}
+
+// End the connection with an ioError payload. Every path that can fail funnels
+// here, so the AS3 side sees at most one FAIL-vs-CLOSE pair and the handle is
+// released exactly once.
+static void as_ws_fail(as_ws* w, const char* text) {
+    AS_WS_LOCK();
+    if (w->error == NULL && text != NULL) w->error = as_ws_mcopy(text);
+    w->state = AS_WS_FAILED;
+    as_ws_push_locked(w, 8, NULL, 0);
+    AS_WS_WAKE();
+    AS_WS_UNLOCK();
+}
+
+static struct as_ws_msg* as_ws_take(as_ws* w) {
+    if (w == NULL) return NULL;
+    AS_WS_LOCK();
+    struct as_ws_msg* m = w->q_head;
+    if (m != NULL) { w->q_head = m->next; if (w->q_head == NULL) w->q_tail = NULL; m->next = NULL; }
+    AS_WS_UNLOCK();
+    return m;
+}
+
+static void as_ws_msg_free(struct as_ws_msg* m) { if (m != NULL) { free(m->data); free(m); } }
+
+static int as_ws_state_of(as_ws* w) { return w == NULL ? AS_WS_IDLE : w->state; }
+static int as_ws_close_code_of(as_ws* w) { return w == NULL ? -1 : w->close_code; }
+static char* as_ws_error_of(as_ws* w) { return w == NULL ? NULL : w->error; }
+
+// \`protocol\` is a plain String property the app sets before connect and reads
+// afterwards. libcurl does not surface the server's Sec-WebSocket-Protocol
+// choice, so it keeps the client-set value -- which is also what AIR reports when
+// the server offered no choice (measured, temp/wsapi/out-adl2.txt).
+static char* as_ws_protocol_of(as_ws* w) {
+    if (w == NULL || w->protocol == NULL) return NULL;
+    return as_str_dup(w->protocol);
+}
+
+static void as_ws_set_protocol(as_ws* w, char* v) {
+    if (w == NULL) return;
+    AS_WS_LOCK();
+    free(w->protocol);
+    w->protocol = (v == NULL || v[0] == '\\0') ? NULL : as_ws_mcopy(v);
+    AS_WS_UNLOCK();
+}
+
+#if defined(ASC_HTTP_BACKEND) && defined(ASC_ASYNC_THREADS)
+// ============================ real backend =================================
+
+static int as_ws_debug(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("AS_WS_DEBUG");
+        v = (e != NULL && e[0] != '\\0' && strcmp(e, "0") != 0) ? 1 : 0;
+    }
+    return v;
+}
+
+// The host part of a URL, which is all AIR puts in an ioError: measured
+// "Error #2031: Socket Error. URL: 127.0.0.1" -- no port, no scheme.
+static char* as_ws_host_of(const char* url) {
+    const char* p = url;
+    while (*p != '\\0' && *p != ':') p++;
+    if (*p == ':') { p++; if (*p == '/') p++; if (*p == '/') p++; }
+    const char* q = p;
+    while (*q != '\\0' && *q != ':' && *q != '/') q++;
+    size_t n = (size_t)(q - p);
+    char* h = (char*)malloc(n + 1);
+    if (h != NULL) { if (n > 0) memcpy(h, p, n); h[n] = '\\0'; }
+    return h;
+}
+
+// Block the AS3 thread for at most \`ms\` when a worker may still produce
+// something. This is what makes one tickTimers() cover a loopback round trip
+// instead of depending on how fast the host spins - the socket pump makes the
+// same promise with poll().
+static void as_ws_wait(int ms) {
+    if (ms <= 0) return;
+    AS_WS_LOCK();
+#ifdef _WIN32
+    SleepConditionVariableSRW(&as_ws_cv, &as_ws_lock, (DWORD)ms, 0);
+#else
+    {
+        struct timeval tv;
+        struct timespec ts;
+        gettimeofday(&tv, NULL);
+        ts.tv_sec = tv.tv_sec + ms / 1000;
+        ts.tv_nsec = (long)tv.tv_usec * 1000L + (long)(ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += 1; ts.tv_nsec -= 1000000000L; }
+        pthread_cond_timedwait(&as_ws_cv, &as_ws_lock, &ts);
+    }
+#endif
+    AS_WS_UNLOCK();
+}
+
+static void as_ws_sleep(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
+// Wait for the connection to become readable for at most \`ms\`.
+static void as_ws_wait_io(CURL* h, int ms) {
+    curl_socket_t s = CURL_SOCKET_BAD;
+    if (curl_easy_getinfo(h, CURLINFO_ACTIVESOCKET, &s) != CURLE_OK || s == CURL_SOCKET_BAD) {
+        as_ws_sleep(ms);
+        return;
+    }
+#ifdef _WIN32
+    // No readability wait on Windows. fd_set cannot be used: the MSVC target
+    // resolves the type to winsock's (a count + array) while FD_ZERO/FD_SET come
+    // from <sys/select.h> (a bit mask over __fds_bits), and the two cannot be
+    // mixed in one translation unit; WSAPoll would need <winsock2.h>, which this
+    // preamble deliberately does not include (it must precede <windows.h>, and a
+    // wrong order breaks the rest of the runtime). So the worker sleeps the
+    // timeout instead of waking on readability -- the recv above is already
+    // non-blocking and returns CURLE_AGAIN, so this costs at most ms of extra
+    // latency per retry on a worker thread, never on the AS3 thread.
+    (void)s;
+    as_ws_sleep(ms);
+#else
+    fd_set rf;
+    struct timeval tv;
+    FD_ZERO(&rf);
+    FD_SET(s, &rf);
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    select((int)s + 1, &rf, NULL, NULL, &tv);
+#endif
+}
+
+// ---- the RFC 6455 frame codec ----------------------------------------------
+//
+// WHY WE FRAME IT OURSELVES. curl's ws_* API is not usable as the frame layer:
+//
+//   1. It does not expose the FIN bit. A MIDDLE continuation frame and the LAST
+//      continuation frame of a fragmented message are both reported as CURLWS_CONT
+//      with bytesleft == 0 (measured on the vendored 8.11.1: temp/wsnative/frag_probe.c
+//      against a server sending TEXT|FIN=0, CONT|FIN=0, CONT|FIN=1). RFC 6455 §5.4
+//      requires the endpoint to REASSEMBLE before delivering, and AIR does, so
+//      "one fragmented message = one WebSocketEvent" is the contract, and curl's
+//      frame view cannot express it.
+//   2. Its raw mode is not a way out: curl_ws_recv still parses frames and still
+//      auto-answers PING by calling curl_ws_send with CURLWS_PONG, which raw mode
+//      rejects outright -- "ws_send, raw mode: fragsize and flags cannot be
+//      non-zero" (measured: temp/wsnative/rawprobe2.c). Any server that pings a
+//      raw-mode client breaks the connection.
+//
+// So only the HANDSHAKE stays curl's (CURLOPT_CONNECT_ONLY=2, which runs the HTTP
+// upgrade, validates the response and leaves TLS set up), and the data phase runs
+// over curl_easy_send/curl_easy_recv: WYSIWYG bytes, TLS already decrypted, with
+// CURLE_AGAIN as the only "nothing yet" answer (measured: temp/wsnative/rawsock.c
+// reads the server's PING as 89 02 70 70). The codec below is then the whole of
+// §5.2 (framing), §5.4 (fragmentation) and §5.5 (control frames), including the
+// client-side masking curl would otherwise have done -- a CLIENT frame MUST be
+// masked, and a conforming server (including the Node fixture in
+// test/unit/websocket.ts) drops the connection otherwise.
+
+// A 4-byte mask key. Not a security boundary (RFC 6455 §5.3 says so itself: the
+// masking exists to stop cache-poisoning proxies from seeing a shape they
+// understand), but it must be unpredictable enough that a peer cannot slice the
+// payload structure, so this is xorshift32 seeded from the clock, not a counter.
+static unsigned int as_ws_rng = 0;
+static void as_ws_mask_key(unsigned char* k) {
+    AS_WS_LOCK();
+    if (as_ws_rng == 0) as_ws_rng = ((unsigned int)as_now_ms() ^ 0x9E3779B9u) | 1u;
+    for (int i = 0; i < 4; i++) {
+        as_ws_rng ^= as_ws_rng << 13;
+        as_ws_rng ^= as_ws_rng >> 17;
+        as_ws_rng ^= as_ws_rng << 5;
+        k[i] = (unsigned char)(as_ws_rng & 0xFF);
+    }
+    AS_WS_UNLOCK();
+}
+
+// Write every byte or fail.
+static int as_ws_write_all(CURL* h, const unsigned char* p, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        size_t sent = 0;
+        CURLcode rc = curl_easy_send(h, (const char*)(p + off), len - off, &sent);
+        if (rc == CURLE_AGAIN) { as_ws_wait_io(h, 10); continue; }
+        if (rc != CURLE_OK) return 0;
+        if (sent == 0) return 0;
+        off += sent;
+    }
+    return 1;
+}
+
+// One complete, FIN-set, MASKED client frame. AS3's format constants are the wire
+// opcodes for TEXT/BINARY/CLOSE (1/2/8); PING/PONG are 9/10 on the wire as well,
+// so the mapping is a pass-through (curl's own CURLWS_PING/PONG bits are 1<<4 and
+// 1<<6, which is why the earlier non-raw path needed a switch here).
+static int as_ws_send_frame(CURL* h, int opcode, const unsigned char* data, size_t len) {
+    unsigned char hdr[14];
+    unsigned char mask[4];
+    int n = 0;
+    as_ws_mask_key(mask);
+    hdr[n++] = (unsigned char)(0x80 | (unsigned char)(opcode & 0x0f));
+    if (len < 126) {
+        hdr[n++] = (unsigned char)(0x80 | (unsigned char)len);
+    } else if (len <= 0xFFFFu) {
+        hdr[n++] = (unsigned char)(0x80 | 126);
+        hdr[n++] = (unsigned char)((len >> 8) & 0xFF);
+        hdr[n++] = (unsigned char)(len & 0xFF);
+    } else {
+        hdr[n++] = (unsigned char)(0x80 | 127);
+        for (int i = 7; i >= 0; i--) hdr[n++] = (unsigned char)((len >> (i * 8)) & 0xFF);
+    }
+    for (int i = 0; i < 4; i++) hdr[n++] = mask[i];
+    if (!as_ws_write_all(h, hdr, (size_t)n)) return 0;
+    if (len == 0) return 1;
+    unsigned char* body = (unsigned char*)malloc(len);
+    if (body == NULL) return 0;
+    for (size_t i = 0; i < len; i++) body[i] = (unsigned char)(data[i] ^ mask[i & 3]);
+    int ok = as_ws_write_all(h, body, len);
+    free(body);
+    return ok;
+}
+
+// A 64-bit payload length is legal on the wire but nothing this runtime can serve:
+// one message has to fit the queue's int length. 64 MB is already far past AIR's
+// practical payload and keeps a hostile/garbled header from becoming an allocation.
+#define AS_WS_MAX_MSG (64 * 1024 * 1024)
+
+// Append to the message being assembled (growing the buffer amortised-doubling).
+static int as_ws_frag_append(unsigned char** frag, int* frag_len, int* frag_cap,
+                             const unsigned char* p, int n) {
+    if (n <= 0) return 1;
+    if (*frag_len + n > AS_WS_MAX_MSG) return 0;
+    if (*frag_len + n > *frag_cap) {
+        int grow = *frag_cap == 0 ? 4096 : *frag_cap;
+        while (grow < *frag_len + n) grow *= 2;
+        unsigned char* np = (unsigned char*)realloc(*frag, (size_t)grow);
+        if (np == NULL) return 0;
+        *frag = np;
+        *frag_cap = grow;
+    }
+    memcpy(*frag + *frag_len, p, (size_t)n);
+    *frag_len += n;
+    return 1;
+}
+
+// Read whatever is already available into the stream buffer.
+//   1 = bytes arrived, 0 = nothing available, -1 = transport failure
+static int as_ws_rx_read(CURL* h, unsigned char** rx, int* rx_len, int* rx_cap) {
+    unsigned char tmp[16384];
+    size_t got = 0;
+    CURLcode rc = curl_easy_recv(h, tmp, sizeof(tmp), &got);
+    if (rc == CURLE_AGAIN) return 0;
+    if (rc != CURLE_OK) return -1;
+    if (got == 0) return 0;
+    if (*rx_len + (int)got > *rx_cap) {
+        int grow = *rx_cap == 0 ? 16384 : *rx_cap;
+        while (grow < *rx_len + (int)got) grow *= 2;
+        unsigned char* np = (unsigned char*)realloc(*rx, (size_t)grow);
+        if (np == NULL) return -1;
+        *rx = np;
+        *rx_cap = grow;
+    }
+    memcpy(*rx + *rx_len, tmp, got);
+    *rx_len += (int)got;
+    return 1;
+}
+
+// Consume every COMPLETE frame in the stream buffer.
+//   1 = the peer closed, -1 = failure/garbage, 0 = need more bytes
+static int as_ws_parse_frames(CURL* h, as_ws* w, unsigned char** rx, int* rx_len,
+                              unsigned char** frag, int* frag_len, int* frag_cap, int* msg_op) {
+    int off = 0;
+    for (;;) {
+        int avail = *rx_len - off;
+        if (avail < 2) break;
+        const unsigned char* p = *rx + off;
+        int fin = (p[0] & 0x80) != 0;
+        int op = p[0] & 0x0f;
+        int masked = (p[1] & 0x80) != 0;
+        long long len = p[1] & 0x7f;
+        int hdr = 2;
+        if (len == 126) {
+            if (avail < 4) break;
+            len = ((long long)p[2] << 8) | (long long)p[3];
+            hdr = 4;
+        } else if (len == 127) {
+            if (avail < 10) break;
+            len = 0;
+            for (int i = 0; i < 8; i++) len = (len << 8) | (long long)p[2 + i];
+            hdr = 10;
+        }
+        // A control frame may not be fragmented and may not exceed 125 bytes
+        // (RFC 6455 §5.5); anything else is a protocol error, not something to
+        // feed the application.
+        if (op >= 0x8 && (!fin || len > 125)) return -1;
+        if (len > AS_WS_MAX_MSG) return -1;
+        int total = hdr + (masked ? 4 : 0) + (int)len;
+        if (avail < total) break;
+        const unsigned char* mask = masked ? (p + hdr) : NULL;
+        const unsigned char* payload = p + hdr + (masked ? 4 : 0);
+
+        if (op == 0x8) {                       // close
+            // Payload: optional 2-byte big-endian code, then a UTF-8 reason.
+            int code = (len >= 2) ? (((int)payload[0] << 8) | (int)payload[1]) : -1;
+            w->close_code = code;
+            // Echo the close (§5.5.1) and let the caller wind the connection down.
+            as_ws_send_frame(h, 0x8, (const unsigned char*)(len >= 2 ? payload : NULL),
+                             (size_t)(len >= 2 ? 2 : 0));
+            return 1;
+        }
+        if (op == 0x9) {                       // ping -> pong with the same payload
+            if (!as_ws_send_frame(h, 0xA, payload, (size_t)len)) return -1;
+        } else if (op == 0xA) {                // pong: nothing to do
+            /* ignore */
+        } else if (op == 0x0 || op == 0x1 || op == 0x2) {
+            if (op != 0x0) {
+                // A new message starts here; a non-CONT frame while one is being
+                // assembled would be a protocol violation, but resetting is the
+                // forgiving-but-defined choice (the peer's frames are ordered).
+                *msg_op = (op == 0x2) ? 2 : 1;
+                *frag_len = 0;
+            } else if (*msg_op == 0) {
+                return -1;                     // continuation with no message open
+            }
+            if (masked) {
+                // Servers must not mask (§5.1), but unmask anyway rather than
+                // hand the app the raw xor: a lenient read is harmless, a wrong
+                // payload is not.
+                unsigned char* tmp = (unsigned char*)malloc((size_t)(len > 0 ? len : 1));
+                if (tmp == NULL) return -1;
+                for (long long i = 0; i < len; i++) tmp[i] = (unsigned char)(payload[i] ^ mask[i & 3]);
+                int ok = as_ws_frag_append(frag, frag_len, frag_cap, tmp, (int)len);
+                free(tmp);
+                if (!ok) return -1;
+            } else if (!as_ws_frag_append(frag, frag_len, frag_cap, payload, (int)len)) {
+                return -1;
+            }
+            if (fin) {
+                // ONE message per event, however many frames it took.
+                as_ws_push(w, *msg_op, *frag, *frag_len);
+                *frag_len = 0;
+                *msg_op = 0;
+            }
+        } else {
+            return -1;                         // unknown opcode
+        }
+        off += total;
+    }
+    if (off > 0) {
+        memmove(*rx, *rx + off, (size_t)(*rx_len - off));
+        *rx_len -= off;
+    }
+    return 0;
+}
+
+// One recv pass: pull what arrived, then consume the frames it completed.
+//   1 = peer closed, 0 = nothing more right now, -1 = failure
+static int as_ws_recv_pass(CURL* h, as_ws* w, unsigned char** rx, int* rx_len, int* rx_cap,
+                           unsigned char** frag, int* frag_len, int* frag_cap, int* msg_op) {
+    int r = as_ws_rx_read(h, rx, rx_len, rx_cap);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    return as_ws_parse_frames(h, w, rx, rx_len, frag, frag_len, frag_cap, msg_op);
+}
+
+static void as_ws_worker_body(as_ws* w) {
+    char* fail_text = NULL;
+    {
+        size_t hn = w->host != NULL ? strlen(w->host) : 0;
+        fail_text = (char*)malloc(hn + 64);
+        if (fail_text != NULL) snprintf(fail_text, hn + 64, "Error #2031: Socket Error. URL: %s", w->host != NULL ? w->host : "");
+    }
+    CURL* h = curl_easy_init();
+    if (h == NULL) { as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error."); free(fail_text); return; }
+    char errbuf[CURL_ERROR_SIZE];
+    errbuf[0] = '\\0';
+    curl_easy_setopt(h, CURLOPT_URL, w->url);
+    // CONNECT_ONLY=2 is curl's "do the WebSocket handshake, then hand me the
+    // connection": the upgrade request/response, the redirect and TLS are curl's,
+    // and every byte after it is ours (see the codec above for why the data phase
+    // cannot use curl_ws_*).
+    curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, 2L);
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+    struct curl_slist* headers = NULL;
+    if (w->protocol != NULL && w->protocol[0] != '\\0') {
+        size_t n = strlen(w->protocol) + 32;
+        char* hv = (char*)malloc(n);
+        if (hv != NULL) {
+            snprintf(hv, n, "Sec-WebSocket-Protocol: %s", w->protocol);
+            headers = curl_slist_append(headers, hv);
+            free(hv);
+        }
+        if (headers != NULL) curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+    }
+    CURLcode rc = curl_easy_perform(h);
+    if (headers != NULL) { curl_slist_free_all(headers); curl_easy_setopt(h, CURLOPT_HTTPHEADER, NULL); }
+    if (rc != CURLE_OK) {
+        // AIR's text is fixed: "Error #2031: Socket Error. URL: <host>". The curl
+        // detail goes to the debug channel instead of the event, so an app that
+        // matches the documented sentence keeps working.
+        as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
+        if (as_ws_debug()) {
+            fprintf(stderr, "[as3-aot] ws handshake failed: curl rc=%d %s (%s)\\n", (int)rc,
+                    errbuf[0] != '\\0' ? errbuf : curl_easy_strerror(rc), w->url != NULL ? w->url : "-");
+            fflush(stderr);
+        }
+        curl_easy_cleanup(h);
+        free(fail_text);
+        return;
+    }
+    free(fail_text);
+
+    AS_WS_LOCK();
+    w->state = AS_WS_OPEN;
+    as_ws_push_locked(w, AS_WS_MSG_OPEN, NULL, 0);
+    AS_WS_WAKE();
+    AS_WS_UNLOCK();
+    if (as_ws_debug()) {
+        fprintf(stderr, "[as3-aot] ws open %s\\n", w->url != NULL ? w->url : "-");
+        fflush(stderr);
+    }
+
+    unsigned char* frag = NULL;
+    int frag_len = 0, frag_cap = 0, msg_op = 0;
+    unsigned char* rx = NULL;          // post-handshake byte stream (easy_recv)
+    int rx_len = 0, rx_cap = 0;
+    int io_failed = 0;
+
+    for (;;) {
+        // 1) Hand over everything AS3 queued (a close frame may be in there).
+        struct as_ws_msg* send = NULL;
+        AS_WS_LOCK();
+        send = w->s_head;
+        w->s_head = w->s_tail = NULL;
+        AS_WS_UNLOCK();
+        while (send != NULL) {
+            struct as_ws_msg* nx = send->next;
+            if (!as_ws_send_frame(h, send->opcode, send->data, (size_t)send->len)) io_failed = 1;
+            free(send->data);
+            free(send);
+            send = nx;
+            if (io_failed) break;
+        }
+        if (io_failed) break;
+
+        // 2) Read what is there, then decide whether to keep going.
+        int r = as_ws_recv_pass(h, w, &rx, &rx_len, &rx_cap, &frag, &frag_len, &frag_cap, &msg_op);
+        if (r < 0) { io_failed = 1; break; }
+        if (r > 0) break;   // peer sent its close frame
+
+        // 3) A close was requested: give the peer a short grace period to echo
+        // its own close frame, then report CLOSE either way (measured on adl: a
+        // programmatic close DOES dispatch CLOSE, with closeReason -1 when the
+        // peer echoed no code).
+        if (w->stop) {
+            for (int i = 0; i < 30; i++) {
+                as_ws_wait_io(h, 10);
+                int r2 = as_ws_recv_pass(h, w, &rx, &rx_len, &rx_cap, &frag, &frag_len, &frag_cap, &msg_op);
+                if (r2 != 0) break;
+            }
+            break;
+        }
+        as_ws_wait_io(h, 10);
+    }
+
+    free(frag);
+    free(rx);
+    curl_easy_cleanup(h);
+
+    if (io_failed) {
+        // An abrupt end (reset, TLS truncation) is reported as the socket error
+        // AIR uses, followed by CLOSE. AIR itself throws #2030 ("End of file was
+        // encountered") out of its own reader here -- measured as an UNCAUGHT
+        // Error from air.net::WebSocket -- and reproducing a crash is not a
+        // contract worth keeping.
+        size_t hn = w->host != NULL ? strlen(w->host) : 0;
+        char* t = (char*)malloc(hn + 64);
+        if (t != NULL) {
+            snprintf(t, hn + 64, "Error #2031: Socket Error. URL: %s", w->host != NULL ? w->host : "");
+            as_ws_fail(w, t);
+            free(t);
+        } else {
+            as_ws_fail(w, "Error #2031: Socket Error.");
+        }
+        return;
+    }
+
+    AS_WS_LOCK();
+    w->state = AS_WS_CLOSED;
+    as_ws_push_locked(w, 8, NULL, 0);
+    AS_WS_WAKE();
+    AS_WS_UNLOCK();
+    if (as_ws_debug()) {
+        fprintf(stderr, "[as3-aot] ws closed %s code=%d\\n", w->url != NULL ? w->url : "-", w->close_code);
+        fflush(stderr);
+    }
+}
+
+#ifdef _WIN32
+static unsigned __stdcall as_ws_worker(void* arg) { as_ws_worker_body((as_ws*)arg); return 0; }
+#else
+static void* as_ws_worker(void* arg) { as_ws_worker_body((as_ws*)arg); return NULL; }
+#endif
+
+// Start one connection. \`protocols\` is already the comma-joined header value the
+// AS3 class builds from Vector.<String>, which is exactly what the wire wants:
+// "Sec-WebSocket-Protocol: a, b".
+static int as_ws_start(as_ws* w, const char* url, const char* protocols) {
+    if (w == NULL || url == NULL) return 0;
+    if (w->started) return 0;
+    {
+        // curl_global_init is not thread-safe and must run before any worker
+        // touches libcurl; this is the AS3 thread, so a plain guard is enough.
+        // Harmless when as_job_publish already did it.
+        static int as_curl_ready = 0;
+        if (!as_curl_ready) { as_curl_ready = 1; curl_global_init(CURL_GLOBAL_DEFAULT); }
+    }
+    w->url = as_ws_mcopy(url);
+    w->host = as_ws_host_of(url);
+    if (protocols != NULL && protocols[0] != '\\0') {
+        free(w->protocol);
+        w->protocol = as_ws_mcopy(protocols);
+    }
+    w->started = 1;
+    w->state = AS_WS_CONNECTING;
+#ifdef _WIN32
+    {
+        uintptr_t hh = _beginthreadex(NULL, 0, as_ws_worker, w, 0, NULL);
+        w->thread = (hh != 0) ? (HANDLE)hh : NULL;
+        if (w->thread == NULL) { w->state = AS_WS_FAILED; w->error = as_ws_mcopy("Error #2031: Socket Error."); return 0; }
+    }
+#else
+    if (pthread_create(&w->thread, NULL, as_ws_worker, w) != 0) {
+        w->state = AS_WS_FAILED;
+        w->error = as_ws_mcopy("Error #2031: Socket Error.");
+        return 0;
+    }
+#endif
+    return 1;
+}
+
+// Queue one frame for the worker. 0 when the connection cannot take it (never
+// opened or already winding down), which the AS3 class turns into AIR's #2002.
+static int as_ws_send(as_ws* w, int opcode, const void* data, int len) {
+    if (w == NULL || w->state != AS_WS_OPEN) return 0;
+    struct as_ws_msg* m = (struct as_ws_msg*)malloc(sizeof(struct as_ws_msg));
+    if (m == NULL) return 0;
+    m->next = NULL;
+    m->opcode = opcode;
+    m->len = len;
+    m->data = NULL;
+    if (len > 0 && data != NULL) {
+        m->data = (unsigned char*)malloc((size_t)len);
+        if (m->data == NULL) { free(m); return 0; }
+        memcpy(m->data, data, (size_t)len);
+    }
+    AS_WS_LOCK();
+    if (w->s_tail != NULL) w->s_tail->next = m; else w->s_head = m;
+    w->s_tail = m;
+    AS_WS_WAKE();
+    AS_WS_UNLOCK();
+    return 1;
+}
+
+// Request a close. A close frame with \`code\` (0 = none, which is what AIR's
+// close() default sends) is queued first; the CLOSE event follows when the worker
+// reports back.
+static void as_ws_shutdown(as_ws* w, int code) {
+    if (w == NULL) return;
+    if (w->state == AS_WS_OPEN) {
+        unsigned char payload[2];
+        int len = 0;
+        if (code > 0 && code <= 65535) {
+            payload[0] = (unsigned char)((code >> 8) & 0xFF);
+            payload[1] = (unsigned char)(code & 0xFF);
+            len = 2;
+        }
+        as_ws_send(w, 8, payload, len);
+    }
+    AS_WS_LOCK();
+    w->stop = 1;
+    AS_WS_WAKE();
+    AS_WS_UNLOCK();
+}
+
+#else  // no curl backend, or no threads: the honest stub
+// ======================= fail-loud backend-less seam =======================
+
+static void as_ws_wait(int ms) { (void)ms; }
+
+// connect() fails the way AIR fails a refused connect, asynchronously through the
+// same queue a real failure uses. The build itself says why on the console
+// (src/index.ts prints "websocket: no transport"), so the runtime failure is a
+// contract, not a mystery.
+static int as_ws_start(as_ws* w, const char* url, const char* protocols) {
+    (void)url;
+    if (w == NULL) return 0;
+    if (protocols != NULL && protocols[0] != '\\0') {
+        free(w->protocol);
+        w->protocol = as_ws_mcopy(protocols);
+    }
+    w->started = 1;
+    as_ws_fail(w, "Error #2031: Socket Error.");
+    return 0;
+}
+
+static int as_ws_send(as_ws* w, int opcode, const void* data, int len) { (void)w; (void)opcode; (void)data; (void)len; return 0; }
+static void as_ws_shutdown(as_ws* w, int code) { (void)w; (void)code; }
+
+#endif
+
 // Drain the completed jobs. Called only at the frame boundary, on the AS3
 // thread. The table is scanned under as_job_lock - workers write j->state under
 // that same lock - but the thunks run with the lock RELEASED: they dispatch AS3
@@ -15439,6 +16247,7 @@ static void as_sock_mark_roots(void) {
 // Returns the number of thunks run.
 static int as_file_dialog_tick(void);
 static int as_sock_dispatch(void);    // defined with the AS3 Socket section (needs Socket_new)
+static int as_ws_dispatch(void);      // defined with the air.net.WebSocket section (same reason)
 
 static int as_async_tick_with(int sock_wait_ms) {
     // A thunk dispatches AS3 events and a listener may call the frame-boundary
@@ -15457,6 +16266,16 @@ static int as_async_tick_with(int sock_wait_ms) {
     if (as_sock_any()) {
         as_sock_pump(sock_wait_ms);
         sock_events = as_sock_dispatch();
+    }
+
+    // WebSocket workers publish into a queue instead of a descriptor this pass
+    // can poll: as_ws_wait() gives them the same bounded wait the socket pump
+    // gets, so one tickTimers() covers a connect -> open -> data -> close round
+    // trip on loopback, while a real frame boundary waits 0 and never blocks.
+    int ws_events = 0;
+    if (as_ws_any()) {
+        as_ws_wait(sock_wait_ms);
+        ws_events = as_ws_dispatch();
     }
 
 #ifdef ASC_HTTP_WEB
@@ -15546,7 +16365,7 @@ static int as_async_tick_with(int sock_wait_ms) {
     }
 
     as_async_in_tick = 0;
-    return finished + sock_events + dialog_events;
+    return finished + sock_events + ws_events + dialog_events;
 }
 
 // The frame boundary's entry point: never blocks.
@@ -15574,7 +16393,7 @@ static void as_async_tick_wait(void) {
         // The 10 ms socket wait is what makes a loopback round trip (connect ->
         // write -> peer echo -> socketData) land inside one tickTimers() call
         // instead of depending on how fast the host spins.
-        if (as_async_tick_with(10) == 0 && !as_sock_in_flight()) break;
+        if (as_async_tick_with(10) == 0 && !as_sock_in_flight() && !as_ws_in_flight()) break;
     }
 }
 

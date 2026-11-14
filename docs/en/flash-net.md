@@ -1712,6 +1712,108 @@ Two things most easily got wrong:
 
 ---
 
+## 7A. `air.net.WebSocket` (stage four hundred and eight; AIR 51)
+
+> This section is the single detailed contract for `air.net.WebSocket` / `flash.events.WebSocketEvent`.
+> The measurements come from adl 51.4.1 probes (`temp/wsapi/out-adl*.txt`), and **measurement beats
+> documentation**: wherever the docs leave a question open (does `close()` dispatch at all, is `data` a
+> String or a ByteArray) the measurement decides.
+
+### 7A.1 Capability table
+
+| Member | Status |
+|---|---|
+| `new WebSocket()` | an `EventDispatcher` subclass |
+| `connect(url:String, protocols:Vector.<String> = null)` | `ws://` / `wss://`; `protocols` is joined into **one** `Sec-WebSocket-Protocol` header value (`"a, b"`, empty entries skipped) |
+| `sendMessage(format:uint, data:*)` | `fmtTEXT`/`fmtPING`/`fmtPONG` require a `String`, `fmtBINARY` requires a `ByteArray`; an unknown format is **silently dropped** (measured) |
+| `close(code:uint = 0)` | sends a close frame (`code` in a 2-byte payload) and dispatches `Event.CLOSE` once the peer's close arrives |
+| `startServer(socket:Socket)` | **not implemented**, throws `#2031 "... WebSocket server mode is not implemented by this runtime."` (a server needs its own `Sec-WebSocket-Accept`, see 7A.4) |
+| `protocol` (read/write) | keeps the **application's** value; libcurl does not surface the server's chosen subprotocol, and measured adl also answers the application's value/`null` when the server picks nothing |
+| `closeReason` (read-only) | the peer's close-frame status code, `-1` when the peer sent none |
+| `fmtTEXT=1` / `fmtBINARY=2` / `fmtCLOSE=8` / `fmtPING=9` / `fmtPONG=10` | static constants (the values are the wire opcodes) |
+| `WebSocketEvent.DATA = "websocketData"` | `data` is **always a `ByteArray`** (TEXT included) with `position` left at the **end**; `stringData` is only set for TEXT and is `null` otherwise; `format` is a `uint` |
+
+### 7A.2 Transport contract (why neither an ANE nor curl's `ws_*` frame layer)
+
+- **No native extension is needed**: the vendored static curl (8.11.1) is already compiled into native
+  builds, and `http(s)://` and `ws(s)://` share the same TLS (Schannel on Windows, SecureTransport on
+  macOS). Both `--air-app`'s networking probe and the CLI's `air.net.WebSocket` probe inject
+  `ASC_HAVE_CURL` + `curl`/`nghttp2`, so a program that only speaks WebSocket never misses the link.
+- **curl does the handshake, the runtime does the framing.** `CURLOPT_CONNECT_ONLY=2` runs the HTTP
+  upgrade (validating the response and setting up TLS) and then hands the connection over; the data
+  phase runs over `curl_easy_send`/`curl_easy_recv`.
+  **Why not curl's `curl_ws_*` frame layer** (both measured, not assumed):
+  1. It **does not expose the FIN bit** -- a middle CONTINUATION frame and the **last** frame of a
+     fragmented message look identical (`CURLWS_CONT` + `bytesleft == 0`, probe
+     `temp/wsnative/frag_probe.c`), while RFC 6455 section 5.4 requires the endpoint to **reassemble
+     before delivering**, and AIR does exactly that (one `websocketData`). Deciding message end from
+     `bytesleft` splits one message into several events.
+  2. Its raw mode **contradicts itself**: `curl_ws_recv` still parses frames and answers a server PING
+     by calling `curl_ws_send(..., CURLWS_PONG)` itself, while raw mode refuses any send carrying flags
+     (`ws_send, raw mode: fragsize and flags cannot be non-zero`, probe `temp/wsnative/rawprobe2.c`) --
+     any server that pings a raw-mode client breaks the connection.
+- **One worker thread per connection**: `curl_easy_send/recv` block, and the AS3 thread must never sit
+  on the wire. The worker owns the connection until it ends and **never touches AS3/GC**: results are
+  published as `as_ws_msg` nodes into a lock-protected queue, and the frame-boundary `as_ws_dispatch()`
+  turns them into events (the same contract as `as_sock_dispatch`).
+- **Framing details**: client frames **must be masked** (section 5.3, xorshift32 seeded from the clock);
+  server frames are unmasked but still read as if masked; control frames must carry `FIN=1` and be at
+  most 125 bytes; PING is answered with PONG by the transport (curl no longer does it); a received close
+  frame is answered with a close and its code reported; unknown opcodes / orphan CONTINUATIONs /
+  messages over 64MB are all treated as transport failure.
+- **`wss://` is measured**: `wss://ws.postman-echo.com/raw` handshakes with `101` and echoes masked text
+  back (`temp/wsnative/wssprobe.c` and `temp/wsrt/wss.as`). A local self-signed TLS server is **not** in
+  the regression suite -- that would need an option to switch certificate validation off, which this
+  runtime does not expose (the same stance as `SecureSocket` never silently falling back to plaintext).
+- **Class key**: `air.net.WebSocket` is not under `flash.*`, so the C-side key is the sanitized fully
+  qualified name `air_net_WebSocket`, and `import air.net.WebSocket` resolves through
+  `buildImportAlias`; a top-level script has no per-file import context, so `program.imports` is also
+  published into the global short-name table (otherwise `var w:WebSocket` fails with
+  `unknown type WebSocket`).
+- **`_ws` is a borrowed handle** (the same shape as `Socket._sock`): the props table traces only
+  `_protocol` and never `_ws`, while `as_ws_mark_roots()` registers `obj` (the AS3 object) as a
+  **permanent root**, so events keep arriving even if the application drops its reference.
+
+### 7A.3 Errors and states (all measured on adl)
+
+| Scenario | Result |
+|---|---|
+| `connect(null)` | synchronous `TypeError #2007 "Error #2007: Parameter url must be non-null."` |
+| `connect("http://...")` / `connect("")` | synchronous `ArgumentError #2147 "Error #2147: Forbidden protocol in URL <url>."` (the empty string lands here too) |
+| `connect()` while already connected | synchronous `Error #2082 "Error #2082: Connect failed because the object is already connected."` |
+| `sendMessage` with a wrong type | synchronous `ArgumentError #1508` (TEXT/PING/PONG want a String, BINARY wants a ByteArray) |
+| unknown `format` | **silently dropped** (measured; neither throws nor sends) |
+| `sendMessage`/`close` before connecting | **silent no-op** (no throw) |
+| connect failure (refused / non-101 / certificate failure) | **asynchronous** `ioError`: `errorID=2031`, `text="Error #2031: Socket Error. URL: <host>"` (host only, no scheme or port); `Event.CLOSE` is **still** dispatched afterwards |
+| `sendMessage`/`close` after a failure or close | `Error #2002 "Error #2002: Operation attempted on invalid socket."` |
+| `startServer(socket)` | `#2031` (server mode is not implemented, text in 7A.1) |
+| no backend (wasm, or a build without curl) | `connect()` is **not silent**: the same asynchronous `ioError #2031`, and the CLI prints a note at build time |
+
+### 7A.4 Acceptance
+
+```sh
+node src/index.ts examples/websocket.as --run                 # client contract (no server)
+node --test --test-name-pattern=websocket test/unit/*.ts      # shape pins + a real-server round trip
+```
+
+- `examples/websocket.as` is a **self-contained** client contract: defaults, the four argument errors,
+  the silent no-ops before connecting, the asynchronous `#2031` of a refused connect (host text and
+  "CLOSE is still dispatched"), `#2002` after the close, and the named `startServer` gap. **It
+  deliberately contains no on-wire round trip** -- that needs a server, and this subset's `ServerSocket`
+  only exists on POSIX targets (7.3, last item), so on Windows it would be skipped in exactly the build
+  that most needs it.
+- `websocket-roundtrip/` in `test/unit/websocket.ts` drives the same seam with Node's http server (real
+  SHA-1 accept, real masking, real fragments, real close code) and asserts: handshake -> TEXT -> BINARY
+  -> **fragment reassembly** -> the peer's close `4001` in `closeReason`, `data` being a ByteArray,
+  `stringData` `null` for BINARY, the subprotocol header value `chat.v1, chat.v2`, and the server's PING
+  being answered by the transport. The `websocket/` group pins the source shape (error texts, the props
+  table not tracing `_ws`, the framing belonging to the runtime, the `ASC_HAVE_CURL` wiring, `advapi32`).
+- **Server mode (`startServer`) is a named gap**: it has to complete `SHA-1(key + GUID)` -> base64
+  `Sec-WebSocket-Accept` on an accepted `Socket` and then reuse the same frame codec. That is the entry
+  in `TODO.md`'s outstanding table, not something that "happened not to be done".
+
+---
+
 ## 8. Boundaries Explicitly Not Done / Deferred
 
 | Item | Judgment |
@@ -1720,6 +1822,7 @@ Two things most easily got wrong:
 | `certificateError` with `preventDefault()` let-through | ⏸ deferred (no UI to carry certificate interaction); failure lands as `ioError` |
 | `URLRequestDefaults.setLoginCredentialsForHost` | ⏸ deferred (authentication scenario) |
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **done, see §7** (`SecureSocket` only to API surface + honest failure: TLS state machine unimplemented, `isSupported=false`) |
+| `air.net.WebSocket` | ✅ **done, see §7A** (client side; `startServer()` is a named gap, registered in `TODO.md`) |
 | `DatagramSocket` (UDP) | ⏸ deferred (a different base from TCP: connectionless, no `flush` semantics, `send()` carries the target address) |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*`/RTMP | ❌ not done (depends on FMS / audio-video, out of scope) |
 | `FileReference`/`FileReferenceList` (file upload/download dialogs) | ⏸ deferred (depends on native file dialogs) |

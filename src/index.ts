@@ -1233,7 +1233,64 @@ async function main(): Promise<void> {
     }
   }
 
-  // [WasmExport] declarations are auto-exported: append their C symbols (or alias
+  // ---- air.net.WebSocket: the vendored static libcurl's ws_* client ----
+  // Air's WebSocket needs no native extension here: curl 8.11.1 in vendor/curl is
+  // built with CURL_DISABLE_WEBSOCKETS=OFF, so the SAME archive that already serves
+  // http(s):// frames and unmasks RFC 6455 data. A program that names
+  // air.net.WebSocket therefore gets ASC_HAVE_CURL plus the curl tree injected,
+  // exactly as a URLRequest program would (docs/zh-cn/flash-net.md §4.6).
+  //
+  // wasm/wasi: no injection. The stub seam in src/runtime.ts fails connect() with
+  // AIR's own ioError #2031 asynchronously, which is loud and correct (a browser
+  // page can open a WebSocket, but not through this seam -- that is a browser
+  // transport, tracked separately, not a silent success).
+  {
+    const hasCurl = cfg.defines.some((d) => d === 'ASC_HAVE_CURL' || d.startsWith('ASC_HAVE_CURL='));
+    const wantsWs = cfg.target !== 'wasm' && !hasCurl && featureScanTexts.some((t) => t.includes('air.net.WebSocket'));
+    if (wantsWs) {
+      const vendorDir = resolve(dirname(fileURLToPath(import.meta.url)), '../vendor');
+      const curlDir = resolve(vendorDir, 'curl');
+      const hostKey = hostVendorKey('native', process.platform, process.arch, cfg.architecture);
+      const libDir = resolve(curlDir, 'lib', hostKey);
+      const incDir = resolve(curlDir, 'include');
+      const libFile = process.platform === 'win32' ? 'libcurl.lib' : 'libcurl.a';
+      if (!existsSync(resolve(libDir, libFile)) || !existsSync(incDir)) {
+        throw new Error(
+          `this program uses air.net.WebSocket but the vendored curl for ${hostKey} is not in vendor/curl ` +
+          `(missing: ${existsSync(incDir) ? `lib/${hostKey}/${libFile}` : 'include/'})\n` +
+          `  build it with:  vendor/provision/${process.platform === 'darwin' ? 'macos.sh --only curl' : 'windows.ps1 -Only curl'}\n` +
+          `  or supply your own: --manifest with defines ["ASC_HAVE_CURL"] + link-libs ["curl"]`
+        );
+      }
+      if (!cfg.includePaths.some((p) => resolve(p) === incDir)) cfg.includePaths.push(incDir);
+      if (!cfg.linkPaths.some((p) => resolve(p) === libDir)) cfg.linkPaths.push(libDir);
+      for (const l of ['curl', 'nghttp2', 'z']) if (!cfg.linkLibs.includes(l)) cfg.linkLibs.push(l);
+      if (process.platform === 'win32') {
+        // Schannel TLS (secur32 + the CryptoAPI hashes in crypt32), the Winsock
+        // stack its threaded resolver uses, and advapi32 -- CryptAcquireContext /
+        // CryptCreateHash / CryptHashData live there, not in crypt32, and curl's
+        // sha256.c reaches them through schannel. CURL_STATICLIB is what stops
+        // curl/curl.h from declaring the API __declspec(dllimport).
+        if (!cfg.defines.some((d) => d.startsWith('CURL_STATICLIB'))) cfg.defines.push('CURL_STATICLIB=1');
+        for (const l of ['crypt32', 'ws2_32', 'secur32', 'bcrypt', 'iphlpapi', 'advapi32']) {
+          if (!cfg.linkLibs.includes(l)) cfg.linkLibs.push(l);
+        }
+      } else if (process.platform === 'darwin') {
+        for (const f of ['Security', 'SystemConfiguration']) {
+          if (!cfg.frameworks.includes(f)) cfg.frameworks.push(f);
+        }
+      }
+      cfg.defines.push('ASC_HAVE_CURL');
+      console.log(`   + websocket: vendored curl linked (${hostKey}; handshake via curl, RFC 6455 framing in the runtime)`);
+    } else if (cfg.target === 'wasm' && featureScanTexts.some((t) => t.includes('air.net.WebSocket'))) {
+      console.log(
+        '   - websocket: this program uses air.net.WebSocket, but the wasm target has no WebSocket backend;\n' +
+        '     connect() will report ioError #2031 (docs/zh-cn/flash-net.md §4.6)'
+      );
+    }
+  }
+
+  // [WasmExport] declarations are auto-exported: append their C symbol names (or alias
   // wrapper names) to the link-time export list so they land in the .wasm export
   // table without the user spelling out long namespaced symbol names on the CLI.
   if (exports.length > 0) {

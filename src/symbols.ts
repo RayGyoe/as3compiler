@@ -824,6 +824,18 @@ export class SymbolTable {
         if (stmt.kind === 'ClassDecl') this.classPos.set(fqn(stmt.name, stmt.packageName), { line: stmt.line, col: stmt.col });
       }
     }
+    // A top-level SCRIPT has no per-file import context: buildImportAlias is built
+    // per class/interface, and a script's statements resolve through the global
+    // short-name table alone. flash.* built-ins survived that by accident (they are
+    // keyed by their SHORT name, so `import flash.net.Socket` + `var s:Socket` hit
+    // the 'Socket' key), but a package class keyed by its sanitized FQN does not:
+    // `import air.net.WebSocket` + `var w:WebSocket` failed with "unknown type
+    // 'WebSocket'" because the only key is `air_net_WebSocket`. Publish the script's
+    // imports into the same table, never overwriting an alias a user class of the
+    // same short name already claimed.
+    for (const [short, key] of buildImportAlias(program.imports ?? [], this.classMap, null)) {
+      if (!typeAlias.has(short)) typeAlias.set(short, key);
+    }
     // pass 0: register interfaces. Two loops on purpose: ALL interface names are
     // published before any interface's member types are resolved. AS3 allows a
     // same-package type to be referenced without an import, and resolveType only
@@ -3224,6 +3236,94 @@ export class SymbolTable {
       superClass: 'Socket',
       isFinal: false,
       implements: [],
+    });
+// air.net.WebSocket (AIR 51.0+): the RFC 6455 client. The transport is the
+    // vendored static libcurl (curl_ws_*), so an app needs no native extension --
+    // see the WebSocket seam in src/runtime.ts and docs/zh-cn/flash-net.md §4.6.
+    //
+    // The class key is the SANITIZED FQN, not the short name: air.* is not in the
+    // flash.* namespace, so resolveType() maps `air.net.WebSocket` to
+    // `air_net_WebSocket` both for an explicit `import air.net.WebSocket` and for
+    // `import air.net.*` (that path matches on fqn). The emitted C therefore uses
+    // air_net_WebSocket_* for every member.
+    //
+    // The API surface, the constants and the error ids below are measured on adl
+    // 51.4.1 (temp/wsapi/out-adl*.txt), not inferred from the documentation:
+    // startServer(socket) exists, close(code = 0), connect(url, protocols = null),
+    // sendMessage(format, data), protocol (read-write String), closeReason
+    // (read-only int, -1 until a peer close frame carries a code).
+    const wsM = (ret: CType, params: Param[]): MethodInfo => skm('air_net_WebSocket', ret, params);
+    this.classMap.set('air_net_WebSocket', {
+      fields: new Map(),
+      methods: new Map([
+        ['connect', wsM({ kind: 'void' }, [
+          { name: 'url', type: 'String', defaultValue: null, isRest: false },
+          { name: 'protocols', type: 'Vector.<String>', defaultValue: { kind: 'Null' }, isRest: false },
+        ])],
+        ['sendMessage', wsM({ kind: 'void' }, [
+          { name: 'format', type: 'uint', defaultValue: null, isRest: false },
+          { name: 'data', type: 'any', defaultValue: null, isRest: false },
+        ])],
+        ['close', wsM({ kind: 'void' }, [
+          { name: 'code', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
+        ])],
+        ['startServer', wsM({ kind: 'void' }, [
+          { name: 'socket', type: 'Socket', defaultValue: null, isRest: false },
+        ])],
+      ]),
+      // AS3's format constants are the WIRE opcodes for text/binary/close; ping
+      // and pong are 9/10 here but 16/64 inside curl (the seam maps them).
+      staticFields: new Map([
+        ['fmtTEXT', { type: { kind: 'uint' }, init: { kind: 'Num', value: 1, isInt: true }, visibility: 'public', owner: 'air_net_WebSocket', isStatic: true, isConst: true }],
+        ['fmtBINARY', { type: { kind: 'uint' }, init: { kind: 'Num', value: 2, isInt: true }, visibility: 'public', owner: 'air_net_WebSocket', isStatic: true, isConst: true }],
+        ['fmtCLOSE', { type: { kind: 'uint' }, init: { kind: 'Num', value: 8, isInt: true }, visibility: 'public', owner: 'air_net_WebSocket', isStatic: true, isConst: true }],
+        ['fmtPING', { type: { kind: 'uint' }, init: { kind: 'Num', value: 9, isInt: true }, visibility: 'public', owner: 'air_net_WebSocket', isStatic: true, isConst: true }],
+        ['fmtPONG', { type: { kind: 'uint' }, init: { kind: 'Num', value: 10, isInt: true }, visibility: 'public', owner: 'air_net_WebSocket', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['closeReason', skg('air_net_WebSocket', { kind: 'int' })],
+        ['protocol', skg('air_net_WebSocket', { kind: 'string' })],
+      ]),
+      setters: new Map([
+        ['protocol', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'String', defaultValue: null, isRest: false }], owner: 'air_net_WebSocket', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
+      ]),
+      constructor: { params: [] },
+      superClass: 'EventDispatcher',
+      isFinal: false,
+      implements: [],
+      fqn: 'air.net::WebSocket',
+    });
+    // flash.events.WebSocketEvent (AIR 51): the 'websocketData' payload. data is
+    // ALWAYS a ByteArray, even for fmtTEXT, and stringData is its decoded view --
+    // null for anything that is not a text message.
+    this.classMap.set('WebSocketEvent', {
+      fields: new Map([
+        ['_format', { type: { kind: 'uint' }, init: null, visibility: 'private', owner: 'WebSocketEvent', isStatic: false, isConst: false }],
+        ['_data', { type: { kind: 'object', className: 'ByteArray' }, init: null, visibility: 'private', owner: 'WebSocketEvent', isStatic: false, isConst: false }],
+      ]),
+      methods: new Map(),
+      staticFields: new Map([
+        ['DATA', { type: { kind: 'string' }, init: { kind: 'Str', value: 'websocketData' }, visibility: 'public', owner: 'WebSocketEvent', isStatic: true, isConst: true }],
+      ]),
+      staticMethods: new Map(),
+      getters: new Map([
+        ['data', { returnType: { kind: 'object', className: 'ByteArray' }, params: [], owner: 'WebSocketEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['format', { returnType: { kind: 'uint' }, params: [], owner: 'WebSocketEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['stringData', { returnType: { kind: 'string' }, params: [], owner: 'WebSocketEvent', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+      ]),
+      setters: new Map(),
+      // No parameter defaults: the reference requires all three, and adl's
+      // constructor declaration carries no optional marker.
+      constructor: { params: [
+        { name: 'type', type: 'String', defaultValue: null, isRest: false },
+        { name: 'format', type: 'uint', defaultValue: null, isRest: false },
+        { name: 'data', type: 'ByteArray', defaultValue: null, isRest: false },
+      ] },
+      superClass: 'Event',
+      isFinal: true,
+      implements: [],
+      fqn: 'flash.events::WebSocketEvent',
     });
     // XMLSocket: NUL-terminated messages over the same transport. `connected` and
     // `timeout` are its only state; everything else is connect/close/send.

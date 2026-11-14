@@ -1924,6 +1924,16 @@ export class Emitter {
       // documented error instead of quietly rebinding to a new port.
       if (cls === 'ServerSocket') out.push('int _closed;');
     }
+    if (cls === 'air_net_WebSocket') {
+      // air.net.WebSocket: `_ws` is a BORROWED handle to the connection owned by
+      // RUNTIME_PREAMBLE's WebSocket registry (see the WebSocket seam) and must
+      // never be a GC pointer; `_protocol` is the app-visible String snapshot
+      // (marked through the props table); `_closeReason` is what closeReason
+      // reports (-1 when the peer sent no code); `_closed` is what makes a
+      // post-mortem send/close throw AIR's #2002 instead of being the silent
+      // no-op a never-connected instance gets.
+      out.push('void* _ws;', 'void* _protocol;', 'int _closeReason;', 'int _closed;');
+    }
     return out;
   }
 
@@ -4419,6 +4429,11 @@ export class Emitter {
     // C-runtime-only `_arr` slot that the GC must trace even when the class
     // declares no AS3-visible field of its own (Set extends Sequence).
     if (info.arrayBacked) return true;
+    // air.net.WebSocket declares no AS3-visible field either (protocol/closeReason
+    // are accessors), yet its `protocol` String snapshot lives in a C-runtime-only
+    // slot that the GC must trace (emitPropTables adds it). Without this, a
+    // collection could free the string the class still hands out.
+    if (name === 'air_net_WebSocket') return true;
     for (const [fname, f] of info.fields) if (f.owner === name) return true;
     return false;
   }
@@ -4853,6 +4868,12 @@ export class Emitter {
       // entry of their own.
       if (name === 'StyleSheet') {
         this.line(`{ "_rules", 6, offsetof(StyleSheet, _rules), NULL, NULL, 1 },`);
+      }
+      // air.net.WebSocket's `_protocol` is the app-visible String snapshot (a tag-3
+      // char* slot); `_ws` is a BORROWED handle into the WebSocket registry and must
+      // never be traced as a GC pointer. Only the string is listed.
+      if (name === 'air_net_WebSocket') {
+        this.line(`{ "_protocol", 3, offsetof(air_net_WebSocket, _protocol), NULL, NULL, 1 },`);
       }
       // SharedObject's persisted table (a GC object) and its client callback
       // target live in C-runtime-only slots; type 6 makes gc_scan follow them.
@@ -18297,6 +18318,236 @@ this.line('AS_bake_pend_n = 0;');
     this.line('char* SecureSocket_get_serverCertificateStatus(void* _this) { (void)_this; return (char*)"unknown"; }');
     this.line('void SecureSocket_addBinaryChainBuildingCertificate(void* _this, ByteArray* certificate, bool trusted) { (void)_this; (void)certificate; (void)trusted; }');
     this.line('');
+    this.cblock(`// ---- air.net.WebSocket (AIR 51): RFC 6455 client over libcurl's ws_* ----
+//
+// The AS3 half of the seam in src/runtime.ts. Transport state, the worker thread
+// and the message queue live there; here one queued message becomes one event,
+// plus the synchronous contract adl 51.4.1 measured (temp/wsapi/out-adl*.txt):
+//
+//   connect(null)              TypeError #2007 "Parameter url must be non-null."
+//   connect("http://x")        ArgumentError #2147 "Forbidden protocol in URL http://x."
+//   connect() twice            Error #2082 "...already connected."
+//   sendMessage(fmtTEXT, 123)  ArgumentError #1508 "...argument data is invalid."
+//   send/close after the end   Error #2002 "Operation attempted on invalid socket."
+//   send/close before connect  silent no-op (measured, same source)
+//   events                     connect, websocketData (WebSocketEvent), close, ioError
+//   closeReason                int, -1 until a peer close frame carries a code
+static int air_net_WebSocket__live(air_net_WebSocket* o) {
+    as_ws* w = (as_ws*)o->_ws;
+    if (w == NULL) return 0;
+    int st = as_ws_state_of(w);
+    return st == AS_WS_CONNECTING || st == AS_WS_OPEN;
+}
+
+void air_net_WebSocket_ctor(air_net_WebSocket* o) {
+    EventDispatcher_ctor((EventDispatcher*)o, NULL);
+    o->_protocol = NULL;
+    o->_closeReason = -1;
+    o->_closed = 0;
+    o->_ws = (void*)as_ws_new((void*)o);
+}
+
+air_net_WebSocket* air_net_WebSocket_new(void) {
+    air_net_WebSocket* o = (air_net_WebSocket*)gc_alloc(GCT_CLASS, sizeof(air_net_WebSocket));
+    o->vtable = &air_net_WebSocket_vt;
+    air_net_WebSocket_ctor(o);
+    return o;
+}
+
+void air_net_WebSocket_connect(void* _this, char* url, as_vector_string* protocols) {
+    air_net_WebSocket* o = (air_net_WebSocket*)_this;
+    if (url == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter url must be non-null.", 2007)); return; }
+    if (air_net_WebSocket__live(o)) {
+        as_throw(Error_new((char*)"Error #2082: Connect failed because the object is already connected.", 2082));
+        return;
+    }
+    if (!(strncmp(url, "ws://", 5) == 0 || strncmp(url, "wss://", 6) == 0)) {
+        // AIR names the offending URL verbatim, and an EMPTY url reaches the same
+        // error ("Forbidden protocol in URL ."), so the empty case is not split out.
+        const char* parts[3];
+        parts[0] = "Error #2147: Forbidden protocol in URL ";
+        parts[1] = url;
+        parts[2] = ".";
+        as_throw(ArgumentError_new(as_str_concat_n(3, parts), 2147));
+        return;
+    }
+    // A connection is one-shot: the handle is released when its CLOSE event runs
+    // (see as_ws_dispatch), so a reconnect after that builds a fresh one.
+    if (o->_ws == NULL) o->_ws = (void*)as_ws_new((void*)o);
+    if (o->_ws == NULL) { o->_closed = 1; as_throw(Error_new((char*)"Error #2031: Socket Error.", 2031)); return; }
+    // Vector.<String> -> the header VALUE ("a, b"), which is exactly the wire form
+    // of Sec-WebSocket-Protocol. Empty entries are skipped instead of emitting a
+    // ", ," the server would have to guess at.
+    char* protos = NULL;
+    if (protocols != NULL && protocols->length > 0) {
+        size_t n = 1;
+        for (int i = 0; i < protocols->length; i++)
+            n += strlen(protocols->data[i] != NULL ? protocols->data[i] : "") + 2;
+        protos = (char*)malloc(n);
+        if (protos != NULL) {
+            protos[0] = '\\0';
+            for (int i = 0; i < protocols->length; i++) {
+                const char* one = protocols->data[i] != NULL ? protocols->data[i] : "";
+                if (one[0] == '\\0') continue;
+                if (protos[0] != '\\0') strcat(protos, ", ");
+                strcat(protos, one);
+            }
+        }
+    }
+    o->_closeReason = -1;
+    o->_closed = 0;
+    // A backend-less build fails here and queues the ioError: the app still sees
+    // AIR's asynchronous contract, and src/index.ts has already said on the console
+    // that this build cannot speak WebSocket.
+    as_ws_start((as_ws*)o->_ws, url, protos);
+    free(protos);
+}
+
+void air_net_WebSocket_sendMessage(void* _this, unsigned int format, as_value data) {
+    air_net_WebSocket* o = (air_net_WebSocket*)_this;
+    if (!air_net_WebSocket__live(o)) {
+        // After the connection is gone AIR throws #2002; before connect() the same
+        // call is a silent no-op (both measured).
+        if (o->_closed) as_throw(Error_new((char*)"Error #2002: Operation attempted on invalid socket.", 2002));
+        return;
+    }
+    if (format == 1 || format == 9 || format == 10) {
+        if (!as_v_is_string(data)) { as_throw(ArgumentError_new((char*)"Error #1508: The value specified for argument data is invalid.", 1508)); return; }
+        char* s = (char*)data.ptr;
+        if (s == NULL) s = (char*)"";
+        as_ws_send((as_ws*)o->_ws, (int)format, s, (int)strlen(s));
+        return;
+    }
+    if (format == 2) {
+        if (data.tag != 4 || !as_is(as_v_obj_val(data), &ByteArray_vt)) {
+            as_throw(ArgumentError_new((char*)"Error #1508: The value specified for argument data is invalid.", 1508));
+            return;
+        }
+        ByteArray* ba = (ByteArray*)as_v_obj_val(data);
+        as_ws_send((as_ws*)o->_ws, 2, ba->data, ba->length);
+        return;
+    }
+    // Any other format value is accepted and dropped: measured (fmt 999 -> no
+    // throw, nothing sent), and inventing an error there would reject code AIR runs.
+}
+
+void air_net_WebSocket_close(void* _this, unsigned int code) {
+    air_net_WebSocket* o = (air_net_WebSocket*)_this;
+    if (!air_net_WebSocket__live(o)) {
+        if (o->_closed) as_throw(Error_new((char*)"Error #2002: Operation attempted on invalid socket.", 2002));
+        return;
+    }
+    as_ws_shutdown((as_ws*)o->_ws, (int)code);
+}
+
+void air_net_WebSocket_startServer(void* _this, Socket* socket) {
+    (void)_this;
+    if (socket == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter socket must be non-null.", 2007)); return; }
+    // SERVER MODE IS NOT IMPLEMENTED. It is not a framing problem -- it needs the
+    // RFC 6455 opening handshake on an already-accepted flash.net.Socket (SHA-1 +
+    // base64 Sec-WebSocket-Accept over the client's key, then the same frame codec
+    // the client side already has). Reporting it beats pretending to listen on a
+    // socket that will never answer (§1.5); recorded in TODO.md's leftover table.
+    as_throw(Error_new((char*)"Error #2031: Socket Error. WebSocket server mode is not implemented by this runtime.", 2031));
+}
+
+int air_net_WebSocket_get_closeReason(void* _this) { return ((air_net_WebSocket*)_this)->_closeReason; }
+char* air_net_WebSocket_get_protocol(void* _this) { return ((air_net_WebSocket*)_this)->_protocol; }
+void air_net_WebSocket_set_protocol(void* _this, char* value) {
+    air_net_WebSocket* o = (air_net_WebSocket*)_this;
+    o->_protocol = value; gc_write_barrier((void*)value);
+    as_ws_set_protocol((as_ws*)o->_ws, value);
+}
+
+// The frame-boundary pump: one queued transport message -> one AS3 event. Runs on
+// the AS3 thread with as_ws_lock released for every dispatch (a listener may call
+// close()/connect(), which takes the same lock).
+int as_ws_dispatch(void) {
+    int total = 0;
+    int n = as_ws_total();
+    for (int i = 0; i < n; i++) {
+        as_ws* w = as_ws_at(i);
+        if (w == NULL || w->obj == NULL) continue;
+        air_net_WebSocket* o = (air_net_WebSocket*)w->obj;
+        for (;;) {
+            struct as_ws_msg* m = as_ws_take(w);
+            if (m == NULL) break;
+            int op = m->opcode;
+            if (op == AS_WS_MSG_OPEN) {
+                EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"connect", false, false));
+                total++;
+            } else if (op == 1 || op == 2) {
+                // AIR delivers the payload as a ByteArray in BOTH formats, and leaves
+                // its position at the END (measured: a 9-byte text message reports
+                // data pos=9) -- a listener that wants to read it rewinds first.
+                ByteArray* ba = ByteArray_new();
+                ba->data = (void*)gc_alloc(GCT_BYTES, (size_t)(m->len > 0 ? m->len : 1));
+                ba->capacity = m->len;
+                ba->length = m->len;
+                if (m->len > 0) memcpy(ba->data, m->data, (size_t)m->len);
+                gc_write_barrier((void*)ba->data);
+                ba->position = m->len;
+                EventDispatcher_dispatchEvent((void*)o, (Event*)WebSocketEvent_new((char*)"websocketData", (unsigned)op, ba));
+                total++;
+            } else {
+                // CLOSE is the terminal message of a connection in every case: peer
+                // close, app close, or a transport failure (which arrives as the
+                // same CLOSE with w->error set). One teardown path, so nothing can
+                // be left queued against a handle that no longer exists.
+                char* err = as_ws_error_of(w);
+                if (err != NULL) {
+                    EventDispatcher_dispatchEvent((void*)o, (Event*)IOErrorEvent_new((char*)"ioError", false, false, as_str_dup(err)));
+                    total++;
+                }
+                o->_closeReason = as_ws_close_code_of(w);
+                o->_closed = 1;
+                o->_ws = NULL;
+                as_ws_forget(w);
+                EventDispatcher_dispatchEvent((void*)o, (Event*)Event_new((char*)"close", false, false));
+                total++;
+                as_ws_msg_free(m);
+                break;
+            }
+            as_ws_msg_free(m);
+        }
+    }
+    as_ws_reap();
+    return total;
+}
+
+// ---- flash.events.WebSocketEvent (AIR 51) ----
+// data is ALWAYS a ByteArray (even for TEXT -- stringData is the decoded view),
+// and format is one of WebSocket's fmt* constants. The constructor takes all
+// three (no defaults, per the reference), and there is no setter for either.
+void WebSocketEvent_ctor(WebSocketEvent* o, char* type, unsigned int format, ByteArray* data) {
+    Event_ctor((Event*)o, type, false, false);
+    o->_format = format;
+    o->_data = data;
+    gc_write_barrier((void*)data);
+}
+
+WebSocketEvent* WebSocketEvent_new(char* type, unsigned int format, ByteArray* data) {
+    WebSocketEvent* o = (WebSocketEvent*)gc_alloc(GCT_CLASS, sizeof(WebSocketEvent));
+    o->vtable = &WebSocketEvent_vt;
+    WebSocketEvent_ctor(o, type, format, data);
+    return o;
+}
+
+ByteArray* WebSocketEvent_get_data(void* _this) { return ((WebSocketEvent*)_this)->_data; }
+unsigned int WebSocketEvent_get_format(void* _this) { return ((WebSocketEvent*)_this)->_format; }
+char* WebSocketEvent_get_stringData(void* _this) {
+    WebSocketEvent* o = (WebSocketEvent*)_this;
+    // null for anything that is not a TEXT message -- the reference is explicit,
+    // and a BINARY message must not be silently decoded as UTF-8.
+    if (o->_format != 1) return NULL;
+    if (o->_data == NULL) return (char*)"";
+    int n = o->_data->length;
+    if (n <= 0) return (char*)"";
+    char* s = as_str_alloc((size_t)n + 1);
+    memcpy(s, o->_data->data, (size_t)n);
+    s[n] = '\\0';
+    return s;
+}`);
     // ---- the AS3 side of the socket seam ----
     //
     // as_sock_dispatch() is the second half of the frame-boundary pump (the first
@@ -27497,6 +27748,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Context3D_submit is defined further down (it is the AGAL draw's sync point) and
     // the native draw deliberately shares it, so it needs a prototype here.
     this.line('void Context3D_submit(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances);');
+    // keepTextures=1 skips the AGAL t0..t7 rebind: the native channel binds its
+    // samplers by name (Context3DNative.bindTexture) and the AGAL table still
+    // holds whatever the last AGAL draw left there.
+    this.line('void Context3D_submit_ex(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances, int keepTextures);');
     this.line('void Context3DNative_drawTriangles(void* _this, NativeProgram3D* p, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles) {');
     this.indent++;
     this.line('Context3DNative* self = (Context3DNative*)_this;');
@@ -27523,10 +27778,18 @@ void FileStream_writeObject(void* _this, as_value v) {
     // draws. Calling as_s3d_draw directly skipped ALL of that -- the vertex streams
     // never existed, so s3d_draw returned on `numStreams == 0` without a word
     // (apps/shader-m30: the native draw was encoded and produced nothing). In native
-    // mode the constant/texture uploads are inert on the glue side (uniforms arrive
-    // through setUniform*, and vc/fc binding is suppressed), so sharing the function
-    // costs nothing and removes the chance of the two paths diverging again.
-    this.line('Context3D_submit(self->context, indexBuffer, numTriangles, 1);');
+    // mode the constant uploads are inert on the glue side (uniforms arrive through
+    // setUniform* and vc/fc binding is suppressed), so sharing costs nothing and
+    // removes the chance of the two paths diverging again. The ONE part that is not
+    // inert is the AGAL t0..t7 rebind -- see keepTextures on Context3D_submit_ex.
+    this.line('Context3D_submit_ex(self->context, indexBuffer, numTriangles, 1, 1);');
+    // The backend's live program is now the native HLSL pair, and s3d_compile is the
+    // only thing that changes that. Dropping the AGAL cache here is what makes the
+    // FIRST AGAL draw after the native sequence recompile (it reads the native
+    // `$Globals` block as vc[] otherwise: nyc-m36's sky dome and crowd came out as
+    // giant black slivers) and also what makes the SECOND recompile (a stale
+    // `o->gpuProgram` would otherwise let program B draw with program A's pipeline).
+    this.line('self->context->gpuProgram = NULL;');
     this.indent--;
     this.line('}');
     this.line('Texture* Context3DNative_createTexture(void* _this, int width, int height, char* format, bool renderable, bool mipmapped) {');
@@ -28379,7 +28642,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // drawTrianglesInstanced. Uploads bound streams/constants/textures, compiles
     // the Program3D (AGAL bytecode -> MSL -> MTLRenderPipelineState) on first
     // use, then submits one clear+draw+commit with the given instance count.
-    this.line('void Context3D_submit(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances) {');
+    this.line('void Context3D_submit_ex(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances, int keepTextures) {');
     this.indent++;
     this.line('if (o->gpu == NULL) { (void)numTriangles; (void)numInstances; (void)indexBuffer; return; }');
     // Upload vertex streams va0..va7 from the bound VertexBuffer3D. Starling
@@ -28444,6 +28707,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     // keeps bitmapData/gpu, so it is recognised by vtable FIRST and uploaded as
     // one MTLTextureTypeCube (the AGAL translator declares a matchingly typed
     // sampler -- `texturecube<float>` -- only when the bytecode says <cube>).
+    //
+    // keepTextures=1 (the native draw) skips this whole block: it would overwrite
+    // the samplers the native program just bound by name with the AGAL table's
+    // leftovers, and the stale texture carries the AGAL handle's mip flag. The
+    // first city frame that came through the native channel lost every textured
+    // mesh exactly here -- the ground's map was replaced by the sky dome's, whose
+    // chain flag is 0 while the native sampler asks for a mip filter, which is the
+    // dropped-draw path in s3d_draw (nyc-m36, 2026-11-14).
+    this.line('if (!keepTextures) {');
+    this.indent++;
     for (let i = 0; i < 8; i++) {
       this.line(`if (o->tex${i} != NULL) {`);
       this.indent++;
@@ -28466,6 +28739,8 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.indent--;
       this.line('}');
     }
+    this.indent--;
+    this.line('}');
     // Propagate blend factors to the GPU context BEFORE the lazy pipeline
     // compile below — Metal bakes the blend state into MTLRenderPipelineState,
     // so the factors set via setBlendFactors must be visible when s3d_compile
@@ -28478,7 +28753,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // The cache key is the Program3D pointer PLUS its upload serial: re-uploading
     // new bytecode into a program that has already drawn must recompile, the way
     // AIR does, instead of silently reusing the previous pair's shaders.
-    this.line('if (o->program != NULL && (o->program != o->gpuProgram || o->programGpuSerial != o->program->uploadSerial)) {');
+    this.line('if (!keepTextures && o->program != NULL && (o->program != o->gpuProgram || o->programGpuSerial != o->program->uploadSerial)) {');
     this.indent++;
     this.line('ByteArray* vp = o->program->vertexProgram;');
     this.line('ByteArray* fp = o->program->fragmentProgram;');
@@ -28496,6 +28771,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('as_s3d_set_instance_count(o->gpu, numInstances);');
     this.line('as_s3d_draw(o->gpu, numTriangles);');
+    this.indent--;
+    this.line('}');
+    this.line('void Context3D_submit(Context3D* o, IndexBuffer3D* indexBuffer, int numTriangles, int numInstances) {');
+    this.indent++;
+    this.line('Context3D_submit_ex(o, indexBuffer, numTriangles, numInstances, 0);');
     this.indent--;
     this.line('}');
     this.line('void Context3D_drawTriangles(void* _this, IndexBuffer3D* indexBuffer, int firstIndex, int numTriangles) {');
