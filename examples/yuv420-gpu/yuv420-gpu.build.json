@@ -37,6 +37,8 @@
     "icu",
     "zlib",
     "d3d12",
+    "d3dcompiler",
+    "d3d12",
     "dxgi",
     "d3dcompiler",
     "d3d12allocator",
