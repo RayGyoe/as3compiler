@@ -75,7 +75,12 @@ function onRefused(e:IOErrorEvent):void { refusedEvent = e.text; refusedID = e.e
 refused.addEventListener(IOErrorEvent.IO_ERROR, onRefused);
 refused.connect("127.0.0.1", 1);
 check(refusedEvent == "", "a refused connect dispatches no event synchronously");
-for (var r:int = 0; r < 200 && refusedEvent == ""; r++) { tickFrame(); }
+// tickTimers(), not tickFrame(): the refusal is delivered by the event loop, and
+// tickFrame() never blocks, so a frame-count loop finishes in microseconds. The
+// RST itself is not instant either -- measured ~2 s on a Windows box whose
+// filtering stack delays it (immediate on POSIX loopback) -- so the bound has to
+// be wall-clock time, and tickTimers() is the hook that waits for async work.
+for (var r:int = 0; r < 40 && refusedEvent == ""; r++) { tickTimers(); }
 check(refusedID == 2031, "a refused connect reports ioError errorID 2031 (got " + refusedID + ")");
 check(refusedEvent.indexOf("127.0.0.1") >= 0, "the ioError text names the host it could not reach");
 check(!refused.connected, "a refused connect leaves the socket disconnected");

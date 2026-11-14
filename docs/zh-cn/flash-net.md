@@ -1535,7 +1535,7 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
 | `connect(url:String, protocols:Vector.<String> = null)` | ✅ `ws://` / `wss://`；`protocols` 逐项拼成**一个** `Sec-WebSocket-Protocol` 头值（`"a, b"`，空项跳过） |
 | `sendMessage(format:uint, data:*)` | ✅ `fmtTEXT`/`fmtPING`/`fmtPONG` 要 `String`，`fmtBINARY` 要 `ByteArray`；未知 format **静默丢弃**（实测） |
 | `close(code:uint = 0)` | ✅ 发 close 帧（`code` 落在 2 字节 payload），等对端回 close 后派 `Event.CLOSE` |
-| `startServer(socket:Socket)` | ⚠️ **未实现**，抛 `#2031 "… WebSocket server mode is not implemented by this runtime."`（服务端需要自己算 `Sec-WebSocket-Accept`，见 §7A.4） |
+| `startServer(socket:Socket)` | ✅ 接管**已接受**的 `flash.net.Socket`（AIR 的用法：`ServerSocketConnectEvent.socket`），自己读客户端握手、回 `101`、`SHA-1(key + GUID)` → base64 的 `Sec-WebSocket-Accept`，之后复用同一套帧编解码（服务端帧不掩码）。`null` 抛 `#2007`，其余形态**静默接受**，见 §7A.5 |
 | `protocol`（读写） | ✅ 保留**应用设定值**；libcurl 不回报服务端选中的子协议，实测 adl 在服务端不选时也返回应用设定的值/`null` |
 | `closeReason`（只读） | ✅ 对端 close 帧的状态码，对端未带码时为 `-1` |
 | `fmtTEXT=1` / `fmtBINARY=2` / `fmtCLOSE=8` / `fmtPING=9` / `fmtPONG=10` | ✅ 静态常量（值即线上 opcode） |
@@ -1571,6 +1571,12 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
   `air_net_WebSocket`，`import air.net.WebSocket` 经 `buildImportAlias` 解析；顶层脚本没有
   逐文件 import 上下文，故 `program.imports` 也写进全局短名表（否则 `var w:WebSocket` 报
   `unknown type 'WebSocket'`）。
+- **服务端模式换的是「谁是字节的读者」，不是「谁是连接的主人」**：`Socket` 的数据面归
+  `as_sock` 注册表的 poll 循环，WebSocket 的数据面归 worker 线程，两条路不能各读一半。
+  所以 `startServer()` 先 `as_sock_detach()`——把已接受的 fd 从 socket 注册表**摘走**并在
+  `Socket` 上留下 `_sock = NULL`（此后这个 `Socket` 不再参与 poll、也不会派 `progress`/`close`），
+  再交给 worker。worker 侧不需要 curl：对端是**拨进来**的，没有握手要做、没有 TLS 要维护，
+  `as_ws_wire` 的两个载体（client = `CURL*`，server = 裸 fd）因此共用一个帧编解码器。
 - **`_ws` 是借来的句柄**（与 `Socket._sock` 同构）：属性表只 trace `_protocol`，不 trace `_ws`；
   `as_ws_mark_roots()` 把 `obj`（AS3 对象）注册为**永久根**，所以应用忘了引用也照样收事件。
 
@@ -1586,7 +1592,7 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
 | 连接前 `sendMessage`/`close` | **静默无操作**（不抛） |
 | 连接失败（拒绝/非 101/证书失败） | **异步** `ioError`：`errorID=2031`、`text="Error #2031: Socket Error. URL: <host>"`（只有 host，无 scheme/端口）；随后**仍派 `Event.CLOSE`** |
 | 失败或已关闭后再 `sendMessage`/`close` | `Error #2002 "Error #2002: Operation attempted on invalid socket."` |
-| `startServer(socket)` | `#2031`（服务端模式未实现，文案见 §7A.1） |
+| `startServer(socket)` | 只有 `null` 抛 `TypeError #2007`；未连接/已被拒绝/已在服务的 `Socket` **静默接受**（不抛也不派事件）；见 §7A.5 |
 | 后端缺失（wasm / 无 curl 构建） | `connect()` **不会静默**：同样异步 `ioError #2031`；CLI 在构建期印一行 `websocket: no transport` 之类的说明 |
 
 ### 7A.4 验收
@@ -1597,17 +1603,52 @@ node --test --test-name-pattern='websocket' test/unit/*.ts   # 形状钉 + 真�
 ```
 
 - `examples/websocket.as` 是**自包含**的客户端契约：默认值、四个参数错误、连接前的静默无操作、
-  拒绝连接的异步 `#2031`（含 host 文案与「仍派 CLOSE」）、关闭后的 `#2002`、`startServer` 的
-  具名缺口。**它刻意不含线上回环**——那需要一个服务器，而本子集的 `ServerSocket` 只在 POSIX
-  目标可用（§7.3 末条），Windows 上会在最需要验证的构建里跳过。
+  拒绝连接的异步 `#2031`（含 host 文案与「仍派 CLOSE」）、关闭后的 `#2002`、以及 `startServer`
+  的**参数**契约（`null` 抛 `#2007`、未连接/被拒绝/重复调用静默接受且不派事件）。**它刻意不含
+  线上回环**——那需要一个对端，而 `ServerSocket` 只在 POSIX 目标可用（§7.3 末条），Windows
+  上会在最需要验证的构建里跳过。
 - `test/unit/websocket.ts` 的 `websocket-roundtrip/` 用 Node 的 http 服务器（真 SHA-1 accept、
   真掩码、真分片、真 close 码）驱动同一套 seam，断言：握手 → TEXT → BINARY → **分片重组** →
   对端 close `4001` 进 `closeReason`、`data` 是 ByteArray 且 BINARY 的 `stringData` 为 `null`、
   子协议头值 `chat.v1, chat.v2`、服务端 PING 被传输层 PONG 回。`websocket/` 组则钉住源码形状
   （错误文案、props 表不 trace `_ws`、分帧是运行时自己的、`ASC_HAVE_CURL` 挂载、`advapi32`）。
-- **服务端模式（`startServer`）是具名缺口**：它要在已接受的 `Socket` 上自行完成
-  `SHA-1(key + GUID)` → base64 的 `Sec-WebSocket-Accept` 握手，再复用同一套帧编解码。
-  这就是 `TODO.md` 遗留表里的那一条，不是「碰巧没做」。
+- **服务端模式的回环在 `websocket-roundtrip/` 的第二条用例里**：角色反转——编译出来的
+  AS3 程序当**服务端**（`ServerSocket` → accept → `startServer`），Node 这一侧手写 RFC 6455
+  当**客户端**。断言覆盖服务端视角的全套：`101` + 正确的 `Sec-WebSocket-Accept`、**不回**
+  子协议（AIR 实测如此，即使客户端提了）、掩码入帧被解掩码、分片重组、BINARY 回显、PING 由
+  传输层 PONG、对端 close 码进 `closeReason`，以及 §7A.5 那几条「服务端不派 `CONNECT`」。
+
+### 7A.5 服务端模式（`startServer`）
+
+AIR 的用法是**两步**：`ServerSocket` 自己 accept，应用在 `ServerSocketConnectEvent` 里把
+`event.socket` 交给 `startServer()`。所以服务端不是「监听 + 升级」，而是「**接管一条已经
+established 的 TCP 连接，从它上面读 HTTP 升级请求**」。实测（`adl 51.4.1`，探针 `temp/wssrv/`）
+的口径逐条如下：
+
+| 项 | AIR 实测 | 本运行时 |
+|---|---|---|
+| `startServer(null)` | 同步 `TypeError #2007 "Parameter socket must be non-null."` | ✅ 同 |
+| `Socket` 未连接 / 已被拒绝连接 | **静默接受**：不抛、不派事件 | ✅ 同（worker 起来后发现没有 fd 就安静结束） |
+| 对同一条连接重复 `startServer()` | 静默接受 | ✅ 同（fd 已被摘走，第二次拿不到句柄） |
+| 客户端握手 | 服务端完成 RFC 6455 升级 | ✅ 读请求头、校验 `Upgrade: websocket`，回 `101` |
+| 响应头 | `101 Switching Protocols` + `Upgrade` + `Connection` + `Sec-WebSocket-Accept` **四行** | ✅ 逐行同 |
+| `Sec-WebSocket-Protocol` | **不回显**（即使客户端提了） | ✅ 不回显（`protocol` 保留应用设定值） |
+| `Event.CONNECT` | **不派**——服务端第一条事件就是 `DATA` | ✅ 不派（`as_ws_push_locked(AS_WS_MSG_OPEN)` 仅客户端） |
+| `DATA.data` 的 `position` | **0**（客户端模式是末尾） | ✅ 按方向分叉 |
+| 入帧掩码 | 客户端帧必须掩码，服务端解掩码 | ✅ 解掩码（含控制帧：close 码与 PONG 载荷取的是**解掩码后**的字节） |
+| 出帧掩码 | 服务端**不掩码** | ✅ 由 `as_ws_wire.server` 决定，不是由调用点决定 |
+| 分片 | 一个消息一次 `DATA` | ✅ 同一套 `as_ws_parse_frames` |
+| `PING` | 传输层自动 `PONG` | ✅ 应用看不到 PING |
+| `close(1001)` | 发出 close 码并派 `Event.CLOSE`，但 `closeReason` 仍是 **`-1`** | ✅ 同（`closeReason` 只由**对端**的 close 帧填） |
+
+**一处如实报明的差异**：fd 摘走之后，那个 `Socket` 的 `connected` 会一直是 `true`——包括
+WebSocket 已经关掉之后。这是「两个主人」的必然结果（worker 拿不到那个 AS3 对象的引用），而 AIR 在
+这一点的行为没有实测口径（探针只量到握手期与连接期都是 `true`）。`Socket.close()` 在摘走之后是
+惰性的：关不动 wire（worker 持有 fd），也不会派事件。要么按 AIR 补测再对齐，要么在文档里保持这一句。
+
+**为什么服务端也要 worker 线程**：握手本身是一次阻塞读（对端可能迟迟不把请求头发完），
+而 `Socket` 的 poll 循环在 AS3 帧边界上跑——在那里等一个字节就是把整个应用冻住。摘掉 fd 之后
+`as_sock` 不再看它，worker 独占它，与客户端模式共用「只往队列里放消息、帧边界才变事件」的契约。
 
 ---
 
@@ -1619,7 +1660,7 @@ node --test --test-name-pattern='websocket' test/unit/*.ts   # 形状钉 + 真�
 | `certificateError` 可 `preventDefault()` 放行 | ⏸ 延后（无 UI 承载证书交互），失败落 `ioError` |
 | `URLRequestDefaults.setLoginCredentialsForHost` | ⏸ 延后（认证场景） |
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **已做，见 §7**（`SecureSocket` 只到 API 面 + 诚实失败：TLS 状态机未实现，`isSupported=false`） |
-| `air.net.WebSocket` | ✅ **已做，见 §7A**（客户端；`startServer()` 是具名缺口，登记在 `TODO.md` 遗留表） |
+| `air.net.WebSocket` | ✅ **已做，见 §7A**（客户端 + `startServer()` 服务端） |
 | `DatagramSocket`（UDP） | ⏸ 延后（与 TCP 底座不同：无连接、无 `flush` 语义、`send()` 自带目标地址） |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*`/RTMP | ❌ 不做（依赖 FMS / 音视频，超出范围） |
 | `FileReference`/`FileReferenceList`（文件上传/下载对话框） | ⏸ 延后（依赖原生文件对话框） |

@@ -633,16 +633,20 @@ function checkBackendParity(): string[] {
 
   // ---- socket fd seam ----
   const preamble = readNorm(join(root, 'src', 'runtime.ts'));
-  check('as_sock_close_fd has a real POSIX body and an inert non-POSIX stub',
-    preamble.includes('static inline void as_sock_close_fd(int fd) { if (fd >= 0) close(fd); }') &&
+  // NOTE: the guard is ASC_SOCK_NATIVE (not POSIX) since Windows joined the seam: the
+  // real body is now as_sock_close_handle, which is close() on POSIX and closesocket()
+  // on Winsock. The pin's intent is unchanged -- a real body for the targets that have
+  // sockets, an inert stub for the ones that do not.
+  check('as_sock_close_fd has a real body and an inert no-backend stub',
+    preamble.includes('static inline void as_sock_close_fd(int fd) { as_sock_close_handle(fd); }') &&
     preamble.includes('static inline void as_sock_close_fd(int fd) { (void)fd; }'));
   // 裸 close(s->fd) 一旦回来，WASI/Windows 就会重新编译失败。
   check('no unguarded close(s->fd) survives in the socket state machine',
     !/close\(s->fd\)/.test(preamble));
   // struct sockaddr_storage 由 sys/socket.h 提供；定义必须整体待在 POSIX 守卫内，
   // 否则其参数类型在 WASI 上是不完整类型（-Wvisibility）。
-  check('as_sock_fill_addr lives entirely inside the ASC_SOCK_POSIX guard',
-    /#ifdef ASC_SOCK_POSIX\nstatic void as_sock_fill_addr[\s\S]*?\n}\n#endif/.test(preamble));
+  check('as_sock_fill_addr lives entirely inside the socket-platform guard',
+    /#ifdef ASC_SOCK_NATIVE\nstatic void as_sock_fill_addr[\s\S]*?\n}\n#endif/.test(preamble));
 
   // ---- GPU-window seam: BOTH backend files must implement the neutral five ----
   // 生成的 C 在 ASC_RENDER_WINGPU 下无条件引用 sk_gpu_begin_frame / sk_gpu_flush

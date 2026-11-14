@@ -24,8 +24,10 @@
 //   5. Once a connection is gone (or was never made and failed), send and close
 //      throw Error #2002 — the same "operation on an invalid socket" rule
 //      flash.net.Socket follows.
-//   6. Server mode is a NAMED gap, not a silent stall: startServer() reports
-//      itself instead of pretending to accept.
+//   6. Server mode's ARGUMENT contract: null is #2007, a CLOSED Socket is #2002,
+//      and a Socket that was never connected is accepted silently and then does
+//      nothing at all (all three measured on AIR 51.4.1, temp/wssrv). The live
+//      server round trip needs a peer and is pinned in test/unit/websocket.ts.
 
 import air.net.WebSocket;
 import flash.events.Event;
@@ -98,10 +100,31 @@ check(errorIdOf(function():void { dead.sendMessage(WebSocket.fmtTEXT, "x"); }) =
 check(errorIdOf(function():void { dead.close(); }) == 2002, "close() after a failed connect is Error #2002");
 
 // ---------------------------------------------------------------------------
-// 3. Server mode is a named gap
+// 3. Server mode's argument contract (measured on AIR 51.4.1)
 // ---------------------------------------------------------------------------
+// A Socket that was never connected is ACCEPTED and then never does anything:
+// AIR throws nothing, dispatches nothing, and the WebSocket stays idle. Refusing
+// here would reject code AIR runs, so this asserts the silence.
 var modeW:WebSocket = new WebSocket();
 var plain:Socket = new Socket();
-check(errorIdOf(function():void { modeW.startServer(plain); }) == 2031, "startServer() reports the unimplemented server mode");
+var modeEvents:int = 0;
+modeW.addEventListener(Event.CONNECT, function(e:Event):void { modeEvents++; });
+modeW.addEventListener(Event.CLOSE, function(e:Event):void { modeEvents++; });
+modeW.addEventListener(IOErrorEvent.IO_ERROR, function(e:IOErrorEvent):void { modeEvents++; });
+check(errorIdOf(function():void { modeW.startServer(plain); }) == 0,
+      "startServer() on a Socket that is not connected throws nothing");
+for (var j:int = 0; j < 20; j++) tickTimers();
+check(modeEvents == 0, "an unconnected startServer() dispatches no event");
+check(errorIdOf(function():void { modeW.sendMessage(WebSocket.fmtTEXT, "x"); }) == 0,
+      "sendMessage() after that startServer() is still a no-op");
+
+// Everything else is silent too: a Socket whose connect() was refused, and a
+// second startServer() on an already-serving WebSocket (both measured).
+var refused:Socket = new Socket();
+refused.connect("127.0.0.1", 1);
+check(errorIdOf(function():void { new WebSocket().startServer(refused); }) == 0,
+      "startServer() on a Socket whose connect() is still pending throws nothing");
+check(errorIdOf(function():void { modeW.startServer(plain); }) == 0,
+      "a second startServer() on the same WebSocket throws nothing");
 
 trace("websocket: all assertions passed");

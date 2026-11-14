@@ -112,6 +112,13 @@ export const RUNTIME_PREAMBLE = `// MSVC marks the classic CRT calls this runtim
 // GDI section; the generated C never calls a GDI entry point (all GPU/D3D work
 // lives in the separate d3d_glue.cc translation unit), so it loses nothing.
 #define NOGDI
+// <winsock2.h> MUST precede <windows.h>: windows.h pulls in the legacy
+// <winsock.h>, and the two declare conflicting winsock types (fd_set,
+// sockaddr_in, ...), which is a hard error rather than a warning. ws2tcpip.h is
+// the home of getaddrinfo/freeaddrinfo/inet_ntop, and it also has to be ordered
+// this way. Both are needed by the flash.net socket seam (ASC_SOCK_WIN below).
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <psapi.h>
 // <io.h> is the UCRT/MinGW home of the low-level file API. FileStream.truncate
@@ -14636,12 +14643,25 @@ static void as_job_release(as_job* j) {
 // measured from adl, not guessed: temp/air-probe/Probe11.as and
 // air-probe11-result.txt; see docs/zh-cn/flash-net.md §7.
 //
-// Targets: POSIX native has sockets. WASI preview 1 has none, Emscripten's
-// browser target cannot open raw TCP, and Windows has no path here yet, so those
-// get a seam that always fails with "unsupported" — the AS3 side then reports
-// the documented ioError instead of silently doing nothing.
-
-#if !defined(__wasi__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32)
+// Targets: POSIX native and Windows both have sockets. WASI preview 1 and
+// Emscripten's browser target have none, so those get a seam that always fails
+// with "unsupported" — the AS3 side then reports the documented ioError instead
+// of silently doing nothing.
+//
+// Windows is the same state machine on Winsock2. Everything platform-specific is
+// folded into the small shim below (descriptor type, non-blocking switch, error
+// accessor, poll), so the state machine, the buffers and the event order have
+// exactly ONE copy. Two details are not cosmetic:
+//   * <winsock2.h> is included back at the top of the preamble, BEFORE
+//     <windows.h>; include order is load-bearing there, and <windows.h> alone
+//     would drag in the old winsock.h and collide with it.
+//   * a connect in progress is reported as WSAEWOULDBLOCK on Winsock (there is no
+//     EINPROGRESS for a non-blocking connect), so the "would block" and
+//     "in progress" tests share one constant per platform.
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#define ASC_SOCK_NATIVE 1
+#define ASC_SOCK_WIN 1
+#elif !defined(__wasi__) && !defined(__EMSCRIPTEN__)
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -14651,7 +14671,64 @@ static void as_job_release(as_job* j) {
 #include <fcntl.h>
 #include <errno.h>
 #include <unistd.h>
+#define ASC_SOCK_NATIVE 1
 #define ASC_SOCK_POSIX 1
+#endif
+
+#ifdef ASC_SOCK_NATIVE
+#ifdef ASC_SOCK_WIN
+// socklen_t does not exist in the MSVC headers; every call site below binds it
+// through this alias instead of testing the platform at each one.
+typedef int as_socklen_t;
+typedef SOCKET as_sock_fd_t;
+typedef WSAPOLLFD as_sock_pollfd;
+// WSAPoll's input events are POLLRDNORM/POLLOUT; POLLIN is defined as POLLRDNORM
+// there and POLLERR/POLLHUP exist too, but they are OUTPUT-only in Winsock, which
+// is exactly how they are used below.
+#define AS_SOCK_POLL_IN  POLLRDNORM
+#define AS_SOCK_POLL_OUT POLLWRNORM
+#define AS_SOCK_POLL_ERR POLLERR
+#define AS_SOCK_POLL_HUP POLLHUP
+// Winsock reports these as WSA* codes, and its E* names in <errno.h> are a
+// DIFFERENT numbering (EWOULDBLOCK is 140 there, WSAEWOULDBLOCK is 10035).
+#define AS_SOCK_WOULD_BLOCK WSAEWOULDBLOCK
+#define AS_SOCK_IN_PROGRESS WSAEWOULDBLOCK
+#define AS_SOCK_INTR        WSAEINTR
+static int as_sock_last_error(void) { return WSAGetLastError(); }
+// WSAStartup once per process, before the first socket call. Winsock has no
+// equivalent of "sockets just work"; every entry point goes through here.
+static int as_sock_wsa_init(void) {
+    static int ready = 0;
+    if (ready) return 1;
+    WSADATA d;
+    if (WSAStartup(MAKEWORD(2, 2), &d) != 0) return 0;
+    ready = 1;
+    return 1;
+}
+static int as_sock_set_nonblock(int fd) { u_long on = 1; return ioctlsocket(fd, FIONBIO, &on) == 0 ? 0 : -1; }
+static void as_sock_close_handle(int fd) { if (fd >= 0) closesocket(fd); }
+static int as_sock_poll(as_sock_pollfd* f, int n, int ms) { return (int)WSAPoll(f, (ULONG)n, ms); }
+#else
+typedef socklen_t as_socklen_t;
+typedef int as_sock_fd_t;
+typedef struct pollfd as_sock_pollfd;
+#define AS_SOCK_POLL_IN  POLLIN
+#define AS_SOCK_POLL_OUT POLLOUT
+#define AS_SOCK_POLL_ERR POLLERR
+#define AS_SOCK_POLL_HUP POLLHUP
+#define AS_SOCK_WOULD_BLOCK EWOULDBLOCK
+#define AS_SOCK_IN_PROGRESS EINPROGRESS
+#define AS_SOCK_INTR        EINTR
+static int as_sock_last_error(void) { return errno; }
+static int as_sock_wsa_init(void) { return 1; }
+static int as_sock_set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+static void as_sock_close_handle(int fd) { if (fd >= 0) close(fd); }
+static int as_sock_poll(as_sock_pollfd* f, int n, int ms) { return poll(f, (nfds_t)n, ms); }
+#endif
 #endif
 
 // ---- flash.net.NetworkInfo.findInterfaces: the OS interface inventory ----
@@ -14874,13 +14951,14 @@ static int as_net_scan(as_net_row* out, int cap) {
 // Closing a raw descriptor is the ONE socket operation the platform-neutral part
 // of the state machine still needs: as_sock_drop_fd/as_sock_free run on every
 // target, including the ones with no backend, where fd is always -1. Wrapping it
-// here keeps <unistd.h> out of the non-POSIX builds — WASI and Windows have no
-// close() in scope there (WASI has it only under wasi-libc's unistd.h, which this
-// seam deliberately does not include), and an undeclared close() is a hard error
-// in C99+ even though the guarded call can never run. The POSIX build keeps the
-// real close(); every other target gets an inert stub.
-#ifdef ASC_SOCK_POSIX
-static inline void as_sock_close_fd(int fd) { if (fd >= 0) close(fd); }
+// here keeps <unistd.h> out of the non-socket builds — WASI has close() only
+// under wasi-libc's unistd.h, which this seam deliberately does not include, and
+// an undeclared identifier is a hard error in C99+ even though the guarded call
+// can never run. Native builds go through as_sock_close_handle(), which is
+// close() on POSIX and closesocket() on Winsock; every other target gets an
+// inert stub.
+#ifdef ASC_SOCK_NATIVE
+static inline void as_sock_close_fd(int fd) { as_sock_close_handle(fd); }
 #else
 static inline void as_sock_close_fd(int fd) { (void)fd; }
 #endif
@@ -14958,7 +15036,7 @@ static as_sock* as_sock_new(int is_server) {
     s->state = AS_SOCK_IDLE;
     s->is_server = is_server;
     s->timeout_ms = 20000;
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     s->unsupported = 0;
 #else
     s->unsupported = 1;
@@ -14974,6 +15052,37 @@ static void as_sock_drop_fd(as_sock* s) {
     s->fd = -1;
     s->state = AS_SOCK_IDLE;
     s->listening = 0;               // a dropped fd is not accepting connections
+}
+
+// Hand a CONNECTED descriptor to a second owner -- air.net.WebSocket's
+// startServer() is the only caller. The WebSocket worker owns the connection from
+// then on, but the AS3 Socket must keep reporting connected == true: measured on
+// AIR 51.4.1, an accepted Socket still answers true during and after the
+// server-mode handshake. fd = -1 is exactly what the pump skips (every loop there
+// tests fd < 0) and what makes the Socket's own read()/write()/close() inert
+// instead of racing the worker for the wire. Bytes the app already buffered are
+// handed over too: they can only be the start of the client's opening handshake.
+static int as_sock_detach(as_sock* s, unsigned char** pre, int* pre_len) {
+    if (pre != NULL) *pre = NULL;
+    if (pre_len != NULL) *pre_len = 0;
+    if (s == NULL || s->fd < 0) return -1;
+    int fd = s->fd;
+    if (pre != NULL && s->rlen > s->rpos) {
+        int n = s->rlen - s->rpos;
+        unsigned char* copy = (unsigned char*)malloc((size_t)n);
+        if (copy != NULL) {
+            memcpy(copy, s->rbuf + s->rpos, (size_t)n);
+            *pre = copy;
+            if (pre_len != NULL) *pre_len = n;
+        }
+    }
+    s->rlen = 0;
+    s->rpos = 0;
+    s->wlen = 0;
+    s->wpos = 0;                    // nothing queued can belong to a valid handshake
+    s->fd = -1;
+    s->events = 0;
+    return fd;
 }
 
 // close(): AIR dispatches no close event for this (only the peer's close does),
@@ -15037,29 +15146,32 @@ static int as_sock_local_port(as_sock* s) { return s->local_port; }
 static const char* as_sock_remote_addr(as_sock* s) { return s->remote_addr[0] != 0 ? s->remote_addr : NULL; }
 static int as_sock_remote_port(as_sock* s) { return s->remote_port; }
 static void as_sock_set_no_delay(as_sock* s, int on) {
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     if (s == NULL || s->fd < 0) return;
     int v = on ? 1 : 0;
-    setsockopt(s->fd, IPPROTO_TCP, TCP_NODELAY, &v, sizeof(v));
+    // The optval pointer is const char* in Winsock and const void* in POSIX;
+    // the char* form is accepted by both, and the cast is what keeps the call
+    // site platform-free.
+    setsockopt(s->fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&v, (as_socklen_t)sizeof(v));
 #endif
 }
 
 // Format a sockaddr into the text AIR reports (localAddress/remoteAddress).
-// POSIX-only: its parameter type struct sockaddr_storage is declared by the
-// sys/socket.h include above, so the whole function (callers included) lives
-// inside the guard — otherwise its prototype names an incomplete struct on
-// WASI/Windows and clang warns [-Wvisibility].
-#ifdef ASC_SOCK_POSIX
+// Only native builds have it: struct sockaddr_storage comes from the socket
+// headers above, so the whole function (callers included) lives inside the
+// guard — otherwise its prototype names an incomplete struct on WASI and clang
+// warns [-Wvisibility].
+#ifdef ASC_SOCK_NATIVE
 static void as_sock_fill_addr(const struct sockaddr_storage* ss, char* out, size_t cap, int* port) {
     out[0] = 0;
     if (port != NULL) *port = 0;
     if (ss->ss_family == AF_INET) {
         const struct sockaddr_in* v4 = (const struct sockaddr_in*)ss;
-        inet_ntop(AF_INET, &v4->sin_addr, out, (socklen_t)cap);
+        inet_ntop(AF_INET, (const void*)&v4->sin_addr, out, (as_socklen_t)cap);
         if (port != NULL) *port = (int)ntohs(v4->sin_port);
     } else if (ss->ss_family == AF_INET6) {
         const struct sockaddr_in6* v6 = (const struct sockaddr_in6*)ss;
-        inet_ntop(AF_INET6, &v6->sin6_addr, out, (socklen_t)cap);
+        inet_ntop(AF_INET6, (const void*)&v6->sin6_addr, out, (as_socklen_t)cap);
         if (port != NULL) *port = (int)ntohs(v6->sin6_port);
     }
 }
@@ -15068,13 +15180,13 @@ static void as_sock_fill_addr(const struct sockaddr_storage* ss, char* out, size
 // Remember the addresses the OS assigned, so localPort/remotePort read back the
 // real values (AIR reports them once the connection is up).
 static void as_sock_capture_addrs(as_sock* s) {
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     struct sockaddr_storage ss;
-    socklen_t len = (socklen_t)sizeof(ss);
+    as_socklen_t len = (as_socklen_t)sizeof(ss);
     if (s->fd >= 0 && getsockname(s->fd, (struct sockaddr*)&ss, &len) == 0) {
         as_sock_fill_addr(&ss, s->local_addr, sizeof(s->local_addr), &s->local_port);
     }
-    len = (socklen_t)sizeof(ss);
+    len = (as_socklen_t)sizeof(ss);
     if (s->fd >= 0 && getpeername(s->fd, (struct sockaddr*)&ss, &len) == 0) {
         as_sock_fill_addr(&ss, s->remote_addr, sizeof(s->remote_addr), &s->remote_port);
     }
@@ -15098,8 +15210,9 @@ static void as_sock_connect(as_sock* s, const char* host, int port) {
     s->remote_port = 0;
     snprintf(s->url, sizeof(s->url), "%s", host);
     if (s->unsupported) { as_sock_fail(s, 0); return; }  // no socket backend on this target
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     {
+        if (!as_sock_wsa_init()) { as_sock_fail(s, 0); return; }
         char portstr[16];
         snprintf(portstr, sizeof(portstr), "%d", port);
         struct addrinfo hints;
@@ -15110,13 +15223,12 @@ static void as_sock_connect(as_sock* s, const char* host, int port) {
         // Resolution is synchronous: the OS resolver caches, and a socket must be
         // usable without a worker thread (see the seam note above).
         int rc = getaddrinfo(host, portstr, &hints, &res);
-        if (rc != 0 || res == NULL) { as_sock_fail(s, EADDRNOTAVAIL); if (res != NULL) freeaddrinfo(res); return; }
-        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-        if (fd < 0) { as_sock_fail(s, errno); freeaddrinfo(res); return; }
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        if (rc != 0 || res == NULL) { as_sock_fail(s, 0); if (res != NULL) freeaddrinfo(res); return; }
+        int fd = (int)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) { as_sock_fail(s, as_sock_last_error()); freeaddrinfo(res); return; }
+        as_sock_set_nonblock(fd);
         s->fd = fd;
-        int cr = connect(fd, res->ai_addr, res->ai_addrlen);
+        int cr = connect(fd, res->ai_addr, (as_socklen_t)res->ai_addrlen);
         freeaddrinfo(res);
         if (cr == 0) {
             // A loopback connect completes inline, but AIR reports
@@ -15129,12 +15241,13 @@ static void as_sock_connect(as_sock* s, const char* host, int port) {
             s->started_ms = as_now_ms();
             return;
         }
-        if (errno == EINPROGRESS || errno == EALREADY) {
+        int ce = as_sock_last_error();
+        if (ce == AS_SOCK_IN_PROGRESS) {
             s->state = AS_SOCK_CONNECTING;
             s->started_ms = as_now_ms();
             return;
         }
-        as_sock_fail(s, errno);
+        as_sock_fail(s, ce);
     }
 #endif
 }
@@ -15145,8 +15258,9 @@ static int as_sock_bind(as_sock* s, const char* host, int port) {
     if (s == NULL) return 0;
     if (s->fd >= 0) as_sock_drop_fd(s);
     if (s->unsupported) return 0;
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     {
+        if (!as_sock_wsa_init()) return 0;
         struct addrinfo hints;
         struct addrinfo* res = NULL;
         memset(&hints, 0, sizeof(hints));
@@ -15157,13 +15271,12 @@ static int as_sock_bind(as_sock* s, const char* host, int port) {
         snprintf(portstr, sizeof(portstr), "%d", port);
         const char* node = (host != NULL && host[0] != 0) ? host : NULL;
         if (getaddrinfo(node, portstr, &hints, &res) != 0 || res == NULL) { if (res != NULL) freeaddrinfo(res); return 0; }
-        int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        int fd = (int)socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) { freeaddrinfo(res); return 0; }
         int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        int flags = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        if (bind(fd, res->ai_addr, res->ai_addrlen) != 0) { close(fd); freeaddrinfo(res); return 0; }
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, (as_socklen_t)sizeof(one));
+        as_sock_set_nonblock(fd);
+        if (bind(fd, res->ai_addr, (as_socklen_t)res->ai_addrlen) != 0) { as_sock_close_handle(fd); freeaddrinfo(res); return 0; }
         freeaddrinfo(res);
         s->fd = fd;
         s->state = AS_SOCK_IDLE;
@@ -15178,7 +15291,7 @@ static int as_sock_bind(as_sock* s, const char* host, int port) {
 
 static int as_sock_listen(as_sock* s, int backlog) {
     if (s == NULL || s->fd < 0) return 0;
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     if (listen(s->fd, backlog > 0 ? backlog : 128) != 0) return 0;
     s->listening = 1;
     return 1;
@@ -15192,15 +15305,14 @@ static int as_sock_listen(as_sock* s, int backlog) {
 // where Socket_new is in scope).
 static void as_sock_accept_one(as_sock* s) {
     if (s == NULL || s->fd < 0 || s->accepted_ready) return;
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     struct sockaddr_storage ss;
-    socklen_t len = (socklen_t)sizeof(ss);
-    int fd = accept(s->fd, (struct sockaddr*)&ss, &len);
+    as_socklen_t len = (as_socklen_t)sizeof(ss);
+    int fd = (int)accept(s->fd, (struct sockaddr*)&ss, &len);
     if (fd < 0) return;
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    as_sock_set_nonblock(fd);
     as_sock* c = as_sock_new(0);
-    if (c == NULL) { close(fd); return; }
+    if (c == NULL) { as_sock_close_handle(fd); return; }
     c->fd = fd;
     c->state = AS_SOCK_CONNECTED;
     c->timeout_ms = s->timeout_ms;
@@ -15248,9 +15360,11 @@ static void as_sock_write(as_sock* s, const void* data, int len) {
 static void as_sock_try_flush(as_sock* s) {
     if (s == NULL || s->fd < 0) return;
     if (s->wlen <= s->wpos) { s->wlen = s->wpos = 0; return; }
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     for (;;) {
-        ssize_t n = send(s->fd, s->wbuf + s->wpos, s->wlen - s->wpos, 0);
+        // long long, not ssize_t: Winsock's send returns int, and there is no
+        // ssize_t in the MSVC headers.
+        long long n = (long long)send(s->fd, (const char*)(s->wbuf + s->wpos), (int)(s->wlen - s->wpos), 0);
         if (n > 0) {
             s->wpos += (size_t)n;
             if (s->wpos >= s->wlen) { s->wlen = s->wpos = 0; }
@@ -15258,9 +15372,10 @@ static void as_sock_try_flush(as_sock* s) {
             if (s->wlen == 0) return;
             continue;
         }
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        if (n < 0) { as_sock_fail(s, errno); return; }
+        int e = as_sock_last_error();
+        if (n < 0 && e == AS_SOCK_INTR) continue;
+        if (n < 0 && e == AS_SOCK_WOULD_BLOCK) return;
+        if (n < 0) { as_sock_fail(s, e); return; }
         return;
     }
 #endif
@@ -15282,7 +15397,7 @@ static int as_sock_read(as_sock* s, void* dst, int n) {
 // this keeps pulling until the kernel says there is no more, so one frame hands
 // over a whole chunk (the adl run shows bytesLoaded = the whole echo).
 static void as_sock_drain(as_sock* s) {
-#ifdef ASC_SOCK_POSIX
+#ifdef ASC_SOCK_NATIVE
     for (;;) {
         if (s->rcap - s->rlen < 4096) {
             if (s->rpos > 0) { memmove(s->rbuf, s->rbuf + s->rpos, (size_t)(s->rlen - s->rpos)); s->rlen -= s->rpos; s->rpos = 0; }
@@ -15294,7 +15409,7 @@ static void as_sock_drain(as_sock* s) {
                 s->rcap = cap;
             }
         }
-        ssize_t n = recv(s->fd, s->rbuf + s->rlen, (size_t)(s->rcap - s->rlen), 0);
+        long long n = (long long)recv(s->fd, (char*)(s->rbuf + s->rlen), (int)(s->rcap - s->rlen), 0);
         if (n > 0) { s->rlen += (int)n; s->events |= AS_SOCK_EV_DATA; continue; }
         if (n == 0) {
             // The peer closed. Bytes received in this same pass are already
@@ -15304,9 +15419,10 @@ static void as_sock_drain(as_sock* s) {
             as_sock_drop_fd(s);
             return;
         }
-        if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-        as_sock_fail(s, errno);
+        int e = as_sock_last_error();
+        if (e == AS_SOCK_INTR) continue;
+        if (e == AS_SOCK_WOULD_BLOCK) return;
+        as_sock_fail(s, e);
         return;
     }
 #endif
@@ -15316,8 +15432,8 @@ static void as_sock_drain(as_sock* s) {
 // the state machine that turns readiness into events.
 static void as_sock_pump(int wait_ms) {
     if (as_sock_count == 0) return;
-#ifdef ASC_SOCK_POSIX
-    static struct pollfd* pfds = NULL;
+#ifdef ASC_SOCK_NATIVE
+    static as_sock_pollfd* pfds = NULL;
     static as_sock** owners = NULL;
     static int cap = 0;
     int n = 0;
@@ -15326,34 +15442,63 @@ static void as_sock_pump(int wait_ms) {
         if (s == NULL || s->dead || s->fd < 0) continue;
         if (n >= cap) {
             int grow = cap == 0 ? 8 : cap * 2;
-            struct pollfd* np = (struct pollfd*)realloc(pfds, (size_t)grow * sizeof(struct pollfd));
+            as_sock_pollfd* np = (as_sock_pollfd*)realloc(pfds, (size_t)grow * sizeof(as_sock_pollfd));
             as_sock** no = (as_sock**)realloc(owners, (size_t)grow * sizeof(as_sock*));
             if (np == NULL || no == NULL) { free(np != NULL ? np : pfds); break; }
             pfds = np;
             owners = no;
             cap = grow;
         }
-        pfds[n].fd = s->fd;
-        pfds[n].events = POLLIN;
-        if (s->state == AS_SOCK_CONNECTING || s->wlen > s->wpos) pfds[n].events |= POLLOUT;
+        pfds[n].fd = (as_sock_fd_t)s->fd;
+        pfds[n].events = (short)AS_SOCK_POLL_IN;
+        if (s->state == AS_SOCK_CONNECTING || s->wlen > s->wpos) pfds[n].events = (short)(pfds[n].events | AS_SOCK_POLL_OUT);
         pfds[n].revents = 0;
         owners[n] = s;
         n++;
     }
-    if (n > 0) poll(pfds, (nfds_t)n, wait_ms);
+    if (n > 0) as_sock_poll(pfds, n, wait_ms);
+#ifdef ASC_SOCK_WIN
+    // A failed non-blocking connect is a documented WSAPoll blind spot: the socket
+    // is never reported through POLLERR/POLLHUP/POLLOUT, so a refused port would
+    // stay "connecting" until the connect timeout. The select() write/except sets
+    // DO report it, so connecting sockets are probed after the wait and their
+    // result is folded into revents; the shared SO_ERROR branch below then reads
+    // the real Winsock error. Measured: 127.0.0.1:1 lands here with
+    // WSAECONNREFUSED (10061) and the AS3 side gets ioError #2031 as documented.
+    for (int i = 0; i < n; i++) {
+        as_sock* cs = owners[i];
+        if (cs == NULL || cs->state != AS_SOCK_CONNECTING || cs->fd < 0) continue;
+        if ((pfds[i].revents & (AS_SOCK_POLL_OUT | AS_SOCK_POLL_ERR | AS_SOCK_POLL_HUP)) != 0) continue;
+        // The fd_set is filled field by field instead of through FD_ZERO/FD_SET:
+        // both macros expand to a cast through FAR, and this preamble deliberately
+        // #undefs FAR (an AS3 identifier named FAR would otherwise be rewritten;
+        // see the object-like macro scrub near the top). struct fd_set is a
+        // documented Winsock type -- u_int fd_count plus SOCKET fd_array[FD_SETSIZE]
+        // -- so writing the single slot directly is what FD_SET would have done.
+        fd_set wset, eset;
+        wset.fd_count = 1;
+        wset.fd_array[0] = (SOCKET)cs->fd;
+        eset.fd_count = 1;
+        eset.fd_array[0] = (SOCKET)cs->fd;
+        struct timeval tv0;
+        tv0.tv_sec = 0;
+        tv0.tv_usec = 0;
+        if (select(0, NULL, &wset, &eset, &tv0) > 0) pfds[i].revents = (short)(pfds[i].revents | AS_SOCK_POLL_OUT);
+    }
+#endif
     for (int i = 0; i < n; i++) {
         as_sock* s = owners[i];
         short re = pfds[i].revents;
         if (s == NULL || s->dead || re == 0) continue;
         if (s->is_server) {
-            if (re & POLLIN) as_sock_accept_one(s);
+            if (re & AS_SOCK_POLL_IN) as_sock_accept_one(s);
             continue;
         }
         if (s->state == AS_SOCK_CONNECTING) {
-            if (re & (POLLOUT | POLLERR | POLLHUP)) {
+            if (re & (AS_SOCK_POLL_OUT | AS_SOCK_POLL_ERR | AS_SOCK_POLL_HUP)) {
                 int e = 0;
-                socklen_t elen = (socklen_t)sizeof(e);
-                if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &e, &elen) != 0) e = errno;
+                as_socklen_t elen = (as_socklen_t)sizeof(e);
+                if (getsockopt(s->fd, SOL_SOCKET, SO_ERROR, (char*)&e, &elen) != 0) e = as_sock_last_error();
                 if (e == 0) {
                     s->state = AS_SOCK_CONNECTED;
                     as_sock_capture_addrs(s);
@@ -15365,9 +15510,9 @@ static void as_sock_pump(int wait_ms) {
             continue;
         }
         if (s->state == AS_SOCK_CONNECTED) {
-            if (re & POLLOUT) as_sock_try_flush(s);
-            if (re & POLLIN) as_sock_drain(s);
-            if (s->state == AS_SOCK_CONNECTED && (re & (POLLERR | POLLHUP)) && !(re & POLLIN)) {
+            if (re & AS_SOCK_POLL_OUT) as_sock_try_flush(s);
+            if (re & AS_SOCK_POLL_IN) as_sock_drain(s);
+            if (s->state == AS_SOCK_CONNECTED && (re & (AS_SOCK_POLL_ERR | AS_SOCK_POLL_HUP)) && !(re & AS_SOCK_POLL_IN)) {
                 // A hangup without readable data: nothing left to read.
                 s->events |= AS_SOCK_EV_CLOSE;
                 as_sock_drop_fd(s);
@@ -15471,6 +15616,10 @@ typedef struct as_ws {
     volatile int stop;         // AS3 asked for a close: send it, then wind down
     int close_code;            // peer's close code, -1 when the frame carried none
     int started;
+    int is_server;             // startServer(): WE read the opening handshake
+    int fd;                    // server mode: the accepted descriptor, owned by the worker
+    unsigned char* pre;        // server mode: bytes the accepted Socket had buffered
+    int pre_len;
     char* url;                 // malloc'd copies: this struct is NOT a GC object
     char* host;
     char* protocol;
@@ -15562,7 +15711,7 @@ static void as_ws_reap(void) {
             if (w->started) pthread_join(w->thread, NULL);
 #endif
 #endif
-            free(w->url); free(w->host); free(w->protocol); free(w->error);
+            free(w->url); free(w->host); free(w->protocol); free(w->error); free(w->pre);
             while (w->q_head != NULL) { struct as_ws_msg* m = w->q_head; w->q_head = m->next; free(m->data); free(m); }
             while (w->s_head != NULL) { struct as_ws_msg* m = w->s_head; w->s_head = m->next; free(m->data); free(m); }
             free(w);
@@ -15638,6 +15787,9 @@ static struct as_ws_msg* as_ws_take(as_ws* w) {
 static void as_ws_msg_free(struct as_ws_msg* m) { if (m != NULL) { free(m->data); free(m); } }
 
 static int as_ws_state_of(as_ws* w) { return w == NULL ? AS_WS_IDLE : w->state; }
+// Which direction this connection was opened in. The AS3 class only asks so the
+// dispatch pass can reproduce AIR's per-direction ByteArray position.
+static int as_ws_is_server(as_ws* w) { return w == NULL ? 0 : w->is_server; }
 static int as_ws_close_code_of(as_ws* w) { return w == NULL ? -1 : w->close_code; }
 static char* as_ws_error_of(as_ws* w) { return w == NULL ? NULL : w->error; }
 
@@ -15792,47 +15944,127 @@ static void as_ws_mask_key(unsigned char* k) {
     AS_WS_UNLOCK();
 }
 
-// Write every byte or fail.
-static int as_ws_write_all(CURL* h, const unsigned char* p, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        size_t sent = 0;
-        CURLcode rc = curl_easy_send(h, (const char*)(p + off), len - off, &sent);
-        if (rc == CURLE_AGAIN) { as_ws_wait_io(h, 10); continue; }
-        if (rc != CURLE_OK) return 0;
-        if (sent == 0) return 0;
-        off += sent;
-    }
-    return 1;
+// ---- the transport carrier -------------------------------------------------
+//
+// The codec below must run over TWO carriers: the client path's curl easy handle
+// (TLS already terminated by curl, bytes decrypted) and the server path's raw
+// accepted descriptor (AIR's startServer() takes a flash.net.Socket, and a plain
+// Socket has no TLS layer of its own). Nothing else differs, so the carrier is a
+// small struct instead of a second codec: framing, fragmentation, control frames
+// and queueing stay byte-identical, and only the two primitives that touch the
+// wire know which side they are on.
+typedef struct as_ws_wire {
+    CURL* h;        // client mode: the handle left by CURLOPT_CONNECT_ONLY=2
+    int fd;         // server mode: descriptor taken from the accepted Socket (-1 = none)
+    int server;     // 1 => WE are the server: we do not mask, the peer must
+} as_ws_wire;
+
+#ifdef ASC_SOCK_WIN
+#define AS_WS_SEND_FLAGS 0
+#else
+// A peer that closes while we are writing raises SIGPIPE on POSIX, which kills the
+// process by default; MSG_NOSIGNAL turns that into the EPIPE the codec already
+// treats as a dead connection.
+#define AS_WS_SEND_FLAGS MSG_NOSIGNAL
+#endif
+
+static void as_ws_sleep(int ms);
+
+static void as_ws_wire_wait(as_ws_wire* wr, int ms) {
+    if (wr->h == NULL) { as_ws_sleep(ms); return; }
+    as_ws_wait_io(wr->h, ms);
 }
 
-// One complete, FIN-set, MASKED client frame. AS3's format constants are the wire
-// opcodes for TEXT/BINARY/CLOSE (1/2/8); PING/PONG are 9/10 on the wire as well,
-// so the mapping is a pass-through (curl's own CURLWS_PING/PONG bits are 1<<4 and
-// 1<<6, which is why the earlier non-raw path needed a switch here).
-static int as_ws_send_frame(CURL* h, int opcode, const unsigned char* data, size_t len) {
+// Write every byte or fail.
+static int as_ws_wire_write(as_ws_wire* wr, const unsigned char* p, size_t len) {
+    if (wr->h != NULL) {
+        size_t off = 0;
+        while (off < len) {
+            size_t sent = 0;
+            CURLcode rc = curl_easy_send(wr->h, (const char*)(p + off), len - off, &sent);
+            if (rc == CURLE_AGAIN) { as_ws_wire_wait(wr, 10); continue; }
+            if (rc != CURLE_OK) return 0;
+            if (sent == 0) return 0;
+            off += sent;
+        }
+        return 1;
+    }
+#ifdef ASC_SOCK_NATIVE
+    {
+        size_t off = 0;
+        while (off < len) {
+            int n = (int)send((as_sock_fd_t)wr->fd, (const char*)(p + off),
+                              (int)(len - off), AS_WS_SEND_FLAGS);
+            if (n > 0) { off += (size_t)n; continue; }
+            int e = as_sock_last_error();
+            if (e == AS_SOCK_WOULD_BLOCK || e == AS_SOCK_INTR) { as_ws_sleep(2); continue; }
+            return 0;
+        }
+        return 1;
+    }
+#else
+    (void)wr; (void)p; (void)len;
+    return 0;
+#endif
+}
+
+// >0 bytes read, 0 nothing yet, -1 dead or garbage.
+static int as_ws_wire_read(as_ws_wire* wr, unsigned char* dst, size_t cap) {
+    if (wr->h != NULL) {
+        size_t got = 0;
+        CURLcode rc = curl_easy_recv(wr->h, dst, cap, &got);
+        if (rc == CURLE_AGAIN) return 0;
+        if (rc != CURLE_OK || got == 0) return -1;
+        return (int)got;
+    }
+#ifdef ASC_SOCK_NATIVE
+    {
+        int n = (int)recv((as_sock_fd_t)wr->fd, (char*)dst, (int)cap, 0);
+        if (n > 0) return n;
+        if (n == 0) return -1;                  // orderly EOF: the peer is gone
+        int e = as_sock_last_error();
+        if (e == AS_SOCK_WOULD_BLOCK || e == AS_SOCK_INTR) return 0;
+        return -1;
+    }
+#else
+    (void)wr; (void)dst; (void)cap;
+    return -1;
+#endif
+}
+
+// One complete, FIN-set frame. AS3's format constants are the wire opcodes for
+// TEXT/BINARY/CLOSE (1/2/8); PING/PONG are 9/10 on the wire as well, so the
+// mapping is a pass-through (curl's own CURLWS_PING/PONG bits are 1<<4 and 1<<6,
+// which is why the earlier non-raw path needed a switch here).
+//
+// MASKING follows the side we are on, not the call site: a CLIENT frame MUST be
+// masked and a SERVER frame MUST NOT be (RFC 6455 §5.1), and a conforming peer
+// drops the connection when that is wrong.
+static int as_ws_send_frame(as_ws_wire* wr, int opcode, const unsigned char* data, size_t len) {
     unsigned char hdr[14];
     unsigned char mask[4];
+    int use_mask = !wr->server;
     int n = 0;
-    as_ws_mask_key(mask);
+    if (use_mask) as_ws_mask_key(mask);
     hdr[n++] = (unsigned char)(0x80 | (unsigned char)(opcode & 0x0f));
     if (len < 126) {
-        hdr[n++] = (unsigned char)(0x80 | (unsigned char)len);
+        hdr[n++] = (unsigned char)((use_mask ? 0x80 : 0) | (unsigned char)len);
     } else if (len <= 0xFFFFu) {
-        hdr[n++] = (unsigned char)(0x80 | 126);
+        hdr[n++] = (unsigned char)((use_mask ? 0x80 : 0) | 126);
         hdr[n++] = (unsigned char)((len >> 8) & 0xFF);
         hdr[n++] = (unsigned char)(len & 0xFF);
     } else {
-        hdr[n++] = (unsigned char)(0x80 | 127);
+        hdr[n++] = (unsigned char)((use_mask ? 0x80 : 0) | 127);
         for (int i = 7; i >= 0; i--) hdr[n++] = (unsigned char)((len >> (i * 8)) & 0xFF);
     }
-    for (int i = 0; i < 4; i++) hdr[n++] = mask[i];
-    if (!as_ws_write_all(h, hdr, (size_t)n)) return 0;
+    if (use_mask) for (int i = 0; i < 4; i++) hdr[n++] = mask[i];
+    if (!as_ws_wire_write(wr, hdr, (size_t)n)) return 0;
     if (len == 0) return 1;
+    if (!use_mask) return as_ws_wire_write(wr, data, len);
     unsigned char* body = (unsigned char*)malloc(len);
     if (body == NULL) return 0;
     for (size_t i = 0; i < len; i++) body[i] = (unsigned char)(data[i] ^ mask[i & 3]);
-    int ok = as_ws_write_all(h, body, len);
+    int ok = as_ws_wire_write(wr, body, len);
     free(body);
     return ok;
 }
@@ -15862,29 +16094,26 @@ static int as_ws_frag_append(unsigned char** frag, int* frag_len, int* frag_cap,
 
 // Read whatever is already available into the stream buffer.
 //   1 = bytes arrived, 0 = nothing available, -1 = transport failure
-static int as_ws_rx_read(CURL* h, unsigned char** rx, int* rx_len, int* rx_cap) {
+static int as_ws_rx_read(as_ws_wire* wr, unsigned char** rx, int* rx_len, int* rx_cap) {
     unsigned char tmp[16384];
-    size_t got = 0;
-    CURLcode rc = curl_easy_recv(h, tmp, sizeof(tmp), &got);
-    if (rc == CURLE_AGAIN) return 0;
-    if (rc != CURLE_OK) return -1;
-    if (got == 0) return 0;
-    if (*rx_len + (int)got > *rx_cap) {
+    int got = as_ws_wire_read(wr, tmp, sizeof(tmp));
+    if (got <= 0) return got;
+    if (*rx_len + got > *rx_cap) {
         int grow = *rx_cap == 0 ? 16384 : *rx_cap;
-        while (grow < *rx_len + (int)got) grow *= 2;
+        while (grow < *rx_len + got) grow *= 2;
         unsigned char* np = (unsigned char*)realloc(*rx, (size_t)grow);
         if (np == NULL) return -1;
         *rx = np;
         *rx_cap = grow;
     }
-    memcpy(*rx + *rx_len, tmp, got);
-    *rx_len += (int)got;
+    memcpy(*rx + *rx_len, tmp, (size_t)got);
+    *rx_len += got;
     return 1;
 }
 
 // Consume every COMPLETE frame in the stream buffer.
 //   1 = the peer closed, -1 = failure/garbage, 0 = need more bytes
-static int as_ws_parse_frames(CURL* h, as_ws* w, unsigned char** rx, int* rx_len,
+static int as_ws_parse_frames(as_ws_wire* wr, as_ws* w, unsigned char** rx, int* rx_len,
                               unsigned char** frag, int* frag_len, int* frag_cap, int* msg_op) {
     int off = 0;
     for (;;) {
@@ -15914,19 +16143,34 @@ static int as_ws_parse_frames(CURL* h, as_ws* w, unsigned char** rx, int* rx_len
         int total = hdr + (masked ? 4 : 0) + (int)len;
         if (avail < total) break;
         const unsigned char* mask = masked ? (p + hdr) : NULL;
-        const unsigned char* payload = p + hdr + (masked ? 4 : 0);
+        const unsigned char* raw_payload = p + hdr + (masked ? 4 : 0);
+        const unsigned char* payload = raw_payload;
+        // Control frames are read straight out of the stream, so a MASKED one (any
+        // frame from a client, RFC 6455 §5.1) has to be unmasked once here: the
+        // close code and the PONG payload are the peer's bytes, not the xor of
+        // them. §5.5 caps a control payload at 125 bytes, so this is a stack array
+        // and never an allocation. The data path unmasks its own copy below.
+        // NOTE: payload stays the RAW view for the DATA path below (which unmasks
+        // into its own heap copy, because a message can be megabytes); ctl is the
+        // unmasked view that only the control branches may use.
+        unsigned char plain_ctl[125];
+        const unsigned char* ctl = raw_payload;
+        if (masked && len > 0 && len <= 125) {
+            for (int k = 0; k < (int)len; k++) plain_ctl[k] = (unsigned char)(raw_payload[k] ^ mask[k & 3]);
+            ctl = plain_ctl;
+        }
 
         if (op == 0x8) {                       // close
             // Payload: optional 2-byte big-endian code, then a UTF-8 reason.
-            int code = (len >= 2) ? (((int)payload[0] << 8) | (int)payload[1]) : -1;
+            int code = (len >= 2) ? (((int)ctl[0] << 8) | (int)ctl[1]) : -1;
             w->close_code = code;
             // Echo the close (§5.5.1) and let the caller wind the connection down.
-            as_ws_send_frame(h, 0x8, (const unsigned char*)(len >= 2 ? payload : NULL),
+            as_ws_send_frame(wr, 0x8, (const unsigned char*)(len >= 2 ? ctl : NULL),
                              (size_t)(len >= 2 ? 2 : 0));
             return 1;
         }
         if (op == 0x9) {                       // ping -> pong with the same payload
-            if (!as_ws_send_frame(h, 0xA, payload, (size_t)len)) return -1;
+            if (!as_ws_send_frame(wr, 0xA, ctl, (size_t)len)) return -1;
         } else if (op == 0xA) {                // pong: nothing to do
             /* ignore */
         } else if (op == 0x0 || op == 0x1 || op == 0x2) {
@@ -15940,9 +16184,10 @@ static int as_ws_parse_frames(CURL* h, as_ws* w, unsigned char** rx, int* rx_len
                 return -1;                     // continuation with no message open
             }
             if (masked) {
-                // Servers must not mask (§5.1), but unmask anyway rather than
-                // hand the app the raw xor: a lenient read is harmless, a wrong
-                // payload is not.
+                // A CLIENT must mask (§5.1) and a server must not; unmask whatever
+                // arrives rather than hand the app raw xor bytes. Lenient on
+                // purpose: a wrongly-unmasked payload is corruption, while a
+                // lenient read only accepts a peer that is already broken.
                 unsigned char* tmp = (unsigned char*)malloc((size_t)(len > 0 ? len : 1));
                 if (tmp == NULL) return -1;
                 for (long long i = 0; i < len; i++) tmp[i] = (unsigned char)(payload[i] ^ mask[i & 3]);
@@ -15972,76 +16217,333 @@ static int as_ws_parse_frames(CURL* h, as_ws* w, unsigned char** rx, int* rx_len
 
 // One recv pass: pull what arrived, then consume the frames it completed.
 //   1 = peer closed, 0 = nothing more right now, -1 = failure
-static int as_ws_recv_pass(CURL* h, as_ws* w, unsigned char** rx, int* rx_len, int* rx_cap,
+static int as_ws_recv_pass(as_ws_wire* wr, as_ws* w, unsigned char** rx, int* rx_len, int* rx_cap,
                            unsigned char** frag, int* frag_len, int* frag_cap, int* msg_op) {
-    int r = as_ws_rx_read(h, rx, rx_len, rx_cap);
+    int r = as_ws_rx_read(wr, rx, rx_len, rx_cap);
     if (r < 0) return -1;
     if (r == 0) return 0;
-    return as_ws_parse_frames(h, w, rx, rx_len, frag, frag_len, frag_cap, msg_op);
+    return as_ws_parse_frames(wr, w, rx, rx_len, frag, frag_len, frag_cap, msg_op);
+}
+
+// ---- SHA-1 + base64, for the server-side opening handshake ------------------
+//
+// RFC 6455 §4.2.2 answers Sec-WebSocket-Key with
+// base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")). Neither primitive is
+// a security boundary here (the handshake proves nothing about identity), and this
+// runtime cannot assume a crypto library on every target, so this is the textbook
+// SHA-1 plus a 20-byte base64: local to the seam, used nowhere else.
+static void as_ws_sha1(const unsigned char* msg, size_t len, unsigned char out[20]) {
+    unsigned int h[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    size_t blocks = (len + 9 + 63) / 64;
+    unsigned char* buf = (unsigned char*)calloc(blocks, 64);
+    if (buf == NULL) { memset(out, 0, 20); return; }
+    if (len > 0) memcpy(buf, msg, len);
+    buf[len] = 0x80;
+    {
+        unsigned long long bits = (unsigned long long)len * 8ull;
+        for (int i = 0; i < 8; i++) buf[blocks * 64 - 1 - (size_t)i] = (unsigned char)((bits >> (8 * i)) & 0xFF);
+    }
+    for (size_t b = 0; b < blocks; b++) {
+        unsigned int w[80];
+        const unsigned char* p = buf + b * 64;
+        for (int i = 0; i < 16; i++)
+            w[i] = ((unsigned int)p[i * 4] << 24) | ((unsigned int)p[i * 4 + 1] << 16)
+                 | ((unsigned int)p[i * 4 + 2] << 8) | (unsigned int)p[i * 4 + 3];
+        for (int i = 16; i < 80; i++) {
+            unsigned int x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+            w[i] = (x << 1) | (x >> 31);
+        }
+        unsigned int a = h[0], bb = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            unsigned int f, k;
+            if (i < 20) { f = (bb & c) | ((~bb) & d); k = 0x5A827999u; }
+            else if (i < 40) { f = bb ^ c ^ d; k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (bb & c) | (bb & d) | (c & d); k = 0x8F1BBCDCu; }
+            else { f = bb ^ c ^ d; k = 0xCA62C1D6u; }
+            unsigned int t = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+            e = d; d = c; c = (bb << 30) | (bb >> 2); bb = a; a = t;
+        }
+        h[0] += a; h[1] += bb; h[2] += c; h[3] += d; h[4] += e;
+    }
+    free(buf);
+    for (int i = 0; i < 5; i++) {
+        out[i * 4] = (unsigned char)(h[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(h[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(h[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)h[i];
+    }
+}
+
+// Base64 of 20 bytes -> 28 chars + NUL. Callers pass at least 32 bytes.
+static void as_ws_b64(const unsigned char* src, int len, char* out) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i = 0, o = 0;
+    while (i + 2 < len) {
+        unsigned int v = ((unsigned int)src[i] << 16) | ((unsigned int)src[i + 1] << 8) | (unsigned int)src[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = T[(v >> 6) & 63];
+        out[o++] = T[v & 63];
+        i += 3;
+    }
+    if (i < len) {
+        unsigned int v = (unsigned int)src[i] << 16;
+        if (i + 1 < len) v |= (unsigned int)src[i + 1] << 8;
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = (i + 1 < len) ? T[(v >> 6) & 63] : '=';
+        out[o++] = '=';
+    }
+    out[o] = '\\0';
+}
+
+// Case-insensitive comparison of a non-NUL-terminated header name.
+static int as_ws_ci_eq(const char* a, size_t n, const char* b) {
+    if (strlen(b) != n) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+// Pull one header value out of an NUL-terminated HTTP request block. 1 = found.
+static int as_ws_header(const char* req, const char* name, char* out, size_t cap) {
+    const char* p = req;
+    for (;;) {
+        const char* eol = strchr(p, '\\n');
+        const char* colon = NULL;
+        if (eol == NULL) return 0;
+        colon = (const char*)memchr(p, ':', (size_t)(eol - p));
+        if (colon != NULL) {
+            size_t nl = (size_t)(colon - p);
+            while (nl > 0 && (p[nl - 1] == ' ' || p[nl - 1] == '\\t' || p[nl - 1] == '\\r')) nl--;
+            if (as_ws_ci_eq(p, nl, name)) {
+                const char* v = colon + 1;
+                size_t vl = 0;
+                while (v < eol && (*v == ' ' || *v == '\\t')) v++;
+                vl = (size_t)(eol - v);
+                while (vl > 0 && (v[vl - 1] == '\\r' || v[vl - 1] == ' ' || v[vl - 1] == '\\t')) vl--;
+                if (vl + 1 > cap) return 0;
+                memcpy(out, v, vl);
+                out[vl] = '\\0';
+                return 1;
+            }
+        }
+        p = eol + 1;
+        if (*p == '\\r' || *p == '\\n' || *p == '\\0') return 0;   // end of the header block
+    }
+}
+
+// Offset just past the CRLFCRLF that ends an HTTP header block, or -1.
+static int as_ws_find_header_end(const unsigned char* p, int len, int from) {
+    for (int i = (from < 0 ? 0 : from); i + 3 < len; i++) {
+        if (p[i] == '\\r' && p[i + 1] == '\\n' && p[i + 2] == '\\r' && p[i + 3] == '\\n') return i + 4;
+    }
+    return -1;
+}
+
+// The server side of the opening handshake (§4.2). Reads until the blank line that
+// ends the request, then answers exactly the headers AIR answers -- measured on AIR
+// 51.4.1: "HTTP/1.1 101 Switching Protocols", Upgrade, Connection and
+// Sec-WebSocket-Accept, in that order, and NO Sec-WebSocket-Protocol even when the
+// client offered one (the server-side protocol stays null).
+//
+// \`pre\`/\`pre_len\` are bytes the accepted Socket had already buffered; they are the
+// beginning of the same request. Bytes past the blank line are the client's first
+// frames (some clients pipeline them), so they come back in \`rest\`.
+//   1 = handshake done, 0 = not a WebSocket client / transport failure
+static int as_ws_server_handshake(as_ws_wire* wr, as_ws* w, unsigned char* pre, int pre_len,
+                                 unsigned char** rest, int* rest_len) {
+    int cap = 8192;
+    int req_len = 0;
+    int header_end = -1;
+    unsigned char* req = (unsigned char*)malloc((size_t)cap + 1);
+    double deadline = as_now_ms() + 10000.0;
+    *rest = NULL;
+    *rest_len = 0;
+    if (req == NULL) return 0;
+    if (pre != NULL && pre_len > 0) {
+        req_len = pre_len > cap ? cap : pre_len;
+        memcpy(req, pre, (size_t)req_len);
+        req[req_len] = '\\0';
+        header_end = as_ws_find_header_end(req, req_len, -1);
+    }
+    while (header_end < 0) {
+        int n = 0;
+        int from = req_len - 3;
+        if (req_len >= cap) break;                       // a header this big is not a client
+        if (as_now_ms() > deadline) break;
+        n = as_ws_wire_read(wr, req + req_len, (size_t)(cap - req_len));
+        if (n < 0) { free(req); return 0; }
+        if (n == 0) { as_ws_wire_wait(wr, 10); continue; }
+        req_len += n;
+        req[req_len] = '\\0';
+        header_end = as_ws_find_header_end(req, req_len, from);
+    }
+    if (header_end < 0) { free(req); return 0; }
+    {
+        char key[256];
+        char joined[512];
+        char accept[64];
+        char resp[512];
+        unsigned char dg[20];
+        int rl = 0;
+        char* head = (char*)malloc((size_t)header_end + 1);
+        if (head == NULL) { free(req); return 0; }
+        memcpy(head, req, (size_t)header_end);
+        head[header_end] = '\\0';
+        if (!as_ws_header(head, "Sec-WebSocket-Key", key, sizeof(key))) {
+            if (as_ws_debug()) { fprintf(stderr, "[as3-aot] ws server: no Sec-WebSocket-Key\\n"); fflush(stderr); }
+            free(head);
+            free(req);
+            return 0;
+        }
+        free(head);
+        if (req_len > header_end) {
+            int extra = req_len - header_end;
+            unsigned char* tail = (unsigned char*)malloc((size_t)extra);
+            if (tail != NULL) {
+                memcpy(tail, req + header_end, (size_t)extra);
+                *rest = tail;
+                *rest_len = extra;
+            }
+        }
+        free(req);
+        snprintf(joined, sizeof(joined), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+        as_ws_sha1((const unsigned char*)joined, strlen(joined), dg);
+        as_ws_b64(dg, 20, accept);
+        rl = snprintf(resp, sizeof(resp),
+                      "HTTP/1.1 101 Switching Protocols\\r\\n"
+                      "Upgrade: websocket\\r\\n"
+                      "Connection: Upgrade\\r\\n"
+                      "Sec-WebSocket-Accept: %s\\r\\n\\r\\n", accept);
+        if (rl <= 0) return 0;
+        if (!as_ws_wire_write(wr, (const unsigned char*)resp, (size_t)rl)) return 0;
+    }
+    // No subprotocol is echoed: that is AIR's server behaviour (measured), and
+    // inventing one would change what the peer's application sees.
+    (void)w;
+    return 1;
+}
+
+// The ioError text for a transport failure. AIR builds it as
+// "Error #2031: Socket Error. URL: <host>" (measured); a server-mode connection
+// was never given a URL, so its failure stays the plain documented sentence.
+static char* as_ws_fail_text(as_ws* w) {
+    size_t hn = w->host != NULL ? strlen(w->host) : 0;
+    char* t = NULL;
+    if (hn == 0) return as_ws_mcopy("Error #2031: Socket Error.");
+    t = (char*)malloc(hn + 64);
+    if (t != NULL) snprintf(t, hn + 64, "Error #2031: Socket Error. URL: %s", w->host);
+    return t;
 }
 
 static void as_ws_worker_body(as_ws* w) {
-    char* fail_text = NULL;
-    {
-        size_t hn = w->host != NULL ? strlen(w->host) : 0;
-        fail_text = (char*)malloc(hn + 64);
-        if (fail_text != NULL) snprintf(fail_text, hn + 64, "Error #2031: Socket Error. URL: %s", w->host != NULL ? w->host : "");
-    }
-    CURL* h = curl_easy_init();
-    if (h == NULL) { as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error."); free(fail_text); return; }
-    char errbuf[CURL_ERROR_SIZE];
-    errbuf[0] = '\\0';
-    curl_easy_setopt(h, CURLOPT_URL, w->url);
-    // CONNECT_ONLY=2 is curl's "do the WebSocket handshake, then hand me the
-    // connection": the upgrade request/response, the redirect and TLS are curl's,
-    // and every byte after it is ours (see the codec above for why the data phase
-    // cannot use curl_ws_*).
-    curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, 2L);
-    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
-    struct curl_slist* headers = NULL;
-    if (w->protocol != NULL && w->protocol[0] != '\\0') {
-        size_t n = strlen(w->protocol) + 32;
-        char* hv = (char*)malloc(n);
-        if (hv != NULL) {
-            snprintf(hv, n, "Sec-WebSocket-Protocol: %s", w->protocol);
-            headers = curl_slist_append(headers, hv);
-            free(hv);
+    as_ws_wire wr;
+    unsigned char* seed = NULL;        // stream bytes already read with the handshake
+    int seed_len = 0;
+    char* fail_text = as_ws_fail_text(w);
+    wr.h = NULL;
+    wr.fd = -1;
+    wr.server = w->is_server;
+
+    if (w->is_server) {
+#ifdef ASC_SOCK_NATIVE
+        // Server mode: no curl anywhere. AIR hands the app an already-accepted
+        // flash.net.Socket, so the opening handshake is READ from the peer rather
+        // than written to it, and there is no TLS layer to preserve.
+        wr.fd = w->fd;
+        if (!as_ws_server_handshake(&wr, w, w->pre, w->pre_len, &seed, &seed_len)) {
+            free(w->pre);
+            w->pre = NULL;
+            w->pre_len = 0;
+            as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
+            free(fail_text);
+            if (seed != NULL) free(seed);
+            as_sock_close_handle(wr.fd);
+            return;
         }
-        if (headers != NULL) curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
-    }
-    CURLcode rc = curl_easy_perform(h);
-    if (headers != NULL) { curl_slist_free_all(headers); curl_easy_setopt(h, CURLOPT_HTTPHEADER, NULL); }
-    if (rc != CURLE_OK) {
-        // AIR's text is fixed: "Error #2031: Socket Error. URL: <host>". The curl
-        // detail goes to the debug channel instead of the event, so an app that
-        // matches the documented sentence keeps working.
-        as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
+        free(w->pre);
+        w->pre = NULL;
+        w->pre_len = 0;
         if (as_ws_debug()) {
-            fprintf(stderr, "[as3-aot] ws handshake failed: curl rc=%d %s (%s)\\n", (int)rc,
-                    errbuf[0] != '\\0' ? errbuf : curl_easy_strerror(rc), w->url != NULL ? w->url : "-");
+            fprintf(stderr, "[as3-aot] ws server handshake ok (fd=%d)\\n", wr.fd);
             fflush(stderr);
         }
-        curl_easy_cleanup(h);
+#else
+        as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
         free(fail_text);
         return;
+#endif
+    } else {
+        CURL* h = curl_easy_init();
+        if (h == NULL) {
+            as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
+            free(fail_text);
+            return;
+        }
+        char errbuf[CURL_ERROR_SIZE];
+        errbuf[0] = '\\0';
+        curl_easy_setopt(h, CURLOPT_URL, w->url);
+        // CONNECT_ONLY=2 is curl's "do the WebSocket handshake, then hand me the
+        // connection": the upgrade request/response, the redirect and TLS are curl's,
+        // and every byte after it is ours (see the codec above for why the data phase
+        // cannot use curl_ws_*).
+        curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, 2L);
+        curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+        struct curl_slist* headers = NULL;
+        if (w->protocol != NULL && w->protocol[0] != '\\0') {
+            size_t n = strlen(w->protocol) + 32;
+            char* hv = (char*)malloc(n);
+            if (hv != NULL) {
+                snprintf(hv, n, "Sec-WebSocket-Protocol: %s", w->protocol);
+                headers = curl_slist_append(headers, hv);
+                free(hv);
+            }
+            if (headers != NULL) curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+        }
+        CURLcode rc = curl_easy_perform(h);
+        if (headers != NULL) { curl_slist_free_all(headers); curl_easy_setopt(h, CURLOPT_HTTPHEADER, NULL); }
+        if (rc != CURLE_OK) {
+            // AIR's text is fixed: "Error #2031: Socket Error. URL: <host>". The curl
+            // detail goes to the debug channel instead of the event, so an app that
+            // matches the documented sentence keeps working.
+            as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
+            if (as_ws_debug()) {
+                fprintf(stderr, "[as3-aot] ws handshake failed: curl rc=%d %s (%s)\\n", (int)rc,
+                        errbuf[0] != '\\0' ? errbuf : curl_easy_strerror(rc),
+                        w->url != NULL ? w->url : "-");
+                fflush(stderr);
+            }
+            curl_easy_cleanup(h);
+            free(fail_text);
+            return;
+        }
+        wr.h = h;
     }
     free(fail_text);
 
     AS_WS_LOCK();
     w->state = AS_WS_OPEN;
-    as_ws_push_locked(w, AS_WS_MSG_OPEN, NULL, 0);
+    // Client only: AIR dispatches NO connect event on the SERVER side (measured
+    // twice on AIR 51.4.1 -- a server-mode WebSocket's first event is its first
+    // DATA), so pushing OPEN there would invent an event no AIR app listens for.
+    if (!w->is_server) as_ws_push_locked(w, AS_WS_MSG_OPEN, NULL, 0);
     AS_WS_WAKE();
     AS_WS_UNLOCK();
     if (as_ws_debug()) {
-        fprintf(stderr, "[as3-aot] ws open %s\\n", w->url != NULL ? w->url : "-");
+        fprintf(stderr, "[as3-aot] ws open %s\\n", w->url != NULL ? w->url : (w->is_server ? "(server)" : "-"));
         fflush(stderr);
     }
 
     unsigned char* frag = NULL;
     int frag_len = 0, frag_cap = 0, msg_op = 0;
-    unsigned char* rx = NULL;          // post-handshake byte stream (easy_recv)
-    int rx_len = 0, rx_cap = 0;
+    unsigned char* rx = seed;          // post-handshake byte stream
+    int rx_len = seed_len, rx_cap = seed_len;
     int io_failed = 0;
 
     for (;;) {
@@ -16053,7 +16555,7 @@ static void as_ws_worker_body(as_ws* w) {
         AS_WS_UNLOCK();
         while (send != NULL) {
             struct as_ws_msg* nx = send->next;
-            if (!as_ws_send_frame(h, send->opcode, send->data, (size_t)send->len)) io_failed = 1;
+            if (!as_ws_send_frame(&wr, send->opcode, send->data, (size_t)send->len)) io_failed = 1;
             free(send->data);
             free(send);
             send = nx;
@@ -16062,7 +16564,7 @@ static void as_ws_worker_body(as_ws* w) {
         if (io_failed) break;
 
         // 2) Read what is there, then decide whether to keep going.
-        int r = as_ws_recv_pass(h, w, &rx, &rx_len, &rx_cap, &frag, &frag_len, &frag_cap, &msg_op);
+        int r = as_ws_recv_pass(&wr, w, &rx, &rx_len, &rx_cap, &frag, &frag_len, &frag_cap, &msg_op);
         if (r < 0) { io_failed = 1; break; }
         if (r > 0) break;   // peer sent its close frame
 
@@ -16072,18 +16574,21 @@ static void as_ws_worker_body(as_ws* w) {
         // peer echoed no code).
         if (w->stop) {
             for (int i = 0; i < 30; i++) {
-                as_ws_wait_io(h, 10);
-                int r2 = as_ws_recv_pass(h, w, &rx, &rx_len, &rx_cap, &frag, &frag_len, &frag_cap, &msg_op);
+                as_ws_wire_wait(&wr, 10);
+                int r2 = as_ws_recv_pass(&wr, w, &rx, &rx_len, &rx_cap, &frag, &frag_len, &frag_cap, &msg_op);
                 if (r2 != 0) break;
             }
             break;
         }
-        as_ws_wait_io(h, 10);
+        as_ws_wire_wait(&wr, 10);
     }
 
     free(frag);
     free(rx);
-    curl_easy_cleanup(h);
+    if (wr.h != NULL) curl_easy_cleanup(wr.h);
+#ifdef ASC_SOCK_NATIVE
+    if (wr.fd >= 0) as_sock_close_handle(wr.fd);
+#endif
 
     if (io_failed) {
         // An abrupt end (reset, TLS truncation) is reported as the socket error
@@ -16091,15 +16596,9 @@ static void as_ws_worker_body(as_ws* w) {
         // encountered") out of its own reader here -- measured as an UNCAUGHT
         // Error from air.net::WebSocket -- and reproducing a crash is not a
         // contract worth keeping.
-        size_t hn = w->host != NULL ? strlen(w->host) : 0;
-        char* t = (char*)malloc(hn + 64);
-        if (t != NULL) {
-            snprintf(t, hn + 64, "Error #2031: Socket Error. URL: %s", w->host != NULL ? w->host : "");
-            as_ws_fail(w, t);
-            free(t);
-        } else {
-            as_ws_fail(w, "Error #2031: Socket Error.");
-        }
+        char* t = as_ws_fail_text(w);
+        as_ws_fail(w, t != NULL ? t : "Error #2031: Socket Error.");
+        free(t);
         return;
     }
 
@@ -16113,7 +16612,6 @@ static void as_ws_worker_body(as_ws* w) {
         fflush(stderr);
     }
 }
-
 #ifdef _WIN32
 static unsigned __stdcall as_ws_worker(void* arg) { as_ws_worker_body((as_ws*)arg); return 0; }
 #else
@@ -16154,6 +16652,65 @@ static int as_ws_start(as_ws* w, const char* url, const char* protocols) {
         return 0;
     }
 #endif
+    return 1;
+}
+
+// Server mode: adopt an already-accepted flash.net.Socket. Called on the AS3
+// thread; the opening handshake and the whole connection live on the worker.
+//
+// Measured on AIR 51.4.1 (temp/wssrv: adl plus a hand-written RFC 6455 client):
+//   * startServer(null)           -> TypeError #2007 "Parameter socket must be non-null."
+//   * startServer(new Socket())   -> NO throw, and nothing ever happens
+//   * startServer(closed Socket)  -> Error #2002 "Operation attempted on invalid socket."
+//   * the accepted Socket keeps reporting connected == true afterwards
+//   * the SERVER side dispatches NO CONNECT event, while DATA arrives with the
+//     payload as a ByteArray at position 0 (client mode leaves it at the end)
+//   * close(code) writes the code and dispatches CLOSE with closeReason -1 when
+//     the peer does not get to echo one
+static int as_ws_start_server(as_ws* w, as_sock* s) {
+    if (w == NULL) return 0;
+    if (w->started) return 0;                 // emit.ts turns this into #2082 first
+    w->is_server = 1;
+    if (s == NULL) return 0;                  // emit.ts turns this into #2007 first
+    if (s->dead) return 0;                    // emit.ts turns this into #2002 first
+    if (as_sock_state_of(s) != AS_SOCK_CONNECTED || s->fd < 0) {
+        // Not a connected socket: AIR throws nothing and never dispatches
+        // anything. Accepting and doing nothing reproduces that exactly.
+        return 1;
+    }
+    {
+        unsigned char* pre = NULL;
+        int pre_len = 0;
+        int fd = as_sock_detach(s, &pre, &pre_len);
+        if (fd < 0) return 1;
+        w->fd = fd;
+        w->pre = pre;
+        w->pre_len = pre_len;
+        w->host = NULL;                       // no URL: the peer dialed us
+        w->started = 1;
+        w->state = AS_WS_CONNECTING;
+#ifdef _WIN32
+        {
+            uintptr_t hh = _beginthreadex(NULL, 0, as_ws_worker, w, 0, NULL);
+            w->thread = (hh != 0) ? (HANDLE)hh : NULL;
+            if (w->thread == NULL) {
+                as_sock_close_handle(w->fd);
+                w->fd = -1;
+                w->state = AS_WS_FAILED;
+                w->error = as_ws_mcopy("Error #2031: Socket Error.");
+                return 0;
+            }
+        }
+#else
+        if (pthread_create(&w->thread, NULL, as_ws_worker, w) != 0) {
+            as_sock_close_handle(w->fd);
+            w->fd = -1;
+            w->state = AS_WS_FAILED;
+            w->error = as_ws_mcopy("Error #2031: Socket Error.");
+            return 0;
+        }
+#endif
+    }
     return 1;
 }
 
@@ -16217,6 +16774,17 @@ static int as_ws_start(as_ws* w, const char* url, const char* protocols) {
         free(w->protocol);
         w->protocol = as_ws_mcopy(protocols);
     }
+    w->started = 1;
+    as_ws_fail(w, "Error #2031: Socket Error.");
+    return 0;
+}
+
+// Server mode has no transport at all in this build, so it fails the same loud way
+// connect() does: an AS_WS_FAILED state and an asynchronous ioError (#2031).
+static int as_ws_start_server(as_ws* w, as_sock* s) {
+    (void)s;
+    if (w == NULL) return 0;
+    w->is_server = 1;
     w->started = 1;
     as_ws_fail(w, "Error #2031: Socket Error.");
     return 0;

@@ -1233,6 +1233,19 @@ async function main(): Promise<void> {
     }
   }
 
+  // ---- Winsock: the Windows backend of the flash.net socket seam ----
+  //
+  // runtime.ts now has a real Winsock2 path for Socket/ServerSocket/XMLSocket
+  // (ASC_SOCK_WIN), so a native Windows link needs ws2_32 on the command line.
+  // Added for the whole target rather than derived from "does this program open a
+  // socket": the archive is an OS import, it costs nothing when unused, and a
+  // source-text scan would be a second, drifting copy of the frontend's
+  // reachability. wasm builds are excluded -- there is no window on the socket
+  // handle there and the seam stays "unsupported" (loud ioError) as documented.
+  if (process.platform === 'win32' && cfg.target !== 'wasm' && !cfg.linkLibs.includes('ws2_32')) {
+    cfg.linkLibs.push('ws2_32');
+  }
+
   // ---- air.net.WebSocket: the vendored static libcurl's ws_* client ----
   // Air's WebSocket needs no native extension here: curl 8.11.1 in vendor/curl is
   // built with CURL_DISABLE_WEBSOCKETS=OFF, so the SAME archive that already serves

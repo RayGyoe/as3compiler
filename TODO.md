@@ -20541,6 +20541,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 > **2026-11-08 追加（GC 小对象空闲块查找 O(1)，v0.4.358）**：**移出 1 行 / 改写 0 行 / 新登记 0 行**。`gc_find_block()` 的小对象请求在原 `floor` 类最多探测 **8 个节点**，未命中即从 `ceil(size / GC_SMALL_ALIGN)` 类继续，消除同类过小块的无界扫描并尽量保持旧地址复用顺序；`size >= GC_SMALL_MAX` 显式进入 mid 链，big 仍只查 big 链。初版漏掉 mid 分派导致 768B 请求反复开段；直接从 ceil 类起查又因保守栈扫描下的保留集变化使 `gc_alloc_threshold.as` 新增红（after **1,764,040**，旧算法 **1,025,200**；单节点探测仍 **1,348,128**）。这些中间结果均未计为完成。最终同机 A/B（`temp/perf/gcfindblock.as`，各 30000 次目标分配）：旧算法基线/小空闲块淹没 **4/8348 ms**，最终算法 **4/6 ms**；`unit: runtime/GcSizeClasses` **12/12**、全部 `gc_` 端到端示例 **8/8**，未放宽原测试。最终全量 `node test.ts`（`temp/perf/regress-final3.log`）为 **656 tests / 634 pass / 19 fail / 3 skipped**，19 红与既有基线逐项相同，新增失败 **0**。原始 Bench3/`pt_8000` 源文件当前不在工作树，未重测其 <50 ms 验收判据。
 > **2026-11-08 追加（static 每帧固定成本旧项收口）**：**移出 1 行 / 改写 0 行 / 新登记 0 行**。阶段三百一十五登记的旧根因路径已被后续阶段实际移除：阶段三百六十二加入静止窗口 dirty-key + Present skip（当时实测 `presentskip=512/512`），阶段三百七十又彻底删除 `as_render_fp` 每帧整树哈希并改用 `ASC_dirty_epoch`。本轮重建丢失的 static 夹具（`temp/framecost/Static.as`，静态 TextField + Bitmap、600 帧、无显示树写入），当前版本再次得到 `presentskip=512`、`keychg=0/0/0/1`，确认逻辑帧继续且光栅/Present 被跳过。本机外置进程 CPU 采样波动为 0.112–1.302 ms/帧，原始 AIR 夹具也不在工作树，故**不声称复测出新的 AOT/AIR ≤3× 比值**；本行收口依据是旧根因路径已删除及现有静止跳帧证据，不是虚构一组新性能数字。
 >
+> **2026-11-14 追加（阶段四百一十三：`WebSocket.startServer()` 服务端落地）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒ 主表 **87 → 86 行**（`未开始` 63 → **62**，`部分完成` 20 不变）。移出的是 `startServer(socket)` 那条——服务端那一半已按 `adl 51.4.1` 实测落地（`temp/wssrv/` 探针：服务端**不派** `CONNECT`、`DATA.position` 为 0、不回显子协议、`close(1001)` 后 `closeReason` 仍是 `-1`），验收是**角色反转**的单元回环（编译产物当服务端、Node 手写 RFC 6455 当客户端）。**本阶段修净的不占表**：`as_ws_parse_frames` 的控制帧漏解掩码（客户端模式永远踩不到——对端帧本就不掩码——服务端模式下 close 码与 PONG 载荷取到的是 xor 后的字节）、以及服务端沿用 `AS_WS_MSG_OPEN` 派出了 AIR 不会派的 `Event.CONNECT`。
 > **2026-11-14 追加（阶段四百零八：`air.net.WebSocket` 原生客户端）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表 **86 → 87 行**（`未开始` 62 → **63**，含 `未开始 / D43b` 1 行；`部分完成` 20 不变）。**新登记的 1 行**是 `startServer(socket)`——客户端那一半（握手交给 `CURLOPT_CONNECT_ONLY=2`，分帧/掩码/分片重组/close 码归运行时）已全部落地并在 Node 真服务器上跑通，服务端缺的**只是握手**：在已接受的 `Socket` 上算 `Sec-WebSocket-Accept`，再复用同一套帧编解码。本轮只登记不改，因为真正的难点不在算法而在**数据面归属**（`as_sock` 的 poll 循环 vs worker 线程，两条路不能各读一半）。**本阶段修净的不占表**：`wss://` 在真机对 `wss://ws.postman-echo.com/raw` 实测 101 + echo 回环、`advapi32` 漏链（`CryptAcquireContext`/`CryptCreateHash` 在 advapi32 而非 crypt32）、顶层脚本 `import air.net.WebSocket` 后 `var w:WebSocket` 报 `unknown type` —— 都是「`adl` 跑得对我们跑不出」，同阶段落地。**顺带记一条口径**：curl 的 `curl_ws_*` 帧层与 `CURLWS_RAW_MODE` 都**不能**当我们的帧层用（前者不暴露 FIN，后者拒绝它自己为自动 PONG 发出的带 flags 发送，两条都有探针），今后遇到「第三方库已经有这个协议」的判断，先验「它暴露的抽象粒度够不够」，不是验「它有没有这个功能」。
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
@@ -20630,7 +20631,6 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 | `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | **部分完成**（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
 | **`transparent=false` 的 `BitmapData`：adl 在 `getPixel32()`/`getPixels()` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的 alpha** | 未开始（2026-11-05 阶段三百七十四 的像素 oracle 量到） | `temp/vidcopy/` 的 DUMP 直接可见：同一份 `setPixels` 输入，adl 读回 `FF030201`、AOT 读回 `04030201`（低三字节相同）。这是本轮改动**之前**就存在的分歧——逐格循环与新的 bulk 路径给出同一个值，所以不是修 `setPixels` 引入的。影响面：`transparent=false` 的位图如果被写进非 255 的 alpha（ANE 帧的 alpha 恒为 255，所以 meeting 客户端的摄像头预览不受影响），AOT 下会整块半透明、AIR 下不透明。`examples/bitmap-setpixels-endian.as` 用的是 `transparent=false` 但源 alpha 恰好 255，所以既有钉子没有暴露它。 | 两条路选一条：① 在**写入侧**强制（`setPixels`/`setPixel32`/`fillRect`/`copyPixels`/`draw` 等所有入口，`!transparent` 时把 alpha 压成 255）；② 在**读取侧**强制（`getPixel32`/`getPixels` 时屏蔽）。AIR 到底是哪一侧还没测——这决定 `BitmapData` 内部是否允许存在带 alpha 的像素（会连带影响 `draw()` 的合成与 `Bitmap.bitmapData` 上屏）。**动手前先补一组双端探针**：`transparent=false` 位图 `setPixel32(0,0,0x80FF0000)` 之后，(a) `getPixel32` 读回什么、(b) `BitmapData.draw` 到另一张图上得到什么、(c) 作为 `Bitmap` 上屏后采样到什么。三处一致才敢选侧。 |
-| **`WebSocket.startServer(socket:Socket)` 只报明、不落地**（`#2031 "WebSocket server mode is not implemented by this runtime."`） | 未开始（2026-11-14 阶段四百零八 落地 `air.net.WebSocket` 客户端时登记） | 客户端的握手/分帧/掩码/分片重组/close 码已全部落地（`docs/zh-cn/flash-net.md` §7A），服务端缺的**只是握手那一半**：在已接受的 `Socket` 上读 `Sec-WebSocket-Key`、算 `SHA-1(key + 258EAFA5-E914-47DA-95CA-C5AB0DC85B11)` → base64 回 `Sec-WebSocket-Accept`，之后可直接复用同一套 `as_ws_parse_frames`/`as_ws_send_frame`（服务端帧不掩码）。难点不在算法而在**归属**：`Socket` 的数据面归 `as_sock` 注册表的 poll 循环，而 WebSocket 的数据面归 worker 线程，两条路要么合并要么移交，不能各读一半 | 先定「`startServer` 后该 socket 从注册表摘除、交给 worker」这一条，再补 SHA-1（vendored curl 只带了 `Curl_sha256`，**没有导出 sha1**；可用自写的 40 行实现或链 `bcrypt` 的 `BCryptHashData`）；验收用 `temp/wsnative/server.cjs` 的角色反转（AS3 当服务端、Node 当客户端） |
 
 
 
@@ -21336,6 +21336,55 @@ AIR 的 12/3），且与 G41 轻路径（已按 `sk_air_line_metrics` 报半像�
 **回归面**：全量 `node test.ts` 670/670 全绿。`ane-app` 13 断言全过、`native-process` 16 组全过、
 `weak-listener` A–J 全过、`text-underline`/`tf-scale-metrics` 复过。
 
+### 阶段四百一十三：`air.net.WebSocket.startServer()`——服务端那一半（v0.4.387 → v0.4.388）
+
+> 编号说明：四百零八~四百一十二 是并行的原生着色器轨（本轮工作树里同时在改）已占用的号，
+> 这里按文件内已有最大号顺延，不去挤那两个空号。
+
+阶段四百零八 把 `air.net.WebSocket` 的**客户端**做成了运行时能力，服务端只剩一条遗留项：
+`startServer(socket)` 只报明、不落地（`#2031 "WebSocket server mode is not implemented"`）。本阶段
+把它补上，并且**先测后做**——`adl 51.4.1` 探针（`temp/wssrv/`：AS3 当服务端、Node 当客户端）把
+AIR 的真实形状逐条量出来，实现照着实测写，不照着「WebSocket 服务端应该长什么样」写。
+
+**测出来的第一件事：服务端不是「监听 + 升级」，而是「接管一条已经 established 的连接」。** AIR 的
+用法是 `ServerSocket` 自己 accept，应用在 `ServerSocketConnectEvent` 里把 `event.socket` 交给
+`startServer()`；那一半握手要从**已被对端发起**的字节流上读。所以服务端模式不需要 curl：没有握手要
+发、没有 TLS 要建，只要读请求头、验 `Upgrade: websocket`、回 `101` 与
+`Sec-WebSocket-Accept = base64(SHA-1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`。SHA-1 是我
+自己写的（~60 行，vendored curl 只导出 `Curl_sha256`），base64 同批补上。
+
+**真正的难点是数据面归属，不是算法。** `Socket` 的字节归 `as_sock` 注册表的 poll 循环（跑在 AS3
+帧边界），WebSocket 的字节归 worker 线程；两条路各读一半就是竞态，而把 poll 循环挪到 worker 上则是
+另一场重写。定案是**移交**：`startServer()` 先 `as_sock_detach()` 把已接受的 fd 从 socket 注册表
+**摘走**（`Socket._sock` 置 NULL，此后该 `Socket` 不再参与 poll、不再派 `progress`/`close`），再交给
+worker；worker 侧把传输抽象成 `as_ws_wire`（client = `CURL*`，server = 裸 fd），**同一套帧编解码器**
+服务两个方向。
+
+**掩码按方向，不按调用点。** 抽出 `as_ws_wire.server` 之后，`as_ws_send_frame` 自己决定
+`use_mask = !wr->server`——客户端必掩、服务端必不掩（RFC 6455 §5.1）。反向的读侧也有一处**必须**
+解掩码而客户端模式从来不会踩到的分支：**控制帧**。close 码与 PONG 载荷原先直接取自原始流，客户端
+模式下对端帧本就不掩码所以一直是对的；服务端模式下对端帧是掩码的，于是 close 码成了垃圾、PONG 回
+的是 xor 后的字节（单元测试先抓到 PONG 载荷 `'a' != 'p1'`）。修法是在控制帧分支上叠一个 125 字节
+栈缓冲（§5.5 保证控制帧 ≤125）解一次，**数据帧仍走它自己的堆副本**——消息可能是几 MB，不能靠栈。
+
+**服务端不派 `CONNECT`。** 实测两次：服务端模式的第一条事件就是 `DATA`。原实现沿用了客户端的
+`AS_WS_MSG_OPEN`，于是 `as_ws_dispatch()` 会派一个 AIR 应用根本不会收到的 `Event.CONNECT`。改为
+`as_ws_push_locked(AS_WS_MSG_OPEN)` 仅客户端（注释写清依据）。同批按实测分叉的还有 `DATA` 的
+`position`：客户端模式在**末尾**，服务端模式是 **0**。
+
+**验收**（角色反转，`test/unit/websocket.ts` 的 `websocket-roundtrip/` 第二条）：编译出来的 AS3 当
+服务端（`ServerSocket` → accept → `startServer`）、Node 手写 RFC 6455 当客户端，断言
+`101` + 正确的 `Sec-WebSocket-Accept` + **不回显子协议**（AIR 实测，即使客户端提了）、掩码入帧被解
+掩码、分片重组（一个消息一次 `DATA`）、BINARY 回显、PING 由传输层 PONG、对端 close `4002` 进
+`closeReason`、`data` 是 `ByteArray` 且 `position == 0`、以及「服务端不派 CONNECT」。`websocket/` 组
+补 6 条形状钉（旧「未实现」文案必须消失、`as_sock_detach` 被 `startServer` 用上、握手是 SHA-1 +
+base64、回的是四行头、服务端路径**一次 curl 都不调**、`position` 按方向分叉），总数 38 → 44。
+`examples/socket.as` 与 `examples/websocket.as` 复跑全绿（后者改成钉新的**参数**契约：`null` 抛
+`#2007`、未连接/被拒/重复调用静默接受且不派事件——与实测一致）。
+
+**留一条口径**：`close(1001)` 会发出 close 码并派 `Event.CLOSE`，但 `closeReason` 仍是 `-1`——因为
+`closeReason` 只由**对端**的 close 帧填，这一点客户端模式早就如此，服务端模式照抄。
+
 ### 阶段四百零八：`air.net.WebSocket`——原生 WebSocket 客户端，不再需要 ANE（v0.4.382 → v0.4.383）
 
 真实项目（talkmed-meeting）的 WebSocket 一直靠一个第三方 ANE（websocketpp + OpenSSL 的
@@ -21376,7 +21425,8 @@ accept、真掩码、真分片、真 close 码）跑通 握手 → TEXT → BINA
 握手 101 + 掩码文本 echo 成功（`temp/wsnative/wssprobe.c`、`temp/wsrt/wss.as`）。
 
 **具名缺口**（记入遗留表）：① `startServer(socket)` 未实现——服务端要在已接受的 `Socket` 上自行算
-`Sec-WebSocket-Accept`（SHA-1(key+GUID) → base64）再复用同一套帧编解码；② 本地 TLS 自签服务器
+`Sec-WebSocket-Accept`（SHA-1(key+GUID) → base64）再复用同一套帧编解码（**已于阶段四百一十三 落地并
+移出遗留表**）；② 本地 TLS 自签服务器
 没有进回归——那要暴露「关掉证书校验」的开关，本运行时不做；③ `bytesTotal`/`protocol` 的服务端选择
 值 curl 不回报（与 adl 实测的服务端不选时行为一致）。
 

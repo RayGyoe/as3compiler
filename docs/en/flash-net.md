@@ -1727,7 +1727,7 @@ Two things most easily got wrong:
 | `connect(url:String, protocols:Vector.<String> = null)` | `ws://` / `wss://`; `protocols` is joined into **one** `Sec-WebSocket-Protocol` header value (`"a, b"`, empty entries skipped) |
 | `sendMessage(format:uint, data:*)` | `fmtTEXT`/`fmtPING`/`fmtPONG` require a `String`, `fmtBINARY` requires a `ByteArray`; an unknown format is **silently dropped** (measured) |
 | `close(code:uint = 0)` | sends a close frame (`code` in a 2-byte payload) and dispatches `Event.CLOSE` once the peer's close arrives |
-| `startServer(socket:Socket)` | **not implemented**, throws `#2031 "... WebSocket server mode is not implemented by this runtime."` (a server needs its own `Sec-WebSocket-Accept`, see 7A.4) |
+| `startServer(socket:Socket)` | adopts an **already accepted** `flash.net.Socket` (AIR's usage: `ServerSocketConnectEvent.socket`), reads the client handshake itself, answers `101` with `Sec-WebSocket-Accept` = base64(`SHA-1(key + GUID)`), and then reuses the same frame codec (server frames are unmasked). `null` throws `#2007`; every other shape is **silently accepted**, see 7A.5 |
 | `protocol` (read/write) | keeps the **application's** value; libcurl does not surface the server's chosen subprotocol, and measured adl also answers the application's value/`null` when the server picks nothing |
 | `closeReason` (read-only) | the peer's close-frame status code, `-1` when the peer sent none |
 | `fmtTEXT=1` / `fmtBINARY=2` / `fmtCLOSE=8` / `fmtPING=9` / `fmtPONG=10` | static constants (the values are the wire opcodes) |
@@ -1770,6 +1770,14 @@ Two things most easily got wrong:
   `buildImportAlias`; a top-level script has no per-file import context, so `program.imports` is also
   published into the global short-name table (otherwise `var w:WebSocket` fails with
   `unknown type WebSocket`).
+- **Server mode changes who reads the bytes, not who owns the connection**: a `Socket`'s data plane
+  belongs to the `as_sock` registry's poll loop while a WebSocket's belongs to the worker thread, and
+  the two must never each read half of it. `startServer()` therefore calls `as_sock_detach()` first --
+  taking the accepted fd **out** of the socket registry and leaving `Socket._sock` as `NULL` (that
+  socket no longer joins the poll loop and never dispatches `progress`/`close`) -- and then hands the
+  fd to the worker. The worker needs no curl there: the peer dialed **us**, so there is no handshake to
+  perform and no TLS layer to keep, which is why `as_ws_wire`'s two carriers (client = `CURL*`,
+  server = a bare fd) can share one frame codec.
 - **`_ws` is a borrowed handle** (the same shape as `Socket._sock`): the props table traces only
   `_protocol` and never `_ws`, while `as_ws_mark_roots()` registers `obj` (the AS3 object) as a
   **permanent root**, so events keep arriving even if the application drops its reference.
@@ -1786,7 +1794,7 @@ Two things most easily got wrong:
 | `sendMessage`/`close` before connecting | **silent no-op** (no throw) |
 | connect failure (refused / non-101 / certificate failure) | **asynchronous** `ioError`: `errorID=2031`, `text="Error #2031: Socket Error. URL: <host>"` (host only, no scheme or port); `Event.CLOSE` is **still** dispatched afterwards |
 | `sendMessage`/`close` after a failure or close | `Error #2002 "Error #2002: Operation attempted on invalid socket."` |
-| `startServer(socket)` | `#2031` (server mode is not implemented, text in 7A.1) |
+| `startServer(socket)` | only `null` throws `TypeError #2007`; a never-connected / refused / already-serving `Socket` is **silently accepted** (no throw, no event), see 7A.5 |
 | no backend (wasm, or a build without curl) | `connect()` is **not silent**: the same asynchronous `ioError #2031`, and the CLI prints a note at build time |
 
 ### 7A.4 Acceptance
@@ -1798,19 +1806,60 @@ node --test --test-name-pattern=websocket test/unit/*.ts      # shape pins + a r
 
 - `examples/websocket.as` is a **self-contained** client contract: defaults, the four argument errors,
   the silent no-ops before connecting, the asynchronous `#2031` of a refused connect (host text and
-  "CLOSE is still dispatched"), `#2002` after the close, and the named `startServer` gap. **It
-  deliberately contains no on-wire round trip** -- that needs a server, and this subset's `ServerSocket`
-  only exists on POSIX targets (7.3, last item), so on Windows it would be skipped in exactly the build
-  that most needs it.
+  "CLOSE is still dispatched"), `#2002` after the close, and `startServer`'s **argument** contract
+  (`null` throws `#2007`; never-connected / refused / repeated calls are silently accepted and dispatch
+  nothing). **It deliberately contains no on-wire round trip** -- that needs a peer, and this subset's
+  `ServerSocket` only exists on POSIX targets (7.3, last item), so on Windows it would be skipped in
+  exactly the build that most needs it.
 - `websocket-roundtrip/` in `test/unit/websocket.ts` drives the same seam with Node's http server (real
   SHA-1 accept, real masking, real fragments, real close code) and asserts: handshake -> TEXT -> BINARY
   -> **fragment reassembly** -> the peer's close `4001` in `closeReason`, `data` being a ByteArray,
   `stringData` `null` for BINARY, the subprotocol header value `chat.v1, chat.v2`, and the server's PING
   being answered by the transport. The `websocket/` group pins the source shape (error texts, the props
   table not tracing `_ws`, the framing belonging to the runtime, the `ASC_HAVE_CURL` wiring, `advapi32`).
-- **Server mode (`startServer`) is a named gap**: it has to complete `SHA-1(key + GUID)` -> base64
-  `Sec-WebSocket-Accept` on an accepted `Socket` and then reuse the same frame codec. That is the entry
-  in `TODO.md`'s outstanding table, not something that "happened not to be done".
+- **Server mode's round trip is the second `websocket-roundtrip/` case**: the roles are reversed -- the
+  compiled AS3 program is the **server** (`ServerSocket` -> accept -> `startServer`) and Node speaks
+  RFC 6455 by hand as the **client**. It asserts the whole server-side view: `101` with the correct
+  `Sec-WebSocket-Accept`, **no** subprotocol echo (AIR measured; not even when the client offers one),
+  masked inbound frames getting unmasked, fragment reassembly, BINARY echo, PING answered by the
+  transport, the peer's close code reaching `closeReason`, plus the "a server dispatches no `CONNECT`"
+  items from 7A.5.
+
+### 7A.5 Server mode (`startServer`)
+
+AIR's usage is **two steps**: a `ServerSocket` accepts, and the application hands
+`event.socket` to `startServer()` inside the `ServerSocketConnectEvent` handler. So server mode is
+not "listen + upgrade", it is "**adopt an already established TCP connection and read the HTTP
+upgrade request off it**". Measured on `adl 51.4.1` (probe `temp/wssrv/`), item by item:
+
+| Item | Measured AIR behaviour | This runtime |
+|---|---|---|
+| `startServer(null)` | synchronous `TypeError #2007 "Parameter socket must be non-null."` | same |
+| never-connected / refused `Socket` | **silently accepted**: no throw, no event | same (the worker starts, finds no fd and ends quietly) |
+| calling `startServer()` twice on one connection | silently accepted | same (the fd was detached, so the second call gets no handle) |
+| client handshake | the server completes the RFC 6455 upgrade | reads the request head, checks `Upgrade: websocket`, answers `101` |
+| response headers | `101 Switching Protocols` + `Upgrade` + `Connection` + `Sec-WebSocket-Accept`, **four lines** | identical |
+| `Sec-WebSocket-Protocol` | **not** echoed, even when the client offered one | not echoed (`protocol` keeps the application's value) |
+| `Event.CONNECT` | **never dispatched** -- the server's first event is `DATA` | never dispatched (`as_ws_push_locked(AS_WS_MSG_OPEN)` is client-only) |
+| `DATA.data` `position` | **0** (client mode leaves it at the end) | split by direction |
+| inbound masking | client frames must be masked and are unmasked | unmasked, control frames included (the close code and PONG payload are the **unmasked** bytes) |
+| outbound masking | server frames are **not** masked | decided by `as_ws_wire.server`, not by the call site |
+| fragmentation | one message, one `DATA` | the same `as_ws_parse_frames` |
+| `PING` | the transport answers `PONG` | the application never sees a PING |
+| `close(1001)` | sends the code and dispatches `Event.CLOSE`, but `closeReason` stays **`-1`** | same (`closeReason` is only filled by the **peer's** close frame) |
+
+**One difference, stated plainly**: after the fd is detached that `Socket` keeps reporting
+`connected == true` -- including after the WebSocket is gone. That is inherent to having two owners (the
+worker holds no reference to the AS3 object), and AIR's behaviour at that point was never measured (the
+probe only established `true` during and after the handshake). `Socket.close()` is inert once detached:
+it cannot close the wire (the worker owns the fd) and dispatches nothing. Either measure AIR and match
+it, or leave this note standing.
+
+**Why server mode also needs the worker thread**: the handshake is a blocking read (the peer may take
+its time finishing the request head), while the `Socket` poll loop runs on the AS3 frame boundary --
+waiting for one byte there freezes the whole application. Once the fd is detached, `as_sock` no longer
+looks at it and the worker owns it, under the same "the worker only fills a queue, events only exist at
+the frame boundary" contract as client mode.
 
 ---
 
@@ -1822,7 +1871,7 @@ node --test --test-name-pattern=websocket test/unit/*.ts      # shape pins + a r
 | `certificateError` with `preventDefault()` let-through | ⏸ deferred (no UI to carry certificate interaction); failure lands as `ioError` |
 | `URLRequestDefaults.setLoginCredentialsForHost` | ⏸ deferred (authentication scenario) |
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **done, see §7** (`SecureSocket` only to API surface + honest failure: TLS state machine unimplemented, `isSupported=false`) |
-| `air.net.WebSocket` | ✅ **done, see §7A** (client side; `startServer()` is a named gap, registered in `TODO.md`) |
+| `air.net.WebSocket` | ✅ **done, see §7A** (client side and `startServer()` server side) |
 | `DatagramSocket` (UDP) | ⏸ deferred (a different base from TCP: connectionless, no `flush` semantics, `send()` carries the target address) |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*`/RTMP | ❌ not done (depends on FMS / audio-video, out of scope) |
 | `FileReference`/`FileReferenceList` (file upload/download dialogs) | ⏸ deferred (depends on native file dialogs) |

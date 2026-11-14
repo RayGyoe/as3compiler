@@ -18441,14 +18441,34 @@ void air_net_WebSocket_close(void* _this, unsigned int code) {
 }
 
 void air_net_WebSocket_startServer(void* _this, Socket* socket) {
-    (void)_this;
+    air_net_WebSocket* o = (air_net_WebSocket*)_this;
     if (socket == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter socket must be non-null.", 2007)); return; }
-    // SERVER MODE IS NOT IMPLEMENTED. It is not a framing problem -- it needs the
-    // RFC 6455 opening handshake on an already-accepted flash.net.Socket (SHA-1 +
-    // base64 Sec-WebSocket-Accept over the client's key, then the same frame codec
-    // the client side already has). Reporting it beats pretending to listen on a
-    // socket that will never answer (§1.5); recorded in TODO.md's leftover table.
-    as_throw(Error_new((char*)"Error #2031: Socket Error. WebSocket server mode is not implemented by this runtime.", 2031));
+    {
+        // Only the null SOCKET throws. Everything else is accepted in silence,
+        // which is what AIR 51.4.1 does (measured in temp/wssrv): a Socket that
+        // was never connected, one whose connect() was refused, and a SECOND
+        // startServer() on an already-serving WebSocket all return without
+        // throwing and without dispatching anything. Inventing #2002/#2082 here
+        // would reject code AIR runs.
+        int st = (o->_ws != NULL) ? as_ws_state_of((as_ws*)o->_ws) : AS_WS_IDLE;
+        if (st == AS_WS_CONNECTING || st == AS_WS_OPEN) return;
+    }
+    {
+        as_sock* s = (as_sock*)socket->_sock;
+        // No as_sock at all means the Socket never connected (Socket._sock is
+        // only allocated by connect()); see as_ws_start_server for the rest.
+        if (s == NULL) return;
+        // One handle per connection, created on demand and released by the CLOSE
+        // event (as_ws_dispatch), exactly like connect().
+        if (o->_ws == NULL) o->_ws = (void*)as_ws_new((void*)o);
+        if (o->_ws == NULL) { o->_closed = 1; as_throw(Error_new((char*)"Error #2031: Socket Error.", 2031)); return; }
+        o->_closeReason = -1;
+        o->_closed = 0;
+        // The worker owns the descriptor from here. A backend-less build (or a
+        // failed worker spawn) queues the ioError instead of throwing, so the app
+        // still sees AIR's asynchronous contract.
+        as_ws_start_server((as_ws*)o->_ws, s);
+    }
 }
 
 int air_net_WebSocket_get_closeReason(void* _this) { return ((air_net_WebSocket*)_this)->_closeReason; }
@@ -18486,7 +18506,13 @@ int as_ws_dispatch(void) {
                 ba->length = m->len;
                 if (m->len > 0) memcpy(ba->data, m->data, (size_t)m->len);
                 gc_write_barrier((void*)ba->data);
-                ba->position = m->len;
+                // Position: client mode leaves it at the END (measured: a 9-byte
+                // text message reports data pos=9), but AIR's SERVER side hands
+                // the payload over at position 0 (measured on AIR 51.4.1 through
+                // startServer). Both are quoted from the probes in temp/wsapi and
+                // temp/wssrv; a listener that reads without rewinding sees the
+                // difference, so it is reproduced per direction.
+                ba->position = as_ws_is_server(w) ? 0 : m->len;
                 EventDispatcher_dispatchEvent((void*)o, (Event*)WebSocketEvent_new((char*)"websocketData", (unsigned)op, ba));
                 total++;
             } else {

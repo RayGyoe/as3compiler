@@ -22,14 +22,14 @@
 
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { test } from 'node:test';
 import assert from 'node:assert';
-import type { Socket } from 'node:net';
+import { Socket as NetSocket, type Socket } from 'node:net';
 import { registerGroup, root, readNorm } from '../harness.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
@@ -71,10 +71,14 @@ function checkWebSocketShape(): string[] {
     rt.includes('as_ws_parse_frames(') && /int fin = \(p\[0\] & 0x80\) != 0;/.test(rt));
   check('a fragmented message is reassembled before it is published',
     rt.includes('as_ws_frag_append(') && /if \(fin\) \{[\s\S]{0,200}as_ws_push\(w, \*msg_op/.test(rt));
-  check('client frames are masked (RFC 6455 §5.3)',
-    rt.includes('as_ws_mask_key(') && /0x80 \| \(unsigned char\)len/.test(rt));
+  // Masking follows the SIDE, not the call site: a client frame must be masked
+  // and a server frame must not (RFC 6455 §5.1), so one codec serves both
+  // directions and the flag comes from as_ws_wire.server.
+  check('client frames are masked and server frames are not',
+    rt.includes('as_ws_mask_key(') && rt.includes('int use_mask = !wr->server;')
+    && /use_mask \? 0x80 : 0\) \| \(unsigned char\)len/.test(rt));
   check('a server PING is answered with a PONG by the transport',
-    rt.includes('as_ws_send_frame(h, 0xA,'));
+    rt.includes('as_ws_send_frame(wr, 0xA,'));
 
   // --- the frame-boundary contract ---------------------------------------
   // Same shape as the socket pump: mark roots, drain in the tick, and keep the
@@ -103,8 +107,35 @@ function checkWebSocketShape(): string[] {
   }
   check('measurement note: an unknown sendMessage format is silently dropped',
     /unknown format/i.test(emitSrc));
-  check('server mode is a NAMED gap, reported as #2031',
-    emitSrc.includes('WebSocket server mode is not implemented by this runtime'));
+  // --- server mode (startServer) -----------------------------------------
+  // AIR 51.4.1 measured: only a NULL socket throws; every other argument is
+  // accepted in silence (never-connected, refused, already-serving). The gap that
+  // used to be reported as #2031 is closed, so the old sentence must be gone.
+  check('server mode is implemented (the old "not implemented" throw is gone)',
+    !emitSrc.includes('WebSocket server mode is not implemented'));
+  check('startServer() adopts the accepted descriptor instead of copying it',
+    /air_net_WebSocket_startServer[\s\S]{0,2000}as_ws_start_server\(/.test(emitSrc)
+    && rt.includes('as_sock_detach('));
+  check('the server handshake is SHA-1 + base64 over the client key',
+    rt.includes('as_ws_sha1(') && rt.includes('as_ws_b64(')
+    && rt.includes('258EAFA5-E914-47DA-95CA-C5AB0DC85B11'));
+  check('the server answers the measured 101 reply',
+    rt.includes('"HTTP/1.1 101 Switching Protocols') &&
+    rt.includes('"Upgrade: websocket') &&
+    rt.includes('"Connection: Upgrade') &&
+    rt.includes('"Sec-WebSocket-Accept: %s'));
+  // No curl anywhere on the server path: the peer dialed us, so there is no
+  // handshake to perform and no TLS layer to keep. A curl call here would mean the
+  // seam had quietly gone back to the client code path.
+  const hnStart = rt.indexOf('static int as_ws_server_handshake(');
+  const hnEnd = rt.indexOf('static void as_ws_worker_body(', hnStart);
+  const serverFn = hnStart >= 0 && hnEnd > hnStart ? rt.slice(hnStart, hnEnd) : '';
+  check('the server handshake path never calls libcurl',
+    serverFn.length > 0 && !serverFn.includes('curl_easy_'));
+  check('a never-connected Socket is accepted silently (no #2007/#2002)',
+    emitSrc.includes('if (s == NULL) return;'));
+  check('DATA position follows AIR per direction (server 0, client end)',
+    emitSrc.includes('as_ws_is_server(w) ? 0 : m->len'));
 
   // --- borrowing, not owning ---------------------------------------------
   // `_ws` is a handle into the runtime registry, exactly like Socket._sock: the
@@ -306,7 +337,8 @@ function cCompiler(): string | null {
 }
 
 test('websocket-roundtrip/ a real server: handshake, TEXT, BINARY, fragments, close code', async (t) => {
-  if (cCompiler() === null) {
+  const cc = cCompiler();
+  if (cc === null) {
     t.skip('no C compiler on PATH');
     return;
   }
@@ -392,7 +424,8 @@ trace(ioText == null ? "OK-NO-IOERR" : "FAIL-IOERR " + ioText);
     // synchronous child would block the event loop its peer needs.
     let out = '';
     try {
-      const r = await runAsync('node', ['src/index.ts', asFile, '-o', exe, '--run'], {
+      // Use the compiler this machine actually has (cc is absent on Windows).
+      const r = await runAsync('node', ['src/index.ts', asFile, '--cc', cc, '-o', exe, '--run'], {
         cwd: root,
         timeout: 300_000,
         maxBuffer: 32 * 1024 * 1024,
@@ -420,5 +453,281 @@ trace(ioText == null ? "OK-NO-IOERR" : "FAIL-IOERR " + ioText);
   } finally {
     await fixture.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// websocket-roundtrip/: air.net.WebSocket.startServer() -- the SERVER side.
+// ---------------------------------------------------------------------------
+//
+// The compiled AS3 program IS the server (ServerSocket -> accept -> startServer)
+// and this process is the raw RFC 6455 CLIENT. That direction is the one with no
+// coverage until now: AIR hands startServer() an already-accepted
+// flash.net.Socket, so the runtime has to READ the opening handshake instead of
+// writing one, and every frame it sends must be unmasked while every frame it
+// receives must be unmasked-after-masking.
+
+// A CLIENT frame: always masked (RFC 6455 §5.1), FIN optional for fragments.
+function clientFrame(opcode: number, payload: Buffer, fin = true): Buffer {
+  const n = payload.length;
+  const head: number[] = [(fin ? 0x80 : 0x00) | opcode];
+  if (n < 126) head.push(0x80 | n);
+  else if (n < 65536) head.push(0x80 | 126, (n >> 8) & 0xff, n & 0xff);
+  else {
+    head.push(0x80 | 127, 0, 0, 0, 0,
+      (n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff);
+  }
+  const mask = Buffer.from([0x11, 0x22, 0x33, 0x44]);
+  const body = Buffer.from(payload);
+  for (let i = 0; i < body.length; i++) body[i] ^= mask[i & 3];
+  return Buffer.concat([Buffer.from(head), mask, body]);
+}
+
+// The AS3 server. Every line it prints is matched by the driver below, so a
+// failure names itself instead of "the program exited 1".
+const WS_SERVER_SRC = `
+import air.net.WebSocket;
+import flash.events.Event;
+import flash.events.IOErrorEvent;
+import flash.events.ServerSocketConnectEvent;
+import flash.events.WebSocketEvent;
+import flash.net.ServerSocket;
+import flash.net.Socket;
+import flash.utils.ByteArray;
+
+var srv:ServerSocket = new ServerSocket();
+var ws:WebSocket = null;
+var connectSeen:Boolean = false;
+var dataIsBytes:Boolean = true;
+var posZero:Boolean = true;
+var texts:String = "";
+var closeReason:int = -999;
+var closed:Boolean = false;
+var ioText:String = null;
+
+function onAccept(e:ServerSocketConnectEvent):void {
+    var sock:Socket = e.socket;
+    trace("SRV-ACCEPT-CONNECTED=" + sock.connected);
+    ws = new WebSocket();
+    ws.addEventListener(Event.CONNECT, function(ev:Event):void { connectSeen = true; });
+    ws.addEventListener(WebSocketEvent.DATA, onData);
+    ws.addEventListener(Event.CLOSE, onClose);
+    ws.addEventListener(IOErrorEvent.IO_ERROR, function(ev:IOErrorEvent):void { ioText = ev.text; });
+    ws.startServer(sock);
+    trace("SRV-STARTSERVER-DONE protocol=" + (ws.protocol === null ? "null" : ws.protocol));
+}
+
+function onData(e:WebSocketEvent):void {
+    if (!(e.data is ByteArray)) dataIsBytes = false;
+    if (e.data.position != 0) posZero = false;
+    if (e.format == WebSocket.fmtTEXT) {
+        texts = texts + e.stringData + "|";
+        ws.sendMessage(WebSocket.fmtTEXT, e.stringData);
+    } else {
+        ws.sendMessage(WebSocket.fmtBINARY, e.data);
+    }
+}
+
+function onClose(e:Event):void {
+    closeReason = ws.closeReason;
+    closed = true;
+}
+
+srv.addEventListener(ServerSocketConnectEvent.CONNECT, onAccept);
+srv.bind(0, "127.0.0.1");
+srv.listen();
+trace("PORT=" + srv.localPort);
+
+for (var i:int = 0; i < 2000 && !closed; i++) tickTimers();
+
+trace(closed ? "OK-CLOSED" : "FAIL-NO-CLOSE");
+trace(connectSeen ? "FAIL-SERVER-DISPATCHED-CONNECT" : "OK-NO-CONNECT-EVENT");
+trace(dataIsBytes ? "OK-DATA-BYTES" : "FAIL-DATA-NOT-BYTES");
+trace(posZero ? "OK-POS-ZERO" : "FAIL-POS-NOT-ZERO");
+trace(texts == "srv-text|fragmented|" ? "OK-TEXTS" : "FAIL-TEXTS " + texts);
+trace(closeReason == 4002 ? "OK-CLOSE-4002" : "FAIL-CLOSE-CODE " + closeReason);
+trace(ioText == null ? "OK-NO-IOERR" : "FAIL-IOERR " + ioText);
+trace("DONE");
+`;
+
+test('websocket-roundtrip/ startServer(): a compiled AS3 server answers a raw client', async (t) => {
+  const cc = cCompiler();
+  if (cc === null) { t.skip('no C compiler on PATH'); return; }
+  const dir = mkdtempSync(join(tmpdir(), 'as-wssrv-'));
+  const asFile = join(dir, 'wssrv.as');
+  const exe = join(dir, process.platform === 'win32' ? 'wssrv.exe' : 'wssrv');
+  writeFileSync(asFile, WS_SERVER_SRC);
+
+  // Build synchronously (nothing is listening yet), then SPAWN the binary: its
+  // stdout is how the AS3 side reports the port it picked (bind(0)), and the
+  // client cannot exist before it knows that number.
+  execFileSync('node', ['src/index.ts', asFile, '--cc', cc, '-o', exe], {
+    cwd: root,
+    timeout: 300_000,
+    stdio: 'pipe',
+  });
+
+  const child = spawn(exe, [], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += String(d); });
+  child.stderr.on('data', (d) => { stderr += String(d); });
+
+  const sock = new NetSocket();
+  try {
+    const port = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(`the AS3 server never printed PORT=:\n${stdout}\n${stderr}`)),
+        30_000);
+      const look = (): void => {
+        const m = /PORT=(\d+)/.exec(stdout);
+        if (m !== null) { clearTimeout(timer); resolve(Number(m[1])); }
+      };
+      child.stdout.on('data', look);
+      look();
+    });
+
+    // --- the client's view of the wire -----------------------------------
+    let head = '';
+    let rest = Buffer.alloc(0);
+    const frames: { fin: boolean; op: number; body: Buffer }[] = [];
+    let wake: (() => void) | null = null;
+    let headReady: (() => void) | null = null;
+
+    const parse = (): void => {
+      for (;;) {
+        if (rest.length < 2) break;
+        const fin = (rest[0] & 0x80) !== 0;
+        const op = rest[0] & 0x0f;
+        const masked = (rest[1] & 0x80) !== 0;
+        assert.ok(!masked, 'a SERVER frame must not be masked (RFC 6455 §5.1)');
+        let len = rest[1] & 0x7f;
+        let off = 2;
+        if (len === 126) {
+          if (rest.length < 4) break;
+          len = rest.readUInt16BE(2);
+          off = 4;
+        }
+        if (rest.length < off + len) break;
+        frames.push({ fin, op, body: Buffer.from(rest.subarray(off, off + len)) });
+        rest = rest.subarray(off + len);
+      }
+      if (wake !== null) { const w = wake; wake = null; w(); }
+    };
+
+    sock.on('data', (d: Buffer) => {
+      rest = Buffer.concat([rest, d]);
+      if (head === '') {
+        const i = rest.indexOf('\r\n\r\n');
+        if (i < 0) return;
+        head = rest.subarray(0, i + 4).toString('latin1');
+        rest = rest.subarray(i + 4);
+        if (headReady !== null) { const h = headReady; headReady = null; h(); }
+      }
+      parse();
+    });
+
+    const waitHead = async (): Promise<void> => {
+      if (head !== '') return;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no handshake response:\n${stdout}\n${stderr}`)), 20_000);
+        headReady = () => { clearTimeout(timer); resolve(); };
+      });
+    };
+
+    const nextFrame = async (what: string): Promise<{ fin: boolean; op: number; body: Buffer }> => {
+      for (;;) {
+        const f = frames.shift();
+        if (f !== undefined) return f;
+        const got = await new Promise<boolean>((resolve) => {
+          const timer = setTimeout(() => resolve(false), 20_000);
+          wake = () => { clearTimeout(timer); resolve(true); };
+        });
+        if (!got) throw new Error(`timed out waiting for ${what}:\n${stdout}\n${stderr}`);
+      }
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      sock.once('connect', () => resolve());
+      sock.once('error', reject);
+      sock.connect(port, '127.0.0.1');
+    });
+
+    const key = Buffer.from('the-sample-nonce').toString('base64');
+    sock.write([
+      'GET /chat HTTP/1.1',
+      `Host: 127.0.0.1:${port}`,
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Key: ${key}`,
+      'Sec-WebSocket-Version: 13',
+      'Sec-WebSocket-Protocol: chat, superchat',
+      '', '',
+    ].join('\r\n'));
+
+    await waitHead();
+    assert.match(head, /^HTTP\/1\.1 101 Switching Protocols/);
+    const want = createHash('sha1').update(key + GUID).digest('base64');
+    assert.ok(head.includes(`Sec-WebSocket-Accept: ${want}`),
+      `the server's accept token is wrong:\n${head}`);
+    // AIR 51.4.1 measured: the server echoes NO subprotocol, even when asked.
+    assert.ok(!/sec-websocket-protocol/i.test(head),
+      `the server must not echo a subprotocol:\n${head}`);
+
+    sock.write(clientFrame(1, Buffer.from('srv-text')));
+    const echo = await nextFrame('the TEXT echo');
+    assert.strictEqual(echo.op, 1);
+    assert.strictEqual(echo.body.toString('utf8'), 'srv-text');
+
+    // Fragment reassembly on the SERVER side: two frames, one event, one echo.
+    sock.write(clientFrame(1, Buffer.from('frag'), false));
+    sock.write(clientFrame(0, Buffer.from('mented'), true));
+    const frag = await nextFrame('the reassembled TEXT echo');
+    assert.strictEqual(frag.op, 1);
+    assert.strictEqual(frag.body.toString('utf8'), 'fragmented');
+
+    sock.write(clientFrame(2, Buffer.from([1, 2, 3])));
+    const bin = await nextFrame('the BINARY echo');
+    assert.strictEqual(bin.op, 2);
+    assert.deepStrictEqual([...bin.body], [1, 2, 3]);
+
+    sock.write(clientFrame(9, Buffer.from('p1')));
+    const pong = await nextFrame('the PONG');
+    assert.strictEqual(pong.op, 10);
+    assert.strictEqual(pong.body.toString('utf8'), 'p1');
+
+    const closePayload = Buffer.alloc(4);
+    closePayload.writeUInt16BE(4002, 0);
+    closePayload.write('bye', 2, 'utf8');
+    sock.write(clientFrame(8, closePayload));
+    const echoClose = await nextFrame('the CLOSE echo');
+    assert.strictEqual(echoClose.op, 8);
+    assert.strictEqual(echoClose.body.readUInt16BE(0), 4002);
+
+    // --- the server's own report -----------------------------------------
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { child.kill(); reject(new Error(`the AS3 server did not exit:\n${stdout}\n${stderr}`)); }, 60_000);
+      child.on('exit', () => { clearTimeout(timer); resolve(); });
+    });
+    for (const line of [
+      'SRV-ACCEPT-CONNECTED=true',
+      'SRV-STARTSERVER-DONE protocol=null',
+      'OK-CLOSED', 'OK-NO-CONNECT-EVENT', 'OK-DATA-BYTES', 'OK-POS-ZERO',
+      'OK-TEXTS', 'OK-CLOSE-4002', 'OK-NO-IOERR', 'DONE',
+    ]) {
+      assert.ok(stdout.includes(line), `server line "${line}" missing:\n${stdout}\n${stderr}`);
+    }
+  } finally {
+    sock.destroy();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+      // Windows keeps the exe locked until the process is really gone; the rm
+      // below would fail with EPERM if it ran first.
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => resolve(), 5000);
+        child.on('exit', () => { clearTimeout(timer); resolve(); });
+      });
+    }
+    rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
