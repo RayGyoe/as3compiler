@@ -740,6 +740,20 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
     'dng_sdk', 'piex', 'expat', 'freetype2', 'harfbuzz', 'icu',
     'zlib',
   ];
+  // skia.lib on Windows is built with skia_use_direct3d=true, so linking the archive
+  // at ALL pulls in D3D-referencing members -- measured: a CPU-raster app (no
+  // ASC_RENDER_WINGPU, no d3d_glue.cc, no gl_glue.cc) still fails to link with
+  //   lld-link: undefined symbol: D3D12SerializeRootSignature  (skia.lib gpu.GrD3DRootSignature.obj)
+  //   lld-link: undefined symbol: D3DCompile                   (skia.lib gpu.GrD3DPipelineStateBuilder.obj)
+  // The two import libraries are the measured minimum and stay link-time-only: the
+  // resulting import table carries neither d3d12.dll nor d3dcompiler_47.dll, which is
+  // what keeps the win32 floor at Win7 for the CPU path (scripts/win7-imports.ts).
+  // `dxgi` and `d3d12allocator` belong to the D3D12 backend proper and are added there.
+  // Scope: a WINDOW build. A headless (visible=false) build is rasterized into a
+  // surface with no swapchain and never loads the archive members that need these,
+  // and test/unit/build.ts pins that the offscreen link set stays free of D3D
+  // (a headless build that drags in D3D has linked a window it does not have).
+  if (onWin && visible) linkLibs.push('d3d12', 'd3dcompiler');
   // <renderMode> direct/gpu maps to the native window-on-GPU backend. The switch
   // the *generated C* and window_glue.cc key off is ASC_RENDER_WINGPU, which is
   // backend-neutral ("this window's Skia composition runs on the GPU"); the
@@ -801,7 +815,7 @@ export function airManifest(vendorRel: string, visible: boolean, resizable: bool
       // skia_use_direct3d=false, i.e. a second full Skia build per bit width
       // (~+36 MB each) for a build-machine-only benefit. Not worth it while the
       // runtime artifact is already provably clean; see docs/zh-cn/win32.md §6 (Win7).
-      linkLibs.push('d3d12', 'd3dcompiler');
+      // (d3d12 + d3dcompiler are already on every Windows Skia link, above.)
     } else if (onWin) {
       defines.push('ASC_RENDER_D3D=1');
       sources.push(d3dSrc);
