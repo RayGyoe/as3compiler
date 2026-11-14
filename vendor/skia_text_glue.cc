@@ -1070,12 +1070,21 @@ int sk_textlayout_line_metrics(void* para, int* starts, int* ends, double* tops,
   std::vector<LineMetrics> lm;
   p->getLineMetrics(lm);
   int n = 0;
+  // `tops` is the ACCUMULATED line-box height, deliberately not `fBaseline - fAscent`.
+  // Skia's own box height is `fHeight`, and on Windows an EMPTY trailing line reports a
+  // baseline/ascent pair that lands one pixel above where the previous box ended
+  // (measured: fHeight 11 per line, but an empty second line's fBaseline - fAscent is
+  // 10 against 0 for the first). Its only consumer is TextField.textHeight's "sum of
+  // the line boxes that actually hold text" (see emit.ts), which wants exactly this
+  // running sum -- and `fHeight` is the same number the line box reports as h.
+  double acc = 0.0;
   for (auto& m : lm) {
     if (n >= cap) break;
     if (starts) starts[n] = (int)m.fStartIndex;
     if (ends) ends[n] = (int)m.fEndIndex;
-    if (tops) tops[n] = (double)m.fBaseline - (double)m.fAscent;
+    if (tops) tops[n] = acc;
     if (bottoms) bottoms[n] = (double)m.fBaseline + (double)m.fDescent;
+    acc += (double)m.fHeight;
     n++;
   }
   return n;

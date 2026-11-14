@@ -26051,6 +26051,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int n = as_tf_line_table(tf, starts, NULL, tops, AS_TF_MAX_LINES);');
     this.line('int k = n;');
     this.line('while (k > 1 && as_tf_line_end(et, starts, n, k - 1, elen) <= starts[k - 1]) k--;');
+    // `tops[i]` is the ACCUMULATED box height of lines 0..i-1 (sk_textlayout_line_metrics),
+    // so tops[k] is "how tall the k lines that hold text are". It cannot be rebuilt from
+    // the baselines here: an empty line's baseline sits one pixel off its box on Windows
+    // (see that function), which is what made "ab\n" report 10 instead of one full box.
     this.line('double h = (k < n) ? tops[k] : as_skia_textlayout_height(para);');
     // ...and the leading it drops is the LAST counted line's own (a stylesheet rule's
     // `leading` lives on the run, not on defaultTextFormat): adl reports 30 for two
