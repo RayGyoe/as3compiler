@@ -20,15 +20,18 @@ function checkLeafMethodDevirtualization(): string[] {
     /Base_inherited\(\(\(Leaf\*\)as_req_obj\(\(void\*\)\(g_leaf\)\)\), 4\)/.test(c));
   check('no fabricated Leaf_inherited implementation or call is emitted',
     !c.includes('Leaf_inherited('));
+  // The return value is hoisted into a temp so the shadow-stack leave runs
+  // AFTER the call (Error.getStackTrace, stage 431); the direct-call binding
+  // itself is what this pin guards.
   check('an implicit public this call is direct',
-    c.includes('return (Leaf_helper(this, value));'));
+    c.includes('= (Leaf_helper(this, value));'));
   check('a sealed with call on a leaf receiver is direct',
     /g_withResult = \(Leaf_callHelper\(__w\d+, 5\)\)/.test(c));
 
   check('a base-typed reference still dispatches an override through the vtable',
     /g_base\)\)\)->vtable->polymorphic\(/.test(c));
   check('private methods stay outside the first devirtualization slice',
-    c.includes('return (this->vtable->secret(this));'));
+    c.includes('= (this->vtable->secret(this));'));
   check('getters stay virtual even when their receiver is a leaf class',
     c.includes('this->vtable->get_accessor(this)')
     && c.includes('->vtable->get_helperCount('));
@@ -39,7 +42,7 @@ function checkLeafMethodDevirtualization(): string[] {
   check('interface receivers keep their independent interface vtable',
     /g_runner\.vt->run\(\(void\*\)as_req_obj/.test(c));
   check('super calls keep their existing owner-direct binding',
-    c.includes('return Base_polymorphic(this);'));
+    c.includes('= Base_polymorphic(this);'));
   check('bound-method thunks keep virtual dispatch',
     /Leaf_callHelper__bound[\s\S]*?\(\(Leaf\*\)env\)->vtable->callHelper/.test(c));
 

@@ -1779,7 +1779,7 @@ function checkEmitListenerSnapshot(): string[] {
     disp.indexOf('as_disp_depth++;') < disp.indexOf('as_disp_depth--;') &&
     disp.indexOf('as_disp_depth--;') < disp.indexOf('return !event->cancelled;'));
   check('the frame guard resets the depth after a longjmp',
-    c.includes('as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return;'));
+    c.includes('as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return;'));
 
   console.log(`     [listener-snap] ${ok} check(s) passed`);
   return bad;
@@ -2702,7 +2702,7 @@ function checkEntryPointRecovery(): string[] {
   // reuses this id inherits a stale NativeWindow pointing at it.
   const closeBody = fnBody(c, 'static void ASC_window_on_close(int id) {');
   check('a close that throws still detaches the window slot',
-    closeBody.includes('as_disp_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return;'));
+    closeBody.includes('as_disp_depth = 0; as_astack_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return;'));
   // The callbacks are handed to the native layer by these exact names, so no
   // _impl/body split may reappear: both halves would have to be installed, and a
   // missed rename leaves the window with a dead handler.
@@ -3915,14 +3915,14 @@ function checkEmitObjectTruthy(): string[] {
   const objParam = gen('function t(o:Object):Boolean { return Boolean(o); }\ntrace(t(null));');
   const objBody = body(objParam, /static bool t\(Object\* _o\) \{/);
   check('Boolean(<Object param>) unboxes before ToBoolean',
-    objBody.includes('return as_v_truthy(as_obj_to_value((void*)(_o)));'));
+    objBody.includes('= as_v_truthy(as_obj_to_value((void*)(_o)));'));
   check('Boolean(<Object param>) is NOT a pointer test',
     objBody !== '' && !/_o != NULL/.test(objBody));
 
   const objField = gen('class Holder { public var o:Object; public function f():Boolean { return Boolean(o); } }\ntrace(new Holder());');
   check('an Object FIELD takes the same path',
     body(objField, /static bool Holder_f\(void\* _this\) \{/)
-      .includes('return as_v_truthy(as_obj_to_value((void*)(this->_o)));'));
+      .includes('= as_v_truthy(as_obj_to_value((void*)(this->_o)));'));
 
   // --- everything else keeps its old, AIR-matching spelling ---------------------
   const plain = gen('class Plain { public var v:int = 1; }\n'
@@ -3934,10 +3934,10 @@ function checkEmitObjectTruthy(): string[] {
       /static bool t\(as_array\* a\) \{/).includes('return (a != NULL);'));
   check('a `*` operand still goes through as_v_truthy',
     body(gen('function t(d:*):Boolean { return Boolean(d); }\ntrace(t(1));'),
-      /static bool t\(as_value d\) \{/).includes('return as_v_truthy(d);'));
+      /static bool t\(as_value d\) \{/).includes('= as_v_truthy(d);'));
   check('a static String keeps the empty-string test',
     body(gen('function t(s:String):Boolean { return Boolean(s); }\ntrace(t(""));'),
-      /static bool t\(char\* s\) \{/).includes('return (s != NULL && strlen(s) > 0);'));
+      /static bool t\(char\* s\) \{/).includes('= (s != NULL && strlen(s) > 0);'));
   check('a bool operand is still the value itself',
     body(gen('function t(b:Boolean):Boolean { return Boolean(b); }\ntrace(t(true));'),
       /static bool t\(bool b\) \{/).includes('return b;'));

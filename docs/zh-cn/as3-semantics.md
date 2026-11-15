@@ -179,7 +179,7 @@ AIR 的内建方法形参表**不能凭文档抄**：AS3 参考页会漏掉真�
 |------|------|------|------|------|
 | A | AIR 接受，而**我们要求补齐实参** | 300 → 0 | `ctx.drawTriangles(ib)`、`ctx.configureBackBuffer(1, 1, 0)`、`new NativeMenuItem()`、`hasOwnProperty()` | ✅ 已修：按文档值补默认（`greq`/`gopt` 两组形参助手） |
 | B | **我们发明了 AIR 没有的默认** | 48 → 0 | `g.moveTo(1)`、`m.rotate()`、`r.inflate(1)`、`p.normalize()`、`new ShaderData()` | ✅ 已修：改回必填（收紧——不再接受 `mxmlc` 拒绝的程序） |
-| C | 我们声明了**多余的形参**（AIR 不许传这么多） | 9 | `File.moveTo` 多一个 `force`、`BitmapData.encode` 多一个 `byteArrayOffset`、`FileListEvent` 多一个 `directory` | 登记遗留（需改 C 侧签名与实现） |
+| C | 我们声明了**多余的形参**（AIR 不许传这么多） | 9 → 6 | `File.moveTo` 的 `force`（阶段二百九十八删）、`FileListEvent` 的 `directory`（阶段二百九十九删）、`BitmapData.encode` 的 `byteArrayOffset`（阶段四百二十一改回三参） | 具名三例已修；余 6 条待逐条复核 C 侧签名 |
 | D | AIR 接受**更多实参**（`...rest` 或更长的形参表） | 27+ | `NetConnection.connect(…rest)`；`MouseEvent` 构造器缺 `commandKey`/`controlKey`/`clickCount`；`TextFormat` 构造器缺 7 个尾参 | 登记遗留（需 C 侧接受并忽略多出的实参） |
 | E | 成员**根本没实现**（与实参无关） | 3 | `BitmapData.floodFill`/`merge`、`SharedObject.name` | 登记遗留 |
 

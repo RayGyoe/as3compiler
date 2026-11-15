@@ -14,7 +14,7 @@ import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, parseAirApp, prepareAirApp } from '../../src/air-app.ts';
 import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
-import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS, readNorm } from '../harness.ts';
+import { registerGroup, root, dir, EXAMPLE_TIMEOUT_MS, readNorm, PROBE_SYSTEM_LINK_FLAGS } from '../harness.ts';
 
 // ---- flash.display.Screen (阶段八十九·七十一) ----
 // Screen's contract is not "return some display info" — it is a set of measured
@@ -1779,6 +1779,43 @@ function checkCapabilitiesOs(): string[] {
   return bad;
 }
 
+// ---- 阶段四百二十二 (plan E1+E2): openWithDefaultApplication + systemIdleMode ----
+function checkDesktopIntegration(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [desktop] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [desktop] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.filesystem.File;\n' +
+    'import flash.desktop.NativeApplication;\n' +
+    'import flash.desktop.SystemIdleMode;\n' +
+    'var f:File = new File();\n' +
+    'f.openWithDefaultApplication();\n' +
+    'NativeApplication.nativeApplication.systemIdleMode = SystemIdleMode.KEEP_AWAKE;\n')).c.replace(/\r\n/g, '\n');
+  const owStart = c.indexOf('void File_openWithDefaultApplication(void* _this) {');
+  const ow = c.slice(owStart, c.indexOf('\n}', owStart));
+  check('openWith raises #1009 on a null path (not the usual #2037)',
+    ow.includes('o->_nativePath == NULL') && ow.includes('Error #1009: Cannot access a property or method of a null object reference.'));
+  check('openWith raises #3003 on a missing path',
+    ow.includes('as_path_exists(o->_nativePath)') && ow.includes('Error #3003: File or directory does not exist.'));
+  check('openWith hands the path to the OS launcher seam', ow.includes('as_open_external(o->_nativePath)'));
+  const smStart = c.indexOf('void NativeApplication_set_systemIdleMode(void* _this, char* value) {');
+  const sm = c.slice(smStart, c.indexOf('\n}', smStart));
+  check('systemIdleMode null raises #2007 idleMode', sm.includes('Error #2007: Parameter idleMode must be non-null.'));
+  check('systemIdleMode invalid value raises #2008', sm.includes('Error #2008: Parameter systemIdleMode must be one of the accepted values.'));
+  check('systemIdleMode validates normal/keepAwake', sm.includes('strcmp(value, "normal")') && sm.includes('strcmp(value, "keepAwake")'));
+  check('systemIdleMode drives the idle backend', sm.includes('as_set_idle_mode(strcmp(value, "keepAwake") == 0)'));
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  check('idle backend uses SetThreadExecutionState on Windows', pre.includes('SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)'));
+  check('idle backend uses IOPMAssertion on macOS', pre.includes('IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep'));
+  check('macOS idle backend includes IOPMLib.h', pre.includes('#include <IOKit/pwr_mgt/IOPMLib.h>'));
+  console.log(`[desktop] ${ok} desktop-integration checks passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/DesktopIntegration', checkDesktopIntegration);
 registerGroup('unit: platform/DrawableReadable', checkDrawableReadable);
 registerGroup('unit: platform/AudioWiring', checkAudioWiring);
 registerGroup('unit: platform/Screen', checkScreen);
@@ -3326,7 +3363,7 @@ registerGroup('unit: platform/WebResizeSeam', checkWebResizeSeam);
 
 // ---- flash.net.NetworkInfo.findInterfaces: the OS interface inventory ----
 //
-// 阶段三百六十三. The TalkMED desktop client builds its device id from the first
+// 阶段三百六十三. A real desktop client builds its device id from the first
 // interface that reports a hardwareAddress and, when the Vector is empty, falls
 // into a Windows-only branch that does `new File("C:/Windows/System32/cmd.exe")`.
 // While this class was a shell (empty Vector + one "not implemented" line on
@@ -3407,6 +3444,8 @@ function checkNetworkInventory(): string[] {
   // verbatim (trailing space intact) and ipVersion picks the IPVersion constant.
   check('hardwareAddress is copied from the platform row verbatim',
     body.includes('cur->hardwareAddress = as_str_dup(rows[i].mac);'));
+  check('displayName is carried per row (Windows FriendlyName, "" on POSIX), not hard-coded',
+    body.includes('cur->displayName = as_str_dup(rows[i].display);'));
   check('ipVersion is one of the two IPVersion constants',
     /rows\[i\]\.v6 != 0 \? "IPv6" : "IPv4"/.test(body));
 
@@ -3459,8 +3498,34 @@ function checkNetworkInventory(): string[] {
     && preamble.includes('((struct sockaddr_in6*)p->ifa_netmask)->sin6_addr'));
   check('a target with no inventory reports the gap instead of pretending to be offline',
     /as_shell_unsupported\("flash\.net\.NetworkInfo\.findInterfaces \(this target has no interface inventory/.test(preamble));
-  check('the arm is POSIX-only, so wasm/win32 keep the honest fallback',
+  check('the POSIX arm is getifaddrs-guarded, so wasm keeps the honest fallback',
     preamble.includes('#define ASC_NET_IFADDRS 1') && /#if !defined\(__wasi__\) && !defined\(__EMSCRIPTEN__\)/.test(preamble));
+
+  // (9) The Windows arm (C1). AIR's Windows inventory differs from the POSIX walk in
+  // measured ways (temp/netwin/net-air-ref.txt): GUID name, FriendlyName display,
+  // UPPERCASE '-' MAC with NO trailing space, active=OperStatus, mtu=(int)Mtu
+  // (loopback -1), natural unicast order. Each is pinned to the line that handles it.
+  check('the Windows arm is GetAdaptersAddresses under ASC_NET_WIN32',
+    preamble.includes('#define ASC_NET_WIN32 1') && preamble.includes('GetAdaptersAddresses(AF_UNSPEC, flags, NULL, addrs, &size)'));
+  check('Windows MAC is UPPERCASE hex joined by "-" with NO trailing space',
+    preamble.includes('static void as_net_mac_str_win(') && /p \+= snprintf\(out \+ p, 4, "%02X", hw\[i\]\);/.test(preamble)
+    && preamble.includes("if (i + 1 < len) out[p++] = '-';"));
+  check('Windows name is the adapter GUID and display the FriendlyName (UTF-8)',
+    preamble.includes('snprintf(r->name, sizeof r->name, "%s", a->AdapterName);')
+    && preamble.includes('as_net_wide_utf8(r->display, (int)sizeof r->display, a->FriendlyName);'));
+  check('Windows active is OperStatus==up (loopback is active, unlike POSIX)',
+    preamble.includes('int active = (a->OperStatus == IfOperStatusUp) ? 1 : 0;'));
+  check('Windows mtu is (int)Mtu, so the loopback 0xFFFFFFFF reads as -1',
+    preamble.includes('int mtu = (int)a->Mtu;'));
+  check('Windows drops IPv6 link-local (fe80::/10) like the POSIX arm',
+    preamble.includes('if (b6[0] == 0xfe && (b6[1] & 0xc0) == 0x80) continue;'));
+  check('Windows broadcast is the computed directed broadcast, suppressed for loopback',
+    preamble.includes('int loopback = (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) ? 1 : 0;')
+    && preamble.includes('ba.s_addr = htonl(ip | ~mask);'));
+  check('the row carries a GUID-sized name and a display field',
+    preamble.includes('char name[64];') && preamble.includes('char display[128];'));
+  check('iphlpapi is on the probe link line (GetAdaptersAddresses is an OS import)',
+    PROBE_SYSTEM_LINK_FLAGS.includes('-liphlpapi'));
 
   console.log(`     [netif] ${ok} check(s) passed`);
   return bad;
@@ -3551,3 +3616,239 @@ function checkMoveLoopPaint(): string[] {
 }
 
 registerGroup('unit: platform/MoveLoopPaint', checkMoveLoopPaint);
+
+function checkMicrophoneDevices(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [micdev] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [micdev] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  // (1) The WASAPI inventory seam: active capture endpoints, outside the GC.
+  check('preamble enumerates active WASAPI capture endpoints',
+    pre.includes('EnumAudioEndpoints(en, eCapture, DEVICE_STATE_ACTIVE, &col)'));
+  check('preamble reads the device friendly name (PKEY pid 14)',
+    pre.includes('as_mic_pkey_friendly') && pre.includes('}, 14};'));
+  // (2) GUIDs by hand, no global INITGUID side effects.
+  check('preamble defines the WASAPI GUIDs by hand (no initguid.h)',
+    pre.includes('as_mic_clsid_enumerator') && pre.includes('as_mic_iid_enumerator') && !pre.includes('#include <initguid.h>'));
+  // (3) mmdeviceapi.h's Microphone enum constant is renamed around the include so
+  // it cannot collide with the flash.media.Microphone C struct (GDI Rectangle precedent).
+  check('the Microphone enum clash is renamed around mmdeviceapi.h',
+    pre.includes('#define Microphone ASC_WASAPI_Microphone') && pre.includes('#undef Microphone'));
+  // (4) Non-Windows targets report the gap once rather than pretending no mic.
+  check('non-Windows targets report the capture-inventory gap loudly',
+    pre.includes('flash.media.Microphone (this target has no capture-device inventory'));
+  // Generated device-face bodies.
+  const c = generateC(parse(
+    'import flash.media.Microphone;\n' +
+    'var m:Microphone = Microphone.getMicrophone();\n' +
+    'var n:Array = Microphone.names;\n' +
+    'var s:Boolean = Microphone.isSupported;\n' +
+    'var e:Microphone = Microphone.getEnhancedMicrophone(0);\n')).c.replace(/\r\n/g, '\n');
+  const fromStart = c.indexOf('static Microphone* Microphone__from_index(int _index) {');
+  const fromBody = c.slice(fromStart, c.indexOf('\n}', fromStart));
+  // (5) AIR-measured defaults (adl 51.4.1, temp/micprobe).
+  check('getMicrophone populates the AIR defaults',
+    fromBody.includes('m->rate = 8;') && fromBody.includes('m->gain = 50;')
+    && fromBody.includes('m->silenceLevel = 10;') && fromBody.includes('m->silenceTimeout = 2000;')
+    && fromBody.includes('m->activityLevel = -1;') && fromBody.includes('m->codec = as_str_dup("nellymoser");')
+    && fromBody.includes('m->enableVAD = true;'));
+  // (6) index<0 selects the first device; out-of-range returns null.
+  check('index<0 selects device 0 and out-of-range returns NULL',
+    fromBody.includes('int idx = _index < 0 ? 0 : _index;') && fromBody.includes('if (idx >= n) return NULL;'));
+  // (7) GC write barriers on the freshly assigned string fields.
+  check('name/codec assignments carry GC write barriers',
+    fromBody.includes('gc_write_barrier((void*)m->name);') && fromBody.includes('gc_write_barrier((void*)m->codec);'));
+  // (8) names is a fresh Array of GC strings on every call.
+  const namesStart = c.indexOf('static as_array* Microphone_get_names_static(void* _this) {');
+  const namesBody = c.slice(namesStart, c.indexOf('\n}', namesStart));
+  check('names builds a fresh Array of friendly-name strings',
+    namesBody.includes('as_array_new()') && namesBody.includes('as_array_push(a, as_v_str(as_str_dup(rows[i].name)))'));
+  // (9) isSupported tracks the device count.
+  check('isSupported == (device count > 0)',
+    c.includes('static bool Microphone_get_isSupported_static(void* _this) { (void)_this; return as_mic_scan(NULL, 0) > 0; }'));
+  // (10) getEnhancedMicrophone delegates to the same lookup.
+  check('getMicrophone/getEnhancedMicrophone share the lookup helper',
+    c.includes('static Microphone* Microphone_getMicrophone_static(int _index) { return Microphone__from_index(_index); }')
+    && c.includes('static Microphone* Microphone_getEnhancedMicrophone_static(int _index) { return Microphone__from_index(_index); }'));
+  // (11) symbols: invented members removed, isSupported is a static getter.
+  const sym = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const symMic = sym.slice(sym.indexOf("shell('Microphone'"), sym.indexOf("shell('Microphone'") + 1400);
+  check('the invented fps field and setCodec/setRate methods are gone',
+    !symMic.includes("['fps'") && !symMic.includes("'setCodec'") && !symMic.includes("'setRate'"));
+  check('isSupported is modelled as a static Boolean getter',
+    symMic.includes("['isSupported', { kind: 'bool' }]"));
+  // (12) ole32 rides along on the native Windows link (COM imports).
+  const idx = readFileSync(join(root, 'src', 'index.ts'), 'utf8');
+  check('ole32 is linked for the whole native Windows target',
+    idx.includes("['ws2_32', 'iphlpapi', 'ole32']"));
+  console.log(`     [micdev] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: platform/MicrophoneDevices', checkMicrophoneDevices);
+
+function checkMicrophoneCapture(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [miccap] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [miccap] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  // (1) audioclient.h rides the SAL-before-scrub block; NOBITMAP skips mmreg.h's
+  // BITMAPINFOHEADER-dependent video structs (a GDI type NOGDI hides).
+  check('audioclient.h is included with the NOBITMAP guard',
+    pre.includes('#define NOBITMAP') && pre.includes('#include <audioclient.h>'));
+  // (2) IAudioClient / IAudioCaptureClient IIDs by hand (no initguid.h).
+  check('the capture IIDs are defined by hand',
+    pre.includes('as_mic_iid_audioclient') && pre.includes('as_mic_iid_captureclient'));
+  // (3) The worker captures the device MIX format in shared mode (a custom rate
+  // is rejected, AUDCLNT_E_UNSUPPORTED_FORMAT) -- GetMixFormat + Initialize.
+  check('the worker captures the shared-mode mix format',
+    pre.includes('GetMixFormat(ac, &fmt)') && pre.includes('AUDCLNT_SHAREMODE_SHARED'));
+  check('the worker drives the capture client packet loop',
+    pre.includes('GetNextPacketSize(acc, &packet)') && pre.includes('GetBuffer(acc, &data, &frames, &flags')
+    && pre.includes('ReleaseBuffer(acc, frames)'));
+  // (4) Downmix to mono + linear resample to rate kHz, 2048-sample buffers.
+  check('the worker downmixes and resamples to 2048-sample buffers',
+    pre.includes('double step = (double)mixRate / (double)targetRate;') && pre.includes('float accbuf[2048];')
+    && pre.includes('if (accn == 2048)'));
+  // (5) Thread discipline: the worker only queues under the lock; it never builds
+  // an AS3 event or allocates on the GC heap. The dispatch (generated) does that.
+  const workerStart = pre.indexOf('static void as_mic_worker_body(as_mic* m) {');
+  const workerBody = pre.slice(workerStart, pre.indexOf('\nstatic unsigned __stdcall as_mic_worker', workerStart));
+  check('the capture worker never touches the GC heap or AS3 events',
+    workerBody.length > 0 && !workerBody.includes('gc_alloc') && !workerBody.includes('EventDispatcher_dispatchEvent')
+    && !workerBody.includes('SampleDataEvent_new'));
+  check('the worker publishes buffers under the lock and wakes the dispatcher',
+    workerBody.includes('AS_MIC_LOCK();') && workerBody.includes('AS_MIC_WAKE();'));
+  // (6) GC roots: the live Microphone objects are permanent roots while capturing.
+  check('as_mic_mark_roots is declared and called from the GC root walk',
+    pre.includes('static void as_mic_mark_roots(void);') && pre.includes('as_mic_mark_roots();')
+    && pre.includes('gc_mark_ptr(as_mics[i]->obj)'));
+  // (7) The dispatch pump runs UNCONDITIONALLY at the frame boundary -- not gated
+  // on a live socket (the regression that left events queued forever).
+  const hubStart = pre.indexOf('static int as_async_tick_with(');
+  const hubBody = pre.slice(hubStart, pre.indexOf('\nstatic int as_async_tick(void)', hubStart));
+  const sockGate = hubBody.indexOf('if (as_sock_any())');
+  const micCall = hubBody.indexOf('int mic_events = as_mic_dispatch();');
+  check('as_mic_dispatch is called outside the socket gate',
+    micCall > 0 && (sockGate < 0 || micCall > hubBody.indexOf('}', sockGate)));
+  // (8) Non-Windows / no-thread builds report the capture gap loudly.
+  check('backend-less builds report the capture gap once',
+    pre.includes('flash.media.Microphone capture (this target has no audio-capture backend'));
+  // Generated capture-side bodies.
+  const c = generateC(parse(
+    'import flash.media.Microphone;\n' +
+    'import flash.events.SampleDataEvent;\n' +
+    'var m:Microphone = Microphone.getMicrophone();\n' +
+    'm.addEventListener(SampleDataEvent.SAMPLE_DATA, function(e:SampleDataEvent):void {});\n' +
+    'm.setLoopBack(true);\n' +
+    'm.setSilenceLevel(0, 1000);\n' +
+    'm.setUseEchoSuppression(true);\n')).c.replace(/\r\n/g, '\n');
+  // (9) The dispatch builds a ByteArray of big-endian float32 samples and fires
+  // SampleDataEvent with the cumulative position; activityLevel is published live.
+  const dispStart = c.indexOf('int as_mic_dispatch(void) {');
+  const dispBody = c.slice(dispStart, c.indexOf('\n}', dispStart));
+  check('the dispatch serializes samples as big-endian float32',
+    dispBody.includes('dst[s*4+0] = (unsigned char)(u >> 24);') && dispBody.includes('dst[s*4+3] = (unsigned char)(u);'));
+  check('the dispatch fires SampleDataEvent with the buffer position',
+    dispBody.includes('SampleDataEvent_new((char*)"sampleData", false, false, (double)b->position, ba)')
+    && dispBody.includes('EventDispatcher_dispatchEvent((void*)o, (Event*)ev)'));
+  check('the dispatch publishes live activityLevel and frees the buffer',
+    dispBody.includes('o->activityLevel = m->activity;') && dispBody.includes('as_mic_buf_free(b);'));
+  check('the ByteArray payload is GC-owned with a write barrier',
+    dispBody.includes('gc_alloc(GCT_BYTES') && dispBody.includes('gc_write_barrier((void*)ba->data);'));
+  // (10) setLoopBack starts/stops the worker and resets activityLevel on stop.
+  const lbStart = c.indexOf('void Microphone_setLoopBack(void* _this, bool state) {');
+  const lbBody = c.slice(lbStart, c.indexOf('\n}', lbStart));
+  check('setLoopBack drives as_mic_start/as_mic_stop and resets activityLevel',
+    lbBody.includes('as_mic_start((void*)m, (int)m->rate, m->silenceLevel, (int)m->silenceTimeout)')
+    && lbBody.includes('as_mic_stop((void*)m); m->activityLevel = -1;'));
+  // (11) setSilenceLevel writes the real fields and pushes to a live worker.
+  check('setSilenceLevel writes the fields and updates the worker',
+    c.includes('m->silenceLevel = silenceLevel;') && c.includes('as_mic_set_silence((void*)m, silenceLevel, timeout)'));
+  // (12) setUseEchoSuppression stores the hint (shared-mode echo cancellation is
+  // a system effect, so it is not a per-client switch).
+  check('setUseEchoSuppression stores the hint',
+    c.includes('void Microphone_setUseEchoSuppression(void* _this, bool useEchoSuppression) { as_mic_set_echo((void*)_this, useEchoSuppression ? 1 : 0); }'));
+  console.log(`     [miccap] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: platform/MicrophoneCapture', checkMicrophoneCapture);
+
+function checkCameraDevices(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [camdev] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [camdev] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  // (1) The DirectShow inventory seam: video-capture category, outside the GC.
+  check('preamble enumerates DirectShow video-capture devices',
+    pre.includes('de->lpVtbl->CreateClassEnumerator(de, &as_cam_clsid_videocap, &em, 0)'));
+  check('preamble reads the device friendly name via IPropertyBag',
+    pre.includes('pb->lpVtbl->Read(pb, L"FriendlyName", (VARIANT*)&var, NULL)'));
+  // (2) GUIDs by hand, no strmiids.lib / global INITGUID side effects.
+  check('preamble defines the DirectShow GUIDs by hand (no strmiids/initguid)',
+    pre.includes('as_cam_clsid_devenum') && pre.includes('as_cam_iid_createdevenum')
+    && pre.includes('as_cam_clsid_videocap') && pre.includes('as_cam_iid_propbag')
+    && !pre.includes('#include <initguid.h>'));
+  // (3) ICreateDevEnum is declared by hand (strmif.h needs RGNDATA/BITMAPINFOHEADER
+  // that NOGDI hides); IMoniker/IPropertyBag come from ocidl.h.
+  check('ICreateDevEnum is declared by hand, not via strmif.h',
+    pre.includes('typedef struct ICreateDevEnumVtbl') && !pre.includes('#include <strmif.h>'));
+  check('ocidl.h supplies IMoniker/IEnumMoniker/IPropertyBag',
+    pre.includes('#include <ocidl.h>'));
+  // (4) Non-Windows targets report the gap once rather than pretending no camera.
+  check('non-Windows targets report the camera-inventory gap loudly',
+    pre.includes('flash.media.Camera (this target has no camera-device inventory'));
+  // Generated device-face bodies.
+  const c = generateC(parse(
+    'import flash.media.Camera;\n' +
+    'var c:Camera = Camera.getCamera();\n' +
+    'var n:Array = Camera.names;\n' +
+    'var s:Boolean = Camera.isSupported;\n' +
+    'var nm:String = c.name;\n' +
+    'var ix:int = c.index;\n')).c.replace(/\r\n/g, '\n');
+  const fromStart = c.indexOf('Camera* Camera__from_name(char* name) {');
+  const fromBody = c.slice(fromStart, c.indexOf('\n}', fromStart));
+  // (5) null selects the first device; out-of-range / unknown name returns null.
+  check('getCamera(null) selects device 0 and out-of-range returns NULL',
+    fromBody.includes('if (name == NULL) { idx = 0; }') && fromBody.includes('if (idx < 0 || idx >= got) { free(rows); return NULL; }'));
+  // (6) name matches by index-as-string OR by friendly name (AIR getCamera("0")).
+  check('getCamera matches by index-as-string or by friendly name',
+    fromBody.includes('long v = strtol(name, &end, 10);') && fromBody.includes('if (strcmp(rows[i].name, name) == 0) { idx = i; break; }'));
+  // (7) camName/camIdx populated from the inventory; GC write barrier on the string.
+  check('camName/camIdx populated with a GC write barrier on the name',
+    fromBody.includes('c->camName = as_str_dup(rows[idx].name); gc_write_barrier((void*)c->camName);') && fromBody.includes('c->camIdx = idx;'));
+  // (8) names is a fresh Array of GC strings on every call.
+  const namesStart = c.indexOf('Camera_get_names_static(void* _this) {');
+  const namesBody = c.slice(namesStart, c.indexOf('\n}', namesStart));
+  check('names builds a fresh Array of friendly-name strings',
+    namesBody.includes('as_array_new()') && namesBody.includes('as_array_push(a, as_v_str(as_str_dup(rows[i].name)))'));
+  // (9) isSupported tracks the device count.
+  check('isSupported == (device count > 0)',
+    c.includes('bool Camera_get_isSupported_static(void* _this) { (void)_this; return as_cam_scan(NULL, 0) > 0; }'));
+  // (10) name/index are read-only accessors over the backing fields.
+  check('name/index getters read the camName/camIdx backing fields',
+    c.includes('return o->camName != NULL ? o->camName : (char*)"";') && c.includes('return ((Camera*)_this)->camIdx;'));
+  // (11) getCamera delegates to the lookup helper (forward-declared).
+  check('getCamera delegates to Camera__from_name',
+    c.includes('static Camera* Camera__from_name(char* name);') && c.includes('Camera* Camera_getCamera_static(char* name) { return Camera__from_name(name); }'));
+  // (12) symbols: isSupported static getter, index getter, camName/camIdx fields.
+  const sym = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const symCam = sym.slice(sym.indexOf("this.classMap.set('Camera'"), sym.indexOf("this.classMap.set('Camera'") + 2200);
+  check('isSupported is modelled as a static Boolean getter',
+    symCam.includes("['isSupported', { returnType: { kind: 'bool' }"));
+  check('index is modelled as a read-only int getter',
+    symCam.includes("['index', { returnType: { kind: 'int' }"));
+  check('camName/camIdx are private backing fields (no reserved-name clash)',
+    symCam.includes("['camName'") && symCam.includes("['camIdx'") && !symCam.includes("['_index'"));
+  console.log(`     [camdev] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: platform/CameraDevices', checkCameraDevices);

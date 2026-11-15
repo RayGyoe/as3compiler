@@ -131,6 +131,12 @@
 #include "include/core/SkColorFilter.h"
 #include "include/effects/SkColorMatrix.h"
 #include "include/encode/SkPngEncoder.h"
+// A2 (stage 422): JPEG encode drives the libjpeg-turbo C API directly. The vendored
+// libjpeg.lib carries the compressor symbols even though Skia's SkJpegEncoder wrapper
+// is disabled, so no Skia rebuild is needed. MANGLE_JPEG_NAMES / JPEG_INTERNALS are
+// deliberately NOT defined: the lib exports unmangled jpeg_* names and we only use
+// the public API (jpegint.h is gated behind JPEG_INTERNALS and is not vendored).
+#include "third_party/externals/libjpeg-turbo/jpeglib.h"
 
 // Shared with the text half (vendor/skia_text_glue.cc): the platform font
 // manager. C++ linkage on purpose -- sk_sp<SkFontMgr> cannot cross an
@@ -691,6 +697,28 @@ void* sk_surface_make_snapshot(void* surface) {
   return image.release();  // caller owns one ref
 }
 
+// D1 (stage 427): threshold a raster surface's alpha to a BINARY stencil (0 or 255).
+// AIR's Bitmap/TextField mask is a soft alpha mask only when BOTH the mask and the
+// masked object set cacheAsBitmap; with cacheAsBitmap on the content alone it is a
+// hard stencil (any coverage -> full opacity). The alpha byte is byte 3 of every
+// 32-bit pixel in BOTH RGBA and BGRA orders, so this is pixel-order independent.
+// Returns 1 on success, 0 if the surface is not a 32-bit raster.
+int sk_surface_threshold_alpha(void* surface) {
+  SkPixmap pm;
+  if (surface == nullptr || !((SkSurface*)surface)->peekPixels(&pm)) return 0;
+  if (pm.colorType() != kRGBA_8888_SkColorType && pm.colorType() != kBGRA_8888_SkColorType) return 0;
+  uint8_t* base = (uint8_t*)pm.writable_addr();
+  size_t rb = pm.rowBytes();
+  for (int y = 0; y < pm.height(); y++) {
+    uint8_t* row = base + (size_t)y * rb;
+    for (int x = 0; x < pm.width(); x++) {
+      uint8_t* a = row + (size_t)x * 4 + 3;
+      *a = (*a != 0) ? 255 : 0;
+    }
+  }
+  return 1;
+}
+
 void sk_surface_delete(void* surface) {
   ((SkSurface*)surface)->unref();
 }
@@ -930,6 +958,10 @@ int sk_paint_set_blend(void* paint, const char* name) {
   else if (strcmp(name, "add") == 0) m = SkBlendMode::kPlus;
   else if (strcmp(name, "overlay") == 0) m = SkBlendMode::kOverlay;
   else if (strcmp(name, "hardlight") == 0) m = SkBlendMode::kHardLight;
+  // D1 (stage 427): pixel masking composites the mask over the content layer with
+  // kDstIn (keep the destination only where the source has alpha). Not an AS3
+  // BlendMode name -- only the internal mask path requests it.
+  else if (strcmp(name, "dstin") == 0) m = SkBlendMode::kDstIn;
   else return 0;
   ((SkPaint*)paint)->setBlendMode(m);
   return 1;
@@ -1833,6 +1865,98 @@ int sk_image_encode_png(void* image, const char* path) {
   size_t n = fwrite(data->data(), 1, data->size(), f);
   fclose(f);
   return (int)n;
+}
+
+// Memory counterpart of sk_image_encode_png, for BitmapData.encode(rect,
+// compressor, byteArray) which writes into a ByteArray rather than a file.
+// Encodes the image to PNG and hands back a freshly malloc'd buffer the caller
+// owns (and must free); returns 1 on success and sets *out/*outLen, 0 on failure
+// (outputs untouched). The image is typically built by sk_image_from_argb, so the
+// PNG carries the runtime's straight alpha (kUnpremul) -- PNG is a lossless
+// straight-alpha format, no premultiply round-trip is introduced here.
+int sk_image_encode_png_mem(void* image, unsigned char** out, size_t* outLen) {
+  if (image == nullptr || out == nullptr || outLen == nullptr) return 0;
+  auto data = SkPngEncoder::Encode(nullptr, (SkImage*)image, {});
+  if (!data || data->size() == 0) return 0;
+  unsigned char* buf = (unsigned char*)malloc(data->size());
+  if (!buf) return 0;
+  memcpy(buf, data->data(), data->size());
+  *out = buf;
+  *outLen = data->size();
+  return 1;
+}
+
+// A2 (stage 422): memory JPEG encode for BitmapData.encode(rect, JPEGEncoderOptions,
+// byteArray). jpeg_mem_dest is NOT in the vendored lib (Skia excludes jdatdst.c), so
+// we supply a growing-memory destination manager. AIR drops alpha by taking the
+// PREMULTIPLIED-over-black RGB (measured adl 51.4.1: 0x80FF0000 -> rgb 0x800000,
+// alpha 255), so we readPixels as kPremul and strip A. quality is validated 0..100
+// by the caller (encode raises #2006 above 100); clamped here defensively.
+struct AscJpegMemDest {
+  struct jpeg_destination_mgr pub;
+  unsigned char* buf;
+  size_t cap, len;
+};
+static void asc_jpeg_init_dest(j_compress_ptr cinfo) {
+  AscJpegMemDest* d = (AscJpegMemDest*)cinfo->dest;
+  d->cap = 4096; d->len = 0;
+  d->buf = (unsigned char*)malloc(d->cap);
+  d->pub.next_output_byte = d->buf;
+  d->pub.free_in_buffer = d->cap;
+}
+static boolean asc_jpeg_empty_output(j_compress_ptr cinfo) {
+  AscJpegMemDest* d = (AscJpegMemDest*)cinfo->dest;
+  size_t used = d->cap - d->pub.free_in_buffer;
+  d->cap *= 2;
+  unsigned char* nb = (unsigned char*)realloc(d->buf, d->cap);
+  if (nb == nullptr) return FALSE;
+  d->buf = nb;
+  d->pub.next_output_byte = d->buf + used;
+  d->pub.free_in_buffer = d->cap - used;
+  return TRUE;
+}
+static void asc_jpeg_term_dest(j_compress_ptr cinfo) {
+  AscJpegMemDest* d = (AscJpegMemDest*)cinfo->dest;
+  d->len = d->cap - d->pub.free_in_buffer;
+}
+int sk_image_encode_jpeg_mem(void* image, int quality, unsigned char** out, size_t* outLen) {
+  if (image == nullptr || out == nullptr || outLen == nullptr) return 0;
+  SkImage* img = (SkImage*)image;
+  int w = img->width(), h = img->height();
+  if (w <= 0 || h <= 0) return 0;
+  SkImageInfo info = SkImageInfo::Make(w, h, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+  std::vector<uint8_t> rgba((size_t)w * h * 4);
+  if (!img->readPixels(info, rgba.data(), (size_t)w * 4, 0, 0)) return 0;
+  std::vector<uint8_t> rgb((size_t)w * 3);
+  struct jpeg_compress_struct cinfo;
+  struct jpeg_error_mgr jerr;
+  AscJpegMemDest dst;
+  cinfo.err = jpeg_std_error(&jerr);
+  jpeg_create_compress(&cinfo);
+  cinfo.dest = (struct jpeg_destination_mgr*)&dst;
+  dst.pub.init_destination = asc_jpeg_init_dest;
+  dst.pub.empty_output_buffer = asc_jpeg_empty_output;
+  dst.pub.term_destination = asc_jpeg_term_dest;
+  cinfo.image_width = (JDIMENSION)w; cinfo.image_height = (JDIMENSION)h;
+  cinfo.input_components = 3; cinfo.in_color_space = JCS_RGB;
+  jpeg_set_defaults(&cinfo);
+  jpeg_set_quality(&cinfo, quality < 0 ? 0 : (quality > 100 ? 100 : quality), TRUE);
+  jpeg_start_compress(&cinfo, TRUE);
+  while (cinfo.next_scanline < cinfo.image_height) {
+    const uint8_t* src = rgba.data() + (size_t)cinfo.next_scanline * w * 4;
+    for (int x = 0; x < w; x++) {
+      rgb[(size_t)x * 3 + 0] = src[(size_t)x * 4 + 0];
+      rgb[(size_t)x * 3 + 1] = src[(size_t)x * 4 + 1];
+      rgb[(size_t)x * 3 + 2] = src[(size_t)x * 4 + 2];
+    }
+    JSAMPROW row = rgb.data();
+    jpeg_write_scanlines(&cinfo, &row, 1);
+  }
+  jpeg_finish_compress(&cinfo);
+  jpeg_destroy_compress(&cinfo);
+  *out = dst.buf;
+  *outLen = dst.len;
+  return 1;
 }
 
 void sk_image_delete(void* image) { ((SkImage*)image)->unref(); }

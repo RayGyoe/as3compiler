@@ -204,7 +204,7 @@ AIR's built-in parameter lists **cannot be copied from the documentation**: the 
 |-------|---------|-------|----------|-------------|
 | A | AIR accepts, **we demanded the argument** | 300 → 0 | `ctx.drawTriangles(ib)`, `ctx.configureBackBuffer(1, 1, 0)`, `new NativeMenuItem()`, `hasOwnProperty()` | ✅ fixed: defaults added from the documented values (the `greq`/`gopt` parameter helpers) |
 | B | **We invented defaults AIR does not have** | 48 → 0 | `g.moveTo(1)`, `m.rotate()`, `r.inflate(1)`, `p.normalize()`, `new ShaderData()` | ✅ fixed: required again (a tightening -- programs `mxmlc` rejects are no longer accepted) |
-| C | We declare **extra parameters** (AIR forbids that many) | 9 | `File.moveTo` has an extra `force`, `BitmapData.encode` an extra `byteArrayOffset`, `FileListEvent` an extra `directory` | left over (needs C-side signature and implementation changes) |
+| C | We declare **extra parameters** (AIR forbids that many) | 9 → 6 | `File.moveTo`'s `force` (removed stage 298), `FileListEvent`'s `directory` (removed stage 299), `BitmapData.encode`'s `byteArrayOffset` (back to 3 params, stage 421) | the three named cases are fixed; the remaining 6 await a per-case C-side signature review |
 | D | AIR accepts **more arguments** (`...rest` or a longer parameter list) | 27+ | `NetConnection.connect(…rest)`; `MouseEvent`'s constructor lacks `commandKey`/`controlKey`/`clickCount`; `TextFormat`'s constructor lacks 7 trailing parameters | left over (the C side must accept and ignore the surplus arguments) |
 | E | The member is **not implemented at all** (unrelated to arity) | 3 | `BitmapData.floodFill`/`merge`, `SharedObject.name` | left over |
 

@@ -1228,6 +1228,15 @@ export function effectiveDefines(cfg: BuildConfig): string[] {
     cfg.sources.some(s => /(^|[/\\])window_glue\.cc$/.test(s));
   if (nativeDesktop && !defs.includes('ASC_USE_FILE_DIALOG=1')) defs.push('ASC_USE_FILE_DIALOG=1');
   if (nativeDesktop && !defs.includes('ASC_USE_NATIVE_DRAG=1')) defs.push('ASC_USE_NATIVE_DRAG=1');
+  // MSVC marks the CRT stdio functions (fopen / _wfopen) deprecated. The generated
+  // C preamble already defines _CRT_SECURE_NO_WARNINGS, but the vendor glue TUs
+  // (skia_glue.cc / skia_text_glue.cc) do not include it and use those functions,
+  // so a cold compile emits a -Wdeprecated-declarations warning. Define it for the
+  // whole Windows native compile so the glue is warning-free whether the object
+  // cache is cold or warm -- a no-warning test pin must not depend on cache state.
+  if (process.platform === 'win32' && cfg.target === 'native' && !defs.includes('_CRT_SECURE_NO_WARNINGS')) {
+    defs.push('_CRT_SECURE_NO_WARNINGS');
+  }
   return defs;
 }
 

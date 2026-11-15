@@ -1367,8 +1367,12 @@ function checkDisplayObjectMask(): string[] {
 
   // The paint path: a clip in the object's PARENT space, issued after the save and
   // BEFORE the object's own translate (a mask is a sibling and must not travel).
+  // 阶段四百二十七（D1）：矢量 clipPath 路径移入「像素遮罩门控」的 else 分支——content 设
+  // cacheAsBitmap 且遮罩是 Bitmap/TextField 时走像素 alpha 合成，其余仍走 clipPath。
   check('as_render_object clips to the mask stencil',
-    c.includes('if (o->_mask_ref != NULL) {\n    void* mp = as_mask_path(o, o->_mask_ref);\n    if (mp != NULL) { as_skia_canvas_clip_path(canvas, mp, 1); as_skia_path_delete(mp); }'));
+    c.includes('void* mp = as_mask_path(o, o->_mask_ref);') &&
+    c.includes('if (mp != NULL) { as_skia_canvas_clip_path(canvas, mp, 1); as_skia_path_delete(mp); }') &&
+    c.includes('if (o->_cache_flag && as_mask_has_pixels(o->_mask_ref)) {'));
   const renderBody = c.slice(c.indexOf('static void as_render_object(void* canvas, DisplayObject* o) {'));
   const iSave = renderBody.indexOf('as_skia_canvas_save(canvas);');
   const iMask = renderBody.indexOf('void* mp = as_mask_path(o, o->_mask_ref);');

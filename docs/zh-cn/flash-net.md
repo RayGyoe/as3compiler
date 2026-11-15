@@ -311,7 +311,7 @@ AIR 默认设 `ACCEPT` 头为一串 MIME 列表（除非你在 `requestHeaders` 
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **已落地（阶段八十九·五十三）**：TCP 底座 + 完整 `IDataInput`/`IDataOutput`；`SecureSocket` 仅 API 面 + 诚实失败（`isSupported=false`，TLS 状态机未做）。语义详见 §7 |
 | `FileReference`/`FileReferenceList`/`FileFilter` | ❌ |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌（`NetStream` 仅有 dynamic `client` 槽，见 `symbols.ts:2451`；播放路线已单独立项评估，见 [`video.md`](video.md)） |
-| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **已落地（阶段三百六十三）**：`findInterfaces()` 走 `getifaddrs` 真枚举（MAC / `active` / `mtu` / IPv4+IPv6 地址与前缀长度），返回值与身份语义全部按 adl 51.4.1 实测对齐；Windows 与 WASI 仍是诚实报明 + 空 Vector。契约与验收见 §6.10 |
+| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **已落地（阶段三百六十三）**：`findInterfaces()` 走 `getifaddrs` 真枚举（MAC / `active` / `mtu` / IPv4+IPv6 地址与前缀长度），返回值与身份语义全部按 adl 51.4.1 实测对齐；**Windows 走 `GetAdaptersAddresses`（阶段四百二十，语义见 §6.10.5）**，WASI 仍诚实报明 + 空 Vector。契约与验收见 §6.10 |
 | `Responder` | ❌ |
 | 静态自包含打包（含 curl 的 `vendor/` 静态库） | ✅ **已落地（阶段八十九·五十三）**：`vendor/curl` 提供 `libcurl.a`/`libnghttp2.a`/`libz.a`，`otool -L` 不再出现 `libcurl.4.dylib`（见 §4.1） |
 | 代理 / cookie jar / HTTP-2 | ✅ **已落地（阶段八十九·五十三）**：进程级 `CURLSH` 共享 cookie（`URLRequest.manageCookies`）、环境变量与**系统代理**两路、`ASC_HTTP2` opt-in（默认仍 1.1，见 §4.1） |
@@ -1291,11 +1291,11 @@ AOT 侧清单注入同一对 define，因此两端指向同一个 `.sol`：
 
 ---
 
-### 6.10 `NetworkInfo.findInterfaces()` 的网卡枚举 —— **已执行（阶段三百六十三）**
+### 6.10 `NetworkInfo.findInterfaces()` 的网卡枚举 —— **已执行（阶段三百六十三；Windows 后端阶段四百二十）**
 
 #### 6.10.1 为什么必须做：**空 Vector 不是"降级"，是另一个程序**
 
-`talkmed-meeting-desktop` 的 `ServerData.initDevicesUuid()` 用第一个带 `hardwareAddress` 的接口
+真应用的 `ServerData.initDevicesUuid()` 用第一个带 `hardwareAddress` 的接口
 造设备 id：
 
 ```as3
@@ -1345,7 +1345,7 @@ if (macAddress.length == 0) deviceId = windowsOnlyPath();  // new File("C:/Windo
 | 语义层（C） | `emit.ts` 的 `NetworkInfo_findInterfaces` | 把行按名字分组：名字变就 `NetworkInterface_new()` + push，每行一个 `InterfaceAddress` push 进 `cur->addresses`。行缓冲 `malloc` / `free`，每次调用零 GC 垃圾堆积、零 arena 增长 |
 | 类形状 | `symbols.ts` | `NetworkInterface extends Object` + 上面 8 个成员；新增 `InterfaceAddress`；`NetworkInfo` 补 `disableNetworkChanges` 与静态 `isSupported`/`permissionStatus`；新增 `constClass('IPVersion')` |
 | 新对象初值 | `emit.ts` 的 `SHELL_CTOR_EXTRA` | 覆盖 shell 自动填的空 Vector：`addresses`/`subInterfaces` 置 `NULL`、`mtu=-1`；`InterfaceAddress` 置 `ipVersion="IPv4"`、`prefixLength=-1` |
-| 其它目标 | 同文件 `#else` 分支 | Windows/WASI **没有** ifaddrs：`as_shell_unsupported` 报明一次并返回 0（规矩见 §2 的「诚实报明」口径） |
+| 其它目标 | 同文件 `#elif`/`#else` 分支 | **Windows 走 `GetAdaptersAddresses`（阶段四百二十，`ASC_NET_WIN32`，语义见 §6.10.5）**；WASI 没有接口清单：`as_shell_unsupported` 报明一次并返回 0（规矩见 §2 的「诚实报明」口径） |
 
 前缀长度的**坑**：netmask 不能按固定偏移取。`m+4` 在 macOS 上对 `lo0` 的 IPv6 netmask 会算成 96，
 必须按 `sa_family` 分别取 `sin_addr` / `sin6_addr` 再数前导 1。
@@ -1357,7 +1357,41 @@ if (macAddress.length == 0) deviceId = windowsOnlyPath();  // new File("C:/Windo
 | 契约对齐 | `examples/net-interfaces.as` **同一份断言**同时跑 AOT 与 `mxmlc + adl`（后者把失败信息写进 `~/Documents/ni-adl.txt`） | 两边都 `OK` |
 | 逐值对照 | `temp/netprobe/Cmp.as` 的输出与 adl 探针输出逐行 diff | 完全相同（含 `hw.len=18`、`mtu=16384`、`prefix=128`、`subInterfaces=null`、`sameIfaceObj=false`） |
 | 结构钉子 | `unit: platform/NetworkInventory` 27 钉（生成 C + `RUNTIME_PREAMBLE`） | 全过 |
-| 真机端到端 | `bin-aot/build-aot.sh --run`（TalkMED Meeting，macOS） | 登录窗正常出现；日志 `uuid mac == c2:15:48:c4:50:d4 `，请求体 `"uuid":"c2:15:48:c4:50:d4 "`；`#2004` 消失 |
+| 真机端到端 | `bin-aot/build-aot.sh --run`（真应用，macOS） | 登录窗正常出现；日志 `uuid mac == c2:15:48:c4:50:d4 `，请求体 `"uuid":"c2:15:48:c4:50:d4 "`；`#2004` 消失 |
+
+#### 6.10.5 Windows 后端（阶段四百二十，C1）—— `GetAdaptersAddresses`
+
+POSIX 的 `getifaddrs` 在 Windows 不存在，此前 Windows 与 WASI 一样报明 + 空 Vector。阶段四百二十
+补上 `ASC_NET_WIN32` 分支（`iphlpapi.h` 的 `GetAdaptersAddresses`），**Windows 真机逐行对齐 adl 51.4.1**
+（`temp/netwin/net-air-ref.txt`，7 网卡全字段 diff 为空）。Windows 的 AIR 语义与 macOS **多处不同**，
+都是实测、不是近似：
+
+| 字段 | macOS（§6.10.2） | **Windows（adl 51.4.1 实测）** |
+|---|---|---|
+| `name` | 接口名 `en0` | **适配器 GUID** `{680418F5-...}`（`AdapterName`，38 字符） |
+| `displayName` | `""` | **FriendlyName**（`以太网`/`VMware Network Adapter VMnet1`，UTF-8） |
+| `hardwareAddress` | `aa:bb:..:ff `（小写 `:` + 尾空格） | **`74-56-3C-B7-45-19`**（大写 `-`、**无**尾空格） |
+| `active` | UP∧RUNNING∧非 loopback（`lo0`=false） | **`OperStatus==IfOperStatusUp`**（loopback=**true**，断开的蓝牙=false） |
+| `mtu` | `SIOCGIFMTU`（`lo0`=16384） | **`(int)Mtu`**（loopback 的 `0xFFFFFFFF` ⇒ **-1**） |
+| 接口内地址序 | IPv4 先 | **适配器 unicast 自然序**（IPv6 可能在前） |
+| `broadcast` | IPv4 广播 | IPv4 **计算定向广播** `ip \| ~mask`；loopback 与 IPv6 为 `""` |
+| IPv6 link-local | 丢弃 `fe80::/10` | 同（按字节判 `fe80::/10`） |
+
+实现要点：
+- `as_net_row` 扩容：`name[32]→name[64]`（GUID 38 字符会截断）、新增 `display[128]`；消费端
+  `displayName` 改读 `rows[i].display`（POSIX 填 `""`，行为不变）。
+- 行按适配器**连续**分组（内层遍历 `FirstUnicastAddress`），消费端的名字游程分组据此建对象图。
+- 链接：`iphlpapi` 与 `ws2_32` 一起在 CLI 的 Winsock 块按整目标注入（`index.ts`），harness 探针
+  `PROBE_SYSTEM_LINK_FLAGS` 同步加 `-liphlpapi`。
+
+**踩到的坑（SAL 宏）**：`iphlpapi.h` 会拉进 SAL 注解头，`#define IN/OUT/OPTIONAL` 等空宏。若把它放在
+前导**晚处** include，会在顶部「Windows object-like 宏 scrub」（`#undef near/far/OUT/...`）**之后**重新
+引入这些宏，把同名 AS3 字段（`ident-free-fn.as` 专测的 `OUT`）展开成空 ⇒ `expected identifier`。
+修法：`iphlpapi.h` 必须放在顶部 Windows include 块（scrub **之前**），并补 `#undef INOUT/OUTOPT/INOUTOPT`。
+
+验收：`examples/net-interfaces.as` 改为**平台感知**（Windows 大写 `-` MAC、loopback `mtu=-1`、
+Windows 也要求非空清单），AOT 与 adl 双端过；`unit: platform/NetworkInventory` 37 钉（含 9 个 Windows 钉）；
+全量 `node test.ts` 688/684/0 红。
 
 ---
 

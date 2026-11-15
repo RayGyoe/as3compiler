@@ -223,8 +223,9 @@ static int as_native_drag_callback(int win, int phase, uint64_t serial, double x
 static void as_native_drag_init(void) { sk_drag_init(as_native_drag_callback); }
 void NativeDragManager_acceptDragDrop_static(InteractiveObject* target) {
     if (!target) as_throw(TypeError_new((char*)"Error #2007: Parameter target must be non-null.", 2007));
-    if (!as_nd_event_depth || (as_nd_phase != 1 && as_nd_phase != 2))
-        as_throw(Error_new((char*)"acceptDragDrop requires nativeDragEnter or nativeDragOver.", 0));
+    // AIR (adl 51.4.1): a valid target outside nativeDragEnter/Over is a silent no-op,
+    // not an error -- only a null target throws #2007.
+    if (!as_nd_event_depth || (as_nd_phase != 1 && as_nd_phase != 2)) return;
     ASCWin* w = ASC_w(as_nd_window);
     if (w && as_nd_visible((DisplayObject*)target, w->stage) && as_nd_contains((DisplayObject*)target, (DisplayObject*)as_nd_hit)) {
         as_nd_accepted = target; gc_write_barrier(target);
@@ -232,7 +233,11 @@ void NativeDragManager_acceptDragDrop_static(InteractiveObject* target) {
 }
 char* NativeDragManager_get_dropAction_static(void* self) { (void)self; return as_nd_name(as_nd_action); }
 void NativeDragManager_set_dropAction_static(void* self, char* value) {
-    (void)self; int bit = as_nd_bit(value);
+    (void)self;
+    // AIR (adl 51.4.1): outside a destination drag session the setter is a no-op (the
+    // getter keeps returning "none") and an invalid value does not throw either.
+    if (!as_nd_clip) return;
+    int bit = as_nd_bit(value);
     if (bit < 0) as_throw(ArgumentError_new((char*)"Error #2004: Invalid native drag action.", 2004));
     as_nd_action = bit;
 }
@@ -241,8 +246,12 @@ bool NativeDragManager_get_isDragging_static(void* self) { (void)self; return as
 bool NativeDragManager_get_isSupported_static(void* self) { (void)self; return sk_drag_supported() != 0; }
 void NativeDragManager_doDrag_static(InteractiveObject* initiator, Clipboard* clipboard, BitmapData* image, Point* offset, NativeDragOptions* options) {
     if (!sk_drag_supported()) { as_shell_unsupported((char*)"NativeDragManager.doDrag: native backend unavailable"); return; }
-    if (!initiator || !clipboard) as_throw(TypeError_new((char*)"Error #2007: initiator and clipboard must be non-null.", 2007));
-    if (!as_nd_mouse_depth || as_nd_source || as_nd_clip) as_throw(Error_new((char*)"doDrag requires a mouseDown/mouseMove gesture and no active drag.", 0));
+    // AIR (adl 51.4.1): only a null clipboard throws #2007 (checked first); a null
+    // initiator with a valid clipboard, or no mouseDown/mouseMove gesture, is a silent
+    // no-op rather than an error.
+    if (!clipboard) as_throw(TypeError_new((char*)"Error #2007: Parameter clipboard must be non-null.", 2007));
+    if (!initiator) return;
+    if (!as_nd_mouse_depth || as_nd_source || as_nd_clip) return;
     ASCWin* w = ASC_w(as_nd_mouse_window);
     if (!w || !w->stage || !as_nd_visible((DisplayObject*)initiator, w->stage)) as_throw(ArgumentError_new((char*)"Drag initiator must be attached to the gesture window.", 2004));
 #ifdef _WIN32

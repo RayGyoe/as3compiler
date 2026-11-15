@@ -1073,6 +1073,11 @@ export class SymbolTable {
         // temp/errprobe. Appended LAST so the { vtable; message } view the
         // uncaught-exception printer uses (as_error_view) keeps its offsets.
         ['name', { type: { kind: 'string' }, init: null, visibility: 'public', owner: 'Error', isStatic: false, isConst: false }],
+        // The captured AS3 stack behind getStackTrace(): Error_ctor fills it at
+        // CONSTRUCTION time (AIR captures there, not at throw -- temp/stackprobe).
+        // Private, so it is not an AS3-visible member; appended AFTER `name` so
+        // the { vtable; message } offsets as_error_view relies on never move.
+        ['_stacktrace', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'Error', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         // Error overrides Object.toString: the name alone when the message is
@@ -1080,8 +1085,9 @@ export class SymbolTable {
         // `new Error("boom")` -> "Error: boom"; measured).
         ['toString', { returnType: { kind: 'string' }, params: [], owner: 'Error', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
         // AIR's Error.getStackTrace() (a real method on Error, inherited by every
-        // subclass). The C body is hand-written next to Error_toString; it reports
-        // itself once through as_shell_unsupported and returns "".
+        // subclass). The C body is hand-written next to Error_toString: it returns
+        // the _stacktrace captured at construction, or null when no frame was live
+        // (AIR's release-player "no stack information" answer).
         ['getStackTrace', { returnType: { kind: 'string' }, params: [], owner: 'Error', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       staticFields: new Map(),
@@ -2785,28 +2791,37 @@ export class SymbolTable {
     function stMatch(owner: string, value: string): FieldInfo {
       return { type: { kind: 'string' }, init: { kind: 'Str', value }, visibility: 'public', owner, isStatic: true, isConst: true };
     }
-    // flash.media.Camera: Starling's Texture.fromCamera / ConcreteTexture.attachCamera
-    // reference it as a type (and Camera.getCamera() as a factory). No camera backend
-    // in this subset — the object exists so those signatures compile; getCamera is a
-    // no-op returning NULL (the demo never triggers the camera path).
+    // flash.media.Camera: B2 (stage 426) makes the device face real -- names /
+    // isSupported / getCamera are hand-written overrides over the DirectShow
+    // as_cam_scan seam (src/runtime.ts); getCamera(name) matches by device name or
+    // index-as-string (null -> first device, out-of-range/bad -> null) and populates
+    // _name/_index. Capture itself still goes through the app's ANE -- this stage is
+    // enumeration only, no video stream. Starling's Texture.fromCamera /
+    // ConcreteTexture.attachCamera reference Camera as a type.
     this.classMap.set('Camera', {
-      fields: new Map(),
+      fields: new Map([
+        ['camName', { type: { kind: 'string' }, init: null, visibility: 'private', owner: 'Camera', isStatic: false, isConst: false }],
+        ['camIdx', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Camera', isStatic: false, isConst: false }],
+      ]),
       methods: new Map(),
       staticFields: new Map(),
       staticMethods: new Map([
         ['getCamera', { returnType: { kind: 'object', className: 'Camera' }, params: [{ name: 'name', type: 'String', defaultValue: { kind: 'Null' }, isRest: false }], owner: 'Camera', visibility: 'public', isStatic: true, isFinal: false, isGetter: false, isSetter: false }],
       ]),
       getters: new Map([
-        // flash.media.Camera.name (read-only String) -- the device's name. There is
-        // no camera backend in this build, so the value is the empty string and the
-        // omission reports itself once through as_shell_unsupported.
+        // flash.media.Camera.name (read-only String) -- the device's friendly name,
+        // populated by getCamera from the DirectShow inventory (_name backing field).
         ['name', { returnType: { kind: 'string' }, params: [], owner: 'Camera', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // flash.media.Camera.index (read-only int) -- the device's position in names.
+        ['index', { returnType: { kind: 'int' }, params: [], owner: 'Camera', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map(),
       staticGetters: new Map([
         // Camera.names: an Array of the available camera names (CamMic.as:21 reads
         // it straight into a picker). Empty, not NULL, so a for-each is well-defined.
         ['names', { returnType: { kind: 'array' }, params: [], owner: 'Camera', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
+        // Camera.isSupported: whether any camera device exists (names.length > 0).
+        ['isSupported', { returnType: { kind: 'bool' }, params: [], owner: 'Camera', visibility: 'public', isStatic: true, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       constructor: { params: [] },
       superClass: 'EventDispatcher',
@@ -4911,6 +4926,7 @@ export class SymbolTable {
     const shBoolP = (name: string, def: boolean): Param => ({ name, type: 'Boolean', defaultValue: { kind: 'Bool', value: def }, isRest: false });
     const shNumP = (name: string, def: number): Param => ({ name, type: 'Number', defaultValue: { kind: 'Num', value: def, isInt: false }, isRest: false });
     const shIntP = (name: string, def: number): Param => ({ name, type: 'int', defaultValue: { kind: 'Num', value: def, isInt: true }, isRest: false });
+    const shUintP = (name: string, def: number): Param => ({ name, type: 'uint', defaultValue: { kind: 'Num', value: def, isInt: true }, isRest: false });
     const shNullP = (name: string, type: string): Param => ({ name, type, defaultValue: { kind: 'Null' }, isRest: false });
     const shReq = (name: string, type: string): Param => ({ name, type, defaultValue: null, isRest: false });
     // AIR-REQUIRED parameter: no default, so omitting the argument is a CodegenError
@@ -4957,15 +4973,15 @@ export class SymbolTable {
       } as ClassInfo);
     };
     // flash.display.JPEGEncoderOptions / PNGEncoderOptions: the compressor argument
-    // of BitmapData.encode. Both are plain option bundles in AIR (a quality number,
-    // a fastCompression flag); the slots are real fields, assigned by the shell
-    // constructor from the same-named parameter. `encode` itself reports itself
-    // loudly for both formats (see symbols.ts) -- the options still carry the values
-    // a caller passes so a reflection-based caller sees them back.
+    // of BitmapData.encode. Both are plain option bundles in AIR. adl 51.4.1 measured
+    // (temp/jpegprobe/): JPEGEncoderOptions.quality is a **uint** defaulting to **80**
+    // (not 50); the constructor does NOT range-check (new JPEGEncoderOptions(-5) reads
+    // back 4294967291), encode itself raises #2006 when quality > 100. PNG is real via
+    // SkPngEncoder (stage 421), JPEG via the libjpeg-turbo C API (stage 422 A2).
     shell('JPEGEncoderOptions', 'flash.display::JPEGEncoderOptions', 'Object',
-      [['quality', { kind: 'number' }]],
+      [['quality', { kind: 'uint' }]],
       [],
-      [shNumP('quality', 50)],
+      [shUintP('quality', 80)],
       []);
     shell('PNGEncoderOptions', 'flash.display::PNGEncoderOptions', 'Object',
       [['fastCompression', { kind: 'bool' }]],
@@ -5437,23 +5453,30 @@ export class SymbolTable {
        ['connect', { kind: 'void' }, [shReq('connectionName', 'String')]],
        ['send', { kind: 'void' }, [shReq('connectionName', 'String'), shReq('methodName', 'String'), { name: 'args', type: 'any', defaultValue: null, isRest: true }]]],
       [], [], ['isSupported']);
-    // flash.media.Microphone: capture device. `names` / `isSupported` / the two
-    // getters are static in AIR; the activity/level members are plain fields so a
-    // read of `activityLevel` is a value (0), not a stub call.
+    // flash.media.Microphone: capture device. B1a (stage 424) makes the device face
+    // real -- names / isSupported / getMicrophone / getEnhancedMicrophone are
+    // hand-written overrides in emitShellClasses over the WASAPI as_mic_scan seam
+    // (src/runtime.ts); getMicrophone populates name/index and the AIR-measured
+    // defaults (rate 8, gain 50, silenceLevel 10, silenceTimeout 2000, activityLevel
+    // -1, codec nellymoser, enableVAD true). adl 51.4.1 describeType (temp/micprobe)
+    // shows NO fps field and NO setCodec/setRate methods -- those were invented and
+    // are removed. Capture + SampleDataEvent + live activityLevel are B1b. The
+    // remaining AIR members (requestPermission, permissionStatus/permissionManager,
+    // soundTransform, framesPerPacket, encodeQuality, noiseSuppressionLevel,
+    // useEchoSuppression, enhancedOptions) and the readonly-accessor nuance are
+    // tracked in TODO.md (Microphone API full alignment).
     shell('Microphone', 'flash.media::Microphone', 'EventDispatcher',
       [['gain', { kind: 'number' }], ['rate', { kind: 'int' }], ['silenceLevel', { kind: 'number' }],
        ['silenceTimeout', { kind: 'int' }], ['activityLevel', { kind: 'number' }], ['index', { kind: 'int' }],
        ['name', { kind: 'string' }], ['codec', { kind: 'string' }], ['enableVAD', { kind: 'bool' }],
-       ['fps', { kind: 'number' }], ['muted', { kind: 'bool' }]],
+       ['muted', { kind: 'bool' }]],
       [], [],
       [['setSilenceLevel', { kind: 'void' }, [shReq('silenceLevel', 'Number'), shIntP('timeout', -1)]],
        ['setUseEchoSuppression', { kind: 'void' }, [shReq('useEchoSuppression', 'Boolean')]],
-       ['setLoopBack', { kind: 'void' }, [gopt('state', 'Boolean', { kind: 'Bool', value: true })]],
-       ['setCodec', { kind: 'void' }, [shReq('codec', 'String')]],
-       ['setRate', { kind: 'void' }, [shIntP('rate', 11)]]],
+       ['setLoopBack', { kind: 'void' }, [gopt('state', 'Boolean', { kind: 'Bool', value: true })]]],
       [['getMicrophone', shObj('Microphone'), [shIntP('index', -1)]],
        ['getEnhancedMicrophone', shObj('Microphone'), [shIntP('index', -1)]]],
-      [['names', { kind: 'array' }]], ['isSupported']);
+      [['names', { kind: 'array' }], ['isSupported', { kind: 'bool' }]], []);
     // flash.desktop.Clipboard (阶段二百九十三): a REAL clipboard, not a shell. AIR's
     // model (Clipboard.html) is one object holding a set of (format -> data)
     // entries, with `generalClipboard` being that same set backed by the operating
@@ -6780,16 +6803,18 @@ export class SymbolTable {
         ['dispose', bdm({ kind: 'void' }, [])],
         // encode(rect, compressor, byteArray, byteArrayOffset = 0): serialize the
         // pixels through the named compressor (JPEGEncoderOptions /
-        // PNGEncoderOptions). Neither format is available from this build's vendored
-        // Skia (skia_use_libjpeg_turbo_encode / _libwebp_encode are off; SkPngEncoder
-        // IS linked, so PNG has a real path available through the glue). Writing the
-        // WRONG format's bytes into the caller's ByteArray would be a silent lie, so
-        // the body reports the gap and writes nothing; see TODO.md ('encode').
+        // PNGEncoderOptions). adl 51.4.1 describeType: exactly THREE parameters
+        // (rect, compressor, byteArray=null) -- there is NO byteArrayOffset (the
+        // older 4-param model was wrong; the byteArrayOffset string in airglobal
+        // belongs to Texture.uploadFromBitmapData). encode writes at the ByteArray's
+        // current `position`, advancing it and auto-extending length (writeBytes
+        // semantics). PNG is real (SkPngEncoder is linked, stage 421); JPEG encoding
+        // is still off in the vendored Skia (skia_use_libjpeg_turbo_encode=false) and
+        // reports the gap rather than writing the wrong format's bytes.
         ['encode', bdm({ kind: 'void' }, [
           { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },
           { name: 'compressor', type: 'Object', defaultValue: null, isRest: false },
           { name: 'byteArray', type: 'ByteArray', defaultValue: { kind: 'Null' }, isRest: false },
-          { name: 'byteArrayOffset', type: 'uint', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
         ])],
         ['setPixels', bdm({ kind: 'void' }, [
           { name: 'rect', type: 'Rectangle', defaultValue: null, isRest: false },

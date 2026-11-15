@@ -101,3 +101,44 @@ trace('native-drag: OK');
 `);
   assert.match(out.stdout,/native-drag: OK/);
 });
+
+// AIR (adl 51.4.1 temp/dragprobe) error/no-op contract: outside a drag session the
+// dropAction setter and acceptDragDrop are silent no-ops (only null target/clipboard
+// throw #2007), and doDrag with a null initiator or no mouse gesture no-ops instead of
+// throwing. The injectable backend (sk_drag_supported=1) lets these run headless.
+test('unit: desktop/native drag AIR error and no-op contract',()=> {
+  const out=run(`
+function check(v:Boolean,m:String):void {if(!v)throw new Error(m);}
+function inject(s:Stage,p:int,x:Number,y:Number,mask:int=1):int {return 1234567;}
+var root:Stage=new Stage();var target:Sprite=new Sprite();target.x=20;target.y=10;
+target.graphics.beginFill(0);target.graphics.drawRect(0,0,100,100);target.graphics.endFill();root.addChild(target);
+check(NativeDragManager.isSupported,'supported');
+check(NativeDragManager.dragInitiator==null,'initiator null');
+check(!NativeDragManager.isDragging,'not dragging');
+check(NativeDragManager.dropAction=='none','default none');
+NativeDragManager.dropAction='copy';check(NativeDragManager.dropAction=='none','set copy outside session no-op');
+NativeDragManager.dropAction='move';check(NativeDragManager.dropAction=='none','set move outside session no-op');
+var threwInvalid:Boolean=false;try{NativeDragManager.dropAction='bogus';}catch(e:Error){threwInvalid=true;}
+check(!threwInvalid && NativeDragManager.dropAction=='none','invalid outside session no throw');
+var nullThrew:Boolean=false;try{NativeDragManager.acceptDragDrop(null);}catch(e:TypeError){nullThrew=(e.errorID==2007);}
+check(nullThrew,'acceptDragDrop null #2007');
+var sessionThrew:Boolean=false;try{NativeDragManager.acceptDragDrop(target);}catch(e:Error){sessionThrew=true;}
+check(!sessionThrew,'acceptDragDrop outside session no-op');
+var cbThrew:Boolean=false;try{NativeDragManager.doDrag(null,null);}catch(e:TypeError){cbThrew=(e.errorID==2007);}
+check(cbThrew,'doDrag null clipboard #2007');
+var cb:Clipboard=new Clipboard();cb.setData('text','hello');
+var nullInitThrew:Boolean=false;try{NativeDragManager.doDrag(null,cb);}catch(e:Error){nullInitThrew=true;}
+check(!nullInitThrew && !NativeDragManager.isDragging,'doDrag null initiator no-op');
+var noGestureThrew:Boolean=false;try{NativeDragManager.doDrag(target,cb);}catch(e:Error){noGestureThrew=true;}
+check(!noGestureThrew && !NativeDragManager.isDragging,'doDrag no gesture no-op');
+inject(root,7,0,0);
+var cb2:Clipboard=new Clipboard();cb2.setData('text','outgoing');var started:Boolean=false;
+target.addEventListener(NativeDragEvent.NATIVE_DRAG_START,function(e:NativeDragEvent):void{started=true;});
+NativeDragManager.doDrag(target,cb2);
+check(started && NativeDragManager.isDragging && NativeDragManager.dragInitiator===target,'doDrag with gesture starts');
+inject(root,8,0,0);
+check(!NativeDragManager.isDragging && NativeDragManager.dragInitiator==null,'complete cleans');
+trace('native-drag-contract: OK');
+`);
+  assert.match(out.stdout,/native-drag-contract: OK/);
+});

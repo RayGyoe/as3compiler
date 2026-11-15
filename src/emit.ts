@@ -4585,6 +4585,37 @@ export class Emitter {
           continue;
         }
         if (name === 'NetworkInfo' && mname === 'findInterfaces') { this.emitNetworkInfoFindInterfaces(); continue; }
+        // flash.media.Microphone capture controls (B1b, stage 425). setLoopBack(true)
+        // starts the WASAPI capture worker (as_mic_start), false stops it and resets
+        // activityLevel to -1 (AIR). setSilenceLevel writes the real fields and pushes
+        // them to a live worker; setUseEchoSuppression stores the hint (shared-mode
+        // echo cancellation is a system effect). The SampleDataEvent pump itself is
+        // as_mic_dispatch, emitted below with the static side.
+        if (name === 'Microphone' && mname === 'setLoopBack') {
+          this.line('void Microphone_setLoopBack(void* _this, bool state) {');
+          this.indent++;
+          this.line('Microphone* m = (Microphone*)_this;');
+          this.line('if (state) { as_mic_start((void*)m, (int)m->rate, m->silenceLevel, (int)m->silenceTimeout); }');
+          this.line('else { as_mic_stop((void*)m); m->activityLevel = -1; }');
+          this.indent--;
+          this.line('}');
+          continue;
+        }
+        if (name === 'Microphone' && mname === 'setSilenceLevel') {
+          this.line('void Microphone_setSilenceLevel(void* _this, double silenceLevel, int timeout) {');
+          this.indent++;
+          this.line('Microphone* m = (Microphone*)_this;');
+          this.line('m->silenceLevel = silenceLevel;');
+          this.line('if (timeout >= 0) m->silenceTimeout = timeout;');
+          this.line('as_mic_set_silence((void*)m, silenceLevel, timeout);');
+          this.indent--;
+          this.line('}');
+          continue;
+        }
+        if (name === 'Microphone' && mname === 'setUseEchoSuppression') {
+          this.line('void Microphone_setUseEchoSuppression(void* _this, bool useEchoSuppression) { as_mic_set_echo((void*)_this, useEchoSuppression ? 1 : 0); }');
+          continue;
+        }
         this.emitShellStub(`${name}_${mname}`, `void* _this${this.shellArgs(m.params, info.importAlias)}`, m.returnType, `${label}.${mname}`);
       }
       for (const [mname, m] of info.getters) {
@@ -4614,6 +4645,14 @@ export class Emitter {
       for (const [mname, m] of info.staticMethods) {
         if (m.owner !== name) continue;
         if (name === 'NativeDragManager') continue;
+        // flash.media.Microphone.getMicrophone / getEnhancedMicrophone (B1a): real
+        // device lookup over the WASAPI as_mic_scan seam, populating name/index and
+        // the AIR-measured defaults. getMicrophone emits the shared helper first.
+        if (name === 'Microphone' && (mname === 'getMicrophone' || mname === 'getEnhancedMicrophone')) {
+          if (mname === 'getMicrophone') this.emitMicrophoneFromIndex();
+          this.line(`static Microphone* Microphone_${mname}_static(int _index) { return Microphone__from_index(_index); }`);
+          continue;
+        }
         this.emitShellStub(`${name}_${mname}_static`, this.shellArgs(m.params, info.importAlias, true), m.returnType, `${label}.${mname}`);
       }
       for (const [mname, m] of info.staticSetters ?? []) {
@@ -4628,6 +4667,12 @@ export class Emitter {
         // program can branch the way AIR documents instead of catching a throw.
         if (name === 'NativeProcess' && mname === 'isSupported') {
           this.line('bool NativeProcess_get_isSupported_static(void* _this) { (void)_this; return as_np_supported() != 0; }');
+          continue;
+        }
+        // flash.media.Microphone.names / isSupported (B1a): real WASAPI inventory.
+        if (name === 'Microphone' && mname === 'names') { this.emitMicrophoneNames(); continue; }
+        if (name === 'Microphone' && mname === 'isSupported') {
+          this.line('static bool Microphone_get_isSupported_static(void* _this) { (void)_this; return as_mic_scan(NULL, 0) > 0; }');
           continue;
         }
         // A static getter returning the class it lives on is the documented
@@ -4650,6 +4695,12 @@ export class Emitter {
         }
         this.emitShellStub(`${name}_get_${mname}_static`, 'void* _this', m.returnType, `${label}.${mname}`);
       }
+      // The Microphone SampleDataEvent frame-boundary pump (B1b). Emitted here
+      // because it needs the generated SampleDataEvent/ByteArray/EventDispatcher
+      // constructors; the capture worker and queue live in the runtime preamble
+      // (as_mic_*). One queued buffer -> one SAMPLE_DATA event carrying 2048
+      // big-endian float32 mono samples, position advancing by 2048 (AIR contract).
+      if (name === 'Microphone') this.emitMicrophoneDispatch();
       this.line('');
     }
     if (any) this.line('');
@@ -4668,9 +4719,12 @@ export class Emitter {
   //     an IPv4 broadcast;
   //   * the SAME Vector on repeated reads of one interface's addresses field (the
   //     field holds the vector; there is no per-read rebuild);
-  //   * hardwareAddress carries AIR's trailing space verbatim -- a caller that
-  //     stores it as a device id sends it to its server, so tidying it up here
-  //     would quietly change what the outside world sees.
+  //   * hardwareAddress carries AIR's exact per-platform form verbatim -- macOS
+  //     lowercase ':' pairs + ONE trailing space, Windows UPPERCASE '-' pairs with
+  //     no trailing space (as_net_mac_str / as_net_mac_str_win). A caller stores
+  //     this string as a device id, so tidying it up here would quietly change what
+  //     the outside world sees; displayName is the Windows FriendlyName and "" on
+  //     POSIX, carried per row rather than hard-coded.
   // The rows are malloc'd scratch, freed before returning: no GC object and no
   // arena growth per call, so a program that polls this on a timer does not leak.
   private emitNetworkInfoFindInterfaces(): void {
@@ -4690,7 +4744,7 @@ export class Emitter {
     this.indent++;
     this.line('cur = NetworkInterface_new();');
     this.line('cur->name = as_str_dup(rows[i].name);');
-    this.line('cur->displayName = as_str_dup("");');
+    this.line('cur->displayName = as_str_dup(rows[i].display);');
     this.line('cur->hardwareAddress = as_str_dup(rows[i].mac);');
     this.line('cur->active = rows[i].active != 0;');
     this.line('cur->mtu = rows[i].mtu;');
@@ -4714,6 +4768,120 @@ export class Emitter {
     this.line('}');
     this.line('free(rows);');
     this.line('return out;');
+    this.indent--;
+    this.line('}');
+  }
+
+  // flash.media.Microphone.getMicrophone shared device lookup (B1a, stage 424).
+  // as_mic_scan answers the capture-device rows; this builds one Microphone with
+  // the AIR-measured defaults (adl 51.4.1, temp/micprobe): rate 8, gain 50,
+  // silenceLevel 10, silenceTimeout 2000, activityLevel -1 (no capture yet -- B1b),
+  // muted false, codec nellymoser, enableVAD true. index<0 selects the first
+  // device; an out-of-range index returns null exactly like AIR.
+  private emitMicrophoneFromIndex(): void {
+    this.line('static Microphone* Microphone__from_index(int _index) {');
+    this.indent++;
+    this.line('int n = as_mic_scan(NULL, 0);');
+    this.line('if (n <= 0) return NULL;');
+    this.line('int idx = _index < 0 ? 0 : _index;');
+    this.line('if (idx >= n) return NULL;');
+    this.line('as_mic_row* rows = (as_mic_row*)malloc(sizeof(as_mic_row) * (size_t)n);');
+    this.line('if (rows == NULL) return NULL;');
+    this.line('int got = as_mic_scan(rows, n);');
+    this.line('if (idx >= got) { free(rows); return NULL; }');
+    this.line('Microphone* m = Microphone_new();');
+    this.line('m->name = as_str_dup(rows[idx].name);');
+    this.line('m->_index = idx;');
+    this.line('m->rate = 8;');
+    this.line('m->gain = 50;');
+    this.line('m->silenceLevel = 10;');
+    this.line('m->silenceTimeout = 2000;');
+    this.line('m->activityLevel = -1;');
+    this.line('m->muted = false;');
+    this.line('m->codec = as_str_dup("nellymoser");');
+    this.line('m->enableVAD = true;');
+    this.line('gc_write_barrier((void*)m->name);');
+    this.line('gc_write_barrier((void*)m->codec);');
+    this.line('free(rows);');
+    this.line('return m;');
+    this.indent--;
+    this.line('}');
+  }
+
+  // flash.media.Microphone.names (B1a): a fresh Array of friendly-name strings on
+  // every call (identity never shared, like NetworkInfo.findInterfaces). Empty on
+  // a machine with no capture device; the platform seam reports the gap once.
+  private emitMicrophoneNames(): void {
+    this.line('static as_array* Microphone_get_names_static(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('int n = as_mic_scan(NULL, 0);');
+    this.line('as_array* a = as_array_new();');
+    this.line('if (n <= 0) return a;');
+    this.line('as_mic_row* rows = (as_mic_row*)malloc(sizeof(as_mic_row) * (size_t)n);');
+    this.line('if (rows == NULL) return a;');
+    this.line('int got = as_mic_scan(rows, n);');
+    this.line('for (int i = 0; i < got; i++) as_array_push(a, as_v_str(as_str_dup(rows[i].name)));');
+    this.line('free(rows);');
+    this.line('return a;');
+    this.indent--;
+    this.line('}');
+  }
+
+  // The Microphone SampleDataEvent pump (B1b, stage 425). Runs on the AS3 thread
+  // at the frame boundary (called from as_async_tick_with); the capture worker
+  // only queues buffers under as_mic_lock. Each buffer becomes one SAMPLE_DATA
+  // event whose data is a ByteArray of len big-endian float32 samples and whose
+  // position is the cumulative sample count (AIR: 0, 2048, 4096, ...). The lock is
+  // released for every dispatch -- a listener may call setLoopBack(false), which
+  // takes the same lock.
+  private emitMicrophoneDispatch(): void {
+    this.line('int as_mic_dispatch(void) {');
+    this.indent++;
+    this.line('int total = 0;');
+    this.line('int n = as_mic_total();');
+    this.line('for (int i = 0; i < n; i++) {');
+    this.indent++;
+    this.line('as_mic* m = as_mic_at(i);');
+    this.line('if (m == NULL || m->obj == NULL) continue;');
+    this.line('Microphone* o = (Microphone*)m->obj;');
+    this.line('for (;;) {');
+    this.indent++;
+    this.line('struct as_mic_buf* b = as_mic_take(m);');
+    this.line('if (b == NULL) break;');
+    this.line('ByteArray* ba = ByteArray_new();');
+    this.line('int nbytes = b->len * 4;');
+    this.line('ba->data = (void*)gc_alloc(GCT_BYTES, (size_t)(nbytes > 0 ? nbytes : 1));');
+    this.line('ba->capacity = nbytes;');
+    this.line('ba->length = nbytes;');
+    this.line('unsigned char* dst = (unsigned char*)ba->data;');
+    this.line('for (int s = 0; s < b->len; s++) {');
+    this.indent++;
+    this.line('union { float f; uint32_t u; } cv; cv.f = b->samples[s];');
+    this.line('uint32_t u = cv.u;');
+    this.line('dst[s*4+0] = (unsigned char)(u >> 24);');
+    this.line('dst[s*4+1] = (unsigned char)(u >> 16);');
+    this.line('dst[s*4+2] = (unsigned char)(u >> 8);');
+    this.line('dst[s*4+3] = (unsigned char)(u);');
+    this.indent--;
+    this.line('}');
+    this.line('gc_write_barrier((void*)ba->data);');
+    this.line('ba->position = 0;');
+    // activityLevel is a public FIELD on the shell (B1a), so mic.activityLevel
+    // reads it directly -- publish the worker's live 0..100 here, before the
+    // listener runs, so a handler reading mic.activityLevel sees this buffer's
+    // level (AIR reports 0..100 during capture, -1 before/after).
+    this.line('o->activityLevel = m->activity;');
+    this.line('SampleDataEvent* ev = SampleDataEvent_new((char*)"sampleData", false, false, (double)b->position, ba);');
+    this.line('EventDispatcher_dispatchEvent((void*)o, (Event*)ev);');
+    this.line('total++;');
+    this.line('as_mic_buf_free(b);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('as_mic_reap();');
+    this.line('return total;');
     this.indent--;
     this.line('}');
   }
@@ -8640,7 +8808,29 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
   // explicit `return as_v_undefined();`; a TYPED body that can fall through was
   // already rejected by checkAllPathsReturn (symbols.ts), exactly as mxmlc does.
   private emitFunctionBodyEnd(body: Block, ret: CType): void {
-    if (ret.kind === 'any' && stmtCompletesNormally(body)) this.line('return as_v_undefined();');
+    if (!stmtCompletesNormally(body)) return;
+    // Fall-through exit: pop this function's shadow-stack frame. A body that
+    // ends in return/throw already left it (Return emits its own leave; a throw
+    // unwinds to a catch that restores the saved depth), so this must NOT run
+    // for those -- stmtCompletesNormally is exactly that test (no double pop).
+    this.line('as_astack_leave();');
+    if (ret.kind === 'any') this.line('return as_v_undefined();');
+  }
+
+  // The class half of a shadow-stack frame: AIR prints the AVM2 qualified name
+  // ("pkg::Class"), never the sanitized C identifier. The static-side "$"
+  // suffix is appended by the caller (AVM2 names the static class "Cls$").
+  private frameClassName(cname: string): string {
+    const ci = this.symbols.getClass(cname);
+    return ci?.fqn ?? ci?.reflectFqn ?? cname;
+  }
+
+  // Push one shadow-stack frame (Error.getStackTrace). cls NULL -> "global"
+  // (AIR's free-function half); meth NULL -> constructor frame "Cls()".
+  private emitFrameEnter(cls: string | null, meth: string | null): void {
+    const c = cls === null ? 'NULL' : `"${this.escapeCString(cls)}"`;
+    const m = meth === null ? 'NULL' : `"${this.escapeCString(meth)}"`;
+    this.line(`as_astack_enter(${c}, ${m});`);
   }
 
   private emitFunctionValues(): void {
@@ -8890,6 +9080,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         this.currentClosureCells = this.closureCellEnv.get(fn.name)?.resolve ?? null;
       }
       this.indent++;
+      // Named function expressions keep AIR's "Function/name" half; a closure
+      // declared inside a class method carries that class (fnQName's rule).
+      this.emitFrameEnter(fn.cname !== null ? this.frameClassName(fn.cname) : (fn.asName !== null ? 'Function' : null), fn.asName ?? 'anonymous');
       // A closure declared inside a `with` body keeps that scope: AIR captures the
       // with OBJECT in the closure's chain, so the names it serves are decided at
       // CALL time (adl 51.4.1, temp/proxyany/wcap). The captures were recorded by
@@ -12022,6 +12215,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('o->name = (char*)"Error";');
     this.line('o->message = message; o->errorID = id;');
     this.line('gc_write_barrier((void*)message);');
+    // AIR captures the stack at CONSTRUCTION, not at throw (temp/stackprobe):
+    // a never-thrown Error still reports its construction site, and a rethrow
+    // keeps these frames. NULL when no AS3 frame is live (release player).
+    this.line('o->_stacktrace = as_astack_format();');
+    this.line('gc_write_barrier((void*)o->_stacktrace);');
     this.indent--;
     this.line('}');
     this.line('Error* Error_new(char* message, int id) {');
@@ -12035,11 +12233,26 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // Error.toString(): the name alone when the message is empty, "name: message"
     // otherwise (measured: `new Error()` -> "Error", `new Error("boom")` ->
     // "Error: boom", `new Error("boom", 7)` -> "Error: boom").
-    // Error.getStackTrace(): AIR hands back the AVM2 stack captured at throw time.
-    // This compiler keeps no shadow stack for exception objects, so the call
-    // reports itself once and returns the empty string (the callers are all
-    // diagnostics that concatenate it into a log line).
-    this.line('char* Error_getStackTrace(void* _this) { (void)_this; as_shell_unsupported((char*)"Error.getStackTrace"); return (char*)""; }');
+    // Error.getStackTrace(): the shadow-stack text Error_ctor captured, behind
+    // the same header Error_toString uses ("name: message", or the name alone
+    // when the message is empty), then one tab-indented "Cls/meth()" line per
+    // frame, innermost first (adl 51.4.1, temp/stackprobe). A NULL capture
+    // returns null: AIR's release player answers null with no stack info.
+    this.line('char* Error_getStackTrace(void* _this) {');
+    this.indent++;
+    this.line('Error* e = (Error*)_this;');
+    this.line('if (e->_stacktrace == NULL) return NULL;');
+    this.line('const char* nm = (e->name != NULL) ? e->name : "Error";');
+    this.line('if (e->message == NULL || e->message[0] == 0) {');
+    this.indent++;
+    this.line('const char* parts[3]; parts[0] = nm; parts[1] = "\\n"; parts[2] = e->_stacktrace;');
+    this.line('return as_str_concat_n(3, parts);');
+    this.indent--;
+    this.line('}');
+    this.line('const char* parts[5]; parts[0] = nm; parts[1] = ": "; parts[2] = e->message; parts[3] = "\\n"; parts[4] = e->_stacktrace;');
+    this.line('return as_str_concat_n(5, parts);');
+    this.indent--;
+    this.line('}');
     this.line('char* Error_toString(void* _this) {');
     this.indent++;
     this.line('Error* e = (Error*)_this;');
@@ -12066,6 +12279,10 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
       this.line(`o->name = (char*)"${subName}";`);
       this.line('o->message = message; o->errorID = id;');
       this.line('gc_write_barrier((void*)message);');
+      // Same construction-time capture as Error_ctor (the subclass ctors do
+      // not call it; SQLError_ctor does and inherits the capture from there).
+      this.line('o->_stacktrace = as_astack_format();');
+      this.line('gc_write_barrier((void*)o->_stacktrace);');
       this.indent--;
       this.line('}');
       this.line(`${sub}* ${sub}_new(char* message, int id) {`);
@@ -13061,10 +13278,19 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.indent--;
     this.line('}');
     this.line('char* NativeApplication_get_systemIdleMode(void* _this) { (void)_this; return ASC_idle_mode; }');
-    // Setting it stores the value (so a read-back agrees with what was written, the
-    // way AIR reports the mode it is in) but the idle-timer part has no backend, so
-    // a KEEP_AWAKE request is reported once rather than silently ignored.
-    this.line('void NativeApplication_set_systemIdleMode(void* _this, char* value) { (void)_this; ASC_idle_mode = value; if (value != NULL && strcmp(value, "keepAwake") == 0) as_shell_unsupported((char*)"flash.desktop.NativeApplication.systemIdleMode (this build never inhibits the system idle timer)"); }');
+    // Setting it validates the value (adl 51.4.1: anything other than "normal" /
+    // "keepAwake" raises ArgumentError #2008), stores it so a read-back agrees,
+    // and drives the real idle-timer backend (as_set_idle_mode: SetThreadExecutionState
+    // on Windows, IOPMAssertion on macOS; other targets report the gap once).
+    this.line('void NativeApplication_set_systemIdleMode(void* _this, char* value) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('if (value == NULL) { as_throw(Error_new((char*)"Error #2007: Parameter idleMode must be non-null.", 2007)); return; }');
+    this.line('if (strcmp(value, "normal") != 0 && strcmp(value, "keepAwake") != 0) { as_throw(Error_new((char*)"Error #2008: Parameter systemIdleMode must be one of the accepted values.", 2008)); return; }');
+    this.line('ASC_idle_mode = value;');
+    this.line('as_set_idle_mode(strcmp(value, "keepAwake") == 0);');
+    this.indent--;
+    this.line('}');
     // ---- NativeApplication: icon / menu / autoExit / capability bits (阶段二百五十五) ----
     // The statics live here (not in the menu block below) because the setters and
     // getters are emitted here; the menu subsystem further down only uses them.
@@ -13291,10 +13517,11 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('as_mark_dirty(o);');
     this.indent--;
     this.line('}');
-    // cacheAsBitmapMatrix: stored (AIR's getter hands back what was set) but not
-    // applied -- this renderer bakes a cacheAsBitmap subtree at the object's own
-    // resolution, so a fixed-resolution cache for a transformed object is a quality
-    // / perf difference, not a different picture. The assignment says so once.
+    // cacheAsBitmapMatrix: stored AND applied (stage 428, D2). AIR caches the object
+    // as if transformed by this matrix and blits with the inverse, so the final picture
+    // is unchanged but the cache resolution scales with the matrix (as_render_cached).
+    // The getter hands back what was set. adl desktop CPU mode no-ops the matrix (getter
+    // null); we keep the round-trip and honor the documented cache-resolution semantics.
     this.line('Matrix* DisplayObject_get_cacheAsBitmapMatrix(void* _this) { DisplayObject* o = (DisplayObject*)_this; if (o == NULL) return NULL; return o->_cache_matrix; }');
     this.line('void DisplayObject_set_cacheAsBitmapMatrix(void* _this, Matrix* value) {');
     this.indent++;
@@ -13302,7 +13529,7 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('if (o == NULL) return;');
     this.line('o->_cache_matrix = value;');
     this.line('as_mark_dirty(o);');
-    this.line('if (value != NULL) { gc_write_barrier((void*)value); as_shell_unsupported("DisplayObject.cacheAsBitmapMatrix (this renderer caches at the object\'s own resolution)"); }');
+    this.line('if (value != NULL) { gc_write_barrier((void*)value); }');
     this.indent--;
     this.line('}');
     // DisplayObject.scrollRect: the object is displayed clipped to the rectangle and
@@ -16458,14 +16685,54 @@ this.line('AS_bake_pend_n = 0;');
     this.line('}');
     this.line('void Camera_ctor(Camera* o) { EventDispatcher_ctor((EventDispatcher*)o, NULL); }');
     this.line('Camera* Camera_new(void) { Camera* o = (Camera*)gc_alloc(GCT_CLASS, sizeof(Camera)); o->vtable = &Camera_vt; Camera_ctor(o); return o; }');
-    this.line('Camera* Camera_getCamera_static(char* name) { (void)name; as_shell_unsupported("Camera.getCamera"); return NULL; }');
-    // No camera backend: getCamera() finds nothing, and the two documented readers
-    // report the missing device once (as_shell_unsupported) instead of silently
-    // pretending an empty name / an empty camera list is the truth of the machine.
-    // The app guards every use with `if (camera)`, and its own camera picker just
-    // shows no entries.
-    this.line('char* Camera_get_name(void* _this) { (void)_this; as_shell_unsupported("Camera.name"); return (char*)""; }');
-    this.line('as_array* Camera_get_names_static(void* _this) { (void)_this; as_shell_unsupported("Camera.names"); return as_array_new(); }');
+    this.line('static Camera* Camera__from_name(char* name);');
+    this.line('Camera* Camera_getCamera_static(char* name) { return Camera__from_name(name); }');
+    // flash.media.Camera device face (B2, stage 426): real DirectShow enumeration
+    // over the as_cam_scan seam. getCamera(name) matches by device name OR by
+    // index-as-string (AIR: getCamera("0") selects device 0); null selects the first
+    // device, an out-of-range index or unknown name returns null. camName/camIdx are
+    // populated from the inventory; name/index are read-only accessors over them.
+    this.line('static Camera* Camera__from_name(char* name) {');
+    this.indent++;
+    this.line('int n = as_cam_scan(NULL, 0);');
+    this.line('if (n <= 0) return NULL;');
+    this.line('as_cam_row* rows = (as_cam_row*)malloc(sizeof(as_cam_row) * (size_t)n);');
+    this.line('if (rows == NULL) return NULL;');
+    this.line('int got = as_cam_scan(rows, n);');
+    this.line('int idx = -1;');
+    this.line('if (name == NULL) { idx = 0; }');
+    this.line('else {');
+    this.indent++;
+    this.line('char* end; long v = strtol(name, &end, 10);');
+    this.line('if (end != name && *end == 0 && v >= 0 && v < got) { idx = (int)v; }');
+    this.line('else { for (int i = 0; i < got; i++) if (strcmp(rows[i].name, name) == 0) { idx = i; break; } }');
+    this.indent--;
+    this.line('}');
+    this.line('if (idx < 0 || idx >= got) { free(rows); return NULL; }');
+    this.line('Camera* c = Camera_new();');
+    this.line('c->camName = as_str_dup(rows[idx].name); gc_write_barrier((void*)c->camName);');
+    this.line('c->camIdx = idx;');
+    this.line('free(rows);');
+    this.line('return c;');
+    this.indent--;
+    this.line('}');
+    this.line('char* Camera_get_name(void* _this) { Camera* o = (Camera*)_this; return o->camName != NULL ? o->camName : (char*)""; }');
+    this.line('int Camera_get_index(void* _this) { return ((Camera*)_this)->camIdx; }');
+    this.line('as_array* Camera_get_names_static(void* _this) {');
+    this.indent++;
+    this.line('(void)_this;');
+    this.line('int n = as_cam_scan(NULL, 0);');
+    this.line('as_array* a = as_array_new();');
+    this.line('if (n <= 0) return a;');
+    this.line('as_cam_row* rows = (as_cam_row*)malloc(sizeof(as_cam_row) * (size_t)n);');
+    this.line('if (rows == NULL) return a;');
+    this.line('int got = as_cam_scan(rows, n);');
+    this.line('for (int i = 0; i < got; i++) as_array_push(a, as_v_str(as_str_dup(rows[i].name)));');
+    this.line('free(rows);');
+    this.line('return a;');
+    this.indent--;
+    this.line('}');
+    this.line('bool Camera_get_isSupported_static(void* _this) { (void)_this; return as_cam_scan(NULL, 0) > 0; }');
     // ---- flash.external.ExtensionContext + flash.events.StatusEvent (stage 135) ----
     // The AS3 half of the AIR native-extension bridge, as a SHELL. No FRE host is
     // linked here, so a context carries its extension id, is a real EventDispatcher
@@ -21007,10 +21274,21 @@ FileFilter* FileFilter_new(char* description, char* extension, char* macType) {
     this.line('File__submitOp((File*)_this, recursive ? 2 : 1);');
     this.indent--;
     this.line('}');
-    // No backend here: a native file dialog / the OS shell. These report
-    // themselves once (stderr) instead of silently returning, so a flow that
-    // depends on one is visibly stalled rather than mysteriously empty.
-    this.line('void File_openWithDefaultApplication(void* _this) { (void)_this; as_shell_unsupported((char*)"flash.filesystem.File.openWithDefaultApplication"); }');
+    // openWithDefaultApplication: hand the path to the OS default handler (the
+    // same as_open_external seam navigateToURL uses -- ShellExecuteW on Windows,
+    // `open` on macOS, xdg-open elsewhere, with the ASC_OPEN_LAUNCHER headless
+    // override). Measured on adl 51.4.1: an empty File (no path) raises #1009, a
+    // missing path raises #3003, and a directory is accepted (the file manager
+    // opens it). The existence check runs BEFORE launching so a missing file never
+    // spawns anything.
+    this.line('void File_openWithDefaultApplication(void* _this) {');
+    this.indent++;
+    this.line('File* o = (File*)_this;');
+    this.line('if (o->_nativePath == NULL) { as_throw(Error_new((char*)"Error #1009: Cannot access a property or method of a null object reference.", 1009)); return; }');
+    this.line('if (!as_path_exists(o->_nativePath)) { as_throw(Error_new((char*)"Error #3003: File or directory does not exist.", 3003)); return; }');
+    this.line('as_open_external(o->_nativePath);');
+    this.indent--;
+    this.line('}');
     // File.upload(request, fieldName, testUpload): File extends FileReference in
     // AIR, and this build implements the upload for real (file-dialog.ts carries
     // the measured multipart envelope), so the File-typed entry point hands
@@ -24167,32 +24445,81 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('free(tmp); free(a);');
     this.indent--;
     this.line('}');
-    // BitmapData.encode(rect, compressor, byteArray, byteArrayOffset = 0): serialize
-    // the pixels through the named compressor. Neither format this build can reach:
-    // the vendored Skia is built with skia_use_libjpeg_turbo_encode=false and
-    // _libwebp_encode=false (SkPngEncoder IS linked, so PNG could be done through
-    // the glue -- see TODO.md 'encode'). Pointing the caller at the WRONG format's
-    // bytes would be a silent lie, so nothing is written and the gap is reported.
-    this.line('void BitmapData_encode(void* _this, Rectangle* rect, Object* compressor, ByteArray* out, unsigned byteArrayOffset) {');
+    // BitmapData.encode(rect, compressor, byteArray=null): serialize the rect region
+    // through the named compressor into the ByteArray at its CURRENT position
+    // (advancing position, auto-extending length -- writeBytes semantics; adl 51.4.1
+    // measured: there is NO byteArrayOffset parameter, describeType shows 3 params).
+    // PNG is real via SkPngEncoder (stage 421); JPEG via the libjpeg-turbo C API
+    // (stage 422 A2). An unknown compressor still reports the gap loudly.
+    // Null checks per adl: rect/compressor null -> TypeError #2007; byteArray null ->
+    // silent no-op (it is an optional parameter defaulting to null).
+    this.line('void BitmapData_encode(void* _this, Rectangle* rect, Object* compressor, ByteArray* out) {');
     this.indent++;
-    this.line('(void)_this; (void)rect; (void)out; (void)byteArrayOffset;');
-    this.line('const char* fmt = "an unknown compressor";');
-    this.line('if (compressor != NULL && as_is(compressor, &JPEGEncoderOptions_vt)) fmt = "JPEGEncoderOptions";');
-    this.line('else if (compressor != NULL && as_is(compressor, &PNGEncoderOptions_vt)) fmt = "PNGEncoderOptions";');
-    this.line('as_shell_unsupported(as_str_concat_n(4, (const char*[]){ "BitmapData.encode with ", fmt, " (this build has no image encoder: the vendored Skia disables JPEG/WebP encoding)", "" }));');
+    this.line('BitmapData* bd = (BitmapData*)_this;');
+    this.line('if (rect == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter rectangle must be non-null.", 2007)); return; }');
+    this.line('if (compressor == NULL) { as_throw(TypeError_new((char*)"Error #2007: Parameter compressor must be non-null.", 2007)); return; }');
+    this.line('if (out == NULL || bd == NULL || bd->pixels == NULL) return;');
+    this.line('int isPng = as_is(compressor, &PNGEncoderOptions_vt);');
+    this.line('int isJpeg = as_is(compressor, &JPEGEncoderOptions_vt);');
+    this.line('if (!isPng && !isJpeg) {');
+    this.indent++;
+    this.line('as_shell_unsupported("BitmapData.encode with an unknown compressor (only PNG and JPEG are supported)");');
+    this.line('return;');
     this.indent--;
     this.line('}');
-    // applyFilter: blur sourceRect of sourceBitmapData (via BlurFilter) into this
-    // at destPoint. DropShadowFilter/GlowFilter rasterization is deferred (throw);
-    // unknown filters are value-only no-ops.
+    // JPEG quality is a uint (adl: new JPEGEncoderOptions(-5) reads back 4294967291).
+    // encode raises #2006 above 100; compare unsigned so a wrapped negative is caught
+    // rather than masked by an int cast. The constructor itself does not range-check.
+    this.line('unsigned jpegQuality = 80;');
+    this.line('if (isJpeg) {');
+    this.indent++;
+    this.line('jpegQuality = ((JPEGEncoderOptions*)compressor)->quality;');
+    this.line('if (jpegQuality > 100) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return; }');
+    this.indent--;
+    this.line('}');
+    this.line('int sx = (int)rect->x, sy = (int)rect->y;');
+    this.line('int sw = (int)rect->width, sh = (int)rect->height;');
+    this.line('if (sx < 0) { sw += sx; sx = 0; } if (sy < 0) { sh += sy; sy = 0; }');
+    this.line('if (sw > bd->width - sx) sw = bd->width - sx;');
+    this.line('if (sh > bd->height - sy) sh = bd->height - sy;');
+    this.line('if (sw <= 0 || sh <= 0) return;');
+    // The encoder is a Skia seam: pure-C builds (no ASC_USE_SKIA) have no image
+    // backend, so report the gap loudly there instead of calling undeclared functions.
+    this.line('#ifdef ASC_USE_SKIA');
+    this.line('unsigned* region = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
+    this.line('const unsigned* sp = (const unsigned*)bd->pixels;');
+    this.line('for (int y = 0; y < sh; y++) memcpy(region + (size_t)y * sw, sp + (size_t)(sy + y) * bd->width + sx, sizeof(unsigned) * (size_t)sw);');
+    this.line('void* img = sk_image_from_argb(region, sw, sh);');
+    this.line('free(region);');
+    this.line('if (img == NULL) return;');
+    this.line('unsigned char* enc = NULL; size_t encLen = 0;');
+    this.line('int ok = isPng ? sk_image_encode_png_mem(img, &enc, &encLen) : sk_image_encode_jpeg_mem(img, (int)jpegQuality, &enc, &encLen);');
+    this.line('sk_image_delete(img);');
+    this.line('if (!ok || enc == NULL) { if (enc != NULL) free(enc); return; }');
+    this.line('as_ba_grow_pos(out, (int)encLen);');
+    this.line('memcpy((unsigned char*)out->data + out->position, enc, encLen);');
+    this.line('out->position += (int)encLen;');
+    this.line('if (out->position > out->length) out->length = out->position;');
+    this.line('free(enc);');
+    this.line('#else');
+    this.line('as_shell_unsupported("BitmapData.encode (this build has no Skia image backend)");');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
+    // applyFilter: blur sourceRect of sourceBitmapData (via BlurFilter, CPU box blur)
+    // or rasterize a DropShadow/Glow (via the Skia image-filter seams) into this at
+    // destPoint; unknown filters are value-only no-ops.
+    this.line('static double as_filter_sigma(double blur, int quality);');
     this.line('void BitmapData_applyFilter(void* _this, BitmapData* source, Rectangle* sourceRect, Point* destPoint, BitmapFilter* filter) {');
     this.indent++;
     this.line('BitmapData* dst = (BitmapData*)_this;');
     this.line('if (dst == NULL || source == NULL || source->pixels == NULL || dst->pixels == NULL || filter == NULL || sourceRect == NULL || destPoint == NULL) return;');
     this.line('int blurX = 0, blurY = 0, quality = 1;');
-    this.line('if (as_is(filter, &BlurFilter_vt)) { BlurFilter* b = (BlurFilter*)filter; blurX = (int)b->blurX; blurY = (int)b->blurY; quality = b->quality; }');
-    this.line('else if (as_is(filter, &DropShadowFilter_vt) || as_is(filter, &GlowFilter_vt)) { as_throw(Error_new((char*)"applyFilter: DropShadowFilter/GlowFilter rasterization not implemented", 0)); return; }');
-    this.line('else { return; }');
+    this.line('int is_blur = as_is(filter, &BlurFilter_vt);');
+    this.line('int is_glow = as_is(filter, &GlowFilter_vt);');
+    this.line('int is_shadow = as_is(filter, &DropShadowFilter_vt);');
+    this.line('if (is_blur) { BlurFilter* b = (BlurFilter*)filter; blurX = (int)b->blurX; blurY = (int)b->blurY; quality = b->quality; }');
+    this.line('else if (!is_glow && !is_shadow) { return; }');
     this.line('int sx = (int)sourceRect->x, sy = (int)sourceRect->y;');
     this.line('int sw = (int)sourceRect->width, sh = (int)sourceRect->height;');
     this.line('if (sx < 0) { sw += sx; sx = 0; } if (sy < 0) { sh += sy; sy = 0; }');
@@ -24203,12 +24530,74 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('unsigned* region = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
     this.line('const unsigned* sp = (const unsigned*)source->pixels;');
     this.line('for (int y = 0; y < sh; y++) memcpy(region + (size_t)y * sw, sp + (size_t)(sy + y) * source->width + sx, sizeof(unsigned) * (size_t)sw);');
+    this.line('if (is_blur) {');
+    this.indent++;
     this.line('unsigned* blurred = (unsigned*)malloc(sizeof(unsigned) * (size_t)(sw * sh));');
     this.line('as_blur_apply(blurred, region, sw, sh, blurX / 2, blurY / 2, quality);');
     this.line('unsigned* dp = (unsigned*)dst->pixels;');
     this.line('as_bd_mark_dirty(dst);');
     this.line('for (int y = 0; y < sh; y++) { int ty = dy + y; if (ty < 0 || ty >= dst->height) continue; for (int x = 0; x < sw; x++) { int tx = dx + x; if (tx < 0 || tx >= dst->width) continue; dp[(size_t)ty * dst->width + tx] = blurred[(size_t)y * sw + x]; } }');
-    this.line('free(region); free(blurred);');
+    this.line('free(blurred);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    // A3 (stage 429): DropShadow/Glow rasterization. Reuses the same Skia image-filter
+    // seams as the DisplayObject.filters path (as_render_filtered): render the source
+    // region into a padded surface, apply the filter via a saveLayer paint, read the
+    // pixels back and blit to dst anchored at destPoint (the source rect's top-left).
+    // The padding lets the blur/shadow expand beyond the source rect, as AIR does.
+    this.line('#ifdef ASC_USE_SKIA');
+    this.line('double fBlurX, fBlurY, fStrength, fAlpha; int fQuality; unsigned fColor;');
+    this.line('double ddx = 0.0, ddy = 0.0; int drawSource = 1; int shadowOnly = 0;');
+    this.line('if (is_glow) {');
+    this.indent++;
+    this.line('GlowFilter* gf = (GlowFilter*)filter;');
+    this.line('fBlurX = gf->blurX; fBlurY = gf->blurY; fStrength = gf->strength; fAlpha = gf->alpha; fQuality = gf->quality; fColor = gf->color; shadowOnly = gf->_shadow_only;');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('DropShadowFilter* ds = (DropShadowFilter*)filter;');
+    this.line('fBlurX = ds->blurX; fBlurY = ds->blurY; fStrength = ds->strength; fAlpha = ds->alpha; fQuality = ds->quality; fColor = ds->color; shadowOnly = ds->_shadow_only; drawSource = !ds->_shadow_only;');
+    this.line('double rad = ds->angle * 3.14159265358979323846 / 180.0; ddx = ds->distance * cos(rad); ddy = ds->distance * sin(rad);');
+    this.indent--;
+    this.line('}');
+    this.line('double sigX = as_filter_sigma(fBlurX, fQuality), sigY = as_filter_sigma(fBlurY, fQuality);');
+    this.line('int margin = (int)ceil(fmax(fBlurX, fBlurY)) + (int)ceil(sqrt(ddx * ddx + ddy * ddy)) + 2;');
+    this.line('int fw = sw + 2 * margin, fh = sh + 2 * margin;');
+    this.line('void* img = as_skia_image_from_argb(region, sw, sh);');
+    this.line('void* surf = as_skia_surface_new(fw, fh);');
+    this.line('if (img != NULL && surf != NULL) {');
+    this.indent++;
+    this.line('void* sc = as_skia_surface_canvas(surf);');
+    this.line('as_skia_canvas_clear_transparent(sc);');
+    this.line('void* p = as_skia_paint_fill(0x000000, 1.0);');
+    this.line('if (is_glow) as_skia_paint_set_glow(p, sigX, sigY, fColor, fAlpha, fStrength);');
+    this.line('else as_skia_paint_set_drop_shadow(p, ddx, ddy, sigX, sigY, fColor, fAlpha, fStrength, drawSource);');
+    this.line('as_skia_canvas_save_layer_paint(sc, p);');
+    this.line('as_skia_paint_delete(p);');
+    this.line('as_skia_canvas_draw_image_rect(sc, img, margin, margin, sw, sh, 1);');
+    this.line('as_skia_canvas_restore(sc);');
+    // The halo/shadow layer may carry only the silhouette; paint the source body on
+    // top in the same regimes as as_render_filtered.
+    this.line('if (is_glow) { if (!shadowOnly) as_skia_canvas_draw_image_rect(sc, img, margin, margin, sw, sh, 1); }');
+    this.line('else { if (drawSource && fAlpha * fStrength > 1.0) as_skia_canvas_draw_image_rect(sc, img, margin, margin, sw, sh, 1); }');
+    this.line('unsigned* fout = (unsigned*)malloc(sizeof(unsigned) * (size_t)(fw * fh));');
+    this.line('as_skia_surface_read_argb(surf, fout, fw, fh);');
+    this.line('unsigned* dp = (unsigned*)dst->pixels;');
+    this.line('as_bd_mark_dirty(dst);');
+    this.line('int ox = dx - margin, oy = dy - margin;');
+    this.line('for (int y = 0; y < fh; y++) { int ty = oy + y; if (ty < 0 || ty >= dst->height) continue; for (int x = 0; x < fw; x++) { int tx = ox + x; if (tx < 0 || tx >= dst->width) continue; dp[(size_t)ty * dst->width + tx] = fout[(size_t)y * fw + x]; } }');
+    this.line('free(fout);');
+    this.indent--;
+    this.line('}');
+    this.line('if (img != NULL) as_skia_image_delete(img);');
+    this.line('if (surf != NULL) as_skia_surface_delete(surf);');
+    this.line('#else');
+    this.line('as_throw(Error_new((char*)"applyFilter: DropShadowFilter/GlowFilter needs the Skia image backend", 0));');
+    this.line('#endif');
+    this.indent--;
+    this.line('}');
+    this.line('free(region);');
     this.indent--;
     this.line('}');
     // perlinNoise: fill the bitmap with a deterministic hash-based grayscale noise
@@ -29610,7 +29999,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and window-sweep entry points plant the same buffer (ASC_window_on_*), which
     // is why this one checks the flag first instead of assuming it is free.
     this.line('int _fguard = 0;');
-    this.line("if (as_frame_guard == 0) { if (AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; } _fguard = 1; as_frame_guard = 1; }");
+    this.line("if (as_frame_guard == 0) { if (AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; } _fguard = 1; as_frame_guard = 1; }");
     // Frame-boundary GC safe point: all user frame callbacks have returned, so
     // only permanent roots (static fields, stage, event registry, timers) are
     // live. Each frame advances the incremental mark/sweep by a fixed budget
@@ -30744,6 +31133,37 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('if (o->filters != NULL && o->filters->length > 0) as_filters_expand(o->filters, &bl, &bt, &br, &bb);');
+    // D2 (stage 428): cacheAsBitmapMatrix. AIR caches the object AS IF transformed by
+    // this matrix, then draws the cache with the INVERSE, so the final picture is
+    // unchanged (adl 51.4.1: identity/scale/translate matrices all pixel-identical to
+    // no matrix, temp/cabmprobe) -- only the cache RESOLUTION scales with the matrix
+    // (a 2x matrix bakes a 2x bitmap). It is a mobile/GPU-era feature; adl desktop CPU
+    // mode no-ops it (getter null). We honor the documented semantics: bake the content
+    // under M and blit under M^-1, sizing the surface to M-transformed bounds. Gated on
+    // a NON-identity matrix so the common (no-matrix) tuned path is untouched.
+    this.line('int cm_on = 0; double cma = 1.0, cmb = 0.0, cmc = 0.0, cmd = 1.0, cmtx = 0.0, cmty = 0.0;');
+    this.line('double cia = 1.0, cib = 0.0, cic = 0.0, cid = 1.0, citx = 0.0, city = 0.0;');
+    this.line('if (o->_cache_flag && o->_cache_matrix != NULL) {');
+    this.indent++;
+    this.line('Matrix* cm = o->_cache_matrix;');
+    this.line('cma = cm->a; cmb = cm->b; cmc = cm->c; cmd = cm->d; cmtx = cm->tx; cmty = cm->ty;');
+    this.line('if ((cma != 1.0 || cmb != 0.0 || cmc != 0.0 || cmd != 1.0 || cmtx != 0.0 || cmty != 0.0) &&');
+    this.line('    as_mat_invert(cma, cmb, cmc, cmd, cmtx, cmty, &cia, &cib, &cic, &cid, &citx, &city)) {');
+    this.indent++;
+    this.line('cm_on = 1;');
+    // AABB of the four transformed corners becomes the bake span.
+    this.line('double xs[4], ys[4];');
+    this.line('xs[0] = cma * bl + cmc * bt + cmtx; ys[0] = cmb * bl + cmd * bt + cmty;');
+    this.line('xs[1] = cma * br + cmc * bt + cmtx; ys[1] = cmb * br + cmd * bt + cmty;');
+    this.line('xs[2] = cma * bl + cmc * bb + cmtx; ys[2] = cmb * bl + cmd * bb + cmty;');
+    this.line('xs[3] = cma * br + cmc * bb + cmtx; ys[3] = cmb * br + cmd * bb + cmty;');
+    this.line('double mbl = xs[0], mbr = xs[0], mbt = ys[0], mbb = ys[0];');
+    this.line('for (int ci = 1; ci < 4; ci++) { if (xs[ci] < mbl) mbl = xs[ci]; if (xs[ci] > mbr) mbr = xs[ci]; if (ys[ci] < mbt) mbt = ys[ci]; if (ys[ci] > mbb) mbb = ys[ci]; }');
+    this.line('bl = mbl; bt = mbt; br = mbr; bb = mbb;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     // Snap the bake ORIGIN down to a DEVICE pixel of the destination canvas.
     //
     // The blit below is a whole-image drawImageRect with nearest sampling, so a
@@ -30865,6 +31285,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_clear_transparent(c2);');
     this.line('as_skia_canvas_scale(c2, sx, sy);');
     this.line('as_skia_canvas_translate(c2, -bxo, -byo);');
+    this.line('if (cm_on) as_skia_canvas_concat(c2, cma, cmb, cmc, cmd, cmtx, cmty);');
     // The bake surface must hold the UNFOLDED subtree: this object's alpha belongs on
     // the blit below, not inside the snapshot, or a folded alpha would land twice.
     this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;');
@@ -30902,7 +31323,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // retained surface. The canvas still carries scale(sx,sy)*translate(-bxo,-byo),
     // so the object-local dirty rect clips in exactly those coordinates; kClear
     // erases the rect, then the subtree repaints under the clip, leaving the rest.
-    this.line('else if (o->_render_dirty && !o->_dirty_full && (o->filters == NULL || o->filters->length == 0) && o->_cache_surface != NULL) {');
+    this.line('else if (o->_render_dirty && !o->_dirty_full && !cm_on && (o->filters == NULL || o->filters->length == 0) && o->_cache_surface != NULL) {');
     this.indent++;
     this.line('double dl = o->_dirty_l, dt = o->_dirty_t, dr = o->_dirty_r, db = o->_dirty_b;');
     this.line('if (ASC_bake_trace) fprintf(stderr, "t=%.0f bake_patch o=%p dl=%.3f dt=%.3f dr=%.3f db=%.3f lw=%d lh=%d\\n", as_now_ms(), (void*)o, dl, dt, dr, db, lw, lh);');
@@ -30935,6 +31356,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_canvas_clear_transparent(c2);');
     this.line('as_skia_canvas_scale(c2, sx, sy);');
     this.line('as_skia_canvas_translate(c2, -bxo, -byo);');
+    this.line('if (cm_on) as_skia_canvas_concat(c2, cma, cmb, cmc, cmd, cmtx, cmty);');
     this.line('double keep_bx = ASC_bake_ctm_x, keep_by = ASC_bake_ctm_y, keep_am = ASC_alpha_mul;');
     this.line('ASC_alpha_mul = 1.0;');
     this.line('as_skia_canvas_total_scale(canvas, &ASC_bake_ctm_x, &ASC_bake_ctm_y);');
@@ -30945,7 +31367,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('ASC_bake_ctm_x = keep_bx; ASC_bake_ctm_y = keep_by; ASC_alpha_mul = keep_am;');
     this.line('if (o->_cache_image != NULL) { as_final_release(o, o->_cache_image); as_skia_image_delete(o->_cache_image); o->_cache_image = NULL; }');
     this.line('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);');
-    this.line('if (ASC_bake_verify > 0) as_bake_verify(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint");');
+    this.line('if (ASC_bake_verify > 0 && !cm_on) as_bake_verify(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint");');
     this.line('as_final_register(o, o->_cache_image);');
     this.line('redrawn = 1; rl = bl; rt = bt; rr = br; rb = bb;');
     this.line('o->_render_dirty = 0; o->_dirty_full = 0; o->_dirty_l = 0.0; o->_dirty_t = 0.0; o->_dirty_r = -1.0; o->_dirty_b = -1.0;');
@@ -30973,7 +31395,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (uncached == cached, pinned by autobake-origin.as) is untouched.
     this.line('double bl_bx = 1.0, bl_by = 1.0; as_skia_canvas_total_scale(canvas, &bl_bx, &bl_by);');
     this.line('int bl_smooth = (fabs(bl_bx - sx) > 0.001 || fabs(bl_by - sy) > 0.001) ? 1 : 0;');
+    this.line('if (cm_on) { as_skia_canvas_save(canvas); as_skia_canvas_concat(canvas, cia, cib, cic, cid, citx, city); }');
     this.line('as_skia_canvas_draw_image_rect(canvas, o->_cache_image, bxo, byo, (double)pw / sx, (double)ph / sy, bl_smooth);');
+    this.line('if (cm_on) as_skia_canvas_restore(canvas);');
     this.indent--;
     this.line('}');
     this.line('if (redrawn && ASC_show_redraw_regions) {');
@@ -31104,6 +31528,78 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent--;
     this.line('}');
     this.line('static int as_single_primitive(DisplayObject* o) { return as_draw_count(o) == 1; }');
+    // ---- D1 (stage 427): Bitmap/TextField pixel masking ----
+    // A vector mask is a clipPath (as_mask_path); a Bitmap/TextField has no vector
+    // outline, so its PIXELS are the stencil. AIR (adl 51.4.1, temp/maskprobe) makes
+    // this a soft ALPHA mask when BOTH the mask and the masked object set
+    // cacheAsBitmap, and a HARD binary stencil when only the content does; without
+    // cacheAsBitmap on the content, draw() applies no pixel mask at all. The paint
+    // loop therefore opens a content saveLayer and composites the rasterized mask
+    // over it with kDstIn (keep content only where the mask has alpha), thresholding
+    // the mask alpha to 0/255 for the binary case.
+    this.line('static int as_mask_has_pixels(DisplayObject* m) {');
+    this.indent++;
+    this.line('if (m == NULL) return 0;');
+    this.line('if (as_is((void*)m, &Bitmap_vt) || as_is((void*)m, &TextField_vt)) return 1;');
+    this.line('if (as_is((void*)m, &DisplayObjectContainer_vt)) {');
+    this.indent++;
+    this.line('DisplayObjectContainer* mc = (DisplayObjectContainer*)m;');
+    this.line('if (mc->children != NULL) {');
+    this.indent++;
+    this.line('for (int i = 0; i < mc->children->length; i++) {');
+    this.indent++;
+    this.line('DisplayObject* ch = (DisplayObject*)as_v_obj_val(mc->children->data[i]);');
+    this.line('if (as_mask_has_pixels(ch)) return 1;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.line('return 0;');
+    this.indent--;
+    this.line('}');
+    // Rasterize the mask subtree (local coords) and composite it over the current
+    // content layer with kDstIn, in the PARENT space the content layer lives in.
+    this.line('static void as_mask_pixel_composite(void* canvas, DisplayObject* o, DisplayObject* m, int binary) {');
+    this.indent++;
+    this.line('double pa = 1.0, pb = 0.0, pc = 0.0, pd = 1.0, ptx = 0.0, pty = 0.0;');
+    this.line('if (o->parent != NULL) as_to_stage_matrix((DisplayObject*)o->parent, &pa, &pb, &pc, &pd, &ptx, &pty);');
+    this.line('double ia, ib, ic, id, itx, ity;');
+    this.line('if (!as_mat_invert(pa, pb, pc, pd, ptx, pty, &ia, &ib, &ic, &id, &itx, &ity)) return;');
+    this.line('double ma, mb, mc, md, mtx, mty;');
+    this.line('as_to_stage_matrix(m, &ma, &mb, &mc, &md, &mtx, &mty);');
+    this.line('double a, b, c, d, tx, ty;');
+    this.line('as_mat_mul(ia, ib, ic, id, itx, ity, ma, mb, mc, md, mtx, mty, &a, &b, &c, &d, &tx, &ty);');
+    this.line('double bl, bt, br, bb;');
+    this.line('if (!as_render_bounds(m, &bl, &bt, &br, &bb)) return;');
+    this.line('if (!(br > bl) || !(bb > bt)) return;');
+    this.line('double sx = 1.0, sy = 1.0; as_skia_canvas_total_scale(canvas, &sx, &sy);');
+    this.line('if (!(sx > 0.0) || !(sy > 0.0)) { sx = 1.0; sy = 1.0; }');
+    this.line('int pw = (int)ceil((br - bl) * sx); int ph = (int)ceil((bb - bt) * sy);');
+    this.line('if (pw < 1 || ph < 1 || pw > 32768 || ph > 32768) return;');
+    this.line('void* surf = as_skia_surface_new(pw, ph);');
+    this.line('if (surf == NULL) return;');
+    this.line('void* sc = as_skia_surface_canvas(surf);');
+    this.line('as_skia_canvas_clear_transparent(sc);');
+    this.line('as_skia_canvas_scale(sc, sx, sy);');
+    this.line('as_skia_canvas_translate(sc, -bl, -bt);');
+    this.line('as_render_object_content(sc, m);');
+    this.line('if (binary) as_skia_surface_threshold_alpha(surf);');
+    this.line('void* img = as_skia_surface_make_snapshot(surf);');
+    this.line('as_skia_surface_delete(surf);');
+    this.line('if (img == NULL) return;');
+    this.line('void* paint = as_skia_paint_new();');
+    this.line('as_skia_paint_set_blend(paint, "dstin");');
+    this.line('as_skia_canvas_save_layer_paint(canvas, paint);');
+    this.line('as_skia_paint_delete(paint);');
+    this.line('as_skia_canvas_concat(canvas, a, b, c, d, tx, ty);');
+    this.line('as_skia_canvas_translate(canvas, bl, bt);');
+    this.line('as_skia_canvas_draw_image_rect(canvas, img, 0.0, 0.0, br - bl, bb - bt, 1);');
+    this.line('as_skia_canvas_restore(canvas);');
+    this.line('as_skia_image_delete(img);');
+    this.indent--;
+    this.line('}');
     this.line('static void as_render_object(void* canvas, DisplayObject* o) {');
     this.indent++;
     this.line('if (o == NULL || !o->visible) return;');
@@ -31150,10 +31646,26 @@ void FileStream_writeObject(void* _this, as_value v) {
     // measurement table in as_mask_path): a mask is a sibling, so it must not follow
     // the object's transform. The path is per-frame scratch (SkCanvas::clipPath copies
     // it), hence the delete.
+    this.line('int pixel_mask_on = 0; int pixel_mask_binary = 0;');
     this.line('if (o->_mask_ref != NULL) {');
+    this.indent++;
+    // D1 (stage 427): a Bitmap/TextField mask with cacheAsBitmap on the content is a
+    // PIXEL mask -- isolate the content in a layer and composite the rasterized mask
+    // over it with kDstIn at the end (as_mask_pixel_composite). Both cached -> soft
+    // alpha; content-only cached -> binary stencil. Without cacheAsBitmap on the
+    // content, AIR draw() applies no pixel mask, so keep the vector/box path.
+    this.line('if (o->_cache_flag && as_mask_has_pixels(o->_mask_ref)) {');
+    this.indent++;
+    this.line('pixel_mask_on = 1;');
+    this.line('pixel_mask_binary = o->_mask_ref->_cache_flag ? 0 : 1;');
+    this.line('as_skia_canvas_save_layer_alpha(canvas, 1.0);');
+    this.indent--;
+    this.line('} else {');
     this.indent++;
     this.line('void* mp = as_mask_path(o, o->_mask_ref);');
     this.line('if (mp != NULL) { as_skia_canvas_clip_path(canvas, mp, 1); as_skia_path_delete(mp); }');
+    this.indent--;
+    this.line('}');
     this.indent--;
     this.line('}');
     this.line('int alpha_on = (o->alpha < 1.0);');
@@ -31161,6 +31673,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int alpha_fold = (alpha_on && as_single_primitive(o));');
     this.line('if (alpha_fold) ASC_alpha_mul = keep_alpha_mul * o->alpha;');
     this.line('else if (alpha_on) as_skia_canvas_save_layer_alpha(canvas, o->alpha);');
+    // A pixel mask composites in PARENT space after the content paints, so the
+    // object's own transform is wrapped in a save/restore (only when pixel-masked,
+    // leaving every other object's paint untouched).
+    this.line('if (pixel_mask_on) as_skia_canvas_save(canvas);');
     this.line('as_skia_canvas_translate(canvas, o->x, o->y);');
     this.line('as_skia_canvas_rotate(canvas, o->rotation);');
     this.line('as_skia_canvas_scale(canvas, o->scaleX, o->scaleY);');
@@ -31353,6 +31869,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (scroll_on) as_skia_canvas_restore(canvas);');
     this.line('if (ct_on) as_skia_canvas_restore(canvas);');
     this.line('if (blend_on) as_skia_canvas_restore(canvas);');
+    this.line('if (pixel_mask_on) as_skia_canvas_restore(canvas);');
     // saveLayerAlpha is a save like any other: without this restore the layer (and
     // the translate/rotate/scale applied after it) stayed in force for the REST of
     // the frame, so every sibling painted after a半透明 object inherited its
@@ -31363,6 +31880,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // was rebuilt -- "拖动列表后点刷新，上面的按钮跳下来再恢复".
     this.line('if (alpha_on && !alpha_fold) as_skia_canvas_restore(canvas);');
     this.line('ASC_alpha_mul = keep_alpha_mul;');
+    this.line('if (pixel_mask_on) { as_mask_pixel_composite(canvas, o, o->_mask_ref, pixel_mask_binary); as_skia_canvas_restore(canvas); }');
     this.line('as_skia_canvas_restore(canvas);');
     this.indent--;
     this.line('}');
@@ -33012,7 +33530,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_mouse(int id, double x, double y, const char* type) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     // SDL reports mouse coordinates in logical *window* points, so they must be
     // mapped back through the align offset and the content scale before they mean
@@ -33147,7 +33665,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_wheel(int id, double x, double y, double delta) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -33163,7 +33681,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_key(int id, const char* type, int keyCode, int charCode, int mod) {');
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL || w->stage == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -33253,7 +33771,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('static void ASC_window_on_frame(int id) {')
     this.indent++;
     this.line('int planted = (as_frame_guard == 0);');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; as_nd_mouse_depth = 0; as_nd_mouse_window = -1; return; }');
     this.line('as_frame_guard = 1;');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
@@ -33325,7 +33843,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // callback hands back NULL, and by then this function has already freed it and
     // installed the replacement in w->surface. `w` is assigned before setjmp and
     // never after, so longjmp cannot clobber it.
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; return (w != NULL) ? w->surface : NULL; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; return (w != NULL) ? w->surface : NULL; }');
     this.line('as_frame_guard = 1;');
     this.line('if (w == NULL || lw <= 0 || lh <= 0 || pw <= 0 || ph <= 0) { if (planted) as_frame_guard = 0; return NULL; }');
     this.line('if (scale <= 0.0) scale = 1.0;');
@@ -33402,7 +33920,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('int planted = (as_frame_guard == 0);');
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) { if (planted) as_frame_guard = 0; return; }');
-    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
+    this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
     this.line('as_frame_guard = 1;');
     this.line('w->closed = 1;');
     this.line('if (w->surface != NULL) { as_skia_surface_delete(w->surface); w->surface = NULL; w->canvas = NULL; }');
@@ -34204,6 +34722,9 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
       this.line(`void ${name}_ctor(${name}* o${params ? ', ' + params : ''}) {`);
       this.indent++;
+      // Constructor frame: AIR prints "Cls()" with no "/method" part. A super()
+      // call runs the superclass ctor, which pushes its own frame on top.
+      this.emitFrameEnter(this.frameClassName(name), null);
       // Dynamic class (`dynamic class`, or any subclass of one): arbitrary
       // undeclared keys live in the instance's own `_dyn` slot table, so it must
       // exist before the first body statement (as_dyn_set writes through it).
@@ -34322,6 +34843,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.line(`as_swc_frames(${swcCharId}, 1, (DisplayObject*)o);`);
         }
       }
+      this.line('as_astack_leave();');
       this.indent--;
       this.line('}');
       this.line('');
@@ -34386,12 +34908,16 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.declareVar('this', { kind: 'object', className: cname });
         for (const p of m.params) this.declareVar(p.name, this.ann(p.type));
         const params = this.paramDecls(m.params);
+        // Shadow-stack frame (Error.getStackTrace): AIR prints the static side
+        // as "Cls$/meth", the instance side as "Cls/meth".
+        const frameCls = this.frameClassName(cname) + (m.isStatic ? '$' : '');
 
         if (m.isStatic && m.isGetter) {
           // Static getter: no `this` receiver; `_this` is unused. The `_static`
           // suffix distinguishes it from an instance getter of the same name.
           this.line(`${this.cTypeName(returnType)} ${cname}_get_${m.name}_static(void* _this) {`);
           this.indent++;
+          this.emitFrameEnter(frameCls, m.name);
           this.line('(void)_this;');
           this.hoistFunctionLocals(m.body.body);
           this.emitClosureCellLocals();
@@ -34404,6 +34930,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         } else if (m.isStatic && m.isSetter) {
           this.line(`void ${cname}_set_${m.name}_static(void* _this${params ? ', ' + params : ''}) {`);
           this.indent++;
+          this.emitFrameEnter(frameCls, m.name);
           this.line('(void)_this;');
           this.hoistFunctionLocals(m.body.body);
           this.emitClosureCellLocals();
@@ -34416,6 +34943,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         } else if (m.isStatic) {
           this.line(`${this.cTypeName(returnType)} ${cname}_${m.name}_static(${params}) {`);
           this.indent++;
+          this.emitFrameEnter(frameCls, m.name);
           this.hoistFunctionLocals(m.body.body);
           this.emitClosureCellLocals();
           this.emitArgsIfUsed(m.body, m.params);
@@ -34427,6 +34955,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         } else if (m.isGetter) {
           this.line(`${this.cTypeName(returnType)} ${cname}_get_${m.name}(void* _this) {`);
           this.indent++;
+          this.emitFrameEnter(frameCls, m.name);
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
           this.emitClosureCellLocals();
@@ -34439,6 +34968,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         } else if (m.isSetter) {
           this.line(`void ${cname}_set_${m.name}(void* _this${params ? ', ' + params : ''}) {`);
           this.indent++;
+          this.emitFrameEnter(frameCls, m.name);
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
           this.emitClosureCellLocals();
@@ -34451,6 +34981,7 @@ void FileStream_writeObject(void* _this, as_value v) {
         } else {
           this.line(`${this.cTypeName(returnType)} ${this.memberCName(cname, m.name)}(void* _this${params ? ', ' + params : ''}) {`);
           this.indent++;
+          this.emitFrameEnter(frameCls, m.name);
           this.line(`${cname}* this = (${cname}*)_this;`);
           this.hoistFunctionLocals(m.body.body);
           this.emitClosureCellLocals();
@@ -34482,6 +35013,8 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.currentReturnType = f.returnType;
       this.line(`${this.cTypeName(f.returnType)} ${this.freeCName(stmt.name)}(${this.paramDecls(stmt.params)}) {`);
       this.indent++;
+      // AIR prints a free-function frame as "global/fn()".
+      this.emitFrameEnter(null, stmt.name);
       this.hoistFunctionLocals(stmt.body.body);
       this.emitClosureCellLocals();
       this.emitArgsIfUsed(stmt.body, stmt.params);
@@ -34618,6 +35151,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.indent++;
       this.line(`if (${cname}_cinit_done) return;`);
       this.line(`${cname}_cinit_done = true;`);
+      this.emitFrameEnter(this.frameClassName(cname) + '$', 'cinit');
       // Emit each initializer in its declaring class's static context, so
       // protected members resolve and short types map via its imports.
       const emitFieldInit = (fname: string): boolean => {
@@ -34659,6 +35193,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       // in source order; the oracle caught it.)
       for (const si of this.staticFieldInits) if (si.cname === cname) emitFieldInit(si.fname);
       for (const b of this.staticInitBlocks) if (b.cname === cname) emitInitBlock(b);
+      this.line('as_astack_leave();');
       this.indent--;
       this.line('}');
       this.line('');
@@ -34902,6 +35437,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Static fields initialize lazily on first access (see emitStaticInits), so
     // main() only runs module-level variable initializers and top-level
     // statements; the demo bootstrap's static reads trigger each class's cinit.
+    // The top-level script runs in a frame of its own (printed "global()"):
+    // AIR's nearest analogue is the script-init frame; the ADL runtime frames
+    // below it are a different loader and are not reproduced.
+    this.emitFrameEnter(null, null);
     for (const stmt of this.program.body) {
       this.emitTopLevel(stmt);
     }
@@ -35496,15 +36035,50 @@ void FileStream_writeObject(void* _this, as_value v) {
           const e = this.emitExpr(stmt.value);
           const code = this.currentReturnType ? this.convertImplicit(e, this.currentReturnType) : e.code;
           if (this.tryFrames.length === 0) {
-            this.line(`return ${code};`);
+            // Pop the shadow-stack frame AFTER the value is evaluated: a
+            // `return new Error(...)` must still see this frame (AIR captures at
+            // construction). A call-shaped expression (identifier followed by
+            // '(') is hoisted into a temp first; pure reads and parenthesized
+            // comparisons cannot run AS3 code and return directly.
+            if (/[A-Za-z_][A-Za-z0-9_]*\(/.test(code)) {
+              const retType = this.currentReturnType ?? e.type;
+              if (retType.kind === 'void') {
+                // A void function may `return voidCall();` (legal AS3/C). There is
+                // no value to preserve, so run the call as a statement, then leave
+                // and return -- hoisting into `void _ret = ...` is invalid C
+                // (incomplete type 'void'; real-app RWebSocket.sendMessage /
+                // TextField.appendText).
+                this.line(`${code};`);
+                this.line('as_astack_leave();');
+                this.line('return;');
+              } else {
+                const t = this.tmpName('ret');
+                this.line(`${this.cTypeName(retType)} ${t} = ${code};`);
+                this.line('as_astack_leave();');
+                this.line(`return ${t};`);
+              }
+            } else {
+              this.line('as_astack_leave();');
+              this.line(`return ${code};`);
+            }
           } else {
             // AS3 evaluates the return value first, then runs any pending finally
             // blocks, then returns. Capture the value, unwind try frames, return.
             const retType = this.currentReturnType ?? e.type;
-            const t = this.tmpName('ret');
-            this.line(`${this.cTypeName(retType)} ${t} = ${code};`);
-            this.emitUnwind(0);
-            this.line(`return ${t};`);
+            if (retType.kind === 'void') {
+              // void `return voidCall();`: evaluate the call, unwind, leave, return
+              // (no value temp -- `void _ret = ...` is invalid C).
+              this.line(`${code};`);
+              this.emitUnwind(0);
+              this.line('as_astack_leave();');
+              this.line('return;');
+            } else {
+              const t = this.tmpName('ret');
+              this.line(`${this.cTypeName(retType)} ${t} = ${code};`);
+              this.emitUnwind(0);
+              this.line('as_astack_leave();');
+              this.line(`return ${t};`);
+            }
           }
         } else {
           if (this.tryFrames.length > 0) this.emitUnwind(0);
@@ -35515,6 +36089,7 @@ void FileStream_writeObject(void* _this, as_value v) {
           // `public static function getEncryptedLocalStore(key:String):* {
           //    if (!EncryptedLocalStore || ...) return;`
           const rt = this.currentReturnType;
+          this.line('as_astack_leave();');
           if (rt !== null && rt.kind !== 'void') {
             this.line(`return ${rt.kind === 'any' ? 'as_v_undefined()' : this.defaultInit(rt)};`);
           } else {
@@ -36673,6 +37248,7 @@ void FileStream_writeObject(void* _this, as_value v) {
   private emitTry(stmt: Extract<Stmt, { kind: 'Try' }>): void {
     const env = this.tmpName('env');
     const ret = this.tmpName('ex');
+    const fd = this.tmpName('astack');
     const frame: { active: boolean; finallyBody: Block | null } = {
       active: false,
       finallyBody: stmt.finallyBody ?? null,
@@ -36680,6 +37256,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.tryFrames.push(frame);
     this.line('{');
     this.indent++;
+    // Saved BEFORE setjmp and never written after, so the value survives
+    // longjmp (C11 7.13.2.1): a throw skips the callees' frame pops, and the
+    // catch path must restore the shadow-stack depth to this entry value.
+    this.line(`int ${fd} = as_astack_depth;`);
     this.line(`jmp_buf ${env};`);
     this.line(`int ${ret} = AS_SETJMP(${env});`);
     this.line(`if (${ret} == 0) {`);
@@ -36693,6 +37273,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('} else {');
     this.indent++;
     this.line('as_jmp_pop();');
+    this.line(`as_astack_depth = ${fd};`);
     this.indent--;
     this.line('}');
     if (stmt.catches.length > 0) {

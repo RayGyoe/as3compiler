@@ -758,6 +758,7 @@ static FREResult FRENewObject(const uint8_t* className, uint32_t argc, FREObject
         for (uint32_t i = 0; i < argc; i++) argv2[i] = as_fre_unbox(argv[i]);
     }
     jmp_buf jb;
+    int astack_saved = as_astack_depth;
     if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_value r = as_dyn_new_args((as_class*)cls.ptr, (int)argc, argv2);
@@ -768,6 +769,7 @@ static FREResult FRENewObject(const uint8_t* className, uint32_t argc, FREObject
         return FRE_OK;
     }
     as_jmp_pop();
+    as_astack_depth = astack_saved;
     as_fre_set_thrown(thrownException, as_fre_take_exception());
     return FRE_ACTIONSCRIPT_ERROR;
 }
@@ -785,6 +787,7 @@ static FREResult FREGetObjectProperty(FREObject object, const uint8_t* propertyN
     if (object == NULL || v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;
     if (v.tag != 4 || v.ptr == NULL) return FRE_TYPE_MISMATCH;
     jmp_buf jb;
+    int astack_saved = as_astack_depth;
     if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_value r = as_dyn_get(v.ptr, (const char*)propertyName);
@@ -795,6 +798,7 @@ static FREResult FREGetObjectProperty(FREObject object, const uint8_t* propertyN
         return FRE_OK;
     }
     as_jmp_pop();
+    as_astack_depth = astack_saved;
     as_fre_set_thrown(thrownException, as_fre_take_exception());
     return FRE_ACTIONSCRIPT_ERROR;
 }
@@ -807,6 +811,7 @@ static FREResult FRESetObjectProperty(FREObject object, const uint8_t* propertyN
     if (object == NULL || v.tag == 0 || v.tag == 5) return FRE_INVALID_OBJECT;
     if (v.tag != 4 || v.ptr == NULL) return FRE_TYPE_MISMATCH;
     jmp_buf jb;
+    int astack_saved = as_astack_depth;
     if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_dyn_set(v.ptr, (const char*)propertyName, as_fre_unbox(propertyValue));
@@ -814,6 +819,7 @@ static FREResult FRESetObjectProperty(FREObject object, const uint8_t* propertyN
         return FRE_OK;
     }
     as_jmp_pop();
+    as_astack_depth = astack_saved;
     as_fre_set_thrown(thrownException, as_fre_take_exception());
     return FRE_ACTIONSCRIPT_ERROR;
 }
@@ -831,6 +837,7 @@ static FREResult FRECallObjectMethod(FREObject object, const uint8_t* methodName
         for (uint32_t i = 0; i < argc; i++) argv2[i] = as_fre_unbox(argv[i]);
     }
     jmp_buf jb;
+    int astack_saved = as_astack_depth;
     if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         as_value r = as_dyn_call(v.ptr, (const char*)methodName, argv2, (int)argc);
@@ -841,6 +848,7 @@ static FREResult FRECallObjectMethod(FREObject object, const uint8_t* methodName
         return FRE_OK;
     }
     as_jmp_pop();
+    as_astack_depth = astack_saved;
     as_fre_set_thrown(thrownException, as_fre_take_exception());
     return FRE_ACTIONSCRIPT_ERROR;
 }
@@ -1616,6 +1624,7 @@ static as_value as_ext_call(void* ctxp, const char* fn, as_value* args, int argc
     }
     as_value result = as_v_null();
     jmp_buf jb;
+    int astack_saved = as_astack_depth;
     if (AS_SETJMP(jb) == 0) {
         as_jmp_push(&jb);
         FREObject r = c->funcs[fi].function((FREContext)c, c->funcs[fi].functionData, (uint32_t)argc, argv);
@@ -1625,6 +1634,7 @@ static as_value as_ext_call(void* ctxp, const char* fn, as_value* args, int argc
         // An AS3 exception thrown across the extension (a listener, a getter, a
         // callProperty) propagates to the AS3 caller, which is what AIR does.
         as_jmp_pop();
+        as_astack_depth = astack_saved;
         as_throw_val(as_fre_take_exception());
     }
     as_fre_scope_end();

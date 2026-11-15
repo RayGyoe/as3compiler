@@ -152,7 +152,7 @@ function checkParseIntFloat(): string[] {
   const flat = pre.replace(/\s+/g, ' ');
   const call = generateC(parse('function zzq():Number { return parseInt("ff", 16); }\nvar qq:Number = zzq();\ntrace(qq);\n')).c;
   check('parseInt compiles to the helper, not atoi',
-    call.includes('return as_parse_int("ff", ((double)(16)));') && !/return atoi\(/.test(call));
+    call.includes('= as_parse_int("ff", ((double)(16)));') && !/return atoi\(/.test(call));
   check('the radix is passed through', call.includes('as_parse_int("ff", ((double)(16)))'));
   check('a radix-less call defaults to 0 (auto-detect)',
     /as_parse_int\([^)]*, 0\.0\)/.test(generateC(parse('var n:Number = parseInt("ff");\ntrace(n);\n')).c));

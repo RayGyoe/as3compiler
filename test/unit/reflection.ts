@@ -370,7 +370,7 @@ function checkClassValueOperand(): string[] {
   check('a `*` left side uses the tag-checked box variants',
     c.includes('g_r4 = as_class_is_val(g_dyn, g_c);') && c.includes('g_r5 = as_class_as_val(g_dyn, g_c);'));
   check('a Class PARAMETER resolves to the parameter (no `unknown type` error)',
-    c.includes('return as_class_is_val(x, c);'));
+    c.includes('= as_class_is_val(x, c);'));
   check('the runtime helper validates the operand with #1009',
     c.includes('static as_class* as_req_class(as_class* c) {')
     && c.includes('Error #1009: Cannot access a property or method of a null object reference.'));
@@ -628,7 +628,7 @@ function checkMemberShadow(): string[] {
   check('an own getter shadows the inherited field on `o.parent`',
     c.includes('->vtable->get_parent('));
   check('...and on a bare `parent` inside a method body',
-    c.includes('return (this->vtable->get_parent(this));'));
+    c.includes('= (this->vtable->get_parent(this));'));
 
   // A subclass that does NOT redeclare the getter still gets it (away3d reads
   // `parent` on Entity/Mesh/SegmentSet/... constantly), dispatched virtually.

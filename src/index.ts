@@ -1242,8 +1242,12 @@ async function main(): Promise<void> {
   // source-text scan would be a second, drifting copy of the frontend's
   // reachability. wasm builds are excluded -- there is no window on the socket
   // handle there and the seam stays "unsupported" (loud ioError) as documented.
-  if (process.platform === 'win32' && cfg.target !== 'wasm' && !cfg.linkLibs.includes('ws2_32')) {
-    cfg.linkLibs.push('ws2_32');
+  if (process.platform === 'win32' && cfg.target !== 'wasm') {
+    // iphlpapi rides along: GetAdaptersAddresses behind NetworkInfo.findInterfaces
+    // (ASC_NET_WIN32) is an OS import just like Winsock, added for the whole target.
+    // ole32 rides along too: CoInitializeEx/CoCreateInstance/PropVariantClear behind
+    // the Microphone WASAPI inventory (as_mic_scan) are OS imports, same rationale.
+    for (const l of ['ws2_32', 'iphlpapi', 'ole32']) if (!cfg.linkLibs.includes(l)) cfg.linkLibs.push(l);
   }
 
   // ---- air.net.WebSocket: the vendored static libcurl's ws_* client ----

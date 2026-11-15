@@ -147,10 +147,13 @@ trace("no-dialog: OK");`, false);
 // define must still get both backends and the OLE libraries.
 test('unit: desktop backends are wired for every native window build', () => {
   const cfg = { ...defaultBuildConfig(), sources: [join(root, 'vendor', 'window_glue.cc')], defines: ['ASC_USE_WINDOW=1'] };
-  const before = objectDir(cfg);
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    // Baseline under the SAME faked platform: the Windows-only _CRT_SECURE_NO_WARNINGS
+    // define makes effectiveDefines platform-specific, so the no-mutation check must
+    // compare like-with-like (darwin before vs darwin after), not win32 vs darwin.
+    const before = objectDir(cfg);
     assert(effectiveDefines(cfg).includes('ASC_USE_FILE_DIALOG=1'));
     const macSteps = buildCompileSteps(cfg, 'main.c', 'main');
     assert(macSteps.some(step => step.includes(join(root, 'vendor', 'file_dialog_macos.mm'))));

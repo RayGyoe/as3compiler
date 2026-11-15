@@ -20306,6 +20306,151 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-15 追加（阶段四百三十一：F1 `Error.getStackTrace` 的 AS3 栈帧模型）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**86 行**：`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按状态列重数）。`Error.getStackTrace` 原登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3「报明」清单（不在本表），本轮毕业（§3 移除该行、§4 新增毕业行）。**AIR 契约**（adl 51.4.1
+> `temp/stackprobe`）：Error **构造时**捕获调用栈，文本 `name: message\n\tat Class/method()…`（内层在前、构造帧 `Class()`、自由函数 `global/fn()`、
+> 无文件行号），无栈返 null。实现：runtime TLS 影子栈 `as_astack_enter/leave`（类/方法名），函数入口 push、返回 leave（调用形返回值先 hoist 再 leave，
+> 保 `return new Error()` 仍见本帧）、`emitTry`/FRE setjmp 存恢复深度、7 处帧边界守卫重置；Error `_stacktrace` 私有字段构造时快照。A/B：AS3 authored
+> 帧逐帧一致（ADL 加载器帧不同源、以 `global()` 脚本帧替代）。见 `examples/error-stacktrace.as` + `unit: runtime/StackTrace` 33 钉。**计划全部 12 个里程碑落地**。
+
+> **2026-11-15 追加（阶段四百三十：E3 `NativeDragManager` Windows OLE 拖放契约对齐）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表 **85 → 86 行**（`未开始` 64 → **65**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变，已按状态列重数）。**本阶段修净的不占表**：按 adl 51.4.1
+> `temp/dragprobe` 实测，原实现三处偏严（会抛 AIR 不抛的错）已修——① 会话外 `dropAction` setter 是静默 no-op（getter 恒回 `none`、非法值也不抛）；
+> ② `acceptDragDrop` 仅 null target 抛 `#2007`，会话外合法 target 是 no-op；③ `doDrag` 仅 null clipboard 抛 `#2007`（先查 clipboard），null initiator 或无
+> mouseDown/mouseMove 手势都是 no-op。drag-IN（`IDropTarget`）/drag-OUT（`DoDragDrop`）会话状态机本身早实测可用、不变。**新登记的 1 行**是 Windows
+> `doDrag` 的 `dragImage` 不渲染（macOS 已有）：OLE 拖动图像走 shell 私有协议（`DragImageBits` 格式 + `IDropSourceHelper`），`DRAGIMAGEBITS`/IID 都不在公开
+> SDK 头，需按 Wine/ReactOS 核实后真机目视验收，协议核实前不盲改以免崩掉已可用的 drag-OUT；当前按 §1.5 报明（系统光标）。见 `test/unit/native-drag.ts`
+> 两用例（会话状态机 + AIR 错误/no-op 契约）。
+
+> **2026-11-15 追加（阶段四百二十九：A3 `BitmapData.applyFilter` 的 DropShadow/Glow 光栅化）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按表内实际行重数）。`applyFilter` 的 DropShadow/Glow 原是
+> `BitmapData_applyFilter` 里的 inline 抛错（不在本表，由 [`docs/zh-cn/app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 批一 A3 跟踪），本轮实装。
+> **AIR 契约**（adl 51.4.1 `temp/filterprobe`）：源区域按 `destPoint` 锚定（源 rect 左上→destPoint），滤镜外扩进 padding；DropShadow 按
+> `distance·cos/sin(angle)` 偏移 + 模糊、`hideObject` 仅阴影；Glow 环绕彩色光晕 + 源体。实现：复用 `DisplayObject.filters` 路径同一套 Skia
+> image-filter seam（`as_skia_paint_set_drop_shadow`/`as_skia_paint_set_glow`），源区域 `as_skia_image_from_argb` 画进带 padding 表面、saveLayer paint
+> 施滤镜、`as_skia_surface_read_argb` 读回按 `destPoint-margin` blit；BlurFilter 保留 CPU 盒模糊、未知滤镜 no-op、无 Skia 降级报明。A/B：阴影/发光/
+> hideObject 网格逐字一致，仅发光 fringe alpha 差 8（16 vs 24，模糊核容差内）。见 `examples/filter-shadow-glow.as` + `unit: render/FilterShadowGlow` 12 钉。
+> 纯 C 构建（无 Skia）编译通过（`#else` 报明）。**批一（A1/A2/A3）全部完成**。
+
+> **2026-11-15 追加（阶段四百二十八：D2 `DisplayObject.cacheAsBitmapMatrix` 按矩阵缓存）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按表内实际行重数）。`cacheAsBitmapMatrix` 原登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3「报明」清单（不在本表），本轮毕业（§3 移除该行、§4 新增毕业行）。**AIR 契约**（adl 51.4.1
+> `temp/cabmprobe` + 官方文档）：按所设矩阵缓存、再以**逆变换** blit ⇒ **最终画面不变**（仅缓存分辨率随矩阵缩放，2x 矩阵烘 2x 位图）；
+> 移动/GPU 特性，adl 桌面 CPU 模式 no-op（getter 恒回 null）。实现：`as_render_cached` 门控「`_cache_flag` + 非单位矩阵」，bounds 取矩阵变换后
+> 四角 AABB、surface concat M、blit concat M⁻¹（画面恒等）；矩阵态禁增量 patch、跳过 bake-verify oracle；常见（无矩阵）调优路径零改动。
+> setter 移除 unsupported 报明，getter 保留回读（计划要求）。A/B：scale/translate/identity 都与无矩阵**逐像素一致**（[A]=[B]、[C]=[D]、[E]）。
+> 8 个 bake/cache 示例（autobake*/cacheasbitmap/bake-bitmap-swap/draw-over）全绿 ⇒ 无回归；纯 C 构建编译通过。见 `examples/cache-matrix.as` +
+> `unit: render/CacheMatrix` 8 钉。
+
+> **2026-11-15 追加（阶段四百二十七：D1 `DisplayObject.mask` Bitmap/TextField 像素遮罩）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按表内实际行重数）。`DisplayObject.mask` 原登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3「报明」清单（不在本表；矢量遮罩早在阶段三百一十八已落地），本轮 Bitmap/TextField **像素遮罩**毕业
+> （§3 移除该行、§4 新增毕业行）。**像素 alpha 裁剪**：content 设 `cacheAsBitmap` 时生效——mask 也缓存为**软 alpha**、仅 content 缓存为**二值模板**
+> （任何覆盖→不透明）、content 不缓存则 `draw()` 不施像素遮罩（adl 51.4.1 `temp/maskprobe` 三档实测）。实现：content 隔离 `saveLayer` +
+> 遮罩子树光栅化（`as_render_object_content` 到离屏 surface）+ `kDstIn` 合成（`sk_paint_set_blend` 新增 `dstin`），二值时 `sk_surface_threshold_alpha`
+> 把 alpha 阈值化（byte 3，RGBA/BGRA 无关）。矢量遮罩仍走 clipPath（`as_mask_path` 不动），`visible`/alpha 对矢量遮罩依旧忽略。
+> A/B：二值模板**逐像素精确**、软 alpha 边缘差 1–7（舍入/AA，容差内）；TextField 遮罩字形裁剪正确（字体度量差属另一项）。见 `examples/pixel-mask.as` +
+> `unit: render/PixelMask` 14 钉。纯 C 构建（无 Skia）编译通过（`as_skia_*` 桩早退）。
+
+> **2026-11-15 追加（阶段四百二十六：B2 `flash.media.Camera` 设备面真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按表内实际行重数）。`Camera` 原登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3「报明」清单（不在本表），本轮设备面毕业（§3 移除该行、§4 新增毕业行）。
+> **Windows DirectShow 真枚举**（`as_cam_scan`）：`CoCreateInstance(CLSID_SystemDeviceEnum)` →
+> `CreateClassEnumerator(CLSID_VideoInputDeviceCategory)` → 逐 `IMoniker` `BindToStorage(IID_IPropertyBag)` 读
+> `FriendlyName`（`PropVariantInit/Clear` 免 oleaut32）。`ICreateDevEnum` 手声明（strmif.h 需 NOGDI 隐藏的
+> RGNDATA/BITMAPINFOHEADER），IMoniker/IEnumMoniker/IPropertyBag 走 `<ocidl.h>`，GUID 手写免 strmiids.lib/initguid.h。
+> `getCamera(name=null)` 按设备名**或索引串**匹配（`getCamera("0")` 选设备 0、null→首、越界/坏名 null），只读
+> `name`/`index` 反映清单（camName/camIdx 私有Backing字段，避开 `index` POSIX 保留名消歧）。**采集仍走应用 ANE，本阶段无视频流**。
+> 契约对照 adl 51.4.1（`temp/camprobe/CameraProbe.as`，本机 2 摄像头）：AOT 与 AIR 输出 **diff IDENTICAL**（names/isSupported/
+> getCamera 各路径逐行一致）。`examples/camera-devices.as`（平台感知，无摄像头 CI 也过）+ `unit: platform/CameraDevices` **16 钉**。
+> 全量 `node test.ts` 见本阶段末节。
+
+> **2026-11-15 追加（阶段四百二十五：B1b `flash.media.Microphone` 采集 + `SampleDataEvent`）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1）。`Microphone` 登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §2（不在本表），本轮采集毕业（§4 新增毕业行，`SampleDataEvent` 行同步改口径）。
+> **WASAPI 共享模式真采集**（`as_mic_worker_body`）：抓设备 mix format（本机 48 kHz 立体声 float32——共享模式拒自定义速率
+> `AUDCLNT_E_UNSUPPORTED_FORMAT`，故必须抓 mix format 再自行下混单声道 + 线性重采样到 `rate` kHz）→2048 样本缓冲入
+> SRWLOCK 保护队列；帧边界 `as_mic_dispatch`（emit.ts 发射，需生成的 `SampleDataEvent`/`ByteArray` 构造器）建
+> `ByteArray`（2048 大端 float32，`data.length` 8192）+ `SampleDataEvent`（`position` 累加 2048）派发，实时
+> `activityLevel` 0..100（peak×100）。**线程不碰 AS3/GC**：worker 只 malloc 缓冲 + 锁下入队，`as_mic_mark_roots` 把活
+> Microphone 列为永久根（`gc_mark_ptr(obj)`），`ByteArray.data` 走 `GCT_BYTES` + 写屏障。`setSilenceLevel`/`setUseEchoSuppression`
+> 真 setter（后者为提示——共享模式回声消除是系统效果，存 pending 条目）。**AIR 契约全实测**（adl 51.4.1，
+> `temp/micprobe/MicCapture.as`）：每事件 8192 字节/2048 样本、position 0/2048/4096…、activityLevel 采集前 -1 采集时 0..100；
+> A/B 事件尺寸/position/样本范围逐字一致（ev2 样本 0.0103 与 AIR 0.01034 几乎重合）。**两个陷阱**：① `audioclient.h`→`mmreg.h`
+> 的视频格式结构嵌 `BITMAPINFOHEADER`（GDI 类型，被 preamble 的 `NOGDI` 隐藏）⇒ include 前 `#define NOBITMAP` 跳过；
+> ② `as_mic_dispatch` 初版误置于 `if (as_sock_any())` 内，无 socket 时永不派发（事件恒 0）⇒ 移到块外无条件调用。
+> 验收：`examples/microphone-capture.as`（平台感知，无设备 CI 也过）、`unit: platform/MicrophoneCapture` 17 钉、
+> A/B 契约一致、全量 **698/694/0 红 / 4 skip**。这是 plan 的 **B1b**（B1 至此全部落地）。
+>
+> **2026-11-15 追加（阶段四百二十四：B1a `flash.media.Microphone` 设备面真枚举）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1）。`Microphone` 登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §2（不在本表），本轮设备面毕业（§4 新增毕业行），采集线程与
+> `SampleDataEvent` 属 **B1b**（[`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md)）。**WASAPI 真枚举**
+> （`as_mic_scan`：`EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)` + `PKEY_Device_FriendlyName`，GUID 手工定义
+> 不用 `initguid.h` 以免全局 INITGUID 副作用）；friendly name 与 AIR 逐字一致（`temp/micprobe` A/B，本机
+> `Microphone (Realtek USB2.0 MIC)`）。**AIR 契约全实测**（adl 51.4.1）：`getMicrophone(index=-1)` 选首设备
+> （index<0→0）、越界 null，默认值 rate 8/gain 50/silenceLevel 10/silenceTimeout 2000/activityLevel -1/muted false/
+> codec nellymoser/enableVAD true；`getEnhancedMicrophone` 同设备。**describeType 证实 AIR 无 `fps` 字段、无
+> `setCodec`/`setRate` 方法**——原 shell 自造这三者，本轮删除。**两个平台陷阱**：① `mmdeviceapi.h` 的
+> `EndpointFormFactor` 枚举常量名 `Microphone` 与生成 C 的 `typedef struct Microphone` 冲突（GDI `Rectangle`
+> 同类），用 `#define Microphone ASC_WASAPI_Microphone` 包住 include 后 `#undef` 化解；② COM 头须在顶部
+> object-like 宏 scrub 之前（同 `iphlpapi.h`）。`ole32` 随 native Windows 目标链接（`CoInitializeEx`/
+> `PropVariantClear` 是 OS import）。**顺带根因修一个冷缓存假绿**：vendor glue（`skia_text_glue.cc` 的 `_wfopen`、
+> `skia_glue.cc` 的 `fopen`）不含生成 C preamble 的 `_CRT_SECURE_NO_WARNINGS`，冷编译出 `-Wdeprecated-declarations`
+> 警告、暖缓存命中则无 ⇒ `swc-static-text` 的「无警告」钉随缓存状态假绿/红。在 `effectiveDefines` 给 Windows
+> native 统一加 `_CRT_SECURE_NO_WARNINGS`（覆盖单步/多步两路径所有源），并把 `file-dialog` 的 objectDir 不变钉
+> 改为同平台比较（win32-only define 使 effectiveDefines 平台相关，跨平台比较不再成立）。验收：
+> `examples/microphone-devices.as`（平台感知，无设备 CI 也过）、`unit: platform/MicrophoneDevices` 14 钉 +
+> `unit: build/WindowsArch` 3 新钉、A/B 设备面逐字一致、全量 **696/692/0 红 / 4 skip**。这是 plan 的 **B1a**。
+>
+> **2026-11-15 追加（阶段四百二十三：A2 `BitmapData.encode` JPEG 真编码）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1）。本项登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3（`BitmapData.encode("jpeg"/"webp")` 行），本轮 JPEG 部分移出并毕业
+> （该行改为 webp-only）。**关键发现：无需重编 Skia**——vendored `libjpeg.lib` 本就带压缩符号
+> （`jpeg_start_compress` 等），只是 Skia 的 `SkJpegEncoder` 包装被关；直接驱动 libjpeg-turbo C API 即可
+> （`jpeg_mem_dest` 不在库中故自带内存 destination）。**AIR 契约全实测**（`temp/jpegprobe/`，adl 51.4.1）：
+> `JPEGEncoderOptions.quality` 为 **uint 默认 80**（原 shell 误作 Number/50，已修）、构造器不校验（`-5`→4294967291）、
+> encode 时 >100 抛 `#2006`、去 alpha 取 **premul-over-black**（`0x80FF0000`→rgb `800000`、alpha 255，与 AIR 逐字一致）。
+> 验收：`examples/jpeg-encode.as` 过、`unit: render/JpegEncode` 14 钉、A/B 契约逐字一致（仅低 quality 小图字节数因编码器版本异）、
+> 纯 C guard 报明、全量 694/690/0 红。这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **A2**。
+>
+> **2026-11-15 追加（阶段四百二十二：E1+E2 桌面集成）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1）。两项都登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3 成员级报明清单（不在本表），本轮移出并毕业：
+> **E1 `File.openWithDefaultApplication`** 复用 `as_open_external` seam（Win `ShellExecuteW`/mac `open`/Linux `xdg-open`），
+> **E2 `NativeApplication.systemIdleMode`** 接 `SetThreadExecutionState`（Win）/`IOPMAssertion`（mac）。按 §1.5
+> 同阶段修净 ⇒ 不入表。**AIR 契约全实测**（`temp/desktopprobe/`，adl 51.4.1）：openWith 空 File 抛 `#1009`
+> （特例，非通用 `#2037`）、不存在 `#3003`、目录可开；systemIdleMode null 抛 `#2007`（idleMode）、非法值 `#2008`、
+> 往返不变。验收：`examples/desktop-integration.as` 双端过（AOT + adl PROOF）、`unit: platform/DesktopIntegration` 10 钉、
+> 全量 692/688/0 红。这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **E1+E2**。
+>
+> **2026-11-15 追加（阶段四百二十一：A1 `BitmapData.encode` PNG 真编码）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1）。这一项登记在
+> [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3 的成员级报明清单（不在本表）：`BitmapData.encode` 此前对
+> PNG/JPEG 都是空操作，本轮把 **PNG** 接上已链进来的 `SkPngEncoder`（新增内存版 `sk_image_encode_png_mem`），
+> JPEG/WebP 仍报明（A2 待做）。按 §1.5 它是「`adl` 跑得对、我们跑不出」的遗留缺陷，同阶段修净 ⇒ 不入表。
+> **AIR 契约全是实测**（`temp/pngprobe/`，adl 51.4.1 + `describeType`）：签名是**三参** `(rect, compressor,
+> byteArray=null)`——原 `symbols.ts` 的四参（多 `byteArrayOffset`）是错的，已改回（`as3-semantics.md` §3.3 C 类
+> 具名三例随之全部修净：298/299/421）；在当前 `position` 写入并推进/自动扩 `length`（writeBytes 语义、覆盖既有字节）；
+> null rect/compressor 抛 `#2007`、null byteArray 静默 no-op。**不透明像素回环精确**（真应用快照场景），半透明经
+> premultiply 舍入（AIR 与 Skia 皆然，AIR 内部预乘存储使其 `getPixel32` 本身有损）——登记为实测差异。验收：
+> `examples/png-encode.as`（不透明回环 0 损耗 + 语义/错误码对齐 adl）、`unit: render/PngEncode` 14 钉、全量 690/686/0 红。
+> 这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **A1**。
+>
+> **2026-11-15 追加（阶段四百二十：C1 `NetworkInfo.findInterfaces()` Windows 后端）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**85 行**：`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1）。这一项与阶段三百六十三同源，
+> 登记在 [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) 的毕业注里（不在本表）：三百六十三做了 POSIX `getifaddrs`，
+> 本轮补上 **Windows `GetAdaptersAddresses`**（`ASC_NET_WIN32`），WASI 仍报明。按 §1.5 它是「`adl` 跑得对、
+> 我们跑不出」的遗留缺陷，同阶段修净 ⇒ 不入表。**Windows 语义与 macOS 多处不同且全是实测**（`temp/netwin/`，
+> 7 网卡全字段对 adl 51.4.1 逐行 diff 为空）：`name`=适配器 GUID、`displayName`=FriendlyName、MAC=大写 `-`
+> 无尾空格、`active`=`OperStatus==Up`（loopback=true）、`mtu`=`(int)Mtu`（loopback=-1）、地址按 unicast 自然序、
+> 广播=计算定向广播。**顺带修净一处自引入回归**：`iphlpapi.h` 的 SAL 宏（`IN/OUT/OPTIONAL`）若晚处 include
+> 会在顶部 scrub 之后重定义 `OUT`，把 `ident-free-fn.as` 专测的同名字段展开成空 ⇒ 必须放顶部 include 块（scrub 前）
+> 并补 `#undef INOUT/OUTOPT/INOUTOPT`。验收：`examples/net-interfaces.as` 改平台感知双端过、
+> `unit: platform/NetworkInventory` 37 钉（9 Windows）、全量 688/684/0 红。口径见 `flash-net.md` §6.10.5。
+> 这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **C1**（真应用启动即退出的真根因）。
+>
 > **2026-11-15 追加（阶段四百一十九：`toFixed` 半上入收口 + 遗留表审计）**：**新登记 1 行 / 改写 1 行 / 移出 2 行** ⇒
 > 按「项数以表内实际行数**为准**」重数，主表 **86 → 85 行**（`未开始` **64** / `部分完成` **20** / `调研完成·实现暂缓` **1**）。
 > **移出 2 行**：① 「`toFixed` 对 `.5` 的舍入方向与 AIR 不同」——本轮**修净**。拿到了 avmplus 源码
@@ -20664,6 +20809,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 | `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | **部分完成**（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
 | **`transparent=false` 的 `BitmapData`：adl 在 `getPixel32()`/`getPixels()` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的 alpha** | 未开始（2026-11-05 阶段三百七十四 的像素 oracle 量到） | `temp/vidcopy/` 的 DUMP 直接可见：同一份 `setPixels` 输入，adl 读回 `FF030201`、AOT 读回 `04030201`（低三字节相同）。这是本轮改动**之前**就存在的分歧——逐格循环与新的 bulk 路径给出同一个值，所以不是修 `setPixels` 引入的。影响面：`transparent=false` 的位图如果被写进非 255 的 alpha（ANE 帧的 alpha 恒为 255，所以 meeting 客户端的摄像头预览不受影响），AOT 下会整块半透明、AIR 下不透明。`examples/bitmap-setpixels-endian.as` 用的是 `transparent=false` 但源 alpha 恰好 255，所以既有钉子没有暴露它。 | 两条路选一条：① 在**写入侧**强制（`setPixels`/`setPixel32`/`fillRect`/`copyPixels`/`draw` 等所有入口，`!transparent` 时把 alpha 压成 255）；② 在**读取侧**强制（`getPixel32`/`getPixels` 时屏蔽）。AIR 到底是哪一侧还没测——这决定 `BitmapData` 内部是否允许存在带 alpha 的像素（会连带影响 `draw()` 的合成与 `Bitmap.bitmapData` 上屏）。**动手前先补一组双端探针**：`transparent=false` 位图 `setPixel32(0,0,0x80FF0000)` 之后，(a) `getPixel32` 读回什么、(b) `BitmapData.draw` 到另一张图上得到什么、(c) 作为 `Bitmap` 上屏后采样到什么。三处一致才敢选侧。 |
+| **Windows `NativeDragManager.doDrag` 的 `dragImage` 不渲染**（macOS 已实现 RGBA 拖动图像 + offset；Windows 传入 `dragImage` 报明未实现、改用系统光标） | 未开始（2026-11-15 阶段四百三十 E3 验证 OLE 拖放时确认；`desktop-file-interaction.md` 早已登记此限制） | OLE 拖动图像走 shell **私有协议**：`IDataObject` 须提供注册格式 `DragImageBits`（`DRAGIMAGEBITS` 结构 = 尺寸 + 光标 offset + 32bpp 预乘 alpha `HBITMAP`），`IDropSource` 须实现 `IDropSourceHelper`（`GiveFeedback` 回 `DRAGDROP_S_USEDEFAULTCURSORS`）。`DRAGIMAGEBITS`/`IDropSourceHelper`/其 IID **都不在公开 Windows SDK 头**（`shlobj.h`/`shobjidl.h`/`shlguid.h` 实测无），属 reverse-engineered 接口。`vendor/native_drag_win.cc` 的 `sk_drag_begin` 已收到 rgba/尺寸/offset 但 `(void)` 忽略，`Data` 是只读快照（私有格式需可变态）。drag-IN（`IDropTarget`）与 drag-OUT（`DoDragDrop`）本身已实测可用，仅缺拖动图像。 | 需先按 Wine/ReactOS 的 `IDropSourceHelper` IID 与 `DRAGIMAGEBITS` 布局核实私有协议，把 `Data` 扩成携带 `DragImageBits` 格式（`HBITMAP` 由 rgba 建 32bpp DIB section、预乘 alpha、随 `Data` 释放），`Source` 增 `IDropSourceHelper`。**必须真机拖出到资源管理器/编辑器目视验收**（本机无法程序化模拟交互拖拽）；协议核实前不盲改，避免崩掉已可用的 drag-OUT 路径。当前按 §1.5 报明（`as_shell_unsupported`），不静默降级 |
 
 
 
@@ -22352,3 +22498,459 @@ BigInteger 停止边界，病态用例，独立立项（证据 `temp/tofixed3/ma
 
 **验收**：`node test.ts` → **688 tests / 684 pass / 0 fail / 4 skipped**（`exit=0`；较上轮 +1 即新示例
 `tofixed-round.as`，4 跳过为 `status-item` 需 darwin + 3 个符号链接 EPERM）；版本 `v0.4.394 → v0.4.395`。
+
+### 阶段四百二十：C1 `NetworkInfo.findInterfaces()` Windows 后端 —— 真应用启动即退出的真根因（v0.4.395 → v0.4.396）
+
+**需求来源**：[`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **C1**（跨批排序首项，高影响快赢）。
+真应用 `ServerData.initDevicesUuid()` 用第一个带 `hardwareAddress` 的接口造设备 id；Windows 上
+`findInterfaces()` 此前是 shell（报明 + 空 Vector）⇒ macAddress 空 ⇒ 落进 Windows 专用分支 ⇒ 文档类
+构造函数里 `exit(1)`（与阶段三百六十三 macOS 症状同源，只是平台换成 Windows）。
+
+**一、adl 51.4.1 Windows 实测契约**（`temp/netwin/`，`NetProbe.as` 文档类写 `applicationStorageDirectory`，
+7 网卡全字段；`net-air-ref.txt`）。**与 macOS 多处不同，全是实测**：
+
+| 字段 | macOS（阶段三百六十三） | Windows（本轮） |
+|---|---|---|
+| `name` | `en0` | 适配器 GUID `{680418F5-...}`（38 字符） |
+| `displayName` | `""` | FriendlyName（`以太网`/`VMware Network Adapter VMnet1`） |
+| `hardwareAddress` | `aa:bb:..:ff `（小写 `:`+尾空格） | `74-56-3C-B7-45-19`（大写 `-`、无尾空格） |
+| `active` | UP∧RUNNING∧非 loopback | `OperStatus==IfOperStatusUp`（loopback=true） |
+| `mtu` | `SIOCGIFMTU`（lo0=16384） | `(int)Mtu`（loopback 0xFFFFFFFF⇒-1） |
+| 地址序 | IPv4 先 | unicast 自然序（IPv6 可前） |
+| `broadcast` | IPv4 广播 | 计算定向广播 `ip\|~mask`；loopback/IPv6="" |
+| IPv6 link-local | 丢 fe80::/10 | 同 |
+
+**二、实现**（runtime-only，消费端 `emitNetworkInfoFindInterfaces` 仅 `displayName` 改读行字段）：
+- `src/runtime.ts` 新增 `ASC_NET_WIN32` 分支：`GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST|
+  MULTICAST|DNS_SERVER, ...)`，16KB 起 5 次 realloc 重试；`as_net_mac_str_win`（`%02X`+`-`）、
+  `as_net_wide_utf8`（`WideCharToMultiByte` CP_UTF8）；行按适配器连续分组、内层遍历 `FirstUnicastAddress`。
+- `as_net_row` 扩容 `name[32]→name[64]`（GUID 截断）+ 新增 `display[128]`；POSIX 分支 `display[0]='\0'`。
+- `src/emit.ts`：`cur->displayName = as_str_dup(rows[i].display)`（不再硬编码 ""）。
+- 链接：`src/index.ts` Winsock 块循环加 `['ws2_32','iphlpapi']`；`test/harness.ts` `PROBE_SYSTEM_LINK_FLAGS`
+  加 `-liphlpapi`。
+
+**三、自引入回归与修复（SAL 宏）**：首版把 `#include <iphlpapi.h>` 放在 net 段（前导晚处），它拉进的 SAL
+注解头 `#define IN/OUT/OPTIONAL` 在顶部「Windows object-like 宏 scrub」**之后**重新引入 `OUT`，把
+`ident-free-fn.as` 专测的同名 AS3 字段展开成空 ⇒ `error: expected identifier`（全量唯一红）。修：include
+移到顶部 Windows include 块（scrub 之前）+ 补 `#undef INOUT/OUTOPT/INOUTOPT`。修后 ident-free-fn 恢复、
+NetworkInfo 仍与 AIR 逐行一致。
+
+**四、验收**：
+- A/B：`temp/netwin/NetProbeAot.as` 编译运行，与 `net-air-ref.txt` 逐行 diff 为空（含 OS 行 Windows 11）。
+- `examples/net-interfaces.as` 改**平台感知**（Windows 大写 `-` MAC、loopback mtu=-1、Windows 也要求非空清单），
+  泛化原注释里的私有名；AOT 与 adl 双端过。
+- `unit: platform/NetworkInventory` **37 钉**（含 9 个 Windows 钉：GUID/FriendlyName、大写短横 MAC、OperStatus、
+  (int)Mtu、fe80 跳过、loopback 广播抑制、name[64]/display[128]、iphlpapi 在探针链接线）。
+- 全量 `node test.ts` → **688 tests / 684 pass / 0 fail / 4 skipped**（exit=0；4 跳过为 status-item 需 darwin
+  + 3 符号链接 EPERM）；版本 `v0.4.395 → v0.4.396`。
+
+**记账**：遗留表 85 行不变（本项登记在 stubs.md 毕业注，非遗留表，与阶段三百六十三同源）；stubs.md §2.2
+毕业注补 Windows；`flash-net.md` §6.10.5（zh/en）新增 Windows 契约 + SAL 坑；README（zh/en）示例描述与
+根类 NetworkInfo 子句同步；plan 文档 C1 标落地。
+
+---
+
+### 阶段四百二十一：A1 `BitmapData.encode` PNG 真编码（v0.4.396 → v0.4.397）
+
+**一、背景**：真应用的快照/截图走 `BitmapData.encode(rect, new PNGEncoderOptions(), ba)`。此前 `encode`
+对 PNG/JPEG 都是空操作（`emit.ts` 直接 return），快照拿不到字节。vendored Skia **已链 `SkPngEncoder`**
+（`vendor/skia_glue.cc` 的文件版 `sk_image_encode_png` 一直在），故 PNG 无需重编 Skia，只差一个内存版 seam。
+这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **A1**（A2=JPEG 需重编 Skia 开
+`libjpeg_turbo_encode`，独立后置）。
+
+**二、AIR 契约（adl 51.4.1 实测，`temp/pngprobe/`）**：
+
+| 项 | 实测 | 实现 |
+|---|---|---|
+| 签名 | `describeType` 报 **3 参** `(Rectangle, Object, ByteArray=null)`，**无 `byteArrayOffset`** | `symbols.ts` 改回三参（原四参是错的，`byteArrayOffset` 串属 `Texture.uploadFromBitmapData`） |
+| 写入位置 | 在当前 `position` 写、推进 `position`、自动扩 `length`（writeBytes 语义，覆盖既有字节） | `as_ba_grow_pos(out, pngLen)` + memcpy + `out->position += pngLen` |
+| null compressor | `TypeError #2007: Parameter compressor must be non-null.` | 逐字 |
+| null rect | `TypeError #2007: Parameter rectangle must be non-null.` | 逐字 |
+| null byteArray | **静默接受**（可选参） | `if (out == NULL ...) return;` |
+| 部分 rect | 只编该区域 | rect 裁剪 + 区域 memcpy |
+| 不透明像素回环 | 精确 | straight ARGB → `sk_image_from_argb` → `SkPngEncoder`，0 损耗 |
+| 半透明像素回环 | AIR 自身有 premultiply 舍入损耗 | 我方同样经 premultiply（Skia），登记为实测差异 |
+
+**三、实现**：
+- `vendor/skia_glue.cc`：新增 `int sk_image_encode_png_mem(void* image, unsigned char** out, size_t* outLen)`
+  （`SkPngEncoder::Encode` → malloc 缓冲，调用方 free），紧邻原文件版。
+- `src/runtime.ts`：`#ifdef ASC_USE_SKIA` 区补 extern 声明。
+- `src/symbols.ts`：`BitmapData.encode` 三参 + 注释记录实测。
+- `src/emit.ts`：`BitmapData_encode` 全量重写——#2007 负例、null out 静默、非 PNG compressor 走
+  `as_shell_unsupported`（JPEG/WebP 仍报明）、rect 裁剪、区域 memcpy → `sk_image_from_argb` →
+  `sk_image_encode_png_mem` → `as_ba_grow_pos` + memcpy + 推进 position/length + free。
+- 构建：示例 `examples/png-encode.build.json`（同 bake-bitmap-swap 的 Skia 清单）+ `test/examples.ts`
+  `EXAMPLE_ARGS` 注册（纯 C 构建无图像后端，必须链 Skia）。
+
+**四、premultiply 偏差（如实登记）**：AIR 内部以**预乘**存储位图，其 `getPixel32` 本身对半透明有损；
+本运行时以**直通**存储，`getPixel32` 精确。PNG 编码两端都经 premultiply，故半透明像素的 RGB 回环在两臂
+都有舍入损耗（只是 AIR 的「原图读出」也损、我方「原图读出」精确，对照点不同）。**不透明像素（alpha=255，
+真应用快照场景）premultiply 为恒等 ⇒ 两臂都精确**。示例因此对不透明像素断言精确回环、对半透明只断言 alpha 保持。
+
+**五、验收**：
+- A/B：`temp/pngprobe/PngProbeAot.as` 的 T1–T6 语义/错误码与 adl 逐项一致（PNG 字节数因编码器不同而异，魔数/位置/覆盖语义同）。
+- `examples/png-encode.as`：不透明回环 **0 损耗** + 魔数 + position/length 语义 + 部分 rect + #2007 负例 + 半透明 alpha 保持；AOT 过。
+- `unit: render/PngEncode` **14 钉**（三参签名、无 byteArrayOffset、内存编码 seam、writeBytes 语义、#2007 文案、null no-op、JPEG 仍报明、**ASC_USE_SKIA guard + 纯 C 报明 fallback**、glue/preamble/symbols 结构）。
+- 全量 `node test.ts` → **690 tests / 686 pass / 0 fail / 4 skipped**（exit=0）；版本 `v0.4.396 → v0.4.397`。
+
+**一处自引入回归（已修）**：`BitmapData_encode` 是被**每个程序**发射的内建，初版无条件调 `sk_image_from_argb`/
+`sk_image_encode_png_mem`/`sk_image_delete` ⇒ **纯 C 构建**（未定义 `ASC_USE_SKIA`，那些 seam 未声明）全部编译失败
+（首轮全量 289 红，连 `array.as` 都挂）。修法：Skia 段包进 `#ifdef ASC_USE_SKIA`，`#else` 走 `as_shell_unsupported`
+响亮报明。**教训**：凡是被普遍发射的内建里新增 Skia seam 调用，必须同步加 `ASC_USE_SKIA` guard（与 `as_skia_*`
+空桩同口径），不能只验 Skia 示例。
+
+**记账**：遗留表 85 行不变（本项登记在 stubs.md §3 成员级报明清单，非遗留表）；stubs.md §2.1 PNGEncoderOptions
+行改「PNG 已实装」、§3 jpeg/webp 行补注、§4 毕业表新增 `BitmapData.encode`(PNG) 行（zh/en）；`as3-semantics.md`
+§3.3 C 类具名三例全部修净（9 → 6，298/299/421，zh/en）；README（zh/en）新增 png-encode 示例描述；plan 文档 A1 标落地。
+
+---
+
+### 阶段四百二十二：E1+E2 桌面集成 —— openWithDefaultApplication + systemIdleMode（v0.4.397 → v0.4.398）
+
+**一、背景**：真应用用 `File.openWithDefaultApplication` 打开下载的文件、用 `NativeApplication.systemIdleMode`
+在演示时抑制系统休眠。两者此前都是报明空壳。这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md)
+的 **E1+E2**（桌面快赢，同批回归）。
+
+**二、AIR 契约（adl 51.4.1 实测，`temp/desktopprobe/`）**：
+
+| 项 | 实测 | 实现 |
+|---|---|---|
+| E1 空 File（无路径） | `#1009: Cannot access a property or method of a null object reference.` | 直查 `_nativePath == NULL`（**不走 `as_file_has_path`**，后者抛通用的 `#2037`） |
+| E1 路径不存在 | `#3003: File or directory does not exist.` | `as_path_exists` 检查在启动**之前** |
+| E1 目录 | **ok**（开资源管理器） | `as_open_external` 不区分文件/目录 |
+| E1 存在文件 | 开默认程序 | 同上（`ShellExecuteW`/`open`/`xdg-open`） |
+| E2 默认 | `normal` | 不变 |
+| E2 往返 | `keepAwake`/`normal` 读回一致 | 存 `ASC_idle_mode` |
+| E2 null | `#2007: Parameter idleMode must be non-null.` | 单独判 null |
+| E2 非法值 | `#2008: Parameter systemIdleMode must be one of the accepted values.` | 只接受 normal/keepAwake |
+
+**三、实现**：
+- E1：`File_openWithDefaultApplication` 重写——`_nativePath == NULL` → `#1009`；`!as_path_exists` → `#3003`；
+  否则 `as_open_external(o->_nativePath)`（复用 navigateToURL 的 seam，Win `ShellExecuteW`、mac `open`、Linux `xdg-open`，
+  含 `ASC_OPEN_LAUNCHER` headless override——但 Windows 分支走 `ShellExecuteW` 不用 override）。
+- E2：`NativeApplication_set_systemIdleMode` 重写——null → `#2007`、非法 → `#2008`、存值 + `as_set_idle_mode(keepAwake)`。
+- 新增 runtime seam `as_set_idle_mode(int keepAwake)`：Win `SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)`，
+  NORMAL 走 `ES_CONTINUOUS` 释放；mac `IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,...)`（静态
+  `ASC_idle_assertion`，NORMAL 释放），顶部 `__APPLE__` include 块补 `<IOKit/pwr_mgt/IOPMLib.h>`；其他目标报明一次。
+
+**四、验收**：
+- A/B：`temp/desktopprobe/DesktopProbeAot.as` 与 adl 参考逐项 diff 内容一致（仅 trace 尾换行差）；E1 目录成功路径真机开出资源管理器。
+- `examples/desktop-integration.as`：错误契约 + 往返（**无启动**，成功路径真机验）；AOT 过 + adl PROOF 文件确认双端过。
+- `unit: platform/DesktopIntegration` **10 钉**（#1009/#3003/as_open_external、#2007/#2008/校验/as_set_idle_mode、Win/mac 后端 + IOPMLib 头）。
+- 全量 `node test.ts` → **692 tests / 688 pass / 0 fail / 4 skipped**（exit=0）；版本 `v0.4.397 → v0.4.398`。
+
+**记账**：遗留表 85 行不变（两项登记在 stubs.md §3，移出并毕业）；stubs.md §3 删 openWith/systemIdleMode 两行、
+§4 毕业表新增两行（zh/en）；README（zh/en）新增 desktop-integration 示例描述；plan 文档 E1+E2 标落地。
+
+---
+
+### 阶段四百二十三：A2 `BitmapData.encode` JPEG 真编码 —— 直接驱动 libjpeg-turbo，无需重编 Skia（v0.4.398 → v0.4.399）
+
+**一、背景**：A1（阶段四百二十一）实装了 PNG 编码，JPEG 仍报明。plan 原估 A2 需重编 Skia 开 `libjpeg_turbo_encode`
+（守 MSVC ABI）或独立链 libjpeg-turbo。**实测发现不必重编**：vendored `libjpeg.lib` 本就带压缩符号
+（`llvm-nm` 查得 `jpeg_start_compress`/`jpeg_write_scanlines`/`jpeg_CreateCompress`/`jpeg_finish_compress` 均为 `T`），
+只是 Skia 的 `SkJpegEncoder` C++ 包装被 gn  arg 关掉。于是直接驱动 libjpeg-turbo C API。这是
+[`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **A2**。
+
+**二、可行性调查（关键）**：
+- `vendor/skia/third_party/externals/libjpeg-turbo/` 有 `jpeglib.h`/`jconfig.h`/`jmorecfg.h`/`jerror.h`；
+  `jpeglibmangler.h`/`jpegint.h` 虽缺，但 `jpeglib.h` 对二者均有守卫：`MANGLE_JPEG_NAMES`（不定义→无修饰名，匹配 lib）、
+  `JPEG_INTERNALS`（应用不定义→不需 jpegint.h）。故**无需补任何头**。
+- `jpeg_mem_dest` **不在库中**（Skia 排除了 `jdatdst.c`）→ 自带增长内存 destination manager（`init_destination`/
+  `empty_output_buffer`/`term_destination`）。最小验证程序 `temp/jpegtest/t.c` 编译+链接+编码成功（magic ffd8）。
+
+**三、AIR 契约（adl 51.4.1 实测，`temp/jpegprobe/`）**：
+
+| 项 | 实测 | 实现 |
+|---|---|---|
+| `JPEGEncoderOptions.quality` 类型/默认 | **uint，默认 80**（原 shell 误作 Number/50） | symbols.ts 改 `{ kind:'uint' }` + `shUintP('quality',80)` |
+| 构造器校验 | **不校验**：`new JPEGEncoderOptions(101).quality==101`、`(-5)`→4294967291 | uint 字段自然强制转换 |
+| encode quality>100 | `#2006: The supplied index is out of bounds.`（RangeError） | unsigned 比较 `jpegQuality>100`（负值 wrap 也被抓） |
+| quality 0/100 | 均接受 | libjpeg 0..100 |
+| null compressor/rect | `#2007` | 同 PNG |
+| null byteArray | 静默 no-op | 同 PNG |
+| 去 alpha | **premul-over-black**：`0x80FF0000`→rgb `800000`、alpha 255 | readPixels `kPremul_SkAlphaType` 后剥 A |
+| magic/写入语义 | FF D8、当前 position 写入推进 | 同 PNG |
+
+**四、实现**：
+- `vendor/skia_glue.cc`：`#include "third_party/externals/libjpeg-turbo/jpeglib.h"`（不定义 MANGLE_JPEG_NAMES/JPEG_INTERNALS）；
+  新增 `sk_image_encode_jpeg_mem(void* image, int quality, unsigned char** out, size_t* outLen)` + 静态内存 destination
+  助手；readPixels premul RGBA → 剥 A 成 RGB scanline → `jpeg_set_quality`/`jpeg_start_compress`/`jpeg_write_scanlines`。
+- `src/runtime.ts`：`extern int sk_image_encode_jpeg_mem(...)`（ASC_USE_SKIA 块内，PNG extern 旁）。
+- `src/symbols.ts`：新增 `shUintP` 助手；JPEGEncoderOptions quality 改 uint 默认 80。
+- `src/emit.ts`：`BitmapData_encode` 重构为 PNG/JPEG 分流（`isPng`/`isJpeg`）；JPEG 读 quality、unsigned 校验 >100 抛 #2006；
+  编码 ternary `isPng ? sk_image_encode_png_mem : sk_image_encode_jpeg_mem`；未知 compressor 报明；纯 C `#else` 报明（文案改
+  「BitmapData.encode (this build has no Skia image backend)」，PNG/JPEG 共用）。
+
+**五、验收**：
+- A/B：`temp/jpegprobe/JpegProbeAot.as` 与 adl 参考净 diff——**T1/T2/T4/T5/T6-q101 逐字一致**，T5 premul 回环 `ff800000` 相同；
+  仅 T3 q10len（759 vs 631）、T6 q0 len（758 vs 630）异——低 quality 小图压缩字节数因编码器版本差（JPEG 有损、跨编码器字节非 AIR 契约）。
+- `examples/jpeg-encode.as`：默认 80/uint wrap/#2006/#2007/no-op/quality 尺寸效应/不透明回环（±2）/premul-over-black（±4）；AOT 过。
+- `unit: render/JpegEncode` **14 钉**；`unit: render/PngEncode` 4 钉随共享 encode 重构同步更新（png→enc、JPEG 转真、fallback 文案）。
+- 纯 C 构建（无 manifest）编译过且报明一次后继续。
+- 全量 `node test.ts` → **694 tests / 690 pass / 0 fail / 4 skipped**（exit=0）；版本 `v0.4.398 → v0.4.399`。
+
+**记账**：遗留表 85 行不变（本项登记在 stubs.md §3，JPEG 部分移出毕业）；stubs.md §2 JPEGEncoderOptions 行改 uint/80、
+§3 jpeg/webp 行改 webp-only、§4 毕业表新增 `BitmapData.encode`(JPEG) 行（zh/en）；README（zh/en）新增 jpeg-encode 示例描述；
+plan 文档 A2 标落地。**经验**：「vendored Skia 关了某编码」不等于底层 C 库没有该符号——先 `llvm-nm` 查库再决定是否重编。
+
+---
+
+### 阶段四百二十四：B1a `flash.media.Microphone` 设备面真枚举 —— WASAPI 活跃采集端点（v0.4.399 → v0.4.400）
+
+**一、背景**：`Microphone` 原为 shell 类（`getMicrophone()` 返 null、`names` 空、`isSupported=false`），真应用的
+管理员/主讲人麦克风音量监听静默失效。plan 的 B1 拆为 **B1a 设备面**（本阶段）与 **B1b 采集线程 + SampleDataEvent**
+（下一阶段，硬依赖 B1a），分两阶段降风险。这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **B1a**。
+
+**二、AIR 契约实测**（`temp/micprobe/`，adl 51.4.1，本机 `Microphone (Realtek USB2.0 MIC)`）：
+- `isSupported=true`；`names.length=1`、`names[0]="Microphone (Realtek USB2.0 MIC)"`（每次新 Array）。
+- `getMicrophone()` → name/index 0；默认 rate 8 / gain 50 / silenceLevel 10 / silenceTimeout 2000 / activityLevel -1 /
+  muted false / codec nellymoser / enableVAD true；`getMicrophone(0)` 同、`getMicrophone(999)=null`；
+  `getEnhancedMicrophone()` 同设备 idx 0；`gain` 可写。
+- **describeType 权威成员表**：静态 `getMicrophone`/`getEnhancedMicrophone`、只读 `names`/`isSupported`（另有
+  `permissionStatus`/`permissionManager`）；实例 `setSilenceLevel`/`setLoopBack`/`requestPermission`/`setUseEchoSuppression`
+  （**无 `setCodec`/`setRate`**）；访问器 gain/rate/soundTransform/framesPerPacket/encodeQuality/noiseSuppressionLevel/
+  enableVAD/muted 等（**无 `fps`**——mxmlc 拒编）。原 shell 自造的 `fps` 字段与 `setCodec`/`setRate` 方法本轮删除。
+
+**三、WASAPI 可行性**（`temp/mictest/t.c`）：`CLSID_MMDeviceEnumerator`/`IID_IMMDeviceEnumerator` 不在 `uuid.lib`，
+`initguid.h` 亦无效 ⇒ **手工定义 GUID** + `PROPERTYKEY`（FriendlyName pid 14），仅 `-lole32` 即可链接；
+`EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE)` 输出与 AIR 逐字一致。
+
+**四、实现**：
+- `src/runtime.ts`：顶部 Windows 块加 `<objbase.h>`/`<mmdeviceapi.h>`/`<functiondiscoverykeys_devpkey.h>`/`<propidl.h>`
+  （在 object-like 宏 scrub 之前，同 iphlpapi）；`mmdeviceapi.h` 的 `EndpointFormFactor` 枚举常量 `Microphone` 与生成 C
+  的 `typedef struct Microphone` 冲突（GDI Rectangle 同类）⇒ `#define Microphone ASC_WASAPI_Microphone` 包住 include 后 `#undef`。
+  新增 `as_mic_row { char name[256]; }` + 手工 GUID/PKEY + `as_mic_wide_utf8` + `as_mic_scan`（`CoInitializeEx` MTA
+  容忍 `RPC_E_CHANGED_MODE`，返回总数，平衡 release/`CoUninitialize`）；非 Windows 臂报明一次。
+- `src/symbols.ts`：`shell('Microphone')` 删 `fps`/`setCodec`/`setRate`；`isSupported` 从 staticBools 移入 staticGetters。
+- `src/emit.ts`：`emitShellClasses` 静态成员 override——`Microphone_get_names_static`（新 Array + GC 字符串）、
+  `Microphone_get_isSupported_static`（`as_mic_scan(NULL,0)>0`）、`getMicrophone`/`getEnhancedMicrophone` 共享
+  `Microphone__from_index`（填 AIR 默认值、index<0→0、越界 null、name/codec 加 gc_write_barrier）。
+- `src/index.ts`：`ole32` 随 native Windows 目标链接（同 ws2_32/iphlpapi 的 OS-import 理据）。
+- `src/build.ts`：**冷缓存假绿根因修**——`effectiveDefines` 给 Windows native 统一加 `_CRT_SECURE_NO_WARNINGS`
+  （vendor glue 的 `_wfopen`/`fopen` 不含生成 C preamble 的该 define，冷编译出弃用警告、暖缓存则无，使
+  `swc-static-text` 的无警告钉随缓存假绿/红）；覆盖单步/多步两路径所有源。
+- `test/unit/file-dialog.ts`：objectDir 不变钉改为同平台比较（win32-only CRT define 使 effectiveDefines 平台相关，
+  原跨 win32/darwin 比较不再成立）。
+
+**五、验收**：
+- A/B：`temp/micprobe/MicProbeAot.as` 与 adl 参考设备面 portion **逐字一致**（isSupported/names/getMicrophone 默认值/
+  0/999/getEnhancedMicrophone/gain）。
+- `examples/microphone-devices.as`：平台感知（无设备 CI 也过）；AOT 过。
+- `unit: platform/MicrophoneDevices` **14 钉**；`unit: build/WindowsArch` **3 新钉**（CRT define 进 effectiveDefines/
+  编译命令、wasm 无）；`builtin-arity.as`（用 setLoopBack）无回归。
+- 全量 `node test.ts` → **696 tests / 692 pass / 0 fail / 4 skipped**（exit=0）；版本 `v0.4.399 → v0.4.400`。
+
+**记账**：遗留表 85 行不变（Microphone 登记在 stubs.md §2，设备面毕业）；stubs.md §2 Microphone 行改设备面真实现、
+§4 毕业表新增 Microphone(设备面) 行（zh/en）；README（zh/en）新增 microphone-devices 示例描述；plan 文档 B1a 标落地、
+B1 行拆 B1a✅/B1b。**经验**：① Windows COM 头可能污染生成 C 的类型名（mmdeviceapi 的 Microphone 枚举），用局部宏改名
+化解（NOGDI 同精神）；② 「无警告」类测试钉若依赖对象缓存暖态会假绿——vendor glue 的 CRT 弃用警告须在构建层统一消除。
+
+### 阶段四百二十五：B1b `flash.media.Microphone` 采集 + `SampleDataEvent` —— WASAPI 共享模式采集线程（v0.4.400 → v0.4.401）
+
+**一、背景**：B1a（阶段四百二十四）落地设备面后，`setLoopBack`/`setSilenceLevel`/`setUseEchoSuppression` 与实时
+`activityLevel` 仍空转，真应用的麦克风音量监听拿不到 `SampleDataEvent`。本阶段补采集线程 + 帧边界事件派发，
+B1 至此全部落地。这是 [`app-gap-closure-plan.md`](docs/zh-cn/app-gap-closure-plan.md) 的 **B1b**（硬依赖 B1a 设备面）。
+
+**二、AIR 契约实测**（`temp/micprobe/MicCapture.as`，adl 51.4.1）：
+- `setLoopBack(true)` 后 `SampleDataEvent.SAMPLE_DATA` 按帧到达；每事件 `data.length=8192`（**2048 个 float32 样本**），
+  `position` 累加 2048（0/2048/4096/…），`readFloat()` 读出合理声压值（大端 float32）。
+- `activityLevel` 采集前 **-1**、采集时 **0..100** 随声压变化（静音≈1、响亮≈100）；`setLoopBack(false)` 后复位 -1。
+- `rate` 以 kHz 计（set 44 → 44）；`setSilenceLevel(0,1000)`/`setUseEchoSuppression(true)` 不报错。
+
+**三、WASAPI 可行性**（`temp/mictest/cap.c`，仅 `-lole32`）：`GetDefaultAudioEndpoint(eCapture,eConsole)` →
+`Activate(IID_IAudioClient)` → `GetMixFormat` → `Initialize(SHARED)` → `GetService(IID_IAudioCaptureClient)` →
+`Start` → `GetNextPacketSize`/`GetBuffer`/`ReleaseBuffer` 循环，实测抓 36480 帧。**关键：共享模式拒自定义速率**
+（直接请求 44100/mono/float32 报 `hr=88890008` `AUDCLNT_E_UNSUPPORTED_FORMAT`）⇒ 必须抓设备 mix format
+（本机 tag=3 ch=2 rate=48000 bits=32）再**自行下混单声道 + 线性重采样**到 `rate` kHz。IAudioClient IID 的 Data4
+须为 `{0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2}`（错字节致 `Activate hr=80004002`）。
+
+**四、实现**：
+- `src/runtime.ts`：顶部 Windows 块加 `<audioclient.h>`（SAL-before-scrub 同 B1a）；include 前 `#define NOBITMAP`
+  跳过 `mmreg.h` 嵌 `BITMAPINFOHEADER`（GDI 类型，被 `NOGDI` 隐藏）的视频格式结构。新增 `as_mic_buf`/`as_mic`
+  （registry 按 obj 键控，免改 Microphone 结构）+ SRWLOCK/CONDITION_VARIABLE 锁 + 手工 IAudioClient/IAudioCaptureClient IID。
+  `as_mic_worker_body`：COM MTA（容忍 `RPC_E_CHANGED_MODE`）抓 mix format → 下混单声道 → 线性重采样
+  （`step=mixRate/targetRate≥1` 降采样，prevLast 桥接缓冲边界）→ 2048 样本缓冲锁下入队 + wake；peak×100 算
+  `activity`；silenceLevel>0 且低于阈值则门控不派。**线程不碰 AS3/GC**（只 malloc + 锁下入队）。`as_mic_start/stop/
+  set_silence/set_echo`（echo 存 pending 条目）、`as_mic_take/reap/mark_roots/any/total/at`；非 Windows/无线程臂报明一次。
+  GC 根 walk 加 `as_mic_mark_roots()`（`gc_mark_ptr(obj)`）；帧边界 hub `as_async_tick_with` **无条件**调
+  `as_mic_dispatch()`（初版误置 `if(as_sock_any())` 内致无 socket 时永不派发，已移出）。
+- `src/emit.ts`：`emitMicrophoneDispatch` 发射 `as_mic_dispatch`（需生成的 SampleDataEvent/ByteArray 构造器）：
+  每缓冲建 `ByteArray`（`GCT_BYTES` + 写屏障，2048 **大端** float32）+ `SampleDataEvent_new("sampleData",…,position,ba)`
+  派发，`o->activityLevel=m->activity` 发活值（activityLevel 是 shell 字段，`mic.activityLevel` 直读字段绕过 getter，
+  故由 dispatch 写字段而非加 getter override）。实例方法 override：`setLoopBack`（start/stop + 复位 -1）、
+  `setSilenceLevel`（写真字段 + 推活 worker）、`setUseEchoSuppression`（存提示）。
+
+**五、验收**：
+- A/B：`temp/micprobe/MicCapAot.as` 与 adl 参考契约一致——ev1 len=8192 pos=0 act≈1 样本全 0、ev2 pos=2048
+  样本 0.0103（AIR 0.01034 几乎重合）、position 累加 2048、activityLevel 0..100、events=5。
+- `examples/microphone-capture.as`：平台感知（无设备 CI 也过），有界泵帧循环（3 事件或 3 s 截止）；AOT 过、harness 过。
+- `unit: platform/MicrophoneCapture` **17 钉**（audioclient/NOBITMAP、手工 IID、mix format 共享模式、packet 循环、
+  下混重采样 2048、worker 不碰 GC/事件、锁下入队、GC 根、dispatch 在 socket 门外、backend-less 报明、大端 float32、
+  SampleDataEvent+position、活值 activityLevel+释放、GCT_BYTES+写屏障、setLoopBack/setSilenceLevel/setUseEchoSuppression）。
+- 全量 `node test.ts` → **698 tests / 694 pass / 0 fail / 4 skipped**（exit=0）；版本 `v0.4.400 → v0.4.401`。
+
+**记账**：遗留表 85 行不变（`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，按状态列重数核实；Microphone 登记在
+stubs.md §2，采集毕业）；stubs.md §2 Microphone/SampleDataEvent 行改采集真实现、§4 毕业表新增 Microphone(采集) 行（zh/en）；
+README（zh/en）新增 microphone-capture 示例描述；plan 文档 B1b 标落地、B1 全部完成。**经验**：① Windows SDK 头可能
+拉进被 `NOGDI` 隐藏的类型（audioclient→mmreg→BITMAPINFOHEADER），用 `NOBITMAP` 这类局部开关跳过无关结构；② 帧边界
+派发泵必须无条件调用，误置于某个后端门（如 `as_sock_any`）内会让无该后端的程序永远收不到事件；③ shell 类的公开
+**字段**被 AS3 直读（绕过 getter），要发活值须在 dispatch 写字段，加 getter override 无效。
+
+### 阶段四百二十六：B2 `flash.media.Camera` 设备面真枚举 —— DirectShow 视频采集设备（v0.4.401 → v0.4.402）
+
+**一、契约（adl 51.4.1 实测，`temp/camprobe/CameraProbe.as`，本机 2 摄像头）**：`Camera.names` 每次返回**新 Array**
+（friendly name：`Full HD webcam` / `OBS Virtual Camera`）；`Camera.isSupported == (names.length > 0)`；
+`getCamera()`（null）选首设备（name=names[0]、index=0）；`getCamera("0")` 按**索引串**选设备 0；`getCamera("999")`
+（越界）与 `getCamera("no-such-camera-xyz")`（坏名）均返 **null**；只读 `name`/`index` 反映清单。**采集仍走应用 ANE，
+本阶段不做视频流**（计划 B2 口径）。
+
+**二、Windows 可行性**（`temp/camtest/cam3.c`，仅 `-lole32`）：DirectShow `CoCreateInstance(CLSID_SystemDeviceEnum)` →
+`CreateClassEnumerator(CLSID_VideoInputDeviceCategory)` → 逐 `IMoniker` `BindToStorage(IID_IPropertyBag)` 读 `FriendlyName`，
+实测枚举 2 设备与 AIR 逐字一致。**关键：strmif.h 需 RGNDATA/BITMAPINFOHEADER**（被 `NOGDI` 隐藏）⇒ 不包 strmif.h，
+改**手声明 `ICreateDevEnum`**（小接口：QI/AddRef/Release + CreateClassEnumerator），IMoniker/IEnumMoniker/IPropertyBag
+走标准 COM `<ocidl.h>`（无 GDI 依赖）；GUID 手写免 strmiids.lib/initguid.h；`PropVariantInit/Clear`（ole32）免
+oleaut32 的 VariantInit/Clear。MediaFoundation 需 mfplat.lib 且更重，DirectShow 仅 ole32（B1a 已链）故取后者。
+
+**三、实现**：
+- `src/runtime.ts`：顶部 Windows 块加 `<ocidl.h>`（SAL-before-scrub 同序）；新增 `as_cam_row`（inline name[256]，
+  扫描不占 GC）+ 手工 GUID（CLSID_SystemDeviceEnum/IID_ICreateDevEnum/CLSID_VideoInputDeviceCategory/IID_IPropertyBag）+
+  手声明 ICreateDevEnumVtbl + `as_cam_scan(out,cap)`（先 `as_cam_scan(NULL,0)`  sizing，COM MTA 容忍 RPC_E_CHANGED_MODE，
+  CoInitializeEx 配平，malloc-free COM scratch）。非 Windows 臂报明一次（mac AVFoundation 待后续）。
+- `src/symbols.ts`：Camera classMap 加私有 backing 字段 `camName`(string)/`camIdx`(int)（避开 `index` POSIX 保留名
+  消歧成 `__index`）、`index` 只读 getter、`isSupported` 静态 bool getter；`name` getter / `names` 静态 getter / `getCamera` 保留。
+- `src/emit.ts`：Camera 手写段（classMap 生成结构/vtable/getters，方法体手写）——`Camera__from_name`（null→首、
+  strtol 索引串匹配或 strcmp 名匹配、越界/坏名 null、填 camName/camIdx + 写屏障）+ 前置声明；`getCamera` 委托；
+  `name`/`index` getter 读 backing；`names` 每次新 Array（as_str_dup GC 串）；`isSupported == as_cam_scan(NULL,0)>0`。
+
+**四、验收**：
+- A/B：`temp/camprobe/CameraProbeAot.as` 与 adl 参考 **diff IDENTICAL**（isSupported/names.length/names[0..1]/names fresh/
+  getCamera()/default name+index/getCamera('0')/getCamera('999')/getCamera(bad) 逐行一致），stderr 0 字节。
+- `examples/camera-devices.as`：平台感知（无摄像头 CI 也过），harness PASS。
+- `unit: platform/CameraDevices` **16 钉**（DirectShow 枚举/IPropertyBag FriendlyName、手工 GUID 免 strmiids/initguid、
+  ICreateDevEnum 手声明不包 strmif.h、ocidl.h、非 Windows 报明、null→首+越界 null、索引串或名匹配、camName/camIdx+写屏障、
+  names 新 Array、isSupported、name/index getter、getCamera 委托+前置声明、symbols isSupported/index/camName/camIdx）。
+- 全量 `node test.ts` → **700 tests / 696 pass / 0 fail / 4 skipped**（exit=0，`temp/node-test-full.log`）；版本 `v0.4.401 → v0.4.402`。
+
+**记账**：遗留表 85 行不变（`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，按状态列重数核实；Camera 原登记在
+stubs.md §3「报明」清单，设备面毕业）；stubs.md §3 移除 Camera 行、§4 毕业表新增 Camera(设备面) 行（zh/en）；
+README（zh/en）新增 camera-devices 示例描述；plan 文档 B2 标落地、批二全部完成。**经验**：① Windows SDK 头可能拉进
+被 `NOGDI` 隐藏的类型（strmif.h 需 RGNDATA/BITMAPINFOHEADER），小接口可手声明避开整个头；② C 命名消歧会把 `_index`
+变成 `__index`（`index` 是 POSIX 保留名），私有 backing 字段用 camName/camIdx 这类非保留名避开；③ 设备枚举优先选
+仅依赖已链库的后端（DirectShow 仅 ole32，MediaFoundation 需额外 mfplat.lib）。
+
+### 阶段四百二十七：D1 `DisplayObject.mask` Bitmap/TextField 像素遮罩 —— 按像素 alpha 裁剪（v0.4.402 → v0.4.403）
+
+**目标**：真应用 17 处 `.mask=` 里，Bitmap/TextField 当遮罩时现仅按包围盒 stencil 裁剪（圆形/文字遮罩变成方块）。本阶段按 AIR 实测接上**像素 alpha** 裁剪。
+
+**AIR 契约（adl 51.4.1，`temp/maskprobe/`）**：
+- 矢量遮罩 = 二值模板（alpha/visible 忽略）——阶段三百一十八已对齐，本阶段不动。
+- Bitmap/TextField 遮罩只在 **content 设 `cacheAsBitmap`** 时生效：
+  - mask 也 `cacheAsBitmap` ⇒ **软 alpha** 遮罩（半 alpha 遮罩区保留部分透明度：`[both] half=0x7FFF0000`）。
+  - 仅 content `cacheAsBitmap` ⇒ **二值模板**（任何覆盖→不透明：`[content-only] half=0xFFFF0000`）。
+  - content 不缓存 ⇒ `draw()` **不施**像素遮罩（`[neither]` 全不透明）。
+- 圆形 Bitmap 遮罩双缓存：中心/盘内不透明红、盘外透明、边缘二值锐利。
+
+**实现**：
+- `vendor/skia_glue.cc`：`sk_paint_set_blend` 新增 `dstin`→`SkBlendMode::kDstIn`（仅内部遮罩路径用，非 AS3 BlendMode 名）；新增 `sk_surface_threshold_alpha`（raster surface 逐像素 byte 3 阈值化 0/255，RGBA/BGRA 无关；m124 的 SkSurface 无 `notifyPixelsChanged`，raster snapshot 直读修改后缓冲）。
+- `src/runtime.ts`：`extern int sk_surface_threshold_alpha`；`as_skia_surface_threshold_alpha` 包装（Skia 臂调 sk_、纯 C 臂返回 0）。
+- `src/emit.ts`：`as_mask_has_pixels`（递归识别 Bitmap/TextField，容器递归子件）；`as_mask_pixel_composite`（mask-to-parent 矩阵 = 父链逆×遮罩链，同 `as_mask_path`；遮罩局部 bounds × 设备缩放建离屏 surface，`as_render_object_content` 光栅化遮罩子树，二值时阈值化，snapshot 后 `kDstIn` saveLayer + concat + drawImageRect + restore）；paint 循环：`pixel_mask_on = o->_cache_flag && as_mask_has_pixels(mask)`，`pixel_mask_binary = mask->_cache_flag ? 0 : 1`，content 隔离 `saveLayerAlpha(1.0)`，对象变换仅在像素遮罩时包 save/restore（其余对象零改动），内层 restore 后在父空间合成遮罩再 restore content 层。矢量遮罩 else 分支仍走 `as_mask_path` clipPath。
+
+**验收**：
+- A/B（`temp/maskprobe/MaskProbeAot.as` vs adl）：二值模板**逐像素精确**（center/inside/outside/edge 全中）；软 alpha 边缘差 1–7（`near-edge` 248 vs 255、`half` 128 vs 127，舍入/AA，容差内）；TextField 遮罩字形裁剪正确（y=60 差属字体度量，非遮罩 bug）。
+- `examples/pixel-mask.as`（链 Skia 清单）：二值模板精确 + 软 alpha「明显部分」+ 无缓存不施遮罩，harness PASS。
+- `unit: render/PixelMask` **14 钉**全绿（helper/合成/门控/二值判定/saveLayer/变换包裹/矢量路径保留/glue dstin+threshold/preamble 双臂）。
+- `examples/display-mask.as`（矢量遮罩）PASS ⇒ 无回归；纯 C 构建（无 Skia）编译通过。
+
+**记账**：遗留表 85 行不变（`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，按状态列重数核实；DisplayObject.mask 原登记在 stubs.md §3，矢量遮罩早已落地，本轮像素遮罩毕业）；stubs.md §3 移除 DisplayObject.mask 行、§4 毕业表新增像素遮罩行（zh/en）；README（zh/en）新增 pixel-mask 示例描述；plan 文档 D1 标落地。**经验**：① AIR 像素遮罩的软/硬两档由「mask 是否也 cacheAsBitmap」决定，content 不缓存则 draw() 根本不施像素遮罩——门控三者缺一不可；② 遮罩合成须在**父空间**（content 层所在空间），对象自身变换要包 save/restore 退回父空间再 concat mask-to-parent，且只对像素遮罩对象加这对 save/restore 以免波及其余渲染；③ SkSurface m124 无 notifyPixelsChanged，raster 表面改像素后 makeImageSnapshot 直读修改缓冲。
+
+### 阶段四百二十八：D2 `DisplayObject.cacheAsBitmapMatrix` 按矩阵缓存 + 逆变换 blit（v0.4.403 → v0.4.404）
+
+**目标**：真应用 7 处 `cacheAsBitmapMatrix` 原仅存储未应用（setter 报 unsupported）。本阶段按 AIR 实测接上「按矩阵缓存 + 逆变换 blit」。
+
+**AIR 契约（adl 51.4.1 `temp/cabmprobe` + 官方文档）**：
+- 把对象按所设矩阵 M 缓存、再以 M⁻¹ blit ⇒ **最终画面不变**（实测 [A] 无矩阵 = [B] scale2、[C] = [D] 缩放态、[E] 平移都逐像素一致）。
+- 仅**缓存分辨率**随矩阵缩放（2x 矩阵烘 2x 位图，供缩放时保质量）。
+- 移动/GPU 时代特性；adl 桌面 CPU 模式 **no-op**（getter 恒回 null，即使刚 set）。
+
+**实现（`src/emit.ts`）**：
+- `as_render_cached` 顶部：门控 `o->_cache_flag && o->_cache_matrix != NULL` 且非单位矩阵且可逆 ⇒ `cm_on`；bounds 取 M 变换后四角 AABB（替换 bl/bt/br/bb 供后续 snapping/尺寸）。
+- 三条构建路径中的 rebuild/full-repaint：surface canvas `translate(-bxo,-byo)` 后 `if (cm_on) concat(M)`；增量 patch 路径加 `!cm_on` 门控（矩阵态走全量重绘，避开 dirty-rect 局部坐标问题）；bake-verify oracle 加 `!cm_on`（oracle 不知 M）。
+- blit：`if (cm_on) { save; concat(M⁻¹); }` drawImageRect `if (cm_on) restore;` ⇒ M⁻¹ 抵消 M，画面恒等。
+- setter 移除 `as_shell_unsupported` 报明（属性被接受）；getter 保留回读（计划「getter 回读不变」）。
+- 常见（无矩阵/单位矩阵）路径 `cm_on=0`，调优过的 device-grid snapping/分辨率匹配/增量重绘**零改动**。
+
+**验收**：
+- A/B（`temp/cabmprobe/CabmProbeAot.as` vs adl）：[A]–[E] 像素**逐字匹配**（矩阵抵消如 AIR 文档）。
+- `examples/cache-matrix.as`（链 Skia）：画面恒等（scale/translate/identity）+ getter 回读，harness PASS。
+- `unit: render/CacheMatrix` **8 钉**全绿（门控/AABB/surface concat M/blit M⁻¹/禁 patch/跳 verify/setter 不报明/getter 回读）。
+- 8 个 bake/cache 示例（autobake/autobake-move/autobake-origin/autobake-patch/autobake-scrollrect/bake-bitmap-swap/cacheasbitmap/draw-over）全绿 ⇒ 无回归；纯 C 构建编译通过。
+
+**记账**：遗留表 85 行不变（`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1；cacheAsBitmapMatrix 原登记在 stubs.md §3，本轮毕业）；stubs.md §3 移除 cacheAsBitmapMatrix 行、§4 毕业表新增行（zh/en）；README（zh/en）新增 cache-matrix 示例描述；plan 文档 D2 标落地、批四全部完成。**经验**：① cacheAsBitmapMatrix 的 observable 契约是「画面恒等」（逆变换抵消），不是「画面变化」——AIR 桌面 CPU 模式甚至 getter 回 null；② 把矩阵接进重度调优的缓存机制时，门控非单位矩阵可保常见路径零改动，矩阵态禁增量 patch/跳 verify 避开局部坐标与 oracle 不一致；③ 缓存分辨率是内部量，验收只能钉「画面恒等 + getter」这类可观测契约。
+
+### 阶段四百二十九：A3 `BitmapData.applyFilter` 的 DropShadow/Glow 光栅化（v0.4.404 → v0.4.405）
+
+**目标**：真应用 1 处 `BitmapData.applyFilter` 用 DropShadow/Glow 原抛「rasterization not implemented」。本阶段复用 `DisplayObject.filters` 路径同一套 Skia image-filter seam 实装。
+
+**AIR 契约（adl 51.4.1 `temp/filterprobe`）**：
+- 源区域按 `destPoint` 锚定：源 rect 左上 → destPoint（源内 (30,30) 的红方 → dst (80,80)）；滤镜外扩进 padding（模糊/阴影超出源 rect，AIR 亦然）。
+- DropShadow：按 `distance·cos/sin(angle)` 偏移 + 模糊；`hideObject=true` 仅画阴影（源体不画）。
+- Glow：环绕源体的彩色光晕（recolored silhouette blurred）+ 源体本身。
+
+**实现（`src/emit.ts` `BitmapData_applyFilter`）**：
+- 去抛错；dispatch 分 `is_blur`/`is_glow`/`is_shadow`，未知滤镜仍 no-op。源 rect 裁剪 + region 拷贝为两路共用。
+- BlurFilter 保留原 CPU 盒模糊（`as_blur_apply`）路径不动。
+- DropShadow/Glow（`#ifdef ASC_USE_SKIA`）：取滤镜参数（glow 无 distance；shadow 算 ddx/ddy）；`margin = ceil(max(blurX,blurY)) + ceil(|offset|) + 2`，表面 `fw=sw+2·margin`；`as_skia_image_from_argb(region)` → 表面 `clear_transparent` → paint `as_skia_paint_set_drop_shadow`/`as_skia_paint_set_glow` → `save_layer_paint` + `draw_image_rect(margin,margin)` + restore；按 `as_render_filtered` 同 regimes 补画源体（glow 非 shadowOnly、shadow drawSource 且 alpha·strength>1）；`as_skia_surface_read_argb` 读回按 `destPoint-margin` blit 进 dst（裁剪）。
+- `#else` 报明「needs the Skia image backend」（不静默 no-op）。`as_filter_sigma` 加前向声明（定义在渲染段、调用在 BitmapData 段）。
+
+**验收**：
+- A/B（`temp/filterprobe/FilterProbeAot.as` vs adl）：DS/GL/DS-hide 网格**逐字一致**；仅 GL fringe 单点 alpha 16 vs 24（差 8，模糊核容差内）。
+- `examples/filter-shadow-glow.as`（链 Skia）：DS 源体/锚定/阴影外扩/远场透明、GL 光晕彩色/远场透明/fringe 容差、hideObject 仅阴影、BlurFilter 仍有效、未知滤镜 no-op，harness PASS。
+- `unit: render/FilterShadowGlow` **12 钉**全绿（去抛错/两 seam/image lift/padding/destPoint 锚定/hideObject/#ifdef 双臂/降级报明/CPU blur 保留/未知 no-op）。
+- 滤镜示例（stage61/swc-shape/overflow-clip）全绿 ⇒ 无回归；纯 C 构建（无 Skia）编译通过。
+
+**记账**：遗留表 85 行不变（`未开始` 64 / `部分完成` 20 / `调研完成·实现暂缓` 1，按状态列重数核实；applyFilter 原是 inline 抛错、不在本表，由 plan 批一 A3 跟踪）；README（zh/en）新增 filter-shadow-glow 示例描述；plan 文档 A3 标落地、**批一（A1/A2/A3）全部完成**。**经验**：① applyFilter 与 DisplayObject.filters 共享同一套 Skia image-filter seam，几何关键是「源 rect 左上锚定 destPoint + padding 容滤镜外扩」，读回按 destPoint-margin blit；② glow/shadow 的源体补画 regimes 必须与 as_render_filtered 一致（glow halo 只含 silhouette、shadow 的 drawSource 由 hideObject 与 alpha·strength 决定）；③ 跨段调用 static helper（as_filter_sigma）须前向声明，否则 implicit-declaration 编译错。
+
+### 阶段四百三十：E3 `NativeDragManager` Windows OLE 拖放契约对齐（v0.4.405 → v0.4.406）
+
+**目标**：真应用用 `NativeDragManager.doDrag`/`acceptDragDrop`。Windows OLE 后端（`vendor/native_drag_win.cc` 的 `IDropTarget`/`IDataObject`/`IDropSource` + `src/native-drag.ts` 共享状态机）早已接入、drag-IN 实测可用。本阶段按 adl 实测对齐错误/no-op 契约、验证会话状态机。
+
+**AIR 契约（adl 51.4.1 `temp/dragprobe`）与原实现偏差**：
+- `dropAction`：会话外 setter 是**静默 no-op**（set copy/move 后 getter 仍 `none`），非法值也**不抛**。原实现总是写 `as_nd_action` 且非法抛 #2004 ⇒ 偏严。
+- `acceptDragDrop(target)`：仅 null target 抛 `#2007`；会话外合法 target 是 **no-op**（AIR 回 OK）。原实现会话外抛「requires nativeDragEnter/Over」⇒ 偏严。
+- `doDrag`：仅 **null clipboard** 抛 `#2007`「Parameter clipboard must be non-null.」（先查 clipboard）；null initiator（clipboard 合法）或无 mouseDown/mouseMove 手势都是 **no-op**。原实现 null initiator 抛 #2007、无手势抛错 ⇒ 偏严。
+
+**实现（`src/native-drag.ts`，mac/Win 共享）**：
+- `set_dropAction_static`：`if (!as_nd_clip) return;`（会话外 no-op），会话内保留校验 + 设置。
+- `acceptDragDrop_static`：null → #2007；非 enter/over 相位 `return`（去抛错）。
+- `doDrag_static`：先查 `!clipboard` → #2007（clipboard 文案）；`!initiator` → return；`!as_nd_mouse_depth || as_nd_source || as_nd_clip` → return。
+- 会话状态机（enter/over/drop/exit 协商、accept 子树校验、源端 start/update/complete、clipboard 生命周期/安全域）不变。
+
+**验收**：
+- `test/unit/native-drag.ts` 两用例全绿：① 既有「acceptance/coordinates/clipboard/lifetime/source」注入式状态机测试（dropAction 在 over 内设、doDrag 有手势，不受 no-op 改动影响）；② 新增「AIR error and no-op contract」（会话外 dropAction/acceptDragDrop no-op、doDrag null clipboard #2007/null initiator/无手势 no-op、有手势正常 start/complete）。
+- 纯 C 注入后端（`sk_drag_supported=1`）编译无警告。
+
+**记账**：遗留表 **85 → 86 行**（`未开始` 64 → 65；新登记 Windows `dragImage` 不渲染——OLE 拖动图像走 shell 私有协议 `DragImageBits`/`IDropSourceHelper`，不在公开 SDK 头，需 Wine/ReactOS 核实 + 真机目视，协议核实前不盲改以免崩掉已可用 drag-OUT，当前按 §1.5 报明系统光标）；本阶段修净的三处契约偏差不占表；`desktop-file-interaction.md` 增契约对齐注记；plan 文档 E3 标落地、批五全部完成。**经验**：① AIR 拖放 API 在会话外普遍**宽容 no-op**（仅 null 参数抛 #2007），比「严格守卫」更贴近真实——对齐时先实测会话外行为再改；② OLE 拖动图像是 reverse-engineered 私有协议（公开 SDK 无 `DRAGIMAGEBITS`/`IDropSourceHelper`），无法程序化目视验收时按 §1.5 报明 + 登记残留，不盲改崩掉已可用路径；③ 共享状态机（native-drag.ts）一处对齐 mac/Win 双端。
+
+### 阶段四百三十一：F1 `Error.getStackTrace` 的 AS3 栈帧模型（v0.4.406 → v0.4.407）
+
+**目标**：真应用 2 处 `Error.getStackTrace` 原报 unsupported 返回空串。本阶段引入运行时 AS3 栈帧表示，按 AIR 文本格式返回栈。这是计划唯一需要新运行时表示的项。
+
+**AIR 契约（adl 51.4.1 `temp/stackprobe`）**：
+- Error **构造时**捕获调用栈（构造未 throw 也有栈）；rethrow 保留原栈。
+- 文本：第一行 `name: message`（name 默认 Error，子类用各自 name）；每帧 `\tat Class/method()`，**内层在前**；构造器帧 `Class()`（无 /method）；自由函数 `global/fn()`；无文件路径/行号。
+- 无栈帧时返回 **null**（release/无调试信息口径）。ADL 加载器帧（runtime::ContentPlayer/AppRunner/ADLEntry）来自另一运行时，不复现。
+
+**实现**：
+- `src/runtime.ts`：TLS 影子栈 `as_aframe{cls,meth} as_astack[512]` + `as_astack_depth`（ASC_TLS，与 as_frame_jmp 同口径）；`as_astack_enter/leave`（越界只计数、leave 防下溢）；`as_astack_format`（depth=0→NULL，栈顶→栈底拼 `\tat Cls/meth()\n`，GC 字符串）。
+- `src/symbols.ts`：Error classMap 在 name **之后**加私有 `_stacktrace`（string，进 props 表供 GC 精确标记、不进反射；as_error_view 的 message 偏移不动）。
+- `src/emit.ts`：Error_ctor + 15 个手写子类 ctor 末尾 `o->_stacktrace = as_astack_format()` + 写屏障；Error_getStackTrace 重写（NULL→null，header + 帧文本，去 unsupported）。新 helper frameClassName（用 fqn/reflectFqn，不泄漏 sanitize 名）+ emitFrameEnter。push 覆盖 6 方法分支/自由函数/anonFuncs/用户 ctor（meth=NULL）/_cinit/main 顶层（global()）；leave 覆盖 Return 四分支（调用形返回值先 hoist 进 temp 再 leave，保 return new Error() 仍见本帧）/emitFunctionBodyEnd（先验 stmtCompletesNormally 不双 pop）/ctor/cinit 落尾；emitTry setjmp 前存深度、else 恢复；7 处帧边界守卫 as_disp_depth=0 后追加 as_astack_depth=0。
+- `src/fre.ts`：5 个 FRE setjmp 边界同样存/恢复深度（ANE worker 线程经 FRE 进 AS3）。
+
+**验收**：
+- A/B（`temp/stackprobe/ab.as` vs adl）：constructed/method-throw/top-throw/rethrow 四场景 AS3 authored 帧**逐帧一致**（StackProbe/level3→level2→level1→StackProbe()）；ADL 加载器帧以单一 global() 脚本帧替代。
+- `examples/error-stacktrace.as`：10 组断言（header/内层在前/ctor 帧/自由函数帧/静态帧/子类 name/构造点 vs throw 点/rethrow/return-new 帧/catch 后深度恢复），harness PASS。
+- `unit: runtime/StackTrace` **33 钉**全绿（TLS/NULL 口径/内层在前/GC 字符串/ctor 与子类捕获/字段顺序与各 push 点/四路 leave/不双 pop/setjmp 存恢复/7 守卫重置/void 返回不 hoist 成 void temp）。
+- 全量回归 **709/705/0/4** exit=0；纯 C 构建编译通过（影子栈纯 C 无平台依赖）。8 个既有结构钉因发射结构合法变化更新（保留意图）；顺带修复 test/unit/emit.ts 既有 MIXED 行尾。
+
+**记账**：遗留表 86 行不变（`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1；getStackTrace 原登记在 stubs.md §3，本轮毕业）；stubs.md §3 移除 getStackTrace 行、§4 毕业表新增行（zh/en）；README（zh/en）新增 error-stacktrace 示例描述；plan 文档 F1 标落地、批六完成、**全部 12 个里程碑落地**。**经验**：① AS3 栈帧须用运行时影子栈（C backtrace 给的是 mangled C 名、无法映射回 AS3 类/方法），入口 push/返回 leave/catch 与帧边界恢复深度三者缺一不可；② `return new Error()` 必须先把返回值 hoist 进 temp 再 leave，否则 Error 构造时本帧已弹、栈少一层；③ 帧深度恢复要覆盖 emitTry 与 FRE 的所有 setjmp 边界 + 帧边界守卫，漏一处会在异常后栈漂移；④ 私有字段加在 Error.name 之后保 as_error_view 偏移；⑤ 帧名用 fqn/reflectFqn 绝不泄漏 sanitize 名；⑥ **void 函数 `return voidCall();` 不得 hoist 成 `void _ret = ...`**（非法 C，incomplete type 'void'）——真应用 `RWebSocket.sendMessage`/`TextField.appendText` 首编即暴露（示例套件原未覆盖），void 路径直接「执行调用→leave→return;」（bare 与 try/finally 两路），已补示例第 11 例 + 3 结构钉，真应用 x86 重编通过。

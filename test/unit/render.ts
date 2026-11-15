@@ -1642,6 +1642,212 @@ function checkAlphaLayerBalance(): string[] {
   console.log(`[alphalayer] ${ok} alpha-layer balance checks passed`);
   return bad;
 }
+// ---- 阶段四百二十一 (plan A1): BitmapData.encode PNG 的真实编码与 AIR 契约 ----
+function checkPngEncode(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [pngenc] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [pngenc] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.BitmapData;\n' +
+    'import flash.display.PNGEncoderOptions;\n' +
+    'import flash.display.JPEGEncoderOptions;\n' +
+    'import flash.geom.Rectangle;\n' +
+    'import flash.utils.ByteArray;\n' +
+    'var b:BitmapData = new BitmapData(2, 2, true, 0xFFFFFFFF);\n' +
+    'var ba:ByteArray = new ByteArray();\n' +
+    'b.encode(new Rectangle(0, 0, 2, 2), new PNGEncoderOptions(), ba);\n' +
+    'b.encode(new Rectangle(0, 0, 2, 2), new JPEGEncoderOptions(), ba);\n')).c.replace(/\r\n/g, '\n');
+  // adl 51.4.1 describeType: exactly 3 params, NO byteArrayOffset.
+  check('encode has the 3-parameter AIR signature',
+    c.includes('void BitmapData_encode(void* _this, Rectangle* rect, Object* compressor, ByteArray* out)'));
+  const encStart = c.indexOf('void BitmapData_encode(void* _this, Rectangle* rect, Object* compressor, ByteArray* out) {');
+  const encBody = c.slice(encStart, c.indexOf('\n}', encStart));
+  check('encode body carries no byteArrayOffset', !encBody.includes('byteArrayOffset'));
+  // PNG path: straight-ARGB image -> memory PNG encoder.
+  check('PNG path encodes via sk_image_encode_png_mem', encBody.includes('sk_image_encode_png_mem(img, &enc, &encLen)'));
+  check('PNG path builds the image from straight ARGB', encBody.includes('sk_image_from_argb(region, sw, sh)'));
+  // writeBytes semantics: write at the current position, advance it, extend length.
+  check('encode writes at the current position and advances it',
+    encBody.includes('as_ba_grow_pos(out, (int)encLen)') && encBody.includes('out->position += (int)encLen'));
+  // null checks per adl.
+  check('null rect raises #2007 rectangle', encBody.includes('Error #2007: Parameter rectangle must be non-null.'));
+  check('null compressor raises #2007 compressor', encBody.includes('Error #2007: Parameter compressor must be non-null.'));
+  check('null byteArray is a silent no-op', encBody.includes('if (out == NULL || bd == NULL || bd->pixels == NULL) return;'));
+  // JPEG is real now (stage 422 A2): the same body dispatches to the libjpeg seam.
+  check('JPEG path encodes via sk_image_encode_jpeg_mem', encBody.includes('sk_image_encode_jpeg_mem(img, (int)jpegQuality, &enc, &encLen)'));
+  // pure-C builds (no ASC_USE_SKIA) must not call the undeclared Skia seam.
+  check('the Skia encode block is guarded by ASC_USE_SKIA with a loud pure-C fallback',
+    encBody.includes('#ifdef ASC_USE_SKIA') && encBody.includes('#else') &&
+    encBody.includes('BitmapData.encode (this build has no Skia image backend)'));
+  // the glue + preamble carry the memory encoder seam.
+  const glue = readGlue();
+  check('glue defines sk_image_encode_png_mem',
+    glue.includes('int sk_image_encode_png_mem(void* image, unsigned char** out, size_t* outLen)'));
+  check('glue PNG memory encoder uses SkPngEncoder', /sk_image_encode_png_mem[\s\S]*?SkPngEncoder::Encode/.test(glue));
+  check('preamble declares the memory encoder extern',
+    RUNTIME_PREAMBLE.includes('extern int sk_image_encode_png_mem(void* image, unsigned char** out, size_t* outLen);'));
+  // symbols.ts models 3 params (isolate the encode block; Texture has its own byteArrayOffset).
+  const sym = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const symEncode = sym.slice(sym.indexOf("['encode', bdm("), sym.indexOf("['setPixels', bdm("));
+  check('symbols.ts encode models 3 params (no byteArrayOffset)',
+    symEncode.includes("name: 'byteArray'") && !symEncode.includes('byteArrayOffset'));
+  console.log(`[pngenc] ${ok} PNG-encode checks passed`);
+  return bad;
+}
+registerGroup('unit: render/PngEncode', checkPngEncode);
+
+function checkJpegEncode(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [jpegenc] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [jpegenc] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.BitmapData;\n' +
+    'import flash.display.JPEGEncoderOptions;\n' +
+    'import flash.geom.Rectangle;\n' +
+    'import flash.utils.ByteArray;\n' +
+    'var b:BitmapData = new BitmapData(2, 2, true, 0xFFFFFFFF);\n' +
+    'var ba:ByteArray = new ByteArray();\n' +
+    'b.encode(new Rectangle(0, 0, 2, 2), new JPEGEncoderOptions(90), ba);\n')).c.replace(/\r\n/g, '\n');
+  const encStart = c.indexOf('void BitmapData_encode(void* _this, Rectangle* rect, Object* compressor, ByteArray* out) {');
+  const encBody = c.slice(encStart, c.indexOf('\n}', encStart));
+  // adl 51.4.1: quality is a uint defaulting to 80; encode raises #2006 above 100.
+  check('encode reads the JPEG quality field', encBody.includes('jpegQuality = ((JPEGEncoderOptions*)compressor)->quality;'));
+  check('encode validates quality > 100 as unsigned (uint wrap caught)', encBody.includes('if (jpegQuality > 100)'));
+  check('quality > 100 raises RangeError #2006', encBody.includes('Error #2006: The supplied index is out of bounds.') && encBody.includes('RangeError_new'));
+  check('JPEG dispatches to the libjpeg memory seam', encBody.includes('sk_image_encode_jpeg_mem(img, (int)jpegQuality, &enc, &encLen)'));
+  check('an unknown compressor still reports the gap', encBody.includes('only PNG and JPEG are supported'));
+  check('the JPEG seam is inside the ASC_USE_SKIA guard', encBody.includes('#ifdef ASC_USE_SKIA') && encBody.includes('#else'));
+  // symbols.ts: JPEGEncoderOptions.quality is uint default 80 (not Number/50).
+  const sym = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const symJpeg = sym.slice(sym.indexOf("shell('JPEGEncoderOptions'"), sym.indexOf("shell('PNGEncoderOptions'"));
+  check('JPEGEncoderOptions.quality is a uint field', symJpeg.includes("['quality', { kind: 'uint' }]"));
+  check('JPEGEncoderOptions.quality defaults to 80', symJpeg.includes("shUintP('quality', 80)"));
+  // glue: drives the libjpeg-turbo C API directly (no Skia rebuild), premul-over-black.
+  const glue = readGlue();
+  check('glue defines sk_image_encode_jpeg_mem', glue.includes('int sk_image_encode_jpeg_mem(void* image, int quality, unsigned char** out, size_t* outLen)'));
+  check('glue JPEG encoder uses the libjpeg compress API', /sk_image_encode_jpeg_mem[\s\S]*?jpeg_start_compress[\s\S]*?jpeg_write_scanlines/.test(glue));
+  check('glue reads premultiplied pixels (AIR drops alpha over black)', /sk_image_encode_jpeg_mem[\s\S]*?kPremul_SkAlphaType/.test(glue));
+  check('glue supplies its own memory destination (jpeg_mem_dest is not vendored)', glue.includes('asc_jpeg_init_dest') && !/sk_image_encode_jpeg_mem[\s\S]*?jpeg_mem_dest/.test(glue));
+  check('glue includes jpeglib.h without defining mangling/internal macros', glue.includes('third_party/externals/libjpeg-turbo/jpeglib.h') && !glue.includes('#define MANGLE_JPEG_NAMES') && !glue.includes('#define JPEG_INTERNALS'));
+  check('preamble declares the JPEG memory encoder extern', RUNTIME_PREAMBLE.includes('extern int sk_image_encode_jpeg_mem(void* image, int quality, unsigned char** out, size_t* outLen);'));
+  console.log(`[jpegenc] ${ok} JPEG-encode checks passed`);
+  return bad;
+}
+registerGroup('unit: render/JpegEncode', checkJpegEncode);
+
+// D1 (stage 427): Bitmap/TextField pixel masking. A vector mask is a clipPath; a
+// Bitmap/TextField has no outline so its PIXELS are the stencil, applied only when
+// the content sets cacheAsBitmap (both cached -> soft alpha, content-only -> binary).
+function checkPixelMask(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [pixelmask] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [pixelmask] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Sprite;\n' +
+    'import flash.display.Bitmap;\n' +
+    'import flash.display.BitmapData;\n' +
+    'var s:Sprite = new Sprite();\n' +
+    'var bd:BitmapData = new BitmapData(8, 8, true, 0xFFFFFFFF);\n' +
+    'var m:Bitmap = new Bitmap(bd);\n' +
+    's.cacheAsBitmap = true;\n' +
+    's.mask = m;\n')).c.replace(/\r\n/g, '\n');
+  // The pixel-mask detector recognizes Bitmap/TextField (and recurses containers).
+  check('as_mask_has_pixels detects Bitmap/TextField',
+    c.includes('static int as_mask_has_pixels(DisplayObject* m)') &&
+    c.includes('as_is((void*)m, &Bitmap_vt) || as_is((void*)m, &TextField_vt)'));
+  // The compositor rasterizes the mask and blends it with kDstIn.
+  check('as_mask_pixel_composite composites with a dstin paint',
+    c.includes('static void as_mask_pixel_composite(void* canvas, DisplayObject* o, DisplayObject* m, int binary)') &&
+    c.includes('as_skia_paint_set_blend(paint, "dstin")') &&
+    c.includes('as_skia_canvas_save_layer_paint(canvas, paint)'));
+  check('compositor thresholds the mask alpha for the binary case',
+    c.includes('if (binary) as_skia_surface_threshold_alpha(surf);'));
+  check('compositor draws the mask snapshot in parent space',
+    c.includes('as_skia_canvas_draw_image_rect(canvas, img, 0.0, 0.0, br - bl, bb - bt, 1)'));
+  // The paint loop gates pixel masking on content cacheAsBitmap + a pixel mask.
+  check('paint loop gates pixel masking on content cacheAsBitmap',
+    c.includes('if (o->_cache_flag && as_mask_has_pixels(o->_mask_ref))'));
+  check('both cached -> soft alpha, content-only -> binary stencil',
+    c.includes('pixel_mask_binary = o->_mask_ref->_cache_flag ? 0 : 1;'));
+  check('pixel-masked content is isolated in a saveLayer',
+    c.includes('pixel_mask_on = 1;') && c.includes('as_skia_canvas_save_layer_alpha(canvas, 1.0);'));
+  check('the mask is composited then the content layer restored',
+    c.includes('if (pixel_mask_on) { as_mask_pixel_composite(canvas, o, o->_mask_ref, pixel_mask_binary); as_skia_canvas_restore(canvas); }'));
+  check('the object transform is wrapped only when pixel-masked',
+    c.includes('if (pixel_mask_on) as_skia_canvas_save(canvas);') &&
+    c.includes('if (pixel_mask_on) as_skia_canvas_restore(canvas);'));
+  // The vector clipPath path is preserved for non-pixel masks.
+  check('vector masks still use the clipPath path',
+    c.includes('void* mp = as_mask_path(o, o->_mask_ref);') &&
+    c.includes('as_skia_canvas_clip_path(canvas, mp, 1)'));
+  // The glue carries the dstin blend + the binary alpha threshold.
+  const glue = readGlue();
+  check('glue maps dstin to SkBlendMode::kDstIn',
+    glue.includes('strcmp(name, "dstin") == 0) m = SkBlendMode::kDstIn;'));
+  check('glue thresholds alpha at byte 3 (RGBA/BGRA independent)',
+    glue.includes('int sk_surface_threshold_alpha(void* surface)') &&
+    glue.includes('uint8_t* a = row + (size_t)x * 4 + 3;') &&
+    glue.includes('*a = (*a != 0) ? 255 : 0;'));
+  check('preamble declares the threshold extern',
+    RUNTIME_PREAMBLE.includes('extern int sk_surface_threshold_alpha(void* surface);'));
+  check('preamble wraps threshold for Skia and pure-C builds',
+    RUNTIME_PREAMBLE.includes('static inline int as_skia_surface_threshold_alpha(void* s) { return sk_surface_threshold_alpha(s); }') &&
+    RUNTIME_PREAMBLE.includes('static inline int as_skia_surface_threshold_alpha(void* s) { (void)s; return 0; }'));
+  console.log(`[pixelmask] ${ok} pixel-mask checks passed`);
+  return bad;
+}
+registerGroup('unit: render/PixelMask', checkPixelMask);
+
+// D2 (stage 428): cacheAsBitmapMatrix. AIR caches under the matrix and blits under its
+// inverse, so the picture is unchanged but the cache resolution scales with the matrix.
+function checkCacheMatrix(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [cachematrix] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [cachematrix] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.Sprite;\n' +
+    'import flash.geom.Matrix;\n' +
+    'var s:Sprite = new Sprite();\n' +
+    's.cacheAsBitmap = true;\n' +
+    's.cacheAsBitmapMatrix = new Matrix(2, 0, 0, 2, 0, 0);\n')).c.replace(/\r\n/g, '\n');
+  const rcStart = c.indexOf('static void as_render_cached(void* canvas, DisplayObject* o) {');
+  const rc = c.slice(rcStart, c.indexOf('\nstatic ', rcStart + 10));
+  // Gated on an explicit cacheAsBitmap + a NON-identity matrix (common path untouched).
+  check('matrix path gated on cacheAsBitmap + non-identity matrix',
+    rc.includes('if (o->_cache_flag && o->_cache_matrix != NULL)') &&
+    rc.includes('cma != 1.0 || cmb != 0.0 || cmc != 0.0 || cmd != 1.0 || cmtx != 0.0 || cmty != 0.0'));
+  check('the bake span becomes the AABB of the transformed corners',
+    rc.includes('xs[0] = cma * bl + cmc * bt + cmtx;') && rc.includes('bl = mbl; bt = mbt; br = mbr; bb = mbb;'));
+  check('the cache is baked under the matrix',
+    rc.includes('if (cm_on) as_skia_canvas_concat(c2, cma, cmb, cmc, cmd, cmtx, cmty);'));
+  check('the blit applies the inverse matrix (picture identity)',
+    rc.includes('if (cm_on) { as_skia_canvas_save(canvas); as_skia_canvas_concat(canvas, cia, cib, cic, cid, citx, city); }') &&
+    rc.includes('if (cm_on) as_skia_canvas_restore(canvas);'));
+  check('incremental patch is disabled for the matrix case',
+    rc.includes('!o->_dirty_full && !cm_on &&'));
+  check('the bake-verify oracle is skipped for the matrix case',
+    rc.includes('if (ASC_bake_verify > 0 && !cm_on) as_bake_verify'));
+  // The setter accepts the property (no unsupported report) and the getter round-trips.
+  check('setter no longer reports cacheAsBitmapMatrix unsupported',
+    !c.includes('as_shell_unsupported("DisplayObject.cacheAsBitmapMatrix'));
+  check('getter round-trips the stored matrix',
+    c.includes('Matrix* DisplayObject_get_cacheAsBitmapMatrix(void* _this) { DisplayObject* o = (DisplayObject*)_this; if (o == NULL) return NULL; return o->_cache_matrix; }'));
+  console.log(`[cachematrix] ${ok} cache-matrix checks passed`);
+  return bad;
+}
+registerGroup('unit: render/CacheMatrix', checkCacheMatrix);
 registerGroup('unit: render/DrawComposite', checkDrawComposite);
 registerGroup('unit: render/ScrollRectWindow', checkScrollRectWindow);
 registerGroup('unit: render/ScrollRectBake', checkScrollRectBakeInvalidation);
@@ -2631,7 +2837,7 @@ function checkRepaintBoundary(): string[] {
     emitted.includes('if (o->_cache_flag) { use_cache = 1; }')
     && emitted.includes('else { o->_render_dirty = 0; o->_auto_baked = 0; o->_cache_valid = 0; }'));
   check('a finite dirty rect repaints in place (bake_patch) instead of rebuilding',
-    emitted.includes('else if (o->_render_dirty && !o->_dirty_full && (o->filters == NULL || o->filters->length == 0) && o->_cache_surface != NULL) {')
+    emitted.includes('else if (o->_render_dirty && !o->_dirty_full && !cm_on && (o->filters == NULL || o->filters->length == 0) && o->_cache_surface != NULL) {')
     && emitted.includes('as_skia_canvas_clip_rect(c2, dl, dt, dr - dl, db - dt);')
     && emitted.includes('as_skia_canvas_clear_rect(c2, dl, dt, dr - dl, db - dt);')
     && emitted.includes('o->_cache_image = as_skia_surface_make_snapshot(o->_cache_surface);'));
@@ -2922,7 +3128,7 @@ function checkAutoBakePatch(): string[] {
     && emitted.includes('bake_verify_bad o=%p kind=%s npix=%d of=%d'));
   check('both in-place repairs verify, the from-scratch rebuild does not',
     (emitted.match(/if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "patch"\);/g) ?? []).length === 1
-    && (emitted.match(/if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint"\);/g) ?? []).length === 1
+    && (emitted.match(/if \(ASC_bake_verify > 0 && !cm_on\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint"\);/g) ?? []).length === 1
     && emitted.split('as_bake_verify(o, canvas').length - 1 === 2);
 
   // Source shape inside the generated C itself (not just the emitter's text).
@@ -2934,9 +3140,9 @@ function checkAutoBakePatch(): string[] {
   check('the generated patch branch verifies its own repair',
     /o->_cache_image = as_skia_surface_make_snapshot\(o->_cache_surface\);\n\s*if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "patch"\);/.test(c));
   check('the whole-surface repaint verifies too',
-    /o->_cache_image = as_skia_surface_make_snapshot\(o->_cache_surface\);\n\s*if \(ASC_bake_verify > 0\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint"\);/.test(c));
+    /o->_cache_image = as_skia_surface_make_snapshot\(o->_cache_surface\);\n\s*if \(ASC_bake_verify > 0 && !cm_on\) as_bake_verify\(o, canvas, pw, ph, sx, sy, bxo, byo, "repaint"\);/.test(c));
   check('every oracle call site is guarded by the environment switch',
-    c.split('\n').filter((l) => l.includes('as_bake_verify(o, canvas')).every((l) => l.trimStart().startsWith('if (ASC_bake_verify > 0)')));
+    c.split('\n').filter((l) => l.includes('as_bake_verify(o, canvas')).every((l) => l.trimStart().startsWith('if (ASC_bake_verify > 0')));
 
   console.log(`[autopatch] ${ok} auto-bake repair checks passed`);
   return bad;
@@ -3062,3 +3268,54 @@ function checkTextFieldBoundsAutosize(): string[] {
   return bad;
 }
 registerGroup('unit: render/TextFieldBoundsAutosize', checkTextFieldBoundsAutosize);
+
+// ---- 阶段四百二十九（A3）：BitmapData.applyFilter 的 DropShadow/Glow 光栅化 ----
+// 从「招错」改为复用 DisplayObject.filters 路径同一套 Skia image-filter seam：源区
+// 域画进带 padding 的表面、saveLayer paint 施加滤镜、读回像素按 destPoint 锚定 blit。
+// 这里钉住：不再招错、走 Skia seam、padding/锚定、hideObject  regimes、无 Skia 降级、
+// BlurFilter CPU 路径与未知滤镜 no-op 保留。
+function checkFilterShadowGlow(): string[] {
+  const bad: string[] = [];
+  const ok = (cond: boolean, msg: string): void => { if (!cond) bad.push(msg); };
+  const c = generateC(parse(`
+    import flash.display.BitmapData;
+    import flash.filters.DropShadowFilter;
+    import flash.filters.GlowFilter;
+    import flash.geom.Rectangle;
+    import flash.geom.Point;
+    var bd:BitmapData = new BitmapData(100, 100, true, 0);
+    var src:BitmapData = new BitmapData(100, 100, true, 0);
+    bd.applyFilter(src, new Rectangle(0, 0, 100, 100), new Point(0, 0), new DropShadowFilter());
+    bd.applyFilter(src, new Rectangle(0, 0, 100, 100), new Point(0, 0), new GlowFilter());
+  `)).c.replace(/\r\n/g, '\n');
+  const i = c.indexOf('void BitmapData_applyFilter(void* _this, BitmapData* source, Rectangle* sourceRect, Point* destPoint, BitmapFilter* filter) {');
+  ok(i >= 0, 'BitmapData_applyFilter must exist');
+  const body = c.slice(i, c.indexOf('\n}', i));
+
+  ok(!body.includes('rasterization not implemented'),
+    'applyFilter must no longer throw "not implemented" for DropShadow/Glow');
+  ok(body.includes('as_skia_paint_set_drop_shadow('),
+    'DropShadow must reuse the Skia drop-shadow seam');
+  ok(body.includes('as_skia_paint_set_glow('),
+    'Glow must reuse the Skia glow seam');
+  ok(body.includes('as_skia_image_from_argb(region, sw, sh)'),
+    'the source region must be lifted into an SkImage');
+  ok(body.includes('int margin =') && body.includes('fw = sw + 2 * margin'),
+    'the surface must be padded so the blur/shadow can expand beyond the source rect');
+  ok(body.includes('int ox = dx - margin, oy = dy - margin;'),
+    'the filtered output must be anchored at destPoint minus the padding');
+  ok(body.includes('drawSource = !ds->_shadow_only;'),
+    'hideObject must select the shadow-only regime');
+  ok(body.includes('#ifdef ASC_USE_SKIA') && body.includes('#else'),
+    'the Skia rasterization must be guarded with a loud non-Skia fallback');
+  ok(body.includes('needs the Skia image backend'),
+    'a non-Skia build must report the missing backend, not silently no-op');
+  ok(body.includes('as_blur_apply(blurred, region, sw, sh, blurX / 2, blurY / 2, quality);'),
+    'BlurFilter must keep its CPU box-blur path');
+  ok(body.includes('else if (!is_glow && !is_shadow) { return; }'),
+    'an unknown filter must remain a value-only no-op');
+
+  console.log('[filterglow] applyFilter DropShadow/Glow checks done');
+  return bad;
+}
+registerGroup('unit: render/FilterShadowGlow', checkFilterShadowGlow);

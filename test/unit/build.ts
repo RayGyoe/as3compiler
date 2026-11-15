@@ -1036,6 +1036,19 @@ function checkWindowsArch(): string[] {
     /--ane-platform <Windows-x86-64\|Windows-x86\|MacOS-x86-64\|iPhone-ARM>/.test(indexSrc) &&
     !indexSrc.includes('MacOS-AOT'));
 
+  // MSVC deprecates the CRT stdio functions the vendor glue uses (fopen/_wfopen).
+  // The whole Windows native compile must define _CRT_SECURE_NO_WARNINGS so the
+  // glue is warning-free cold or warm (a no-warning pin must not depend on the
+  // object cache being warm). wasm uses wasi-libc, which has no such deprecation.
+  const winNative = { ...defaultBuildConfig(), target: 'native' as Target };
+  const winWasm = { ...defaultBuildConfig(), target: 'wasm' as Target };
+  check('Windows native compile defines _CRT_SECURE_NO_WARNINGS (vendor glue warning-free)',
+    process.platform !== 'win32' || effectiveDefines(winNative).includes('_CRT_SECURE_NO_WARNINGS'));
+  check('the define reaches the single-step compile command',
+    process.platform !== 'win32' || buildCompileCommand(winNative, 'a.c', 'a.exe').includes('_CRT_SECURE_NO_WARNINGS'));
+  check('wasm (wasi-libc) takes no MSVC CRT define',
+    !effectiveDefines(winWasm).includes('_CRT_SECURE_NO_WARNINGS'));
+
   console.log(`[winarch] ${ok} passed, ${bad.length} failed`);
   return bad;
 }

@@ -1,16 +1,15 @@
 // flash.net.NetworkInfo.findInterfaces: the OS interface inventory.
 //
-// This is the one AIR "shell" surface a real project cannot live without. The
-// TalkMED desktop client derives its device id from the first interface that
-// reports a hardwareAddress and falls through to a Windows-only branch when the
-// vector is empty (src/cn/edoctor/net/ServerData.as, initDevicesUuid). While this
-// build answered an empty Vector, that fall-through ran on macOS, reached
-// new File("C:/Windows/System32/cmd.exe"), threw ArgumentError #2004 inside the
-// document class constructor -- before any window existed -- and the application
-// printed one line and exited(1) at startup.
+// This is the one AIR "shell" surface a real project cannot live without. A real
+// desktop client derives its device id from the first interface that reports a
+// hardwareAddress; while this build answered an empty Vector on Windows, that
+// fall-through reached a Windows-only path and threw inside the document class
+// constructor -- before any window existed -- so the application printed one line
+// and exited(1) at startup. The Windows backend (GetAdaptersAddresses) now answers
+// a real inventory, so that fall-through no longer runs.
 //
-// Every value pinned below was measured on adl 51.4.1 (temp/netprobe/README.md),
-// and the assertions hold on ANY host:
+// Every value pinned below was measured on adl 51.4.1, and the assertions hold on
+// ANY host. The inventory's FORM is platform-specific (both measured, not assumed):
 //   - networkInfo is the documented singleton, and findInterfaces hands out a NEW
 //     Vector with NEW NetworkInterface objects on every call;
 //   - a reported interface always has at least one address; a FRESH
@@ -18,41 +17,52 @@
 //     subInterfaces (not empty Vectors);
 //   - IPv6 LINK-LOCAL addresses (fe80::/10) are never reported -- an interface
 //     that only has those does not appear at all;
-//   - hardwareAddress is lowercase hex joined with ':' and, exactly as AIR does
-//     it, ONE TRAILING SPACE (18 characters for a 6-byte address). Callers store
-//     this string as a device id, so the space is part of the contract;
+//   - hardwareAddress is AIR's exact per-platform form, and callers store it as a
+//     device id, so the form is part of the contract:
+//       POSIX:   "aa:bb:cc:dd:ee:ff " -- lowercase ':' pairs + ONE trailing space;
+//       Windows: "AA-BB-CC-DD-EE-FF" -- uppercase '-' pairs, NO trailing space;
+//   - name is the POSIX interface name ("en0") but the Windows adapter GUID;
+//     displayName is "" on POSIX and the Windows FriendlyName;
+//   - active is UP/RUNNING/not-loopback on POSIX, but OperStatus==up on Windows
+//     (the Windows loopback pseudo-interface reports active=true);
+//   - mtu is positive on POSIX (lo0 is 16384); the Windows loopback reports -1;
+//   - addresses keep the platform's natural order (POSIX IPv4-first; Windows the
+//     adapter's unicast order, IPv6 may precede IPv4);
 //   - ipVersion is "IPv4" or "IPv6" (IPVersion's constants), prefixLength is the
 //     netmask width, and broadcast is "" for anything that is not an IPv4
-//     broadcast address.
-//
-// One honest gap: the Windows backend is not implemented yet, so there the Vector
-// comes back empty and this build reports it once on stderr. The assertions below
-// therefore require a non-empty inventory only on POSIX hosts.
+//     broadcast address (the loopback has none).
 import flash.net.NetworkInfo;
 import flash.net.NetworkInterface;
 import flash.net.InterfaceAddress;
 import flash.net.IPVersion;
 import flash.system.Capabilities;
 
+var isWindows: Boolean = Capabilities.os.indexOf("Win") >= 0;
+
 function fail(what: String): void {
   throw new Error("net-interfaces: " + what);
 }
 
-function isHexDigit(ch: String): Boolean {
-  return (ch >= "0" && ch <= "9") || (ch >= "a" && ch <= "f");
+function isHexDigit(ch: String, upper: Boolean): Boolean {
+  if (ch >= "0" && ch <= "9") return true;
+  return upper ? (ch >= "A" && ch <= "F") : (ch >= "a" && ch <= "f");
 }
 
-// "aa:bb:cc:dd:ee:ff " -- lowercase pairs, colon-separated, ONE trailing space.
+// AIR's hardwareAddress form is platform-specific (see the header). "" is allowed:
+// an interface with no link layer (the loopback) reports an empty string.
 function isAirMac(v: String): Boolean {
-  if (v.length == 0) return true;               // an interface with no link layer
-  if (v.charAt(v.length - 1) != " ") return false;
-  var body: String = v.substring(0, v.length - 1);
-  var parts: Array = body.split(":");
+  if (v.length == 0) return true;
+  var body: String = v;
+  if (!isWindows) {
+    if (v.charAt(v.length - 1) != " ") return false;   // POSIX trailing space
+    body = v.substring(0, v.length - 1);
+  }
+  var parts: Array = body.split(isWindows ? "-" : ":");
   if (parts.length < 2) return false;
   for (var i: int = 0; i < parts.length; i++) {
     var p: String = parts[i];
     if (p.length != 2) return false;
-    if (!isHexDigit(p.charAt(0)) || !isHexDigit(p.charAt(1))) return false;
+    if (!isHexDigit(p.charAt(0), isWindows) || !isHexDigit(p.charAt(1), isWindows)) return false;
   }
   return true;
 }
@@ -100,8 +110,9 @@ if (first === second) fail("findInterfaces must hand out a NEW Vector per call")
 if (first.length != second.length) fail("the inventory changed between two calls: " + first.length + " vs " + second.length);
 if (first.length > 0 && first[0] === second[0]) fail("NetworkInterface objects must be fresh per call");
 
-var requiresInventory: Boolean = Capabilities.os.indexOf("Win") < 0;
-if (requiresInventory && first.length == 0) fail("no interfaces reported on " + Capabilities.os);
+// Both backends are real now (POSIX getifaddrs, Windows GetAdaptersAddresses), so
+// every desktop host must report a non-empty inventory.
+if (first.length == 0) fail("no interfaces reported on " + Capabilities.os);
 
 var seenNames: Array = [];
 var withMac: int = 0;
@@ -116,7 +127,6 @@ for (var n: int = 0; n < first.length; n++) {
   if (iface.hardwareAddress == null) fail(iface.name + ": hardwareAddress should be \"\" when absent, not null");
   if (!isAirMac(iface.hardwareAddress)) fail(iface.name + ": hardwareAddress is not AIR's form: [" + iface.hardwareAddress + "]");
   if (typeof iface.active != "boolean") fail(iface.name + ": active is not a Boolean");
-  if (iface.mtu <= 0) fail(iface.name + ": mtu should be positive on an enumerated interface, got " + iface.mtu);
   if (iface.parent != null) fail(iface.name + ": parent should be null");
   if (iface.subInterfaces != null) fail(iface.name + ": subInterfaces should be null");
 
@@ -124,6 +134,17 @@ for (var n: int = 0; n < first.length; n++) {
   if (addrs == null) fail(iface.name + ": an enumerated interface must carry an addresses Vector");
   if (addrs.length == 0) fail(iface.name + ": reported without any address");
   if (addrs !== iface.addresses) fail(iface.name + ": addresses must be the SAME Vector on repeated reads");
+
+  // The Windows loopback pseudo-interface reports mtu -1 (its Mtu is 0xFFFFFFFF);
+  // every other enumerated interface has a positive mtu on both platforms.
+  var isLoopback: Boolean = false;
+  for (var z: int = 0; z < addrs.length; z++) {
+    if (addrs[z].address == "127.0.0.1" || addrs[z].address == "::1") isLoopback = true;
+  }
+  if (iface.mtu <= 0 && !(isWindows && isLoopback && iface.mtu == -1)) {
+    fail(iface.name + ": mtu should be positive on an enumerated interface, got " + iface.mtu);
+  }
+
   for (var a: int = 0; a < addrs.length; a++) {
     var ad: InterfaceAddress = addrs[a];
     if (ad.address == null || ad.address.length == 0) fail(iface.name + ": address[" + a + "] is empty");

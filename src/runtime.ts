@@ -105,6 +105,9 @@ export const RUNTIME_PREAMBLE = `// MSVC marks the classic CRT calls this runtim
 // sysctlbyname("kern.osproductversion"): the macOS *product* version that AIR
 // appends to the family name in Capabilities.os (see as_cap_os below).
 #include <sys/sysctl.h>
+// IOPMAssertionCreateWithName: the macOS idle-timer backend behind
+// NativeApplication.systemIdleMode = KEEP_AWAKE (as_set_idle_mode below).
+#include <IOKit/pwr_mgt/IOPMLib.h>
 #elif defined(_WIN32)
 // <windows.h> pulls in <wingdi.h>, whose GDI Rectangle() function collides with
 // the C struct that flash.geom.Rectangle compiles to (typedef struct Rectangle
@@ -120,6 +123,37 @@ export const RUNTIME_PREAMBLE = `// MSVC marks the classic CRT calls this runtim
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+// <iphlpapi.h> declares GetAdaptersAddresses, the Windows interface inventory behind
+// NetworkInfo.findInterfaces (ASC_NET_WIN32 below). It MUST be included here, BEFORE
+// the object-like macro scrub: it pulls in the SAL annotation headers that #define
+// IN/OUT/OPTIONAL, and a late include would re-introduce those macros after the scrub
+// and rewrite same-named AS3 fields (the ident-free-fn regression).
+#include <iphlpapi.h>
+// WASAPI capture-device enumeration for flash.media.Microphone (B1a, stage 424).
+// Like iphlpapi.h these COM headers must precede the object-like macro scrub below
+// (they pull SAL annotations). The GUIDs are defined by hand in the as_mic section
+// rather than via initguid.h, so no global INITGUID side effects leak into the TU.
+#include <objbase.h>
+// <mmdeviceapi.h> defines an EndpointFormFactor enum constant named Microphone,
+// which collides with the C struct flash.media.Microphone compiles to (typedef
+// struct Microphone Microphone) -- the same class of clash as GDI Rectangle above.
+// Rename just that constant for the duration of the include, then restore the name.
+#define Microphone ASC_WASAPI_Microphone
+#include <mmdeviceapi.h>
+#undef Microphone
+#include <functiondiscoverykeys_devpkey.h>
+#include <propidl.h>
+// IMoniker / IEnumMoniker / IPropertyBag for the Camera device enumeration (B2,
+// stage 426, DirectShow). Standard COM (no GDI dependency, unlike strmif.h which
+// needs RGNDATA/BITMAPINFOHEADER that NOGDI hides); ICreateDevEnum itself is
+// declared by hand in the as_cam section. Same SAL-before-scrub ordering.
+#include <ocidl.h>
+// IAudioClient / IAudioCaptureClient for the Microphone capture worker (B1b, stage
+// 425). Same SAL-before-scrub ordering as the other WASAPI headers above. NOBITMAP
+// skips mmreg.h's video-format structs, which embed BITMAPINFOHEADER -- a GDI type
+// the preamble's NOGDI hides; audio capture needs none of them.
+#define NOBITMAP
+#include <audioclient.h>
 #include <psapi.h>
 // <io.h> is the UCRT/MinGW home of the low-level file API. FileStream.truncate
 // calls _chsize_s(), which <stdio.h> does not declare at all, so without this
@@ -187,6 +221,9 @@ export const RUNTIME_PREAMBLE = `// MSVC marks the classic CRT calls this runtim
 #undef IN
 #undef OUT
 #undef OPTIONAL
+#undef INOUT
+#undef OUTOPT
+#undef INOUTOPT
 #endif
 
 // ---------- path encoding seam ----------
@@ -676,6 +713,31 @@ static int as_open_external(const char* url) {
         _exit(127);
     }
     return 1;
+#endif
+}
+
+// ---------- system idle inhibition (NativeApplication.systemIdleMode) ----------
+// AIR's KEEP_AWAKE stops the OS idle timer; NORMAL releases it. Windows uses
+// SetThreadExecutionState, macOS an IOPMAssertion; other targets have no portable
+// backend and report the gap once (the get/set round-trip still works).
+#ifdef __APPLE__
+static IOPMAssertionID ASC_idle_assertion = kIOPMNullAssertionID;
+#endif
+static void as_set_idle_mode(int keepAwake) {
+#ifdef _WIN32
+    if (keepAwake) SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
+    else SetThreadExecutionState(ES_CONTINUOUS);
+#elif defined(__APPLE__)
+    if (keepAwake) {
+        if (ASC_idle_assertion == kIOPMNullAssertionID)
+            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,
+                kIOPMAssertionLevelOn, CFSTR("asaot systemIdleMode keepAwake"), &ASC_idle_assertion);
+    } else if (ASC_idle_assertion != kIOPMNullAssertionID) {
+        IOPMAssertionRelease(ASC_idle_assertion);
+        ASC_idle_assertion = kIOPMNullAssertionID;
+    }
+#else
+    if (keepAwake) as_shell_unsupported("flash.desktop.NativeApplication.systemIdleMode (this target has no idle-timer backend)");
 #endif
 }
 
@@ -8064,6 +8126,57 @@ static void as_jmp_pop(void) {
 static ASC_TLS jmp_buf as_frame_jmp;
 static ASC_TLS int as_frame_guard = 0;
 
+// ---------- AS3 shadow call stack (Error.getStackTrace) ----------
+// AIR captures the call stack when an Error is CONSTRUCTED, not when it is
+// thrown (measured on adl 51.4.1, temp/stackprobe): a constructed-but-never-
+// thrown Error still reports its construction site, and a rethrow keeps the
+// ORIGINAL frames. C has no unwinder metadata, so every generated AS3 function
+// pushes one frame here on entry and pops it on every return path; a longjmp
+// out of a throw skips the pops, so each try's setjmp saves the depth and
+// restores it in the catch path, and every frame-boundary guard resets it to 0.
+// Per-THREAD for the same reason as the jmp stack above: an ANE worker thread
+// runs AS3 code concurrently with the dispatcher thread.
+// cls/meth point at C string literals (static storage, never GC'd). A NULL cls
+// prints "global" (AIR's free-function half); a NULL meth marks a CONSTRUCTOR
+// frame, which AIR prints as "Class()" with no "/method" part.
+typedef struct { const char* cls; const char* meth; } as_aframe;
+static ASC_TLS as_aframe as_astack[512];
+static ASC_TLS int as_astack_depth = 0;
+static void as_astack_enter(const char* cls, const char* meth) {
+    // Past the cap the depth keeps counting (so leave stays balanced) but no
+    // frame is recorded -- deep stacks are truncated, not corrupted.
+    if (as_astack_depth < 512) { as_astack[as_astack_depth].cls = cls; as_astack[as_astack_depth].meth = meth; }
+    as_astack_depth++;
+}
+static void as_astack_leave(void) { if (as_astack_depth > 0) as_astack_depth--; }
+// Render the captured frames innermost-first (AIR's order), one "\\tat Cls/meth()"
+// line each. The "name: message" header is NOT part of this string -- the
+// generated Error_getStackTrace prepends it from the Error's own fields.
+// Returns NULL when no frame is live: AIR's release player answers null from
+// getStackTrace() when it has no stack information.
+static char* as_astack_format(void) {
+    if (as_astack_depth == 0) return NULL;
+    int n = as_astack_depth < 512 ? as_astack_depth : 512;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        as_aframe* f = &as_astack[i];
+        // "\\tat " (4) + cls + optional "/meth" + "()\\n" (3)
+        total += 4 + strlen(f->cls != NULL ? f->cls : "global") + (f->meth != NULL ? 1 + strlen(f->meth) : 0) + 3;
+    }
+    char* out = as_str_alloc(total + 1);
+    char* p = out;
+    for (int i = n - 1; i >= 0; i--) {
+        as_aframe* f = &as_astack[i];
+        const char* cls = f->cls != NULL ? f->cls : "global";
+        memcpy(p, "\\tat ", 4); p += 4;
+        size_t l = strlen(cls); memcpy(p, cls, l); p += l;
+        if (f->meth != NULL) { *p++ = '/'; l = strlen(f->meth); memcpy(p, f->meth, l); p += l; }
+        *p++ = '('; *p++ = ')'; *p++ = '\\n';
+    }
+    *p = 0;
+    return out;
+}
+
 static const char* as_error_message(void* e) {
     return e ? ((as_error_view*)e)->message : "unknown";
 }
@@ -8720,6 +8833,7 @@ static void as_sock_mark_roots(void);
 // WebSocket section further down, and the stub branch at the end of the
 // preamble defines it too, so the declaration stays unconditional.
 static void as_ws_mark_roots(void);
+static void as_mic_mark_roots(void);
 static void as_audio_mark_roots(void);
 // Native-extension roots: the AS3 ExtensionContext objects a live FREContext
 // points at, plus every FREObject handle the running extension call created.
@@ -8745,6 +8859,7 @@ static void gc_mark_internal_roots(void) {
     as_native_drag_mark_roots();
     as_sock_mark_roots();
     as_ws_mark_roots();
+    as_mic_mark_roots();
     as_audio_mark_roots();
     as_fre_mark_ctx_roots();
     if (as_exception_boxed) gc_mark_value(as_exception_v);
@@ -11517,6 +11632,7 @@ extern void sk_gpu_draw_texture(void* canvas, void* backendTexture, int w, int h
 #endif
 extern void* sk_surface_canvas(void* surface);
 extern void* sk_surface_make_snapshot(void* surface);
+extern int sk_surface_threshold_alpha(void* surface);
 extern void sk_surface_delete(void* surface);
 extern void sk_canvas_clear(void* canvas, unsigned rgb);
 extern void sk_canvas_clear_transparent(void* canvas);
@@ -11575,6 +11691,8 @@ extern int sk_path_stroke_contains(void* path, double width, double x, double y)
 extern uint32_t sk_path_generation_id(void* path);
 extern void sk_path_add_transformed(void* dst, void* src, double a, double b, double c, double d, double tx, double ty);
 extern int sk_image_encode_png(void* image, const char* path);
+extern int sk_image_encode_png_mem(void* image, unsigned char** out, size_t* outLen);
+extern int sk_image_encode_jpeg_mem(void* image, int quality, unsigned char** out, size_t* outLen);
 extern void sk_image_delete(void* image);
 extern void sk_paint_set_linear_gradient(void* paint, double x0, double y0, double x1, double y1, unsigned rgb0, double a0, unsigned rgb1, double a1);
 extern void* sk_image_from_file(const char* path);
@@ -11740,6 +11858,7 @@ static inline void* as_skia_surface_make_snapshot(void* s) {
     return img;
 }
 static inline int as_skia_surface_peek_pixels(void* s, void** pixels, int* rowBytes) { return sk_surface_peek_pixels(s, pixels, rowBytes); }
+static inline int as_skia_surface_threshold_alpha(void* s) { return sk_surface_threshold_alpha(s); }
 static inline void as_skia_image_delete(void* img) { as_mem_untrack(img); sk_image_delete(img); }
 static inline void as_skia_surface_save_png(void* s, const char* path) {
     void* img = sk_surface_make_snapshot(s);
@@ -12696,6 +12815,7 @@ static inline void* as_skia_surface_canvas(void* s) { (void)s; return NULL; }
 static inline void as_skia_surface_delete(void* s) { (void)s; }
 static inline void* as_skia_surface_make_snapshot(void* s) { (void)s; return NULL; }
 static inline int as_skia_surface_peek_pixels(void* s, void** pixels, int* rowBytes) { (void)s; (void)pixels; (void)rowBytes; return 0; }
+static inline int as_skia_surface_threshold_alpha(void* s) { (void)s; return 0; }
 static inline void as_skia_image_delete(void* img) { (void)img; }
 static inline void as_skia_surface_save_png(void* s, const char* path) { (void)s; (void)path; }
 static inline void* as_skia_paint_fill(unsigned rgb, double alpha) { (void)rgb; (void)alpha; return NULL; }
@@ -15014,6 +15134,12 @@ static int as_sock_poll(as_sock_pollfd* f, int n, int ms) { return poll(f, (nfds
 #include <netpacket/packet.h>
 #endif
 #define ASC_NET_IFADDRS 1
+#elif defined(_WIN32)
+// GetAdaptersAddresses (iphlpapi.h, included at the top of the preamble BEFORE the
+// object-like macro scrub) is the Windows interface inventory. AIR's Windows
+// semantics differ from the POSIX walk below in several measured ways -- see the
+// ASC_NET_WIN32 branch of as_net_scan.
+#define ASC_NET_WIN32 1
 #endif
 
 // One ADDRESS row. The strings are inline char arrays on purpose: the scan runs
@@ -15021,7 +15147,8 @@ static int as_sock_poll(as_sock_pollfd* f, int n, int ms) { return poll(f, (nfds
 // owns no GC memory and leaks nothing into the arena; the generated code copies
 // each field into a GC string when it builds the AS3 objects.
 typedef struct as_net_row {
-    char name[32];
+    char name[64];      // Windows adapter GUIDs are 38 chars; POSIX names are short
+    char display[128];  // Windows FriendlyName; "" on POSIX (measured on adl)
     char mac[32];
     char addr[64];
     char bcast[64];
@@ -15161,6 +15288,7 @@ static int as_net_scan(as_net_row* out, int cap) {
                 if (out != NULL && n < cap) {
                     as_net_row* o = &out[n];
                     snprintf(o->name, sizeof o->name, "%s", rows[j].name);
+                    o->display[0] = '\\0';
                     snprintf(o->mac, sizeof o->mac, "%s", mac);
                     snprintf(o->addr, sizeof o->addr, "%s", rows[j].addr);
                     snprintf(o->bcast, sizeof o->bcast, "%s", rows[j].bcast);
@@ -15178,6 +15306,109 @@ static int as_net_scan(as_net_row* out, int cap) {
     freeifaddrs(list);
     return n;
 }
+#elif defined(ASC_NET_WIN32)
+// "XX-XX-XX-XX-XX-XX" -- UPPERCASE hex joined with '-', NO trailing space. This is
+// AIR's Windows hardwareAddress form (adl 51.4.1), deliberately different from the
+// macOS as_net_mac_str above (lowercase ':' + one trailing space). A caller stores
+// this string as a device id, so the platform's exact form is part of the contract.
+static void as_net_mac_str_win(char* out, const unsigned char* hw, int len) {
+    int p = 0;
+    out[0] = '\\0';
+    if (len <= 0) return;
+    for (int i = 0; i < len; i++) {
+        p += snprintf(out + p, 4, "%02X", hw[i]);
+        if (i + 1 < len) out[p++] = '-';
+    }
+    out[p] = '\\0';
+}
+
+// FriendlyName is a wide string; the row carries UTF-8 like every other field.
+static void as_net_wide_utf8(char* out, int outsz, const wchar_t* w) {
+    out[0] = '\\0';
+    if (w == NULL) return;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, outsz, NULL, NULL) <= 0) out[0] = '\\0';
+}
+
+// Windows inventory via GetAdaptersAddresses. Measured against adl 51.4.1
+// (temp/netwin/net-air-ref.txt); the differences from the POSIX walk are real
+// platform semantics, not approximations:
+//   * name = AdapterName (the GUID), display = FriendlyName;
+//   * active = (OperStatus == IfOperStatusUp): the loopback pseudo-interface is
+//     active=true here (macOS lo0 is false), a disconnected adapter is false;
+//   * mtu = (int)Mtu, so the loopback's 0xFFFFFFFF reads as -1;
+//   * addresses keep the adapter's natural unicast order (IPv6 may precede IPv4),
+//     NOT the POSIX IPv4-first rule; IPv6 link-local (fe80::/10) is still skipped;
+//   * broadcast is the computed IPv4 directed broadcast, "" for loopback and IPv6.
+// Rows are grouped per adapter (contiguous) so the consumer's name-run grouping
+// builds one NetworkInterface with its addresses in order. Like the POSIX path this
+// runs outside the GC and owns only malloc scratch, freed before returning.
+static int as_net_scan(as_net_row* out, int cap) {
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    ULONG size = 16384;
+    IP_ADAPTER_ADDRESSES* addrs = NULL;
+    ULONG ret = ERROR_BUFFER_OVERFLOW;
+    for (int tries = 0; tries < 5 && ret == ERROR_BUFFER_OVERFLOW; tries++) {
+        free(addrs);
+        addrs = (IP_ADAPTER_ADDRESSES*)malloc(size);
+        if (addrs == NULL) return 0;
+        ret = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, addrs, &size);
+    }
+    if (ret != NO_ERROR || addrs == NULL) { free(addrs); return 0; }
+    as_net_row* rows = NULL;
+    int nrows = 0, rcap = 0;
+    for (IP_ADAPTER_ADDRESSES* a = addrs; a != NULL; a = a->Next) {
+        char mac[32];
+        as_net_mac_str_win(mac, a->PhysicalAddress, (int)a->PhysicalAddressLength);
+        int active = (a->OperStatus == IfOperStatusUp) ? 1 : 0;
+        int mtu = (int)a->Mtu;
+        int loopback = (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) ? 1 : 0;
+        for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u != NULL; u = u->Next) {
+            struct sockaddr* sa = u->Address.lpSockaddr;
+            if (sa == NULL) continue;
+            int fam = sa->sa_family;
+            if (fam != AF_INET && fam != AF_INET6) continue;
+            if (fam == AF_INET6) {
+                const unsigned char* b6 = (const unsigned char*)&((struct sockaddr_in6*)sa)->sin6_addr;
+                if (b6[0] == 0xfe && (b6[1] & 0xc0) == 0x80) continue;  // fe80::/10 link-local
+            }
+            if (nrows >= rcap) {
+                int nc = rcap == 0 ? 16 : rcap * 2;
+                as_net_row* nr = (as_net_row*)realloc(rows, (size_t)nc * sizeof(as_net_row));
+                if (nr == NULL) { free(rows); free(addrs); return 0; }
+                rows = nr; rcap = nc;
+            }
+            as_net_row* r = &rows[nrows++];
+            memset(r, 0, sizeof *r);
+            snprintf(r->name, sizeof r->name, "%s", a->AdapterName);
+            as_net_wide_utf8(r->display, (int)sizeof r->display, a->FriendlyName);
+            snprintf(r->mac, sizeof r->mac, "%s", mac);
+            r->active = active;
+            r->mtu = mtu;
+            r->v6 = (fam == AF_INET6);
+            r->prefix = (int)u->OnLinkPrefixLength;
+            if (fam == AF_INET) {
+                struct sockaddr_in* s4 = (struct sockaddr_in*)sa;
+                inet_ntop(AF_INET, &s4->sin_addr, r->addr, sizeof r->addr);
+                if (!loopback && u->OnLinkPrefixLength > 0 && u->OnLinkPrefixLength <= 32) {
+                    unsigned ip = ntohl(s4->sin_addr.s_addr);
+                    unsigned mask = 0xFFFFFFFFu << (32 - u->OnLinkPrefixLength);
+                    struct in_addr ba;
+                    ba.s_addr = htonl(ip | ~mask);
+                    inet_ntop(AF_INET, &ba, r->bcast, sizeof r->bcast);
+                }
+            } else {
+                inet_ntop(AF_INET6, &((struct sockaddr_in6*)sa)->sin6_addr, r->addr, sizeof r->addr);
+            }
+        }
+    }
+    if (out != NULL) {
+        int m = nrows < cap ? nrows : cap;
+        for (int i = 0; i < m; i++) out[i] = rows[i];
+    }
+    free(rows);
+    free(addrs);
+    return nrows;
+}
 #else
 // No interface inventory on this target. Reported once (the helper caps its own
 // output) so the empty Vector is never mistaken for "this machine has no
@@ -15186,6 +15417,455 @@ static int as_net_scan(as_net_row* out, int cap) {
     (void)out;
     (void)cap;
     as_shell_unsupported("flash.net.NetworkInfo.findInterfaces (this target has no interface inventory; the Vector comes back empty)");
+    return 0;
+}
+#endif
+
+// ---- flash.media.Microphone device inventory (B1a, stage 424) ----
+// One capture-device row: the friendly name (UTF-8). Like as_net_row the string is
+// inline so the scan owns no GC memory; the generated code copies it into a GC
+// string when it builds the names Array / the Microphone instance's name field.
+typedef struct as_mic_row { char name[256]; } as_mic_row;
+#ifdef _WIN32
+// WASAPI identifiers defined by hand: mmdeviceapi.h declares the CLSID/IID in a
+// form initguid.h does not emit in C mode, and a global INITGUID would leak into
+// the whole TU. These are the stable, documented WASAPI GUIDs; PKEY pid 14 is
+// DEVPKEY_Device_FriendlyName. Verified against adl 51.4.1 (temp/mictest, micprobe).
+static const CLSID as_mic_clsid_enumerator = {0xBCDE0395,0xE52F,0x467C,{0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E}};
+static const IID as_mic_iid_enumerator = {0xA95664D2,0x9614,0x4F35,{0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6}};
+static const PROPERTYKEY as_mic_pkey_friendly = {{0xA45C254E,0xDF1C,0x4EFD,{0x80,0x20,0x67,0xD1,0x46,0xA8,0x50,0xE0}}, 14};
+static void as_mic_wide_utf8(char* out, int outsz, const wchar_t* w) {
+    out[0] = '\\0';
+    if (w == NULL) return;
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, outsz, NULL, NULL) <= 0) out[0] = '\\0';
+}
+// Enumerate active capture endpoints (eCapture / DEVICE_STATE_ACTIVE), fill up to
+// cap rows and return the TOTAL device count (a first as_mic_scan(NULL, 0) sizes
+// the buffer). names match AIR Microphone.names friendly names exactly. Runs
+// outside the GC with malloc-free COM scratch; CoInitializeEx is balanced and
+// tolerates RPC_E_CHANGED_MODE (the thread may already be STA from another seam).
+static int as_mic_scan(as_mic_row* out, int cap) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    int coinited = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return 0;
+    IMMDeviceEnumerator* en = NULL;
+    hr = CoCreateInstance(&as_mic_clsid_enumerator, NULL, CLSCTX_ALL, &as_mic_iid_enumerator, (void**)&en);
+    if (FAILED(hr) || en == NULL) { if (coinited) CoUninitialize(); return 0; }
+    IMMDeviceCollection* col = NULL;
+    hr = en->lpVtbl->EnumAudioEndpoints(en, eCapture, DEVICE_STATE_ACTIVE, &col);
+    if (FAILED(hr) || col == NULL) { en->lpVtbl->Release(en); if (coinited) CoUninitialize(); return 0; }
+    UINT count = 0;
+    col->lpVtbl->GetCount(col, &count);
+    int n = 0;
+    for (UINT i = 0; i < count; i++) {
+        IMMDevice* dev = NULL;
+        if (FAILED(col->lpVtbl->Item(col, i, &dev)) || dev == NULL) continue;
+        if (out != NULL && n < cap) {
+            out[n].name[0] = '\\0';
+            IPropertyStore* ps = NULL;
+            if (SUCCEEDED(dev->lpVtbl->OpenPropertyStore(dev, STGM_READ, &ps)) && ps != NULL) {
+                PROPVARIANT var; PropVariantInit(&var);
+                if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &as_mic_pkey_friendly, &var)) && var.vt == VT_LPWSTR) {
+                    as_mic_wide_utf8(out[n].name, (int)sizeof out[n].name, var.pwszVal);
+                }
+                PropVariantClear(&var);
+                ps->lpVtbl->Release(ps);
+            }
+        }
+        n++;
+        dev->lpVtbl->Release(dev);
+    }
+    col->lpVtbl->Release(col);
+    en->lpVtbl->Release(en);
+    if (coinited) CoUninitialize();
+    return n;
+}
+#else
+// No capture-device inventory on this target. Reported once so the empty names
+// Array is never mistaken for "this machine has no microphone"; a program that
+// checks Microphone.isSupported still sees the gap (mac AVFoundation is B1 follow-up).
+static int as_mic_scan(as_mic_row* out, int cap) {
+    (void)out; (void)cap;
+    as_shell_unsupported("flash.media.Microphone (this target has no capture-device inventory; names comes back empty)");
+    return 0;
+}
+#endif
+
+// ---- flash.media.Microphone capture (B1b, stage 425) ----
+// Mirrors the air.net.WebSocket worker shape: a capture thread publishes sample
+// buffers into a lock-protected queue; as_mic_dispatch() (emitted by emit.ts,
+// because it needs the generated SampleDataEvent/ByteArray constructors) drains
+// the queue at the frame boundary and fires SampleDataEvent. No AS3/GC runs on
+// the worker thread. The registry is keyed by the AS3 Microphone pointer, so the
+// shell struct needs no extra handle field. AIR contract (adl 51.4.1,
+// temp/micprobe/MicCapture.as): each SAMPLE_DATA carries 2048 big-endian float32
+// mono samples (data.length 8192), position advances by 2048 per event, and
+// activityLevel is 0..100 (-1 before capture). The device mix format is captured
+// as-is (this host: 48 kHz stereo float32 -- shared mode rejects a custom rate,
+// AUDCLNT_E_UNSUPPORTED_FORMAT), then downmixed to mono and linearly resampled to
+// Microphone.rate kHz.
+struct as_mic_buf { struct as_mic_buf* next; int len; long position; float* samples; };
+typedef struct as_mic {
+    void* obj;                  // the AS3 Microphone; a GC pointer (as_mic_mark_roots)
+    volatile int stop;          // AS3 asked setLoopBack(false)
+    volatile int running;       // worker spawned
+    int rate;                   // requested rate, kHz
+    double silenceLevel;
+    int silenceTimeout;
+    int echo;
+    volatile double activity;   // 0..100, -1 before capture
+    struct as_mic_buf* q_head;  // worker -> AS3
+    struct as_mic_buf* q_tail;
+#ifdef ASC_ASYNC_THREADS
+#ifdef _WIN32
+    HANDLE thread;
+#else
+    pthread_t thread;
+#endif
+#endif
+} as_mic;
+
+static as_mic** as_mics = NULL;
+static int as_mic_count = 0;
+static int as_mic_cap = 0;
+#ifdef ASC_ASYNC_THREADS
+static as_jm_t as_mic_lock =
+#ifdef _WIN32
+    SRWLOCK_INIT;
+#else
+    PTHREAD_MUTEX_INITIALIZER;
+#endif
+#ifdef _WIN32
+static CONDITION_VARIABLE as_mic_cv = CONDITION_VARIABLE_INIT;
+#else
+static pthread_cond_t as_mic_cv = PTHREAD_COND_INITIALIZER;
+#endif
+#define AS_MIC_LOCK()   AS_JOB_LOCK(&as_mic_lock)
+#define AS_MIC_UNLOCK() AS_JOB_UNLOCK(&as_mic_lock)
+#define AS_MIC_WAKE()   AS_JOB_WAKE_ALL(&as_mic_cv)
+#else
+#define AS_MIC_LOCK()   do {} while (0)
+#define AS_MIC_UNLOCK() do {} while (0)
+#define AS_MIC_WAKE()   do {} while (0)
+#endif
+
+static int as_mic_any(void) { return as_mic_count > 0; }
+static int as_mic_total(void) { return as_mic_count; }
+static as_mic* as_mic_at(int i) { return (i >= 0 && i < as_mic_count) ? as_mics[i] : NULL; }
+static void as_mic_mark_roots(void) {
+    for (int i = 0; i < as_mic_count; i++) {
+        if (as_mics[i] != NULL && as_mics[i]->obj != NULL) gc_mark_ptr(as_mics[i]->obj);
+    }
+}
+static as_mic* as_mic_find(void* obj) {
+    for (int i = 0; i < as_mic_count; i++) if (as_mics[i] != NULL && as_mics[i]->obj == obj) return as_mics[i];
+    return NULL;
+}
+// Take one queued buffer under the lock (NULL when empty). The dispatch pass
+// frees it after building the ByteArray.
+static struct as_mic_buf* as_mic_take(as_mic* m) {
+    AS_MIC_LOCK();
+    struct as_mic_buf* b = m->q_head;
+    if (b != NULL) { m->q_head = b->next; if (m->q_head == NULL) m->q_tail = NULL; }
+    AS_MIC_UNLOCK();
+    return b;
+}
+static void as_mic_buf_free(struct as_mic_buf* b) { if (b != NULL) { free(b->samples); free(b); } }
+
+#if defined(ASC_ASYNC_THREADS) && defined(_WIN32)
+// IAudioClient / IAudioCaptureClient IIDs by hand (same rationale as the B1a
+// enumerator GUIDs: no initguid.h, no global INITGUID). Verified temp/mictest/cap.c.
+static const IID as_mic_iid_audioclient = {0x1CB9AD4C,0xDBFA,0x4c32,{0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2}};
+static const IID as_mic_iid_captureclient = {0xC8ADBD64,0xE71E,0x48a0,{0xA4,0xDE,0x18,0x5C,0x39,0x5C,0xD3,0x17}};
+
+static as_mic* as_mic_new(void* obj) {
+    as_mic* m = (as_mic*)calloc(1, sizeof(as_mic));
+    if (m == NULL) return NULL;
+    m->obj = obj;
+    m->activity = -1;
+    if (as_mic_count == as_mic_cap) {
+        int grow = as_mic_cap == 0 ? 4 : as_mic_cap * 2;
+        as_mic** np = (as_mic**)realloc(as_mics, (size_t)grow * sizeof(as_mic*));
+        if (np == NULL) { free(m); return NULL; }
+        as_mics = np; as_mic_cap = grow;
+    }
+    as_mics[as_mic_count++] = m;
+    return m;
+}
+static void as_mic_forget(as_mic* m) {
+    if (m == NULL) return;
+    m->obj = NULL;
+    for (int i = 0; i < as_mic_count; i++) if (as_mics[i] == m) as_mics[i] = NULL;
+}
+// Reap workers that have finished (stop requested and running cleared): join the
+// thread, drain any leftover buffers, free the struct. Called from dispatch.
+static void as_mic_reap(void) {
+    int keep = 0;
+    for (int i = 0; i < as_mic_count; i++) {
+        as_mic* m = as_mics[i];
+        if (m == NULL) continue;
+        if (m->stop && !m->running && m->obj == NULL) {
+            if (m->thread != NULL) { WaitForSingleObject(m->thread, 2000); CloseHandle(m->thread); }
+            while (m->q_head != NULL) { struct as_mic_buf* b = m->q_head; m->q_head = b->next; as_mic_buf_free(b); }
+            free(m);
+            continue;
+        }
+        as_mics[keep++] = m;
+    }
+    as_mic_count = keep;
+}
+
+// The capture worker. Owns all COM pointers (created and released here, on this
+// thread's MTA). Captures the device mix format, downmixes to mono, linearly
+// resamples to m->rate kHz, accumulates 2048-sample buffers and queues them under
+// the lock. activityLevel is the peak amplitude mapped to 0..100.
+static void as_mic_worker_body(as_mic* m) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    int coinited = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) { m->running = 0; return; }
+    IMMDeviceEnumerator* en = NULL;
+    IMMDevice* dev = NULL;
+    IAudioClient* ac = NULL;
+    IAudioCaptureClient* acc = NULL;
+    WAVEFORMATEX* fmt = NULL;
+    hr = CoCreateInstance(&as_mic_clsid_enumerator, NULL, CLSCTX_ALL, &as_mic_iid_enumerator, (void**)&en);
+    if (FAILED(hr) || en == NULL) goto done;
+    hr = en->lpVtbl->GetDefaultAudioEndpoint(en, eCapture, eConsole, &dev);
+    if (FAILED(hr) || dev == NULL) goto done;
+    hr = dev->lpVtbl->Activate(dev, &as_mic_iid_audioclient, CLSCTX_ALL, NULL, (void**)&ac);
+    if (FAILED(hr) || ac == NULL) goto done;
+    hr = ac->lpVtbl->GetMixFormat(ac, &fmt);
+    if (FAILED(hr) || fmt == NULL) goto done;
+    hr = ac->lpVtbl->Initialize(ac, AUDCLNT_SHAREMODE_SHARED, 0, 10000000, 0, fmt, NULL);
+    if (FAILED(hr)) goto done;
+    hr = ac->lpVtbl->GetService(ac, &as_mic_iid_captureclient, (void**)&acc);
+    if (FAILED(hr) || acc == NULL) goto done;
+    ac->lpVtbl->Start(ac);
+    {
+        int mixRate = (int)fmt->nSamplesPerSec;
+        int ch = fmt->nChannels > 0 ? fmt->nChannels : 1;
+        int isFloat = (fmt->wFormatTag == 3 || fmt->wBitsPerSample == 32);  // 3 = WAVE_FORMAT_IEEE_FLOAT
+        int targetRate = m->rate > 0 ? m->rate * 1000 : 8000;
+        double step = (double)mixRate / (double)targetRate;  // input samples per output sample
+        long inCount = 0, outCount = 0, deliveredPos = 0;
+        float prevLast = 0; int havePrev = 0;
+        float accbuf[2048]; int accn = 0; long bufStart = 0; double peak = 0;
+        while (!m->stop) {
+            Sleep(10);
+            UINT32 packet = 0;
+            acc->lpVtbl->GetNextPacketSize(acc, &packet);
+            while (packet > 0 && !m->stop) {
+                BYTE* data = NULL; UINT32 frames = 0; DWORD flags = 0;
+                if (SUCCEEDED(acc->lpVtbl->GetBuffer(acc, &data, &frames, &flags, NULL, NULL)) && data != NULL) {
+                    int silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                    for (UINT32 i = 0; i < frames; i++) {
+                        float mono = 0;
+                        if (!silent) {
+                            if (isFloat) {
+                                float* f = (float*)data;
+                                double s = 0; for (int c = 0; c < ch; c++) s += f[i * ch + c];
+                                mono = (float)(s / ch);
+                            } else {
+                                short* p = (short*)data;
+                                double s = 0; for (int c = 0; c < ch; c++) s += p[i * ch + c];
+                                mono = (float)(s / ch / 32768.0);
+                            }
+                        }
+                        // Linear resample: emit output samples whose input position
+                        // p = outCount*step lies below inCount-1 (two input samples
+                        // available to interpolate). prevLast bridges buffer edges.
+                        inCount++;
+                        // Linear resample. step = mixRate/targetRate >= 1 on every
+                        // real device (the 48 kHz mix rate is >= all Microphone.rate
+                        // kHz values), so this is downsampling: at most one output
+                        // sample falls in each input interval [inCount-2, inCount-1],
+                        // and idx == inCount-2 always holds -- interpolate between
+                        // prevLast (the previous input sample) and mono (this one).
+                        // The else branch is a zero-order-hold fallback for the
+                        // theoretical step < 1 case (a mix rate below the target).
+                        while ((double)outCount * step < (double)(inCount - 1)) {
+                            double p = (double)outCount * step;
+                            long idx = (long)p;
+                            double f = p - (double)idx;
+                            float a, b;
+                            if (idx == inCount - 2) { a = havePrev ? prevLast : mono; b = mono; }
+                            else { a = mono; b = mono; }
+                            float y = (float)(a + (b - a) * f);
+                            if (accn == 0) bufStart = deliveredPos;
+                            accbuf[accn++] = y;
+                            double ay = y < 0 ? -y : y; if (ay > peak) peak = ay;
+                            outCount++;
+                            if (accn == 2048) {
+                                double lvl = peak * 100.0; if (lvl > 100) lvl = 100;
+                                m->activity = lvl;
+                                int gate = (m->silenceLevel > 0 && lvl < m->silenceLevel);
+                                if (!gate) {
+                                    struct as_mic_buf* b = (struct as_mic_buf*)malloc(sizeof(struct as_mic_buf));
+                                    if (b != NULL) {
+                                        b->len = 2048; b->position = bufStart; b->next = NULL;
+                                        b->samples = (float*)malloc(sizeof(float) * 2048);
+                                        if (b->samples != NULL) {
+                                            memcpy(b->samples, accbuf, sizeof(float) * 2048);
+                                            AS_MIC_LOCK();
+                                            if (m->q_tail != NULL) m->q_tail->next = b; else m->q_head = b;
+                                            m->q_tail = b;
+                                            AS_MIC_UNLOCK();
+                                            AS_MIC_WAKE();
+                                            deliveredPos += 2048;
+                                        } else { free(b); }
+                                    }
+                                }
+                                accn = 0; peak = 0;
+                            }
+                        }
+                        prevLast = mono; havePrev = 1;
+                    }
+                    acc->lpVtbl->ReleaseBuffer(acc, frames);
+                }
+                acc->lpVtbl->GetNextPacketSize(acc, &packet);
+            }
+        }
+        ac->lpVtbl->Stop(ac);
+    }
+done:
+    if (fmt != NULL) CoTaskMemFree(fmt);
+    if (acc != NULL) acc->lpVtbl->Release(acc);
+    if (ac != NULL) ac->lpVtbl->Release(ac);
+    if (dev != NULL) dev->lpVtbl->Release(dev);
+    if (en != NULL) en->lpVtbl->Release(en);
+    if (coinited) CoUninitialize();
+    m->running = 0;
+}
+static unsigned __stdcall as_mic_worker(void* arg) { as_mic_worker_body((as_mic*)arg); return 0; }
+
+// setLoopBack(true): start (or restart) capture for this Microphone. The rate and
+// silence settings are snapshotted from the AS3 fields at start time.
+static int as_mic_start(void* obj, int rate, double silenceLevel, int silenceTimeout) {
+    AS_MIC_LOCK();
+    as_mic* m = as_mic_find(obj);
+    if (m != NULL && m->running) { AS_MIC_UNLOCK(); return 1; }  // already capturing
+    if (m == NULL) m = as_mic_new(obj);
+    if (m == NULL) { AS_MIC_UNLOCK(); return 0; }
+    m->obj = obj;
+    m->rate = rate > 0 ? rate : 8;
+    m->silenceLevel = silenceLevel;
+    m->silenceTimeout = silenceTimeout;
+    // m->echo is preserved: setUseEchoSuppression may have stored it in a pending
+    // entry before capture started (shared-mode WASAPI echo cancellation is a
+    // system effect, so the flag is a hint, not a per-client switch).
+    m->stop = 0;
+    m->activity = -1;
+    m->running = 1;
+    uintptr_t hh = _beginthreadex(NULL, 0, as_mic_worker, m, 0, NULL);
+    if (hh == 0) { m->running = 0; AS_MIC_UNLOCK(); return 0; }
+    m->thread = (HANDLE)hh;
+    AS_MIC_UNLOCK();
+    return 1;
+}
+static void as_mic_stop(void* obj) {
+    AS_MIC_LOCK();
+    as_mic* m = as_mic_find(obj);
+    if (m != NULL) { m->stop = 1; m->activity = -1; }
+    AS_MIC_UNLOCK();
+    AS_MIC_WAKE();
+}
+static void as_mic_set_silence(void* obj, double level, int timeout) {
+    AS_MIC_LOCK();
+    as_mic* m = as_mic_find(obj);
+    if (m != NULL) { m->silenceLevel = level; if (timeout >= 0) m->silenceTimeout = timeout; }
+    AS_MIC_UNLOCK();
+}
+static void as_mic_set_echo(void* obj, int use) {
+    AS_MIC_LOCK();
+    as_mic* m = as_mic_find(obj);
+    if (m == NULL) m = as_mic_new(obj);  // pending entry holds the setting until capture
+    if (m != NULL) m->echo = use;
+    AS_MIC_UNLOCK();
+}
+#else
+// No capture backend on this target (non-Windows, or a no-thread build). The
+// device face (B1a) still enumerates where it can; setLoopBack reports the gap
+// once rather than pretending to capture, and dispatch finds no live microphones.
+static int as_mic_start(void* obj, int rate, double silenceLevel, int silenceTimeout) {
+    (void)obj; (void)rate; (void)silenceLevel; (void)silenceTimeout;
+    as_shell_unsupported("flash.media.Microphone capture (this target has no audio-capture backend; setLoopBack is a no-op)");
+    return 0;
+}
+static void as_mic_stop(void* obj) { (void)obj; }
+static void as_mic_set_silence(void* obj, double level, int timeout) { (void)obj; (void)level; (void)timeout; }
+static void as_mic_set_echo(void* obj, int use) { (void)obj; (void)use; }
+static void as_mic_reap(void) { }
+#endif
+
+// ---- flash.media.Camera device inventory (B2, stage 426) ----
+// One capture-device row: the friendly name (UTF-8). Like as_mic_row the string is
+// inline so the scan owns no GC memory; the generated code copies it into a GC
+// string when it builds the names Array / the Camera instance's _name field.
+typedef struct as_cam_row { char name[256]; } as_cam_row;
+#ifdef _WIN32
+// DirectShow device enumeration. The GUIDs are defined by hand (same rationale as
+// the WASAPI ones: no initguid.h / strmiids.lib, no global INITGUID). ICreateDevEnum
+// is DirectShow-specific (strmif.h, which needs RGNDATA/BITMAPINFOHEADER that NOGDI
+// hides), so just that small interface is declared here; IMoniker/IEnumMoniker/
+// IPropertyBag come from <ocidl.h> (standard COM). Verified against adl 51.4.1
+// (temp/camtest/cam3.c, temp/camprobe): names match AIR byte-for-byte.
+static const CLSID as_cam_clsid_devenum = {0x62BE5D10,0x60EB,0x11d0,{0xBD,0x3B,0x00,0xA0,0xC9,0x11,0xCE,0x86}};
+static const IID as_cam_iid_createdevenum = {0x29840822,0x5B84,0x11D0,{0xBD,0x3B,0x00,0xA0,0xC9,0x11,0xCE,0x86}};
+static const CLSID as_cam_clsid_videocap = {0x860BB310,0x5D01,0x11d0,{0xBD,0x3B,0x00,0xA0,0xC9,0x11,0xCE,0x86}};
+static const IID as_cam_iid_propbag = {0x55272A00,0x42CB,0x11CE,{0x81,0x35,0x00,0xAA,0x00,0x4B,0xB8,0x51}};
+typedef interface ICreateDevEnum ICreateDevEnum;
+typedef struct ICreateDevEnumVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(ICreateDevEnum*, REFIID, void**);
+    ULONG (STDMETHODCALLTYPE *AddRef)(ICreateDevEnum*);
+    ULONG (STDMETHODCALLTYPE *Release)(ICreateDevEnum*);
+    HRESULT (STDMETHODCALLTYPE *CreateClassEnumerator)(ICreateDevEnum*, REFCLSID, IEnumMoniker**, DWORD);
+} ICreateDevEnumVtbl;
+interface ICreateDevEnum { const ICreateDevEnumVtbl *lpVtbl; };
+// Enumerate video-capture devices (CLSID_VideoInputDeviceCategory), fill up to cap
+// rows and return the TOTAL device count (a first as_cam_scan(NULL, 0) sizes the
+// buffer). Runs outside the GC with malloc-free COM scratch; CoInitializeEx is
+// balanced and tolerates RPC_E_CHANGED_MODE. PropVariantInit/Clear (ole32) avoid
+// pulling oleaut32's VariantInit/Clear.
+static int as_cam_scan(as_cam_row* out, int cap) {
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    int coinited = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return 0;
+    ICreateDevEnum* de = NULL;
+    hr = CoCreateInstance(&as_cam_clsid_devenum, NULL, CLSCTX_INPROC_SERVER, &as_cam_iid_createdevenum, (void**)&de);
+    if (FAILED(hr) || de == NULL) { if (coinited) CoUninitialize(); return 0; }
+    IEnumMoniker* em = NULL;
+    hr = de->lpVtbl->CreateClassEnumerator(de, &as_cam_clsid_videocap, &em, 0);
+    if (hr != S_OK || em == NULL) { de->lpVtbl->Release(de); if (coinited) CoUninitialize(); return 0; }
+    IMoniker* mk = NULL;
+    int n = 0;
+    while (em->lpVtbl->Next(em, 1, &mk, NULL) == S_OK) {
+        if (out != NULL && n < cap) {
+            out[n].name[0] = '\\0';
+            IPropertyBag* pb = NULL;
+            if (SUCCEEDED(mk->lpVtbl->BindToStorage(mk, NULL, NULL, &as_cam_iid_propbag, (void**)&pb)) && pb != NULL) {
+                PROPVARIANT var; PropVariantInit(&var);
+                if (SUCCEEDED(pb->lpVtbl->Read(pb, L"FriendlyName", (VARIANT*)&var, NULL)) && var.vt == VT_BSTR) {
+                    as_mic_wide_utf8(out[n].name, (int)sizeof out[n].name, var.bstrVal);
+                }
+                PropVariantClear(&var);
+                pb->lpVtbl->Release(pb);
+            }
+        }
+        n++;
+        mk->lpVtbl->Release(mk);
+    }
+    em->lpVtbl->Release(em);
+    de->lpVtbl->Release(de);
+    if (coinited) CoUninitialize();
+    return n;
+}
+#else
+// No camera-device inventory on this target. Reported once so the empty names
+// Array is never mistaken for "this machine has no camera"; a program that checks
+// Camera.isSupported still sees the gap (mac AVFoundation is B2 follow-up).
+static int as_cam_scan(as_cam_row* out, int cap) {
+    (void)out; (void)cap;
+    as_shell_unsupported("flash.media.Camera (this target has no camera-device inventory; names comes back empty)");
     return 0;
 }
 #endif
@@ -17058,6 +17738,7 @@ static void as_ws_shutdown(as_ws* w, int code) { (void)w; (void)code; }
 static int as_file_dialog_tick(void);
 static int as_sock_dispatch(void);    // defined with the AS3 Socket section (needs Socket_new)
 static int as_ws_dispatch(void);      // defined with the air.net.WebSocket section (same reason)
+static int as_mic_dispatch(void);     // emitted by emit.ts (needs SampleDataEvent/ByteArray ctors)
 
 static int as_async_tick_with(int sock_wait_ms) {
     // A thunk dispatches AS3 events and a listener may call the frame-boundary
@@ -17077,6 +17758,11 @@ static int as_async_tick_with(int sock_wait_ms) {
         as_sock_pump(sock_wait_ms);
         sock_events = as_sock_dispatch();
     }
+    // Microphone SampleDataEvent pump (B1b). Same frame-boundary discipline as
+    // the socket/WebSocket passes: the capture worker only queues buffers, the
+    // AS3 events are built here on the AS3 thread. Independent of sockets.
+    int mic_events = as_mic_dispatch();
+    (void)mic_events;
 
     // WebSocket workers publish into a queue instead of a descriptor this pass
     // can poll: as_ws_wait() gives them the same bounded wait the socket pump

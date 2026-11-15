@@ -78,8 +78,9 @@ export const PROBE_SYSTEM_LINK_FLAGS: string[] = process.platform === 'win32'
   // (ASC_SOCK_WIN, not the old inert stub): any probe whose generated C instantiates
   // the socket state machine imports setsockopt/WSAGetLastError, and lld-link reports
   // them as undefined without it -- a probe-only link failure that a real build never
-  // sees (it gets ws2_32 from the CLI/manifest).
-  ? ['-lshell32', '-luser32', '-lole32', '-ladvapi32', '-lws2_32']
+  // sees (it gets ws2_32 from the CLI/manifest). iphlpapi is here for the same
+  // reason: NetworkInfo.findInterfaces (ASC_NET_WIN32) imports GetAdaptersAddresses.
+  ? ['-lshell32', '-luser32', '-lole32', '-ladvapi32', '-lws2_32', '-liphlpapi']
   : [];
 
 // The Skia glue is TWO translation units since stage 221: vendor/skia_glue.cc is

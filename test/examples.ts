@@ -411,6 +411,13 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 一页，只有 resize 才动）。断言是像素、且要靠 stage.render 跑指纹 pass，故同
   // autobake-origin.as 一样链 Skia。
   'bake-bitmap-swap.as': ['--manifest', join(dir, 'bake-bitmap-swap.build.json')],
+  // png-encode.as（阶段四百二十一，plan A1）断言的是 BitmapData.encode 的 PNG 回环像素
+  // 与写入语义，编码/解码都要 Skia（SkPngEncoder + 解码器），纯 C 构建无图像后端，故链 Skia。
+  'png-encode.as': ['--manifest', join(dir, 'png-encode.build.json')],
+  // jpeg-encode.as（阶段四百二十二，plan A2）钉的是 BitmapData.encode 的 JPEG 契约（quality
+  // uint 默认 80、>100 抛 #2006、premul-over-black 去 alpha）与回环；编码走 libjpeg-turbo C API、
+  // 解码走 Skia，纯 C 构建无图像后端，故链 Skia。
+  'jpeg-encode.as': ['--manifest', join(dir, 'jpeg-encode.build.json')],
   // bake-draw-cache.as（阶段二百八十二）钉的是**draw 这条渲染路径自己**：离屏子树只经由
   // `BitmapData.draw` 进入渲染时，窗口绘制的指纹遍历根本不覆盖它，于是显式 cacheAsBitmap
   // 烘一次就永远重放那张图（真机：presenter 模式下大图 = pBitmapData.draw(skinView.view) 的
@@ -428,6 +435,16 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 不参与命中，遮罩没有墨迹就什么都画不出来。adl 51.4.1 实测值（temp/mask/MaskProbe*.as）
   // 逐条比对，故与 draw-over.as 一样必须链 Skia。
   'display-mask.as': ['--manifest', join(dir, 'display-mask.build.json')],
+  // pixel-mask.as（阶段四百二十七，plan D1）钉的是 Bitmap/TextField 遮罩的**像素 alpha**契约：
+  // content 设 cacheAsBitmap 时遮罩按像素裁剪——mask 也 cacheAsBitmap 为软 alpha、仅 content
+  // 缓存为二值模板、content 不缓存则 draw() 不施像素遮罩。adl 51.4.1 实测（temp/maskprobe），
+  // 需光栅后端，故与 display-mask.as 一样链 Skia。
+  'pixel-mask.as': ['--manifest', join(dir, 'pixel-mask.build.json')],
+  // cache-matrix.as（阶段四百二十八，plan D2）钉的是 cacheAsBitmapMatrix 的**画面恒等**契约：
+  // AIR 按矩阵缓存再以逆变换 blit，最终画面不变（仅缓存分辨率随矩阵缩放），adl 51.4.1 实测
+  // （temp/cabmprobe）scale/translate/identity 都与无矩阵逐像素一致。需光栅后端，链 Skia。
+  'cache-matrix.as': ['--manifest', join(dir, 'cache-matrix.build.json')],
+  'filter-shadow-glow.as': ['--manifest', join(dir, 'filter-shadow-glow.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须

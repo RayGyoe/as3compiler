@@ -41,7 +41,7 @@ open temp/DesktopFiles.app
 本机 AIR SDK 51.4.1 的 describeType 和运行探针确认：
 
 - NativeDragEvent 继承 MouseEvent，构造器 13 个参数，cancelable 默认 true，未给坐标为 NaN；clone 保留子类型及相关对象。
-- NativeDragManager.doDrag 是五参数，dropAction 可读写，另有 dragInitiator/isDragging；NativeDragOptions 三个 allow 标志默认 true。运行时已接入原生拖放会话，尚需补齐系统交互验收。
+- NativeDragManager.doDrag 是五参数，dropAction 可读写，另有 dragInitiator/isDragging；NativeDragOptions 三个 allow 标志默认 true。运行时已接入原生拖放会话，尚需补齐系统交互验收。**阶段四百三十（E3）按 adl 51.4.1 `temp/dragprobe` 对齐错误/no-op 契约**：会话外 `dropAction` setter 是静默 no-op（getter 恒回 `none`，非法值也不抛）；`acceptDragDrop` 仅 null target 抛 `#2007`，会话外合法 target 是 no-op；`doDrag` 仅 null clipboard 抛 `#2007`（先查 clipboard），null initiator 或无 mouseDown/mouseMove 手势都是 no-op（原实现这三处偏严、会抛 AIR 不抛的错，已修）。drag-IN/drag-OUT 会话状态机本身不变；Windows `dragImage` 仍走系统光标（私有 `DragImageBits`/`IDropSourceHelper` 协议，见残留表）。
 - FileReference.save 的 data 参数是 `*`，不是 Object；生成器已同步，避免字符串/数值被错误当作对象地址。
 - 未选择就 FileReference.load 抛 #2037；File.load 可以直接读取已有 nativePath。
 - 无效过滤数组成员抛 ArgumentError #2097。

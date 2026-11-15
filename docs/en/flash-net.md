@@ -349,7 +349,7 @@ content via `progress`/`complete`, rather than `ioError`".
 | `Socket`/`SecureSocket`/`ServerSocket`/`XMLSocket` | ✅ **landed (stage eighty-nine / fifty-three)**: TCP base + complete `IDataInput`/`IDataOutput`; `SecureSocket` is API surface only + honest failure (`isSupported=false`, TLS state machine not done). Semantics in detail in §7 |
 | `FileReference`/`FileReferenceList`/`FileFilter` | ❌ |
 | `LocalConnection`/`NetConnection`/`NetStream`/`NetGroup*` | ❌ (`NetStream` has only a dynamic `client` slot, see `symbols.ts:2451`; a playback stack has been scoped separately, see [`video.md`](video.md)) |
-| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **landed (stage 363)**: `findInterfaces()` really enumerates through `getifaddrs` (MAC / `active` / `mtu` / IPv4+IPv6 addresses with prefix lengths), with return-value and identity semantics aligned to adl 51.4.1 measurements; Windows and WASI still report the gap honestly and return an empty Vector. Contract and acceptance: §6.10 |
+| `NetworkInfo`/`NetworkInterface`/`InterfaceAddress`/`IPVersion` | ✅ **landed (stage 363)**: `findInterfaces()` really enumerates through `getifaddrs` (MAC / `active` / `mtu` / IPv4+IPv6 addresses with prefix lengths), with return-value and identity semantics aligned to adl 51.4.1 measurements; **Windows uses `GetAdaptersAddresses` (stage 420, semantics in §6.10.5)**, WASI still reports the gap honestly and returns an empty Vector. Contract and acceptance: §6.10 |
 | `Responder` | ❌ |
 | Static self-contained packaging (including the `vendor/` static library with curl) | ✅ **landed (stage eighty-nine / fifty-three)**: `vendor/curl` provides `libcurl.a`/`libnghttp2.a`/`libz.a`, and `otool -L` no longer shows `libcurl.4.dylib` (see §4.1) |
 | Proxy / cookie jar / HTTP-2 | ✅ **landed (stage eighty-nine / fifty-three)**: process-level `CURLSH` sharing cookies (`URLRequest.manageCookies`), two routes (environment variables and the **system proxy**), `ASC_HTTP2` opt-in (still defaults to 1.1, see §4.1) |
@@ -1469,11 +1469,11 @@ byte format above and reads it back through `getLocal` (also pinning `00 BF` / `
 
 ---
 
-### 6.10 `NetworkInfo.findInterfaces()` interface enumeration — **executed (stage 363)**
+### 6.10 `NetworkInfo.findInterfaces()` interface enumeration — **executed (stage 363; Windows backend stage 420)**
 
 #### 6.10.1 Why it had to be done: an **empty Vector is not a degradation, it is a different program**
 
-`talkmed-meeting-desktop`'s `ServerData.initDevicesUuid()` builds its device id from the first interface
+The real app's `ServerData.initDevicesUuid()` builds its device id from the first interface
 that reports a `hardwareAddress`:
 
 ```as3
@@ -1526,7 +1526,7 @@ so "tidying it up" silently changes externally visible behaviour) and **`address
 | semantic layer (C) | `NetworkInfo_findInterfaces` in `emit.ts` | group the rows by name: `NetworkInterface_new()` + push on a name change, one `InterfaceAddress` per row pushed into `cur->addresses`. The row buffer is `malloc`/`free` — no GC garbage and no arena growth per call |
 | class shape | `symbols.ts` | `NetworkInterface extends Object` with the 8 members above; new `InterfaceAddress`; `NetworkInfo` gains `disableNetworkChanges` plus the static `isSupported`/`permissionStatus`; new `constClass('IPVersion')` |
 | fresh-object defaults | `SHELL_CTOR_EXTRA` in `emit.ts` | overwrite the shell's auto-filled empty Vectors: `addresses`/`subInterfaces` = `NULL`, `mtu=-1`; `InterfaceAddress` = `ipVersion="IPv4"`, `prefixLength=-1` |
-| other targets | the `#else` arm in the same file | Windows/WASI have **no** ifaddrs: `as_shell_unsupported` reports once and returns 0 (the honesty rule in §2) |
+| other targets | the `#elif`/`#else` arms in the same file | **Windows uses `GetAdaptersAddresses` (stage 420, `ASC_NET_WIN32`; semantics in §6.10.5)**; WASI has no inventory: `as_shell_unsupported` reports once and returns 0 (the honesty rule in §2) |
 
 Netmask trap: the prefix length cannot be read at a fixed offset. `m+4` yields 96 for `lo0`'s IPv6 netmask
 on macOS; take `sin_addr` / `sin6_addr` per `sa_family` and count the leading ones.
@@ -1538,7 +1538,44 @@ on macOS; take `sin_addr` / `sin6_addr` per `sa_family` and count the leading on
 | contract alignment | `examples/net-interfaces.as` runs the **same assertions** under AOT and under `mxmlc + adl` (the latter writes its verdict to `~/Documents/ni-adl.txt`) | `OK` on both |
 | value-by-value comparison | diff of `temp/netprobe/Cmp.as` output against the adl probe output | identical (including `hw.len=18`, `mtu=16384`, `prefix=128`, `subInterfaces=null`, `sameIfaceObj=false`) |
 | structural pins | `unit: platform/NetworkInventory`, 27 pins (generated C + `RUNTIME_PREAMBLE`) | all pass |
-| real app end to end | `bin-aot/build-aot.sh --run` (TalkMED Meeting, macOS) | login window appears normally; log reads `uuid mac == c2:15:48:c4:50:d4 `, request body `"uuid":"c2:15:48:c4:50:d4 "`; the `#2004` is gone |
+| real app end to end | `bin-aot/build-aot.sh --run` (the real app, macOS) | login window appears normally; log reads `uuid mac == c2:15:48:c4:50:d4 `, request body `"uuid":"c2:15:48:c4:50:d4 "`; the `#2004` is gone |
+
+#### 6.10.5 The Windows backend (stage 420, C1) — `GetAdaptersAddresses`
+
+POSIX `getifaddrs` does not exist on Windows; Windows used to report the gap and return an empty Vector
+just like WASI. Stage 420 adds the `ASC_NET_WIN32` arm (`GetAdaptersAddresses` from `iphlpapi.h`),
+**line-for-line aligned with adl 51.4.1 on real Windows hardware** (`temp/netwin/net-air-ref.txt`, a
+7-adapter full-field diff is empty). AIR's Windows semantics differ from macOS in **several** ways, all
+measured, not approximated:
+
+| Field | macOS (§6.10.2) | **Windows (measured adl 51.4.1)** |
+|---|---|---|
+| `name` | interface name `en0` | the **adapter GUID** `{680418F5-...}` (`AdapterName`, 38 chars) |
+| `displayName` | `""` | the **FriendlyName** (`以太网`/`VMware Network Adapter VMnet1`, UTF-8) |
+| `hardwareAddress` | `aa:bb:..:ff ` (lowercase `:` + trailing space) | **`74-56-3C-B7-45-19`** (uppercase `-`, **no** trailing space) |
+| `active` | UP∧RUNNING∧not-loopback (`lo0`=false) | **`OperStatus==IfOperStatusUp`** (loopback=**true**, a disconnected Bluetooth adapter=false) |
+| `mtu` | `SIOCGIFMTU` (`lo0`=16384) | **`(int)Mtu`** (the loopback's `0xFFFFFFFF` ⇒ **-1**) |
+| address order within an interface | IPv4 first | the adapter's **natural unicast order** (IPv6 may precede IPv4) |
+| `broadcast` | IPv4 broadcast | the **computed directed broadcast** `ip \| ~mask` for IPv4; `""` for loopback and IPv6 |
+| IPv6 link-local | drop `fe80::/10` | same (byte-wise `fe80::/10` check) |
+
+Implementation notes:
+- `as_net_row` grew: `name[32]→name[64]` (a 38-char GUID would truncate) and a new `display[128]`; the
+  consumer now reads `displayName` from `rows[i].display` (POSIX fills `""`, behaviour unchanged).
+- Rows are grouped **contiguously** per adapter (the inner loop walks `FirstUnicastAddress`); the
+  consumer's name-run grouping builds the object graph from that.
+- Linking: `iphlpapi` is injected for the whole target alongside `ws2_32` in the CLI's Winsock block
+  (`index.ts`); the harness probe `PROBE_SYSTEM_LINK_FLAGS` adds `-liphlpapi` to match.
+
+**The trap (SAL macros)**: `iphlpapi.h` pulls in the SAL annotation headers that `#define IN/OUT/OPTIONAL`
+as empty macros. Including it **late** in the preamble re-introduces those macros **after** the top-of-file
+"Windows object-like macro scrub" (`#undef near/far/OUT/...`), expanding a same-named AS3 field (the `OUT`
+that `ident-free-fn.as` specifically tests) to nothing ⇒ `expected identifier`. Fix: `iphlpapi.h` must sit
+in the top Windows include block (**before** the scrub), plus `#undef INOUT/OUTOPT/INOUTOPT`.
+
+Acceptance: `examples/net-interfaces.as` is now **platform-aware** (Windows uppercase `-` MAC, loopback
+`mtu=-1`, Windows also requires a non-empty inventory), passing under both AOT and adl;
+`unit: platform/NetworkInventory` 37 pins (9 of them Windows); full `node test.ts` 688/684/0 red.
 
 ---
 
