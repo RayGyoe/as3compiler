@@ -203,6 +203,7 @@ behaviour to be measured per item during implementation):
 | `play()` return | **Each call returns a new `SoundChannel`**; a single `Sound` can play several channels at once | Reusing one channel per `Sound` ⇒ the second playback swallows the first |
 | `loops` | "times to loop back to `startTime`": `loops=1` ⇒ plays **twice**; `loops=0` ⇒ once | Treating it as "number of plays" |
 | Channel cap | At most **32** concurrent; beyond that `play()` returns **`null`** | No cap, or throwing |
+| PCM image registry | **Grows on demand** (stage 432, G46): the image table behind `loadPCMFromByteArray`/decoding has no fixed slot cap (the old implementation hard-capped **64** slots and threw `#2068` on the 65th); on doubling, old blocks are never freed so the lock-free real-time audio thread stays safe holding a stale pointer. **Reclamation** (freeing a buffer when its `Sound` becomes unreachable) is not done yet | A fixed 64-slot cap that throws when exceeded |
 | `startTime` / `position` | Milliseconds; `position` **retains** its last value after stop and **resets to 0** at each loop start | `position` stuck at 0, or measured in seconds |
 | `SOUND_COMPLETE` | Dispatched on the `SoundChannel` when playback **finishes** (loops exhausted too) | Never dispatched; or dispatched on `Sound` |
 | `SoundTransform` | Channel-level, then `SoundMixer.soundTransform` applies a **further global layer** | Storing the fields without affecting output |

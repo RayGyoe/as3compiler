@@ -531,7 +531,7 @@ function checkTextSelection(): string[] {
   check('colour setters DROP the alpha byte, like adl',
     c.includes('((TextField*)_this)->borderColor = value & 0xFFFFFFu;')
     && c.includes('((TextField*)_this)->backgroundColor = value & 0xFFFFFFu;')
-    && c.includes('((TextField*)_this)->textColor = value & 0xFFFFFFu;'));
+    && c.includes('tf->textColor = value & 0xFFFFFFu;'));
   check('the colour properties keep plain field reads and only write through setters',
     c.includes('unsigned int TextField_get_borderColor')
     || c.includes('{ "borderColor", 5, offsetof(TextField, borderColor), NULL, NULL, 0, 0, 0 }'));

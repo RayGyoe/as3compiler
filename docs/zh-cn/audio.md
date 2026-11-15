@@ -190,6 +190,7 @@ miniaudio **v0.11.25**，4,108,168 B / 95,864 行。）
 | `play()` 的返回 | **每次返回一个新的 `SoundChannel`**；同一个 `Sound` 可同时多路播放 | 给每个 `Sound` 复用单一 channel ⇒ 第二路吞掉第一路 |
 | `loops` | 「循环回 `startTime` 的次数」：`loops=1` ⇒ 播**两遍**；`loops=0` ⇒ 一遍 | 写成「播放次数」 |
 | 声道上限 | 同时最多 **32** 个；超了 `play()` 返回 **`null`** | 无上限、或抛异常 |
+| PCM 映像注册表 | **按需增长**（阶段四百三十二，G46）：`loadPCMFromByteArray`/解码的映像表无固定槽数上限（旧实现硬 **64** 槽、第 65 次抛 `#2068`）；倍增时旧块永不释放，保实时音频线程无锁读持旧指针仍安全。**回收**（`Sound` 不可达时释放其 buf）尚未做 | 固定 64 槽上限、超限抛异常 |
 | `startTime` / `position` | 毫秒；`position` 停止后**保留**最后值、循环开始时**归零** | `position` 恒 0 或单位搞成秒 |
 | `SOUND_COMPLETE` | 在**播完**（循环也终止）时于 `SoundChannel` 上派发 | 永远不派；或在 `Sound` 上派 |
 | `SoundTransform` | channel 级 → `SoundMixer.soundTransform` 全局**再叠一层** | 只存字段、不影响输出 |

@@ -110,7 +110,25 @@ function checkParseDiagnostics(): string[] {
   check('an unparseable package-level bracket is reported, not hung',
     p5?.message === "Parse error at 1:11: unexpected token '[' in package body");
 
-  check('every parser diagnostic carries a token position', [p1, p2, p3, p4, p5]
+  // G49 (asaotui compiler-gaps): a missing comma between literal elements must be
+  // rejected like mxmlc (array BRACKET_CLOSE / object SCOPE_CLOSE), not silently
+  // accepted as two elements. Array trailing commas are legal; object trailing
+  // commas are not (both measured on mxmlc 51.4.1, temp/g49).
+  const p6 = thrown(() => parse('var a:Array = [1\n2];'));
+  check('an array literal missing a comma is rejected (mxmlc BRACKET_CLOSE)',
+    p6?.message === "Parse error at 2:1: expected ']' but found '2'");
+  const p7 = thrown(() => parse('var o:Object = {a:1\nb:2};'));
+  check('an object literal missing a comma is rejected (mxmlc SCOPE_CLOSE)',
+    p7?.message === "Parse error at 2:1: expected '}' but found 'b'");
+  const p8 = thrown(() => parse('var o:Object = {a:1,};'));
+  check('an object literal trailing comma is rejected (mxmlc: } not allowed)',
+    p8?.message === "Parse error at 1:21: expected a property name but found '}'");
+  check('an array literal trailing comma stays legal (mxmlc accepts [1, 2,])',
+    thrown(() => parse('var a:Array = [1, 2,];')) === null);
+  check('well-formed array/object literals still parse',
+    thrown(() => parse('var a:Array = [1, 2];\nvar o:Object = {a:1, b:2};\nvar e:Array = [];')) === null);
+
+  check('every parser diagnostic carries a token position', [p1, p2, p3, p4, p5, p6, p7, p8]
     .every((e) => typeof e?.token?.line === 'number' && typeof e?.token?.col === 'number'));
 
   if (ok > 0) console.log(`[parsediag] ${ok} parser diagnostic checks passed`);

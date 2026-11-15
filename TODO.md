@@ -20306,6 +20306,24 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-15 追加（阶段四百三十二：asaotui compiler-gaps G46–G51 集中闭合）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**86 行**：`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按状态列重数）。这六条原登记在 sibling 仓
+> [`asaotui/compiler-gaps.md`](../asaotui/compiler-gaps.md)（不在本表），本轮逐条取证后回写判定：**四条确属编译器缺陷已修，两条复核为非缺口**。
+> ① **G49**（数组/对象字面量缺逗号被静默接受）：mxmlc 51.4.1 实测数组缺逗号拒/对象缺逗号拒/数组尾逗号允许/对象尾逗号拒；`parser.ts`
+> `parseArrayLit`/`parseObjectLit` 改 `if (!this.at(',')) break; this.next();`，对象逗号后遇 `}` 抛错；负例钉 `test/unit/diagnostics.ts` p6/p7/p8。
+> ② **G51**（`copyPixels` alpha 遮罩三参数全 `(void)`）：adl `temp/copyprobe` 锁定调制 `modA = maskA==255 ? srcA : (srcA*maskA)>>8`、
+> `mergeAlpha=false` 直拷 RGB+alpha 替换（alpha=0 清零）、`mergeAlpha=true` source-over；`BitmapData_copyPixels` 实现三参数；false 路径逐像素
+> IDENTICAL，true 路径 ±1 取整容差（如实记录）；示例 `copypixels-alpha.as` + `unit: render/CopyPixelsAlpha` 8 钉。
+> ③ **G46**（PCM 注册表硬 64 槽）：`vendor/audio_glue.c` `g_bufs` 改按需倍增指针表（`as_buf_reserve`），旧块永不释放（实时音频线程无锁读持旧指针仍安全），
+> 4 处注册路径统一 reserve；示例 `audio-pcm-registry.as` 注册 80 映像 + `unit: transport/ProgressiveSound` 4 钉。回收路径（建议②）仍属增强另议。
+> ④ **G48**（`textColor` 不覆盖全段 run）：adl `temp/g48` 定性 AIR 的 textColor setter **覆盖** run（case A 墨色蓝且 getTextFormat 读蓝）；
+> `TextField_set_textColor` 镜像 AIR 全段施加 color-only 格式（merge 保留字号）；AOT 5 例逐像素 IDENTICAL；示例 `textcolor-run.as` +
+> `unit: render/TextColorRun` 5 钉 + 重锚 render/text-input 旧 setter 钉。
+> ⑤ **G47**（`stage.focus=null` #1009）：adl `temp/g47` 实测 AIR 确实派发 focusOut（relatedObject=null、bubbles=true），AOT 逐行 IDENTICAL，
+> `as_set_focus`/`as_ime_target` 全 null 安全 ⇒ **非编译器缺陷**，残留 #1009 在库侧 blur 处理（重分类归 asaotui）。
+> ⑥ **G50**（Shape mask 位图双影）：D1 后 `temp/g50` 逐像素证实——全覆盖/部分矩形/圆形 mask 均 0 偏移 0 重影 ⇒ **非缺口**（文档自警的误读），关闭。
+> 全量回归 **714 测试 / 710 通过 / 0 失败 / 4 跳过**（+5：3 新示例 + 2 新单元组），exit=0。版本 `0.4.407 → 0.4.408`。
+
 > **2026-11-15 追加（阶段四百三十一：F1 `Error.getStackTrace` 的 AS3 栈帧模型）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
 > 主表项数不变（**86 行**：`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按状态列重数）。`Error.getStackTrace` 原登记在
 > [`docs/zh-cn/stubs.md`](docs/zh-cn/stubs.md) §3「报明」清单（不在本表），本轮毕业（§3 移除该行、§4 新增毕业行）。**AIR 契约**（adl 51.4.1
@@ -22954,3 +22972,17 @@ README（zh/en）新增 camera-devices 示例描述；plan 文档 B2 标落地�
 - 全量回归 **709/705/0/4** exit=0；纯 C 构建编译通过（影子栈纯 C 无平台依赖）。8 个既有结构钉因发射结构合法变化更新（保留意图）；顺带修复 test/unit/emit.ts 既有 MIXED 行尾。
 
 **记账**：遗留表 86 行不变（`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1；getStackTrace 原登记在 stubs.md §3，本轮毕业）；stubs.md §3 移除 getStackTrace 行、§4 毕业表新增行（zh/en）；README（zh/en）新增 error-stacktrace 示例描述；plan 文档 F1 标落地、批六完成、**全部 12 个里程碑落地**。**经验**：① AS3 栈帧须用运行时影子栈（C backtrace 给的是 mangled C 名、无法映射回 AS3 类/方法），入口 push/返回 leave/catch 与帧边界恢复深度三者缺一不可；② `return new Error()` 必须先把返回值 hoist 进 temp 再 leave，否则 Error 构造时本帧已弹、栈少一层；③ 帧深度恢复要覆盖 emitTry 与 FRE 的所有 setjmp 边界 + 帧边界守卫，漏一处会在异常后栈漂移；④ 私有字段加在 Error.name 之后保 as_error_view 偏移；⑤ 帧名用 fqn/reflectFqn 绝不泄漏 sanitize 名；⑥ **void 函数 `return voidCall();` 不得 hoist 成 `void _ret = ...`**（非法 C，incomplete type 'void'）——真应用 `RWebSocket.sendMessage`/`TextField.appendText` 首编即暴露（示例套件原未覆盖），void 路径直接「执行调用→leave→return;」（bare 与 try/finally 两路），已补示例第 11 例 + 3 结构钉，真应用 x86 重编通过。
+
+### 阶段四百三十二：asaotui compiler-gaps G46–G51 集中闭合（v0.4.407 → v0.4.408）
+
+用户要求审查 sibling 仓 `asaotui/compiler-gaps.md` 的 G46–G51，判断哪些已过时、确属编译器缺陷则修复。逐条取证后：**四条确属缺陷已修（G46/G48/G49/G51），两条复核为非缺口（G47/G50）**。判定与证据回写 `asaotui/compiler-gaps.md`（状态行 + 标题标记）。
+
+- **G49（解析器缺逗号）**：mxmlc 51.4.1 实测（`temp/g49/`，GBK 解码）数组缺逗号拒（`应为 BRACKET_CLOSE`）、对象缺逗号拒（`应为 SCOPE_CLOSE`）、数组尾逗号允许、对象尾逗号拒。`src/parser.ts` `parseArrayLit`/`parseObjectLit` 由「逗号可选」改 `if (!this.at(',')) break; this.next();`，对象逗号后遇 `}` 抛 `expected a property name but found '}'`（向量字面量本就是 while-comma 模式，无需改）。负例钉 `test/unit/diagnostics.ts` p6/p7/p8（精确文案 + 行列）+ 两条正例。
+- **G51（copyPixels alpha 遮罩）**：adl `temp/copyprobe/` 锁定 AIR 语义——alpha 调制 `modA = maskA==255 ? srcA : (srcA*maskA)>>8`（m255 特例，44 点扫描全匹配）；`mergeAlpha=false` 直拷源 RGB + 调制 alpha 替换目标 alpha、alpha=0 整像素清零（AIR premul 内部表示）；`mergeAlpha=true` 调制后 source-over（premul /255）。`src/emit.ts` `BitmapData_copyPixels` 实现三参数（`alphaPoint` 偏移采样、越界读透明）。**false 路径 12 例 + 扫描逐像素 IDENTICAL**；**true 路径 64 例 ±1 取整容差**（AIR 内部 premul 取整极精细，round/floor 各有 ±1，取最优 round 版，视觉不可察，如实记录）。示例 `examples/copypixels-alpha.as`（纯 C）+ `unit: render/CopyPixelsAlpha` 8 钉。
+- **G46（PCM 注册表硬 64 槽）**：`vendor/audio_glue.c` `g_bufs` 由 `static as_pcm_buf[64]` 改按需倍增指针表（`as_buf_reserve`，初值 64），**旧块永不释放**——实时音频线程无锁读 `g_bufs[voice.buf]`，持旧指针仍安全（poor-man's RCU，O(log N) 保留）；新条目写完再 `__atomic_store_n(&g_bufs, nb, __ATOMIC_RELEASE)` 发布。4 处注册路径（decode/register_pcm/stream/buffered）统一 `if (!as_buf_reserve()) return -1;`。示例 `examples/audio-pcm-registry.as`（注册 80 映像 >64，链 audio_glue）+ `unit: transport/ProgressiveSound` 4 钉。回收路径（建议②，Sound 不可达时回收 buf）仍属增强另议。
+- **G48（textColor 不覆盖 run）**：adl `temp/g48/` 定性——AIR 的 textColor setter **覆盖全段 run**（case A：setTextFormat(红) 后 textColor=蓝 ⇒ 墨色蓝且 getTextFormat().color=蓝；case B 后写的 setTextFormat 生效；case E merge 保留字号）。`src/emit.ts` `TextField_set_textColor` 镜像 AIR：`as_tf_fmt_blank()` 造 color-only 格式后 `TextField_setTextFormat(_this, f, 0, -1)` 全段施加。AOT 5 例与 AIR **逐像素 IDENTICAL**。示例 `examples/textcolor-run.as`（链 Skia）+ `unit: render/TextColorRun` 5 钉；重锚 render/text-input 两处旧 setter 结构钉（保留 24-bit 掩码 + mark dirty 意图）。4 个既有 textColor 示例（stage94g/h、textfield-align/dyn-set）无回归。
+- **G47（stage.focus=null #1009）——非编译器缺陷**：adl `temp/g47/`（input TextField 持焦→清空）实测 AIR **确实派发** focusOut（relatedObject=null、bubbles=true），AOT 逐行 **IDENTICAL**；`as_set_focus`/`as_focus_dispatch`/`as_ime_target` 全 null 安全。⇒ 焦点派发与 AIR 一致，残留 #1009 在**库侧 blur 处理**（对 relatedObject=null 取属性），重分类归 asaotui 库修，编译器不改。
+- **G50（Shape mask 位图双影）——非缺口**：D1（像素遮罩）落地后 `temp/g50/` 逐像素证实——锐利非对称位图 + Shape mask 离屏 draw：全覆盖 mask 与原图 0 差异、部分矩形 mask 与向量参考 0 差异且 mask 外 0 重影、圆形 mask 内圈 0 差异外圈 0 重影。⇒ 文档自警的「圆边界穿字被误读为偏移重影」成立，按「逐像素证实才立案」纪律关闭为非缺口。
+- 全量回归 **714 测试 / 710 通过 / 0 失败 / 4 跳过** exit=0（+5：3 新示例 + 2 新单元组；G49/G46 钉并入既有组不增用例数）。版本 `0.4.407 → 0.4.408`。
+
+**记账**：遗留表 86 行不变（`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1；G46–G51 原登记在 asaotui/compiler-gaps.md，不在本表，本轮只回写判定）；README（zh/en）新增 copypixels-alpha / textcolor-run / audio-pcm-registry 三示例。**经验**：① 视觉观察到的「重影/抖动」必须逐像素证实才立案——G50 的「双影」正是文档自己警告的误读，D1 后 mask 对位图内容栅格化无偏移；② 「运行时崩」要先用 adl 对照派发契约再定罪——G47 的 focusOut 派发与 AIR 逐行一致，#1009 实为库侧 null 守卫缺失，不凭推测改编译器；③ textColor 语义须 adl 定性（覆盖 run 而非 run 优先），setter 镜像 AIR 全段施加 color-only 格式比改渲染优先级更忠实（连 getTextFormat().color 都对齐）；④ copyPixels 的 alpha 调制有 m255 特例（(srcA*maskA)>>8 但 maskA==255 保留 srcA），mergeAlpha=true 的 AIR premul 取整极精细、±1 容差须如实记录不粉饰；⑤ 实时音频线程无锁读的注册表增长须旧块永不释放（poor-man's RCU），realloc-移动-释放会 use-after-free。

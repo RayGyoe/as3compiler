@@ -1364,7 +1364,12 @@ class Parser {
     const elements: Expr[] = [];
     while (!this.at(']')) {
       elements.push(this.parseAssignment()); // separator context: no comma operator
-      if (this.at(',')) this.next();
+      // mxmlc requires a comma between elements: without one the literal must
+      // end, so the expect(']') below rejects `[1 2]` ("expected ']' but found
+      // '2'", mxmlc's BRACKET_CLOSE). A trailing comma IS legal (`[1, 2,]`,
+      // measured on mxmlc 51.4.1) -- the loop re-checks ']' after the comma.
+      if (!this.at(',')) break;
+      this.next();
     }
     this.expect(']');
     return { kind: 'ArrayLit', elements };
@@ -1393,7 +1398,14 @@ class Parser {
       this.expect(':');
       const value = this.parseAssignment(); // separator context: no comma operator
       fields.push({ name, value });
-      if (this.at(',')) this.next();
+      // mxmlc requires a comma between fields and rejects a TRAILING comma
+      // (`{a:1, b:2,}` -> "} not allowed here"); a missing comma ends the literal
+      // and the expect('}') below rejects `{a:1 b:2}` (mxmlc's SCOPE_CLOSE).
+      if (!this.at(',')) break;
+      this.next();
+      if (this.at('}')) {
+        throw new ParseError(`expected a property name but found '}'`, this.peek());
+      }
     }
     this.expect('}');
     return { kind: 'ObjectLit', fields };

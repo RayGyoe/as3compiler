@@ -126,8 +126,28 @@ typedef struct {
     long long wk_samples;
 } as_pcm_buf;
 
-static as_pcm_buf g_bufs[64];
+// G46: the PCM registry grows on demand instead of a hard 64-slot cap (a photo
+// slideshow that decodes one image per slide used to exhaust it and throw #2068).
+// Growth allocates a LARGER block, copies the live entries, and publishes the new
+// pointer; the OLD block is intentionally NEVER freed. The real-time audio thread
+// reads g_bufs[voice.buf] without a lock, so a stale pointer must stay valid
+// forever (poor-man's RCU; retention is O(log N) blocks). New entries are fully
+// written before the pointer is published, and a voice only references a buffer
+// after registration completes on the AS3 frame boundary, so the audio thread
+// never observes a half-written entry.
+static as_pcm_buf* g_bufs = NULL;
 static int g_buf_count = 0;
+static int g_buf_cap = 0;
+static int as_buf_reserve(void) {
+    if (g_buf_count < g_buf_cap) return 1;
+    int ncap = g_buf_cap ? g_buf_cap * 2 : 64;
+    as_pcm_buf* nb = (as_pcm_buf*)malloc((size_t)ncap * sizeof(as_pcm_buf));
+    if (nb == NULL) return 0;
+    if (g_bufs != NULL) memcpy(nb, g_bufs, (size_t)g_buf_count * sizeof(as_pcm_buf));
+    __atomic_store_n(&g_bufs, nb, __ATOMIC_RELEASE);
+    g_buf_cap = ncap;
+    return 1;
+}
 
 // ---------------------------------------------------------------------------
 // Voices
@@ -553,7 +573,7 @@ static int as_decode_image(const void* data, unsigned int size, float** outp, lo
 // Decode a whole image into a fresh registry buffer. Synchronous, exactly like
 // Sound.loadCompressedDataFromByteArray (audio.md §5).
 int as_audio_decode(const void* data, unsigned int size) {
-    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    if (!as_buf_reserve()) return -1;
     float* pcm = NULL;
     long long got = 0;
     int channels = 0, rate = 0;
@@ -590,7 +610,7 @@ const char* as_audio_id3_field(int buf, int which) {
 // The samples are copied into the same never-freed shape as a decoded file.
 int as_audio_register_pcm(const float* pcm, long long frames, int channels, int rate) {
     if (pcm == NULL || frames <= 0 || channels <= 0 || rate <= 0) return -1;
-    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    if (!as_buf_reserve()) return -1;
     float* copy = (float*)malloc((size_t)frames * (size_t)channels * sizeof(float));
     if (copy == NULL) return -1;
     memcpy(copy, pcm, (size_t)frames * (size_t)channels * sizeof(float));
@@ -863,7 +883,7 @@ static void as_mp3_wk_feed(as_pcm_buf* b, const unsigned char* p, long long n, i
 // Order a fresh streaming buffer. Returns the buffer id, or -1 when the registry is
 // full. The caller (Sound.load) owns it until the transfer ends.
 int as_audio_stream_open(void) {
-    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    if (!as_buf_reserve()) return -1;
     int id = g_buf_count++;
     memset(&g_bufs[id], 0, sizeof(g_bufs[id]));
     g_bufs[id].used = 1;
@@ -971,7 +991,7 @@ int as_audio_stream_close(int buf, int complete, const void* whole, unsigned int
 // its rate/channels known from the start and its frames appended as f32.
 int as_audio_live_open(int channels, int rate) {
     if (channels <= 0 || rate <= 0) return -1;
-    if (g_buf_count >= (int)(sizeof(g_bufs) / sizeof(g_bufs[0]))) return -1;
+    if (!as_buf_reserve()) return -1;
     int id = g_buf_count++;
     memset(&g_bufs[id], 0, sizeof(g_bufs[id]));
     g_bufs[id].used = 1;

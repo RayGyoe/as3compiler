@@ -24798,17 +24798,68 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void BitmapData_copyPixels(void* _this, BitmapData* src, Rectangle* srcRect, Point* dest, BitmapData* alphaBmp, Point* alphaPt, bool mergeAlpha) {');
     this.indent++;
     this.line('BitmapData* bd = (BitmapData*)_this;');
-    this.line('(void)alphaBmp; (void)alphaPt; (void)mergeAlpha;');
     this.line('if (bd == NULL || bd->pixels == NULL || src == NULL || src->pixels == NULL || srcRect == NULL || dest == NULL) return;');
     this.line('as_bd_mark_dirty(bd);');
     this.line('int sx0 = (int)srcRect->x, sy0 = (int)srcRect->y;');
     this.line('int w = (int)srcRect->width, h = (int)srcRect->height;');
     this.line('int dx0 = (int)dest->x, dy0 = (int)dest->y;');
+    this.line('int ax0 = alphaPt ? (int)alphaPt->x : 0, ay0 = alphaPt ? (int)alphaPt->y : 0;');
     this.line('for (int y = 0; y < h; y++) { for (int x = 0; x < w; x++) {');
+    this.indent++;
     this.line('int sx = sx0 + x, sy = sy0 + y, dx = dx0 + x, dy = dy0 + y;');
     this.line('if (sx < 0 || sy < 0 || sx >= src->width || sy >= src->height) continue;');
     this.line('if (dx < 0 || dy < 0 || dx >= bd->width || dy >= bd->height) continue;');
-    this.line('((unsigned*)bd->pixels)[dy * bd->width + dx] = ((unsigned*)src->pixels)[sy * src->width + sx];');
+    this.line('unsigned s = ((unsigned*)src->pixels)[sy * src->width + sx];');
+    this.line('unsigned sa = (s >> 24) & 0xFFu;');
+    // alphaBitmapData modulates the source alpha (G51). AIR's modulation is
+    // (srcA*maskA)>>8 with an opaque-mask fast path that keeps srcA exact
+    // (measured on adl 51.4.1, temp/copyprobe sweep: srcA=255 m128->127,
+    // m255->255). An out-of-bounds mask sample reads as transparent.
+    this.line('if (alphaBmp != NULL && alphaBmp->pixels != NULL) {');
+    this.indent++;
+    this.line('int ax = ax0 + x, ay = ay0 + y;');
+    this.line('unsigned ma = 0;');
+    this.line('if (ax >= 0 && ay >= 0 && ax < alphaBmp->width && ay < alphaBmp->height)');
+    this.line('  ma = (((unsigned*)alphaBmp->pixels)[ay * alphaBmp->width + ax] >> 24) & 0xFFu;');
+    this.line('sa = (ma == 255u) ? sa : ((sa * ma) >> 8);');
+    this.indent--;
+    this.line('}');
+    this.line('unsigned* dp = &((unsigned*)bd->pixels)[dy * bd->width + dx];');
+    this.line('if (!mergeAlpha) {');
+    this.indent++;
+    // mergeAlpha=false: straight source RGB, the (modulated) alpha REPLACES dest.
+    // A zero alpha clears the RGB too (AIR stores premultiplied: alpha 0 => 0x0).
+    this.line('if (sa == 0) { *dp = 0; } else { *dp = (s & 0x00FFFFFFu) | (sa << 24); }');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    // mergeAlpha=true: source-over blend of the modulated source onto dest,
+    // premultiplied with /255 at each step (adl temp/copyprobe cases 2/4).
+    this.line('unsigned d = *dp;');
+    this.line('unsigned da = (d >> 24) & 0xFFu;');
+    this.line('unsigned inv = 255u - sa;');
+    this.line('unsigned oa = sa + (da * inv + 127u) / 255u;');
+    this.line('if (oa == 0) { *dp = 0; } else {');
+    this.indent++;
+    this.line('unsigned out = 0;');
+    this.line('for (int ch = 0; ch < 3; ch++) {');
+    this.indent++;
+    this.line('int shift = ch * 8;');
+    this.line('unsigned sc = (s >> shift) & 0xFFu, dc = (d >> shift) & 0xFFu;');
+    this.line('unsigned sp = (sc * sa + 127u) / 255u;');
+    this.line('unsigned dpp = (dc * da + 127u) / 255u;');
+    this.line('unsigned op = sp + (dpp * inv + 127u) / 255u;');
+    this.line('unsigned oc = (op * 255u + oa / 2) / oa;');
+    this.line('if (oc > 255u) oc = 255u;');
+    this.line('out |= oc << shift;');
+    this.indent--;
+    this.line('}');
+    this.line('*dp = out | (oa << 24);');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
+    this.indent--;
     this.line('} }');
     this.indent--;
     this.line('}');
@@ -27357,7 +27408,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     // it the value read back was 0x8000FF00 while adl reported 0x0000FF00.
     this.line('void TextField_set_borderColor(void* _this, unsigned int value) { ((TextField*)_this)->borderColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }');
     this.line('void TextField_set_backgroundColor(void* _this, unsigned int value) { ((TextField*)_this)->backgroundColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }');
-    this.line('void TextField_set_textColor(void* _this, unsigned int value) { ((TextField*)_this)->textColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }');
+    this.line('void TextField_set_textColor(void* _this, unsigned int value) {');
+    this.indent++;
+    this.line('TextField* tf = (TextField*)_this;');
+    this.line('tf->textColor = value & 0xFFFFFFu;');
+    // G48: AIR's textColor setter applies the colour to the WHOLE text, overriding
+    // any existing run colour (adl 51.4.1 temp/g48 case A: setTextFormat(red) then
+    // textColor=blue renders BLUE and getTextFormat().color reads blue; case B the
+    // later setTextFormat wins). Mirror it by applying a colour-only format over the
+    // full range -- the setTextFormat merge keeps each run's size/font/etc. The
+    // default field value 0 never runs this setter, so an untouched field still
+    // renders its runs, and the fast-path colour read (fpf->color) now agrees.
+    this.line('TextFormat* f = as_tf_fmt_blank();');
+    this.line('f->color = as_v_num((double)(value & 0xFFFFFFu));');
+    this.line('TextField_setTextFormat(_this, f, 0, -1);');
+    this.line('as_mark_dirty((DisplayObject*)tf);');
+    this.indent--;
+    this.line('}');
     // Point/Rectangle/Matrix/ColorTransform hold only double fields, so they are
     // plain value bundles (no GC pointers); Transform holds Matrix/ColorTransform
     // object references and is marked via its prop table.

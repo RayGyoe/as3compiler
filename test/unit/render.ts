@@ -2914,7 +2914,9 @@ function checkRepaintBoundary(): string[] {
     emitted.includes('void TextField_set_text(void* _this, char* value) {')
     && emitted.includes('void TextField_set_htmlText(void* _this, char* value) { as_tf_html_set((TextField*)_this, value); as_mark_dirty((DisplayObject*)_this); }'));
   check('TextField colour setters mark dirty',
-    emitted.includes('void TextField_set_textColor(void* _this, unsigned int value) { ((TextField*)_this)->textColor = value & 0xFFFFFFu; as_mark_dirty((DisplayObject*)_this); }'));
+    emitted.includes('void TextField_set_textColor(void* _this, unsigned int value) {')
+    && emitted.includes('tf->textColor = value & 0xFFFFFFu;')
+    && emitted.includes('as_mark_dirty((DisplayObject*)tf);'));
   check('TextField text-mutation methods (appendText/replaceText/scrollH/selection/setTextFormat) mark dirty',
     emitted.includes('void TextField_appendText(void* _this, char* s) {')
     && emitted.includes('void TextField_replaceText(void* _this, int beginIndex, int endIndex, char* newText) {')
@@ -3319,3 +3321,72 @@ function checkFilterShadowGlow(): string[] {
   return bad;
 }
 registerGroup('unit: render/FilterShadowGlow', checkFilterShadowGlow);
+
+// G51 (asaotui compiler-gaps): copyPixels must honour alphaBitmapData/alphaPoint/
+// mergeAlpha (all three were `(void)`-discarded). The alpha-modulation formula and
+// the mergeAlpha=false regime are pixel-exact against adl 51.4.1 (temp/copyprobe);
+// mergeAlpha=true is a premultiplied source-over (±1 rounding on partial alpha).
+function checkCopyPixelsAlpha(): string[] {
+  const bad: string[] = [];
+  const ok = (cond: boolean, msg: string): void => { if (!cond) bad.push(msg); };
+  const c = generateC(parse(`
+    import flash.display.BitmapData;
+    import flash.geom.Rectangle;
+    import flash.geom.Point;
+    var bd:BitmapData = new BitmapData(8, 8, true, 0);
+    var src:BitmapData = new BitmapData(8, 8, true, 0);
+    var mask:BitmapData = new BitmapData(8, 8, true, 0);
+    bd.copyPixels(src, new Rectangle(0, 0, 8, 8), new Point(0, 0), mask, new Point(0, 0), true);
+  `)).c.replace(/\r\n/g, '\n');
+  const i = c.indexOf('void BitmapData_copyPixels(void* _this, BitmapData* src, Rectangle* srcRect, Point* dest, BitmapData* alphaBmp, Point* alphaPt, bool mergeAlpha) {');
+  ok(i >= 0, 'BitmapData_copyPixels must exist');
+  const body = c.slice(i, c.indexOf('\n}', i));
+  ok(!body.includes('(void)alphaBmp'), 'alphaBmp must no longer be discarded');
+  ok(!body.includes('(void)mergeAlpha'), 'mergeAlpha must no longer be discarded');
+  ok(body.includes('sa = (ma == 255u) ? sa : ((sa * ma) >> 8);'),
+    'alpha modulation must be (srcA*maskA)>>8 with the opaque-mask fast path (adl sweep)');
+  ok(body.includes('int ax0 = alphaPt ? (int)alphaPt->x : 0, ay0 = alphaPt ? (int)alphaPt->y : 0;'),
+    'alphaPoint must offset the mask sampling (default 0,0)');
+  ok(body.includes('if (ax >= 0 && ay >= 0 && ax < alphaBmp->width && ay < alphaBmp->height)'),
+    'mask sampling must be bounds-checked (out-of-bounds reads transparent)');
+  ok(body.includes('if (sa == 0) { *dp = 0; } else { *dp = (s & 0x00FFFFFFu) | (sa << 24); }'),
+    'mergeAlpha=false keeps straight RGB, replaces alpha, and clears RGB at alpha 0');
+  ok(body.includes('unsigned oa = sa + (da * inv + 127u) / 255u;'),
+    'mergeAlpha=true must source-over blend (outA = sa + da*(255-sa)/255)');
+  ok(body.includes('for (int ch = 0; ch < 3; ch++)'),
+    'mergeAlpha=true must blend each RGB channel');
+  console.log('[copypixelsalpha] copyPixels alpha-mask checks done');
+  return bad;
+}
+registerGroup('unit: render/CopyPixelsAlpha', checkCopyPixelsAlpha);
+
+// G48 (asaotui compiler-gaps): TextField.textColor must override the whole-text run
+// colour, not lose to it. AIR's setter applies a colour-only format over the full
+// range (adl 51.4.1 temp/g48 case A/E); the old body just stored the field, so a
+// measured field's full-range run permanently shadowed textColor (theme switch left
+// every label on the old palette). Pin the setter's new shape.
+function checkTextColorRun(): string[] {
+  const bad: string[] = [];
+  const ok = (cond: boolean, msg: string): void => { if (!cond) bad.push(msg); };
+  const c = generateC(parse(`
+    import flash.text.TextField;
+    var tf:TextField = new TextField();
+    tf.text = "x";
+    tf.textColor = 0xFF0000;
+  `)).c.replace(/\r\n/g, '\n');
+  const i = c.indexOf('void TextField_set_textColor(void* _this, unsigned int value) {');
+  ok(i >= 0, 'TextField_set_textColor must exist');
+  const body = c.slice(i, c.indexOf('\n}', i));
+  ok(body.includes('tf->textColor = value & 0xFFFFFFu;'),
+    'textColor must still mask to 24-bit RGB on write');
+  ok(body.includes('TextFormat* f = as_tf_fmt_blank();')
+    && body.includes('f->color = as_v_num((double)(value & 0xFFFFFFu));'),
+    'the setter must build a colour-only format');
+  ok(body.includes('TextField_setTextFormat(_this, f, 0, -1);'),
+    'the setter must apply the colour over the full range (override existing runs, like AIR)');
+  ok(body.includes('as_mark_dirty((DisplayObject*)tf);'),
+    'the setter must mark the field render-dirty');
+  console.log('[textcolorrun] textColor run-override checks done');
+  return bad;
+}
+registerGroup('unit: render/TextColorRun', checkTextColorRun);

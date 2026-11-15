@@ -340,6 +340,9 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // runner links the same glue but has no device, so the example branches on
   // SoundMixer.areSoundsInaccessible() and passes either way.
   'audio.as': ['--manifest', join(dir, 'audio.build.json')],
+  // G46: the PCM registry must grow past the old fixed 64-slot cap. Same audio
+  // glue as audio.as; registers 80 PCM images and asserts none throws #2068.
+  'audio-pcm-registry.as': ['--manifest', join(dir, 'audio-pcm-registry.build.json')],
   // The video seam is the same shape of build-layer choice (阶段三百九十九): the
   // manifest is what links vendor/video_glue.c + FFmpeg, defines ASC_HAVE_VIDEO and
   // carries the Windows GPU-window backend. Without it this example can say nothing
@@ -445,6 +448,9 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // （temp/cabmprobe）scale/translate/identity 都与无矩阵逐像素一致。需光栅后端，链 Skia。
   'cache-matrix.as': ['--manifest', join(dir, 'cache-matrix.build.json')],
   'filter-shadow-glow.as': ['--manifest', join(dir, 'filter-shadow-glow.build.json')],
+  // textcolor-run.as（阶段四百三十二，G48）钉 textColor 覆盖全段 run 颜色的**像素**契约
+  // （adl 51.4.1 temp/g48：textColor setter 等价全段 color-only 格式）。需光栅后端，链 Skia。
+  'textcolor-run.as': ['--manifest', join(dir, 'textcolor-run.build.json')],
   // draw-over.as 断言的也是**像素**（draw() 的 SourceOver 合成值），同样需要光栅后端。
   'draw-over.as': ['--manifest', join(dir, 'draw-over.build.json')],
   // roundrect.as（阶段二百六十七 · G19）断言的也是**像素**：drawRoundRect 的两个半径必须

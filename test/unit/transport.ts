@@ -874,6 +874,19 @@ function checkProgressiveSound(): string[] {
   check('the buffered (non-progressive) formats are decoded once at close',
     glue.includes('if (b->fmt == AS_SFMT_BUFFERED) {   // decoded in one pass at COMPLETE'));
 
+  // 5. G46: the PCM registry grows on demand (no hard 64-slot cap), and the old
+  //    block is never freed so the lock-free real-time audio thread stays safe.
+  check('the PCM registry is a growable pointer, not a fixed 64-slot array',
+    glue.includes('static as_pcm_buf* g_bufs = NULL;') && !glue.includes('static as_pcm_buf g_bufs[64];'));
+  check('as_buf_reserve doubles capacity on demand',
+    glue.includes('int ncap = g_buf_cap ? g_buf_cap * 2 : 64;'));
+  check('the old block is never freed (real-time audio thread may hold a stale pointer)',
+    glue.includes('__atomic_store_n(&g_bufs, nb, __ATOMIC_RELEASE);')
+    && !/free\(g_bufs\)|free\(old\)/.test(glue));
+  check('every registration path reserves instead of checking a fixed cap',
+    (glue.match(/if \(!as_buf_reserve\(\)\) return -1;/g) ?? []).length >= 4
+    && !glue.includes('sizeof(g_bufs) / sizeof(g_bufs[0])'));
+
   if (ok > 0) console.log(`[progressive-sound] ${ok} progressive-Sound checks passed`);
   return bad;
 }

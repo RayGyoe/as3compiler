@@ -168,6 +168,7 @@ divergence（见 [`swc.md`](swc.md) §9.2 F5 与 AGENTS.md 的 SWC 实测口径�
 | **H6** | `defaultTextFormat = null` 与 `setTextFormat(null, …)` 都抛 `TypeError #2007 "Parameter format must be non-null."` | F1/G1 | 两处 setter 入口显式抛（原先 `setTextFormat(null)` 是静默无操作） |
 | **H7** | `setTextFormat(fmt, b, e)` 同样逐字段合并，且「保持」的基准是 **`b` 处当前生效的格式**（run），不是字段默认 | L1/L2 | `format = as_tf_fmt_merge(format, as_tf_fmt_at(tf, begin))` |
 | **H8** | `appendText` 的两个怪癖：① 追加的字符取**前一字符**的格式；② 调用后 `defaultTextFormat` 被改写成**下标 0 字符**的格式副本 | P4/Q2/Q3/J4 | `TextField_appendText` 内两处显式写出（注释标明是实测口径，不是推导） |
+| **H9** | `textColor` setter **覆盖全段 run 颜色**（等价于对全段施加 color-only 格式）：`setTextFormat(红)` 后 `textColor=蓝` ⇒ 渲染蓝且 `getTextFormat().color` 读蓝；反序则后写的 `setTextFormat` 生效；merge 保留 run 的字号/字体 | `temp/g48/` case A/B/E（adl 51.4.1，AOT 逐像素 IDENTICAL） | `TextField_set_textColor` 造 `as_tf_fmt_blank()` color-only 格式后 `TextField_setTextFormat(_this,f,0,-1)`（阶段四百三十二，G48；修前「有 run 时 run 优先」让主题切换后文字停在旧调色板） |
 
 配套的结构改动：`TextField` 的 `defaultTextFormat` 由**字段**改为**访问器对**（AIR 里它本来就是
 property），C 存储换成运行时槽 `_dtf`/`_insFmt`（进 props 表的 GC 标记，不暴露给 AS3）；
