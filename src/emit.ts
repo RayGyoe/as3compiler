@@ -38105,7 +38105,16 @@ void FileStream_writeObject(void* _this, as_value v) {
           this.hoistImpure(e.right, guaranteed);
         }
         const logical = e.op === '&&' || e.op === '||';
-        if (logical && (!this.isPureExpr(e.left) || (guaranteed && !this.isAtomicExpr(e.left)))) {
+        // The left temp is a PRELUDE statement, so it may only be hoisted when this
+        // logical expression is GUARANTEED to run. Inside a short-circuited branch
+        // (guaranteed=false) an eager prelude evaluates the left even when the branch
+        // is skipped: `n != null && (n.inert() || !n.visible || ...)` threw #1009
+        // because the impure `n.inert()` was hoisted to a `_sc` temp and ran on a null
+        // n (compiler-gaps G47). The `!isPureExpr` arm used to sit OUTSIDE the
+        // guaranteed gate, which is exactly that bug. When not guaranteed, sequence
+        // the operands in place; emitBinary's bool fast path still evaluates each
+        // exactly once via C `&&`/`||` (which short-circuits).
+        if (logical && guaranteed && (!this.isPureExpr(e.left) || !this.isAtomicExpr(e.left))) {
           this.sequenceValueExpr(e.left, true, guaranteed);
           const l = this.emitExpr(e.left);
           const tmp = this.tmpName('sc');

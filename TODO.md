@@ -20306,6 +20306,16 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-15 追加（阶段四百三十三：G47 短路提升根治，纠正阶段四百三十二误判）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表项数不变（**86 行**）。阶段四百三十二曾把 G47（`focusNode(null)` #1009）判为「非编译器缺陷（库侧 blur）」——**本轮证伪并根治**：
+> adl 探针测的是 `stage.focus=null` 直接赋值（那条确实 null 安全），但真正崩的是 `UiApp.focusNode` 的守卫
+> `n != null && (n.inert() || !n.visible || n.app != this)` 被**误编译**。`src/emit.ts` `sequenceValueExpr` 把短路逻辑的 impure 左臂
+> 急切提升为前导 `_sc` 临时语句（`!isPureExpr(left)` 在 `guaranteed` 门**外**），被短路跳过的分支仍求值 ⇒ n=null 时对空 n 调 `inert()` 抛 #1009，
+> **与 TextField 无关**（FRESH 会话也抛）。最小复现 `f != null && (f.bar() || f.baz())`。修法：提升条件 gating 到 `guaranteed`
+> （`if (logical && guaranteed && (!isPureExpr(left) || !isAtomicExpr(left)))`），双 bool 走 emitBinary 的 C `&&`/`||` 快路径（每操作数恰一次、短路），
+> 堵住 AGENTS.md §2.4「短路不提升」红线。示例 `examples/short-circuit-guard.as`（8 组，**有牙**：回退修复⇒#1009⇒恢复⇒绿）。
+> 全量回归 **715 测试 / 711 通过 / 0 失败 / 4 跳过**（+1 新示例），exit=0。版本 `0.4.408 → 0.4.409`。
+
 > **2026-11-15 追加（阶段四百三十二：asaotui compiler-gaps G46–G51 集中闭合）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
 > 主表项数不变（**86 行**：`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1，已按状态列重数）。这六条原登记在 sibling 仓
 > [`asaotui/compiler-gaps.md`](../asaotui/compiler-gaps.md)（不在本表），本轮逐条取证后回写判定：**四条确属编译器缺陷已修，两条复核为非缺口**。
@@ -22972,6 +22982,18 @@ README（zh/en）新增 camera-devices 示例描述；plan 文档 B2 标落地�
 - 全量回归 **709/705/0/4** exit=0；纯 C 构建编译通过（影子栈纯 C 无平台依赖）。8 个既有结构钉因发射结构合法变化更新（保留意图）；顺带修复 test/unit/emit.ts 既有 MIXED 行尾。
 
 **记账**：遗留表 86 行不变（`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1；getStackTrace 原登记在 stubs.md §3，本轮毕业）；stubs.md §3 移除 getStackTrace 行、§4 毕业表新增行（zh/en）；README（zh/en）新增 error-stacktrace 示例描述；plan 文档 F1 标落地、批六完成、**全部 12 个里程碑落地**。**经验**：① AS3 栈帧须用运行时影子栈（C backtrace 给的是 mangled C 名、无法映射回 AS3 类/方法），入口 push/返回 leave/catch 与帧边界恢复深度三者缺一不可；② `return new Error()` 必须先把返回值 hoist 进 temp 再 leave，否则 Error 构造时本帧已弹、栈少一层；③ 帧深度恢复要覆盖 emitTry 与 FRE 的所有 setjmp 边界 + 帧边界守卫，漏一处会在异常后栈漂移；④ 私有字段加在 Error.name 之后保 as_error_view 偏移；⑤ 帧名用 fqn/reflectFqn 绝不泄漏 sanitize 名；⑥ **void 函数 `return voidCall();` 不得 hoist 成 `void _ret = ...`**（非法 C，incomplete type 'void'）——真应用 `RWebSocket.sendMessage`/`TextField.appendText` 首编即暴露（示例套件原未覆盖），void 路径直接「执行调用→leave→return;」（bare 与 try/finally 两路），已补示例第 11 例 + 3 结构钉，真应用 x86 重编通过。
+
+### 阶段四百三十三：G47 短路提升根治（纠正阶段四百三十二「非编译器缺陷」误判）（v0.4.408 → v0.4.409）
+
+阶段四百三十二把 asaotui G47（`focusNode(null)` 抛 #1009）判为「非编译器缺陷（库侧 blur）」。本轮在 sibling 仓撤绕行时**证伪并根治**：那是编译器违反短路红线的真缺陷。
+
+- **误判何以发生**：阶段四百三十二的 adl 探针测的是 `stage.focus=null` **直接赋值**——那条路径确实 null 安全、与 AIR 逐行 IDENTICAL。但真正崩的不是它，而是 `UiApp.focusNode` 的**守卫** `if (n != null && (n.inert() || !n.visible || n.app != this)) return;`。探针没覆盖到守卫，遂把库侧正确 AS3 误判为缺陷源。
+- **真因（逐行取证）**：`src/emit.ts` `sequenceValueExpr` 的 Binary 分支，提升条件 `if (logical && (!isPureExpr(left) || (guaranteed && !isAtomicExpr(left))))` 把 `!isPureExpr(left)` 放在 `guaranteed` 门**外** ⇒ 被短路跳过的分支也发前导语句。生成 C 把 `&&` 右侧 `||` 链急切提升：`bool _sc747 = inert(as_req_obj(n)); ... bool _sc749 = (_sc746 && _sc748);`——n=null 时 `_sc746=false` 本应短路，但 `as_req_obj(n)` 已急切求值 ⇒ 对空 n 调 `inert()` 抛 #1009。**与 TextField/焦点无关**：全新会话 `focusNode(null)` 同样抛（asaotui `probes/widgets/blur-null` FRESH 相位实证）。最小复现 `temp/g47-min/`：`f != null && f.bar()` 存活、`f != null && (f.bar() || f.baz())` 抛 #1009。
+- **修法（最小改动）**：提升条件 gating 到 `guaranteed`：`if (logical && guaranteed && (!isPureExpr(left) || !isAtomicExpr(left)))`。非 guaranteed 时不发前导语句；双 bool 的 `&&`/`||` 走 `emitBinary` 的 C 快路径（每操作数恰一次、短路）。不动快路径，避免双求值/值语义回归。堵的是 AGENTS.md §2.4「短路 `&&`/`||`、`?:`、循环条件不提升」红线。
+- **负例钉（有牙）**：`examples/short-circuit-guard.as` 8 组——null 守卫复合 `||` 不抛、跳过分支 impure 操作数零调用、到达时恰一次、`||` 真左跳右、三项 focusNode 形状、对象 `||` 值语义同一性透传、嵌套跳过。**回退修复 ⇒ `Uncaught #1009`，恢复 ⇒ 全过**。
+- 全量回归 **715 测试 / 711 通过 / 0 失败 / 4 跳过** exit=0（+1 新示例）。版本 `0.4.408 → 0.4.409`。
+
+**记账**：遗留表 86 行不变（G47 原登记在 asaotui/compiler-gaps.md，本轮在该仓重分类为「编译器缺陷·已修」）；README（zh/en）新增 short-circuit-guard 示例。**经验**：① 「运行时崩」用 adl 对照派发契约定罪时，探针必须覆盖**真正崩的那一行**——G47 测了 null 安全的 `stage.focus=null` 却漏了被误编译的守卫，遂误判；② 短路逻辑的 impure 臂提升必须以「该表达式保证求值」为前提，否则被跳过的分支会急切求值（前导语句无短路）；③ 库侧正确 AS3 在 AOT 崩而 adl 不崩，先疑编译器语义保真而非库代码。
 
 ### 阶段四百三十二：asaotui compiler-gaps G46–G51 集中闭合（v0.4.407 → v0.4.408）
 

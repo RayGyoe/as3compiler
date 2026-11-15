@@ -503,6 +503,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/fib.as` — 函数、`while`、`for`、递归边界
 - `examples/class.as` — 类、字段、方法、`new`、`this`
 - `examples/features.as` — 除法/取模、比较、逻辑、自增、字符串相等
+- `examples/short-circuit-guard.as` — **短路守卫的 impure 臂不得急切提升**（阶段四百三十三）：`n != null && (n.inert() || ...)` 在 n=null 时跳过分支零调用、不抛 #1009；复合 `||`/嵌套/对象 `||` 值语义同一性透传，8 组断言（回退修复即红，有牙）
 - `examples/syntax.as` — `uint`、十六进制、`do-while`、`switch`、三元、`break`/`continue`、`Infinity`/`NaN`
 - `examples/ctor.as` — 有参构造函数、`new` 传参
 - `examples/inherit.as` — 继承 `extends`、字段/方法继承

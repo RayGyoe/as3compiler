@@ -457,6 +457,7 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
 - `examples/fib.as` — functions, `while`, `for`, recursion boundary
 - `examples/class.as` — classes, fields, methods, `new`, `this`
 - `examples/features.as` — division/modulo, comparison, logic, increment, string equality
+- `examples/short-circuit-guard.as` — **a short-circuited guard's impure arm must not be eagerly hoisted** (stage 433): `n != null && (n.inert() || ...)` makes zero calls and throws no #1009 when n is null; compound `||`, nesting, and object `||` value-identity passthrough — 8 assertions (red if the fix is reverted, i.e. it has teeth)
 - `examples/syntax.as` — `uint`, hexadecimal, `do-while`, `switch`, ternary, `break`/`continue`, `Infinity`/`NaN`
 - `examples/ctor.as` — parameterized constructors, `new` with arguments
 - `examples/inherit.as` — inheritance `extends`, field/method inheritance
