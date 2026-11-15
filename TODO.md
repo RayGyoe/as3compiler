@@ -20306,6 +20306,21 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-16 追加（阶段四百三十四：F1 影子栈编译期 opt-in，基准回退根治）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒
+> 主表 **87 → 86 行**（`未开始` 66 → **65**）。上一测量轮登记的「F1 影子栈逐调用开销致 fib/oop 性能回退」**本轮根治毕业**：
+> `Emitter.scanStackTrace` 泛型遍历 AST，仅当编译面引用 `Error.getStackTrace`（Member/SuperProperty 或动态字符串键）才置
+> `usesStackTrace`，`run()` 据此在 preamble 前发射 `#define ASC_STACKTRACE 1/0`；runtime 用 `#if ASC_STACKTRACE` 把
+> `as_astack_enter/leave` 在禁用时置空（clang 内联消除），depth 恒 0 ⇒ `getStackTrace()` 返回 null（此类程序本就不调用，不可观测）。
+> fib AOT/C **4.54×→1.03×**（944→203ms，≈C 198ms）回到基线；oop 影子栈移除（72→68ms，余下为已记的 #1034 类型检查语义代价）。
+> 用到 `getStackTrace` 的程序（error-stacktrace 示例、F1 33 钉）`ASC_STACKTRACE 1` 全保 F1 语义。新增 `unit: runtime/StackTraceOptIn`
+> 7 钉守卫检测与门控。全量回归绿。证据 `temp/bench/`（run1/run2.log + fib 各变体）。
+
+> **2026-11-16 追加（基准复测轮：F1 影子栈性能回退登记，纯测量不改 src）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表 **86 → 87 行**（`未开始` 65 → **66**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。Windows 复测 9 项基准（C/JS/AOT 三路
+> 结果全 OK，AIR 路本轮未跑），发现 F1（v0.4.407）影子栈致 fib AOT/C **1.00×→4.54×**、oop 同受影响；同 C A/B 证实影子栈占 fib **78%**
+> （935→209ms），TLS 优化无效，正解为编译期 opt-in（仅 `getStackTrace` 使用时发射）。详见新登记行与 `temp/bench/`。本轮纯测量，
+> `src/` 一行未改、版本号不动；修复待用户确认。
+
 > **2026-11-15 追加（阶段四百三十三：G47 短路提升根治，纠正阶段四百三十二误判）**：**新登记 0 行 / 改写 0 行 / 移出 0 行** ⇒
 > 主表项数不变（**86 行**）。阶段四百三十二曾把 G47（`focusNode(null)` #1009）判为「非编译器缺陷（库侧 blur）」——**本轮证伪并根治**：
 > adl 探针测的是 `stage.focus=null` 直接赋值（那条确实 null 安全），但真正崩的是 `UiApp.focusNode` 的守卫
@@ -23008,3 +23023,14 @@ README（zh/en）新增 camera-devices 示例描述；plan 文档 B2 标落地�
 - 全量回归 **714 测试 / 710 通过 / 0 失败 / 4 跳过** exit=0（+5：3 新示例 + 2 新单元组；G49/G46 钉并入既有组不增用例数）。版本 `0.4.407 → 0.4.408`。
 
 **记账**：遗留表 86 行不变（`未开始` 65 / `部分完成` 20 / `调研完成·实现暂缓` 1；G46–G51 原登记在 asaotui/compiler-gaps.md，不在本表，本轮只回写判定）；README（zh/en）新增 copypixels-alpha / textcolor-run / audio-pcm-registry 三示例。**经验**：① 视觉观察到的「重影/抖动」必须逐像素证实才立案——G50 的「双影」正是文档自己警告的误读，D1 后 mask 对位图内容栅格化无偏移；② 「运行时崩」要先用 adl 对照派发契约再定罪——G47 的 focusOut 派发与 AIR 逐行一致，#1009 实为库侧 null 守卫缺失，不凭推测改编译器；③ textColor 语义须 adl 定性（覆盖 run 而非 run 优先），setter 镜像 AIR 全段施加 color-only 格式比改渲染优先级更忠实（连 getTextFormat().color 都对齐）；④ copyPixels 的 alpha 调制有 m255 特例（(srcA*maskA)>>8 但 maskA==255 保留 srcA），mergeAlpha=true 的 AIR premul 取整极精细、±1 容差须如实记录不粉饰；⑤ 实时音频线程无锁读的注册表增长须旧块永不释放（poor-man's RCU），realloc-移动-释放会 use-after-free。
+
+### 阶段四百三十四：F1 影子栈编译期 opt-in——基准性能回退根治（v0.4.409 → v0.4.410）
+
+用户复测 benchmarks（Windows 9 项，本套件首次 Windows 轮）发现 F1（阶段四百三十一）影子栈致 `fib` AOT/C 从基线 **1.00×** 恶化到 **4.54×**。先纯测量轮登记（上一条注），本轮经用户授权做编译期 opt-in 根治。
+
+- **回退取证（同 C 层 A/B）**：`fib(40)`≈3.3 亿次递归，F1 给每个 AS3 函数入口/返回加 TLS 影子栈帧维护（`as_astack_enter/leave`），每次 ~6–7 cycle。同一份生成 C：带栈 **935/975/930ms** / enter/leave 置空 **209/206/211ms**（≈C 208）⇒ 影子栈占 fib **78%**。合并 TLS 变量（1084ms）、单 TLS 指针+惰性 calloc（921ms）**均无效**；汇编（`temp/bench/fib/fib.s`）实证瓶颈是逐调用帧维护固有成本（两次 TLS 基址查找 + 帧写），非 TLS 查找次数。`oop` 虚方法逐调用同受影响（3.79×）；`array`/`strings` 热循环在 main、无逐调用 AS3 函数，不受影响。
+- **真因与修法（opt-in）**：TLS 写是 `-O2` 无法消除的可观测副作用，须前端做发射决策。`src/emit.ts` 新增 `Emitter.scanStackTrace`（泛型遍历 AST，检测 Member/SuperProperty 的 `getStackTrace` 或动态字符串键，过近似宁可误报不可漏报）置 `usesStackTrace`；`run()` 在 preamble 前发射 `#define ASC_STACKTRACE 1/0`。`src/runtime.ts` 用 `#if ASC_STACKTRACE` 包裹 enter/leave，禁用时置空（clang 内联消除），depth 恒 0 ⇒ `as_astack_format` 返 NULL ⇒ `getStackTrace()` 返 null（此类程序本就不调用，不可观测）；`#ifndef ASC_STACKTRACE` 默认 1 保 preamble 消费者全功能。这不违背「优化交给 -O2」：前端只做「是否发射」的翻译决策，消除空函数仍由 -O2 完成。
+- **现代 release AIR 语义核实**：Adobe 官方文档 + adl 探针（`temp/bench/stack/VProbe.as`，含/不含 `-compiler.verbose-stacktraces` 两态）证实 release FP≥11.5/AIR≥3.5 返回**无文件/行号**的栈（非 null）；仅 FP≤11.4/AIR≤3.4 release 返 null。故 opt-in 禁用态返 null 只对「不调用 getStackTrace 的程序」不可观测，不违背现代 AIR；用到该 API 的程序 `ASC_STACKTRACE 1` 全保 F1。
+- **验收**：`fib` **4.54×→1.03×**（944→203ms，≈C 198）回基线；`oop` 72→68ms（影子栈移除，余下为已记的 #1034 对象解箱检查语义代价 + Windows C 基线更快）；其余 7 项持平。`error-stacktrace` 示例 `ASC_STACKTRACE 1` PASS；`unit: runtime/StackTrace` 33 钉 + 新增 `unit: runtime/StackTraceOptIn` **7 钉**（无引用→0/有引用→1/动态键→1/仅构造 Error→0/默认宏 1/enter 与 leave 门控）全绿。全量回归 **716 测试 / 712 通过 / 0 失败 / 4 跳过** exit=0（+1 新单元组）。
+
+**记账**：遗留表 **87 → 86 行**（移出上一测量轮登记的「F1 影子栈逐调用开销致 fib/oop 性能回退」回退行；`未开始` 66 → **65**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）；benchmarks/README.md 新增 Windows v0.4.410 复测轮（回退取证 + 根治 + 三路结果表，AIR 路待补）并把 v0.4.275 降为上一轮；docs app-gap-closure-plan（zh/en）F1 行补 opt-in 说明。**经验**：① 跨机绝对 ms 不可比（Windows C 基线远快于 macOS），回退定罪只认**同 C 文件 A/B**，不凭跨轮比值；② 逐调用可观测副作用（TLS 写）-O2 消不掉，须前端做发射决策（opt-in），与「优化交给 -O2」不冲突；③ 检测宁可过近似（误报只损性能、漏报静默坏语义），泛型遍历 AST 比枚举 expr kind 更不易漏；④ **并发会话会占用阶段号/版本号**——收尾前必须 `git log` 重核基线（本轮发现 433/v0.4.409 已被 G47 修复占用，遂改用 434/v0.4.410，并核实 G47 修复 intact、本人改动干净叠加）。

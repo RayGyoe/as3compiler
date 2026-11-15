@@ -151,7 +151,7 @@
 
 | 阶段 | 内容 | 文件级落点 | 特有验收 | 估算 | 平台 |
 |---|---|---|---|---|---|
-| **F1 Error.getStackTrace** ✅ **已落地（阶段四百三十一，v0.4.407）** | 运行时 TLS 影子栈（`as_astack_enter/leave`）在函数入口 push/返回 leave/catch 与帧边界恢复深度；Error **构造时**快照栈（`_stacktrace` 私有字段），`getStackTrace` 按 AIR 文本返回 | `runtime.ts` 影子栈 + `emit.ts` 各函数发射点 + `symbols.ts` Error 字段 | AS3 authored 帧与 adl 同 throw 点逐帧一致（`temp/stackprobe`）；无栈返 null；ADL 加载器帧不同源、以 `global()` 脚本帧替代 | 2–3 d | 全平台 |
+| **F1 Error.getStackTrace** ✅ **已落地（阶段四百三十一，v0.4.407）** | 运行时 TLS 影子栈（`as_astack_enter/leave`）在函数入口 push/返回 leave/catch 与帧边界恢复深度；Error **构造时**快照栈（`_stacktrace` 私有字段），`getStackTrace` 按 AIR 文本返回。**阶段四百三十四（v0.4.410）起编译期 opt-in**：仅当编译面引用 `getStackTrace` 才发射影子栈（`ASC_STACKTRACE` 宏门控 enter/leave），否则置空由 -O2 内联消除——根治 fib 逐调用回退（4.54×→1.03×），用到该 API 的程序全保 F1 语义 | `runtime.ts` 影子栈 + `emit.ts` 各函数发射点 + `symbols.ts` Error 字段 | AS3 authored 帧与 adl 同 throw 点逐帧一致（`temp/stackprobe`）；无栈返 null；ADL 加载器帧不同源、以 `global()` 脚本帧替代 | 2–3 d | 全平台 |
 
 批内仅 F1。依赖「AS3 栈帧模型」，是本文**唯一需要新运行时表示**的项（风险见 §7）——**已落地**（阶段四百三十一）。**批六完成；至此计划全部 12 个里程碑（C1/A1/A2/A3/B1a/B1b/B2/D1/D2/E1/E2/E3/F1）全部落地**。
 

@@ -8142,13 +8142,33 @@ static ASC_TLS int as_frame_guard = 0;
 typedef struct { const char* cls; const char* meth; } as_aframe;
 static ASC_TLS as_aframe as_astack[512];
 static ASC_TLS int as_astack_depth = 0;
+// ASC_STACKTRACE is opted IN by the emitter only when the compilation actually
+// references Error.getStackTrace (see Emitter.usesStackTrace). The per-call
+// frame push/pop is pure overhead for the common program that never reads a
+// stack trace -- fib(40) spent ~78% of its runtime here (stage 四百三十三 A/B:
+// 935ms with the shadow stack vs 209ms with empty enter/leave). When disabled,
+// enter/leave compile to nothing (clang inlines the empty bodies away), depth
+// stays 0 and as_astack_format answers NULL, so getStackTrace() returns null --
+// unobservable, since no code in such a program calls it. Defaults to 1 so any
+// preamble consumer that does not set the flag keeps the full F1 behaviour.
+#ifndef ASC_STACKTRACE
+#define ASC_STACKTRACE 1
+#endif
 static void as_astack_enter(const char* cls, const char* meth) {
+#if ASC_STACKTRACE
     // Past the cap the depth keeps counting (so leave stays balanced) but no
     // frame is recorded -- deep stacks are truncated, not corrupted.
     if (as_astack_depth < 512) { as_astack[as_astack_depth].cls = cls; as_astack[as_astack_depth].meth = meth; }
     as_astack_depth++;
+#else
+    (void)cls; (void)meth;
+#endif
 }
-static void as_astack_leave(void) { if (as_astack_depth > 0) as_astack_depth--; }
+static void as_astack_leave(void) {
+#if ASC_STACKTRACE
+    if (as_astack_depth > 0) as_astack_depth--;
+#endif
+}
 // Render the captured frames innermost-first (AIR's order), one "\\tat Cls/meth()"
 // line each. The "name: message" header is NOT part of this string -- the
 // generated Error_getStackTrace prepends it from the Error's own fields.

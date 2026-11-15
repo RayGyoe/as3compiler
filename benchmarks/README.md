@@ -32,7 +32,66 @@ python3 benchmarks/run.py fib nbody
 AIRSDK_HOME=/path/to/AIRSDK_51.4.1/bin python3 benchmarks/run.py
 ```
 
-## 本次结果（编译器 v0.4.275，2026-10-29）
+## 本次结果（编译器 v0.4.410，2026-11-16，**Windows 首轮**）
+
+**背景**：本套件此前所有轮次都在 macOS（arm64）跑。本轮首次在 **Windows x64**（clang 23.1.3，Win SDK
+10.0.22621.0）复测 9 项，目的是检查 F1（阶段四百三十一，`Error.getStackTrace` 影子栈）与 G47（阶段四百三十三）
+之后有无性能回退。**发现确凿回退并当场根治**：F1 影子栈致 `fib` AOT/C 从基线 **1.00×** 恶化到 **4.54×**。
+
+**跑批口径**：C/JS/AOT 三路各内部跑 3 次取中位数、校验三路 `result` 一致（9 项全 `OK`）。**AIR 路本轮未跑**
+（`run.py` 是 macOS 形态：`cc`/`~/Library/Application Support` 日志路径/`mxmlc` 无 `.bat`；Windows 适配的
+`temp/bench/run-win.py` 暂只含 C/JS/AOT 三路，AIR 路待补）。C 基线源码用 POSIX `clock_gettime`，Windows 编译不过，
+以 `temp/bench/win_time.h`（QueryPerformanceCounter shim）经 `cc -include` 注入，**`benchmarks/` 源码一行未改**。
+
+### 回退取证与根治（阶段四百三十四）
+
+**回退**：`fib(40)`≈3.3 亿次递归调用，F1 给每个 AS3 函数入口/返回加 TLS 影子栈帧维护（`as_astack_enter/leave`），
+每次 ~6–7 cycle ⇒ fib AOT **944ms** vs C **208ms**（**4.54×**，基线 v0.4.275 是 1.00×）。`oop` 虚方法逐调用同受影响（3.79×）。
+
+**同 C 层 A/B 定罪**（同一份生成 C，只改影子栈）：
+
+| 变体 | fib (ms) | 结论 |
+|---|---:|---|
+| 带影子栈（现状） | 935 / 975 / 930 | 影子栈占 **78%** |
+| enter/leave 置空 | 209 / 206 / 211 | ≈C（208），回退完全来自影子栈 |
+| 合并 TLS 变量为单结构 | 1084 / 1153 / 1084 | **更慢**（无效） |
+| 单 TLS 指针 + 惰性 calloc | 912 / 921 / 955 | 边际（无效） |
+
+汇编实证（`temp/bench/fib/fib.s`）：每次 enter 两次 TLS 基址查找（`_tls_index`/`%gs:88`）+ 帧写 ⇒ 瓶颈是
+**逐调用帧维护的固有成本**，不是 TLS 查找次数。`array`/`strings` 热循环在 `main`、无逐调用 AS3 函数，**不**受影响。
+
+**根治（编译期 opt-in）**：TLS 写是 `-O2` 无法消除的可观测副作用，须前端做发射决策。`Emitter.scanStackTrace`
+泛型遍历 AST，仅当编译面引用 `Error.getStackTrace`（Member/SuperProperty 或动态字符串键）才置 `usesStackTrace`，
+`run()` 据此在 preamble 前发射 `#define ASC_STACKTRACE 1/0`；runtime 用 `#if ASC_STACKTRACE` 把 enter/leave 在禁用时
+置空（clang 内联消除），depth 恒 0 ⇒ `getStackTrace()` 返回 null（此类程序本就不调用，不可观测）。用到 `getStackTrace`
+的程序（`error-stacktrace` 示例、F1 33 钉）`ASC_STACKTRACE 1` 全保 F1 语义。这不违背「优化交给 -O2」：前端只做
+「是否发射」的翻译决策，消除空函数仍由 -O2 完成。
+
+### 根治后结果（Windows，C/JS/AOT 三路中位数）
+
+| benchmark | C (ms) | JS (ms) | as3compiler (ms) | AOT vs C | 回退前 AOT | 判定 |
+|-----------|-------:|--------:|-----------------:|---------:|-----------:|------|
+| fib | 198 | 537 | **203** | **1.03×** | 944（4.54×） | ✅ **回退已根治**（≈基线 1.00×） |
+| nbody | 142 | 210 | 188 | 1.32× | 192 | 持平 |
+| binarytrees | 71 | 26 | 75 | 1.06× | 85 | 持平 |
+| mandelbrot | 145 | 87 | 83 | **0.57× 快** | 84 | 持平（FMA 口径见结论） |
+| strings | 49 | 92 | 173 | 3.53× | 172 | 持平（分配语义代价） |
+| spectralnorm | 30 | 46 | 29 | **0.97× 快** | 34 | 持平 |
+| oop | 19 | 50 | 68 | 3.58× | 72（3.79×） | 影子栈移除（余 #1034 检查代价） |
+| array | 11 | 18 | 91 | 8.27× | 94 | 持平（动态 Array 语义代价） |
+| vectorint | 11 | 16 | 11 | 1.00× | 11 | 持平 |
+
+> **跨机绝对值不可比**：Windows 的 C 基线远快于 macOS v0.4.275 记录（fib C 198 vs 297、oop C 19 vs 49），
+> 故 `oop`/`array`/`strings` 的 AOT/C 比值偏高主要是 **C 列变快**所致，不是 AOT 回退——定罪只认**同 C 文件 A/B**。
+> `fib` 是唯一确凿回退（同 C A/B 78% 占比），已根治回 1.03×。`oop` 余下 3.58× 是文档已记的 `#1034` 对象解箱
+> 检查语义代价（2000 万次祖先链校验）+ Windows C 基线更快，非本轮引入。`array` 8.27×、`strings` 3.53× 同为已记
+> 的动态语义/分配代价（热循环在 main，不受影子栈影响），如需逐项定罪需同机 v0.4.275 worktree A/B（本轮未做）。
+
+**验收**：`fib` 4.54×→1.03×；`error-stacktrace` 示例 `ASC_STACKTRACE 1` PASS；`unit: runtime/StackTrace` 33 钉 +
+新增 `unit: runtime/StackTraceOptIn` 7 钉全绿；全量回归绿（见 TODO 阶段四百三十四）。版本 `0.4.409 → 0.4.410`。
+证据留档 `temp/bench/`（`run-win.py` + `run1/run2.log` + `fib/` 各变体 + `fib.s`）。
+
+## 上一轮结果（编译器 v0.4.275，2026-10-29）
 
 **背景**：距上一轮 **v0.4.204**（2026-10-22）已过 **71 个小版本**（v0.4.205–v0.4.275，阶段二百三十九~三百一十四），
 中间只有性能改动散落在 `src/` 里、没有基准记录，故全量重跑。**本轮是纯测量轮：`src/` 一行未改、版本号不动。**

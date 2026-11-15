@@ -152,3 +152,40 @@ function checkStackTrace(): string[] {
 }
 
 registerGroup('unit: runtime/StackTrace', checkStackTrace);
+
+// Opt-in gate (阶段四百三十三): the per-call shadow-stack frame work is emitted
+// only when the compilation references Error.getStackTrace. A call-heavy program
+// that never reads a stack trace (fib/recursion) must pay nothing -- the runtime
+// enter/leave compile to empty bodies under ASC_STACKTRACE 0. These pins guard
+// both the detection (Member / dynamic string key) and the runtime gating.
+function checkStackTraceOptIn(): string[] {
+  const failed: string[] = [];
+  const check = (label: string, ok: boolean): void => { if (!ok) failed.push(label); };
+  const gen = (src: string): string => generateC(parse(src)).c.replace(/\r\n/g, '\n');
+
+  const noUse = gen('function f(n:int):int { if (n < 2) return n; return f(n-1)+f(n-2); }\ntrace(f(10));');
+  check('a program without getStackTrace emits ASC_STACKTRACE 0',
+    noUse.startsWith('#define ASC_STACKTRACE 0'));
+  const uses = gen('var e:Error = new Error("x");\ntrace(e.getStackTrace());');
+  check('a program calling getStackTrace emits ASC_STACKTRACE 1',
+    uses.startsWith('#define ASC_STACKTRACE 1'));
+  const dyn = gen('var e:Error = new Error("x");\ntrace(e["getStackTrace"]());');
+  check('a dynamic e["getStackTrace"] key also opts in',
+    dyn.startsWith('#define ASC_STACKTRACE 1'));
+  const ctorOnly = gen('var e:Error = new Error("x");\ntrace(e.message);');
+  check('constructing Error without reading the stack stays opted out',
+    ctorOnly.startsWith('#define ASC_STACKTRACE 0'));
+
+  const rt = RUNTIME_PREAMBLE;
+  check('the preamble defaults ASC_STACKTRACE to 1 when unset',
+    rt.includes('#ifndef ASC_STACKTRACE\n#define ASC_STACKTRACE 1\n#endif'));
+  check('enter records frames only under ASC_STACKTRACE, else a no-op',
+    /static void as_astack_enter\(const char\* cls, const char\* meth\) \{\s*#if ASC_STACKTRACE[\s\S]*?#else\s*\(void\)cls; \(void\)meth;\s*#endif\s*\}/.test(rt));
+  check('leave decrements only under ASC_STACKTRACE',
+    /static void as_astack_leave\(void\) \{\s*#if ASC_STACKTRACE\s*if \(as_astack_depth > 0\) as_astack_depth--;\s*#endif\s*\}/.test(rt));
+
+  if (failed.length !== 0) console.log('     [stacktrace-optin] ' + failed.length + ' check(s) failed');
+  return failed;
+}
+
+registerGroup('unit: runtime/StackTraceOptIn', checkStackTraceOptIn);

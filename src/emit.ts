@@ -772,6 +772,11 @@ export class Emitter {
   // build). Only this class's instance gets the constructor-time stage fallback
   // (ASC_doc_root); every other orphan's DisplayObject.stage is null, matching adl.
   private docRootClass: string | undefined;
+  // Opt-in gate for the Error.getStackTrace shadow stack (stage 四百三十三).
+  // True only when the compilation references getStackTrace; otherwise the
+  // runtime emits empty as_astack_enter/leave (ASC_STACKTRACE 0) so call-heavy
+  // code pays no per-call frame cost. See runtime.ts ASC_STACKTRACE.
+  private usesStackTrace = false;
 
   constructor(
     program: Program,
@@ -802,6 +807,7 @@ export class Emitter {
     this.appDescriptorXml = appDescriptorXml;
     this.aneDescriptors = aneDescriptors;
     this.docRootClass = docRootClass;
+    this.usesStackTrace = this.scanStackTrace(program);
     const subclassed = new Set<string>();
     for (const info of this.symbols.classes.values()) {
       if (info.superClass !== null) subclassed.add(info.superClass);
@@ -811,9 +817,35 @@ export class Emitter {
     }
   }
 
+  // Detect any reference to Error.getStackTrace so the shadow stack is emitted
+  // only when observable. Over-approximates on purpose: a Member/SuperProperty
+  // named getStackTrace, or the string "getStackTrace" used as a dynamic key
+  // (e["getStackTrace"]). A false positive only costs performance (the feature
+  // still works); a false negative would silently break getStackTrace, so the
+  // scan walks every AST node generically rather than enumerating expr kinds.
+  private scanStackTrace(node: unknown): boolean {
+    if (node === null || typeof node !== 'object') return false;
+    if (Array.isArray(node)) {
+      for (const x of node) if (this.scanStackTrace(x)) return true;
+      return false;
+    }
+    const o = node as Record<string, unknown>;
+    if (o.property === 'getStackTrace') return true;
+    if (o.kind === 'Str' && o.value === 'getStackTrace') return true;
+    for (const k of Object.keys(o)) {
+      const v = o[k];
+      if (v !== null && typeof v === 'object' && this.scanStackTrace(v)) return true;
+    }
+    return false;
+  }
+
   // ---------- top level ----------
 
   run(): string {
+    // Opt the shadow stack in only when getStackTrace is referenced (see
+    // scanStackTrace). Must precede RUNTIME_PREAMBLE, whose ASC_STACKTRACE
+    // #ifndef defaults to 1 when this define is absent.
+    this.line(`#define ASC_STACKTRACE ${this.usesStackTrace ? 1 : 0}`);
     this.line(RUNTIME_PREAMBLE.trimEnd());
     this.line('');
     this.emitAnePreamble();
