@@ -105,9 +105,15 @@ export const RUNTIME_PREAMBLE = `// MSVC marks the classic CRT calls this runtim
 // sysctlbyname("kern.osproductversion"): the macOS *product* version that AIR
 // appends to the family name in Capabilities.os (see as_cap_os below).
 #include <sys/sysctl.h>
-// IOPMAssertionCreateWithName: the macOS idle-timer backend behind
-// NativeApplication.systemIdleMode = KEEP_AWAKE (as_set_idle_mode below).
-#include <IOKit/pwr_mgt/IOPMLib.h>
+// NOTE: there is deliberately NO <IOKit/pwr_mgt/IOPMLib.h> here. That header
+// pulls in <CoreFoundation/CFArray.h>, which pulls in MacTypes.h — and MacTypes.h
+// defines "struct Point", the very name this compiler gives flash.geom.Point, so
+// the include is a hard redefinition error for any program that touches Point.
+// The macOS idle-timer backend declares its four entry points by hand instead
+// (see as_set_idle_mode below). Nothing from an Apple *framework* may be
+// #included in this preamble: it would break the header-free invariant that
+// AGENTS.md 2.6 is built on, and the failure only shows up on a program that
+// happens to use flash.geom.Point (阶段四百三十八).
 #elif defined(_WIN32)
 // <windows.h> pulls in <wingdi.h>, whose GDI Rectangle() function collides with
 // the C struct that flash.geom.Rectangle compiles to (typedef struct Rectangle
@@ -720,21 +726,54 @@ static int as_open_external(const char* url) {
 // AIR's KEEP_AWAKE stops the OS idle timer; NORMAL releases it. Windows uses
 // SetThreadExecutionState, macOS an IOPMAssertion; other targets have no portable
 // backend and report the gap once (the get/set round-trip still works).
-#ifdef __APPLE__
-static IOPMAssertionID ASC_idle_assertion = kIOPMNullAssertionID;
+//
+// macOS is the awkward one. <IOKit/pwr_mgt/IOPMLib.h> cannot be included here
+// (it reaches MacTypes.h's "struct Point" through CoreFoundation — see the note
+// in the __APPLE__ include block above), so the three entry points are declared
+// by hand. That is safe because the ABI is public and frozen: IOReturn is int,
+// IOPMAssertionID and IOPMAssertionLevel are uint32_t, CFStringRef is an opaque
+// pointer. Verified end to end, not assumed: with these exact declarations the
+// call returns 0 and "pmset -g assertions" lists the named assertion while it is
+// held (temp/idlefix/probe_abi.c).
+//
+// The one thing that CANNOT be hand-declared is the assertion TYPE. In IOPMLib.h
+// it is  #define kIOPMAssertPreventUserIdleSystemSleep CFSTR("PreventUserIdleSystemSleep")
+// — a compile-time constant string baked into the calling image, which is why the
+// framework exports no symbol for it. So the CFString is built at runtime instead
+// and released straight away: IOPMAssertionCreateWithName keeps what it needs.
+#if defined(__APPLE__) && !defined(__wasi__)
+typedef unsigned int ASC_IOPMAssertionID;
+#define ASC_IOPM_NULL_ASSERTION 0u      // kIOPMNullAssertionID (IOPMLib.h)
+#define ASC_IOPM_LEVEL_ON 255u          // kIOPMAssertionLevelOn (IOPMLib.h)
+#define ASC_CF_STR_ENCODING_UTF8 0x08000100u  // kCFStringEncodingUTF8
+// CFStringCreateWithCString/CFRelease are the same CF entry points the locale
+// block further down declares; identical declarations are legal to repeat.
+extern const void* CFStringCreateWithCString(const void* alloc, const char* cStr, unsigned encoding);
+extern void CFRelease(const void* obj);
+extern int IOPMAssertionCreateWithName(const void* type, unsigned level, const void* name, unsigned* assertionId);
+extern int IOPMAssertionRelease(unsigned assertionId);
 #endif
+
 static void as_set_idle_mode(int keepAwake) {
 #ifdef _WIN32
     if (keepAwake) SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
     else SetThreadExecutionState(ES_CONTINUOUS);
 #elif defined(__APPLE__)
+    static ASC_IOPMAssertionID ASC_idle_assertion = ASC_IOPM_NULL_ASSERTION;
     if (keepAwake) {
-        if (ASC_idle_assertion == kIOPMNullAssertionID)
-            IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep,
-                kIOPMAssertionLevelOn, CFSTR("asaot systemIdleMode keepAwake"), &ASC_idle_assertion);
-    } else if (ASC_idle_assertion != kIOPMNullAssertionID) {
+        if (ASC_idle_assertion == ASC_IOPM_NULL_ASSERTION) {
+            const void* type = CFStringCreateWithCString(NULL, "PreventUserIdleSystemSleep", ASC_CF_STR_ENCODING_UTF8);
+            const void* name = CFStringCreateWithCString(NULL, "asaot systemIdleMode = keepAwake", ASC_CF_STR_ENCODING_UTF8);
+            // A NULL CFString (allocation failure) leaves the id at kIOPMNullAssertionID,
+            // which is exactly the "no assertion held" state: the next KEEP_AWAKE retries.
+            if (type != NULL && name != NULL)
+                IOPMAssertionCreateWithName(type, ASC_IOPM_LEVEL_ON, name, &ASC_idle_assertion);
+            if (name != NULL) CFRelease(name);
+            if (type != NULL) CFRelease(type);
+        }
+    } else if (ASC_idle_assertion != ASC_IOPM_NULL_ASSERTION) {
         IOPMAssertionRelease(ASC_idle_assertion);
-        ASC_idle_assertion = kIOPMNullAssertionID;
+        ASC_idle_assertion = ASC_IOPM_NULL_ASSERTION;
     }
 #else
     if (keepAwake) as_shell_unsupported("flash.desktop.NativeApplication.systemIdleMode (this target has no idle-timer backend)");

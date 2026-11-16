@@ -1856,17 +1856,28 @@ export function platformLinkLibs(): string[] {
 
 // macOS frameworks the RUNTIME platform layer itself needs, as opposed to the
 // ones a manifest asks for (Skia's CoreText/CoreGraphics, SDL2's Cocoa, ...).
+//
 // CoreFoundation is what Capabilities.language/languages read the system locale
 // through: the generated C cannot include the Apple headers (MacTypes.h defines
 // `struct Point`, which is what flash.geom.Point compiles to — see the CF block in
 // runtime.ts), so the handful of CF entry points are declared by hand there and
-// resolved here. Like -liconv above this is an OS-provided detail rather than a
-// third-party dependency, so it is added for every darwin native link instead of
-// being opt-in: a build that omitted it would fail to link, and one that silently
-// fell back to LANG would report the wrong language (AGENTS 1.5).
+// resolved here.
+//
+// IOKit is the same story one step further out: as_set_idle_mode
+// (NativeApplication.systemIdleMode = KEEP_AWAKE) calls IOPMAssertionCreateWithName,
+// also declared by hand for the same reason — <IOKit/pwr_mgt/IOPMLib.h> reaches
+// MacTypes.h through <CoreFoundation/CFArray.h>, and that include alone was enough
+// to fail the whole compile of a program that uses flash.geom.Point (阶段四百三十八).
+//
+// Both are added for every darwin native link instead of being opt-in: a build that
+// omitted one would fail to LINK, and one that silently fell back (LANG for the
+// locale, no assertion for the idle timer) would report the wrong language or drain
+// the battery while the screen was told to stay awake (AGENTS 1.5). They are
+// OS-provided frameworks rather than third-party dependencies, so naming them costs
+// a load command and no payload; an unused one is dropped by dead_strip.
 export function platformFrameworks(cfg: BuildConfig): string[] {
   if (process.platform !== 'darwin' || cfg.target !== 'native') return [];
-  return ['CoreFoundation'].filter((f) => !cfg.frameworks.includes(f));
+  return ['CoreFoundation', 'IOKit'].filter((f) => !cfg.frameworks.includes(f));
 }
 
 // A source file compiled as C++ (Skia glue layer, etc.). Objective-C++ (.mm)

@@ -69,10 +69,21 @@ export const PROBE_ZLIB_LINK_FLAGS: string[] = (() => {
   return existsSync(join(lib, 'z.lib')) ? ['-L', lib, '-lz'] : [];
 })();
 
-// And the Win32 imports the generated C's DESKTOP paths call (`SHFileOperationW`
-// from <shell32>, the window/menu/drag entry points from <user32>/<ole32>). A real
-// build gets them from the manifest; a `cc gen.c -o probe` one-liner has nothing to
-// read that from, so the probe list carries them on Windows only.
+// And the platform imports the generated C's DESKTOP/platform paths call: the
+// Win32 entry points (`SHFileOperationW` from <shell32>, the window/menu/drag
+// entry points from <user32>/<ole32>) and, on macOS, the two Apple frameworks the
+// runtime declares by hand because its headers cannot be included at all
+// (CoreFoundation for Capabilities.language and the idle assertion's CFString,
+// IOKit for IOPMAssertionCreateWithName). A real build gets them from the manifest
+// or from platformFrameworks(); a `cc gen.c -o probe` one-liner has nothing to read
+// that from, so the probe list carries them per host.
+//
+// Both macOS entries are load-bearing since 阶段四百三十五: the idle setter is a
+// non-static emitted function, so the probe object references CFRelease /
+// CFStringCreateWithCString / IOPMAssertion* even when the program never touches
+// systemIdleMode (the linker, not -O2, decides whether to keep it). That is a
+// probe-only failure — the real link line carries platformFrameworks() — but it is
+// the majority of the desktop probe suite, so it is fixed here rather than there.
 export const PROBE_SYSTEM_LINK_FLAGS: string[] = process.platform === 'win32'
   // ws2_32 is here because the flash.net socket seam is REAL on Windows now
   // (ASC_SOCK_WIN, not the old inert stub): any probe whose generated C instantiates
@@ -81,7 +92,9 @@ export const PROBE_SYSTEM_LINK_FLAGS: string[] = process.platform === 'win32'
   // sees (it gets ws2_32 from the CLI/manifest). iphlpapi is here for the same
   // reason: NetworkInfo.findInterfaces (ASC_NET_WIN32) imports GetAdaptersAddresses.
   ? ['-lshell32', '-luser32', '-lole32', '-ladvapi32', '-lws2_32', '-liphlpapi']
-  : [];
+  : process.platform === 'darwin'
+    ? ['-framework', 'CoreFoundation', '-framework', 'IOKit']
+    : [];
 
 // The Skia glue is TWO translation units since stage 221: vendor/skia_glue.cc is
 // the graphics half and vendor/skia_text_glue.cc the text engine (SkParagraph +

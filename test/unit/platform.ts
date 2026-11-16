@@ -1516,20 +1516,32 @@ function checkCapabilitiesLocale(): string[] {
   check('a language outside the table reports xu',
     pre.includes('return "xu";') && pre.includes('as_cap_air_langs[i] != NULL'));
 
-  // The runtime's CoreFoundation calls have to be resolved by the link, and only
-  // where the declarations exist (darwin native). Missing it is a link error the
-  // build layer reports for the whole program, so it is pinned here as data.
+  // The runtime's CoreFoundation/IOKit calls have to be resolved by the link, and
+  // only where the declarations exist (darwin native). Missing one is a link error
+  // the build layer reports for the whole program, so it is pinned here as data.
+  // IOKit joined the list with 阶段四百三十八: as_set_idle_mode calls
+  // IOPMAssertionCreateWithName, declared by hand for the same MacTypes reason.
   const darwinNative = { ...defaultBuildConfig(), frameworks: [] } as BuildConfig;
   const wasmCfg = { ...defaultBuildConfig(), target: 'wasm' as Target } as BuildConfig;
   if (process.platform === 'darwin') {
     check('the darwin native link adds -framework CoreFoundation',
       platformFrameworks(darwinNative).includes('CoreFoundation'));
+    check('the darwin native link adds -framework IOKit (systemIdleMode backend)',
+      platformFrameworks(darwinNative).includes('IOKit'));
   }
   check('the wasm link does not ask for a macOS framework',
     platformFrameworks(wasmCfg).length === 0);
   check('a manifest that already lists CoreFoundation is not duplicated',
-    platformFrameworks({ ...darwinNative, frameworks: ['CoreFoundation'] } as BuildConfig).length === 0
+    !platformFrameworks({ ...darwinNative, frameworks: ['CoreFoundation'] } as BuildConfig).includes('CoreFoundation')
     || process.platform !== 'darwin');
+  check('a manifest that already lists IOKit is not duplicated',
+    !platformFrameworks({ ...darwinNative, frameworks: ['IOKit'] } as BuildConfig).includes('IOKit')
+    || process.platform !== 'darwin');
+  check('both OS frameworks are supplied when the manifest lists neither',
+    (() => {
+      const f = platformFrameworks(darwinNative);
+      return process.platform !== 'darwin' || (f.includes('CoreFoundation') && f.includes('IOKit'));
+    })());
 
   if (ok > 0) console.log(`[capabilities] ${ok} locale checks passed`);
   return bad;
@@ -1809,8 +1821,33 @@ function checkDesktopIntegration(): string[] {
   check('systemIdleMode drives the idle backend', sm.includes('as_set_idle_mode(strcmp(value, "keepAwake") == 0)'));
   const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
   check('idle backend uses SetThreadExecutionState on Windows', pre.includes('SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)'));
-  check('idle backend uses IOPMAssertion on macOS', pre.includes('IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep'));
-  check('macOS idle backend includes IOPMLib.h', pre.includes('#include <IOKit/pwr_mgt/IOPMLib.h>'));
+  check('idle backend uses IOPMAssertion on macOS', pre.includes('IOPMAssertionCreateWithName(type, ASC_IOPM_LEVEL_ON, name, &ASC_idle_assertion)'));
+  // NOT `#include <IOKit/pwr_mgt/IOPMLib.h>`: that include reaches MacTypes.h, whose
+  // `struct Point` is a hard redefinition against flash.geom.Point. 阶段四百三十八
+  // shipped exactly that include unconditionally, and every macOS build of a program
+  // using Point broke (Windows CI could not see it: the include is inside #ifdef
+  // __APPLE__). So the header-free invariant of AGENTS 2.6 is pinned here — twice:
+  // once for IOPMLib specifically, once for the whole class of Apple framework headers.
+  check('macOS idle backend does NOT include IOPMLib.h', !pre.includes('#include <IOKit/'));
+  const appleFrameworkIncludes = [...pre.matchAll(/#include <(?:IOKit|CoreFoundation|CoreServices|CoreGraphics|CoreText|ApplicationServices|Cocoa|Carbon|AppKit|Foundation|AudioToolbox|CoreAudio|Security|SystemConfiguration|Metal|QuartzCore)\//g)];
+  check('the generated C includes no Apple framework header at all (MacTypes struct Point collision)', appleFrameworkIncludes.length === 0);
+  // The declarations that replace the header must be the library's real shapes:
+  // IOReturn is int, IOPMAssertionID/IOPMAssertionLevel are uint32, CFStringRef is
+  // an opaque pointer. Get one wrong and the call still compiles — it just returns
+  // garbage on a 64-bit register/stack mismatch — so the shapes are pinned, not the
+  // mere presence of a declaration.
+  check('IOPMAssertion is hand-declared with the library ABI (int / unsigned / opaque pointer)',
+    pre.includes('extern int IOPMAssertionCreateWithName(const void* type, unsigned level, const void* name, unsigned* assertionId);') &&
+    pre.includes('extern int IOPMAssertionRelease(unsigned assertionId);') &&
+    pre.includes('typedef unsigned int ASC_IOPMAssertionID;'));
+  check('kIOPMAssertionLevelOn value is inlined (255)', pre.includes('#define ASC_IOPM_LEVEL_ON 255u'));
+  // CFSTR() is unavailable without the headers, so the assertion type is the CFString
+  // the header's macro would have built: its literal must stay byte-identical to
+  // kIOPMAssertPreventUserIdleSystemSleep or macOS silently refuses the assertion.
+  check('the assertion type string matches kIOPMAssertPreventUserIdleSystemSleep',
+    pre.includes('CFStringCreateWithCString(NULL, "PreventUserIdleSystemSleep", ASC_CF_STR_ENCODING_UTF8)'));
+  check('the CFStrings are released after the assertion is created',
+    pre.includes('if (name != NULL) CFRelease(name);') && pre.includes('if (type != NULL) CFRelease(type);'));
   console.log(`[desktop] ${ok} desktop-integration checks passed`);
   return bad;
 }
@@ -3524,8 +3561,19 @@ function checkNetworkInventory(): string[] {
     && preamble.includes('ba.s_addr = htonl(ip | ~mask);'));
   check('the row carries a GUID-sized name and a display field',
     preamble.includes('char name[64];') && preamble.includes('char display[128];'));
-  check('iphlpapi is on the probe link line (GetAdaptersAddresses is an OS import)',
-    PROBE_SYSTEM_LINK_FLAGS.includes('-liphlpapi'));
+  // The Windows backend imports GetAdaptersAddresses, so the Win32 probe needs
+  // iphlpapi — but the flag list is per host, and asserting the Win32 token on
+  // every host made this group red on every macOS/Linux run since 阶段四百二十二
+  // (its only regression run was the Windows one). Pin what each host must and must
+  // NOT carry instead: a Win32 import lib on a darwin link line is a link error, so
+  // "leaked" is as much a defect as "missing".
+  if (process.platform === 'win32') {
+    check('iphlpapi is on the probe link line (GetAdaptersAddresses is an OS import)',
+      PROBE_SYSTEM_LINK_FLAGS.includes('-liphlpapi'));
+  } else {
+    check('no Win32 import library leaks onto a non-Windows probe link line',
+      PROBE_SYSTEM_LINK_FLAGS.every((f) => !/^-l(shell32|user32|ole32|advapi32|ws2_32|iphlpapi)$/.test(f)));
+  }
 
   console.log(`     [netif] ${ok} check(s) passed`);
   return bad;
