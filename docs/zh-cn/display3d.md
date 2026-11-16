@@ -1136,7 +1136,91 @@ VS 侧的 `TEXCOORD0` 在 reg 1、PS 侧的 `TEXCOORD0` 在 reg 0 ⇒
 **钉子**：`test/unit/stage3d.ts` 的 `stage3d/d3d-glue` 组（键含因子对、alpha 槽翻译函数及其两处使用、
 四条合成路径都 `kSrc`）。
 
-## 11. 参考链接
+## 11. 多窗口：Stage3D 合成面是**按窗口**的（阶段四百三十六）
+
+2D 的多窗口从阶段八十九·七十一就是每窗独立的（每个窗口自己的 `Stage`、显示树、Skia 表面），但
+**Stage3D 的上屏合成缝一直是进程级单例**：对象模型早就 per-window（`Stage.stage3Ds` 由每个 Stage
+懒创建自己的向量，`Stage3D._owner` 指回该 Stage，`emit.ts` 的 `Stage_get_stage3Ds`），可
+`Context3D_configureBackBuffer` / `Context3D_present` 把渲染目标写进**全局**的
+`ASC_stage3d_lw/lh/tex/pixels/ready/serial`，`ASC_window_render` 再把那唯一一张表面 blit 进**每一个**
+GPU 窗口。于是两窗各自 `requestContext3D` 时是「最后 present 者赢」：两窗同画，`Stage3D.x/y/visible`
+只存不画，副窗的 HiDPI 倍率错用「上一个渲染的窗口」的 `ASC_win_scale`。全部现有消费者（Starling 12
+场景、shmup、asaot3d 29 个 demo）都是单窗口，所以从未暴露。
+
+### 11.1 后端不是瓶颈，缺的是「context → 窗口」的路由
+
+三个后端从一开始就是**多上下文**的（`S3D_MAX_CTX 4` + `s3d_live[]`：`stage3d_glue.mm`、
+`stage3d_webgl.cc`、`stage3d_d3d.cc`），每个 context 有自己的渲染目标/管线缓存。坏掉的只有生成 C 里
+「把哪张表面贴到哪个窗口」这一层，而 `Context3D` **没有**任何指回所属窗口的指针——只有 Stage3D 有
+`_owner`。修法因此全在生成侧，后端一行没改：
+
+| 位置 | 修复前 | 修复后 |
+|---|---|---|
+| `Context3D` 字段 | 无 owner | `_stage3d`（回指创建它的 Stage3D）+ `bbScale`（这个 context 的后缓冲倍率）+ `bbLW/bbLH`（舞台坐标尺寸） |
+| `configureBackBuffer` | 写全局 `ASC_stage3d_lw/lh`；倍率读全局 `ASC_win_scale` | 倍率取 `as_s3d_scale_of(context)` = **所属窗口**的 `scale`；舞台尺寸记在 **context** 上 |
+| `present()` | 写全局表面 | `as_s3d_publish(context)`：`as_s3d_win_id(context)` → `ASC_wins[i]` 的 `s3d_tex/pixels/w/h/lw/lh/ready/serial` |
+| `ASC_window_render` | 画那唯一一张，恒 (0,0)，不看 visible | 画**本窗口**的 `s3d_*`，按本窗口 Stage3D 的 `x/y` 定位，`visible` 门控；每帧重读 |
+| Present 跳过指纹 | 全局 Stage3D 序号 | `w->render_s3d_serial == w->s3d_serial`（每窗一个） |
+| `setScissorRectangle` | 读全局 `ASC_stage3d_lw` 折算 | 用 `o->bbScale`（裁剪属于**这个**后缓冲） |
+
+`as_s3d_win_id()` 的链路是 `Context3D._stage3d` → `Stage3D._owner`（Stage）→ `as_stage_window_id()`
+（阶段三百二十一已有的 `ASC_wins[i].stage` 反查）；反查不到就是 -1（离屏构建、纯 C 的裸 `new Stage()`），
+此时 `present()` 什么都不做——这正是修复前「没有窗口也能出图，但出的图属于全进程」的反面。
+
+### 11.2 一条只有真机才看得见的顺序坑：`configureBackBuffer` 早于窗口存在
+
+第一版修法在 `configureBackBuffer` 里直接把舞台尺寸写进窗口。真机截图立刻否掉：**主窗全白、副窗正常**
+（`temp/s3dwin2/`）。原因是常见顺序就是「先 configure 再 showWindow」——脚本在
+`requestContext3D()` 之后立刻 `configureBackBuffer(300, 200, …)`，而根窗口要到 `Stage.showWindow()`
+才被 `ASC_win_claim_main()` 认领并绑 `w->stage`；那一次写窗口拿到的是 NULL，尺寸**静默丢失**，合成时
+矩形是 0×0，于是主窗什么都不画。副窗是在 `new NativeWindow(...)` 之后才 configure 的，所以它正常——这种
+「一半对一半错」最容易被当成渲染 bug 去查后端。
+
+修法是把舞台尺寸记在 **context** 上（`bbLW/bbLH`），`present()` 时再回填到窗口：present 一定发生在
+窗口绑定之后。`configureBackBuffer` 里那次写窗口保留（已绑定时立刻生效，并 bump serial 强制重组）。
+
+### 11.3 adl 在这台机器上给不出双窗口径
+
+按 §2.4 的纪律本该先 adl 定标，实测做不到（`temp/s3d2win/`，AIR SDK 51.4.1，macOS）：
+
+- **macOS 的 adl 根本没有 Stage3D**：`requestContext3D("auto")` 在副窗**和初始窗**都抛
+  `Error #3702: Context3D not available.`（初始窗用 `S3DInit.as` 单独控制探针复现），所以「两窗各画什么」
+  的像素口径无法在 adl 上取得。
+- `app.xml` 写 `renderMode="gpu"` → `Error #1508: The value specified for argument renderMode is invalid.`
+  （`auto`/`direct`/`cpu` 都能起）；adl 的 `stage.stage3Ds.length` 是 **4**，我们只懒建 1 个。
+
+能定标的照实定标了（`Stage3D.x/y` 的范围，两者一致）：`-8191` 与 `8191` 接受，`8192` / `-8192` / `9000`
+抛 `ArgumentError`，`errorID` 2006，文案逐字节 **`Error #2006: The supplied index is out of bounds.`**；
+默认 `x=0 y=0 visible=true`。合成顺序（StageVideo → Stage3D → 显示列表）、无非透明通道、桌面 4 个实例
+来自 AIR 官方文档（<https://airsdk.dev/reference/actionscript/3.0/flash/display/Stage3D.html>）。
+
+### 11.4 验收：截屏对拍（这不是示例层能做的事）
+
+AS3 没有回读窗口像素的 API（AIR 也没有），所以「A 窗画的是 A 的表面」只能在进程外用截屏判。探针
+`temp/s3dwin2/hold.as`（两窗同帧各画纯色并 `present`）+ `screencapture`（显示为 1512pt@2x，截图 3600px
+宽，故 1 pt ≈ 1.1905 px）：
+
+| 态 | 主窗（红 300×200 @0,0） | 副窗（绿 240×160） | 结论 |
+|---|---|---|---|
+| 修复前（把全局表面写回 0 号窗复刻） | **绿**（副窗的颜色） | 绿 | 两窗同画＝最后 present 者赢，正是登记的 bug |
+| 修复后 | 红 | 绿 | 各窗各画 |
+| 修复后 + `s3dB.x=40, y=34` | 红 | 绿块整体右移 48 px、下移 41 px（40×1.1905、34×1.1905） | `x/y` 真的被合成器用上 |
+| 修复后 + `s3dB.visible=false` | 红 | **0 个绿像素**（露出 stage 底色） | `visible` 真的门控 |
+| 混合模式样例（`(1,0,0,0.25)` 后缓冲） | 仍 `(255,0,0)` | — | §10.6 第 3 条不受影响 |
+
+示例层能断言的（`examples/s3d-multiwindow.as`，Metal 下 **21 钉**全绿）：两个 Stage 各有自己的
+`stage3Ds`、两个 `Context3D` 是不同对象、两个后缓冲尺寸各自跟随 `configureBackBuffer`（300×200 /
+240×160）、两个 context 各自 `drawToBitmapData` 采样到自己的颜色（红/绿）、`x/y` 的 `#2006` 边界与
+「被拒的赋值不落库」、`visible` 读回。示例套件里它是 **compile+link only**（窗口 + GPU），与
+`native-window.as`、`yuv420-gpu/` 同一处置。
+
+**钉子**：`test/unit/stage3d.ts` 的 `stage3d/multiwindow-surface` 组（16 钉）——进程级
+`ASC_stage3d_*` 必须一个不剩、`ASCWin` 的表面槽形状、Present 跳过指纹带每窗序列、`Context3D._stage3d`
+与写屏障、`configureBackBuffer` 只从所属窗口取倍率、舞台尺寸记在 context、`present` 只发所属窗口、
+合成器按 `x/y` 画且被 `visible` 门控、`setScissorRectangle` 用 `bbScale`、关窗回收回读缓冲、表面不得
+当成 GC 根。
+
+## 12. 参考链接
 
 - AIR SDK 参考（`flash.display3D` 包）：<https://airsdk.dev/reference/actionscript/3.0/flash/display3D/package-detail.html>
 - AIR SDK 参考（`Context3D`）：<https://airsdk.dev/reference/actionscript/3.0/flash/display3D/Context3D.html>

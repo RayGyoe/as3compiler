@@ -635,6 +635,12 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
   `docs/zh-cn/display3d.md` §9.16。
   **未链接 Stage3D 后端的构建**（纯 C 状态机）也报 `"baselineExtended"`：AIR 的 `software` 渲染模式在这里会直接
   异步抛 `#3702`（它锁死在 `baseline`），这是我们刻意保留的差异，登记为增强 E17，见 `docs/zh-cn/display3d.md` §9.14
+- `examples/s3d-multiwindow.as` — **多窗口 Stage3D**（阶段四百三十六）：每个窗口的 `Stage` 各有自己的 `stage3Ds`、
+  每个 `Context3D` 有独立后缓冲与独立设备倍率；两窗同帧各画一色并 `present()`，断言两窗的 `backBufferWidth/Height`
+  各自跟随自己的 `configureBackBuffer`、`drawToBitmapData` 各取到自己的颜色、`Stage3D.x/y` 的 `[-8191, 8191]` 边界
+  （越界 `ArgumentError #2006`，文案逐字，且被拒的赋值不落库）、`visible` 读回与默认值。窗口 + GPU，故在
+  `test/examples.ts` 里是 **compile+link only**；随附 `s3d-multiwindow.build.json`（Metal + Skia + SDL2，手工验收），
+  像素层「A 窗画的是 A 的表面」只能靠进程外截屏对拍（见 `docs/zh-cn/display3d.md` §11）
 - `examples/stage86.as` — `flash.utils` 反射（`getQualifiedClassName`/`getDefinitionByName`/动态实例化）
 - `examples/stage87.as` — `Context3D` 骨架补方法（stencil/scissor/缓冲上传读回/`drawTriangles`）
 - `examples/stage88.as` — AS3 语言特性缺口补齐（对象字面量字符串键、逻辑赋值、`for each`、命名空间等）

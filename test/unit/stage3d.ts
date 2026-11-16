@@ -2045,3 +2045,104 @@ function checkStage3dVertexTexture(): string[] {
 }
 
 registerGroup('stage3d/vertex-texture', checkStage3dVertexTexture);
+
+// 阶段四百三十六: Stage3D 的上屏合成不再是**进程级单例**。
+//
+// 这条缺口在示例层抓不住：修复前两个 Context3D 各自渲染完全正常（后端一直是
+// per-context 的 s3d_live[]），坏的只是「把哪张表面贴到哪个窗口」这一层，而 AS3 没有
+// 回读窗口像素的 API —— 所以必须钉生成的 C 的形状。全部断言都读 emit.ts 的
+// `this.line(...)` 产物（emit.ts 的注释里同时写着修复前/后的写法，直接搜源码会假阳）。
+function checkStage3dMultiWindowSurface(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [stage3d] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [stage3d] ${label}`); }
+  };
+
+  const emitted = emittedLines();
+  const symbols = readNorm(join(root, 'src', 'symbols.ts'));
+
+  // 1. 进程级表面状态必须彻底消失。任何 ASC_stage3d_* 全局都会让「最后 present 的
+  //    那张」重新变成全进程共享，即本阶段修的 bug 原样回来。
+  check('no process-wide Stage3D composite state is left',
+    !/ASC_stage3d_(?:lw|lh|tex|pixels|ready|serial)\b/.test(emitted));
+
+  // 2. 表面挂在**窗口**上（每个窗口一格），而不是挂在进程上。
+  check('every window carries its own Stage3D surface slot',
+    /void\* s3d_tex;\n\s*uint8_t\* s3d_pixels;\n\s*int s3d_w, s3d_h;\n\s*int s3d_lw, s3d_lh;\n\s*int s3d_ready;\n\s*uint64_t s3d_serial;/.test(emitted));
+
+  // 3. 窗口的帧序列在快照比较里带上「这一帧的表面序列」——否则 A 窗 present 后 B 窗
+  //    会命中 present-skip，屏幕上停在 B 的旧表面。
+  check('the Present-skip fingerprint includes the per-window surface serial',
+    /w->render_s3d_serial == w->s3d_serial/.test(emitted)
+    && /w->render_s3d_serial = w->s3d_serial;/.test(emitted));
+
+  // 4. Context3D 有回指 Stage3D 的指针（这也是 present 能说出「我属于哪个窗口」的唯一链路：
+  //    Context3D -> Stage3D -> Stage(`_owner`) -> 窗口号）。
+  check('Context3D keeps a back-pointer to the Stage3D that created it',
+    /\['_stage3d', c3f/.test(symbols)
+    && /o->context3d->_stage3d = o; gc_write_barrier/.test(emitted));
+  check('the back-pointer chain ends at the owning window id',
+    /static int as_s3d_win_id\(Context3D\* o\)/.test(emitted)
+    && /as_stage_window_id\(\(Stage\*\)o->_stage3d->_owner\)/.test(emitted));
+
+  // 5. configureBackBuffer 的设备倍率取**所属窗口**的，不再读全局 ASC_win_scale。
+  const cfg = emitted.slice(emitted.indexOf('void Context3D_configureBackBuffer('));
+  const cfgBody = cfg.slice(0, cfg.indexOf('void Context3D_clear('));
+  check('configureBackBuffer takes the device-pixel factor from the owning window',
+    /as_s3d_scale_of\(o\)/.test(cfgBody) && !/ASC_win_scale/.test(cfgBody));
+
+  // 6. back buffer 的**舞台坐标尺寸**记在 context 上（configureBackBuffer 常常早于窗口
+  //    创建：脚本先 configure 再 showWindow，写窗口会静默丢掉尺寸，合成时是 0x0 ——
+  //    主窗全白、副窗正常就是这么来的）。
+  check('configureBackBuffer records the stage-unit size on the context',
+    /o->bbLW = \(int\)width; o->bbLH = \(int\)height;/.test(cfgBody)
+    && /\['bbLW', c3f/.test(symbols) && /\['bbLH', c3f/.test(symbols));
+
+  // 7. present() 把这一帧交给**所属窗口**。
+  const present = emitted.slice(emitted.indexOf('void Context3D_present('));
+  check('present() publishes into the owning window only',
+    /as_s3d_publish\(o, w, h\)/.test(present.slice(0, 800))
+    && /ASCWin\* wn = ASC_w\(as_s3d_win_id\(o\)\);/.test(present));
+
+  // 8. publish 用 context 上的舞台尺寸回填窗口（修复 6 的时序问题）。
+  check('publish() copies the stage-unit footprint from the context onto the window',
+    /wn->s3d_lw = o->bbLW; wn->s3d_lh = o->bbLH;/.test(present));
+
+  // 9/10/11. 合成器读**本窗口**的表面，按 Stage3D.x/y 画，被 visible 门控，且每帧重读。
+  const composite = emitted.slice(emitted.indexOf('Stage3D* _s3 = as_vector_Stage3D_get(w->stage->stage3ds, 0);'));
+  check('the compositor re-reads x/y/visible from this window\u2019s Stage3D every frame',
+    /_s3x = _s3->x; _s3y = _s3->y; _s3vis = _s3->visible \? 1 : 0;/.test(composite));
+  check('the GPU composite draws this window\u2019s surface at Stage3D.x/y',
+    /as_skia_gpu_draw_texture\(canvas, w->s3d_tex, w->s3d_w, w->s3d_h, _s3x, _s3y, \(double\)w->s3d_lw, \(double\)w->s3d_lh\);/.test(emitted));
+  check('Stage3D.visible gates the composite on every backend',
+    (emitted.match(/&& _s3vis\) \{/g) ?? []).length >= 3);
+
+  // 12. Stage3D.x/y 的合法区间与 AIR 的报错（adl 51.4.1 实测：±8191 收、8192 抛 #2006，
+  //     文案就是这一句）。
+  check('Stage3D.x/y reject out-of-range values with AIR\u2019s ArgumentError #2006',
+    /static void as_s3d_check_pos\(double v\)/.test(emitted)
+    && /if \(!\(v >= -8191\.0 && v <= 8191\.0\)\)/.test(emitted)
+    && /ArgumentError_new\(\(char\*\)"Error #2006: The supplied index is out of bounds\."/.test(emitted)
+    && /as_s3d_check_pos\(value\); o->x = value;/.test(emitted)
+    && /as_s3d_check_pos\(value\); o->y = value;/.test(emitted));
+
+  // 13. 裁剪矩形用**这个 context** 的倍率，同样不能读窗口/全局。
+  check('setScissorRectangle scales by this context\u2019s own back-buffer factor',
+    /double sc = \(o->bbScale > 0\.0\) \? o->bbScale : 1\.0;/.test(emitted));
+
+  // 14. 关窗要回收回读缓冲（CPU 路径的 malloc），并把表面标成不可用。
+  check('closing a window releases its Stage3D readback buffer',
+    /if \(w->s3d_pixels != NULL\) \{ free\(w->s3d_pixels\); w->s3d_pixels = NULL; \}/.test(emitted)
+    && /w->s3d_tex = NULL; w->s3d_ready = 0;/.test(emitted));
+
+  // 15. 这块内存不是 GC 对象的（borrowed 后端纹理 / 窗口自己的 malloc），标了就崩。
+  check('the Stage3D surface is not treated as a GC root',
+    !/gc_mark[^;]*s3d_pixels/.test(emitted) && !/gc_mark[^;]*s3d_tex/.test(emitted));
+
+  console.log(`     [stage3d] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('stage3d/multiwindow-surface', checkStage3dMultiWindowSurface);

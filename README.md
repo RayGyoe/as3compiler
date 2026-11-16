@@ -556,6 +556,14 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
   `examples/bitmap-setpixels-endian.build.json` to link Skia)
 - `examples/stage83.as` — Stage3D alignment hardening (CubeTexture/RectangleTexture, render-to-texture pixel assertions, instanced drawing)
 - `examples/vertex-texture.as` — AGAL4 vertex texture fetch: the three translators' vertex sampler declarations, the `tex`/`tld` stage and version gates (#3622/#3803/#3805/#3757, verbatim with `adl`), and on a real Metal device a 2x2 texture's texel mapping, NEAREST vs LINEAR, CLAMP vs REPEAT and per-vertex interpolation. Ships `vertex-texture.build.json` (hand-verified like `stage83.as`)
+- `examples/s3d-multiwindow.as` — **multi-window Stage3D** (stage four-hundred-thirty-six): each window's `Stage` owns
+  its own `stage3Ds` vector and each `Context3D` its own back buffer and device scale; two windows paint one colour each
+  and `present()` in the same frame, asserting that each window's `backBufferWidth/Height` follows its own
+  `configureBackBuffer`, that `drawToBitmapData` samples each context's own colour, and that `Stage3D.x/y` honours the
+  `[-8191, 8191]` bounds (out of range throws `ArgumentError #2006` with the byte-exact message and the rejected value is
+  not stored), plus `visible` read-back and defaults. Window + GPU, so it is **compile+link only** in `test/examples.ts`;
+  ships `s3d-multiwindow.build.json` (Metal + Skia + SDL2, hand-verified). The pixel-level "window A shows A's surface"
+  claim can only be judged by an out-of-process screenshot cross-check (see `docs/en/display3d.md` §11)
 - `examples/stage86.as` — `flash.utils` reflection (`getQualifiedClassName`/`getDefinitionByName`/dynamic instantiation)
 - `examples/stage87.as` — `Context3D` skeleton method completion (stencil/scissor/buffer upload readback/`drawTriangles`)
 - `examples/system-exit.as` — `flash.system.System.exit(code:uint)` (statements after the call still run to the frame boundary; the process status is `code`); the status half lives in `examples/system-exit-status.as` (in `SKIP_FILES`, because the example pool requires every example to exit 0) and is asserted to really exit **7** by the serial case in `test/examples.ts` (stage two hundred forty-five)

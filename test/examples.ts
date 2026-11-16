@@ -156,7 +156,10 @@ function scratchOut(label: string): string {
 // expecting status 0 (node:test turns a non-zero exit into a failure), and this
 // example's whole point is that `System.exit(7)` makes the process exit 7. It is
 // compiled and run by the serial case below instead (阶段二百四十五).
-const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as']);
+// `s3d-multiwindow.as` is the fourth: it needs a real window AND a GPU context for
+// every assertion it makes (two stages, two Context3Ds, pixel readback), so it is
+// compiled+linked by the serial case below with its own Metal manifest.
+const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as', 's3d-multiwindow.as']);
 // Third-party library directories (e.g. com/greensock) ship with full AIR apps
 // but depend on features outside this compiler's subset; they are not part of
 // the regression suite's input. `shmup-stage3d` is the stage 79-83 end-to-end
@@ -907,6 +910,29 @@ test('example: native-window.as (windowed: compile+link only)', async (t) => {
     '--manifest', manifest, '-o', scratchOut('native-window')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  native-window (compile+link)');
+});
+
+test('example: s3d-multiwindow.as (windowed GPU: compile+link only)', async (t) => {
+  // 阶段四百三十六: Stage3D's composite surface stopped being a process-wide
+  // singleton. The example asserts what is observable from AS3 -- two stages with
+  // their own stage3Ds, two Context3Ds with their own back buffers and their own
+  // content, Stage3D.x/y bounds (#2006) and visible -- and it must keep compiling
+  // and linking against the Metal + stage3d glue, which no other example walks in
+  // this direction (two simultaneous contexts).
+  // (Manual run: `node src/index.ts examples/s3d-multiwindow.as
+  //  --manifest examples/s3d-multiwindow.build.json --run`; the pixel-level
+  //  "each window shows its own surface" evidence lives in TODO.md's stage section.)
+  const manifest = join(dir, 's3d-multiwindow.build.json');
+  const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(manifest) || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  s3d-multiwindow (needs the native Skia/SDL2 vendor libs)');
+    t.skip('needs vendor/skia and vendor/sdl2');
+    return;
+  }
+  await runAsync('node', ['src/index.ts', 'examples/s3d-multiwindow.as',
+    '--manifest', manifest, '-o', scratchOut('s3d-multiwindow')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  s3d-multiwindow (compile+link)');
 });
 
 // The encoded-audio path: Sound.load(URLRequest) over a real .mp3 fixture, then

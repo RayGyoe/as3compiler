@@ -651,8 +651,8 @@ small caches remain. An explicit AS3 `cacheAsBitmap` request is not capped by th
 `ASC_AUTO_BAKE_MAX_PIXELS=0` restores the unlimited behavior for A/B runs. This is not a resolution reduction:
 an over-cap subtree is rasterized live at the destination device resolution instead of magnifying a cached image.
 
-A window also skips redundant rasterization and Present when its display-tree fingerprint, Stage3D serial, GPU
-generation and OS redraw generation all match. `ENTER_FRAME`, timers and input still run at their normal rates;
+A window also skips redundant rasterization and Present when its display-tree fingerprint, **its own** Stage3D
+serial (one per window — see `display3d.md` §11), GPU generation and OS redraw generation all match. `ENTER_FRAME`, timers and input still run at their normal rates;
 `ASC_NO_PRESENT_SKIP=1` provides a same-binary A/B switch. A static CPU-window probe skipped 512/512 presents;
 a second run where a timer moved a shape skipped 511/512 while logic still completed 600 frames. The meeting
 window's FPS/MS text changes every frame, so its fingerprint correctly changes too — dynamic nodes are never

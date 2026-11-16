@@ -500,9 +500,11 @@ function checkNativeWindow(): string[] {
   check('Stage.showWindow re-claims a title the app set before the window existed',
     body('void Stage_showWindow(void* _this, double width, double height, char* title) {')
       .includes('if (w->title != NULL && w->title[0] != 0) title = w->title;'));
+  // 阶段四百三十六: the surface is the WINDOW's own slot now (no process-wide
+  // ASC_stage3d_*), and the composite is gated on that window's Stage3D.visible.
   check('Stage3D composites only into a GPU window (AIR: software windows do not)',
     body('static int ASC_window_render(int id) {')
-      .includes('if (w->is_gpu && ASC_stage3d_ready && ASC_stage3d_tex != NULL) {'));
+      .includes('if (w->is_gpu && w->s3d_ready && w->s3d_tex != NULL && _s3vis) {'));
   // A resize must not hand a GPU window a CPU surface it never draws into: the
   // next frame walks the is_gpu branch and would leak the replacement surface.
   const onResize = body('static void* ASC_window_on_resize(int id, int lw, int lh, int pw, int ph, double scale) {');

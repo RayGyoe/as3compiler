@@ -7076,6 +7076,10 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('gc_mark_ptr((void*)ASC_wins[i].type);');
     this.line('gc_mark_ptr((void*)ASC_wins[i].render_mode);');
     this.line('gc_mark_ptr((void*)ASC_wins[i].display_state);');
+    // ASCWin's Stage3D surface fields (s3d_tex/s3d_pixels) are deliberately NOT
+    // marked: s3d_tex is a raw backend texture owned by the Context3D's GPU context
+    // and s3d_pixels is a malloc'd readback buffer. Neither is GC-allocated, and
+    // marking them would corrupt the heap's range check (阶段四百三十六).
     this.indent--;
     this.line('}');
     // The focused DisplayObject: nothing else references it, so it has to be a
@@ -12089,27 +12093,23 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     // Stage3D on-screen compositing (stage 82 P2): Context3D.present() exposes the
     // offscreen render target for ASC_window_render to composite behind the 2D
     // display list (AIR puts Stage3D behind the display list). On both GPU paths
-    // this is a direct GPU→GPU blit (ASC_stage3d_tex: an MTLTexture natively, a GL
-    // texture wrapped as a GrBackendTexture on the web); on the CPU raster path the
-    // target is read back into ASC_stage3d_pixels and drawn as BGRA. Declared up
-    // here (before the Context3D_* method definitions below) so Context3D_present
-    // can reference them. Static storage duration zero-initializes them to NULL/0,
-    // matching the "no Stage3D content yet" state.
-    this.line('static uint8_t* ASC_stage3d_pixels;');
-    this.line('static void* ASC_stage3d_tex;');
-    this.line('static int ASC_stage3d_w;');
-    this.line('static int ASC_stage3d_h;');
-    this.line('static int ASC_stage3d_ready;');
-    // Unlike the display tree, a Stage3D texture is mutated behind Skia's back.
-    // present() is therefore the frame boundary the window change detector uses.
-    this.line('static uint64_t ASC_stage3d_serial;');
-    // The Stage3D back buffer's size in *stage* units (what Context3D was asked to
-    // configure). Under HiDPI these are smaller than the actual render target
-    // (ASC_stage3d_w/h), which AIR allocates at device resolution — the compositor
-    // draws the target into this logical rect (analogous to stage3D.x/y +
-    // configureBackBuffer's width/height in AIR).
-    this.line('static int ASC_stage3d_lw;');
-    this.line('static int ASC_stage3d_lh;');
+    // this is a direct GPU→GPU blit (an MTLTexture natively, a GL texture wrapped
+    // as a GrBackendTexture on the web); on the CPU raster path the target is read
+    // back into a BGRA buffer and drawn.
+    //
+    // The published surface lives in the OWNING WINDOW's ASCWin record (阶段四百三十六),
+    // not in globals: with a single ASC_stage3d_tex/pixels/ready triple, two windows
+    // that each requested a Context3D both composited whichever one presented last
+    // (the tagline was "last present wins"), and Stage3D.x/y/visible could only ever
+    // be stored, never applied. The three helpers below are declared here -- before
+    // the Context3D_* definitions that call them -- and defined with the rest of the
+    // window state further down, because they are the only code that touches a
+    // window. Each takes the Context3D: that is what the AS3 side actually holds,
+    // and the owner chain (Context3D -> Stage3D -> Stage -> window) is resolved
+    // inside them.
+    this.line('static double as_s3d_scale_of(Context3D* o);');
+    this.line('static void as_s3d_set_logical(Context3D* o, int lw, int lh);');
+    this.line('static void as_s3d_publish(Context3D* o, int w, int h);');
     // Forward declaration: the window backend owns the definition (with the rest
     // of the ASC_win_* state further down). Context3D_configureBackBuffer needs the
     // device pixel ratio to honour wantsBestResolution, so it must be visible here.
@@ -29172,7 +29172,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->blendSource = NULL; o->blendDest = NULL;');
     this.line('o->depthTestOn = false; o->depthCompare = NULL; o->cullMode = NULL;');
     this.line('o->program = NULL; o->indexBuffer = NULL; o->vc = NULL; o->fc = NULL;');
-    this.line('o->gpu = NULL; o->gpuProgram = NULL; o->programGpuSerial = 0;');
+    this.line('o->gpu = NULL; o->gpuProgram = NULL; o->programGpuSerial = 0; o->_stage3d = NULL; o->bbScale = 1.0; o->bbLW = 0; o->bbLH = 0;');
     this.line('o->stencilFace = NULL; o->stencilCompare = NULL; o->stencilBothPass = NULL; o->stencilDepthFail = NULL; o->stencilDepthPassStencilFail = NULL; o->stencilRefValue = 0;');
     this.line('o->scissorOn = false; o->scissorX = 0.0; o->scissorY = 0.0; o->scissorW = 0.0; o->scissorH = 0.0;');
     this.line('o->maxBackBufferWidth = 16384; o->maxBackBufferHeight = 16384;');
@@ -29196,8 +29196,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     // flag left the render target at 1x while Starling laid everything out for
     // 2x — the scene was rasterized at half resolution and then upscaled by the
     // compositor, i.e. visibly blurry next to adl.
+    // 阶段四百三十六: the scale comes from the window this context DRAWS INTO,
+    // not from the global ASC_win_scale (which is whatever window rendered last).
+    // A secondary NativeWindow can be on a display with a different device pixel
+    // ratio, and a context that scaled by the wrong one rendered its scene at the
+    // wrong resolution.
+    this.line('double _ws = as_s3d_scale_of(o);');
     this.line('double bbScale = 1.0;');
-    this.line('if (wantsBestResolution && ASC_win_scale > 1.0) bbScale = ASC_win_scale;');
+    this.line('if (wantsBestResolution && _ws > 1.0) bbScale = _ws;');
+    this.line('o->bbScale = bbScale;');
     this.line('int bbw = (int)((double)width * bbScale);');
     this.line('int bbh = (int)((double)height * bbScale);');
     this.line('if (bbw < 1) bbw = 1; if (bbh < 1) bbh = 1;');
@@ -29206,8 +29213,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the real buffer size because of this.
     this.line('o->backBufferWidth = bbw; o->backBufferHeight = bbh; o->antiAlias = (int)antiAlias; o->enableDepthAndStencil = enableDepthAndStencil;');
     // The compositor needs the logical (stage-unit) size to place the target in
-    // the display list — see ASC_stage3d_lw/lh.
-    this.line('ASC_stage3d_lw = (int)width; ASC_stage3d_lh = (int)height; ASC_stage3d_serial++;');
+    // the display list — see ASCWin.s3d_lw/lh. It is recorded on the CONTEXT and
+    // copied to the window by present(): at this point the window may not exist
+    // yet (see symbols.ts bbLW/bbLH), so writing through would lose it.
+    this.line('o->bbLW = (int)width; o->bbLH = (int)height;');
+    this.line('as_s3d_set_logical(o, (int)width, (int)height);');
     // Lazily create the offscreen GPU context on first configureBackBuffer, or
     // resize it on a later call (window resize). Pure-C builds: gpu stays NULL.
     this.line('if (o->gpu == NULL) o->gpu = as_s3d_create(bbw, bbh);');
@@ -29241,30 +29251,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     // drawToBitmapData-style readers see the drawn frame is kept by the
     // readback path itself, which flushes with a wait.
     this.line('as_s3d_flush_async(o->gpu);');
-    // present() = "the frame is done, show it". On the GPU paths (Metal native,
-    // WebGL2 web) expose the offscreen render target's backend texture for a
-    // direct GPU→GPU composite (no CPU readback, no CPU→GPU re-upload — the
-    // latter leaked a blit command buffer per frame on Metal). On the CPU raster
-    // path, read it back into the global BGRA8 buffer that ASC_window_render
-    // composites behind the 2D display list.
+    // present() = "the frame is done, show it". The render target is published to
+    // the window this context belongs to (see as_s3d_publish): on the GPU paths as
+    // the backend texture for a direct GPU→GPU composite (no CPU readback, no
+    // CPU→GPU re-upload — the latter leaked a blit command buffer per frame on
+    // Metal), on the CPU raster path as a readback BGRA buffer that
+    // ASC_window_render composites behind the 2D display list.
     this.line('int w = as_s3d_width(o->gpu), h = as_s3d_height(o->gpu);');
     this.line('if (w <= 0 || h <= 0) return;');
-    this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GPU)');
-    this.line('ASC_stage3d_tex = as_s3d_get_render_target(o->gpu);');
-    this.line('ASC_stage3d_w = w; ASC_stage3d_h = h;');
-    this.line('#else');    this.line('if (ASC_stage3d_pixels == NULL || ASC_stage3d_w != w || ASC_stage3d_h != h) {');
-    this.indent++;
-    this.line('if (ASC_stage3d_pixels != NULL) free(ASC_stage3d_pixels);');
-    this.line('ASC_stage3d_pixels = (uint8_t*)malloc((size_t)w * (size_t)h * 4);');
-    this.line('ASC_stage3d_w = w; ASC_stage3d_h = h;');
-    this.indent--;
-    this.line('}');
-    this.line('as_s3d_readback_render(o->gpu, ASC_stage3d_pixels);');
-    this.line('#endif');
-    this.line('ASC_stage3d_ready = 1;');
-    this.line('ASC_stage3d_serial++;');
-    // Debug probe (ASC_S3D_TRACE=1): what present() handed to the compositor.
-    this.line('{ static int n = 0; if (n++ % 120 == 0 && getenv("ASC_S3D_TRACE") != NULL) fprintf(stderr, "s3d_trace present: w=%d h=%d tex=%p lw=%d lh=%d\\n", w, h, ASC_stage3d_tex, ASC_stage3d_lw, ASC_stage3d_lh); }');
+    this.line('as_s3d_publish(o, w, h);');
     this.indent--;
     this.line('}');
     // Per-frame vertex de-interleave scratch (Context3D_submit). A cached buffer
@@ -29752,7 +29747,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void Context3D_setScissorRectangle(void* _this, Rectangle* rectangle) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
-    this.line('double sc = (ASC_stage3d_lw > 0) ? (double)o->backBufferWidth / (double)ASC_stage3d_lw : 1.0;');
+    // The rect is in stage (logical) units; the render target is at device
+    // resolution. bbScale is exactly that ratio for THIS context's back buffer
+    // (backBufferWidth / requested width), so the scissor no longer reads the
+    // global logical width of some other window's Stage3D.
+    this.line('double sc = (o->bbScale > 0.0) ? o->bbScale : 1.0;');
     this.line('if (rectangle == NULL) { o->scissorOn = false; o->scissorX = 0.0; o->scissorY = 0.0; o->scissorW = 0.0; o->scissorH = 0.0; as_s3d_set_scissor(o->gpu, 0, 0, 0, 0, 0); }');
     this.line('else { o->scissorOn = true; o->scissorX = rectangle->x; o->scissorY = rectangle->y; o->scissorW = rectangle->width; o->scissorH = rectangle->height;');
     this.line('  as_s3d_set_scissor(o->gpu, 1, (int)(rectangle->x * sc), (int)(rectangle->y * sc), (int)(rectangle->width * sc), (int)(rectangle->height * sc)); }');
@@ -30004,12 +30003,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('  as_throw(ArgumentError_new((char*)"Error #2008: Parameter profile must be one of the accepted values.", 2008));');
     this.line('o->renderMode = renderMode;');
     this.line('if (o->context3d == NULL) { o->context3d = Context3D_new(); gc_write_barrier((void*)o->context3d); }');
+    // The context draws for THIS Stage3D's window (阶段四百三十六): present() and
+    // configureBackBuffer() walk context -> Stage3D -> Stage -> window id to find
+    // the surface they publish into.
+    this.line('if (o->context3d->_stage3d == NULL) { o->context3d->_stage3d = o; gc_write_barrier((void*)o); }');
     this.line('as_set_timeout(as_fn_make(Stage3D__contextReady, (void*)o, 0), 0.0);');
     this.indent--;
     this.line('}');
     this.line('Context3D* Stage3D_get_context3D(void* _this) { return ((Stage3D*)_this)->context3d; }');
-    this.line('void Stage3D_set_x(void* _this, double value) { Stage3D* o = (Stage3D*)_this; o->x = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
-    this.line('void Stage3D_set_y(void* _this, double value) { Stage3D* o = (Stage3D*)_this; o->y = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
+    // x/y are the Stage3D's position on the stage, in pixels, and AIR validates the
+    // interval synchronously (measured on adl 51.4.1: -8191 and 8191 are accepted,
+    // 8192 / 9000 / -9000 throw). The error AIR raises for this is #2006 with that
+    // exact wording — an odd choice (it reads like an index error) but it is what
+    // the runtime reports, and AIR's error text is reproduced byte for byte.
+    this.line('static void as_s3d_check_pos(double v) {');
+    this.indent++;
+    this.line('if (!(v >= -8191.0 && v <= 8191.0))');
+    this.line('  as_throw(ArgumentError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006));');
+    this.indent--;
+    this.line('}');
+    this.line('void Stage3D_set_x(void* _this, double value) { Stage3D* o = (Stage3D*)_this; as_s3d_check_pos(value); o->x = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
+    this.line('void Stage3D_set_y(void* _this, double value) { Stage3D* o = (Stage3D*)_this; as_s3d_check_pos(value); o->y = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
     this.line('void Stage3D_set_visible(void* _this, bool value) { Stage3D* o = (Stage3D*)_this; o->visible = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }');
     this.line('as_vector_Stage3D* Stage_get_stage3Ds(void* _this) {');
     this.indent++;
@@ -32545,10 +32559,93 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('char* render_mode;');
     this.line('void* owner;');
     this.line('char* display_state;');
+    // ---- Stage3D composite surface (阶段四百三十六) ----
+    // ONE surface per window: the Stage3D of THIS window's stage publishes here
+    // from Context3D.present(), and ASC_window_render composites exactly this
+    // surface — never another window's. Before this the runtime held one global
+    // ASC_stage3d_tex/pixels pair, so two windows that each requested a Context3D
+    // both showed whichever one presented last, and Stage3D.x/y/visible could only
+    // be stored. (AIR allows up to four Stage3D instances per stage; this runtime
+    // still creates one slot per stage, so the surface is keyed by window rather
+    // than by (window, slot) — growing the slot count is a local change here.)
+    this.line('void* s3d_tex;');        // borrowed backend render target, never freed here
+    this.line('uint8_t* s3d_pixels;');  // CPU-raster builds: readback BGRA buffer (owned)
+    this.line('int s3d_w, s3d_h;');    // render target size in device pixels
+    this.line('int s3d_lw, s3d_lh;');  // footprint in stage units (configureBackBuffer w/h)
+    this.line('int s3d_ready;');        // a frame has been published for this window
+    this.line('uint64_t s3d_serial;');  // present/configure counter: the Present-skip key
     this.indent--;
     this.line('} ASCWin;');
     this.line('static ASCWin ASC_wins[ASC_MAX_WINDOWS];');
     this.line('static ASCWin* ASC_w(int id) { return (id >= 0 && id < ASC_MAX_WINDOWS) ? &ASC_wins[id] : NULL; }');
+    // ---- Stage3D surface routing (阶段四百三十六) ----
+    // The window a Context3D publishes into, or -1 when its Stage is not attached to
+    // a window at all (offscreen builds, or a bare `new Stage()` in a pure-C test).
+    // This is the whole fix for "last present wins": before it a Context3D held no
+    // back-pointer, so present() could not name a window even in principle.
+    this.line('static int as_s3d_win_id(Context3D* o) {');
+    this.indent++;
+    this.line('if (o == NULL || o->_stage3d == NULL || o->_stage3d->_owner == NULL) return -1;');
+    this.line('return as_stage_window_id((Stage*)o->_stage3d->_owner);');
+    this.indent--;
+    this.line('}');
+    // The device pixel ratio of the window this context draws into. configureBackBuffer
+    // scales the requested back buffer by it when wantsBestResolution is set; a
+    // secondary window can be on a display with a different ratio from whichever
+    // window happened to render last, which is what the old global answered.
+    this.line('static double as_s3d_scale_of(Context3D* o) {');
+    this.indent++;
+    this.line('ASCWin* wn = ASC_w(as_s3d_win_id(o));');
+    this.line('return (wn != NULL && wn->scale > 0.0) ? wn->scale : 1.0;');
+    this.indent--;
+    this.line('}');
+    // configureBackBuffer's stage-unit size: the rect the render target occupies on
+    // the stage, which the compositor draws into (offset by Stage3D.x/y). Bumping the
+    // serial forces a recomposite — the footprint changed even if nothing else did.
+    this.line('static void as_s3d_set_logical(Context3D* o, int lw, int lh) {');
+    this.indent++;
+    this.line('ASCWin* wn = ASC_w(as_s3d_win_id(o));');
+    this.line('if (wn == NULL) return;');
+    this.line('wn->s3d_lw = lw; wn->s3d_lh = lh;');
+    this.line('wn->s3d_serial++;');
+    this.indent--;
+    this.line('}');
+    // Context3D.present(): hand this frame's render target to the owning window.
+    //
+    // GPU builds borrow the backend texture for a GPU→GPU composite. CPU-raster
+    // builds read the target back into the window's own BGRA buffer; that buffer is
+    // the only malloc here, freed on resize and on close (see ASC_window_on_close),
+    // because it belongs to the window rather than to the context.
+    this.line('static void as_s3d_publish(Context3D* o, int w, int h) {');
+    this.indent++;
+    this.line('ASCWin* wn = ASC_w(as_s3d_win_id(o));');
+    this.line('if (wn == NULL || w <= 0 || h <= 0) return;');
+    this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GPU)');
+    this.line('wn->s3d_tex = as_s3d_get_render_target(o->gpu);');
+    this.line('wn->s3d_pixels = NULL;');
+    this.line('wn->s3d_w = w; wn->s3d_h = h;');
+    this.line('#else');
+    this.line('if (wn->s3d_pixels == NULL || wn->s3d_w != w || wn->s3d_h != h) {');
+    this.indent++;
+    this.line('if (wn->s3d_pixels != NULL) free(wn->s3d_pixels);');
+    this.line('wn->s3d_pixels = (uint8_t*)malloc((size_t)w * (size_t)h * 4);');
+    this.line('wn->s3d_w = w; wn->s3d_h = h;');
+    this.indent--;
+    this.line('}');
+    this.line('if (wn->s3d_pixels == NULL) return;');
+    this.line('as_s3d_readback_render(o->gpu, wn->s3d_pixels);');
+    this.line('#endif');
+    // The logical footprint comes from the CONTEXT, never from the window: the
+    // window may have been unbound when configureBackBuffer ran (a script configures
+    // before showWindow claims slot 0), and copying it here is what makes that order
+    // work. Without it the rect stayed 0x0 and the surface composited as nothing.
+    this.line('wn->s3d_lw = o->bbLW; wn->s3d_lh = o->bbLH;');
+    this.line('wn->s3d_ready = 1;');
+    this.line('wn->s3d_serial++;');
+    // Debug probe (ASC_S3D_TRACE=1): which window got which surface.
+    this.line('{ static int n = 0; if (n++ % 120 == 0 && getenv("ASC_S3D_TRACE") != NULL) fprintf(stderr, "s3d_trace present: win=%d w=%d h=%d tex=%p lw=%d lh=%d\\n", as_s3d_win_id(o), w, h, wn->s3d_tex, wn->s3d_lw, wn->s3d_lh); }');
+    this.indent--;
+    this.line('}');
     this.cblock(NATIVE_DRAG_BODY);
     this.line('');
     // ---- NativeWindow events ----
@@ -33055,12 +33152,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (w->render_valid) {');
     this.indent++;
     this.line('if (w->render_epoch != ASC_dirty_epoch) as_dbg_key_fp_n++;');
-    this.line('if (w->render_s3d_serial != ASC_stage3d_serial) as_dbg_key_s3d_n++;');
+    // 阶段四百三十六: the skip key is THIS window's own surface serial. A global
+    // serial made every window recomposite whenever any other window's Stage3D
+    // presented, which was a pure waste of a frame (and, with one surface, also
+    // the reason both windows showed the same content).
+    this.line('if (w->render_s3d_serial != w->s3d_serial) as_dbg_key_s3d_n++;');
     this.line('if (w->render_gpu_generation != _gpu_generation) as_dbg_key_gpu_n++;');
     this.line('if (w->render_window_generation != _window_generation) as_dbg_key_window_n++;');
     this.indent--;
     this.line('}');
-    this.line('if (w->render_valid && w->render_epoch == ASC_dirty_epoch && w->render_s3d_serial == ASC_stage3d_serial && w->render_gpu_generation == _gpu_generation && w->render_window_generation == _window_generation && getenv("ASC_NO_PRESENT_SKIP") == NULL) { as_dbg_present_skip_n++; return 0; }');
+    this.line('if (w->render_valid && w->render_epoch == ASC_dirty_epoch && w->render_s3d_serial == w->s3d_serial && w->render_gpu_generation == _gpu_generation && w->render_window_generation == _window_generation && getenv("ASC_NO_PRESENT_SKIP") == NULL) { as_dbg_present_skip_n++; return 0; }');
     // Any early return below must retry next frame, never accept a half-new state.
     this.line('w->render_valid = 0;');
     this.line('void* canvas = NULL;');
@@ -33139,26 +33240,40 @@ void FileStream_writeObject(void* _this, as_value v) {
     // what removed that per-frame CPU readback. So a GPU window draws the texture,
     // a cpu-mode window in the same build draws nothing — which is the documented
     // AIR behaviour, not a silent gap.
+    // Stage3D.x/y/visible are applied HERE, at composite time: AIR positions each
+    // Stage3D viewport at its own x/y on the stage and removes it from the display
+    // with visible=false (AS3 reference: "The horizontal coordinate of the Stage3D
+    // display on the stage, in pixels"; "Use this property to temporarily hide a
+    // Stage3D object"). Reading them per frame — instead of caching the offset
+    // when the back buffer was configured — makes a write that lands after the
+    // last present take effect on the next frame, which is what AIR does.
+    this.line('double _s3x = 0.0, _s3y = 0.0; int _s3vis = 1;');
+    this.line('if (w->stage != NULL && w->stage->stage3ds != NULL && w->stage->stage3ds->length > 0) {');
+    this.indent++;
+    this.line('Stage3D* _s3 = as_vector_Stage3D_get(w->stage->stage3ds, 0);');
+    this.line('if (_s3 != NULL) { _s3x = _s3->x; _s3y = _s3->y; _s3vis = _s3->visible ? 1 : 0; }');
+    this.indent--;
+    this.line('}');
     this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D)');
-    this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: is_gpu=%d ready=%d tex=%p w=%d h=%d lw=%d lh=%d scale=%.4f win lw=%d lh=%d pw=%d ph=%d\\n", w->is_gpu, ASC_stage3d_ready, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, ASC_stage3d_lw, ASC_stage3d_lh, w->scale, w->lw, w->lh, w->pw, w->ph); }');
-    this.line('if (w->is_gpu && ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
+    this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: is_gpu=%d ready=%d tex=%p w=%d h=%d lw=%d lh=%d xy=%.1f,%.1f vis=%d scale=%.4f win lw=%d lh=%d pw=%d ph=%d\\n", w->is_gpu, w->s3d_ready, w->s3d_tex, w->s3d_w, w->s3d_h, w->s3d_lw, w->s3d_lh, _s3x, _s3y, _s3vis, w->scale, w->lw, w->lh, w->pw, w->ph); }');
+    this.line('if (w->is_gpu && w->s3d_ready && w->s3d_tex != NULL && _s3vis) {');
     this.indent++;
     // Source rect = the real render target (device pixels when wantsBestResolution
     // scaled it); dest rect = its logical footprint in stage units, which the canvas
-    // scale above turns back into device pixels 1:1.
-    this.line('as_skia_gpu_draw_texture(canvas, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_lw, (double)ASC_stage3d_lh);');
+    // scale above turns back into device pixels 1:1 — offset by the Stage3D's own x/y.
+    this.line('as_skia_gpu_draw_texture(canvas, w->s3d_tex, w->s3d_w, w->s3d_h, _s3x, _s3y, (double)w->s3d_lw, (double)w->s3d_lh);');
     this.indent--;
     this.line('}');
     this.line('#elif defined(ASC_RENDER_GPU)');
-    this.line('if (ASC_stage3d_ready && ASC_stage3d_tex != NULL) {');
+    this.line('if (w->s3d_ready && w->s3d_tex != NULL && _s3vis) {');
     this.indent++;
-    this.line('as_skia_gl_draw_texture(canvas, ASC_stage3d_tex, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_lw, (double)ASC_stage3d_lh);');
+    this.line('as_skia_gl_draw_texture(canvas, w->s3d_tex, w->s3d_w, w->s3d_h, _s3x, _s3y, (double)w->s3d_lw, (double)w->s3d_lh);');
     this.indent--;
     this.line('}');
     this.line('#else');
-    this.line('if (ASC_stage3d_ready && ASC_stage3d_pixels != NULL) {');
+    this.line('if (w->s3d_ready && w->s3d_pixels != NULL && _s3vis) {');
     this.indent++;
-    this.line('as_skia_canvas_draw_bgra(canvas, ASC_stage3d_pixels, ASC_stage3d_w, ASC_stage3d_h, 0.0, 0.0, (double)ASC_stage3d_lw, (double)ASC_stage3d_lh);');
+    this.line('as_skia_canvas_draw_bgra(canvas, w->s3d_pixels, w->s3d_w, w->s3d_h, _s3x, _s3y, (double)w->s3d_lw, (double)w->s3d_lh);');
     this.indent--;
     this.line('}');
     this.line('#endif');
@@ -33175,7 +33290,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#ifdef ASC_RENDER_WINGPU');
     this.line('if (w->is_gpu) as_skia_gpu_flush(id);');
     this.line('#endif');
-    this.line('w->render_epoch = ASC_dirty_epoch; w->render_s3d_serial = ASC_stage3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
+    this.line('w->render_epoch = ASC_dirty_epoch; w->render_s3d_serial = w->s3d_serial; w->render_gpu_generation = _gpu_generation; w->render_window_generation = _window_generation; w->render_valid = 1;');
     // Stage C: end-of-frame reset (see as_clear_dirty). The cache branch still
     // clears on consume (that is what makes incremental re-bake correct); this
     // clears the LIVE subtrees the cache branch never touches, so auto-bake can
@@ -34022,6 +34137,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
     this.line('as_frame_guard = 1;');
     this.line('w->closed = 1;');
+    // Free the window's Stage3D readback buffer BEFORE the CLOSE dispatch: the
+    // recovery path below (a listener that throws) returns early, so anything put
+    // after the dispatch would leak on that path. s3d_tex is borrowed from the
+    // context's backend and is only dropped, never freed (阶段四百三十六).
+    this.line('if (w->s3d_pixels != NULL) { free(w->s3d_pixels); w->s3d_pixels = NULL; }');
+    this.line('w->s3d_tex = NULL; w->s3d_ready = 0;');
     this.line('if (w->surface != NULL) { as_skia_surface_delete(w->surface); w->surface = NULL; w->canvas = NULL; }');
     this.line('if (w->window != NULL) {');
     this.indent++;

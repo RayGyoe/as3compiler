@@ -8505,6 +8505,32 @@ export class SymbolTable {
         // re-upload of the same Program3D bumps the serial and forces a recompile.
         ['gpuProgram', c3f({ kind: 'object', className: 'Program3D' })],
         ['programGpuSerial', c3f({ kind: 'int' })],
+        // The Stage3D whose requestContext3D created this context (阶段四百三十六).
+        // present()/configureBackBuffer() must publish into the OWNING WINDOW, and
+        // the only back-pointer chain available is Context3D -> Stage3D -> Stage
+        // (`_owner`) -> window id. A Context3D is reachable from several places
+        // (Stage3D.context3D, Starling's painter, a user's field) but none of them
+        // say WHERE it draws, which is exactly why the composite surface used to be
+        // a process-wide singleton.
+        ['_stage3d', c3f({ kind: 'object', className: 'Stage3D' })],
+        // The device-pixel factor configureBackBuffer applied for
+        // wantsBestResolution. setScissorRectangle turns its stage-unit rect into
+        // device pixels with this -- a scissor belongs to THIS back buffer, which
+        // may live in another window at another scale, so it cannot read a global.
+        ['bbScale', c3f({ kind: 'number' })],
+        // The back buffer's size in STAGE units (what configureBackBuffer was asked
+        // for, before the device-pixel factor). The compositor draws the surface at
+        // this size, offset by Stage3D.x/y. It is kept on the CONTEXT rather than
+        // pushed to the window when configureBackBuffer runs, because the common
+        // order is `configureBackBuffer` BEFORE the window exists (a script configures
+        // right after requestContext3D, and the root window is only claimed by
+        // showWindow) -- there is no window to write to yet, and the old write-through
+        // silently lost the size, leaving a 0x0 rect that composited nothing (measured:
+        // the main window stayed white while the secondary window, configured after
+        // it was bound, drew correctly). present() copies these onto the owning
+        // window, by which time the binding exists.
+        ['bbLW', c3f({ kind: 'int' })],
+        ['bbLH', c3f({ kind: 'int' })],
         ['clearR', c3f({ kind: 'number' })],
         ['clearG', c3f({ kind: 'number' })],
         ['clearB', c3f({ kind: 'number' })],

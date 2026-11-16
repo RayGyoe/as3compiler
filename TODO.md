@@ -20306,6 +20306,27 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-16 追加（阶段四百三十六：Stage3D 上屏合成按窗口化）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒
+> 主表 **88 → 87 行**（`未开始` 67 → **66**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。移出的正是同一天登记的那行
+> 「Stage3D 上屏合成是进程级单例」——现已根治：`Context3D` 补 `_stage3d`/`bbScale`/`bbLW`/`bbLH`，`present()` 改发
+> `as_s3d_publish()` 写**所属窗口**的表面槽（`ASC_stage3d_*` 六个全局全删），`ASC_window_render` 按本窗口的
+> `Stage3D.x/y/visible` 合成、倍率取所属窗口 `scale`，Present 跳过指纹改比每窗 `s3d_serial`。**adl 无法定标**（macOS
+> 的 adl 压根没有 Stage3D：`#3702` 在副窗与初始窗都出现），故语义按 AIR 官方文档落地、验收改为真机截屏对拍；能定标的
+> `x/y` 边界照实 adl 定标（`[-8191, 8191]`，越界 `ArgumentError #2006` 文案逐字）。详见下文阶段节与
+> `docs/{zh-cn,en}/display3d.md` §11。
+
+> **2026-11-16 追加（Stage3D 多窗口合成缺口登记，纯登记不改 src）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表 **87 → 88 行**（`未开始` 66 → **67**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。新登记项是**源码审计**
+> 量出的安静缺口：2D 多窗口早已落地（阶段八十九·七十一，每窗独立 Stage），但 Stage3D 的上屏合成缝是**进程级单例**——
+> `Context3D_configureBackBuffer`/`present` 写全局 `ASC_stage3d_lw/lh/tex/pixels/ready`，`ASC_window_render` 把这唯一一张
+> 表面 blit 进**每一个** GPU 窗口 ⇒ 两窗各自 `requestContext3D` 时最后 present 者赢、两窗同画，`Stage3D.x/y/visible`
+> 存而不用，副窗 HiDPI 倍率错用主窗的 `ASC_win_scale`。GPU 后端**不是**瓶颈（三后端都已 `S3D_MAX_CTX 4` + `s3d_live[]`
+> 多上下文登记表），缺的只是生成 C 里「context → 所属窗口」的路由。**从未暴露的原因**：全部 Stage3D 消费者
+> （Starling 12 场景、shmup、asaot3d 29 demo）都是单窗口；`NativeWindow` 家族那行只写了「每窗独立 Stage 已落地」，
+> 不覆盖 Stage3D 合成面，故此前无行可挂。**诚实口径**：AIR 文档声明 GPU 渲染模式的 `NativeWindow` 支持 Stage3D，
+> 但本机尚未 adl 实测双窗行为（每窗 backbuffer 尺寸/x/y/visible/倍率），落地前必须先跑双端孪生探针定标，
+> 不凭文档反推语义（§2.4）。web 不受影响（单 canvas，`NativeWindow` 已诚实抛 `#2012`）。
+
 > **2026-11-16 追加（阶段四百三十五：macOS 编不过根治 + macOS 回归清零）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒
 > 主表 **86 → 87 行**（`未开始` 65 → **66**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。新登记项是**全量 macOS 回归首轮**
 > 暴露的文本度量分歧：同一字体字号下，纯文本字段走 G41 light 快路径报 AIR 模型盒（`rhalf(ascent)+rhalf(descent)+leading`），
@@ -23061,3 +23082,25 @@ README（zh/en）新增 camera-devices 示例描述；plan 文档 B2 标落地�
 **同轮清掉的另两处 macOS 红（都不是本轮引入，都是阶段四百二十二那一轮没见过 macOS 的后果）**：① `test/harness.ts` 的 `PROBE_SYSTEM_LINK_FLAGS` 在 darwin 上是空数组，而生成 C 的 `NativeApplication_set_systemIdleMode` 是**非 static** 函数（链接器决定去留，不是 -O2），探针一律 `Undefined symbols: _CFRelease/_CFStringCreateWithCString/_IOPMAssertion*` ⇒ `unit: emit/NoWarnings` + 5 个 `unit: desktop/*` 全红；补 `-framework CoreFoundation -framework IOKit`（与 Windows 侧 shell32/ws2_32 同一条理由：真构建的链接行来自 manifest/`platformFrameworks()`，探针一行 `cc` 无从得知）。② `unit: platform/NetworkInventory` 有一条 `PROBE_SYSTEM_LINK_FLAGS.includes('-liphlpapi')` —— **Win32 专有 token 断言在任何宿主上都跑**，于是 macOS/Linux 恒红；改成按宿主双分支（Windows 断言在、非 Windows 断言**不许泄漏**，后者同样是有牙的反向钉）。
 
 **记账**：遗留表 **86 → 87 行**（新登记 1 行「纯文本字段与富文本字段的 `textHeight` 相差 0.5–1 px」，`未开始` 65 → **66**）——这是本轮全量 macOS 回归首轮暴露的**另一件事**：`examples/text-underline.as` 用例①仍红（Courier New 12：无下划线 13.5 / 有下划线 14），根因是 light 快路径与 SkParagraph 两条路对行盒的取整口径不同，判「哪个是 AIR 真值」必须先跑 adl（本机 AIR SDK 未装），故**只登记不猜改**。`docs/{zh-cn,en}/compile.md` 无需改（无新增 define，能力面不变），`stubs.md` 的 `systemIdleMode` 行仍准确（实现形态改变，契约未变）。**全量 `node test.ts` 结果：716 测试 / 716 通过 / 0 失败 / 4 跳过**——修前同一套件是 **8 失败**。**经验**：① 「生成 C 保持 header-free」是**机制**不是口号——任何 `#include <AppleFramework/…>` 都可能经 `MacTypes.h` 撞上 `Point`/`Rectangle`，只在用这些类的程序上炸，故必须有**按类**的守卫钉而非个案钉；② 单元钉子能把 bug 写成契约（本轮那条 `includes IOPMLib.h`），修 bug 时必须同步翻转对应钉子，否则下一轮会「修好即回归」；③ 平台分支里的 include 在另一平台的 CI 永远看不见，**跨平台改动的验收必须含该平台的一次真编译**；④ 手写声明必须先验 ABI 再落盘——用 30 行裸 C 探针 + `pmset` 观测，比在 4 MB 生成 C 里试错快两个数量级；⑤ **探针链接行是第二处「只有真构建才知道」的知识**——Windows 侧早有一份 `PROBE_SYSTEM_LINK_FLAGS`，darwin 侧漏了，于是同一份平台代码在两个宿主上表现成「Windows 全绿 / macOS 六组红」；⑥ 断言的**宿主前提**也要像 ABI 一样钉住：`includes('-liphlpapi')` 这种 Win32 断言必须双分支，否则它在新宿主上永远红而不是永远绿。
+
+### 阶段四百三十六：Stage3D 上屏合成按窗口化——多窗口不再「最后 present 者赢」（v0.4.411 → v0.4.412）
+
+用户点名的缺口（同日登记在遗留表）：2D 多窗口早已每窗独立（阶段八十九·七十一），但 Stage3D 的**上屏合成缝**是进程级单例。
+
+- **根因（两层，缺一不可）**。① **表面路由是全局的**：`Context3D_configureBackBuffer` 写全局 `ASC_stage3d_lw/lh`、倍率取全局 `ASC_win_scale`；`Context3D_present` 写全局 `ASC_stage3d_tex/pixels/ready/serial`；`ASC_window_render` 把这**唯一一张**表面在 (0,0) blit 进**每一个** GPU 窗口。两窗各自 `requestContext3D()` 时最后 present 者赢、两窗同画；`Stage3D.x/y/visible` 的 setter 只存值 + mark dirty，合成器恒画 (0,0)；副窗 HiDPI 倍率取「上一个渲染的窗口」的 scale。② **缺一条反查边**：对象模型其实早就 per-window（`Stage_get_stage3Ds` 每 Stage 懒建自己的向量、`Stage3D._owner` 指回该 Stage），但 `Context3D` **没有**任何指回 Stage3D/窗口的指针——`present()` 根本不知道自己是哪个窗口的。GPU 后端**不是**瓶颈：三后端早已 `S3D_MAX_CTX 4` + `s3d_live[]` 多上下文表（`stage3d_glue.mm:955`、`stage3d_webgl.cc:344`、`stage3d_d3d.cc:425`），每 context 独立渲染目标。故修复全在生成侧，**后端一行未改**。
+- **修法（`src/symbols.ts` + `src/emit.ts`）**：`Context3D` 补 `_stage3d`（构造时由 `Stage3D_requestContext3D` 回填 + `gc_write_barrier`）、`bbScale`（本后缓冲的设备倍率）、`bbLW/bbLH`（舞台坐标尺寸）；删掉全部六个 `ASC_stage3d_*` 全局，改在 `ASCWin` 上加 `s3d_tex/s3d_pixels/s3d_w/s3d_h/s3d_lw/s3d_lh/s3d_ready/s3d_serial` 表面槽；新增 `as_s3d_win_id`（`Context3D._stage3d → Stage3D._owner → as_stage_window_id`，反查不到 -1）、`as_s3d_scale_of`、`as_s3d_set_logical`、`as_s3d_publish`、`as_s3d_check_pos`；`present()` → `as_s3d_publish(o, w, h)` 只写所属窗口；`ASC_window_render` 每帧读本窗口 `stage3Ds[0]` 的 `_s3x/_s3y/_s3vis`，按 `x/y` 合成并受 `visible` 门控；Present 跳过指纹改比 `w->render_s3d_serial == w->s3d_serial`；`setScissorRectangle` 用 `o->bbScale`（裁剪属于**这个**后缓冲）；`ASC_window_on_close` 先释放 `s3d_pixels` 再清 `s3d_tex/ready`；表面槽**刻意**不进 GC 根（由窗口生命周期管，回读缓冲是 `GCT_BYTES` 之外的裸缓冲）。
+- **只有真机才看得见的顺序坑（修法本身的第一版是错的）**：第一版在 `configureBackBuffer` 里直接把尺寸写进窗口。真机截图立刻否掉——**主窗全白、副窗正常**。原因是常见顺序就是「先 configure 再 showWindow」：脚本在 `requestContext3D()` 之后立刻 `configureBackBuffer(300,200,…)`，而根窗口要到 `Stage.showWindow()` 才被 `ASC_win_claim_main()` 认领并绑 `w->stage`，那次写窗口拿到 NULL，尺寸**静默丢失** ⇒ 合成矩形 0×0 ⇒ 什么都不画。副窗在 `new NativeWindow()` 之后才 configure，所以它正常；「一半对一半错」最容易被误判成渲染后端 bug。修法：舞台尺寸记在 **context** 的 `bbLW/bbLH`，`present()` 时回填窗口（present 必在绑定之后）；`configureBackBuffer` 的那次写窗口保留（已绑定时立即生效并 bump serial）。
+- **adl 定标：这台机器上做不到（照实报明）**。`temp/s3d2win/` 双探针实测（AIR SDK 51.4.1 / macOS）：**macOS 的 adl 根本没有 Stage3D**——`requestContext3D("auto")` 在副窗与**初始窗**都抛 `Error #3702: Context3D not available.`（初始窗用控制探针 `S3DInit.as` 单独复现），所以「两窗各画什么」的像素口径**无法**在 adl 上取得；`app.xml` 写 `renderMode="gpu"` → `Error #1508`（`auto`/`direct`/`cpu` 都能起）；adl 的 `stage.stage3Ds.length` 是 **4**，我们懒建 1 个（按文档「桌面 4 个实例」，按需创建不算缺陷）。能定标的照实定标并与我们一致：`Stage3D.x/y` 接受 `-8191`/`8191`，`8192`/`-8192`/`9000` 抛 `ArgumentError`，`errorID` **2006**，文案逐字节 `Error #2006: The supplied index is out of bounds.`；默认 `x=0 y=0 visible=true`。合成顺序（StageVideo → Stage3D → 显示列表）、后缓冲 alpha 不参与合成、桌面 4 实例**来自 AIR 官方文档**（不凭文档反推其余语义，§2.4）。
+- **验收（真机截屏对拍，不是猜测）**：探针 `temp/s3dwin2/hold.as`（两窗同帧各画纯色 + `present()`）+ `screencapture`（显示 1800×1169 pt @2x ⇒ 截图 3600×2338 px，1 pt = 2 px）：
+  | 态 | 主窗（红 300×200 @0,0） | 副窗（绿 240×160） | 结论 |
+  |---|---|---|---|
+  | 修复前（把全局表面写回 0 号窗复刻旧代码） | **绿** | 绿 | 两窗同画＝最后 present 者赢，登记的 bug 复现 |
+  | 修复后 | 红（bbox 1440..1959 × 914..1306，181 048 px） | 绿（55 296 px） | 各窗各画 |
+  | 修复后 + `s3dB.x=40, y=34` | 红不变 | 绿块整体右移 48 px、下移 41 px | `x/y` 真的进合成器 |
+  | 修复后 + `s3dB.visible=false` | 红不变 | **0 个绿像素**（露出 `[16,16,16]` 底色） | `visible` 真的门控 |
+  另有 `exit.as` 探针确认 `NativeApplication.nativeApplication.exit()` 能结束进程（adl 里该调用抛 `SecurityError #2018`，故不能在 adl 上对照）。
+- **示例 + 钉子**：新增 `examples/s3d-multiwindow.as`（+ `s3d-multiwindow.build.json`，Metal/Skia/SDL2）：手写 AGAL 全屏四边形（与 `vertex-texture.as` 同一套 `tok/dst/srcLo/head` 编码），两窗各 `requestContext3D` + `configureBackBuffer(300,200)`/`(240,160)`，**21 钉**：两 Stage 各有自己的 `stage3Ds`、两 `Context3D` 是不同对象、两后缓冲尺寸各自跟随、两 context 的 `drawToBitmapData` 各取到自己的颜色（Metal 下 `0xFF0000`/`0x00FF00`，纯 C 构建为黑）、`x/y` 的 `#2006` 边界与被拒赋值不落库、`visible` 读回与默认值——真机 `21 checks passed`。示例套件里它是 **compile+link only**（窗口 + GPU，与 `native-window.as`/`yuv420-gpu` 同一处置）。`test/unit/stage3d.ts` 新增 `stage3d/multiwindow-surface` **16 钉**（进程级 `ASC_stage3d_*` 一个不剩、`ASCWin` 表面槽形状、每窗 serial 指纹、`_stage3d` + 写屏障、倍率只取所属窗口、尺寸记在 context、`present` 只发所属窗口、按 `x/y` 画且受 `visible` 门控、`bbScale` 裁剪、关窗回收、表面不当 GC 根）。
+- **既有钉子按新语义翻转（三组，都是「把旧形状写成契约」的典型）**：`unit: render/PresentSkip`（`w->render_s3d_serial == ASC_stage3d_serial` → `== w->s3d_serial`；`Context3D_present` 里 `ASC_stage3d_serial++` → `as_s3d_publish` 里 `wn->s3d_serial++`）、`unit: render/RepaintBoundary`（x/y setter 现在先 `as_s3d_check_pos(value)`，`visible` 保持原形，三条一起按逐字节形态钉）、`unit: platform/NativeWindow`（合成守卫改为 `if (w->is_gpu && w->s3d_ready && w->s3d_tex != NULL && _s3vis) {`）。
+- **零回归**：`examples/air-starling-demo` 整链重编成功（生成 C 9.09 MB，单窗口 Stage3D/Metal 菜单正常渲染，状态栏 `Metal (Stage3D)`）；全量 `node test.ts` **718 测试 / 718 通过 / 0 失败 / 0 跳过** exit=0（修前同一套件 3 组红，都是上面三组旧钉子；版本 `0.4.411 → 0.4.412`）。
+
+**记账**：主表 **88 → 87 行**（移出本轮修好的进程级单例行；`未开始` 67 → **66**）。文档：`docs/{zh-cn,en}/display3d.md` 新增 §11（多窗口语义、路由表、顺序坑、adl 定标实录、截屏对拍表，原「参考链接」顺延为 §12）；`docs/{zh-cn,en}/compile.md` 的 Present 跳过口径改为「**本窗口的** Stage3D 序号」；README（zh/en）新增 `s3d-multiwindow` 示例行。**经验**：① 「对象模型 per-window」不等于「上屏 per-window」——显示树的 per-window 早在八十九·七十一就成立了，但**合成缝**是另一层，缺的是「context → 窗口」的一条边，登记时按源码审计拆成两层判据才不跑偏；② 后端多上下文能力往往比前端路由先就位（三后端早就有 `s3d_live[]`），遇到「多窗同画」先查路由，别先怀疑后端；③ **写窗口的时机**是新一类陷阱：`configureBackBuffer` 早于 `showWindow` 是常态，任何「configure 时写窗口」的方案都会在主窗静默丢值，而副窗正常——真机截图是唯一能发现它的手段；④ adl 给不出语义时必须**照实报明**并改用可核验的替代证据（官方文档 + 真机截屏 + C 形状钉子），不能拿「文档没写」当理由静默猜；⑤ 修 bug 时**同一语义的旧钉子会立刻变红**，这三组红是健康的信号（说明钉子真的有牙），照新契约逐字节翻转即可，不要为了让测试变绿而放宽钉子。

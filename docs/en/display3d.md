@@ -1103,7 +1103,101 @@ determinism is 0.02% ⇒ any difference ≥2% is a real one.)
 **Nails**: the `stage3d/d3d-glue` group in `test/unit/stage3d.ts` (the key contains the factor pair, the alpha
 slot's translation function and its two call sites, and all four compositing paths using `kSrc`).
 
-## 11. Reference Links
+## 11. Multi-Window: the Stage3D Composite Surface Is **Per Window** (stage four-hundred-thirty-six)
+
+2D multi-window has been per-window since stage one-hundred-ninety-seven-ish (each window has its own `Stage`,
+display tree and Skia surface), but **Stage3D's on-screen composite seam stayed a process-wide singleton**. The
+object model was already per-window (`Stage.stage3Ds` is lazily created per Stage, `Stage3D._owner` points back
+at that Stage, see `Stage_get_stage3Ds` in `emit.ts`), yet `Context3D_configureBackBuffer` / `Context3D_present`
+wrote the render target into **global** `ASC_stage3d_lw/lh/tex/pixels/ready/serial`, and `ASC_window_render`
+blitted that single surface into **every** GPU window. So two windows that each called `requestContext3D` got
+"last present wins": both windows drew the same thing, `Stage3D.x/y/visible` were stored but never used, and a
+secondary window's HiDPI factor came from whichever window rendered last (`ASC_win_scale`). Every existing
+consumer (Starling's 12 scenes, shmup, asaot3d's 29 demos) is single-window, which is why this never showed up.
+
+### 11.1 The Backends Were Never the Bottleneck: What Was Missing Is the "context → window" Route
+
+All three backends have been **multi-context** from the start (`S3D_MAX_CTX 4` + `s3d_live[]` in
+`stage3d_glue.mm`, `stage3d_webgl.cc`, `stage3d_d3d.cc`), each with its own render target and pipeline cache.
+Only the generated C's "which surface goes into which window" layer was broken, and `Context3D` had **no**
+pointer back to its window at all (only Stage3D had `_owner`). The fix is therefore entirely in the generated
+side; no backend line changed:
+
+| Site | Before | After |
+|---|---|---|
+| `Context3D` fields | no owner | `_stage3d` (back-pointer to the creating Stage3D) + `bbScale` (this context's back-buffer factor) + `bbLW/bbLH` (stage-unit size) |
+| `configureBackBuffer` | wrote global `ASC_stage3d_lw/lh`; factor read global `ASC_win_scale` | factor comes from `as_s3d_scale_of(context)` = the **owning window**'s `scale`; the stage-unit size is recorded on the **context** |
+| `present()` | wrote the global surface | `as_s3d_publish(context)`: `as_s3d_win_id(context)` → that `ASC_wins[i]` slot's `s3d_tex/pixels/w/h/lw/lh/ready/serial` |
+| `ASC_window_render` | drew the single surface, always at (0,0), ignoring `visible` | draws **this window's** `s3d_*` at this window's Stage3D `x/y`, gated on `visible`, re-read every frame |
+| Present-skip fingerprint | global Stage3D serial | `w->render_s3d_serial == w->s3d_serial` (one per window) |
+| `setScissorRectangle` | converted through the global `ASC_stage3d_lw` | uses `o->bbScale` (a scissor belongs to **this** back buffer) |
+
+`as_s3d_win_id()` walks `Context3D._stage3d` → `Stage3D._owner` (Stage) → `as_stage_window_id()` (the
+`ASC_wins[i].stage` reverse lookup that already existed). No window means -1 (offscreen builds, a bare
+`new Stage()` in a pure-C test) and `present()` then does nothing — the exact opposite of "draws even with no
+window, but the drawing belongs to the whole process".
+
+### 11.2 An Ordering Trap Only Hardware Shows: `configureBackBuffer` Before the Window Exists
+
+The first version of the fix wrote the stage-unit size into the window from `configureBackBuffer`. A real
+screenshot rejected it immediately: **the main window was all white while the secondary window was correct**
+(`temp/s3dwin2/`). The common order is "configure first, show later" — a script calls
+`configureBackBuffer(300, 200, …)` right after `requestContext3D()`, while the root window is only claimed by
+`Stage.showWindow()` → `ASC_win_claim_main()`, which is what binds `w->stage`. That write saw NULL, the size was
+**silently lost**, the composite rect was 0×0, and nothing was drawn. The secondary window configured *after*
+`new NativeWindow(...)`, so it worked — the "half right, half wrong" shape that most easily sends you hunting
+the backend for a rendering bug.
+
+The fix records the stage-unit size on the **context** (`bbLW/bbLH`) and copies it onto the window in
+`present()`, which always happens after the binding. The write-through in `configureBackBuffer` stays (it takes
+effect immediately when already bound, and bumps the serial to force a recomposite).
+
+### 11.3 adl Cannot Calibrate Dual-Window Semantics on This Machine
+
+Per §2.4 the reference behaviour should have been measured on adl first; that turned out to be impossible here
+(`temp/s3d2win/`, AIR SDK 51.4.1, macOS):
+
+- **macOS adl has no Stage3D at all**: `requestContext3D("auto")` throws
+  `Error #3702: Context3D not available.` in a secondary window **and** in the initial window (reproduced with a
+  control probe, `S3DInit.as`), so the per-window pixel contract cannot be obtained from adl at all.
+- `renderMode="gpu"` in `app.xml` gives `Error #1508: The value specified for argument renderMode is invalid.`
+  (`auto`/`direct`/`cpu` all start); adl reports `stage.stage3Ds.length` **4** where we lazily create one.
+
+What could be measured was measured, and matches: `Stage3D.x/y` accepts `-8191` and `8191`, throws
+`ArgumentError` for `8192` / `-8192` / `9000` with `errorID` 2006 and the byte-exact message
+**`Error #2006: The supplied index is out of bounds.`**; defaults are `x=0 y=0 visible=true`. Composite order
+(StageVideo → Stage3D → display list), no transparency channel, and the desktop's four instances come from the
+AIR reference (<https://airsdk.dev/reference/actionscript/3.0/flash/display/Stage3D.html>).
+
+### 11.4 Acceptance: Screenshot Cross-Check (Not Something the Example Layer Can Do)
+
+AS3 has no API to read back window pixels (neither does AIR), so "window A shows A's surface" can only be judged
+from outside the process. The probe `temp/s3dwin2/hold.as` (two windows, each painting a solid colour and
+`present()`ing every frame) plus `screencapture` (display is 1512pt@2x, the PNG is 3600px wide, so 1 pt ≈
+1.1905 px):
+
+| State | Main window (red 300×200 @0,0) | Secondary window (green 240×160) | Conclusion |
+|---|---|---|---|
+| Before the fix (global surface written into slot 0, reproducing the old code) | **green** (the secondary's colour) | green | Both windows draw the same thing = last present wins, exactly the registered bug |
+| After the fix | red | green | Each window draws its own |
+| After + `s3dB.x=40, y=34` | red | the green block moved right by 48 px and down by 41 px (40×1.1905, 34×1.1905) | `x/y` really reach the compositor |
+| After + `s3dB.visible=false` | red | **0 green pixels** (the stage background shows) | `visible` really gates |
+| Blend-mode sample (`(1,0,0,0.25)` back buffer) | still `(255,0,0)` | — | §10.6 item 3 is unaffected |
+
+What the example layer can assert (`examples/s3d-multiwindow.as`, **21 nails** green under Metal): two Stages
+with their own `stage3Ds`, two distinct `Context3D`s, each back buffer following its own `configureBackBuffer`
+(300×200 / 240×160), each context's `drawToBitmapData` sampling its own colour (red/green), the `#2006` bounds
+including "the rejected value is not stored", and `visible` reading back. In the example suite it is
+**compile+link only** (window + GPU), the same handling as `native-window.as` and `yuv420-gpu/`.
+
+**Nails**: the `stage3d/multiwindow-surface` group in `test/unit/stage3d.ts` (16 nails) — not a single
+process-wide `ASC_stage3d_*` left, the shape of `ASCWin`'s surface slot, the Present-skip fingerprint carrying
+the per-window serial, `Context3D._stage3d` plus its write barrier, `configureBackBuffer` taking the factor only
+from the owning window, the stage-unit size living on the context, `present` publishing to the owning window
+only, the compositor drawing at `x/y` gated on `visible`, `setScissorRectangle` using `bbScale`, the readback
+buffer freed on close, and the surface not being treated as a GC root.
+
+## 12. Reference Links
 
 - AIR SDK reference (`flash.display3D` package): <https://airsdk.dev/reference/actionscript/3.0/flash/display3D/package-detail.html>
 - AIR SDK reference (`Context3D`): <https://airsdk.dev/reference/actionscript/3.0/flash/display3D/Context3D.html>

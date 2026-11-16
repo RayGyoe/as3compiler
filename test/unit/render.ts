@@ -1558,7 +1558,10 @@ function checkPresentSkip(): string[] {
     && body.indexOf('as_render_states((DisplayObject*)st)') < body.indexOf('as_skia_gpu_begin_frame'));
   check('a hit requires a previously completed frame and every generation to match (dirty epoch + serials)',
     body.includes('w->render_valid && w->render_epoch == ASC_dirty_epoch')
-    && body.includes('w->render_s3d_serial == ASC_stage3d_serial')
+    // 阶段四百三十六: the Stage3D serial is per WINDOW now (the composite surface
+    // stopped being a process-wide singleton), so the fingerprint compares this
+    // window's own serial instead of a global one.
+    && body.includes('w->render_s3d_serial == w->s3d_serial')
     && body.includes('w->render_gpu_generation == _gpu_generation')
     && body.includes('w->render_window_generation == _window_generation'));
   check('the A/B escape hatch and the diagnostic counter are present',
@@ -1580,8 +1583,11 @@ function checkPresentSkip(): string[] {
     c.includes('static void as_render_states(DisplayObject* o) {')
     && c.includes('if (as_is(o, &SimpleButton_vt)) {')
     && c.includes('DisplayObject* st = as_sbtn_state(o);'));
-  check('Stage3D present advances the compositor serial',
-    /void Context3D_present[\s\S]*?ASC_stage3d_serial\+\+;/.test(c));
+  // 阶段四百三十六: present() no longer touches a process-wide serial; it publishes
+  // into the owning window, and THAT window's serial is what invalidates its frame.
+  check('Stage3D present advances the owning window\u2019s serial',
+    /void Context3D_present[\s\S]{0,600}?as_s3d_publish\(o, w, h\);/.test(c)
+    && /static void as_s3d_publish\(Context3D\* o, int w, int h\)[\s\S]{0,2000}?wn->s3d_serial\+\+;/.test(c));
 
   const glue = readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8');
   check('the CPU backend presents only a frame that was actually rasterized',
@@ -2989,8 +2995,14 @@ function checkRepaintBoundary(): string[] {
     && emitted.includes('((BitmapFilter*)_f)->_owner = o;'));
   check('Stage3D declares the _owner reverse edge',
     symSource.includes("['_owner', { type: { kind: 'object', className: 'Stage' }, init: null, visibility: 'private', owner: 'Stage3D'"));
+  // 阶段四百三十六: x/y validate AIR's [-8191, 8191] range (#2006) BEFORE storing, so
+  // the setter bodies now open with as_s3d_check_pos(); `visible` has no range and
+  // keeps the plain form. All three still mark the owning stage dirty -- that is the
+  // repaint edge this group exists for.
   check('Stage3D x/y/visible setters mark the owning stage',
-    emitted.includes('void Stage3D_set_x(void* _this, double value) { Stage3D* o = (Stage3D*)_this; o->x = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }'));
+    emitted.includes('void Stage3D_set_x(void* _this, double value) { Stage3D* o = (Stage3D*)_this; as_s3d_check_pos(value); o->x = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }')
+    && emitted.includes('void Stage3D_set_y(void* _this, double value) { Stage3D* o = (Stage3D*)_this; as_s3d_check_pos(value); o->y = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }')
+    && emitted.includes('void Stage3D_set_visible(void* _this, bool value) { Stage3D* o = (Stage3D*)_this; o->visible = value; if (o->_owner != NULL) as_mark_dirty((DisplayObject*)o->_owner); }'));
   check('SimpleButton state flip is detected and marks the button dirty',
     symSource.includes("['_sbtn_prev', { type: { kind: 'object', className: 'DisplayObject' }, init: null, visibility: 'private', owner: 'SimpleButton'")
     && emitted.includes('if (((SimpleButton*)o)->_sbtn_prev != st) { ((SimpleButton*)o)->_sbtn_prev = st; as_mark_dirty(o); }'));
