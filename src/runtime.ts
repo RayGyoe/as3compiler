@@ -999,6 +999,19 @@ static gc_seg* gc_segs = NULL;
 // ~36% of the strings benchmark (temp/bench/invest: swapping as_str_alloc for an
 // arena bump cut 248 ms -> 152 ms). With classes, a warm size class is an O(1)
 // head pop, and the same block is then reused forever.
+// How many nodes of the floor (same-size) class gc_find_block may probe before it
+// gives up and climbs to the rounded-up class. This is a reuse/split trade: a hit
+// reuses a block of the very same class (no split, no fresh address), a miss splits
+// a bigger block and hands the remainder back to the free lists. Deeper is better
+// for allocation-heavy mixes (benchmarks/strings allocates ~16 distinct small sizes
+// per iteration and interleaves them): measured interleaved A/B on strings, 8 (the
+// old bound) is ~2x slower than no floor probe at all, 16 is -6%, 32 is -17% and 64
+// adds nothing. The bound still has to exist -- the unbounded walk it replaced took
+// 30000 allocations to 12.9 s under a small-block flood (temp/perf/gcfindblock.as).
+// A synthesized version of that flood (temp/gcflood/flood2.as: 200k too-small nodes
+// in one class, then 200k misses) is identical at 0 / 8 / 32 probes, because the
+// first split deposits a fitting node in the floor class for the next request.
+#define GC_FIND_PROBES 32u
 #define GC_SMALL_ALIGN 32u
 #define GC_SMALL_CLASSES 16               // classes cover [0, 16*32) = [0, 512)
 #define GC_SMALL_MAX (GC_SMALL_ALIGN * GC_SMALL_CLASSES)
@@ -1037,16 +1050,16 @@ static gc_header** gc_free_list_at(int i) {
     return &gc_free_big;
 }
 // Find a free block able to serve 'size', searching the graded lists in order:
-// a small request probes at most eight nodes of its own class, then climbs from
-// the rounded-up class (whose blocks all fit), then falls through to the mid list; a big request
-// searches only the big list. Returns NULL when nothing fits, so the caller carves
-// a segment.
+// a small request probes at most GC_FIND_PROBES nodes of its own class, then climbs
+// from the rounded-up class (whose blocks all fit), then falls through to the mid
+// list; a big request searches only the big list. Returns NULL when nothing fits,
+// so the caller carves a segment.
 static gc_header* gc_find_block(size_t size, gc_header*** out_head, gc_header** out_prev) {
     bool big = size >= GC_BIG_CLASS;
     // Preserve the old layout for the usual first-fit hits near the class head,
-    // but never walk an unbounded chain of too-small nodes: at most eight probes,
-    // then start at ceil(size/ALIGN), where the first node is large enough. The old
-    // walk made 30000 allocations take 12885 ms under a small-block flood
+    // but never walk an unbounded chain of too-small nodes: at most GC_FIND_PROBES
+    // probes, then start at ceil(size/ALIGN), where the first node is large enough.
+    // The old walk made 30000 allocations take 12885 ms under a small-block flood
     // (temp/perf/gcfindblock.as). Keeping the bounded prefix also avoids needless
     // address-reuse perturbation, which matters to conservative stack scanning
     // (examples/gc_alloc_threshold.as).
@@ -1059,8 +1072,8 @@ static gc_header* gc_find_block(size_t size, gc_header*** out_head, gc_header** 
         gc_header* prev = NULL;
         if (!big && li == first && li < GC_SMALL_CLASSES
             && li != (int)((size + GC_SMALL_ALIGN - 1) / GC_SMALL_ALIGN)) {
-            int probes = 0;
-            for (gc_header* h = *list; h != NULL && probes < 8; h = h->next, probes++) {
+            unsigned probes = 0;
+            for (gc_header* h = *list; h != NULL && probes < GC_FIND_PROBES; h = h->next, probes++) {
                 if (gc_audit_mode_cache != 0) gc_audit_gate("free-list node", h);
                 if (h->size >= size) { *out_head = list; *out_prev = prev; return h; }
                 prev = h;

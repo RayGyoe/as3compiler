@@ -866,12 +866,19 @@ function checkRuntimeGcSizeClasses(): string[] {
     flat.includes('int i = gc_small_class(size); if (i >= 0) return &gc_free_small[i]; return size >= GC_BIG_CLASS ? &gc_free_big : &gc_free_mid;'));
   check('allocation re-checks h->size >= size while walking a class',
     flat.includes('for (gc_header* h = *list; h != NULL; prev = h, h = h->next) { if (gc_audit_mode_cache != 0) gc_audit_gate("free-list node", h); if (h->size >= size) { *out_head = list; *out_prev = prev; return h; } }'));
-  check('small requests probe at most eight own-class nodes, then jump to ceil(size/ALIGN)',
+  check('small requests probe a bounded number of own-class nodes, then jump to ceil(size/ALIGN)',
     flat.includes('int first = big ? GC_SMALL_CLASSES + 1 : size >= GC_SMALL_MAX ? GC_SMALL_CLASSES : gc_small_class(size);')
     && flat.includes('if (!big && li == first && li < GC_SMALL_CLASSES && li != (int)((size + GC_SMALL_ALIGN - 1) / GC_SMALL_ALIGN))')
-    && flat.includes('for (gc_header* h = *list; h != NULL && probes < 8; h = h->next, probes++)')
+    && flat.includes('for (gc_header* h = *list; h != NULL && probes < GC_FIND_PROBES; h = h->next, probes++)')
     && flat.includes('if (h->size >= size) { *out_head = list; *out_prev = prev; return h; } prev = h; } continue;')
     && flat.includes('int last = big ? GC_SMALL_CLASSES + 1 : GC_SMALL_CLASSES;'));
+  // The bound must survive: making it unbounded is what took 30000 allocations to
+  // 12.9 s under a small-block flood, and making it too shallow costs ~17% on the
+  // allocation-heavy benches/strings (8 -> 32 was measured, 64 adds nothing). So
+  // the value is pinned to the measured window, not just "some constant".
+  const probes = (flat.match(/#define GC_FIND_PROBES (\d+)u/) || [])[1];
+  check('the probe bound exists and stays inside the measured window [32, 64]',
+    probes !== undefined && Number(probes) >= 32 && Number(probes) <= 64);
   check('gc_alloc takes its block from gc_find_block, then splits/charges as before',
     flat.includes('gc_header* h = gc_find_block(size, &head, &prev); if (h != NULL) {')
     && flat.includes('gc_seg_range* _sr = gc_seg_find(h);'));

@@ -36,6 +36,24 @@ python3 benchmarks/run.py fib nbody
 AIRSDK_HOME=/path/to/AIRSDK_51.4.1/bin python3 benchmarks/run.py
 ```
 
+## 分配路径：`gc_find_block` 的探针深度 8 → 32（阶段四百四十三，2026-11-18）
+
+`strings` 这类的负载每轮要分配 ~16 个大小各不相同的小对象。`gc_find_block` 在「同尺寸类」里
+最多探 8 个节点找「装得下」的块，找不到就跳到下一类去切一个更大的块。8 这个上界一直偏浅：
+
+| 变体（同源交错 9–11 轮） | strings 中位 (ms) |
+|---|---:|
+| 关掉 floor 类探针 | 465（+105%） |
+| 8 探针（v0.4.358 起） | 236 |
+| 16 探针 | 214（−6%） |
+| **32 探针（本轮）** | **196（−17%）** |
+| 64 探针 | 197（−15%） |
+
+关掉探针反而慢一倍，说明**探针是收益**（复用略大一点的块，避免「切块 + 余块回链 + 地址变冷」）。
+收益落在 `gc_sweep_step`（sample 349 → 268 个样本）与峰值 RSS（15.4 → 13.9 MB），`gc_alloc` 持平。
+其余 10 项基准交错 A/B 全在 ±1% 内（它们 8 探针内就命中）。上界保留并在
+`unit: runtime/GcSizeClasses` 钉成 [32, 64]。详见 [`strings/report.md`](strings/report.md) §3g。
+
 ## 套件扩容：新增 `bigscan`（阶段四百四十一，2026-11-18）
 
 第 12 项，四路齐全：180 KB 纯 ASCII 文本上的 `indexOf(v, startIndex)` 逐命中推进、
