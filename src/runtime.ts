@@ -4170,23 +4170,45 @@ static char* as_array_join(as_array* a, const char* sep) {
     // for elements -- it is the general-purpose stringifier -- so join special-cases
     // the two tags here.
     // Two passes: first measure total length, then copy with a running pointer.
-    // This avoids a temporary parts array (one less malloc per join) and stays
-    // O(n); strcat would re-scan from the start each time and become O(n^2).
-    size_t total = 0;
-    for (int i = 0; i < a->length; i++)
-        total += (a->data[i].tag == 0 || a->data[i].tag == 5) ? 0 : strlen(as_v_str_val(a->data[i]));
+    // That stays O(n) (strcat would re-scan from the start each time and become
+    // O(n^2)) and needs no growth of the result, which a GC string cannot do.
+    // Parts are remembered from the measuring pass so the copy pass does not
+    // measure (or stringify) anything twice. Only the parts that are GUARANTEED
+    // to stay alive across the result allocation are cached: a tag-3 element is a
+    // string the array itself references (so the marker sees it), and the
+    // "null"/"" literals are static. Any other tag stringifies into a FRESH
+    // object whose only reference lives in this C local -- gc_alloc for the result
+    // below may collect, and a cached pointer would then dangle -- so those are
+    // stringified again in the copy pass, exactly as before.
+    int n = a->length;
     size_t seplen = strlen(sep);
-    char* r = as_str_alloc(total + seplen * (a->length - 1) + 1);
+    size_t total = seplen * (size_t)(n - 1);
+    struct as_join_part { const char* p; size_t n; } stack_parts[16];
+    struct as_join_part* parts = stack_parts;
+    if (n > (int)(sizeof(stack_parts) / sizeof(stack_parts[0])))
+        parts = (struct as_join_part*)malloc(sizeof(struct as_join_part) * (size_t)n);
+    for (int i = 0; i < n; i++) {
+        as_value v = a->data[i];
+        const char* sp = NULL;
+        size_t sl = 0;
+        if (v.tag == 0 || v.tag == 5) { sp = ""; sl = 0; }
+        else if (v.tag == 3) { sp = (v.ptr != NULL) ? (const char*)v.ptr : "null"; sl = strlen(sp); }
+        else sl = strlen(as_v_str_val(v));
+        if (parts != NULL) { parts[i].p = sp; parts[i].n = sl; }
+        total += sl;
+    }
+    char* r = as_str_alloc(total + 1);
     char* p = r;
-    for (int i = 0; i < a->length; i++) {
+    for (int i = 0; i < n; i++) {
         if (i > 0) { memcpy(p, sep, seplen); p += seplen; }
-        if (a->data[i].tag == 0 || a->data[i].tag == 5) continue;
-        char* s = as_v_str_val(a->data[i]);
-        size_t n = strlen(s);
-        memcpy(p, s, n);
-        p += n;
+        const char* s = (parts != NULL) ? parts[i].p : NULL;
+        size_t sl;
+        if (s != NULL) sl = parts[i].n;
+        else { s = as_v_str_val(a->data[i]); sl = strlen(s); }
+        if (sl > 0) { memcpy(p, s, sl); p += sl; }
     }
     *p = 0;
+    if (parts != stack_parts) free(parts);
     return r;
 }
 static char* as_arr_to_str(void* a) {
@@ -7697,24 +7719,37 @@ static char* as_str_slice(const char* s, int from, int to) {
 }
 static as_array* as_str_split(const char* s, const char* sep) {
     as_array* r = as_array_new();
-    if (strlen(sep) == 0) {
+    size_t seplen = strlen(sep);
+    if (seplen == 0) {
         // Separator "" splits into CHARACTERS (code units), not bytes.
         int len = as_str_len(s);
         for (int i = 0; i < len; i++) as_array_push(r, as_v_str(as_str_charAt(s, i)));
         return r;
     }
+    // The end is computed ONCE: searching a one-byte separator with
+    // memchr(p, c, strlen(p)) would re-walk the tail every part and turn the
+    // whole split into O(n^2) on a long string. memchr is also the vectorised
+    // search every libc has, and a one-byte separator is the common case
+    // (" " / "," / a lone tab), where strstr pays for the two-byte-stride scan.
+    const char* end = s + strlen(s);
     const char* p = s;
     const char* q;
-    while ((q = strstr(p, sep)) != NULL) {
+    for (;;) {
+        if (seplen == 1) q = (const char*)memchr(p, sep[0], (size_t)(end - p));
+        else q = strstr(p, sep);
+        if (q == NULL) break;
         int n = (int)(q - p);
-        char* part = as_str_alloc(n + 1);
-        memcpy(part, p, n); part[n] = 0;
+        char* part = as_str_alloc((size_t)n + 1);
+        memcpy(part, p, (size_t)n); part[n] = 0;
         as_array_push(r, as_v_str(part));
-        p = q + strlen(sep);
+        p = q + seplen;
     }
-    char* last = as_str_alloc(strlen(p) + 1);
-    strcpy(last, p);
-    as_array_push(r, as_v_str(last));
+    {
+        int n = (int)(end - p);
+        char* last = as_str_alloc((size_t)n + 1);
+        memcpy(last, p, (size_t)n); last[n] = 0;
+        as_array_push(r, as_v_str(last));
+    }
     return r;
 }
 static char* as_str_toUpper(const char* s) {

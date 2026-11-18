@@ -255,6 +255,79 @@ function checkEmitArrayToPrimitive(): string[] {
 }
 registerGroup('unit: emit/ArrayToPrimitive', checkEmitArrayToPrimitive);
 
+// ---- split()/join() scanning shape (阶段四百四十) ----
+// Stage 440 compacted the SCAN half of split/join: split measures its end once
+// (the old shape re-ran `strlen(sep)` per part) and searches a one-byte separator
+// with memchr, join fuses its measure pass into the copy pass for string parts.
+// None of that is observable in a result, so the example (examples/
+// split-join-compact.as) pins the SEMANTICS and this group pins the SHAPE that
+// buys the time -- otherwise a later rewrite can quietly restore the O(n^2)
+// split or the double stringify.
+//
+// The one invariant that is NOT just performance: the join part cache may only
+// hold pointers that outlive `as_str_alloc` of the result. A tag-3 part is a
+// string the array itself references (the marker sees it) and the "null"/""
+// literals are static, but any other tag stringifies into a FRESH object whose
+// only reference would be a C local -- gc_alloc for the result can collect, and a
+// cached pointer would then dangle. So exactly two branches may assign the cached
+// pointer, and every other tag must re-stringify in the copy pass.
+function checkSplitJoinCompact(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [sjcompact] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [sjcompact] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const between = (from: string, to: string): string => {
+    const i = pre.indexOf(from);
+    if (i < 0) return '';
+    const j = pre.indexOf(to, i + from.length);
+    return j < 0 ? '' : pre.slice(i, j);
+  };
+  const split = between('static as_array* as_str_split(', 'static char* as_str_toUpper(');
+  const join = between('static char* as_array_join(', 'static char* as_arr_to_str(');
+  check('both functions were found in the preamble', split !== '' && join !== '');
+
+  // --- split: one strlen for the end, memchr for a one-byte separator
+  check('split computes the end of the source exactly once',
+    split.includes('const char* end = s + strlen(s);'));
+  check('a one-byte separator is searched with memchr over [p, end)',
+    split.includes('if (seplen == 1) q = (const char*)memchr(p, sep[0], (size_t)(end - p));'));
+  check('a multi-byte separator still goes through strstr',
+    split.includes('else q = strstr(p, sep);'));
+  check('the separator length is measured once, not once per part',
+    (split.match(/strlen\(sep\)/g) || []).length === 1);
+  check('the advance uses the hoisted length (no re-measure per part)',
+    split.includes('p = q + seplen;') && !split.includes('p = q + strlen(sep)'));
+  check('the tail part is copied from [p, end) without a second strlen',
+    split.includes('int n = (int)(end - p);') && split.includes('memcpy(last, p, (size_t)n); last[n] = 0;')
+    && !split.includes('strcpy(last, p);'));
+
+  // --- join: parts cached from the measuring pass
+  check('join caches (pointer, length) per part',
+    join.includes('struct as_join_part { const char* p; size_t n; } stack_parts[16];'));
+  check('...on the stack for the common case and on the heap past 16 elements',
+    join.includes('if (n > (int)(sizeof(stack_parts) / sizeof(stack_parts[0])))')
+    && join.includes('malloc(sizeof(struct as_join_part) * (size_t)n)'));
+  check('only a tag-3 element (array-reachable) and the empty string are cached',
+    join.includes('if (v.tag == 0 || v.tag == 5) { sp = ""; sl = 0; }')
+    && join.includes('else if (v.tag == 3) { sp = (v.ptr != NULL) ? (const char*)v.ptr : "null"; sl = strlen(sp); }')
+    && (join.match(/\bsp = (?!NULL)/g) || []).length === 2);
+  check('every other tag is stringified in the measuring pass but NOT cached',
+    join.includes('else sl = strlen(as_v_str_val(v));'));
+  check('the copy pass re-stringifies whatever the cache does not hold',
+    join.includes('else { s = as_v_str_val(a->data[i]); sl = strlen(s); }'));
+  check('the result is still one exactly-sized allocation',
+    join.includes('char* r = as_str_alloc(total + 1);'));
+  check('the heap part table is released on the way out',
+    join.includes('if (parts != stack_parts) free(parts);'));
+
+  console.log(`     [sjcompact] ${ok} split/join shape check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/SplitJoinCompact', checkSplitJoinCompact);
+
 // ---- Function-value arity (#1063) and the qname in its message ----
 // AIR builds every Function value with a fixed parameter list and raises
 // TypeError... no: ArgumentError #1063 when it is invoked with fewer REQUIRED or
