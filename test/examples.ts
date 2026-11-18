@@ -519,6 +519,12 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // 写进 _fieldWidth 后整个子树（含 Stage）的 getBounds 变成 +-3.4028235e38。度量只在 Skia
   // 文本后端下存在，故与 autosize-metrics.as 一样链 Skia。
   'tf-autosize-empty.as': ['--manifest', join(dir, 'tf-autosize-empty.build.json')],
+  // tf-metrics-cache.as（阶段四百三十八）钉的是 TextField 派生度量缓存的**失效**：
+  // 对每一次改动，改动字段的 textWidth/textHeight/maxScrollH/numLines 必须与「按最终
+  // 状态新建的孪生字段」逐项相等（含原地改 defaultTextFormat 在 adl 上不重排已排文本、
+  // 只有重新赋 .text 才用新格式——temp/dtfprobe/Air 实测）。判据要读真实度量，纯 C 构建
+  // textWidth 恒 0 时示例自行 skip，故与 autosize-metrics.as 共用同一份 Skia 清单。
+  'tf-metrics-cache.as': ['--manifest', join(dir, 'autosize-metrics.build.json')],
   // tf-grow-bake.as（G34）断言的是**像素**：`tf.text` 变长后，改后的**第一次**重画必须已经完整
   // —— 烘焙/滤镜表面的尺寸来自 as_render_bounds，而它曾直接读还没被 autoSize 更新的 `_fieldWidth`，
   // 于是保留面按上一段文字建、新文字右端被裁，下一次重画才补上（真机「最后一截字晚一点才出现」）。

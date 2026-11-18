@@ -49,6 +49,11 @@ AIRSDK_HOME=/path/to/AIRSDK_51.4.1/bin python3 benchmarks/run.py
 | stringbuild | **< 1** | 3 | **125 ~ 131** | **18** | OK（四路 `600150`） |
 | textmetrics | - | - | **195 ~ 200** | **~1** | OK（两路 `146400`） |
 
+> **上面 `textmetrics` 那一行是「未修」基线**（30 轮、无预热）。阶段四百三十八修好度量缓存与行表之后，
+> 该项的口径改为 **20000 轮 + 预热**（30 轮里九成是首次懒排版，会把读路径掩盖掉），复测：
+> **as3compiler 11~14 ms / AIR 732~744 ms**，同源码只换编译器的 A/B 是 **126 836 ms → 11~14 ms（≈10000×）**。
+> 逐项与行表数据见 [`textmetrics/report.md`](textmetrics/report.md)。
+
 **两条结论**（详见各自的 `report.md`）：
 
 1. **`+=` 是 O(n²)，AIR 是 O(n)**。AIR 每次追加恒 ≈60 ns、与已累积长度无关（cons string / rope）；

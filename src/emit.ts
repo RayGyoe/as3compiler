@@ -2199,6 +2199,17 @@ export class Emitter {
           this.line('bool _html_block;');
           this.line('int _runs_gen;');
           this.line('int _para_runs_gen;');
+          // Derived metrics, cached NEXT TO the paragraph they were derived from:
+          // longest-line width, textHeight and line count are pure functions of the
+          // built paragraph (plus the run table, which is in the cache key), so they
+          // are recomputed exactly when as_tf_paragraph rebuilds -- never per read.
+          // Before this, textWidth/maxScrollH re-materialised the whole
+          // std::vector<LineMetrics> on every call and textHeight rebuilt the line
+          // table (O(L²)), which made the TextField paint path pay ~6.6 ms per frame
+          // on a 200-line field (benchmarks/textmetrics).
+          this.line('double _m_tw;');
+          this.line('double _m_th;');
+          this.line('int _m_ok;');
           // displayAsPassword layout text + the .text{} pointer it was built from.
           // LAYOUT ONLY: the mask is never returned to AS3 (TextField.text stays the
           // plaintext); it exists so the paragraph (and therefore textWidth, the
@@ -14434,6 +14445,39 @@ this.line('AS_bake_pend_n = 0;');
     this.line('return i > n ? n : i;');
     this.indent--;
     this.line('}');
+    // The same conversion for a WHOLE ascending table of unit indices (a line
+    // table's starts or ends), in ONE monotone sweep: the cursor only moves
+    // forward, so converting L indices costs L advances plus one strlen instead of
+    // L restarts from the string head. The line table used to call as_tf_byte_index
+    // per line on both arrays, which made every line-table build O(L²) -- the
+    // reason textHeight went 11 µs at 20 lines to 727 µs at 200
+    // (benchmarks/textmetrics, temp/tfperf). An index that is not >= its
+    // predecessor (Skia reports non-decreasing ranges; this is defensive) keeps the
+    // cursor where it stands rather than rewinding.
+    this.line('static void as_tf_units_to_bytes(const char* s, int n, int* tab, int count) {');
+    this.indent++;
+    this.line('if (s == NULL || tab == NULL) return;');
+    this.line('int units = 0, i = 0;');
+    this.line('for (int k = 0; k < count; k++) {');
+    this.indent++;
+    this.line('int target = tab[k];');
+    this.line('if (target < 0) target = 0;');
+    this.line('if (target < units) { tab[k] = i; continue; }');
+    this.line('while (i < n && units < target) {');
+    this.indent++;
+    this.line('unsigned char c = (unsigned char)s[i];');
+    this.line('if (c < 0x80) { i += 1; units += 1; }');
+    this.line('else if ((c & 0xE0) == 0xC0) { i += 2; units += 1; }');
+    this.line('else if ((c & 0xF0) == 0xE0) { i += 3; units += 1; }');
+    this.line('else if ((c & 0xF8) == 0xF0) { i += 4; units += 2; }');
+    this.line('else { i += 1; units += 1; }');
+    this.indent--;
+    this.line('}');
+    this.line('tab[k] = (i > n) ? n : i;');
+    this.indent--;
+    this.line('}');
+    this.indent--;
+    this.line('}');
     this.line('static void as_tf_set_caret(TextField* tf, int pos) {');
     this.indent++;
     this.line('int len = (int)strlen(as_tf_text(tf));');
@@ -14538,7 +14582,7 @@ this.line('AS_bake_pend_n = 0;');
     // The layout cache is keyed on the text pointer so a new string invalidates it
     // anyway, but drop it explicitly: a stale paragraph would render (or measure)
     // the text that was just replaced.
-    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_para_text = NULL;');
+    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_para_text = NULL; tf->_m_ok = 0;');
     this.line('as_tf_set_caret(tf, lo + insLen);');
     // AIR pans the field after an edit so the caret never leaves the view (measured:
     // typing past the right edge scrolls, typing past the last line scrolls down).
@@ -14773,6 +14817,9 @@ this.line('AS_bake_pend_n = 0;');
     // The TextField accessors live further down the file (emitted with the TextField
     // methods), so the navigation path that runs before them declares what it needs.
     this.line('static void* as_tf_paragraph(TextField* tf);');
+    // Recomputes the cached derived metrics (see TextField._m_*); called from
+    // as_tf_paragraph the moment a new paragraph is installed.
+    this.line('static void as_tf_metrics_refresh(TextField* tf);');
     this.line('static double as_tf_line_height(TextField* tf);');
     this.line('static int as_tf_visible_lines(TextField* tf);');
     this.line('static int as_tf_line_count(TextField* tf);');
@@ -14793,12 +14840,13 @@ this.line('AS_bake_pend_n = 0;');
     this.line('int n = as_skia_textlayout_line_metrics(para, starts, ends, tops, NULL, cap);');
     this.line('if (n > 0) {');
     this.indent++;
-    this.line('for (int i = 0; i < n; i++) {');
-    this.indent++;
-    this.line('if (starts != NULL) starts[i] = as_tf_byte_index(tf, starts[i]);');
-    this.line('if (ends != NULL) ends[i] = as_tf_byte_index(tf, ends[i]);');
-    this.indent--;
-    this.line('}');
+    // One strlen for the whole table, then one monotone sweep per array (see
+    // as_tf_units_to_bytes): the old shape restarted the UTF-8 walk from the string
+    // head for EVERY line boundary, which is O(L²) and also re-ran strlen per line.
+    this.line('const char* bs = tf->text;');
+    this.line('int bn = (bs != NULL) ? (int)strlen(bs) : 0;');
+    this.line('if (starts != NULL) as_tf_units_to_bytes(bs, bn, starts, n);');
+    this.line('if (ends != NULL) as_tf_units_to_bytes(bs, bn, ends, n);');
     this.line('return n;');
     this.indent--;
     this.line('}');
@@ -25977,6 +26025,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('o->_para_leading = 0.0;');
     this.line('o->_para_ls = 0.0;');
     this.line('o->_para_align = 0;');
+    this.line('o->_m_tw = 0.0;');
+    this.line('o->_m_th = 0.0;');
+    this.line('o->_m_ok = 0;');
     this.line('o->_mask = NULL;');
     this.line('o->_mask_src = NULL;');
     this.line('o->_comp = NULL;');
@@ -26213,6 +26264,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('tf->_para_bold = bold; tf->_para_italic = italic; tf->_para_color = color;');
     this.line('tf->_para_collapse = collapse; tf->_para_leading = leading; tf->_para_ls = letterSpacing;');
     this.line('tf->_para_align = layoutAlign; tf->_para_runs_gen = tf->_runs_gen;');
+    this.line('as_tf_metrics_refresh(tf);');
     this.line('return tf->_para;');
     this.indent--;
     this.line('}');
@@ -26300,6 +26352,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('tf->_para_ls = letterSpacing;');
     this.line('tf->_para_align = layoutAlign;');
     this.line('tf->_para_runs_gen = tf->_runs_gen;');
+    this.line('as_tf_metrics_refresh(tf);');
     this.line('return tf->_para;');
     this.indent--;
     this.line('}');
@@ -26331,6 +26384,47 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return (w > 0.0 && w < 1e30) ? w : 0.0;');
     this.indent--;
     this.line('}');
+    // Recompute the cached derived metrics from the paragraph that was JUST
+    // installed by as_tf_paragraph. Called from there, so "_m_ok" is exactly "_m_*
+    // describe the current paragraph".
+    //
+    // Why cache at all: each of these is a whole-paragraph computation.
+    // `as_skia_textlayout_text_width` materialises a std::vector<LineMetrics> and
+    // then asks getRectsForRange for every line's trailing-blank box; textHeight used
+    // to rebuild the line table (O(L²) before as_tf_units_to_bytes). All of them are
+    // pure functions of the paragraph, yet the TextField paint path calls maxScrollH /
+    // autoSize / align EVERY FRAME -- measured 6.6 ms per frame on a 200-line field
+    // (benchmarks/textmetrics), against AIR's ~0 because AVM2 finished these numbers
+    // at layout time. Computing them once per relayout is the same trade AIR makes.
+    this.line('static void as_tf_metrics_refresh(TextField* tf) {');
+    this.indent++;
+    this.line('void* para = tf->_para;');
+    this.line('tf->_m_ok = 0;');
+    this.line('tf->_m_tw = 0.0;');
+    this.line('tf->_m_th = 0.0;');
+    this.line('if (para == NULL) return;');
+    this.line('int n = as_skia_textlayout_line_count(para);');
+    this.line('if (n < 1) return;');
+    this.line('tf->_m_tw = as_tf_longest_line(para);');
+    // textHeight: AIR omits the TRAILING inter-line leading (see the accessor for
+    // the measurements) and does not count TRAILING EMPTY lines. Both adjustments
+    // need the line table, which is why the number is captured here rather than
+    // derived from `as_skia_textlayout_height` at read time.
+    this.line('const char* et = as_tf_text(tf);');
+    this.line('int elen = (int)strlen(et);');
+    this.line('int starts[AS_TF_MAX_LINES]; double tops[AS_TF_MAX_LINES];');
+    this.line('int ln = as_tf_line_table(tf, starts, NULL, tops, AS_TF_MAX_LINES);');
+    this.line('int k = ln;');
+    this.line('while (k > 1 && as_tf_line_end(et, starts, ln, k - 1, elen) <= starts[k - 1]) k--;');
+    this.line('double h = (k < ln) ? tops[k] : as_skia_textlayout_height(para);');
+    this.line('TextFormat* hf = as_tf_fmt_at(tf, starts[k - 1]);');
+    this.line('if (hf == NULL) hf = as_tf_base_fmt(tf);');
+    this.line('double lead = (hf != NULL) ? as_v_num_val(hf->leading) : 0.0;');
+    this.line('if (lead != 0.0 && k > 1) h -= lead;');
+    this.line('tf->_m_th = h;');
+    this.line('tf->_m_ok = 1;');
+    this.indent--;
+    this.line('}');
     this.line('static double as_tf_align_dx(TextField* tf) {');
     this.indent++;
     this.line('if (as_tf_base_fmt(tf) == NULL) return 0.0;');
@@ -26339,7 +26433,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (a != 1 && a != 2) return 0.0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return 0.0;');
-    this.line('double tw = as_tf_longest_line(para);');
+    this.line('double tw = tf->_m_tw;');
     this.line('if (a == 2) return (tf->_fieldWidth - 4.0 - tw) / 2.0;');
     this.line('return tf->_fieldWidth - 4.0 - tw;');
     this.indent--;
@@ -26413,7 +26507,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (tf->autoSize == NULL || strcmp(tf->autoSize, "none") == 0) return;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return;');
-    this.line('double tw = as_tf_longest_line(para);');
+    this.line('double tw = tf->_m_tw;');
     this.line('double th = as_skia_textlayout_height(para);');
     this.line('double nw = tf->wordWrap ? tf->_fieldWidth : tw + 4.0;');
     this.line('double nh = th + 4.0;');
@@ -26485,9 +26579,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (para == NULL) return 0.0;');
     // An empty paragraph has no line box, and Skia's max-width accessor then hands
     // back -FLT_MAX rather than 0; AIR reports 0 for an empty field (measured,
-    // temp/metricprobe/Metrics6.as: `tw=0` alongside `th=0`).
-    this.line('if (as_skia_textlayout_line_count(para) == 0) return 0.0;');
-    this.line('return as_tf_longest_line(para) * as_tf_scale_ratio(tf);');
+    // temp/metricprobe/Metrics6.as: `tw=0` alongside `th=0`). The cached metrics
+    // carry that same 0 (as_tf_metrics_refresh leaves _m_tw 0 with no lines), so the
+    // read is a field load plus the scale-ratio walk.
+    this.line('if (!tf->_m_ok) return 0.0;');
+    this.line('return tf->_m_tw * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     this.line('double TextField_get_textHeight(void* _this) {');
@@ -26496,6 +26592,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para != NULL) {');
     this.indent++;
+    this.line('if (!tf->_m_ok) return 0.0;');
     // AIR's field height omits the TRAILING inter-line leading: with
     // TextFormat.leading = L every line box is (ascent+descent+L) tall and the
     // stride between lines is the same, but a multi-line field reports
@@ -26509,33 +26606,12 @@ void FileStream_writeObject(void* _this, as_value v) {
     // numLines 1 / textHeight 0, while getLineMetrics(0) still reports the default
     // format's metrics). Skia's paragraph height for the empty text is one strut
     // box, so it has to be dropped explicitly.
-    this.line('if (as_skia_textlayout_line_count(para) == 0) return 0.0;');
-    // TRAILING EMPTY LINES do not count towards textHeight, although they DO count
-    // towards numLines (阶段三百三十六, adl 51.4.1 temp/htmlprobe/Main.as): `"ab\n"`
-    // reports numLines 2 but textHeight 12, `getLineText(1)` is "", and an htmlText of
-    // two <p> elements reports 3 lines / 24 px. Skia's paragraph height counts every
-    // line box, so the trailing empty ones have to be dropped by hand -- `k` is the
-    // line count up to the last line that has a character, and the paragraph height
-    // of the first k lines is the TOP of line k (line tops accumulate the boxes).
-    this.line('const char* et = as_tf_text(tf);');
-    this.line('int elen = (int)strlen(et);');
-    this.line('int starts[AS_TF_MAX_LINES]; double tops[AS_TF_MAX_LINES];');
-    this.line('int n = as_tf_line_table(tf, starts, NULL, tops, AS_TF_MAX_LINES);');
-    this.line('int k = n;');
-    this.line('while (k > 1 && as_tf_line_end(et, starts, n, k - 1, elen) <= starts[k - 1]) k--;');
-    // `tops[i]` is the ACCUMULATED box height of lines 0..i-1 (sk_textlayout_line_metrics),
-    // so tops[k] is "how tall the k lines that hold text are". It cannot be rebuilt from
-    // the baselines here: an empty line's baseline sits one pixel off its box on Windows
-    // (see that function), which is what made "ab\n" report 10 instead of one full box.
-    this.line('double h = (k < n) ? tops[k] : as_skia_textlayout_height(para);');
-    // ...and the leading it drops is the LAST counted line's own (a stylesheet rule's
-    // `leading` lives on the run, not on defaultTextFormat): adl reports 30 for two
-    // 18 px rule lines, i.e. 36 minus one 6 px leading.
-    this.line('TextFormat* hf = as_tf_fmt_at(tf, starts[k - 1]);');
-    this.line('if (hf == NULL) hf = as_tf_base_fmt(tf);');
-    this.line('double lead = (hf != NULL) ? as_v_num_val(hf->leading) : 0.0;');
-    this.line('if (lead != 0.0 && k > 1) h -= lead;');
-    this.line('return h * as_tf_scale_ratio(tf);');
+    // The whole derivation (trailing-leading subtraction, trailing-empty-line
+    // exclusion, the last counted line's own run leading) happens once per relayout
+    // in as_tf_metrics_refresh; here it is a field load. The details stay documented
+    // there: AIR reports numLines*(asc+desc) + L*(numLines-1) for leading L, drops
+    // trailing empty lines, and an empty field is 0.
+    this.line('return tf->_m_th * as_tf_scale_ratio(tf);');
     this.indent--;
     this.line('}');
     // Pure-C fallback (no Skia linked): line count × approximated line height. An
@@ -26670,7 +26746,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (tf->wordWrap) return 0;');
     this.line('void* para = as_tf_paragraph(tf);');
     this.line('if (para == NULL) return 0;');
-    this.line('double tw = as_tf_longest_line(para);');
+    this.line('double tw = tf->_m_tw;');
     this.line('double over = tw + 4.0 - tf->_fieldWidth;');
     this.line('if (as_tf_is_input(tf)) over += tf->_fieldWidth / 4.0 - 1.0;');
     this.line('return (over > 0.0) ? (int)over : 0;');
@@ -26874,7 +26950,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('tf->_runs = out;');
     this.line('gc_write_barrier((void*)out);');
     this.line('tf->_runs_gen++;');
-    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL;');
+    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_m_ok = 0;');
     this.indent--;
     this.line('}');
     // htmlText setter: parse a small HTML subset into plain text + style runs.
@@ -27048,7 +27124,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('}');
     this.line('static void as_tf_html_set(TextField* tf, char* html) {');
     this.indent++;
-    this.line('if (tf->_runs != NULL) { tf->_runs_gen++; as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_runs = NULL; }');
+    this.line('if (tf->_runs != NULL) { tf->_runs_gen++; as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_m_ok = 0; tf->_runs = NULL; }');
     // Reset the block-break flag here and set it below when a block break is
     // emitted, so the layout only honours hard breaks this htmlText actually asked
     // for (see the field's declaration for why a single-line field can still have
@@ -27361,6 +27437,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_skia_textlayout_delete(tf->_para);');
     this.line('tf->_para = NULL;');
     this.line('tf->_para_text = NULL;');
+    this.line('tf->_m_ok = 0;');
     this.line('tf->_runs_gen++;');
     this.line('tf->_runs = NULL;');
     this.line('tf->text = value;');
@@ -30204,7 +30281,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('gc_write_barrier((void*)tf->text);');
     this.line('if (addLen > 0) as_tf_runs_edit(tf, oldLen, oldLen, addLen, endFmt);');
     this.line('if (oldLen > 0) { tf->_dtf = as_tf_fmt_clone(as_tf_fmt_at(tf, 0)); gc_write_barrier((void*)tf->_dtf); }');
-    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_para_text = NULL;');
+    this.line('as_skia_textlayout_delete(tf->_para); tf->_para = NULL; tf->_para_text = NULL; tf->_m_ok = 0;');
     this.indent--;
     this.line('}');
     // replaceText / replaceSelectedText (阶段三百三十七). AIR's replacement APIs do

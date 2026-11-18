@@ -176,10 +176,13 @@ function checkFontMetrics(): string[] {
   // 阶段三百三十七: the leading subtracted is the LAST COUNTED line's own (a stylesheet
   // rule's `leading` lives on the run, not on defaultTextFormat), and trailing EMPTY
   // lines are stepped over first (adl: two 18 px rule lines are 30 tall, not 36).
+  // 阶段四百三十八: this subtraction moved into as_tf_metrics_refresh (the number is
+  // cached with the paragraph); the emitted body is unchanged except for the line
+  // count it passes to as_tf_line_end (`ln`, the table's own count).
   check('textHeight drops the trailing leading for a multi-line field',
     emitted.includes('if (lead != 0.0 && k > 1) h -= lead;')
     && emitted.includes('TextFormat* hf = as_tf_fmt_at(tf, starts[k - 1]);')
-    && emitted.includes('while (k > 1 && as_tf_line_end(et, starts, n, k - 1, elen) <= starts[k - 1]) k--;'));
+    && emitted.includes('while (k > 1 && as_tf_line_end(et, starts, ln, k - 1, elen) <= starts[k - 1]) k--;'));
   // Perf: the typeface lookup is cached, so a repaint does not re-run CoreText's
   // family scan per paragraph.
   check('the typeface lookup is cached per (family, weight, slant)',

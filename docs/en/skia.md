@@ -1363,6 +1363,43 @@ each have a 0.5 px residual (Skia's internal rounding direction for half pixels)
 > with the 0.80 MB set Skia itself ships for wasm) ⇒ an engine swap would now save at most ~2.5 MB, and
 > only pays off on mobile targets under a hard size constraint.
 
+**Derived metrics are cached with the paragraph; the line table is single-pass (stage four-hundred-thirty-eight)**:
+`textWidth` / `textHeight` / `maxScrollH` used to be recomputed **on every read**, and all three sit **on the paint
+path every frame** — `as_render_object`'s TextField branch reads `maxScrollH` unconditionally, an `autoSize` field
+also runs `as_tf_apply_autosize`, and a centre/right-aligned field runs `as_tf_align_dx`; all three land on the
+same "longest line width". `benchmarks/textmetrics` (8 × 200-line fields) measured:
+
+| Operation | Before | After | Native AIR |
+|---|---:|---:|---:|
+| `textWidth` | 31.6 µs | **0.05 µs** | 0.1 µs |
+| `textHeight` | 727 µs | **< 1 µs** | ≈0 |
+| `maxScrollH` | 31.6 µs | **< 1 µs** | 4.4 µs |
+| `numLines` | 0.05 µs | 0.05 µs | 0.05 µs |
+
+Two root causes, two fixes:
+
+1. **A pure function recomputed per read** — `sk_textlayout_max_width_incl_spaces` materialised
+   `getLineMetrics(std::vector&)` (every line, 200 `LineMetrics` plus a heap allocation for a 200-line field) and
+   then asked `getRectsForRange` per line for the trailing-blank box. All of it depends only on the paragraph, which
+   was already cached in `TextField._para` ⇒ now cached alongside it as `_m_tw` / `_m_th` / `_m_ok`
+   (`as_tf_metrics_refresh`), **refreshed only when `as_tf_paragraph` rebuilds the paragraph** (one call on each of
+   the two build paths, none before the cache-hit early return). Same trade AIR makes: AVM2 finishes these numbers
+   at layout time, so its reads are O(1).
+2. **The line table was O(L²)** — converting Skia's UTF-16 line boundaries to byte offsets restarted the UTF-8 walk
+   **from the string head for every boundary** (plus one `strlen` per line). Now `as_tf_units_to_bytes()` converts
+   the whole ascending table in **one monotone sweep**: the cursor only moves forward, so L boundaries cost L
+   advances plus a single `strlen`. Measured (`temp/tfperf/linetable.as`, via `getLineMetrics` per line): 20 lines
+   14.75 → **8.75 µs/call**, 200 lines 756.25 → **69.5 µs/call (10.9×)**, and the 20→200 growth rate drops from 51×
+   to 7.9× (about linear).
+
+The failure mode of a cache is not miscalculation but **staleness**, so `examples/tf-metrics-cache.as` pins a
+backend-independent invariant: **after any mutation, the mutated field's four metrics must equal, item by item, a
+twin field built from scratch in the final state** (including the measured adl fact that mutating
+`defaultTextFormat` in place does not re-lay-out existing text — only re-assigning `.text` picks the new format up;
+`temp/dtfprobe/`). `test/unit/emit.ts`'s `emit/TextFieldMetricsCache` group pins six code-shape invariants (exactly
+two refresh sites, none on the cache-hit return, every paragraph-invalidating path clears `_m_ok`, `textHeight` no
+longer builds a table, both index arrays go through one monotone sweep, and the cursor never rewinds).
+
 ---
 
 ## 9. Image Decoding (`BitmapData.loadBytes` / `Loader`)

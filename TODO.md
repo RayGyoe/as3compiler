@@ -23178,3 +23178,105 @@ JS（rope）、AIR（cons string）里是三种复杂度不同的东西，表格
 = 0.2 ns/byte），能算通的归因才配写进结论，算不通说明还有没找到的热点；⑤ 「有实测差距」不等于
 「可以开工改」——本轮的产出是**护栏**，改（度量缓存 + 单趟行表；cons string 另立一项）各自
 还要单独验收。
+还要单独验收。
+
+### 阶段四百三十八：TextField 派生度量随段落缓存 + 行表单趟化（v0.4.412 → v0.4.413）✅ 已完成
+
+**一、开工顺序来自上一阶段的两条归因**
+
+阶段四百三十七补的两项护栏是**判据**，本轮用 `benchmarks/textmetrics` 做同源 A/B 修掉其中
+「文本派生度量每次现算」这一条（另一条 `+=` 是 cons string，另立阶段）。修前该基准每轮往返
+**6.6 ms**，修后 **0.6 µs**；同一份源码只换编译器、同口径（20000 轮 + 预热）：
+
+| 口径 | 改前 | 改后 | 原生 AIR 51.4.1 |
+|---|---:|---:|---:|
+| 基准总耗时（20000 轮 × 8 字段） | **126 836 ms** | **11 ~ 14 ms** | 732 ~ 744 ms |
+| 单次全量往返（8 字段 × 4 度量） | 6.6 ms | **≈0.6 µs** | ≈37 µs |
+| `result`（checksum） | 97600000 | 97600000 | 97600000 |
+
+⇒ 从「比 AIR 慢 173×」变成「比 AIR 快约 60×」。**不是常数倍优化，是量级**。
+
+> **口径变更要说清**：该基准上一轮是 30 轮、无预热，`195~200 ms` 这个数里九成是**首次懒排版**
+> （8 个段落一次性排出来），会把读路径本身掩盖掉。本轮改为 **20000 轮 + 计时前预热一遍**（AIR 侧
+> 同样预热），量的是稳态读。这不是为了好看而换口径——30 轮 + 预热后我们读 0 ms，落在 `getTimer`
+> 分辨率以下，基准作为护栏就废了。旧口径的 126 836 ms 是**改前代码在现行口径下实跑**得到的。
+
+**二、修法一：派生度量随段落缓存（`_m_tw` / `_m_th` + 有效位 `_m_ok`）**
+
+`textWidth` / `textHeight` / `maxScrollH` 只依赖段落本身，而段落早已缓存在 `TextField._para`
+里；每次读都重算纯属浪费。新增 `as_tf_metrics_refresh(TextField*)` 在 `as_tf_paragraph` **重建
+段落之后**（两条建造路径各一处，光路径 G41 与 SkParagraph 路径）一次性算出两个数并存进新字段
+`_m_tw` / `_m_th` + 有效位 `_m_ok`；四个读入口（`TextField_get_textWidth` /
+`TextField_get_textHeight` / `TextField_get_maxScrollH` / `as_tf_align_dx` / `as_tf_apply_autosize`）
+改为直接读缓存。
+
+- `textHeight` 的 AIR 两条怪癖**逐字保留**：尾部空行不计（`while (k > 1 && as_tf_line_end(...) <= starts[k-1]) k--;`）、
+  最后计入的那一行自己的 `leading` 要减掉。缓存里算，语义不变。
+- **命中早退之前刻意不刷新**：缓存命中意味着段落没变、度量也没变，多刷一次只是白花钱。
+  `test/unit/emit.ts` 的 `emit/TextFieldMetricsCache` 钉「刷新点恰好两处、且都不在命中早退之前」。
+- 缓存最容易错的不是算错而是**算旧了**：每条会丢掉段落的路径（`_para = NULL;`）都同步清
+  `_m_ok`（5 处），单元钉子要求每个 `tf->_para = NULL;` 后 4 行内必须有 `tf->_m_ok = 0;`。
+
+**三、修法二：行表单趟化（O(L²) → O(L)）**
+
+`as_tf_line_table` 把 Skia 的 UTF-16 行边界翻成字节偏移时，对**每一条边界**都从串首重新走一遍
+UTF-8，还逐行一次 `strlen`。新增 `as_tf_units_to_bytes(const char* s, int n, int* tab, int count)`
+把**整条升序数组**一次转换：光标只前进不回头（`target < units` 的防御分支不动游标），L 条边界
+= L 次推进 + 一次 `strlen`。`as_tf_byte_index` 保留给「一次性光标映射」用（拖选/插入符）。
+
+实测（`temp/tfperf/linetable.as`，用 `getLineMetrics(i)` 逐行压表——公开 API 里唯一每次调用都
+完整建一张表的入口；改前/改后同源码同机器，各 4000 / 20000 次调用）：
+
+| 行数 | 改前 | 改后 | 倍数 |
+|---|---:|---:|---:|
+| 20 | 14.75 µs/次 | **8.75 µs/次** | 1.7× |
+| 200 | 756.25 µs/次 | **69.5 µs/次** | **10.9×** |
+
+20→200 行的增长率从 **51× 降到 7.9×**（≈ 线性）。
+
+**四、语义未变的证据**
+
+- `benchmarks/textmetrics` 三路（改前 asc / 改后 asc / AIR）`result` 全为 `97600000`，
+  诊断行 `nl=200 tw=303 th=2600 msh=107` 与改前逐位相同（AIR 的 `th=2700` 是 `skia.md` 遗留表里
+  已登记的行盒取整口径差，不进 checksum）。
+- `temp/tfperf/tfperf2.as` 的 `acc` 累加值改前改后**逐位相同**（`19767905.950927734`）。
+
+**五、钉子：一条与后端无关的不变量 + 六条代码形态**
+
+- **`examples/tf-metrics-cache.as`（新增，9 档）**：任何一次改动之后，「改动的字段」的
+  `textWidth`/`textHeight`/`maxScrollH`/`numLines` 必须与**按最终状态新建的孪生字段**逐项相等。
+  覆盖：初始排版、换文本、`appendText`、原地改/重赋 `defaultTextFormat`、改宽（`wordWrap`）、
+  `displayAsPassword`、清空、清空后重赋、连续读 100 次不变值。变异测试确认钉子有牙（摘掉
+  SkParagraph 路径的刷新 ⇒ 第 ① 档立刻红）。
+- **`adl 51.4.1` 实测顺带钉住一条口径**（`temp/dtfprobe/`）：原地改 `defaultTextFormat.size`
+  **不动已排好的文本**（tw 276.5 不变），且 getter 返回**副本**（`a.defaultTextFormat ===
+  a.defaultTextFormat` 为 false），「读出来改完再赋回去」也不重排，**只有重新赋 `.text` 才用新格式**
+  （276.5 → 461.5）。示例 ④a/④b/④c 三档逐条对照，避免我们把「改格式」做成当场跳变。
+- **`test/unit/emit.ts` 新增 `emit/TextFieldMetricsCache`（9 条断言）**：结构体带 `_m_*`、构造器清零、
+  刷新点恰好 2 处且不在命中早退之前、刷新体保留尾空行排除与尾 leading 扣减、空段落报 0、每条丢段落
+  路径清 `_m_ok`（≥5 处）、`textHeight` 的 Skia 分支只读缓存且不再建表、行表两条数组各一次单趟
+  （`as_tf_units_to_bytes`）、单趟不回退、一次性 `as_tf_byte_index` 仍在（光标用）。
+- **既有钉子翻转**：`emit/TextFieldLongestLine` 四条从「读入口调用
+  `as_tf_longest_line`/`as_tf_line_table`」改为「读缓存」，并新增第五条：缓存恰好从钳掉 -3.4e38 的
+  那个 helper 赋值一次，别处不许出现其它赋值形状。
+
+**六、回归**
+
+- `node test.ts` 全量：**720 项 / 720 过 / 0 红 / 0 跳过**，exit 0（`temp/node-test-s438c.log`）。
+  其中 5 个既有单元组因实现形状改变而**翻转**（不是放宽）：`render/FontMetrics`、
+  `display/LineMetrics`、`display/TfScaleMetrics`、`display/HtmlTextMetrics`、
+  `text-input/IndexDomain`——它们原来钉「读入口里现算」的代码文本，现在钉「读缓存 /
+  单趟行表」，语义约束一条没减（空段落仍报 0、-FLT_MAX 仍被钳、缩放口径不变、
+  尾部空行仍不计）。
+- 文本相关示例另跑：`autosize-metrics` / `htmltext-metrics` / `tf-scale-metrics` / `textflow` /
+  `textrich` / `settextformat-runs` / `textwidth-trailing` / `password-stars` / `text-letterspacing` /
+  `tf-autosize-empty` / `tf-grow-bake`（**像素**级）/ `text-underline` / `gettextformat` /
+  `textcolor-run` / `string-utf16-index`，全绿。
+
+**closure**：① **缓存要跟「被缓存的东西」同源失效**——段落唯一的重建点是 `as_tf_paragraph`，
+所以刷新点也只能在那儿，且**命中路径不刷新**；② **派生量的口径怪癖要在缓存里逐字保留**（尾空行、
+尾 leading），缓存不是「重新设计语义」的机会；③ **O(L²) 往往藏在「转换」而不是「遍历」里**——行表
+的二次成本是做 UTF-16→字节映射时每次从串首重启，把「逐条重扫」换成「整条单趟」就回到线性；
+④ **口径变更必须自证不是作弊**：本轮把 30 轮无预热改成 20000 轮预热，是因为旧口径下修后读数落在
+计时分辨率以下、护栏失效，且改前的 126 836 ms 是**旧代码在现行口径下实跑**的；⑤ **钉子要验证有牙**：
+摘掉刷新点能立刻变红，才算钉住。

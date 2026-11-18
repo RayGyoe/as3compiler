@@ -528,6 +528,13 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
   **accumulated `scaleY / scaleX`** (both directions divided by `scaleX`, ancestors included), while the **glyphs** scale uniformly by the
   accumulated `scaleY` and `scaleX` never widens them (`BitmapData.draw()` ignores the source's own transform, so the pixel check rides
   on an intermediate scaled `Sprite`)
+- `examples/tf-metrics-cache.as` — **derived metrics cached with the paragraph** (stage 438): `textWidth`/`textHeight`/
+  `maxScrollH` depend only on the paragraph, so they are cached alongside `_para` and refreshed only when it is rebuilt.
+  The example pins a backend-independent invariant — **after any mutation, the mutated field's four metrics must equal a
+  twin field built from scratch in the final state** (nine cases: initial, retest, `appendText`, in-place/re-assigned
+  `defaultTextFormat`, width change with `wordWrap`, `displayAsPassword`, clear, re-assign after clear, and 100 repeated
+  reads not changing anything), plus the measured `adl 51.4.1` facts that mutating `defaultTextFormat` in place does not
+  re-lay-out existing text, that its getter returns a copy, and that only re-assigning `.text` picks the new format up
 - `examples/swc-mc-button.as` — stage one hundred and seventy-one: **MovieClip's three button states** (measured on `adl 51.4.1`); with
   `buttonMode == true` **and** the `_up`/`_over`/`_down` `FrameLabel`s present, roll-over/press/roll-out move the playhead **for real** to that
   label's frame (`skin_fla.元件17_55` — `元件17_125` in the earlier export — `_up@1`→`_over@4`→`_down@7`, the home card `_up@1`→`_over@5`→`_down@11`); the press is latched to the object where

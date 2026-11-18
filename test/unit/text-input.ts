@@ -691,8 +691,14 @@ function checkIndexDomain(): string[] {
   // (2) the visual line table converts Skia's answer at its exit, so every consumer
   // (as_tf_line_of_index, as_tf_line_end's CR test, the column arithmetic, the
   // scroll target) stays in bytes; the no-Skia fallback already scans bytes.
+  // 阶段四百三十八: byte mapping is one monotone sweep per array (O(L²) -> O(L)),
+  // one strlen for the whole table, and the sweep never rewinds.
   check('the visual line table hands out BYTE offsets, not Skia code units',
-    /int n = as_skia_textlayout_line_metrics\(para, starts, ends, tops, NULL, cap\);\n\s*if \(n > 0\) \{[\s\S]{0,260}?if \(starts != NULL\) starts\[i\] = as_tf_byte_index\(tf, starts\[i\]\);\n\s*if \(ends != NULL\) ends\[i\] = as_tf_byte_index\(tf, ends\[i\]\);/.test(c));
+    /int n = as_skia_textlayout_line_metrics\(para, starts, ends, tops, NULL, cap\);\n\s*if \(n > 0\) \{[\s\S]{0,400}?if \(starts != NULL\) as_tf_units_to_bytes\(bs, bn, starts, n\);\n\s*if \(ends != NULL\) as_tf_units_to_bytes\(bs, bn, ends, n\);/.test(c));
+  check('the table maps in ONE sweep, not one as_tf_byte_index per boundary',
+    (c.match(/as_tf_units_to_bytes\(bs, bn, (?:starts|ends), n\);/g) ?? []).length === 2
+    && !/as_skia_textlayout_line_metrics[\s\S]{0,400}?as_tf_byte_index\(/.test(c)
+    && /static void as_tf_units_to_bytes\(const char\* s, int n, int\* tab, int count\) \{[\s\S]{0,1200}?if \(target < units\) \{ tab\[k\] = i; continue; \}/.test(c));
   check('the CR/LF fallback table is byte-indexed too (both paths agree)',
     /int le = ls;\n\s*while \(le < len && t\[le\] != 13 && t\[le\] != 10\) le\++;/.test(c));
   check('a click maps Skia\'s answer back to a byte index',

@@ -1399,6 +1399,39 @@ Monaco 的 12+3、但 14 px 起就与 Monaco 分道）——没有一个可解�
 > 10.19 MB 对象**：阶段二百二十一之后它只跟着**画文字**的构建走，阶段二百二十二又把这份数据换成 Skia
 > 自己给 wasm 用的 0.80 MB 那份）⇒ 换引擎如今最多再省约 2.5 MB，只在移动端 + 体积硬约束时才值得。
 
+**派生度量随段落缓存，行表单趟化（阶段四百三十八）**：`textWidth` / `textHeight` / `maxScrollH`
+过去**每次读都重算**，而这三个入口**每帧都在绘制路径上**——`as_render_object` 的 TextField 分支无条件读
+`maxScrollH`，`autoSize` 字段每帧再跑一次 `as_tf_apply_autosize`，居中/右对齐再跑一次 `as_tf_align_dx`，
+三者都落到「最长行宽」这一件事上。`benchmarks/textmetrics`（8 × 200 行字段）量到的差距是：
+
+| 操作 | 改前 | 改后 | 原生 AIR |
+|---|---:|---:|---:|
+| `textWidth` | 31.6 µs | **0.05 µs** | 0.1 µs |
+| `textHeight` | 727 µs | **< 1 µs** | ≈0 |
+| `maxScrollH` | 31.6 µs | **< 1 µs** | 4.4 µs |
+| `numLines` | 0.05 µs | 0.05 µs | 0.05 µs |
+
+两条根因与对应修法：
+
+1. **每次现算纯函数**——`sk_textlayout_max_width_incl_spaces` 每次调用都 `getLineMetrics(std::vector&)`
+   物化**全部行**（200 行 = 200 条 `LineMetrics` + 一次堆分配），再逐行问 `getRectsForRange` 取行尾空白框。
+   它们只依赖段落本身，而段落早已缓存在 `TextField._para` 里 ⇒ 改为一并缓存
+   `_m_tw` / `_m_th` / `_m_ok`（`as_tf_metrics_refresh`），**只在 `as_tf_paragraph` 重建段落时刷新**
+   （两条建造路径各一处，缓存命中的早退之前没有刷新点）。这与 AIR 的取舍同构：AVM2 在排版结束时就把
+   这几个数算好，读是 O(1)。
+2. **行表 O(L²)**——`as_tf_line_table` 把 Skia 的 UTF-16 行边界翻成字节偏移时，对**每一条边界**都从串首
+   重启 UTF-8 走位（还逐行一次 `strlen`）。改为 `as_tf_units_to_bytes()` 的**单趟单调**转换：光标只前进，
+   L 条边界 = L 次推进 + 一次 `strlen`。实测（`temp/tfperf/linetable.as`，`getLineMetrics` 逐行压表）：
+   20 行 14.75 → **8.75 µs/次**，200 行 756.25 → **69.5 µs/次（10.9×）**，且 20→200 行的增长率从 51× 降到
+   7.9×（≈ 线性）。
+
+缓存最容易出的错不是算错而是**算旧了**，故 `examples/tf-metrics-cache.as` 钉一条与后端无关的不变量：
+**任何一次改动之后，「改动的字段」的四个度量必须与「按最终状态新建的孪生字段」逐项相等**
+（含原地改 `defaultTextFormat` 在 adl 上不重排已排文本、只有重新赋 `.text` 才用新格式——`temp/dtfprobe/` 实测）。
+`test/unit/emit.ts` 的 `emit/TextFieldMetricsCache` 另钉生成代码侧的六条不变量（刷新点恰好两处、命中早退
+之前无刷新、每条丢段落的路径都清 `_m_ok`、`textHeight` 不再建表、行表两条数组各一次单趟、`target < units`
+时游标不回退）。
+
 ---
 
 ## 9. 图片解码（`BitmapData.loadBytes` / `Loader`）

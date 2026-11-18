@@ -16,7 +16,7 @@ import flash.text.TextFormat;
 
 var FIELDS:int = 8;
 var LINES:int = 200;
-var ITERS:int = 30;
+var ITERS:int = 20000;
 
 function mkLines(n:int):String {
   var a:Array = [];
@@ -45,6 +45,14 @@ for (var f:int = 0; f < FIELDS; f++) {
 var probe:TextField = fields[0];
 trace("metrics nl=" + probe.numLines + " tw=" + int(probe.textWidth) +
       " th=" + int(probe.textHeight) + " msh=" + probe.maxScrollH);
+
+// 预热一遍且不计时：第一次读会触发**懒排版**（8 个段落 + 首次度量），那是「建字段」
+// 的成本，不是「读度量」的成本。本基准量的是稳态读，故先把 8 个段落排出来（AIR 侧
+// 同样先跑一遍）。阶段四百三十八之前 30 轮里这 3 ms 的首排成本占了九成，掩盖了读路径。
+var warm:int = 0;
+for (var w:int = 0; w < FIELDS; w++) {
+  warm += fields[w].numLines + int(fields[w].textWidth) + int(fields[w].textHeight) + fields[w].maxScrollH;
+}
 
 var checksum:int = 0;
 var thsum:int = 0;

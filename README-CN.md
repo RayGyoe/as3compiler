@@ -568,6 +568,11 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/tf-scale-metrics.as` — 被缩放的 `TextField` 口径：`textWidth`/`textHeight` = 名义 extents 乘**累积 `scaleY / scaleX`**
   （两个方向同除 `scaleX`、含祖先链），而**字形**只按累积 `scaleY` 整体缩放、`scaleX` 不拉宽（`BitmapData.draw()` 忽略被画对象自身的
   transform，故像素断言挂在中间那层被缩放的 `Sprite` 上）
+- `examples/tf-metrics-cache.as` — **派生度量随段落缓存**（阶段四百三十八）：`textWidth`/`textHeight`/`maxScrollH`
+  只依赖段落，故随 `_para` 一并缓存、只在段落重建时刷新；示例钉一条与文本后端无关的不变量 —— **任何一次改动之后，
+  改动字段的四个度量必须与「按最终状态新建的孪生字段」逐项相等**（九档：初始/换文本/`appendText`/原地改或重赋
+  `defaultTextFormat`/改宽 `wordWrap`/`displayAsPassword`/清空/清空后重赋/连读 100 次不变值），并对照 `adl 51.4.1`
+  实测钉住「原地改 `defaultTextFormat` 不重排已排文本、getter 返回副本、只有重新赋 `.text` 才用新格式」
 - `examples/swc-mc-button.as` — **MovieClip 的三种按钮态**（阶段一百七十一，`adl 51.4.1` 实测）：`buttonMode == true` **且**时间轴上有
   `_up`/`_over`/`_down` 三个 `FrameLabel` 时，滚入/按下/滚出把播放头**真的**移到对应标签帧（`skin_fla.元件17_55`——旧导出里叫 `元件17_125`——`_up@1`→`_over@4`→`_down@7`、
   首页卡片 `_up@1`→`_over@5`→`_down@11`）；按压锁在 `mouseDown` 的那个对象上；`buttonMode=false` 与「只有标签」两个负例恒 `1:_up`；

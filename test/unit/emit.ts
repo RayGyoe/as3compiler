@@ -3231,14 +3231,20 @@ function checkTextFieldLongestLine(): string[] {
   check('...before every one of its callers (C has no implicit declarations)',
     helperAt >= 0 && consumers.every((s) => c.indexOf(s) > helperAt));
 
-  check('autoSize takes its width from the clamped helper',
-    /double tw = as_tf_longest_line\(para\);\s*double th = as_skia_textlayout_height\(para\);\s*double nw = tf->wordWrap \? tf->_fieldWidth : tw \+ 4\.0;/.test(c));
+  // 阶段四百三十八：四个读者都不再各自重算，而是读**重排时算好的**缓存
+  // （`_m_tw`），因此这里的钉子从「每个读者都调 helper」翻成「每个读者都读缓存，
+  // 且缓存的唯一写入点是那个 clamped helper」——见 `as_tf_metrics_refresh` 的两条。
+  check('autoSize takes its width from the cached metric',
+    /double tw = tf->_m_tw;\s*double th = as_skia_textlayout_height\(para\);\s*double nw = tf->wordWrap \? tf->_fieldWidth : tw \+ 4\.0;/.test(c));
   check('TextAlignment dx does too',
-    /double tw = as_tf_longest_line\(para\);\s*if \(a == 2\) return \(tf->_fieldWidth - 4\.0 - tw\) \/ 2\.0;/.test(c));
+    /double tw = tf->_m_tw;\s*if \(a == 2\) return \(tf->_fieldWidth - 4\.0 - tw\) \/ 2\.0;/.test(c));
   check('TextField.textWidth does too (and still reports 0 for an empty paragraph)',
-    /if \(as_skia_textlayout_line_count\(para\) == 0\) return 0\.0;\s*return as_tf_longest_line\(para\) \* as_tf_scale_ratio\(tf\);/.test(c));
+    /if \(!tf->_m_ok\) return 0\.0;\s*return tf->_m_tw \* as_tf_scale_ratio\(tf\);/.test(c));
   check('maxScrollH does too',
-    /double tw = as_tf_longest_line\(para\);\s*double over = tw \+ 4\.0 - tf->_fieldWidth;/.test(c));
+    /double tw = tf->_m_tw;\s*double over = tw \+ 4\.0 - tf->_fieldWidth;/.test(c));
+  check('the cache is filled from the clamped helper and nowhere else',
+    (c.match(/tf->_m_tw = as_tf_longest_line\(para\);/g) || []).length === 1
+    && !/_m_tw = (?!as_tf_longest_line|0\.0)/.test(c));
   check('the caret underline rect is sized by the helper, not by the raw sentinel',
     /as_skia_textlayout_height\(cpara\), as_tf_longest_line\(cpara\), 1\.0, up\)/.test(c));
   check('no size decision is left reading as_skia_textlayout_max_width directly',
@@ -3272,6 +3278,118 @@ function checkTextFieldLongestLine(): string[] {
   return bad;
 }
 registerGroup('unit: emit/TextFieldLongestLine', checkTextFieldLongestLine);
+
+// ---- TextField 派生度量缓存 + 行表单趟化（阶段四百三十八）-------------------------
+// 用户按基准报告排序要求先做这两条：`benchmarks/textmetrics` 量出 200 行字段的
+// textWidth 31.6 µs / textHeight 727 µs / maxScrollH 31.6 µs（AIR 0.1 / ≈0 / 4.4），
+// 而这三个入口**每帧都在绘制路径上**（as_render_object 的 TextField 分支无条件调
+// maxScrollH，autoSize 再调 apply_autosize，居中/右对齐再调 align_dx）。
+// 根因两条：① 每次都重算「纯函数 of the paragraph」——`sk_textlayout_max_width_incl_spaces`
+// 每次物化 std::vector<LineMetrics> 并逐行问 getRectsForRange；② 行表对每行边界
+// 从串首重启 UTF-8 走位（O(L²)）且每行一次 strlen。
+// 修法：度量随段落一起缓存（只在其重建时刷新）+ 单趟单调转换。
+// 行为由 benchmarks/textmetrics 的 checksum（result=146400 两端相等）与
+// examples/{autosize-metrics,htmltext-metrics,tf-scale-metrics,textedit,textfield} 钉住，
+// 这里钉生成代码里那几条**不变量**，防止有人把某处改回「每次现算」或让缓存脱离段落。
+function checkTextFieldMetricsCache(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tfmetrics] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tfmetrics] ${label}`); }
+  };
+
+  const src = [
+    'import flash.text.TextField;',
+    'import flash.text.TextFieldAutoSize;',
+    'var tf:TextField = new TextField();',
+    'tf.autoSize = TextFieldAutoSize.LEFT;',
+    'tf.text = "ab\\ncd";',
+    'trace(tf.textWidth + tf.textHeight + tf.maxScrollH + tf.numLines);',
+    '',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  // ① 缓存字段存在且被构造器清零（否则首次读会读到未初始化内存）。
+  check('the TextField struct carries the metric cache',
+    c.includes('double _m_tw;') && c.includes('double _m_th;') && c.includes('int _m_ok;'));
+  check('...and the constructor zeroes it',
+    /o->_m_tw = 0\.0;\s*o->_m_th = 0\.0;\s*o->_m_ok = 0;/.test(c));
+
+  // ② 刷新点恰好两处 = 两条「建造新段落」的路径（light/G41 快路径 + SkParagraph 路径），
+  //    缓存命中早退**之前**没有任何刷新（否则每帧都重算，缓存等于没有）。
+  const refreshes = (c.match(/as_tf_metrics_refresh\(tf\);/g) || []).length;
+  const hitAt = c.indexOf('return tf->_para;');
+  const firstRefreshAt = c.indexOf('as_tf_metrics_refresh(tf);');
+  check('the metrics are refreshed exactly where a paragraph is built (2 paths)',
+    refreshes === 2);
+  check('...and never on the paragraph cache-hit early return',
+    hitAt >= 0 && firstRefreshAt > hitAt);
+
+  // ③ 刷新体里两条 AIR 口径调整必须都在（漏一条就是 ±leading / 多算一行）：
+  //    尾部空行不计入、最后一条计数行的自带 leading 要扣掉。
+  const refreshBody = c.slice(c.indexOf('static void as_tf_metrics_refresh(TextField* tf) {'),
+                               c.indexOf('static double as_tf_align_dx(TextField* tf) {'));
+  check('the refresh keeps the trailing-empty-line exclusion',
+    refreshBody.includes('while (k > 1 && as_tf_line_end(et, starts, ln, k - 1, elen) <= starts[k - 1]) k--;'));
+  check('...and the trailing-leading subtraction',
+    refreshBody.includes('if (lead != 0.0 && k > 1) h -= lead;'));
+  // The empty-paragraph 0 is carried by the cache itself: refresh zeroes _m_*
+  // before the `n < 1` early return, and both getters refuse to answer unless
+  // _m_ok is set -- so a paragraph with no lines reads 0 instead of -FLT_MAX and
+  // a *stale* cache can never be mistaken for a valid one.
+  check('...and textWidth/textHeight refuse a cache that is not marked valid',
+    refreshBody.includes('tf->_m_tw = 0.0;')
+    && refreshBody.indexOf('tf->_m_ok = 0;') < refreshBody.indexOf('if (n < 1) return;')
+    && /if \(!tf->_m_ok\) return 0\.0;\s*return tf->_m_tw \* as_tf_scale_ratio\(tf\);/.test(c)
+    && /if \(!tf->_m_ok\) return 0\.0;\s*return tf->_m_th \* as_tf_scale_ratio\(tf\);/.test(c));
+
+  // ④ 一致性不变量：任何地方把段落丢掉，缓存必须同时失效。
+  //    （只查 `tf->` 形态：构造器用的是 `o->`，那一条由上面第①条覆盖。）
+  const lines = c.split('\n');
+  const stale: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes('tf->_para = NULL;')) continue;
+    const window = lines.slice(i, i + 4).join('\n');
+    if (!window.includes('tf->_m_ok = 0;')) stale.push(`line ${i + 1}`);
+  }
+  check('every paragraph invalidation drops the cache too',
+    (c.match(/tf->_para = NULL;/g) || []).length >= 5 && stale.length === 0);
+
+  // ⑤ textHeight 不再建行表（这正是它从 727 µs 掉到亚微秒的原因）。
+  const thAt = c.indexOf('double TextField_get_textHeight(void* _this) {');
+  const thEnd = c.indexOf('int TextField_get_numLines(void* _this) {', thAt);
+  const thBody = c.slice(thAt, thEnd);
+  // The Skia branch is everything before the no-text-engine fallback (which still
+  // walks the table -- it has no paragraph to derive anything from).
+  const thSkia = thBody.slice(0, thBody.indexOf('const char* t = as_tf_layout_text(tf);'));
+  check('textHeight reads the cache instead of rebuilding the line table',
+    thSkia.includes('return tf->_m_th * as_tf_scale_ratio(tf);')
+    && !thSkia.includes('as_tf_line_table'));
+
+  // ⑥ 行表：单趟单调转换，且不再逐行重启偏移。
+  const ltAt = c.indexOf('static int as_tf_line_table(TextField* tf, int* starts, int* ends, double* tops, int cap) {');
+  const ltBody = c.slice(ltAt, c.indexOf('static int as_tf_line_of_index(', ltAt));
+  check('the line table converts both index arrays in one monotone sweep',
+    ltBody.includes('as_tf_units_to_bytes(bs, bn, starts, n);')
+    && ltBody.includes('as_tf_units_to_bytes(bs, bn, ends, n);'));
+  check('...with a single strlen for the whole table',
+    ltBody.includes('int bn = (bs != NULL) ? (int)strlen(bs) : 0;'));
+  check('...and no per-line restart of the UTF-8 walk',
+    !ltBody.includes('as_tf_byte_index(tf, starts[i])')
+    && !ltBody.includes('for (int i = 0; i < n; i++) {\n    if (starts != NULL) starts[i] ='));
+  check('the sweep never rewinds (defensive: Skia ranges are ascending)',
+    ltBody.includes('if (target < units) { tab[k] = i; continue; }')
+    || c.slice(c.indexOf('static void as_tf_units_to_bytes(')).includes('if (target < units) { tab[k] = i; continue; }'));
+  // 一次性的 caret 映射仍走 as_tf_byte_index（点击/选区每次只转一个下标，O(n) 无妨）。
+  check('the one-shot unit->byte mapping is still there for the caret',
+    c.includes('static int as_tf_byte_index(TextField* tf, int unitIndex) {')
+    && c.includes('idx = as_tf_byte_index(tf, idx);'));
+
+  console.log(`     [tfmetrics] ${ok} TextField metrics-cache check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/TextFieldMetricsCache', checkTextFieldMetricsCache);
 
 // ---- TextField 的可编辑滚动与插入光标（阶段二百四十二）------------------------
 // 用户（air-native 实测）报的三件事里有两件是真缺陷：

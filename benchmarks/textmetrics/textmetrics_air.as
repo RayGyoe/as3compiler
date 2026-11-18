@@ -13,7 +13,7 @@ package {
     public function textmetrics_air() {
       var FIELDS:int = 8;
       var LINES:int = 200;
-      var ITERS:int = 30;
+      var ITERS:int = 20000;
 
       var a:Array = [];
       for (var i:int = 0; i < LINES; i++) a.push("the quick brown fox jumps over the lazy dog 0123456789");
@@ -38,6 +38,12 @@ package {
       var probe:TextField = fields[0];
       var diag:String = "metrics nl=" + probe.numLines + " tw=" + int(probe.textWidth) +
         " th=" + int(probe.textHeight) + " msh=" + probe.maxScrollH;
+
+      // 与 AOT 侧同样的预热（见 textmetrics.as）：先排一遍，量的是稳态读。
+      var warm:int = 0;
+      for (var w:int = 0; w < FIELDS; w++) {
+        warm += fields[w].numLines + int(fields[w].textWidth) + int(fields[w].textHeight) + fields[w].maxScrollH;
+      }
 
       var checksum:int = 0;
       var thsum:int = 0;

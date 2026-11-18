@@ -707,16 +707,23 @@ function checkLineMetrics(): string[] {
     runtime.includes('static inline int as_skia_textlayout_line_box(void* p, int i, double ld, const char* fam, double sz, int b, int it, double* a, double* d, double* l, double* w) { (void)p; (void)i; (void)ld; (void)fam; (void)sz; (void)b; (void)it; (void)a; (void)d; (void)l; (void)w; return 0; }'));
 
   // ---- the empty-field fix in textHeight/textWidth ---------------------
+  // 阶段四百三十八: the empty-paragraph guard moved into as_tf_metrics_refresh, which
+  // leaves _m_ok = 0 and _m_th = 0 when the paragraph has no lines, so both getters
+  // answer 0 from the cache. The pure-C (no paragraph) path keeps its own guard.
   check('textHeight returns 0 for an empty field on BOTH paths (Skia and stub)',
-    emitted.includes('if (as_skia_textlayout_line_count(para) == 0) return 0.0;') &&
+    /static void as_tf_metrics_refresh\(TextField\* tf\) \{[\s\S]{0,400}?if \(n < 1\) return;[\s\S]{0,1200}?tf->_m_ok = 1;/.test(gen) &&
     emitted.includes('const char* t = as_tf_layout_text(tf);') &&
     emitted.includes('if (t == NULL || t[0] == 0) return 0.0;'));
 // 阶段二百三十七: the raw accessor answers -FLT_MAX for a paragraph that produced
   // no text runs, and autoSize wrote that into _fieldWidth (examples/tf-autosize-empty.as),
   // so BOTH guards must stay: no line box => 0, and the remaining value must come from
   // as_tf_longest_line (clamped to >= 0) rather than from the raw accessor.
+  // 阶段四百三十八: the guard now reads the cached line count, and the value is the
+  // cached width -- which is only ever written from as_tf_longest_line (see the
+  // emit/TextFieldMetricsCache group for that half of the invariant).
   check('textWidth guards the empty paragraph instead of reporting -FLT_MAX',
-    /static double TextField_get_textWidth\(void\* _this\) \{[\s\S]{0,400}?if \(as_skia_textlayout_line_count\(para\) == 0\) return 0\.0;[\s\S]{0,160}?as_tf_longest_line\(para\)/.test(gen));
+    /double TextField_get_textWidth\(void\* _this\) \{[\s\S]{0,400}?if \(!tf->_m_ok\) return 0\.0;[\s\S]{0,160}?tf->_m_tw/.test(gen) &&
+    /static double as_tf_longest_line\(void\* para\) \{[\s\S]{0,400}?return \(w > 0\.0 && w < 1e30\) \? w : 0\.0;/.test(gen));
 
   // ---- the example -----------------------------------------------------
   check('the example asserts the adl-measured model (#2006, leading per line, height identity)',
@@ -925,10 +932,12 @@ function checkTfScaleMetrics(): string[] {
   // ② 度量 = 名义 × (scaleY/scaleX)，两个方向同一个除数
   check('the ratio is scaleY/scaleX',
     emitted.includes('return (sx > 0.0) ? sy / sx : 1.0;'));
+  // 阶段四百三十八: both read the paragraph-cached extent (_m_tw / _m_th), which is
+  // exactly what the old code recomputed per read (see emit/TextFieldMetricsCache).
   check('textWidth is scaled by the ratio',
-    emitted.includes('return as_tf_longest_line(para) * as_tf_scale_ratio(tf);'));
+    emitted.includes('return tf->_m_tw * as_tf_scale_ratio(tf);'));
   check('textHeight is scaled by the ratio (Skia path)',
-    emitted.includes('return h * as_tf_scale_ratio(tf);'));
+    emitted.includes('return tf->_m_th * as_tf_scale_ratio(tf);'));
   check('textHeight is scaled by the ratio (pure-C path)',
     emitted.includes('double lh = (double)lk * (size * 1.2 + lead) - ((lk > 1) ? lead : 0.0);')
     && emitted.includes('return lh * as_tf_scale_ratio(tf);'));
@@ -1592,10 +1601,11 @@ function checkHtmlTextMetrics(): string[] {
     emitted.includes('int le = as_tf_line_end(t, starts, n, lineIndex, len);')
     && emitted.includes('return as_str_substring_b(t, ls, le);'));
 
+  // 阶段四百三十八: lives in as_tf_metrics_refresh now (`ln` is the table's count).
   check('textHeight drops trailing EMPTY lines (their boxes are not charged)',
-    emitted.includes('int k = n;')
-    && emitted.includes('while (k > 1 && as_tf_line_end(et, starts, n, k - 1, elen) <= starts[k - 1]) k--;')
-    && emitted.includes('double h = (k < n) ? tops[k] : as_skia_textlayout_height(para);'));
+    emitted.includes('int k = ln;')
+    && emitted.includes('while (k > 1 && as_tf_line_end(et, starts, ln, k - 1, elen) <= starts[k - 1]) k--;')
+    && emitted.includes('double h = (k < ln) ? tops[k] : as_skia_textlayout_height(para);'));
   check('the pure-C textHeight applies the same rule and drops ONE trailing leading',
     emitted.includes('int lk = ln;')
     && emitted.includes('double lh = (double)lk * (size * 1.2 + lead) - ((lk > 1) ? lead : 0.0);'));
