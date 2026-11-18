@@ -765,6 +765,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/strcoerce.as` — 对象 → 字符串的隐式强转
 - `examples/split-join-compact.as` — `split()`/`join()` 的边界语义（阶段四百四十：单字节分隔符走 `memchr`、多字节走 `strstr`，join 量长与拷贝合成一趟）：首/尾/连续分隔符都留**空分片**、无分隔符与「分隔符比源串长」都只给一个整串分片、匹配不重叠、`>16` 元素走堆表、`null`/`undefined` 元素贡献空串、`split().join()` 往返不变（期望值取自 `adl 51.4.1`）
 - `examples/string-ascii-scan.as` — UTF-8 存储上的 UTF-16 码元索引空间，以及它的 ASCII 快路径（阶段四百四十一：字级高位置探测把「码元 ↔ 字节」翻译塌成恒等；`lastIndexOf` 于是可以**反向按字节**扫，通用路径不能——倒着走每个候选都要付一次翻译）：ASCII / CJK / 星光面 / 混合串的针、`from` 夹取、负 `from`、空针，以及一段 176 KB 的 ASCII 文本（快路径真正兑现处，交错 A/B −73.7%；期望值取自 `adl 51.4.1`）
+- `examples/string-accum.as` — 局部/脚本级字符串累加器（阶段四百四十二：只被 `s = expr` / `s += expr` / `s = s + expr` 写过的 String 变量改用一个私有可增长缓冲区，语句位追加**不**把值交出去，读点才交出去并置为已交出、迫使下一次追加另开新块）：循环追加、**别名冻结**（`var t:String = s` 之后 `s += …` 不得改到 `t`）、整体赋值重置、`+= int`、每轮都读、`null` 追加（`"nulln"`）、3000 字节多次扩容、非自引用拼接、闭包捕获（不参与）、值位形态，以及 `s = s + x` 与反序的 `s = x + s` 的分野（期望值取自 `adl 51.4.1`）
 - `examples/flash-net-layered.build.example.json` — 构建清单按目标分层的最小示例（非 `.as`，供构建层断言）
 - `examples/reflection-name.as` — 反射名的数值口径（值域窗口 / 负零 / `Dictionary` / `Vector.<接口>` 元素名）
 - `examples/math-round.as` — `Math.round` 是 `floor(x + 0.5)`（`round(-0.5)` 是 +0、`round(-2.5)` 是 -2）

@@ -460,6 +460,13 @@ export class Emitter {
   // Names already hoisted to the function top for the current function; their
   // in-body `var` sites emit a plain assignment instead of a re-declaration.
   private hoistedLocals: Set<string> = new Set();
+  // Local String accumulators of the body being emitted: AS3 name -> C name of its
+  // `as_sb` buffer (see findSbVars). Empty whenever the body has none, and reset
+  // per function body, so a plain `char*` read/write path is never touched by the
+  // accumulator hooks below.
+  private sbVars: Map<string, string> = new Map();
+  // Cached script-scope accumulator candidates (see sbModuleCandidates).
+  private sbModuleCache: Set<string> | null = null;
   // Static C variables holding shell-class singletons, so emitGCRoots can mark
   // them (see emitShellClasses).
   private shellSingletons: string[] = [];
@@ -1395,6 +1402,9 @@ export class Emitter {
     // Populate the boxed captured-local set after the hoisted vars are known, so
     // only `var`-locals (not params / untyped block locals) get reference cells.
     this.buildEnclosingCaptured();
+    // Which hoisted String locals can become append accumulators (needs the capture
+    // set above: a captured local lives in a closure cell, not in a C local).
+    this.sbVars = this.findSbVars(body);
     // The activation cell holds the captured locals of this body; allocate it up
     // front (before any closure in the body can be created) so the enclosing body
     // and every closure share one storage, whichever side assigns first.
@@ -1409,8 +1419,234 @@ export class Emitter {
       if (this.enclosingCaptured.has(name)) continue;
       const t = this.functionScope!.get(name)!;
       this.line(`${this.cTypeName(t)} ${this.cIdent(name)} = ${this.defaultInit(t)};`);
+      // Its append buffer: zeroed here (as_sb_new), seeded by the var/assign hooks.
+      const sb = this.sbVars.get(name);
+      if (sb !== undefined) this.line(`as_sb ${sb} = as_sb_new();`);
     }
   }
+
+  // Find the local Strings of `body` that may be emitted as append accumulators.
+  //
+  // A `var s:String` qualifies only when EVERY write to it is `s = expr` or
+  // `s += expr` (those two are the only shapes the emit hooks intercept) and it is
+  // never mentioned inside a nested function (a closure writes through its env
+  // cell, which the hooks cannot see). Anything else — `s++`, `s -= x`, `s ||= x`,
+  // `for (s in xs)` — disqualifies the name, so the plain `as_str_concat` path
+  // stays in charge. The read hook is what makes the whole thing sound: between
+  // appends the C variable is stale and only `as_sb_read` can see the bytes.
+  private findSbVars(body: Stmt[]): Map<string, string> {
+    const appends = new Map<string, number>();
+    const bad = new Set<string>();
+    const nestedMention = new Set<string>();
+    // Every AS3 name a nested function body mentions (reads included: a read-only
+    // capture would still see a stale C variable through the env cell).
+    const markNested = (n: unknown): void => {
+      if (n === null || typeof n !== 'object') return;
+      if (Array.isArray(n)) {
+        for (const x of n) markNested(x);
+        return;
+      }
+      const nd = n as Record<string, unknown> & { kind?: string; name?: string };
+      if (nd.kind === 'Var' && typeof nd.name === 'string') nestedMention.add(nd.name);
+      for (const key of Object.keys(nd)) {
+        if (key === 'kind' || key === 'line' || key === 'col') continue;
+        markNested(nd[key]);
+      }
+    };
+    // The AST is plain data, so a reflective walk sees every statement and
+    // expression form without a per-kind switch that could silently miss one —
+    // a missed write would leave the variable stale, so the walker errs wide.
+    const walk = (n: unknown): void => {
+      if (n === null || typeof n !== 'object') return;
+      if (Array.isArray(n)) {
+        for (const x of n) walk(x);
+        return;
+      }
+      const nd = n as Record<string, unknown> & { kind?: string; varName?: unknown };
+      const k = nd.kind;
+      if (k === 'FuncDecl' || k === 'FunctionExpr') {
+        markNested(n);
+        return;
+      }
+      if (k === 'Assign') {
+        const t = nd.target as { kind?: string; name?: string } | undefined;
+        if (t !== undefined && t.kind === 'Var' && typeof t.name === 'string') {
+          const op = String(nd.op);
+          if (op === '+=') appends.set(t.name, (appends.get(t.name) ?? 0) + 1);
+          else if (op === '=') {
+            // `s = s + x` is an append; any other value is a reset (both hookable).
+            if (this.isSelfAppendValue(nd.value, t.name)) appends.set(t.name, (appends.get(t.name) ?? 0) + 1);
+          } else bad.add(t.name);
+        }
+      } else if (k === 'Update') {
+        const t = nd.target as { kind?: string; name?: string } | undefined;
+        if (t !== undefined && t.kind === 'Var' && typeof t.name === 'string') bad.add(t.name);
+      } else if (k === 'ForIn') {
+        if (typeof nd.varName === 'string') bad.add(nd.varName);
+      } else if (k === 'With') {
+        // Inside a `with` body the with-object can claim the write, so the same
+        // `s += x` may end up as `as_dyn_set(obj, "s", ...)` and appending into the
+        // lexical buffer would mutate a variable the statement never touched
+        // (adl 51.4.1: the with-object's property shadows the lexical one).
+        const inWith = new Set<string>();
+        this.collectWithNames(n, inWith);
+        for (const nm of inWith) bad.add(nm);
+      }
+      for (const key of Object.keys(nd)) {
+        if (key === 'kind' || key === 'line' || key === 'col') continue;
+        walk(nd[key]);
+      }
+    };
+    walk(body);
+    const out = new Map<string, string>();
+    for (const [name, count] of appends) {
+      if (count === 0) continue;
+      if (bad.has(name) || nestedMention.has(name)) continue;
+      if (!this.hoistedLocals.has(name)) continue;
+      if (this.enclosingCaptured.has(name)) continue;
+      const t = this.functionScope?.get(name);
+      if (t === undefined || t.kind !== 'string') continue;
+      out.set(name, this.sbCNameFor(name));
+    }
+    return out;
+  }
+
+  // Script-scope accumulators: the same two writable shapes, but on a top-level
+  // `var` (a C file global, `g_name`) instead of a function local. A name is only
+  // eligible when no class or free function in the program mentions it at all --
+  // those bodies are emitted once and cannot be routed through the hooks of
+  // `main`, and a stale global read from one of them would be a wrong value.
+  private sbModuleCandidates(): Set<string> {
+    if (this.sbModuleCache !== null) return this.sbModuleCache;
+    const appends = new Map<string, number>();
+    const bad = new Set<string>();
+    const mentioned = new Set<string>();
+    const mark = (n: unknown): void => {
+      if (n === null || typeof n !== 'object') return;
+      if (Array.isArray(n)) {
+        for (const x of n) mark(x);
+        return;
+      }
+      const nd = n as Record<string, unknown> & { kind?: string; name?: string };
+      if (nd.kind === 'Var' && typeof nd.name === 'string') mentioned.add(nd.name);
+      for (const key of Object.keys(nd)) {
+        if (key === 'kind' || key === 'line' || key === 'col') continue;
+        mark(nd[key]);
+      }
+    };
+    const walk = (n: unknown): void => {
+      if (n === null || typeof n !== 'object') return;
+      if (Array.isArray(n)) {
+        for (const x of n) walk(x);
+        return;
+      }
+      const nd = n as Record<string, unknown> & { kind?: string; varName?: unknown };
+      const k = nd.kind;
+      if (k === 'FuncDecl' || k === 'FunctionExpr' || k === 'ClassDecl') {
+        mark(n);
+        return;
+      }
+      if (k === 'Assign') {
+        const t = nd.target as { kind?: string; name?: string } | undefined;
+        if (t !== undefined && t.kind === 'Var' && typeof t.name === 'string') {
+          const op = String(nd.op);
+          if (op === '+=') appends.set(t.name, (appends.get(t.name) ?? 0) + 1);
+          else if (op === '=') {
+            // `s = s + x` is an append; any other value is a reset (both hookable).
+            if (this.isSelfAppendValue(nd.value, t.name)) appends.set(t.name, (appends.get(t.name) ?? 0) + 1);
+          } else bad.add(t.name);
+        }
+      } else if (k === 'Update') {
+        const t = nd.target as { kind?: string; name?: string } | undefined;
+        if (t !== undefined && t.kind === 'Var' && typeof t.name === 'string') bad.add(t.name);
+      } else if (k === 'ForIn') {
+        if (typeof nd.varName === 'string') bad.add(nd.varName);
+      } else if (k === 'With') {
+        const inWith = new Set<string>();
+        this.collectWithNames(n, inWith);
+        for (const nm of inWith) bad.add(nm);
+      }
+      for (const key of Object.keys(nd)) {
+        if (key === 'kind' || key === 'line' || key === 'col') continue;
+        walk(nd[key]);
+      }
+    };
+    for (const stmt of this.program.body) walk(stmt);
+    const out = new Set<string>();
+    for (const [name, count] of appends) {
+      if (count === 0) continue;
+      if (bad.has(name) || mentioned.has(name)) continue;
+      if (this.hoistedLocals.has(name)) continue;
+      out.add(name);
+    }
+    this.sbModuleCache = out;
+    return out;
+  }
+
+  // The C name of a module accumulator's buffer (`g_name` -> as_sb_g_name).
+  private sbModuleCName(name: string): string {
+    return `as_sb_${this.moduleCName(name)}`;
+  }
+
+  // The append buffer of `name`, when the hooks may claim this read/write site:
+  // a local of the body being emitted, or (inside the script frame) a module var.
+  private sbTargetOf(name: string): string | null {
+    const sb = this.sbVars.get(name);
+    if (sb === undefined) return null;
+    if (this.functionScope === null) {
+      return this.moduleScope.get(name)?.kind === 'string' ? sb : null;
+    }
+    if (this.enclosingCaptured.has(name)) return null;
+    for (let i = this.scopes.length - 1; i >= 0; i--) {
+      if (this.scopes[i].has(name)) return sb;
+    }
+    return null;
+  }
+
+  // The C lvalue the accumulator's variable lives in.
+  private sbLValueOf(name: string): string {
+    return this.functionScope === null ? this.moduleCName(name) : this.cIdent(name);
+  }
+
+  // Every AS3 name mentioned anywhere under a `with` node. A with-object can claim
+  // a write (`as_dyn_set`), so appending into the accumulator's buffer for such a
+  // name would mutate a variable the statement never touched -- both walkers
+  // disqualify everything the body mentions (errring wide on purpose).
+  private collectWithNames(n: unknown, into: Set<string>): void {
+    if (n === null || typeof n !== 'object') return;
+    if (Array.isArray(n)) {
+      for (const x of n) this.collectWithNames(x, into);
+      return;
+    }
+    const d = n as Record<string, unknown> & { kind?: string; name?: string };
+    if (d.kind === 'Var' && typeof d.name === 'string') into.add(d.name);
+    for (const key of Object.keys(d)) {
+      if (key === 'kind' || key === 'line' || key === 'col') continue;
+      this.collectWithNames(d[key], into);
+    }
+  }
+
+  // `s = s + x` -- an append in disguise (see emitAssign): the left operand of the
+  // sum is the variable itself.
+  private isSelfAppendValue(v: unknown, name: string): boolean {
+    if (v === null || typeof v !== 'object') return false;
+    const nd = v as { kind?: string; op?: string; left?: { kind?: string; name?: string } };
+    return nd.kind === 'Binary' && nd.op === '+' && nd.left !== undefined &&
+      nd.left.kind === 'Var' && nd.left.name === name;
+  }
+
+  // The C name of a local's append buffer. AS3 identifiers can spell `as_sb_x`
+  // themselves, so collide against every hoisted local's C name and suffix until
+  // free (two C locals of one name in one block would not compile).
+  private sbCNameFor(name: string): string {
+    const taken = new Set<string>();
+    for (const h of this.hoistedLocals) taken.add(this.cIdent(h));
+    const base = `as_sb_${this.cIdent(name)}`;
+    let cand = base;
+    for (let n = 1; taken.has(cand); n++) cand = `${base}_${n}`;
+    return cand;
+  }
+
 
   // Populate `enclosingCaptured` with the boxed (heap-shared) captured locals of
   // the function currently being emitted. AS3 closures capture by reference, so a
@@ -7149,6 +7385,13 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     for (const [name, ctype] of this.moduleScope) {
       const m = this.gcMarkExpr(this.moduleCName(name), ctype);
       if (m) this.line(m);
+      // An append accumulator's live bytes are in its buffer, not in the (stale)
+      // slot: both the block and the value it last handed out are roots.
+      if (ctype.kind === 'string' && this.sbModuleCandidates().has(name)) {
+        const sb = this.sbModuleCName(name);
+        this.line(`gc_mark_ptr((void*)${sb}.buf);`);
+        this.line(`gc_mark_ptr((void*)${sb}.val);`);
+      }
     }
     this.indent--;
     this.line('}');
@@ -35382,6 +35625,11 @@ void FileStream_writeObject(void* _this, as_value v) {
         const init = v.implicit ? '(as_value){5, 0.0, NULL}' : this.defaultInit(ctype);
         this.line(`static ${this.cTypeName(ctype)} ${cn} = ${init};`);
       }
+      // A script-scope append accumulator keeps its bytes in this buffer (zero
+      // initialised = as_sb_new's state; main() seeds it from the var's init).
+      if (ctype.kind === 'string' && this.sbModuleCandidates().has(v.name)) {
+        this.line(`static as_sb ${this.sbModuleCName(v.name)};`);
+      }
     }
     this.line('');
   }
@@ -35738,6 +35986,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     // AIR's nearest analogue is the script-init frame; the ADL runtime frames
     // below it are a different loader and are not reproduced.
     this.emitFrameEnter(null, null);
+    // Script-scope append accumulators: top-level `var`s are C file globals, and
+    // their hooks only fire inside the script frame (no class/function may mention
+    // them -- see sbModuleCandidates).
+    this.sbVars = new Map();
+    for (const [name, ctype] of this.moduleScope) {
+      if (ctype.kind !== 'string') continue;
+      if (!this.sbModuleCandidates().has(name)) continue;
+      this.sbVars.set(name, this.sbModuleCName(name));
+    }
     for (const stmt of this.program.body) {
       this.emitTopLevel(stmt);
     }
@@ -35770,7 +36027,13 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.sequenceValueExpr(stmt.init, true, true);
         const e = this.emitExpr(stmt.init);
         const ctype = this.moduleScope.get(stmt.name)!;
-        this.line(`${this.moduleCName(stmt.name)} = ${this.convertImplicit(e, ctype)};`);
+        const lhs = this.moduleCName(stmt.name);
+        const sb = this.sbTargetOf(stmt.name);
+        if (sb !== null) {
+          this.line(`(${lhs} = ${this.convertImplicit(e, ctype)}, as_sb_reset(&${sb}, ${lhs}));`);
+        } else {
+          this.line(`${lhs} = ${this.convertImplicit(e, ctype)};`);
+        }
       }
       return;
     }
@@ -37804,7 +38067,13 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (!init) return ''; // already default-initialized at file scope
       const ctype = this.moduleScope.get(name)!;
       const e = this.emitExpr(init);
-      return `${this.moduleCName(name)} = ${this.convert(e, ctype)}`;
+      const lhs = this.moduleCName(name);
+      const sb = this.sbTargetOf(name);
+      // A script-scope accumulator: `var s:String = ""` inside a loop body re-runs
+      // every round, so the buffer has to be re-seeded here, not only at the top
+      // level declaration site (emitTopLevel).
+      if (sb !== null) return `(${lhs} = ${this.convert(e, ctype)}, as_sb_reset(&${sb}, ${lhs}))`;
+      return `${lhs} = ${this.convert(e, ctype)}`;
     }
     let ctype: CType;
     if (type !== null) {
@@ -37823,6 +38092,13 @@ void FileStream_writeObject(void* _this, as_value v) {
       const code = this.convert(e, ctype);
       // A boxed captured local has no C local of its own — assign through the
       // shared closure cell (reference semantics).
+      const sb = this.sbTargetOf(name);
+      if (sb !== null) {
+        // Seed the append buffer from the declaration's value (the buffer starts
+        // empty at the function top, before any statement has run).
+        const lhs = this.sbLValueOf(name);
+        return `(${lhs} = ${code}, as_sb_reset(&${sb}, ${lhs}))`;
+      }
       return `${this.emitVar(name).code} = ${code}`;
     }
     this.declareVar(name, ctype);
@@ -38955,7 +39231,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Local (block-scoped) variables shadow class members and module globals.
     for (let i = this.scopes.length - 1; i >= 0; i--) {
       const lt = this.scopes[i].get(name);
-      if (lt !== undefined) return { code: this.cIdent(name), type: lt };
+      if (lt !== undefined) {
+        // An append accumulator keeps its bytes in a private buffer; the C variable
+        // is stale between appends, so every read must come through here (a read
+        // hook that misses sees the string as it was at the previous flush).
+        const sb = this.sbTargetOf(name);
+        if (sb !== null) return { code: `as_sb_read(&${sb})`, type: lt };
+        return { code: this.cIdent(name), type: lt };
+      }
     }
     // Unqualified identifier inside a method falls back to a field (this->name),
     // a static field (Class_name), or a getter.
@@ -39042,7 +39325,13 @@ void FileStream_writeObject(void* _this, as_value v) {
     // so index.ts reports the collision loudly when it sees one.
     {
       const mt = this.moduleScope.get(name);
-      if (mt !== undefined) return { code: this.moduleCName(name), type: mt };
+      if (mt !== undefined) {
+        // Script-scope append accumulator: same stale-variable contract as a local
+        // (see sbModuleCandidates).
+        const sb = this.sbTargetOf(name);
+        if (sb !== null) return { code: `as_sb_read(&${sb})`, type: mt };
+        return { code: this.moduleCName(name), type: mt };
+      }
     }
     // A free function used as a value (var f:Function = foo).
     const func = this.symbols.getFunc(name);
@@ -40023,6 +40312,47 @@ void FileStream_writeObject(void* _this, as_value v) {
     // COMPOUND_BASE because `||`/`&&` in emitBinary return a bool, not a value).
     if (expr.op === '||=' || expr.op === '&&=') {
       return this.emitLogicalAssign(expr);
+    }
+
+    // Append accumulator (`as_sb`, see findSbVars): the analysis guarantees every
+    // write to this local is one of the two shapes below, so `s` is never read
+    // directly (emitVarLexical routes reads through as_sb_read) and never written
+    // outside this branch / emitVarDecl's seeding.
+    if (target.kind === 'Var' && (expr.op === '=' || expr.op === '+=')) {
+      const sb = this.sbTargetOf(target.name);
+      if (sb !== null) {
+        const lhs = this.sbLValueOf(target.name);
+        // `s = s + x` appends exactly like `s += x` (the left operand of the sum is
+        // the variable itself, so the buffer already holds it). `s = x + s` is NOT
+        // this shape -- the parts would be in the wrong order -- and stays a reset.
+        const val = expr.value;
+        const selfAppend = expr.op === '=' && val.kind === 'Binary' && val.op === '+' &&
+          val.left.kind === 'Var' && val.left.name === target.name;
+        if (expr.op === '+=' || selfAppend) {
+          // `s += x` is String + x: the target is statically a String, so AS3
+          // always concatenates (emitBinary's string branch converts the right
+          // side the same way, ToString and all). For `s = s + x` only the right
+          // operand of the sum is evaluated here (the left one is already in the
+          // buffer; emitting it too would duplicate its side effects).
+          const operand = selfAppend ? (val as Extract<Expr, { kind: 'Binary' }>).right : expr.value;
+          const ov = this.emitExpr(operand);
+          const rs = ov.type.kind === 'string' ? ov.code : this.toStringExpr(ov);
+          // In statement position the new value is thrown away, so nothing has to
+          // be handed out -- and NOT handing it out is what keeps the buffer
+          // growable in place (`as_sb_read` freezes it). Reading it here would turn
+          // every append in a loop into a full copy plus a fresh allocation, which
+          // is the O(n^2) this whole path exists to avoid.
+          // `suppressWithName` marks the lexical fallback of a `with` assignment: it
+          // is a VALUE there (the with-object test wraps it), so the bare-store form
+          // cannot be used even though this is the statement's own expression node.
+          const discarded = this.discardedExprNode !== null && this.discardedExprNode === expr &&
+            this.suppressWithName === null;
+          if (discarded) return { code: `as_sb_append(&${sb}, ${rs})`, type: { kind: 'string' } };
+          return { code: `(as_sb_append(&${sb}, ${rs}), (${lhs} = as_sb_read(&${sb})))`, type: { kind: 'string' } };
+        }
+        const cv = this.convert(this.emitExpr(expr.value), { kind: 'string' });
+        return { code: `((${lhs} = ${cv}), as_sb_reset(&${sb}, ${lhs}))`, type: { kind: 'string' } };
+      }
     }
 
     // a[i] = v  (and a[i] += v etc.)

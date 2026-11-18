@@ -400,6 +400,137 @@ function checkAsciiScan(): string[] {
 }
 registerGroup('unit: emit/AsciiScan', checkAsciiScan);
 
+// ---- 阶段四百四十二：局部字符串累加器（`s += x` 的 O(n²) → O(n)）----
+// A String local whose only writes are `s = expr` and `s += expr` is emitted as a
+// growable buffer (`as_sb`) instead of a fresh full copy per append. The soundness
+// argument is that the C variable stays STALE between appends and every read goes
+// through `as_sb_read`; once a read has handed the bytes out, the next append must
+// start a new block. Both halves are shape-checked here, because a regression in
+// either one is either a wrong string (stale read) or a corrupted alias (in-place
+// growth after a handout) -- and neither is visible in a passing benchmark.
+function checkStringAccumulator(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [sb] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [sb] ${label}`); }
+  };
+
+  const src = [
+    'function run():void {',
+    '  var s:String = "";',
+    '  for (var i:int = 0; i < 3; i++) s += "ab";',
+    '  trace(s);',
+    '  var t:String = s;',
+    '  s += "X";',
+    '  trace(t + "/" + s);',
+    '  var p:String = "a";',
+    '  p = p + "b";',
+    '  trace(p);',
+    '  var o:String = "a";',
+    '  o = "b" + o;',
+    '  trace(o);',
+    '  var c:String = "";',
+    '  var f:Function = function():void { c += "z"; };',
+    '  f();',
+    '  trace(c);',
+    '  var u:String = "x";',
+    '  var r:String = (u += "y");',
+    '  trace(r + u);',
+    '}',
+    'run();',
+  ].join('\n');
+  const c = generateC(parse(src)).c;
+
+  check('a qualifying local gets a zeroed buffer declared at the function top',
+    c.includes('as_sb as_sb_s = as_sb_new();'));
+  check('the declaration value seeds the buffer instead of leaving it empty',
+    c.includes('as_sb_reset(&as_sb_s, s)'));
+  // The append in statement position must NOT read the buffer back: reading it
+  // marks the block handed out, and the next append would then have to copy.
+  const loopAppend = [...c.matchAll(/as_sb_append\(&as_sb_s, "ab"\)[^;]*;/g)].map((m) => m[0]);
+  check('the loop append is a bare as_sb_append (statement position)',
+    loopAppend.length >= 1 && loopAppend.every((l) => !l.includes('as_sb_read')));
+  check('a value-position append does hand the new string out',
+    c.includes('(as_sb_append(&as_sb_u, "y"), (u = as_sb_read(&as_sb_u)))'));
+  check('every read of the accumulator goes through as_sb_read',
+    (c.match(/as_sb_read\(&as_sb_s\)/g) || []).length >= 2);
+  // Disqualifications: a name that is also concatenated into itself, or captured
+  // by a closure, keeps the ordinary as_str_concat path (a stale read through the
+  // closure cell would be a wrong value, and the analysis cannot hook it).
+  // `s = s + x` is an append (the left operand is the variable itself), while the
+  // reversed `s = x + s` is a reset that leaves it off the path entirely.
+  check('`p = p + "b"` appends into the buffer instead of concatenating',
+    !c.includes('as_str_concat(p, "b")') && /as_sb_append\(&as_sb_p, "b"\)/.test(c));
+  check('the reversed `o = "b" + o` is not an append and stays on as_str_concat',
+    !c.includes('as_sb_o') && /\bas_str_concat\("b", _?o\)/.test(c));
+  check('a closure-captured name is not turned into an accumulator',
+    !c.includes('as_sb_c') && c.includes('as_str_concat'));
+  // A `with` body can hand the same `s += x` to the with-object (`as_dyn_set`), so
+  // appending into the lexical buffer would mutate a variable the statement never
+  // touched. Any name mentioned under a `with` is disqualified.
+  const withC = generateC(parse([
+    'function run(o:Object):void {',
+    '  var s:String = "a";',
+    '  s += "b";',
+    '  with (o) { s += "c"; }',
+    '  trace(s);',
+    '}',
+    'run({});',
+  ].join('\n'))).c;
+  check('a name appended inside a `with` body is not claimed',
+    !withC.includes('as_sb as_sb_s') && withC.includes('as_str_concat'));
+  // Same rule for a script-scope accumulator (the with-object may claim the write).
+  const withMod = generateC(parse([
+    'var m:String = "";',
+    'm += "a";',
+    'var o:Object = {};',
+    'with (o) { m += "b"; }',
+    'trace(m);',
+  ].join('\n'))).c;
+  check('a script-scope name touched inside a `with` body is not claimed',
+    !withMod.includes('as_sb as_sb_g_m'));
+
+  // Script-scope accumulators: a top-level var is a C global, so its buffer is a
+  // file-scope static and has to be an explicit GC root (the (stale) slot is not
+  // where the bytes live).
+  const top = generateC(parse('var m:String = "";\nfor (var i:int = 0; i < 3; i++) m += "x";\ntrace(m);\n')).c;
+  check('a script-scope accumulator gets a file-scope buffer',
+    top.includes('static as_sb as_sb_g_m;'));
+  check('the script-scope append is a bare as_sb_append on the global buffer',
+    /as_sb_append\(&as_sb_g_m, "x"\);/.test(top) && !/as_sb_append\(&as_sb_g_m, "x"\),/.test(top));
+  check('the script-scope buffer is a GC root (buf and val)',
+    top.includes('gc_mark_ptr((void*)as_sb_g_m.buf);') && top.includes('gc_mark_ptr((void*)as_sb_g_m.val);'));
+
+  // Runtime half: the private-buffer contract.
+  const runtime = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const fnBody = (sig: string): string => {
+    const i = runtime.indexOf(sig);
+    if (i < 0) return '';
+    const j = runtime.indexOf('\n}\n', i);
+    return j < 0 ? '' : runtime.slice(i, j);
+  };
+  const read = fnBody('static char* as_sb_read(as_sb* b)');
+  const append = fnBody('static void as_sb_append(as_sb* b, const char* t)');
+  const reset = fnBody('static char* as_sb_reset(as_sb* b, const char* v)');
+  check('as_sb_read freezes the block it hands out', read.includes('b->handed = 1;'));
+  check('as_sb_append only grows in place when nothing was handed out',
+    append.includes('int reuse = (b->buf != NULL && !b->handed);')
+    && append.includes('if (!reuse || need > b->cap) {'));
+  check('as_sb_append copies the old bytes into the fresh block',
+    append.includes('if (base > 0) memcpy(nb, src, base);'));
+  check('growth doubles instead of re-measuring to the exact size',
+    append.includes('while (cap < need) cap *= 2;'));
+  check('a NULL current value appends as "null" (ES3 ToString(null))',
+    append.includes('(b->val != NULL ? b->val : "null")'));
+  check('as_sb_reset drops the block and re-seeds from the variable',
+    reset.includes('b->buf = NULL;') && reset.includes('b->val = v;') && reset.includes('b->handed = 0;'));
+
+  console.log(`     [sb] ${ok} accumulator shape check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/StringAccumulator', checkStringAccumulator);
+
 // ---- Function-value arity (#1063) and the qname in its message ----
 // AIR builds every Function value with a fixed parameter list and raises
 // TypeError... no: ArgumentError #1063 when it is invoked with fewer REQUIRED or

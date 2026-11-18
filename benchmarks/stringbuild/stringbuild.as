@@ -7,7 +7,7 @@
 // 本基准不写显式 System.gc()：AOT 侧按 8 MiB 阈值自动增量回收，AIR 侧走 AVM2
 // 自己的 GC，两边都只承受「各自默认 GC 策略」的成本，避免把手工回收算进差异。
 var N:int = 2000;
-var ROUNDS:int = 150;
+var ROUNDS:int = 2000;
 
 var checksum:int = 0;
 

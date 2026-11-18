@@ -1,6 +1,6 @@
 // stringbuild.js — 循环字符串累加（`s += "ab"`）基准（JS 版）
 const N = 2000;
-const ROUNDS = 150;
+const ROUNDS = 2000;
 
 let checksum = 0;
 const t0 = process.hrtime.bigint();

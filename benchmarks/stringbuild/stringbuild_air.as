@@ -10,7 +10,7 @@ package {
   public class stringbuild_air extends Sprite {
     public function stringbuild_air() {
       var N:int = 2000;
-      var ROUNDS:int = 150;
+      var ROUNDS:int = 2000;
       var checksum:int = 0;
 
       var t0:int = getTimer();

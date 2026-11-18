@@ -9,7 +9,7 @@
 #include <time.h>
 
 #define N 2000
-#define ROUNDS 150
+#define ROUNDS 2000
 
 int main(void) {
   long checksum = 0;

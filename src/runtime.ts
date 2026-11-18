@@ -1815,6 +1815,78 @@ static char* as_str_concat(const char* a, const char* b) {
     return r;
 }
 
+// ---- Local string accumulators ----------------
+// as_str_concat must copy its whole left operand, so growing a string with
+// "s += x" in a loop costs sum(i*len) = O(n^2) bytes: benchmarks/stringbuild
+// measures 2260 us for 4000 chars against AIR's 200 us (AIR uses a rope). A local
+// that a function only ever grows is emitted as a growable buffer instead (the
+// emitter's append/read hooks, emit.ts).
+//
+// The buffer is PRIVATE. The C variable is deliberately stale between appends and
+// only a read hook (as_sb_read) exposes the bytes, which is what makes this sound:
+// once exposed, the handed flag forces the next append to start a FRESH block
+// instead of writing in place, so no AS3 value can ever observe a growing buffer
+// through an alias ("var t:String = s;"). struct as_sb lives in a C local, so the
+// conservative stack scan keeps buf/val alive across the allocation in append.
+typedef struct as_sb {
+  const char* val;
+  char* buf;
+  size_t len;
+  size_t cap;
+  int handed;
+} as_sb;
+static as_sb as_sb_new(void) {
+  as_sb b;
+  b.val = NULL;
+  b.buf = NULL;
+  b.len = 0;
+  b.cap = 0;
+  b.handed = 0;
+  return b;
+}
+// The variable's current value becomes authoritative again (a plain assign).
+static char* as_sb_reset(as_sb* b, const char* v) {
+  b->val = v;
+  b->buf = NULL;
+  b->len = 0;
+  b->cap = 0;
+  b->handed = 0;
+  return (char*)v;
+}
+// Read: expose the appended bytes. Everything a previous read already handed out
+// must stay frozen, so the next append copies out instead of growing in place.
+static char* as_sb_read(as_sb* b) {
+  if (b->buf != NULL) {
+    b->val = b->buf;
+    b->handed = 1;
+  }
+  return (char*)b->val;
+}
+static void as_sb_append(as_sb* b, const char* t) {
+  if (t == NULL) t = "null"; // ES3 ToString(null), exactly like as_str_concat
+  size_t nt = strlen(t);
+  int reuse = (b->buf != NULL && !b->handed);
+  // A NULL String appends as the four characters "null": that is ES3 ToString(null),
+  // and it is exactly what as_str_concat substitutes for a NULL operand (measured
+  // on adl 51.4.1: var u:String = null; u += "n" prints nulln).
+  const char* src = reuse ? b->buf : (b->val != NULL ? b->val : "null");
+  size_t base = reuse ? b->len : strlen(src);
+  size_t need = base + nt + 1;
+  if (!reuse || need > b->cap) {
+    size_t cap = reuse && b->cap != 0 ? b->cap : 32;
+    while (cap < need) cap *= 2;
+    char* nb = as_str_alloc(cap);
+    if (base > 0) memcpy(nb, src, base);
+    b->buf = nb;
+    b->cap = cap;
+    b->handed = 0;
+  }
+  memcpy(b->buf + base, t, nt);
+  b->buf[base + nt] = 0;
+  b->len = base + nt;
+  b->val = b->buf;
+}
+
 // Null-safe String equality (AS3 ==/!= on String). A String-typed slot may
 // hold NULL (the AS3 default for an unset String field), and strcmp(NULL, ...)
 // would crash; two NULLs compare equal, a NULL never equals a non-NULL string.
