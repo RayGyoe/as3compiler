@@ -7486,12 +7486,49 @@ memo:
     }
     return len;
 }
+// True when the first n BYTES of s contain no byte with the high bit set. That is the
+// case where a byte offset and a UTF-16 code-unit index coincide, so every translation
+// below collapses to the identity -- and it is also the case the UI actually lives in
+// (identifiers, keys, numbers, Latin labels). Eight bytes per probe: a per-byte test
+// here would just be the walk it is supposed to replace.
+static bool as_u16_prefix_ascii(const char* s, size_t n) {
+    const unsigned char* p = (const unsigned char*)s;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w; memcpy(&w, p + i, 8);
+        if (w & 0x8080808080808080ull) return false;
+    }
+    for (; i < n; i++) if (p[i] & 0x80) return false;
+    return true;
+}
+// Record (code unit, byte) as the cursor for s. Round-robin over two slots, so a nested
+// loop over a SECOND string does not evict the outer cursor on every iteration (that
+// would be correct but back to O(n) per index).
+static void as_u16_cursor_set(const char* s, int unit, int byte) {
+    if (as_u16_cursor[0].s == s) { as_u16_cursor[0].unit = unit; as_u16_cursor[0].byte = byte; }
+    else if (as_u16_cursor[1].s == s) { as_u16_cursor[1].unit = unit; as_u16_cursor[1].byte = byte; }
+    else {
+        as_u16_cur* c = &as_u16_cursor[as_u16_rr];
+        as_u16_rr ^= 1;
+        c->s = s; c->unit = unit; c->byte = byte;
+    }
+}
 // The character holding code unit u: its byte offset, and whether u is the LOW half of an
 // astral pair (the second of the two units one 4-byte character occupies).
 static void as_u16_locate(const char* s, int u, int* off, int* low) {
     int k = 0, b = 0;
+    bool cached = true;
     if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit) { k = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte; }
     else if (as_u16_cursor[1].s == s && u >= as_u16_cursor[1].unit) { k = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte; }
+    else cached = false;
+    // No cursor for this string yet: an ASCII prefix makes the byte offset equal to u, so
+    // one word-wise probe replaces a walk of u characters. Callers clamp u to [0, length]
+    // (as_str_charCodeAt, as_u16_take, as_u16_byte_of), which keeps the probe in bounds.
+    if (!cached && u > 0 && as_u16_prefix_ascii(s, (size_t)u)) {
+        *off = u; *low = 0;
+        as_u16_cursor_set(s, u, u);
+        return;
+    }
     const unsigned char* p = (const unsigned char*)s + b;
     while (k < u && *p != 0) {
         int w = as_u16_width(*p);
@@ -7501,15 +7538,7 @@ static void as_u16_locate(const char* s, int u, int* off, int* low) {
         p += w;
     }
     *off = b; *low = 0;
-    if (as_u16_cursor[0].s == s) { as_u16_cursor[0].unit = k; as_u16_cursor[0].byte = b; }
-    else if (as_u16_cursor[1].s == s) { as_u16_cursor[1].unit = k; as_u16_cursor[1].byte = b; }
-    else {
-        // Round-robin, so a nested loop over a SECOND string does not evict the outer
-        // cursor on every iteration (that would be correct but back to O(n) per index).
-        as_u16_cur* c = &as_u16_cursor[as_u16_rr];
-        as_u16_rr ^= 1;
-        c->s = s; c->unit = k; c->byte = b;
-    }
+    as_u16_cursor_set(s, k, b);
 }
 static int as_u16_byte_of(const char* s, int u) {
     int off = 0, low = 0;
@@ -7521,12 +7550,24 @@ static int as_u16_byte_of(const char* s, int u) {
 // boundary (a valid UTF-8 needle never begins with a continuation byte), so the prefix
 // is a plain upward walk.
 static int as_u16_unit_of(const char* s, int byteoff) {
+    if (byteoff <= 0) return 0;
     int u = 0, b = 0;
-    const unsigned char* p = (const unsigned char*)s;
-    while (b < byteoff) {
-        int w = as_u16_width(*p);
-        b += w; p += w; u += (w == 4) ? 2 : 1;
+    // Resume from a cursor this string already has: a caller that walks monotonically
+    // (indexOf in a loop, a line table, a tokenizer) then pays only the distance since
+    // its last hit instead of re-counting from byte 0.
+    if (as_u16_cursor[0].s == s && byteoff >= as_u16_cursor[0].byte) { u = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte; }
+    else if (as_u16_cursor[1].s == s && byteoff >= as_u16_cursor[1].byte) { u = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte; }
+    // ASCII remainder: the two index spaces coincide there, and one word-wise probe per
+    // 8 bytes replaces the character walk (measured: benchmarks/bigscan, 180 KB ASCII).
+    if (as_u16_prefix_ascii(s + b, (size_t)(byteoff - b))) u += byteoff - b;
+    else {
+        const unsigned char* p = (const unsigned char*)s + b;
+        while (b < byteoff) {
+            int w = as_u16_width(*p);
+            b += w; p += w; u += (w == 4) ? 2 : 1;
+        }
     }
+    as_u16_cursor_set(s, u, byteoff);
     return u;
 }
 // CESU-8 form of one surrogate code unit: the only byte encoding of half an astral
@@ -7647,6 +7688,18 @@ static int as_str_lastIndexOf_from(const char* s, const char* sub, int from) {
     if (from > len) from = len;
     int sublen = (int)strlen(sub);
     if (sublen == 0) return from;
+    // ASCII fast path: units == bytes, so the search is a plain backwards byte scan from
+    // the last possible START at or before the from argument. The general path below must
+    // walk FORWARD (a backwards walk would pay one byte->unit translation per candidate),
+    // so on ASCII input this turns one comparison per character into one per candidate.
+    if (as_u16_prefix_ascii(s, (size_t)len)) {
+        int last = len - sublen;
+        if (last < 0) return -1;
+        if (last > from) last = from;
+        for (int i = last; i >= 0; i--)
+            if (s[i] == sub[0] && strncmp(s + i, sub, (size_t)sublen) == 0) return i;
+        return -1;
+    }
     // One forward walk instead of stepping backwards unit by unit: stepping back would
     // cost a byte->unit translation per candidate, i.e. O(n^2) on a CJK string.
     int best = -1, u = 0;

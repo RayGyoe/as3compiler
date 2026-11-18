@@ -328,6 +328,78 @@ function checkSplitJoinCompact(): string[] {
 }
 registerGroup('unit: emit/SplitJoinCompact', checkSplitJoinCompact);
 
+// ---- 阶段四百四十一：码元翻译的 ASCII 快路径 ----
+// The index space stays UTF-16 code units (G38) over a UTF-8 store, so every
+// indexOf/lastIndexOf/charAt used to walk the prefix character by character. On ASCII the
+// two spaces coincide, so a word-wise high-bit probe collapses the translation to the
+// identity, and lastIndexOf -- which had to walk FORWARD to keep the translation
+// one-pass -- can scan backwards in bytes. The nails below pin the SHAPE of both paths,
+// because the behavioural half is pinned by examples/string-ascii-scan.as against adl.
+function checkAsciiScan(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [asciiscan] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [asciiscan] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const between = (from: string, to: string): string => {
+    const i = pre.indexOf(from);
+    if (i < 0) return '';
+    const j = pre.indexOf(to, i + from.length);
+    return j < 0 ? '' : pre.slice(i, j);
+  };
+  const probe = between('static bool as_u16_prefix_ascii(', 'static void as_u16_locate(');
+  const locate = between('static void as_u16_locate(', 'static int as_u16_byte_of(');
+  const unitOf = between('static int as_u16_unit_of(', 'static int as_u16_emit_surrogate(');
+  const lastIndexOf = between('static int as_str_lastIndexOf_from(', 'static char* as_str_substring(');
+  check('all four sites were found in the preamble',
+    probe !== '' && locate !== '' && unitOf !== '' && lastIndexOf !== '');
+
+  // --- the probe itself: eight bytes per iteration, then a tail
+  check('the probe tests eight bytes at a time on the high bit',
+    probe.includes('for (; i + 8 <= n; i += 8) {')
+    && probe.includes('if (w & 0x8080808080808080ull) return false;'));
+  check('...and finishes the tail byte by byte',
+    probe.includes('for (; i < n; i++) if (p[i] & 0x80) return false;'));
+  check('a hit means "no byte with the high bit set"',
+    probe.includes('return true;') && probe.includes('return false;'));
+
+  // --- translations collapse to the identity on an ASCII prefix
+  check('unit_of resumes from a cursor this string already has (monotone walkers pay only the gap)',
+    unitOf.includes('if (as_u16_cursor[0].s == s && byteoff >= as_u16_cursor[0].byte) {')
+    && unitOf.includes('if (as_u16_cursor[1].s == s && byteoff >= as_u16_cursor[1].byte) {'));
+  check('unit_of adds the ASCII remainder by identity instead of walking it',
+    unitOf.includes('if (as_u16_prefix_ascii(s + b, (size_t)(byteoff - b))) u += byteoff - b;'));
+  check('unit_of short-circuits offset 0 before probing',
+    unitOf.includes('if (byteoff <= 0) return 0;'));
+  check('unit_of leaves the answer as a cursor for the next call',
+    unitOf.includes('as_u16_cursor_set(s, u, byteoff);'));
+  check('locate probes only when no cursor already covers the string',
+    locate.includes('if (!cached && u > 0 && as_u16_prefix_ascii(s, (size_t)u)) {'));
+  check('locate records the identity answer in the cursor, so the next index is free',
+    locate.includes('as_u16_cursor_set(s, u, u);'));
+
+  // --- lastIndexOf: ASCII goes backwards in bytes, the general path still forward
+  check('lastIndexOf takes the byte-wise backward path on ASCII',
+    lastIndexOf.includes('if (as_u16_prefix_ascii(s, (size_t)len)) {'));
+  check('the last candidate START is min(len - sublen, from)',
+    lastIndexOf.includes('int last = len - sublen;')
+    && lastIndexOf.includes('if (last > from) last = from;'));
+  check('a needle longer than the haystack answers -1 before scanning',
+    lastIndexOf.includes('if (last < 0) return -1;'));
+  check('candidates are compared with the needle, walking down to 0',
+    lastIndexOf.includes('for (int i = last; i >= 0; i--)')
+    && lastIndexOf.includes('if (s[i] == sub[0] && strncmp(s + i, sub, (size_t)sublen) == 0) return i;'));
+  check('the general path still walks FORWARD (a backward walk would translate per candidate)',
+    lastIndexOf.includes('while (*p != 0 && u <= from) {')
+    && lastIndexOf.indexOf('while (*p != 0 && u <= from) {') > lastIndexOf.indexOf('as_u16_prefix_ascii'));
+
+  console.log(`     [asciiscan] ${ok} ASCII-path shape check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/AsciiScan', checkAsciiScan);
+
 // ---- Function-value arity (#1063) and the qname in its message ----
 // AIR builds every Function value with a fixed parameter list and raises
 // TypeError... no: ArgumentError #1063 when it is invoked with fewer REQUIRED or

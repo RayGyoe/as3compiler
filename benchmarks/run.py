@@ -31,6 +31,7 @@ BENCHES = [
     "vectorint",
     "stringbuild",
     "textmetrics",
+    "bigscan",
 ]
 RUNS = 3
 

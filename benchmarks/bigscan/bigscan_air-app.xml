@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>bench.bigscan</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>bigscan_air</filename>
+  <initialWindow>
+    <content>bigscan_air.swf</content>
+    <visible>false</visible>
+  </initialWindow>
+</application>

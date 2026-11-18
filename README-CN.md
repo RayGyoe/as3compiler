@@ -764,6 +764,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/audio/` — 带 UI 的音频播放器 + 文件示例：`Sound.load` 的**编码文件加载**、`SoundChannel` + `soundComplete`、原生 `File.browseForOpen` 面板，`FileStream` 的两个方向（文件 → 字节 → `loadCompressedDataFromByteArray`；PCM → 一份真的 16-bit WAV），以及 **边下边播**的 `http(s)://` 源（MP3 渐进式解码）（需 Skia/SDL2/miniaudio + curl 后端，见 `docs/zh-cn/audio.md` §13.5–§13.6）
 - `examples/strcoerce.as` — 对象 → 字符串的隐式强转
 - `examples/split-join-compact.as` — `split()`/`join()` 的边界语义（阶段四百四十：单字节分隔符走 `memchr`、多字节走 `strstr`，join 量长与拷贝合成一趟）：首/尾/连续分隔符都留**空分片**、无分隔符与「分隔符比源串长」都只给一个整串分片、匹配不重叠、`>16` 元素走堆表、`null`/`undefined` 元素贡献空串、`split().join()` 往返不变（期望值取自 `adl 51.4.1`）
+- `examples/string-ascii-scan.as` — UTF-8 存储上的 UTF-16 码元索引空间，以及它的 ASCII 快路径（阶段四百四十一：字级高位置探测把「码元 ↔ 字节」翻译塌成恒等；`lastIndexOf` 于是可以**反向按字节**扫，通用路径不能——倒着走每个候选都要付一次翻译）：ASCII / CJK / 星光面 / 混合串的针、`from` 夹取、负 `from`、空针，以及一段 176 KB 的 ASCII 文本（快路径真正兑现处，交错 A/B −73.7%；期望值取自 `adl 51.4.1`）
 - `examples/flash-net-layered.build.example.json` — 构建清单按目标分层的最小示例（非 `.as`，供构建层断言）
 - `examples/reflection-name.as` — 反射名的数值口径（值域窗口 / 负零 / `Dictionary` / `Vector.<接口>` 元素名）
 - `examples/math-round.as` — `Math.round` 是 `floor(x + 0.5)`（`round(-0.5)` 是 +0、`round(-2.5)` 是 -2）

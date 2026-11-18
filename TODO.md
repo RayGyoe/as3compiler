@@ -20798,6 +20798,11 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 >
 > **2026-11-14 追加（阶段四百一十三：`WebSocket.startServer()` 服务端落地）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒ 主表 **87 → 86 行**（`未开始` 63 → **62**，`部分完成` 20 不变）。移出的是 `startServer(socket)` 那条——服务端那一半已按 `adl 51.4.1` 实测落地（`temp/wssrv/` 探针：服务端**不派** `CONNECT`、`DATA.position` 为 0、不回显子协议、`close(1001)` 后 `closeReason` 仍是 `-1`），验收是**角色反转**的单元回环（编译产物当服务端、Node 手写 RFC 6455 当客户端）。**本阶段修净的不占表**：`as_ws_parse_frames` 的控制帧漏解掩码（客户端模式永远踩不到——对端帧本就不掩码——服务端模式下 close 码与 PONG 载荷取到的是 xor 后的字节）、以及服务端沿用 `AS_WS_MSG_OPEN` 派出了 AIR 不会派的 `Event.CONNECT`。
 > **2026-11-14 追加（阶段四百零八：`air.net.WebSocket` 原生客户端）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒ 按「项数以表内实际行数**为准**」重数，主表 **86 → 87 行**（`未开始` 62 → **63**，含 `未开始 / D43b` 1 行；`部分完成` 20 不变）。**新登记的 1 行**是 `startServer(socket)`——客户端那一半（握手交给 `CURLOPT_CONNECT_ONLY=2`，分帧/掩码/分片重组/close 码归运行时）已全部落地并在 Node 真服务器上跑通，服务端缺的**只是握手**：在已接受的 `Socket` 上算 `Sec-WebSocket-Accept`，再复用同一套帧编解码。本轮只登记不改，因为真正的难点不在算法而在**数据面归属**（`as_sock` 的 poll 循环 vs worker 线程，两条路不能各读一半）。**本阶段修净的不占表**：`wss://` 在真机对 `wss://ws.postman-echo.com/raw` 实测 101 + echo 回环、`advapi32` 漏链（`CryptAcquireContext`/`CryptCreateHash` 在 advapi32 而非 crypt32）、顶层脚本 `import air.net.WebSocket` 后 `var w:WebSocket` 报 `unknown type` —— 都是「`adl` 跑得对我们跑不出」，同阶段落地。**顺带记一条口径**：curl 的 `curl_ws_*` 帧层与 `CURLWS_RAW_MODE` 都**不能**当我们的帧层用（前者不暴露 FIN，后者拒绝它自己为自动 PONG 发出的带 flags 发送，两条都有探针），今后遇到「第三方库已经有这个协议」的判断，先验「它暴露的抽象粒度够不够」，不是验「它有没有这个功能」。
+> **2026-11-18 追加（阶段四百四十一：码元翻译 ASCII 快路径）**：**新登记 0 行 / 改写 1 行 / 移出 0 行** ⇒
+> 主表仍 **88 行**（`未开始` 67 → **66**，`部分完成` 20 → **21**）。改写的是上一阶段登的
+> 「UTF-16 翻译成本」那行：ASCII 侧已被三笔快路径拿回（`strings` −12.3%、新增的 `bigscan` −73.7%），
+> 剩下的是**非 ASCII**（没有恒等可塌，码元必须真的数），建议先补一条 CJK 基准再动。
+
 > **2026-11-18 追加（阶段四百四十：split/join 扫描压实）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒
 > 主表 **87 → 88 行**（`未开始` 66 → **67**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。新登记项是
 > **本阶段顺手量出的漂移**：`strings` 从 v0.4.112 的 199 ms 涨到 ~281 ms，逐点重建后归到两笔**有意兑换**
@@ -20806,7 +20811,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
-| **`strings` 基准里 UTF-16 码元翻译的成本还没回收**（`indexOf`/`indexOf(v,start)`/`lastIndexOf`/`.length` 每次调用都做码元 ↔ 字节偏移翻译；实测把本项从 v0.4.112 的 199 ms 抬到 ~281 ms） | 未开始（2026-11-18 阶段四百四十 逐点重建定位；与同轮的 split/join 扫描压实无关，压实后是 277 ms） | 漂移按提交定到两点：`3c79812`（v0.4.358，`gc_find_block` 的 8 探针前缀，**+19%**，治的是小块洪泛病态）与 `5c79f1d`（v0.4.361，G38 码元索引，**+18%**）。第二项有明确回收路径：一次**字级高位置探测**即可判定「码元索引 == 字节偏移」，命中就跳过整趟前缀计数（`as_str_len` 已有同款探测）。**已证伪半边猜测**：只把 `as_str_indexOf` 的 `as_u16_unit_of` 换成直返字节偏移**没有任何改善**（271/277 vs 基线 269，交错 5 轮）⇒ 成本不在 `strstr` 那条路 | 先按 G38 之后的**新口径**重做「零分配下限」归因（`indexOf` / `lastIndexOf` / `.length` 各占多少 ms；旧表里那句「字符串扫描本身免费」是 G38 之前的读数），再决定改哪一支；全部读数见 `benchmarks/strings/report.md` §3d/§3e |
+| **非 ASCII 串上的码元翻译仍是逐字符走**（ASCII 已由阶段四百四十一的探测/游标/反扫拿回；CJK/emoji 文本的 `indexOf`/`lastIndexOf`/`.length` 仍按字符步进，且 `.length` 每次换串都要全串探一遍） | 部分完成（2026-11-18 阶段四百四十一：ASCII 侧 `strings` −12.3%、`bigscan` −73.7%；非 ASCII 侧未动） | ASCII 那次回收靠三笔：`as_u16_prefix_ascii` 字级高位探测、`as_u16_unit_of` 从游标续走、`as_str_lastIndexOf_from` 的 ASCII 反向字节扫描。**非 ASCII 没有恒等可塌**——码元数必须真的数出来，所以剩下的只有「少数几遍」（游标已做）与「别在 `.length` 上全串探」（`as_str_len` 的 2 槽 memo 已做，但 `toUpperCase()`/`substring()` 每次产生新串 ⇒ memo 必失效）。旧结论「G38 +18% 落在前缀计数」已被剖析推翻（见阶段四百四十一条：本项 59% 在 GC，翻译层约 11%，`as_u16_*` 未进前 20） | 若要做，先补一条 **CJK 文本**基准（`bigscan` 的 CJK 版），把「非 ASCII 翻译占多少」量出来再决定；没有护栏就先不改——本项历史上已经因为「按直觉改一支」白费过一轮（直返字节偏移，5 轮 0 收益） |
 | **同一字体字号下纯文本字段与富文本字段的 `textHeight` 可相差 0.5–1 px**（light 快路径报 AIR 模型盒 `rhalf(asc)+rhalf(desc)+leading`，SkParagraph 路径报 Skia `InternalLineMetrics::height()`——对同一个人工 strut 盒**再取整一次**） | 未开始（2026-11-16 阶段四百三十五 全量 macOS 回归发现；`examples/text-underline.as` 用例①红，Courier New 12：无下划线 13.5 / 有下划线 14） | 两条布局路径对「行盒高度」的最终取整不一致：`vendor/skia_text_glue.cc` 的 `sk_set_air_strut` 已把 Skia 的行盒强制成 AIR 的 `am.model + leading`，但 `ParagraphImpl::addLine` 存的是 `InternalLineMetrics::height()` = `round(descent-ascent+leading)`，所以 Skia 侧多了一次 0.5 进位；light 路径 `sk_text_light_new` 存的是未取整的模型值。凡 `am.model + leading` 非整数即触发，与下划线无关——下划线只是把该字段从 light 路径踢到 paragraph 路径，从而让两个值同时出现。证据 `temp/tu/ul.as`（`a.textHeight=13.5 b.textHeight=14 a.textWidth=57.609375 b.textWidth=57.609375`） | **2026-11-16 用户裁决：示例侧放宽，不追完全对齐**（`examples/text-underline.as` 已改 ±1 px 容差 + `textHeight/N` 步进），分歧本身仍留在表里等 adl 定标。先装 AIR SDK 跑 adl 定真值：① 若 AIR 报 13.5 ⇒ paragraph 路径的 `textHeight` 不能再取 Skia 的取整值，须由 AIR 盒自行累加（改 `sk_textlayout_height`/`textHeight` 的 `tops[k]` 来源）；② 若 AIR 报 14 ⇒ light 路径的 `height` 改成与 Skia 同口径取整（并复核所有文本示例的双端读数）。两种改法都先做**双端全量**再落盘，别只修单侧 |
 | **`toFixed` 对大数（如 `Number.MAX_VALUE`）的有效位截断与 AIR 不同** | 未开始（2026-11-15 阶段四百一十九 修 `.5` 舍入方向时量到） | AIR 的 D2A 数字生成器（avmplus `core/d2a.cpp`）对大数走 BigInteger 停止边界，只生成约「最短往返有效位数 + precision」个有效位、其余补零，且带 off-by-one/two（`MAX_VALUE` 在 `f1` 是 17 位而非 18、`f15` 是 30 位而非 32）。我们的 `as_num_toFixed` 用 `%.1100f` 精确展开，给出全部 309 位整数。证据 `temp/tofixed3/maxvalue-residual.txt`（9 格双端读数）。这是**独立于 `.5` 舍入方向**的「有效位截断」行为；旧 `printf` 实现同样不匹配，属既有缺口而非本轮引入 | 需移植 avmplus D2A 的 BigInteger 停止边界才能逐位复现，无简单公式（「17+precision」在 `f1`/`f15` 偏差 1–2 位）。病态用例（真实代码几乎不对 `MAX_VALUE` 调 `toFixed`），独立立项；`.5` 舍入方向本身已于阶段四百一十九修净（693 格双端矩阵 + `examples/tofixed-round.as`） |
 | **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
@@ -23362,6 +23367,67 @@ UTF-8，还逐行一次 `strlen`。新增 `as_tf_units_to_bytes(const char* s, i
 回归；③ **读一手源码定归属**：`Curl_ws_accept` 里那 4 行就是「谁吃了字节」的判据，比猜 curl 行为快；
 ④ **对齐 AIR 才算修复**：先量 AIR 在同样输入下的行为，再决定这是 bug 还是「本来如此」；
 ⑤ **「不丢」与「不晚」是两件事**：只修握手的 `rest` 会从丢帧变成延迟投递，两处必须同时改。
+
+### 阶段四百四十一：码元翻译的 ASCII 快路径（v0.4.415 → v0.4.416）✅ 已完成
+
+> 字符串层的第五条线程。上一阶段（四百四十二的前一格）在 §3e 留了一条待办：**先按 G38 之后的
+> 口径重做归因，再决定改哪一支**，因为「把 `as_str_indexOf` 的 `as_u16_unit_of` 直返字节偏移」
+> 已被证伪（271/277 vs 基线 269，交错 5 轮，没有任何改善）。
+
+**一、归因（先量后改）**
+
+用 `sample` 采 `benchmarks/strings` 的 30×300k 轮（自耗时 4013 样本）：
+`gc_alloc` 25% / `gc_sweep_step` 20% / `gc_collect` 14% / `main` 11% / `memmove` 6% /
+`strlen`+`as_str_len`+`strstr`+`strncmp`+`memchr` **合计只有 11%**，`as_u16_unit_of`、
+`as_u16_locate` 连前 20 名都没进（被内联）。
+
+⇒ **§3e 的假设要修正**：本项上 G38 那 +18% 不落在「前缀计数」上，而落在
+`.length` 变成码元计数后多出的一次全串探测（`as_str_len`）与 `toUpperCase` 的重新分配上。
+本项 59% 的账面在 GC，翻译层只占 ~11%。
+
+**二、三笔改动（只换实现，答案逐字不变）**
+
+- **① `as_u16_prefix_ascii`**：8 字节一字的高位置探测（`w & 0x8080808080808080ull`），
+  判定「码元索引 == 字节偏移」是否成立。逐字节判定等于把要替换的那趟走一遍，所以必须字级。
+- **② `as_u16_unit_of` / `as_u16_locate`**：命中探测即返回恒等；`unit_of` 还改成**从游标续走**
+  （游标本来就是 `as_u16_locate` 的两槽 round-robin 缓存），于是单调扫描的调用方
+  （`indexOf` 逐命中推进、行表、分词器）只付「距上次命中」的距离，而不是从字节 0 重数。
+- **③ `as_str_lastIndexOf_from`**：命中探测就走**反向字节扫描**。旧实现只能正向逐字符走
+  （注释里写着理由：倒着走每个候选都要付一次字节→码元翻译），ASCII 上这个理由消失。
+
+**三、测量（交错 A/B，同一份 `.as`，逐轮交替）**
+
+| 基准 | 变体 | min | 中位 | 增量 |
+|---|---|---:|---:|---:|
+| `strings`（43 字节的串） | 基线 v0.4.415 | 249 | 255.5 | — |
+| | **本阶段** | **221** | **224** | **−12.3%** |
+| `bigscan`（176000 字节 ASCII，**本阶段新增**） | 基线 v0.4.415 | 37 | 38.0 | — |
+| | **本阶段** | **10** | **10.0** | **−73.7%** |
+
+逐项归因（`strings`，10 轮）：三笔全开 −13.0%；只关 `lastIndexOf` 反扫 ⇒ −2.3%；
+只关 `unit_of`/`locate` 探测 ⇒ −12.6%。**11 个点是 `lastIndexOf`**，`indexOf` 侧的探测在
+43 字节的串上只值 0.4%（噪声级）——但在 176 KB 的文本上是 −73.7%，所以另立 `benchmarks/bigscan`
+作为它的护栏（否则这条改动在本套件里等于没有证据）。
+
+**四、护栏与钉子**
+
+- `examples/string-ascii-scan.as`（33 条断言）：ASCII/CJK/星光面/混合串、`from` 夹取、负 `from`、
+  空针、针比源串长、176 KB 文本的 indexOf/charAt/lastIndexOf。**期望值全部取自 `adl 51.4.1`**
+  （`temp/u16probe`：25 行 + 12 行两份探针，与我们的输出逐行 diff 一致）。
+- `test/unit/emit.ts` 的 `unit: emit/AsciiScan`（14 条源码形状钉子）：探测是 8 字节一字、
+  `unit_of` 从游标续走、`locate` 只在「无游标」时探测、`lastIndexOf` 的候选上界是
+  `min(len - sublen, from)`、**通用路径仍然正向走**（防止有人为了「对称」把非 ASCII 也改成倒扫）。
+  变异实测：改 `i >= 0` → `i > 0`、删掉 `if (last > from) last = from;` ⇒ 立刻红 2 条。
+- `benchmarks/bigscan/`（新第 12 项，四路齐全）：C 列刻意做成**同样的 UTF-8 存储 + UTF-16 码元
+  语义**（直白实现），JS/AIR 列则是「内部就是 UTF-16、不需要翻译」的零翻译下界。
+  读数：C 23 / JS 0 / **asc 10** / AIR 1 ms，`result=27141000` 四路一致。
+
+**五、没有保留的东西**
+
+- 「跳过翻译」（无条件直返字节偏移）：上一阶段已证伪，本阶段用归因解释清楚了——成本不在
+  `strstr`，而在翻译要不要做；正确做法是**先证明不需要翻译**（探测），不是**假装不需要**。
+- 没有动 GC：59% 的账面在分配/清扫，但那是 `benchmarks/strings` 的既有结构（§2/§3b/§3c 已记），
+  与本项无关，属另一条线程。
 
 ### 阶段四百四十：split/join 的扫描趟压实（v0.4.414 → v0.4.415）✅ 已完成
 

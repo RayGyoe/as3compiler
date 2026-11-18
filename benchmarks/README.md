@@ -20,7 +20,7 @@ benchmarks/<name>/
 ## 运行
 
 ```bash
-# 全部 11 项基准（逐项编译其路由 + 各跑 3 次取中位数 + 校验路由间结果一致）
+# 全部 12 项基准（逐项编译其路由 + 各跑 3 次取中位数 + 校验路由间结果一致）
 python3 benchmarks/run.py
 
 # 只跑指定基准
@@ -35,6 +35,19 @@ python3 benchmarks/run.py fib nbody
 # 本轮使用的命令（AIR SDK 51.4.1）
 AIRSDK_HOME=/path/to/AIRSDK_51.4.1/bin python3 benchmarks/run.py
 ```
+
+## 套件扩容：新增 `bigscan`（阶段四百四十一，2026-11-18）
+
+第 12 项，四路齐全：180 KB 纯 ASCII 文本上的 `indexOf(v, startIndex)` 逐命中推进、
+中段 `charAt`、带 `from` 的 `lastIndexOf`。它补的是 `strings` 的盲区——`strings` 的串只有
+43 字节，码元 ↔ 字节翻译的前缀本来就短，看不见「翻译成本随串长增长」这件事；`bigscan`
+把同一层拉开到 176000 字节后，同一笔 ASCII 快路径从 `strings` 的 −12.3% 变成 **−73.7%**
+（交错 A/B 38 → 10 ms）。
+
+C 与 JS 两路的意义不同（详见 `benchmarks/bigscan/report.md`）：C 列**同样是 UTF-8 存储 +
+UTF-16 码元索引**，即「同样的语义用直白的 C 写」——它比我们慢（23 vs 10 ms），因为它的
+翻译没有游标续走；JS 与 AIR 的字符串内部就是 UTF-16，**不需要翻译**，它们是这条基准的
+「零翻译下界」（0–1 ms）。
 
 ## 套件扩容：新增 `stringbuild` 与 `textmetrics`（阶段四百三十七，2026-11-18，`src/` 无改动）
 
