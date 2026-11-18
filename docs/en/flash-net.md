@@ -1776,9 +1776,32 @@ Two things most easily got wrong:
   builds, and `http(s)://` and `ws(s)://` share the same TLS (Schannel on Windows, SecureTransport on
   macOS). Both `--air-app`'s networking probe and the CLI's `air.net.WebSocket` probe inject
   `ASC_HAVE_CURL` + `curl`/`nghttp2`, so a program that only speaks WebSocket never misses the link.
-- **curl does the handshake, the runtime does the framing.** `CURLOPT_CONNECT_ONLY=2` runs the HTTP
-  upgrade (validating the response and setting up TLS) and then hands the connection over; the data
-  phase runs over `curl_easy_send`/`curl_easy_recv`.
+- **curl makes the connection; the handshake and the framing are the runtime's.**
+  `CURLOPT_CONNECT_ONLY=1` performs TCP (plus TLS for `wss://`) and then hands the connection over; the
+  HTTP upgrade is **written and validated here** (`as_ws_client_handshake`: `GET` plus
+  `Host`/`Upgrade`/`Connection`/`Sec-WebSocket-Key`/`Sec-WebSocket-Version` -- and the application's
+  `Sec-WebSocket-Protocol` -- with the response required to be `101` and
+  `Sec-WebSocket-Accept == base64(sha1(key + GUID))`), and the data phase runs over
+  `curl_easy_send`/`curl_easy_recv`.
+  **Why not `CURLOPT_CONNECT_ONLY=2`** (measured, `temp/wscoalesce/` and `temp/wsadl/`): it hands the
+  bytes that already arrived **behind the 101 response** to curl's own ws decoder
+  (`lib/ws.c: Curl_ws_accept` -- under `connect_only` it does
+  `Curl_bufq_write(&ws->recvbuf, mem, nread)`, which only `curl_ws_recv` can read back), while this
+  runtime's data phase is a raw `curl_easy_recv` that **cannot reach them**: when a peer packs a
+  welcome message or a PING into the same TCP segment as the `101`, those frames are **silently
+  dropped**. Measured: with the fixture writing `101 + TEXT + PING` in one `socket.write`, the client
+  failed to see the welcome message and never answered the PING in 3 of 3 runs; with two separate
+  writes it worked -- which is exactly the timing race that made `websocket-roundtrip` flaky.
+  **AIR 51.4.1 receives them normally in the same scenario** (`temp/wsadl/` probe: `CONNECT` then
+  `DATA s=hello-first`, PONG included), so this is a **fidelity fix, not an enhancement**. Under
+  `CONNECT_ONLY=1` those bytes are still in the socket and `curl_easy_recv` reads them like any other
+  byte, so the byte stream has exactly one authority: the runtime's framer.
+  The trailing bytes of the handshake read are not re-fed through the decoder but **seed it as the
+  start of the same stream** (`rest` from both `as_ws_client_handshake` and `as_ws_server_handshake`),
+  and `as_ws_recv_pass` **parses what is already buffered before reading the transport** -- reading
+  first leaves that prefix sitting there until the next arrival, which shows up as "the welcome message
+  only comes after the application speaks".
+
   **Why not curl's `curl_ws_*` frame layer** (both measured, not assumed):
   1. It **does not expose the FIN bit** -- a middle CONTINUATION frame and the **last** frame of a
      fragmented message look identical (`CURLWS_CONT` + `bytesleft == 0`, probe
@@ -1849,11 +1872,16 @@ node --test --test-name-pattern=websocket test/unit/*.ts      # shape pins + a r
   `ServerSocket` only exists on POSIX targets (7.3, last item), so on Windows it would be skipped in
   exactly the build that most needs it.
 - `websocket-roundtrip/` in `test/unit/websocket.ts` drives the same seam with Node's http server (real
-  SHA-1 accept, real masking, real fragments, real close code) and asserts: handshake -> TEXT -> BINARY
-  -> **fragment reassembly** -> the peer's close `4001` in `closeReason`, `data` being a ByteArray,
-  `stringData` `null` for BINARY, the subprotocol header value `chat.v1, chat.v2`, and the server's PING
-  being answered by the transport. The `websocket/` group pins the source shape (error texts, the props
-  table not tracing `_ws`, the framing belonging to the runtime, the `ASC_HAVE_CURL` wiring, `advapi32`).
+  SHA-1 accept, real masking, real fragments, real close code) and asserts: handshake -> **the welcome
+  message and PING packed into the same segment as the `101`** -> TEXT -> BINARY -> **fragment
+  reassembly** -> the peer's close `4001` in `closeReason`, `data` being a ByteArray, `stringData`
+  `null` for BINARY, the subprotocol header value `chat.v1, chat.v2`, and the server's PING being
+  answered by the transport. **The welcome-message case is stage 439's nail**: the fixture writes
+  `101 + TEXT + PING` in **one** `socket.write` (so they arrive in one segment); two separate writes
+  cannot detect a swallowed post-handshake byte. The `websocket/` group pins the source shape (error
+  texts, the props table not tracing `_ws`, the framing belonging to the runtime, `CONNECT_ONLY=1`
+  rather than 2, the client handshake's `Sec-WebSocket-Key`/accept validation, buffered bytes being
+  parsed before the transport is read again, the `ASC_HAVE_CURL` wiring, `advapi32`).
 - **Server mode's round trip is the second `websocket-roundtrip/` case**: the roles are reversed -- the
   compiled AS3 program is the **server** (`ServerSocket` -> accept -> `startServer`) and Node speaks
   RFC 6455 by hand as the **client**. It asserts the whole server-side view: `101` with the correct

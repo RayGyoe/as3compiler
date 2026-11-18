@@ -1581,8 +1581,26 @@ String 是 NUL 结尾的，嵌入的 NUL 无法用 `readUTFBytes` 观测，故�
   共用同一套 TLS（Windows Schannel / macOS SecureTransport）。`--air-app` 的联网探测与 CLI 的
   `air.net.WebSocket` 探测都会挂上 `ASC_HAVE_CURL` + `curl`/`nghttp2`，只有 WebSocket 的程序
   不会漏链。
-- **握手归 curl，分帧归运行时**。`CURLOPT_CONNECT_ONLY=2` 跑完 HTTP upgrade（校验响应、建好 TLS）
-  后把连接交出来，数据面走 `curl_easy_send`/`curl_easy_recv`。
+- **连接归 curl，握手与分帧归运行时**。`CURLOPT_CONNECT_ONLY=1` 只做 TCP（`wss://` 再加 TLS）就
+  把连接交出来；HTTP upgrade 的**请求与响应校验由运行时自己发/自己验**（`as_ws_client_handshake`：
+  `GET` + `Host`/`Upgrade`/`Connection`/`Sec-WebSocket-Key`/`Sec-WebSocket-Version`（+ 应用给的
+  `Sec-WebSocket-Protocol`），响应必须是 `101` 且 `Sec-WebSocket-Accept == base64(sha1(key + GUID))`），
+  数据面走 `curl_easy_send`/`curl_easy_recv`。
+  **为什么不用 `CURLOPT_CONNECT_ONLY=2`**（这条是实测，见 `temp/wscoalesce/` 与 `temp/wsadl/`）：
+  它会把 `101` 之后**已经到达的那批字节直接交给 curl 自己的 ws 解码器**
+  （`lib/ws.c: Curl_ws_accept` —— `connect_only` 时 `Curl_bufq_write(&ws->recvbuf, mem, nread)`，
+  只有 `curl_ws_recv` 能取回），而本运行时的数据面是裸 `curl_easy_recv`，**够不到那批字节**：
+  对端把「欢迎消息 / PING」跟 `101` 挤在同一个 TCP 段里发过来时，这些帧**会被静默丢掉**。
+  实测：夹具把 `101 + TEXT + PING` 写成一次 `socket.write` 时，客户端 3/3 都收不到欢迎消息、
+  也不回 PONG；拆成两次写就正常——这正是 `websocket-roundtrip` 偶发红的那条时间竞态。
+  同一场景下 **AIR 51.4.1 能正常收到**（`temp/wsadl/` 探针：`CONNECT` → `DATA s=hello-first`，
+  PONG 也照发），所以这是**保真修复**而不是增强。`CONNECT_ONLY=1` 之后那段字节还留在 socket 里，
+  `curl_easy_recv` 跟读普通字节一样读得到，**字节流的权威只有一份：运行时的分帧器**。
+  握手读到的尾部字节不是「重新塞回解码器」，而是**作为同一字节流的开头**去初始化它
+  （客户端 `as_ws_client_handshake`、服务端 `as_ws_server_handshake` 都返回 `rest`），
+  且 `as_ws_recv_pass` **先解析已缓冲的字节、再去读传输**——先读后解析会让这段前缀一直躺着，
+  直到下一次字节到达才被处理（表现为「欢迎消息要等应用开口才到」）。
+
   **为什么不用 `curl_ws_*` 帧层**（两条都是实测，不是推测）：
   1. 它**不暴露 FIN 位**——分片消息的中间 CONTINUATION 帧与**最后**一帧在
      `curl_ws_frame` 里长得一模一样（都是 `CURLWS_CONT` + `bytesleft == 0`，探针
@@ -1642,10 +1660,14 @@ node --test --test-name-pattern='websocket' test/unit/*.ts   # 形状钉 + 真�
   线上回环**——那需要一个对端，而 `ServerSocket` 只在 POSIX 目标可用（§7.3 末条），Windows
   上会在最需要验证的构建里跳过。
 - `test/unit/websocket.ts` 的 `websocket-roundtrip/` 用 Node 的 http 服务器（真 SHA-1 accept、
-  真掩码、真分片、真 close 码）驱动同一套 seam，断言：握手 → TEXT → BINARY → **分片重组** →
-  对端 close `4001` 进 `closeReason`、`data` 是 ByteArray 且 BINARY 的 `stringData` 为 `null`、
-  子协议头值 `chat.v1, chat.v2`、服务端 PING 被传输层 PONG 回。`websocket/` 组则钉住源码形状
-  （错误文案、props 表不 trace `_ws`、分帧是运行时自己的、`ASC_HAVE_CURL` 挂载、`advapi32`）。
+  真掩码、真分片、真 close 码）驱动同一套 seam，断言：握手 → **`101` 后同段塞进来的欢迎消息
+  与 PING** → TEXT → BINARY → **分片重组** → 对端 close `4001` 进 `closeReason`、`data` 是
+  ByteArray 且 BINARY 的 `stringData` 为 `null`、子协议头值 `chat.v1, chat.v2`、服务端 PING 被
+  传输层 PONG 回。**欢迎消息这一条是阶段四百三十九的钉子**：夹具把 `101 + TEXT + PING` 写成
+  **一次** `socket.write`（同段到达），拆成两次写就测不出「握手尾部字节被吞」。
+  `websocket/` 组则钉住源码形状（错误文案、props 表不 trace `_ws`、分帧是运行时自己的、
+  `CONNECT_ONLY=1` 而非 2、客户端握手的 `Sec-WebSocket-Key`/accept 校验、握手尾部字节先解析后读、
+  `ASC_HAVE_CURL` 挂载、`advapi32`）。
 - **服务端模式的回环在 `websocket-roundtrip/` 的第二条用例里**：角色反转——编译出来的
   AS3 程序当**服务端**（`ServerSocket` → accept → `startServer`），Node 这一侧手写 RFC 6455
   当**客户端**。断言覆盖服务端视角的全套：`101` + 正确的 `Sec-WebSocket-Accept`、**不回**

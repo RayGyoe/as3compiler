@@ -62,8 +62,13 @@ function checkWebSocketShape(): string[] {
   check('a backend-less build still fails with AIR\'s #2031',
     rt.includes('"Error #2031: Socket Error."'));
   // One worker owns the handle end to end; the AS3 side must never block on the wire.
-  check('the worker owns curl_easy_perform (CONNECT_ONLY=2 handshake)',
-    rt.includes('CURLOPT_CONNECT_ONLY') && rt.includes('curl_easy_perform('));
+  // CONNECT_ONLY=1, never 2: curl's 2 does perform the upgrade, but it then feeds
+  // every byte behind the 101 response to its OWN ws decoder, where the raw
+  // curl_easy_recv path this runtime uses cannot reach them -- a frame a peer
+  // pipelines behind its handshake was silently dropped (TODO 阶段四百三十九).
+  check('the worker owns the transport (CONNECT_ONLY=1, upgrade is ours)',
+    rt.includes('CURLOPT_CONNECT_ONLY, 1L') && rt.includes('curl_easy_perform(')
+    && !/CURLOPT_CONNECT_ONLY,\s*2/.test(rt));
   // curl's ws_* frame layer cannot express the end of a fragmented message (and
   // its raw mode rejects the PONG it sends itself), so the framing is the
   // runtime's own -- and it must stay that way, or fragments split into events.
@@ -127,11 +132,35 @@ function checkWebSocketShape(): string[] {
   // No curl anywhere on the server path: the peer dialed us, so there is no
   // handshake to perform and no TLS layer to keep. A curl call here would mean the
   // seam had quietly gone back to the client code path.
+  // The slice stops at the next function, because as_ws_client_handshake (which
+  // legitimately talks to curl through as_ws_wire_*) is defined a few lines later.
   const hnStart = rt.indexOf('static int as_ws_server_handshake(');
-  const hnEnd = rt.indexOf('static void as_ws_worker_body(', hnStart);
+  const hnEnd = Math.min(
+    ...[rt.indexOf('static int as_ws_client_handshake(', hnStart),
+        rt.indexOf('static void as_ws_worker_body(', hnStart)]
+      .filter((i) => i > hnStart),
+  );
   const serverFn = hnStart >= 0 && hnEnd > hnStart ? rt.slice(hnStart, hnEnd) : '';
   check('the server handshake path never calls libcurl',
-    serverFn.length > 0 && !serverFn.includes('curl_easy_'));
+    serverFn.length > 0 && !/curl_easy_\w+\s*\(/.test(serverFn));
+
+  // --- the client upgrade (阶段四百三十九) --------------------------------
+  // The response is validated here rather than by curl: status 101 plus
+  // base64(sha1(key + GUID)) == Sec-WebSocket-Accept.
+  check('the client handshake verifies the 101 and the accept token',
+    rt.includes('static int as_ws_client_handshake(')
+    && rt.includes('"Sec-WebSocket-Key: %s') && rt.includes('"Sec-WebSocket-Version: 13')
+    && /as_ws_client_handshake[\s\S]{0,4000}as_ws_sha1\(/.test(rt)
+    && /"Sec-WebSocket-Accept", got/.test(rt));
+  // Bytes that arrived with the handshake are the BEGINNING of the frame stream,
+  // so they seed the decoder and are parsed before the transport is read again --
+  // reading first left them unparsed until some later arrival, which made a
+  // welcome message look lost until the app sent something.
+  check('post-handshake bytes seed the decoder on both sides',
+    /as_ws_client_handshake\(&wr, w, &seed, &seed_len\)/.test(rt)
+    && rt.includes('unsigned char* rx = seed;'));
+  check('buffered stream bytes are parsed before the transport is read again',
+    /static int as_ws_recv_pass\([\s\S]{0,900}if \(\*rx_len > 0\)/.test(rt));
   check('a never-connected Socket is accepted silently (no #2007/#2002)',
     emitSrc.includes('if (s == NULL) return;'));
   check('DATA position follows AIR per direction (server 0, client end)',
@@ -250,17 +279,29 @@ function startFixture(): Promise<Fixture> {
       seen.protocol = typeof proto === 'string' ? proto : null;
       if (typeof key !== 'string') { socket.destroy(); return; }
       const accept = createHash('sha1').update(key + GUID).digest('base64');
-      socket.write(
-        'HTTP/1.1 101 Switching Protocols\r\n' +
-        'Upgrade: websocket\r\n' +
-        'Connection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${accept}\r\n` +
-        (seen.protocol !== null ? `Sec-WebSocket-Protocol: ${seen.protocol.split(',')[0].trim()}\r\n` : '') +
-        '\r\n'
-      );
-      // A PING right after the handshake: RFC 6455 §5.5.3 makes answering it the
-      // endpoint's duty, and curl does not do it for the application.
-      socket.write(frame(0x9, Buffer.from('pp')));
+      // The upgrade response, a welcome TEXT and a PING go out in ONE write, so they
+      // share a TCP segment: everything after the 101 is pipelined behind the
+      // handshake. That is the shape that matters -- a real server greets a new
+      // client this way all the time, and it is exactly what a client with
+      // curl's CONNECT_ONLY=2 silently drops (curl hands the bytes behind the 101
+      // to its OWN ws decoder, out of reach of curl_easy_recv). Writing these as
+      // separate socket.write() calls passed even with that bug, because the
+      // kernel usually delivered them after the client's handshake read: the old
+      // flake WAS this race (see TODO 阶段四百三十九).
+      // RFC 6455 §5.5.3 also makes answering the PING the endpoint's duty, and
+      // curl does not do it for the application.
+      socket.write(Buffer.concat([
+        Buffer.from(
+          'HTTP/1.1 101 Switching Protocols\r\n' +
+          'Upgrade: websocket\r\n' +
+          'Connection: Upgrade\r\n' +
+          `Sec-WebSocket-Accept: ${accept}\r\n` +
+          (seen.protocol !== null ? `Sec-WebSocket-Protocol: ${seen.protocol.split(',')[0].trim()}\r\n` : '') +
+          '\r\n'
+        ),
+        frame(0x1, Buffer.from('hello-first')),
+        frame(0x9, Buffer.from('pp')),
+      ]));
 
       let buf = Buffer.alloc(0);
       socket.on('data', (chunk: Buffer) => {
@@ -358,6 +399,7 @@ var ws:WebSocket = new WebSocket();
 var opened:Boolean = false;
 var gotText:String = null;
 var gotBin:String = null;
+var gotFirst:String = null;
 var gotFrag:String = null;
 var ioText:String = null;
 var closeSeen:Boolean = false;
@@ -370,7 +412,8 @@ function onData(e:WebSocketEvent):void {
     dataIsBytes = (e.data is ByteArray);
     if (e.format == WebSocket.fmtTEXT) {
         var s:String = e.stringData;
-        if (s == "hello-ws") gotText = s;
+        if (s == "hello-first") gotFirst = s;
+        else if (s == "hello-ws") gotText = s;
         else if (s == "frag-a+frag-b") gotFrag = s;
         else trace("UNEXPECTED-TEXT " + s);
     } else {
@@ -395,6 +438,15 @@ ws.connect("ws://127.0.0.1:${fixture.port}/ws", protos);
 for (var a:int = 0; a < 500 && !opened && ioText == null; a++) tickTimers();
 if (!opened) { trace("FAIL-OPEN " + (ioText == null ? "timeout" : ioText)); }
 if (opened) trace("OK-OPEN");
+// The welcome message the server pipelined behind its 101 response. It has to be
+// delivered like any other frame: bytes that arrive together with the handshake
+// are still the beginning of the WebSocket stream. The wait is time-based, not
+// tick-based: once the connection is OPEN the worker no longer counts as "in
+// flight", so tickTimers() does not block and a fixed tick budget can expire
+// before the worker has unloaded the buffered frame.
+var tFirst:int = getTimer();
+while (opened && gotFirst == null && ioText == null && getTimer() - tFirst < 5000) tickTimers();
+trace(gotFirst == "hello-first" ? "OK-FIRST" : "FAIL-FIRST " + gotFirst);
 
 ws.sendMessage(WebSocket.fmtTEXT, "hello-ws");
 for (var b:int = 0; b < 500 && gotText == null && ioText == null; b++) tickTimers();
@@ -438,7 +490,7 @@ trace(ioText == null ? "OK-NO-IOERR" : "FAIL-IOERR " + ioText);
     }
 
     for (const line of [
-      'OK-OPEN', 'OK-TEXT', 'OK-BINARY', 'OK-FRAGMENT', 'OK-CLOSE', 'OK-CODE',
+      'OK-OPEN', 'OK-FIRST', 'OK-TEXT', 'OK-BINARY', 'OK-FRAGMENT', 'OK-CLOSE', 'OK-CODE',
       'OK-BYTES', 'OK-STRINGDATA-NULL', 'OK-NO-IOERR',
     ]) {
       assert.ok(out.includes(line), `${line} missing from the client run:\n${out}`);

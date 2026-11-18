@@ -23280,3 +23280,78 @@ UTF-8，还逐行一次 `strlen`。新增 `as_tf_units_to_bytes(const char* s, i
 ④ **口径变更必须自证不是作弊**：本轮把 30 轮无预热改成 20000 轮预热，是因为旧口径下修后读数落在
 计时分辨率以下、护栏失效，且改前的 126 836 ms 是**旧代码在现行口径下实跑**的；⑤ **钉子要验证有牙**：
 摘掉刷新点能立刻变红，才算钉住。
+
+### 阶段四百三十九：WebSocket 握手尾帧丢失（偶发红的真根因）修复（v0.4.413 → v0.4.414）✅ 已完成
+
+> 起点是一条**偶发红**的回归：`websocket-roundtrip/ a real server` 隔几天红一次
+> （`AssertionError: the transport did not answer the server PING with a PONG`），单跑又绿。
+> 按「先定位根因、不许把 flaky 当噪声」处理：8 次串行 + 8 路 CPU 打满下 4 次 + 3 批 × 6 并发
+> （18 次）全都过，说明不是压力/时序抖动本身，而是**某一种字节到达形态**没被覆盖。
+
+**一、根因（实测，不是推测）**
+
+- **把夹具改成一次写就稳定变红**：把升级响应（`101`）与 PING（`89 02 70 70`）合成**一次**
+  `socket.write`（⇒ 同一个 TCP 段）后，连跑 3 次 3 次都红，服务端日志里**没有** `op=0xa`。
+  也就是说：客户端**从没看见**那个 PING。拆成两次写就恢复正常——原来「偶发」的正是
+  「两次写恰好被内核合并成一段」这个竞态。
+- **是谁吃掉了那段字节**：`CURLOPT_CONNECT_ONLY=2` 由 curl 跑 upgrade，而 curl 会把 `101`
+  之后**已经到达的那批字节**交给**它自己的 ws 解码器**：
+  `lib/ws.c: Curl_ws_accept()` → `if (data->set.connect_only) Curl_bufq_write(&ws->recvbuf, mem, nread)`
+  （源码注释自己写着「need to be received when using `curl_ws_recv` later」）。本运行时的数据面是
+  裸 `curl_easy_recv`（见 `docs/zh-cn/flash-net.md` §7A.2 的两条 curl_ws_* 实测理由），
+  **够不到那个 buffer**，于是帧被静默丢弃。`temp/wscoalesce/` 的 C 探针（`CONNECT_ONLY=2` +
+  连读三次）两种写法都读不到任何字节，佐证字节确实进了 curl 内部队列。
+- **AIR 怎么看**：`temp/wsadl/` 探针（adl 51.4.1，同一个「`101 + TEXT + PING` 一次写」的服务端）
+  输出 `CONNECT` → `DATA fmt=1 s=hello-first`，服务端也收到 `op=0xa`（PONG）。⇒ **AIR 不丢**，
+  这是**保真缺陷**，不是增强项。
+
+**二、修法**
+
+- **`CURLOPT_CONNECT_ONLY=1`（只做 TCP；`wss://` 再加 TLS）+ 运行时自己握手**
+  （`as_ws_client_handshake`）：自己发 `GET`（`Host`/`Upgrade`/`Connection`/
+  `Sec-WebSocket-Key`/`Sec-WebSocket-Version`，应用给了 `protocol` 就带
+  `Sec-WebSocket-Protocol`，仍是**一个**逗号拼接的头值），自己验响应——
+  状态必须是 `101`、`Sec-WebSocket-Accept` 必须等于 `base64(sha1(key + GUID))`。
+  校验集合与 curl 原先替我们做的那一套**一致**（curl 也不校验子协议回显，只把 RFC 原文抄在注释里），
+  所以错误路径的可观测行为不变（失败仍是 `#2031`，文案不变）。
+  这样 `101` 之后的字节还留在 socket 里，`curl_easy_recv` 跟读普通字节一样读得到——
+  **字节流的权威只有一份：运行时的分帧器**。
+- **握手尾帧不是「重新塞回解码器」，而是「作为同一字节流的开头」**：客户端与服务端
+  （`as_ws_server_handshake`）都返回 `rest`，交给 worker 的 `seed`（`rx = seed`）。
+- **`as_ws_recv_pass` 先解析已缓冲字节、再去读传输**：原实现是「先读后解析」，`rx_len > 0`
+  的种子只有**下一次字节到达**时才顺带被解析——临床表现是「欢迎消息要等应用先开口才到」。
+  这一步与握手修复**必须一起做**，否则「不丢」变成「晚到」，夹具仍会红（实测就是这个现象）。
+
+**三、钉子（`test/unit/websocket.ts`）**
+
+- **夹具加重**：`101 + TEXT("hello-first") + PING` 写成**一次** `socket.write`，注释写明
+  「两次写测不出这个 bug」；客户端多一条 `OK-FIRST` 断言（必须是时间型等待
+  `getTimer()`，因为连接 OPEN 后 worker 不再算 in-flight，`tickTimers()` 不阻塞，
+  固定 tick 预算会在帧到达前就耗尽——这条也是实测踩出来的）。
+- **源码形状新增/翻转 3 条**：`CONNECT_ONLY=1` 且**全源无** `CONNECT_ONLY=2`；
+  客户端握手带 `Sec-WebSocket-Key`/`Sec-WebSocket-Version` 且真的做 `as_ws_sha1` + `Accept` 比对；
+  `as_ws_recv_pass` 里 `if (*rx_len > 0)` 先解析，且两端 `rest` → `seed` 都在。
+  另修 `the server handshake path never calls libcurl` 的取样区间（新函数定义在它之后，
+  原区间会把客户端握手的注释也算进去）——改成「取到下一个函数定义为止」+ 匹配**调用**而非**提及**。
+- **钉子有牙（两处变异实测）**：① 摘掉 `as_ws_recv_pass` 的先解析块 ⇒ 红（`FAIL-FIRST null`）；
+  ② 把 `CONNECT_ONLY` 改回 2 并跳过自建握手 ⇒ 红（同一条）。
+
+**四、回归与稳定性**
+
+- 单跑 10 次：10/10 绿；3 批 × 6 并发（18 次）：18/18 绿。
+- **`wss://` 端到端复测**：`wss://ws.postman-echo.com/raw` 用新路径（`CONNECT_ONLY=1` + 自建握手
+  走 TLS）仍然 `open=true` / `echo=wss-ok`。
+- `node test.ts` 全量：**720 项 / 720 过 / 0 红 / 0 跳过**，exit 0（`temp/node-test-s439.log`）。
+
+**五、文档**
+
+- `docs/zh-cn/flash-net.md` §7A.2 与 `docs/en/flash-net.md` §7A.2 的传输口径改写：
+  「连接归 curl、握手与分帧归运行时」，并把三条 curl 不可用的理由并列（FIN、raw 模式自相矛盾、
+  `CONNECT_ONLY=2` 吞帧），附 AIR 对照与探针路径；§7A.4 补「同段到达的欢迎消息 + PING」这条断言。
+- `README-CN.md` / `README.md` 的 `air.net.WebSocket` 条目同步口径。
+
+**closure**：① **偶发红先证伪「压力/时序」**——单跑、打满 CPU、并发三组都过，就该怀疑**输入形态**
+而不只是机器；② **改夹具比加 sleep 有用**：把「两种写法」变成「一种更狠的写法」，竞态就变成确定性
+回归；③ **读一手源码定归属**：`Curl_ws_accept` 里那 4 行就是「谁吃了字节」的判据，比猜 curl 行为快；
+④ **对齐 AIR 才算修复**：先量 AIR 在同样输入下的行为，再决定这是 bug 还是「本来如此」；
+⑤ **「不丢」与「不晚」是两件事**：只修握手的 `rest` 会从丢帧变成延迟投递，两处必须同时改。

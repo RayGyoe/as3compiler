@@ -16555,12 +16555,15 @@ static void as_sock_mark_roots(void) {
 //
 // The RFC 6455 CLIENT rides the vendored static libcurl (curl 8.11.1), so an app
 // that speaks WebSocket needs NO native extension: the same archive and the same
-// TLS (Schannel / SecureTransport) that already serve http(s)://. curl does the
-// HANDSHAKE (CURLOPT_CONNECT_ONLY=2 runs the HTTP upgrade, validates the response
-// and leaves TLS set up) and the runtime does the FRAMING -- the split exists
-// because curl's ws_* API cannot express the end of a fragmented message and its
-// raw mode rejects the very same API it uses to auto-answer pings (both measured,
-// see the codec below).
+// TLS (Schannel / SecureTransport) that already serve http(s)://. curl makes the
+// CONNECTION (CURLOPT_CONNECT_ONLY=1: TCP, plus TLS for wss://) and the runtime
+// does the HANDSHAKE and the FRAMING. Both halves are the runtime's for a measured
+// reason: curl's ws_* API cannot express the end of a fragmented message, its raw
+// mode rejects the very same API it uses to auto-answer pings, and its
+// CONNECT_ONLY=2 handshake feeds the bytes behind the 101 response to that same
+// ws layer -- out of reach of curl_easy_recv, so a frame a peer pipelines behind
+// its handshake (a welcome message, a PING) was silently dropped. All three
+// measured; see the codec and as_ws_client_handshake below.
 //
 // Why a thread per connection instead of the socket registry's select() loop:
 // curl_easy_send/curl_easy_recv are BLOCKING calls on the easy handle, and the AS3
@@ -16898,9 +16901,10 @@ static void as_ws_wait_io(CURL* h, int ms) {
 //      non-zero" (measured: temp/wsnative/rawprobe2.c). Any server that pings a
 //      raw-mode client breaks the connection.
 //
-// So only the HANDSHAKE stays curl's (CURLOPT_CONNECT_ONLY=2, which runs the HTTP
-// upgrade, validates the response and leaves TLS set up), and the data phase runs
-// over curl_easy_send/curl_easy_recv: WYSIWYG bytes, TLS already decrypted, with
+// So curl keeps only the CONNECTION (CURLOPT_CONNECT_ONLY=1: TCP and, for wss://,
+// TLS), the upgrade is written and validated by as_ws_client_handshake, and the
+// data phase runs over curl_easy_send/curl_easy_recv: WYSIWYG bytes, TLS already
+// decrypted, with
 // CURLE_AGAIN as the only "nothing yet" answer (measured: temp/wsnative/rawsock.c
 // reads the server's PING as 89 02 70 70). The codec below is then the whole of
 // §5.2 (framing), §5.4 (fragmentation) and §5.5 (control frames), including the
@@ -16935,7 +16939,7 @@ static void as_ws_mask_key(unsigned char* k) {
 // and queueing stay byte-identical, and only the two primitives that touch the
 // wire know which side they are on.
 typedef struct as_ws_wire {
-    CURL* h;        // client mode: the handle left by CURLOPT_CONNECT_ONLY=2
+    CURL* h;        // client mode: the handle left by CURLOPT_CONNECT_ONLY=1
     int fd;         // server mode: descriptor taken from the accepted Socket (-1 = none)
     int server;     // 1 => WE are the server: we do not mask, the peer must
 } as_ws_wire;
@@ -17200,6 +17204,17 @@ static int as_ws_parse_frames(as_ws_wire* wr, as_ws* w, unsigned char** rx, int*
 //   1 = peer closed, 0 = nothing more right now, -1 = failure
 static int as_ws_recv_pass(as_ws_wire* wr, as_ws* w, unsigned char** rx, int* rx_len, int* rx_cap,
                            unsigned char** frag, int* frag_len, int* frag_cap, int* msg_op) {
+    // Parse what is ALREADY buffered before asking the transport for more. The
+    // stream can start with bytes nobody read from the wire yet -- the handshake
+    // hands over the frames a peer pipelined behind its opening response (see
+    // as_ws_client_handshake / as_ws_server_handshake). Reading first would leave
+    // those bytes unparsed until some LATER arrival made the read return: the
+    // welcome message then showed up only after the app's first request echoed
+    // back, which is a latency bug that looks like a lost message.
+    if (*rx_len > 0) {
+        int r0 = as_ws_parse_frames(wr, w, rx, rx_len, frag, frag_len, frag_cap, msg_op);
+        if (r0 != 0) return r0;
+    }
     int r = as_ws_rx_read(wr, rx, rx_len, rx_cap);
     if (r < 0) return -1;
     if (r == 0) return 0;
@@ -17410,6 +17425,143 @@ static int as_ws_server_handshake(as_ws_wire* wr, as_ws* w, unsigned char* pre, 
     return 1;
 }
 
+// The client side of the opening handshake (RFC 6455 §4.1), done HERE rather than
+// by curl. curl's CONNECT_ONLY=2 performs a correct upgrade, but it then hands every
+// byte that arrived after the 101 response to ITS OWN WebSocket decoder
+// (lib/ws.c: Curl_ws_accept -- "In CONNECT_ONLY setup, the payloads from 'mem' need
+// to be received when using 'curl_ws_recv' later"), where only curl_ws_recv can
+// reach them. The data phase here is a raw curl_easy_recv -- see the codec above for
+// why), so those bytes were LOST: a server that pipelines a frame behind its
+// handshake -- a welcome message, a PING, and the common .NET/Java servers all do --
+// simply never had it delivered. Measured: with the test fixture writing
+// 101 + PING in ONE write the client never answered the PING (and never saw it);
+// with two writes the same bytes survived, which is exactly the timing race that
+// made test/unit/websocket.ts flaky. CONNECT_ONLY=1 leaves the post-handshake
+// stream in the socket, so curl_easy_recv returns it like any other byte and the
+// framing authority stays single: ours.
+//
+// Validation kept identical to what curl did for us (so no observable change on the
+// error path): the status must be 101 and Sec-WebSocket-Accept must be
+// base64(sha1(key + GUID)); a subprotocol echo is not verified (curl's ws layer
+// quotes RFC 6455 §4.1 but does not implement the check either).
+//   1 = handshake done, 0 = not a WebSocket peer / transport failure
+static int as_ws_client_handshake(as_ws_wire* wr, as_ws* w,
+                                  unsigned char** rest, int* rest_len) {
+    const char* url = w->url;
+    const char* auth = NULL;
+    const char* path = NULL;
+    const char* sep = (url != NULL) ? strstr(url, "://") : NULL;
+    unsigned char key_raw[16];
+    char key_b64[32];
+    char want[64];
+    unsigned char dg[20];
+    char* req = NULL;
+    unsigned char* resp = NULL;
+    int resp_cap = 8192;
+    int resp_len = 0;
+    int header_end = -1;
+    int ok = 0;
+    double deadline;
+    *rest = NULL;
+    *rest_len = 0;
+    if (url == NULL || sep == NULL) return 0;
+    auth = sep + 3;
+    // userinfo is not supported by AIR's WebSocket either; a '/'-less URL has the
+    // trivial "/" path.
+    for (path = auth; *path != '\\0' && *path != '/'; path++) { }
+    // The key is 16 random octets, base64-encoded (RFC 6455 §4.1 item 7).
+    for (int i = 0; i < 4; i++) as_ws_mask_key(key_raw + i * 4);
+    as_ws_b64(key_raw, 16, key_b64);
+    {
+        size_t alen = (size_t)(path - auth);
+        const char* p = (*path == '\\0') ? "/" : path;
+        size_t need = strlen(p) + alen + strlen(key_b64)
+                    + (w->protocol != NULL ? strlen(w->protocol) : 0) + 256;
+        req = (char*)malloc(need);
+        if (req == NULL) return 0;
+        int n = snprintf(req, need,
+                         "GET %s HTTP/1.1\\r\\n"
+                         "Host: %.*s\\r\\n"
+                         "Upgrade: websocket\\r\\n"
+                         "Connection: Upgrade\\r\\n"
+                         "Sec-WebSocket-Key: %s\\r\\n"
+                         "Sec-WebSocket-Version: 13\\r\\n",
+                         p, (int)alen, auth, key_b64);
+        if (n <= 0 || (size_t)n >= need) { free(req); return 0; }
+        if (w->protocol != NULL && w->protocol[0] != '\\0') {
+            int n2 = snprintf(req + n, need - (size_t)n,
+                              "Sec-WebSocket-Protocol: %s\\r\\n", w->protocol);
+            if (n2 <= 0 || (size_t)(n + n2) >= need) { free(req); return 0; }
+            n += n2;
+        }
+        if ((size_t)(n + 2) >= need) { free(req); return 0; }
+        req[n] = '\\r';
+        req[n + 1] = '\\n';
+        req[n + 2] = '\\0';
+        if (!as_ws_wire_write(wr, (const unsigned char*)req, (size_t)(n + 2))) { free(req); return 0; }
+        free(req);
+    }
+    // Read the response headers. resp_cap bounds a hostile peer; a handshake
+    // response is far under it.
+    resp = (unsigned char*)malloc((size_t)resp_cap + 1);
+    if (resp == NULL) return 0;
+    deadline = as_now_ms() + 10000.0;
+    while (header_end < 0) {
+        int n = 0;
+        int from = resp_len - 3;
+        if (resp_len >= resp_cap) break;
+        if (as_now_ms() > deadline) break;
+        n = as_ws_wire_read(wr, resp + resp_len, (size_t)(resp_cap - resp_len));
+        if (n < 0) goto done;
+        if (n == 0) { as_ws_wire_wait(wr, 10); continue; }
+        resp_len += n;
+        resp[resp_len] = '\\0';
+        header_end = as_ws_find_header_end(resp, resp_len, from);
+    }
+    if (header_end < 0) goto done;
+    // Status line: "HTTP/1.1 101 <reason>". Anything else means the peer did not
+    // upgrade (a 200 body, a 404, an auth error) and the connection is not a
+    // WebSocket -- curl reported that as CURLE_* and we mapped it to #2031, which
+    // is what still happens here.
+    if (resp_len < 12 || memcmp(resp, "HTTP/", 5) != 0) goto done;
+    {
+        const unsigned char* sp = (const unsigned char*)memchr(resp, ' ', resp_len);
+        if (sp == NULL || (size_t)(sp - resp) + 4 > (size_t)resp_len) goto done;
+        if (sp[1] != '1' || sp[2] != '0' || sp[3] != '1') goto done;
+    }
+    {
+        char head[8192];
+        char got[128];
+        int hl = header_end < (int)sizeof(head) ? header_end : (int)sizeof(head) - 1;
+        memcpy(head, resp, (size_t)hl);
+        head[hl] = '\\0';
+        if (!as_ws_header(head, "Sec-WebSocket-Accept", got, sizeof(got))) goto done;
+        {
+            char joined[128];
+            snprintf(joined, sizeof(joined), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key_b64);
+            as_ws_sha1((const unsigned char*)joined, strlen(joined), dg);
+            as_ws_b64(dg, 20, want);
+        }
+        if (strcmp(got, want) != 0) goto done;
+    }
+    // Everything past the blank line is the peer's first frame(s), pipelined behind
+    // the handshake. It is the BEGINNING of the same byte stream, so it seeds the
+    // decoder instead of being re-sent through it.
+    if (resp_len > header_end) {
+        int extra = resp_len - header_end;
+        unsigned char* tail = (unsigned char*)malloc((size_t)extra);
+        if (tail != NULL) {
+            memcpy(tail, resp + header_end, (size_t)extra);
+            *rest = tail;
+            *rest_len = extra;
+        }
+    }
+    ok = 1;
+done:
+    free(resp);
+    return ok;
+}
+
 // The ioError text for a transport failure. AIR builds it as
 // "Error #2031: Socket Error. URL: <host>" (measured); a server-mode connection
 // was never given a URL, so its failure stays the plain documented sentence.
@@ -17469,26 +17621,30 @@ static void as_ws_worker_body(as_ws* w) {
         char errbuf[CURL_ERROR_SIZE];
         errbuf[0] = '\\0';
         curl_easy_setopt(h, CURLOPT_URL, w->url);
-        // CONNECT_ONLY=2 is curl's "do the WebSocket handshake, then hand me the
-        // connection": the upgrade request/response, the redirect and TLS are curl's,
-        // and every byte after it is ours (see the codec above for why the data phase
-        // cannot use curl_ws_*).
-        curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, 2L);
+        // CONNECT_ONLY=1: TCP (and, for wss://, TLS) only -- the upgrade itself is
+        // ours (as_ws_client_handshake). NOT CONNECT_ONLY=2: that one performs the
+        // upgrade correctly but then feeds the bytes behind the 101 response to
+        // curl's own WebSocket decoder, out of reach of curl_easy_recv, which
+        // silently dropped any frame a peer pipelines behind its handshake.
+        curl_easy_setopt(h, CURLOPT_CONNECT_ONLY, 1L);
         curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
-        struct curl_slist* headers = NULL;
-        if (w->protocol != NULL && w->protocol[0] != '\\0') {
-            size_t n = strlen(w->protocol) + 32;
-            char* hv = (char*)malloc(n);
-            if (hv != NULL) {
-                snprintf(hv, n, "Sec-WebSocket-Protocol: %s", w->protocol);
-                headers = curl_slist_append(headers, hv);
-                free(hv);
-            }
-            if (headers != NULL) curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
-        }
         CURLcode rc = curl_easy_perform(h);
-        if (headers != NULL) { curl_slist_free_all(headers); curl_easy_setopt(h, CURLOPT_HTTPHEADER, NULL); }
+        if (rc == CURLE_OK) {
+            wr.h = h;
+            if (!as_ws_client_handshake(&wr, w, &seed, &seed_len)) {
+                as_ws_fail(w, fail_text != NULL ? fail_text : "Error #2031: Socket Error.");
+                if (as_ws_debug()) {
+                    fprintf(stderr, "[as3-aot] ws upgrade failed (%s)\\n", w->url != NULL ? w->url : "-");
+                    fflush(stderr);
+                }
+                curl_easy_cleanup(h);
+                free(fail_text);
+                return;
+            }
+            free(fail_text);
+            goto handshake_done;
+        }
         if (rc != CURLE_OK) {
             // AIR's text is fixed: "Error #2031: Socket Error. URL: <host>". The curl
             // detail goes to the debug channel instead of the event, so an app that
@@ -17504,9 +17660,9 @@ static void as_ws_worker_body(as_ws* w) {
             free(fail_text);
             return;
         }
-        wr.h = h;
     }
     free(fail_text);
+handshake_done:
 
     AS_WS_LOCK();
     w->state = AS_WS_OPEN;
