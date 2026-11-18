@@ -23104,3 +23104,77 @@ README（zh/en）新增 camera-devices 示例描述；plan 文档 B2 标落地�
 - **零回归**：`examples/air-starling-demo` 整链重编成功（生成 C 9.09 MB，单窗口 Stage3D/Metal 菜单正常渲染，状态栏 `Metal (Stage3D)`）；全量 `node test.ts` **718 测试 / 718 通过 / 0 失败 / 0 跳过** exit=0（修前同一套件 3 组红，都是上面三组旧钉子；版本 `0.4.411 → 0.4.412`）。
 
 **记账**：主表 **88 → 87 行**（移出本轮修好的进程级单例行；`未开始` 67 → **66**）。文档：`docs/{zh-cn,en}/display3d.md` 新增 §11（多窗口语义、路由表、顺序坑、adl 定标实录、截屏对拍表，原「参考链接」顺延为 §12）；`docs/{zh-cn,en}/compile.md` 的 Present 跳过口径改为「**本窗口的** Stage3D 序号」；README（zh/en）新增 `s3d-multiwindow` 示例行。**经验**：① 「对象模型 per-window」不等于「上屏 per-window」——显示树的 per-window 早在八十九·七十一就成立了，但**合成缝**是另一层，缺的是「context → 窗口」的一条边，登记时按源码审计拆成两层判据才不跑偏；② 后端多上下文能力往往比前端路由先就位（三后端早就有 `s3d_live[]`），遇到「多窗同画」先查路由，别先怀疑后端；③ **写窗口的时机**是新一类陷阱：`configureBackBuffer` 早于 `showWindow` 是常态，任何「configure 时写窗口」的方案都会在主窗静默丢值，而副窗正常——真机截图是唯一能发现它的手段；④ adl 给不出语义时必须**照实报明**并改用可核验的替代证据（官方文档 + 真机截屏 + C 形状钉子），不能拿「文档没写」当理由静默猜；⑤ 修 bug 时**同一语义的旧钉子会立刻变红**，这三组红是健康的信号（说明钉子真的有牙），照新契约逐字节翻转即可，不要为了让测试变绿而放宽钉子。
+
+### 阶段四百三十七：基准套件扩容 —— 补「循环 `+=`」与「文本度量」两项缺口（v0.4.412，`src/` 无改动，不升版本号）✅ 已完成
+
+**一、为什么缺这两档**
+
+原 9 项里，字符串侧只有 `strings`（split/join 的**分配**路径，96% 成本在临时数组与 GC），
+**「往同一个串上反复 `+=`」这条形态一项都没有**；文本侧**一项都没有**。而这两条正是我
+在 `temp/tfperf/` 实测后确认存在真实差距的地方——**没有护栏的优化等于没有判据**，所以先补
+基准，再谈改（这也是本仓库的一贯做法：历史上几次真回退都只有靠同源 A/B 才定得住罪）。
+
+**二、两个基准的形态与「对等物」**
+
+- **`stringbuild`（四路）**：150 轮 × 每轮向空串追加 2000 次 `"ab"`（= 30 万次 `+=`），收尾读
+  `length` 与 `indexOf("ba")`。C 侧用「容量加倍 + `realloc`」——这是 C 程序员写累加时的常规形态，
+  也是摊还 O(1) 的追加；JS 侧直接 `s += "ab"`（V8 内部同样有 rope）。四路**都不写显式
+  `System.gc()`**，各自只承受默认回收策略的成本，避免把手工回收算进差异。
+- **`textmetrics`（两路，刻意不是四路）**：8 个 200 行、`wordWrap=false`、宽 200 的字段
+  （Arial 12），每轮读 `numLines`/`textWidth`/`textHeight`/`maxScrollH`，共 30 轮。
+  **C 与 JS 没有排版引擎**，`textWidth`/`textHeight`/`maxScrollH` 在那两侧无从实现，硬凑
+  「同构实现」只会拿两套无关数字做比较 ⇒ 只跑 as3compiler 与原生 AIR，`run.py` 在表里显式
+  打 `-` 并注明 `(no route: c, js)`，不静默少算。
+- **checksum 的取舍**：`textmetrics` 只累加行数 + `int(textWidth)` + `maxScrollH`；
+  `textHeight` **参与计时、独立打印 `thsum=`、不进 checksum**——同一夹具两端实测
+  **2600（我们）/ 2700（AIR）**，即逐行 13.0 vs 13.5，这是 `skia.md` 遗留表里已登记的
+  **行盒取整口径差**。把它并进 checksum，一条已知口径差会冒充「性能回退」，基准就失去判别力。
+
+**三、实测（本机 macOS arm64，`python3 benchmarks/run.py stringbuild textmetrics`，每路内部 3 次取中位数）**
+
+| benchmark | C (ms) | JS (ms) | asc (ms) | AIR (ms) | result |
+|-----------|-------:|--------:|---------:|---------:|:-------|
+| `stringbuild` | **< 1** | 3 | **125 ~ 131** | **18** | OK（四路 `600150`） |
+| `textmetrics` | - | - | **195 ~ 200** | **~1** | OK（两路 `146400`） |
+
+C 列稳定落在 1 ms 分辨率以下（同源码微秒变体实测 393 / 521 / 552 µs），故本项**不以 C 为
+归一化基准**：差异不在常数倍。
+
+**四、两条结论（都有可核算的归因，不是「看着慢」）**
+
+1. **`+=` 是 O(n²)，AIR 是 O(n)**。AIR 每次追加恒 ≈60 ns、**与已累积长度无关**
+   （1000 字符 50 µs vs 4000 字符 200 µs，严格线性 ⇒ cons string / rope）；我们每次都
+   `memcpy` 整个左侧（`as_str_concat` 两侧 `strlen` + 全量复制），故 4000 字符单轮构建
+   **2260 µs vs 200 µs（11.3×）**。本项总复制量可手算：2000²/2 × 2 B × 150 轮 = **600 MB**，
+   600 MB ÷ 125 ms = **0.2 ns/字节**，正是顺序 `memcpy` 的量级 ⇒ 成本**几乎全在复制**，
+   与 GC、分配器、装箱都无关（`strings` 里已修掉的那两笔在此不是主因）。
+2. **文本派生度量每次现算**。200 行字段单次：`textWidth` **31.6 µs（AIR 0.1，316×）**、
+   `textHeight` **727 µs（AIR ≈0）**、`maxScrollH` **31.6 µs（AIR 4.4）**、`numLines` 0.05
+   （已是 O(1)，持平）。主因：`sk_textlayout_max_width_incl_spaces` 每次调用都物化一份
+   `std::vector<LineMetrics>`（200 行就是 200 条 + 一次堆分配），而它依赖的段落早已缓存在
+   `TextField._para` 里 ⇒ 本该是 O(1) 的读；`textHeight` 另有 `as_tf_line_table` 对每行调
+   `as_tf_byte_index`（从串首重新走 UTF-8）= **O(L²)**。**这不是冷路径**：
+   `as_render_object` 的 TextField 分支**每帧无条件**调 `maxScrollH`，`autoSize` 再调
+   `as_tf_apply_autosize`，居中/右对齐再调 `as_tf_align_dx`——三者落到同一个「最长行宽」计算。
+
+**五、接线与回归**
+
+- `benchmarks/stringbuild/` 六件套（`.c` / `.js` / `.as` / `_air.as` / `_air-app.xml` / `report.md`）；
+  `benchmarks/textmetrics/` **五件**（无 `.c`/`.js`，多一个 `textmetrics.build.json`——要链 Skia）+ `report.md`。
+- `run.py` 从「硬编码四路」改成**按基准配路由**：`ROUTES`（缺省四路，`textmetrics` 两路）+ `MANIFESTS`
+  （该项的构建清单），跳过的路在表里打 `-` 并列出 `(no route: …)`；编译步也只编该项实际要跑的路。
+  `BENCHES` 末位加两项。`benchmarks/README.md` 主表说明扩到 11 项 + 「套件扩容」节。
+- **`test/unit/js2as.ts` 的 `js2as/benchmarks` 组自动覆盖新增的 `stringbuild.js`**（该组遍历
+  `benchmarks/*/<name>.js` 跑 `jsToAs` 并断言可解析）：`9 files checked → 10 files checked`，通过。
+- **无其它测试依赖该列表**（CI 不跑基准）。
+- **不升版本号**：本轮 `src/` 一行未改（纯基准 + `run.py`），编译器仍是 v0.4.412。
+- `node test.ts`：**718 项 / 718 过 / 0 红 / 0 跳过**，exit 0。
+
+**closure**：① **基准的「对等物」是一份要写明的结论**——同一条 `+=` 在 C（`realloc` 加倍）、
+JS（rope）、AIR（cons string）里是三种复杂度不同的东西，表格底下必须交代清口径，否则读者会
+把「O(n²) vs O(n)」读成「常数倍慢」；② **不是所有基准都能有四路**——`textmetrics` 缺 C/JS
+是**能力缺口**而非偷懒，正确处置是显式打 `-` 并写明理由，而不是硬凑一个假实现；③ **已知口径差
+不许进 checksum**——否则它会把未来的真回退一起淹掉；④ 归因要能**手算核对**（600 MB ÷ 125 ms
+= 0.2 ns/byte），能算通的归因才配写进结论，算不通说明还有没找到的热点；⑤ 「有实测差距」不等于
+「可以开工改」——本轮的产出是**护栏**，改（度量缓存 + 单趟行表；cons string 另立一项）各自
+还要单独验收。

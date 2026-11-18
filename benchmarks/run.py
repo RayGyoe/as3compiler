@@ -29,8 +29,27 @@ BENCHES = [
     "oop",
     "array",
     "vectorint",
+    "stringbuild",
+    "textmetrics",
 ]
 RUNS = 3
+
+# 每一项跑哪几路。缺省是四路（C / JS / AOT / AIR）。
+#
+# `textmetrics` 只有两路：C 与 JS 没有 Skia 排版引擎，`textWidth`/`textHeight`/
+# `maxScrollH` 在那两侧无从实现，硬凑一个「同构实现」只会把基准变成两套无关数字
+# 的比较。跳过的路在表里显式打 `-`，不静默少算（理由见
+# benchmarks/textmetrics/report.md）。
+ROUTES = {
+    "textmetrics": ("asc", "air"),
+}
+DEFAULT_ROUTES = ("c", "js", "asc", "air")
+
+# AOT 侧需要链接第三方库的基准 -> 构建清单（路径相对仓库根）。
+# 文本排版要 Skia（skparagraph），所以 textmetrics 必须带清单编译。
+MANIFESTS = {
+    "textmetrics": "benchmarks/textmetrics/textmetrics.build.json",
+}
 
 
 def sh(cmd, cwd=None):
@@ -43,15 +62,24 @@ def air_log(bench):
     )
 
 
+def routes_of(bench):
+    return ROUTES.get(bench, DEFAULT_ROUTES)
+
+
 def compile_one(bench):
     d = os.path.join(ROOT, "benchmarks", bench)
-    sh(["cc", "-O2", "-o", f"{d}/{bench}_c", f"{d}/{bench}.c"])
-    sh(
-        ["node", "src/index.ts", f"benchmarks/{bench}/{bench}.as",
-         "-o", f"benchmarks/{bench}/{bench}_asc"],
-        cwd=ROOT,
-    )
-    sh([f"{AIRSDK}/mxmlc", f"{bench}_air.as", "-output", f"{bench}_air.swf"], cwd=d)
+    routes = routes_of(bench)
+    if "c" in routes:
+        sh(["cc", "-O2", "-o", f"{d}/{bench}_c", f"{d}/{bench}.c"])
+    if "asc" in routes:
+        cmd = ["node", "src/index.ts", f"benchmarks/{bench}/{bench}.as",
+               "-o", f"benchmarks/{bench}/{bench}_asc"]
+        manifest = MANIFESTS.get(bench)
+        if manifest:
+            cmd += ["--manifest", manifest]
+        sh(cmd, cwd=ROOT)
+    if "air" in routes:
+        sh([f"{AIRSDK}/mxmlc", f"{bench}_air.as", "-output", f"{bench}_air.swf"], cwd=d)
 
 
 def parse(text):
@@ -105,7 +133,7 @@ def run_air(bench):
 
 def main():
     benches = sys.argv[1:] or BENCHES
-    print("编译四路...")
+    print("编译各路...")
     for b in benches:
         compile_one(b)
 
@@ -113,15 +141,24 @@ def main():
     print("\n" + header)
     print("-" * len(header))
     rows = []
+    runners = {"c": run_c, "js": run_js, "asc": run_asc, "air": run_air}
     for b in benches:
-        rc, tc = run_c(b)
-        rj, tj = run_js(b)
-        ra, ta = run_asc(b)
-        rr, tr = run_air(b)
-        results = {rc, rj, ra, rr}
-        flag = "OK" if len(results) == 1 else f"MISMATCH {sorted(results)}"
-        print(f"{b:<14}{tc:>9.0f}{tj:>9.0f}{ta:>10.0f}{tr:>10.0f}  {flag}")
-        rows.append((b, tc, tj, ta, tr, flag))
+        routes = routes_of(b)
+        cells, results = {}, set()
+        for r in DEFAULT_ROUTES:
+            if r not in routes:
+                continue
+            res, t = runners[r](b)
+            results.add(res)
+            cells[r] = t
+        skipped = [r for r in DEFAULT_ROUTES if r not in routes]
+        flag = "OK" if len(results) == 1 and None not in results else f"MISMATCH {sorted(results)}"
+        if skipped:
+            flag += "  (no route: " + ", ".join(skipped) + ")"
+        def cell(key, width):
+            return f"{cells[key]:>{width}.0f}" if key in cells else f"{'-':>{width}}"
+        print(f"{b:<14}{cell('c', 9)}{cell('js', 9)}{cell('asc', 10)}{cell('air', 10)}  {flag}")
+        rows.append((b, cells, flag))
     return rows
 
 

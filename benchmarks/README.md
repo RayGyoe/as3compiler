@@ -13,10 +13,14 @@ benchmarks/<name>/
 └── report.md           # 该基准的结果与分析
 ```
 
+> **例外：`textmetrics` 只有两路**（`<name>.as` + `_air.as` + 构建清单）。文本排版要 Skia，
+> C / JS 没有同构引擎，该项只跑 as3compiler 与 AIR 两路，`run.py` 在表里显式打 `-`。
+> 逐项路由与构建清单位于 `run.py` 的 `ROUTES` / `MANIFESTS` 两张表。
+
 ## 运行
 
 ```bash
-# 全部 9 个基准（编译四路 + 各跑 3 次取中位数 + 校验四路结果一致）
+# 全部 11 项基准（逐项编译其路由 + 各跑 3 次取中位数 + 校验路由间结果一致）
 python3 benchmarks/run.py
 
 # 只跑指定基准
@@ -31,6 +35,34 @@ python3 benchmarks/run.py fib nbody
 # 本轮使用的命令（AIR SDK 51.4.1）
 AIRSDK_HOME=/path/to/AIRSDK_51.4.1/bin python3 benchmarks/run.py
 ```
+
+## 套件扩容：新增 `stringbuild` 与 `textmetrics`（阶段四百三十七，2026-11-18，`src/` 无改动）
+
+**为什么加这两项**：原 9 项里，字符串侧只有 `strings`（split/join 的分配路径），**循环 `+=`**
+没有任何护栏；文本侧则一项都没有，而「大文本字段的度量」是绘制路径每帧都会触碰的入口。
+两项都是**纯加护栏，`src/` 一行未改**（另有 `temp/tfperf/` 下的同源探针作归因证据）。
+
+**本轮结果**（本机 macOS arm64，`python3 benchmarks/run.py stringbuild textmetrics`，每路内部 3 次取中位数）：
+
+| benchmark | C (ms) | JS (ms) | asc (ms) | AIR (ms) | result |
+|-----------|-------:|--------:|---------:|---------:|:-------|
+| stringbuild | **< 1** | 3 | **125 ~ 131** | **18** | OK（四路 `600150`） |
+| textmetrics | - | - | **195 ~ 200** | **~1** | OK（两路 `146400`） |
+
+**两条结论**（详见各自的 `report.md`）：
+
+1. **`+=` 是 O(n²)，AIR 是 O(n)**。AIR 每次追加恒 ≈60 ns、与已累积长度无关（cons string / rope）；
+   我们每次都 `memcpy` 整个左侧。4000 字符的单轮构建：**2260 µs vs 200 µs（11.3×）**，且差距随长度扩大。
+   归因算得清清楚楚：本项总复制量 600 MB ÷ 实测 125 ms = 0.2 ns/字节，正是顺序 `memcpy`——
+   **与 GC 和分配器无关**，`strings/report.md` 里已修掉的那两笔在这里不是主因。
+2. **文本派生度量每次现算**。200 行字段单次 `textWidth` **31.6 µs（AIR 0.1）**、`textHeight`
+   **727 µs（AIR ≈0）**、`maxScrollH` **31.6 µs（AIR 4.4）**；`textHeight` 另有逐行
+   `as_tf_byte_index` 的 O(L²)。而 `maxScrollH` 正是 `as_render_object` 的 TextField 分支
+   **每帧无条件**调用的入口 —— 这几个值只依赖缓存的 `_para`，本该是 O(1) 的读。
+
+> `textmetrics` 的 `checksum` **不含 `textHeight`**：同一夹具两端实测 2600（我们）/ 2700（AIR），
+> 即逐行 13.0 vs 13.5 —— 这是 `skia.md` / `TODO.md` 遗留表里**已登记的行盒取整口径差**，
+> 不是性能问题。把它并进 checksum 会让「已知口径差」冒充「性能回退」。
 
 ## 本次结果（编译器 v0.4.410，2026-11-16，**Windows 首轮**）
 
