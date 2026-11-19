@@ -108,4 +108,49 @@ check(mixed.length == 6, "concat keeps code-unit length (" + mixed.length + ")")
 check(mixed.substr(0, 2) == "中文", "concat keeps the leading characters");
 check(mixed.indexOf("ab") == 4, "concat keeps search indices in code units");
 
+// --------------------------------- 9) from 落在代理对的下半（阶段四百四十五）
+// 码元索引里代理对的两个半字符都是合法下标，但**字节偏移**只有一个：定位时只能
+// 报这对的起点。于是 from 落在下半时，两件事必须显式处理，否则答案错在 before-from：
+//   · 空针在 from 处就地命中（"<pair><pair>".indexOf("", 1) 是 1，不是 0）
+//   · 非空针必须从这对**之后**开始找（.indexOf(pair, 1) 是 2 —— 起点 0 的那个
+//     命中整个落在 from 之前，不合规）
+// 下面每条期望值都由 `adl 51.4.1` 实测（temp/cjk/air/astral.as）。
+var pair:String = "\uD834\uDD1E";                 // 𝄞：1 字符 / 2 码元 / 4 字节
+var two:String = pair + pair;
+check(two.length == 4, "two astral characters are 4 code units");
+check(two.indexOf("", 0) == 0, "empty needle at 0");
+check(two.indexOf("", 1) == 1, "empty needle on the LOW half stays at from, not the pair start");
+check(two.indexOf("", 2) == 2, "empty needle at the second pair start");
+check(two.indexOf("", 9) == 4, "empty needle past the end clamps to the length");
+check(two.indexOf(pair, 1) == 2, "needle search from a low half starts AFTER the straddled pair");
+check(two.indexOf(pair, 2) == 2, "needle search from the second pair start");
+check(two.lastIndexOf(pair, 1) == 0, "lastIndexOf from a low half takes the pair that starts before it");
+var at:String = "a" + pair + "b";                // 4 码元：a | hi | lo | b
+check(at.length == 4, "ascii + astral + ascii is 4 code units");
+check(at.charCodeAt(1) == 0xD834 && at.charCodeAt(2) == 0xDD1E, "the two halves read back separately");
+check(at.indexOf("b", 1) == 3, "indexOf from the HIGH half still finds the following character");
+check(at.indexOf("b", 2) == 3, "indexOf from the LOW half too");
+check(at.substring(1, 3) == pair, "substring over both halves rebuilds the character");
+check(at.substring(1, 2).length == 1, "substring of one half is 1 code unit");
+check(at.slice(1).length == 3, "slice from the high half keeps 3 units");
+check(at.substr(1, 1).length == 1, "substr of one half is 1 code unit");
+
+// ------------------------------- 10) 采样检查点边界：跳转 >= 2048 码元（阶段四百四十五）
+// 定位不必每次都从字节 0 数起；但跳得足够远时走的是**每 1024 码元一格的采样表**，
+// 而一格记的是「首个 >= 边界的字符起点」—— 代理对宽 2 码元，可能正好**跨过**边界。
+// 下例把 4 字节字符摆在 2047/2048 上：高位在 2047，低位 2048 就是一个表边界。
+// 先访问 0 再直接跳到 2048，才真的走表（相邻访问只会续游标）。
+var seam:String = "";
+for (var i:int = 0; i < 2047; i++) seam += "a";
+seam += pair + "b";
+check(seam.length == 2050, "the seam string is 2050 code units");
+check(seam.charCodeAt(0) == 97, "warm the cursor at unit 0");
+check(seam.charCodeAt(2048) == 0xDD1E, "a >= 2048-unit jump must land on the LOW half, not the next character");
+check(seam.charCodeAt(2047) == 0xD834, "and the unit before it is the high half");
+check(seam.charCodeAt(2049) == 98, "the character after the pair is unaffected");
+// 深一点的位置上，跳转读数必须与顺序走到的读数一致（表只是跳过前缀，不改答案）。
+check(seam.charCodeAt(0) == 97, "back to a warm short access");
+check(seam.charCodeAt(1600) == 97, "mid-string ASCII in front of the pair");
+check(seam.charCodeAt(2049) == 98, "jump forward again after a low access");
+
 trace("string-utf16-index OK");

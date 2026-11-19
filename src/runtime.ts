@@ -7465,17 +7465,47 @@ typedef struct as_u16_cur {
 static as_u16_cur as_u16_cursor[2];
 static int as_u16_rr;
 // Length memo, separate from the cursors so a .length does not evict a scan's
-// position (and vice versa). Two entries cover one loop that reads two strings' lengths.
-// Sound because an AS3 String is immutable: same pointer => same length, until the
-// collector frees it, which drops both caches.
+// position (and vice versa). Two entries cover one loop that reads two strings' lengths,
+// kept in MRU order (see as_str_len). Sound because an AS3 String is immutable: same
+// pointer => same length, until the collector frees it, which drops both caches.
 typedef struct as_str_len_memo_s { const char* s; int len; } as_str_len_memo_t;
 static as_str_len_memo_t as_str_len_memo[2];
-static int as_str_len_rr;
+// Sampled checkpoints: the byte offset of every AS_U16_CK_STRIDE-th code unit.
+//
+// WHY this exists: the cursor above only helps a caller whose indices move FORWARD,
+// and the ASCII probe only helps a prefix that is pure ASCII. A caller that splits a
+// CJK string at strided offsets does neither -- substring(o, o + 20) locates o while
+// the cursor still sits at the PREVIOUS o + 20, so every call walks from byte 0.
+// benchmarks/cjkscan measured 853 ms of a 958 ms run inside exactly that walk. With a
+// checkpoint the walk is bounded by one stride wherever the access lands, which makes
+// the cost independent of the caller's order (the ASCII probe is the same idea for the
+// one case where the mapping is the identity).
+//
+// The table is built LAZILY and INCREMENTALLY: a request for code unit u only walks the
+// string up to u, so the first small-index call on a huge string costs nothing extra --
+// each byte is walked at most once per table, ever.
+// Lifetime follows the cursor and length memo exactly: an AS3 String is immutable, so
+// pointer equality means content equality, and every slot is dropped in
+// as_u16_cursor_reset() -- which the sweep calls on EVERY string free, because a
+// recycled address is the only way a cached table can go stale mid-cycle.
+#define AS_U16_CK_STRIDE 1024
+#define AS_U16_CK_SLOTS 2
+typedef struct as_u16_ckpt { int unit; int byte; } as_u16_ckpt;
+typedef struct as_u16_ck {
+    const char* s;      // the string this table belongs to (NULL: slot is free)
+    int n;              // entries in use; entry i covers code unit at[i].unit <= i * STRIDE
+    int cap;            // entries allocated in at
+    as_u16_ckpt* at;    // malloc'd, reused across strings (never freed)
+} as_u16_ck;
+static as_u16_ck as_u16_ck_slot[AS_U16_CK_SLOTS];
+static int as_u16_ck_rr;
 static void as_u16_cursor_reset(void) {
     as_u16_cursor[0].s = NULL; as_u16_cursor[0].unit = 0; as_u16_cursor[0].byte = 0;
     as_u16_cursor[1].s = NULL; as_u16_cursor[1].unit = 0; as_u16_cursor[1].byte = 0;
     as_str_len_memo[0].s = NULL; as_str_len_memo[0].len = 0;
     as_str_len_memo[1].s = NULL; as_str_len_memo[1].len = 0;
+    as_u16_ck_slot[0].s = NULL; as_u16_ck_slot[0].n = 0;
+    as_u16_ck_slot[1].s = NULL; as_u16_ck_slot[1].n = 0;
 }
 // Width in bytes of the character whose lead byte is b. A continuation byte (0x80..0xBF)
 // never STARTS a character, so it reports 1: a malformed string then advances instead of
@@ -7538,10 +7568,25 @@ static int as_str_len_wide(const char* s, size_t n) {
 // CONDITION re-reads s.length from being O(n^2) on a CJK string WITHOUT any
 // loop-invariant hoisting in the emitter: 117ns per call becomes ~2ns, and while-loops
 // and dynamic receivers get the same treatment for free.
+//
+// The two entries are kept in MOST-RECENTLY-USED order (slot 0 = MRU), so a miss always
+// overwrites slot 1 = the least recently used entry. That ordering is load-bearing, not
+// tidiness. A splitter that reads the length of a big SOURCE and of a fresh SLICE
+// (substring(o, o + 20).length) misses on every slice -- each slice is a new pointer --
+// and with a round-robin victim those misses evicted the big string's entry on alternate
+// calls. Re-scanning 516 KB per slice was 700 ms of benchmarks/cjkscan's 958 ms: the
+// scan, not the split. With MRU order the source's entry survives (the victim is the
+// previous, now dead, slice). Measured after the change (temp/cjk/dprobe.as, P3 =
+// substring(o, o+20).length over 20000 strided offsets): 853 ms -> 12 ms.
 static int as_str_len(const char* s) {
     if (s == NULL) return 0;
     if (as_str_len_memo[0].s == s) return as_str_len_memo[0].len;
-    if (as_str_len_memo[1].s == s) return as_str_len_memo[1].len;
+    if (as_str_len_memo[1].s == s) {
+        as_str_len_memo_t t = as_str_len_memo[0];
+        as_str_len_memo[0] = as_str_len_memo[1];
+        as_str_len_memo[1] = t;
+        return as_str_len_memo[0].len;
+    }
     int len;
     size_t n = strlen(s);
     const unsigned char* p = (const unsigned char*)s;
@@ -7562,13 +7607,8 @@ static int as_str_len(const char* s) {
         break;
     }
 memo:
-    if (as_str_len_memo[0].s == NULL) { as_str_len_memo[0].s = s; as_str_len_memo[0].len = len; }
-    else if (as_str_len_memo[1].s == NULL) { as_str_len_memo[1].s = s; as_str_len_memo[1].len = len; }
-    else {
-        as_str_len_memo_t* m = &as_str_len_memo[as_str_len_rr];
-        as_str_len_rr ^= 1;
-        m->s = s; m->len = len;
-    }
+    as_str_len_memo[1] = as_str_len_memo[0];
+    as_str_len_memo[0].s = s; as_str_len_memo[0].len = len;
     return len;
 }
 // True when the first n BYTES of s contain no byte with the high bit set. That is the
@@ -7598,21 +7638,91 @@ static void as_u16_cursor_set(const char* s, int unit, int byte) {
         c->s = s; c->unit = unit; c->byte = byte;
     }
 }
+// Extend the checkpoint table for s so that it covers code unit u, and return the slot
+// (or NULL when there is nothing to resume from or memory is exhausted -- a miss is
+// always safe, it only costs the walk we were doing before).
+static as_u16_ck* as_u16_ck_cover(const char* s, int u) {
+    int need = u / AS_U16_CK_STRIDE + 1;
+    if (need < 2) return NULL;          // a stride is not shorter than walking u characters
+    as_u16_ck* ck;
+    if (as_u16_ck_slot[0].s == s) ck = &as_u16_ck_slot[0];
+    else if (as_u16_ck_slot[1].s == s) ck = &as_u16_ck_slot[1];
+    else {
+        ck = &as_u16_ck_slot[as_u16_ck_rr];
+        as_u16_ck_rr ^= 1;
+        ck->s = s; ck->n = 0;           // the buffer (if any) survives the new owner
+    }
+    if (ck->cap < need) {
+        int cap = ck->cap < 64 ? 64 : ck->cap;
+        while (cap < need) cap *= 2;
+        as_u16_ckpt* na = (as_u16_ckpt*)realloc(ck->at, (size_t)cap * sizeof(as_u16_ckpt));
+        if (na == NULL) { ck->s = NULL; ck->n = 0; return NULL; }
+        ck->at = na; ck->cap = cap;
+    }
+    int k = 0, b = 0;
+    if (ck->n > 0) { k = ck->at[ck->n - 1].unit; b = ck->at[ck->n - 1].byte; }
+    else { ck->at[0].unit = 0; ck->at[0].byte = 0; ck->n = 1; }
+    while (ck->n < need) {
+        int target = ck->n * AS_U16_CK_STRIDE;
+        const unsigned char* p = (const unsigned char*)s + b;
+        while (k < target && *p != 0) {
+            // Eight bytes at a time while the window is pure ASCII: there a byte offset and
+            // a code unit coincide, so the build costs what the ASCII probe costs instead
+            // of eight times more. Reading eight bytes here is as safe as the probe's own
+            // read: k + 8 <= target <= u, and callers clamp u to the length, so at least
+            // eight bytes precede the terminator (a non-ASCII character only ever needs
+            // MORE bytes per unit, never fewer).
+            if (k + 8 <= target) {
+                uint64_t w;
+                memcpy(&w, p, 8);
+                if (!(w & 0x8080808080808080ull)) { k += 8; b += 8; p += 8; continue; }
+            }
+            int w = as_u16_width(*p);
+            k += (w == 4) ? 2 : 1;
+            b += w; p += w;
+        }
+        ck->at[ck->n].unit = k; ck->at[ck->n].byte = b;
+        ck->n++;
+        // Past the terminator there is nothing left to walk: repeating the final landing
+        // point is correct (it is still <= the target unit) and keeps this terminating.
+        if (*p == 0) { while (ck->n < need) { ck->at[ck->n].unit = k; ck->at[ck->n].byte = b; ck->n++; } }
+    }
+    return ck;
+}
+
 // The character holding code unit u: its byte offset, and whether u is the LOW half of an
 // astral pair (the second of the two units one 4-byte character occupies).
 static void as_u16_locate(const char* s, int u, int* off, int* low) {
     int k = 0, b = 0;
-    bool cached = true;
-    if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit) { k = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte; }
-    else if (as_u16_cursor[1].s == s && u >= as_u16_cursor[1].unit) { k = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte; }
-    else cached = false;
-    // No cursor for this string yet: an ASCII prefix makes the byte offset equal to u, so
-    // one word-wise probe replaces a walk of u characters. Callers clamp u to [0, length]
-    // (as_str_charCodeAt, as_u16_take, as_u16_byte_of), which keeps the probe in bounds.
-    if (!cached && u > 0 && as_u16_prefix_ascii(s, (size_t)u)) {
-        *off = u; *low = 0;
-        as_u16_cursor_set(s, u, u);
-        return;
+    bool resumed = false;
+    if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit) { k = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte; resumed = true; }
+    else if (as_u16_cursor[1].s == s && u >= as_u16_cursor[1].unit) { k = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte; resumed = true; }
+    // A cursor can be AT or BEFORE u and still be useless: a strided split (substring at
+    // o, o + 7919, ...) leaves the cursor ~7919 units behind every time, which is the
+    // walk this table exists to cut. Take the checkpoint only when it jumps at least two
+    // strides, so the slot lookup never costs more than the walk it replaces.
+    if (u - k >= AS_U16_CK_STRIDE * 2) {
+        as_u16_ck* ck = as_u16_ck_cover(s, u);
+        if (ck != NULL) {
+            int i = u / AS_U16_CK_STRIDE;
+            if (i >= ck->n) i = ck->n - 1;
+            // An entry records the first character start AT OR PAST its stride boundary,
+            // and a 4-byte character can overshoot it by one code unit -- so entry i may
+            // sit just past u. Step back to the last entry that is <= u (entry 0 is unit 0).
+            while (i > 0 && ck->at[i].unit > u) i--;
+            if (ck->at[i].unit > k) { k = ck->at[i].unit; b = ck->at[i].byte; resumed = true; }
+        }
+    }
+    if (!resumed && u > 0) {
+        // No landing point to resume from: an ASCII prefix makes the byte offset equal to
+        // u, so one word-wise probe replaces a walk of u characters. Callers clamp u to
+        // [0, length] (as_str_charCodeAt, as_u16_take, as_u16_byte_of), which keeps the
+        // probe in bounds.
+        if (as_u16_prefix_ascii(s, (size_t)u)) {
+            *off = u; *low = 0;
+            as_u16_cursor_set(s, u, u);
+            return;
+        }
     }
     const unsigned char* p = (const unsigned char*)s + b;
     while (k < u && *p != 0) {
@@ -7783,7 +7893,19 @@ static int as_str_indexOf_from(const char* s, const char* sub, int from) {
     int len = as_str_len(s);
     if (from < 0) from = 0;
     if (from > len) from = len;
-    const char* p = strstr(s + as_u16_byte_of(s, from), sub);
+    int sublen = (int)strlen(sub);
+    // An empty needle matches AT from -- including when from is the LOW half of a
+    // surrogate pair, which has no byte offset of its own (locate reports the pair's
+    // start). adl 51.4.1: "<astral><astral>".indexOf("", 1) is 1 (temp/cjk/air).
+    if (sublen == 0) return from;
+    int off = 0, low = 0;
+    as_u16_locate(s, from, &off, &low);
+    // from on the LOW half of a pair: a match must START at or after from, so the
+    // straddled character itself is not eligible. Searching from its start would answer
+    // with an index BEFORE from (adl: "<astral><astral>".indexOf("<astral>", 1) is 2,
+    // not 0) -- a wrong answer, not a slower one.
+    if (low) off += as_u16_width((unsigned char)s[off]);
+    const char* p = strstr(s + off, sub);
     return p ? as_u16_unit_of(s, (int)(p - s)) : -1;
 }
 static int as_str_lastIndexOf_from(const char* s, const char* sub, int from) {

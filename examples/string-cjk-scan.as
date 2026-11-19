@@ -76,4 +76,20 @@ check(big.substring(base + 5, base + 7) == "狐狸", "substring by code-unit ind
 check(big.substring(0, 2) == "敏捷", "substring from the head");
 check(big.substring(base + 43, base + 44) == "\n", "substring of the separator");
 
+// ------------------------------------ 5) 深位置跳转不走整串（阶段四百四十五）
+// 定位 / 切片不必每次都从字节 0 数起：跳得远时走「1024 码元一格」的采样表，
+// 跳得近时续游标。表只跳过前缀，**不改答案** —— 下面把深位置的读数与行内相
+// 对位置对齐，错一位就会被抓住。
+check(big.charCodeAt(170000) == line.charCodeAt(170000 % 44), "a deep jump agrees with the line-relative unit");
+check(big.charCodeAt(170000) == 0x5F15, "unit 170000 is 引 (4000 lines x 44 units)");
+check(big.substring(170000, 170020).length == 20, "strided substring keeps 20 units");
+var jumpOK:Boolean = true;
+for (var o:int = 0; o < 175000; o += 5003) {
+  var rel:int = o % 44;                      // 43 是行尾的 "\n"，不在 line 里
+  var want:int = (rel == 43) ? 10 : line.charCodeAt(rel);
+  if (big.charCodeAt(o) != want) jumpOK = false;
+  if (big.substring(o, o + 20).length != 20) jumpOK = false;
+}
+check(jumpOK, "strided deep accesses (step 5003) stay exact");
+
 trace("string-cjk-scan: OK");

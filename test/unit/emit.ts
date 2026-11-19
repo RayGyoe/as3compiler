@@ -375,8 +375,12 @@ function checkAsciiScan(): string[] {
     unitOf.includes('if (byteoff <= 0) return 0;'));
   check('unit_of leaves the answer as a cursor for the next call',
     unitOf.includes('as_u16_cursor_set(s, u, byteoff);'));
-  check('locate probes only when no cursor already covers the string',
-    locate.includes('if (!cached && u > 0 && as_u16_prefix_ascii(s, (size_t)u)) {'));
+  // Stage 445 added a second resume source (the sampled checkpoint), so the probe is now
+  // guarded by "nothing else resumed" rather than "no cursor". The invariant the pin
+  // defends is unchanged: the probe must not run when a landing point is already known.
+  check('locate probes only when nothing else resumed',
+    locate.includes('if (!resumed && u > 0) {')
+    && locate.includes('if (as_u16_prefix_ascii(s, (size_t)u)) {'));
   check('locate records the identity answer in the cursor, so the next index is free',
     locate.includes('as_u16_cursor_set(s, u, u);'));
 
@@ -460,6 +464,88 @@ function checkCjkScan(): string[] {
   return bad;
 }
 registerGroup('unit: runtime/CjkScan', checkCjkScan);
+
+// ---- 阶段四百四十五：采样检查点 + 长度 memo 的 MRU ----
+// Two independent caches decide how far as_u16_locate has to walk, and both fail
+// SILENTLY: a stale checkpoint returns a plausible neighbouring index, an evicted
+// length just re-scans. Neither shows up as a wrong time, so the shape is pinned.
+// The failure modes that matter:
+//   · an entry recorded PAST the unit it is asked for (4-byte characters overshoot a
+//     stride boundary) -- hence the step-back loop, which examples/string-utf16-index.as
+//     pins behaviourally at unit 2048 of a string whose astral pair straddles it;
+//   · a checkpoint surviving a recycled string address -- hence the cursor_reset drop;
+//   · round-robin eviction in the length memo (the original bug: reading a big source's
+//     length and a fresh slice's length alternately evicted the source every time).
+function checkCjkLocate(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [cjklocate] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [cjklocate] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const between = (from: string, to: string): string => {
+    const i = pre.indexOf(from);
+    if (i < 0) return '';
+    const j = pre.indexOf(to, i + from.length);
+    return j < 0 ? '' : pre.slice(i, j);
+  };
+  const cover = between('static as_u16_ck* as_u16_ck_cover(', '// The character holding code unit u:');
+  const locate = between('static void as_u16_locate(', 'static int as_u16_byte_of(');
+  const reset = between('static void as_u16_cursor_reset(void) {', '// Width in bytes of the character whose lead byte');
+  const len = between('static int as_str_len(const char* s) {', 'static void as_u16_cursor_set(');
+  const indexFrom = between('static int as_str_indexOf_from(', 'static int as_str_lastIndexOf_from(');
+  check('all five sites were found in the preamble',
+    cover !== '' && locate !== '' && reset !== '' && len !== '' && indexFrom !== '');
+
+  // --- the table itself
+  check('the stride is stated once and used by both the builder and the lookup',
+    pre.includes('#define AS_U16_CK_STRIDE 1024') && pre.includes('#define AS_U16_CK_SLOTS 2')
+    && cover.includes('int need = u / AS_U16_CK_STRIDE + 1;')
+    && locate.includes('int i = u / AS_U16_CK_STRIDE;'));
+  check('the build walks ASCII eight bytes at a time (it must not cost 8x the probe)',
+    cover.includes('if (k + 8 <= target) {')
+    && cover.includes('if (!(w & 0x8080808080808080ull)) { k += 8; b += 8; p += 8; continue; }'));
+  check('a 4-byte character costs TWO units in the build (unit != byte)',
+    cover.includes('k += (w == 4) ? 2 : 1;'));
+  check('the last entry repeats past the terminator, so a lookup never reads garbage',
+    cover.includes('while (ck->n < need) { ck->at[ck->n].unit = k; ck->at[ck->n].byte = b; ck->n++; }'));
+  check('an allocation failure frees the slot instead of keeping a half table',
+    cover.includes('if (na == NULL) { ck->s = NULL; ck->n = 0; return NULL; }'));
+
+  // --- the lookup
+  check('the table is only consulted on a jump of at least two strides',
+    locate.includes('if (u - k >= AS_U16_CK_STRIDE * 2) {'));
+  check('a boundary entry may sit PAST u (astral overshoot), so the lookup steps back',
+    locate.includes('while (i > 0 && ck->at[i].unit > u) i--;'));
+  check('a landing point is only taken when it is FURTHER than the cursor',
+    locate.includes('if (ck->at[i].unit > k) { k = ck->at[i].unit; b = ck->at[i].byte; resumed = true; }'));
+  check('the ASCII probe now runs only when nothing else resumed',
+    locate.includes('if (!resumed && u > 0) {'));
+  check('every string free drops BOTH checkpoint slots (a recycled address is the only stale risk)',
+    reset.includes('as_u16_ck_slot[0].s = NULL; as_u16_ck_slot[0].n = 0;')
+    && reset.includes('as_u16_ck_slot[1].s = NULL; as_u16_ck_slot[1].n = 0;'));
+
+  // --- the length memo is MRU, not round-robin
+  check('the round-robin index is gone', !pre.includes('as_str_len_rr'));
+  check('a slot-1 hit promotes that entry to MRU',
+    len.includes('if (as_str_len_memo[1].s == s) {')
+    && len.includes('as_str_len_memo[1] = t;'));
+  check('a miss always overwrites slot 1 (the least recently used)',
+    len.includes('as_str_len_memo[1] = as_str_len_memo[0];')
+    && len.includes('as_str_len_memo[0].s = s; as_str_len_memo[0].len = len;'));
+
+  // --- indexOf from a low surrogate half
+  check('an empty needle answers from itself, before any translation',
+    indexFrom.includes('if (sublen == 0) return from;'));
+  check('a low-half from starts the search AFTER the straddled character',
+    indexFrom.includes('if (low) off += as_u16_width((unsigned char)s[off]);'));
+  check('exactly one locate per indexOf call', indexFrom.split('as_u16_locate(').length - 1 === 1);
+
+  console.log(`     [cjklocate] ${ok} checkpoint/memo shape check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/CjkLocate', checkCjkLocate);
 
 // ---- 阶段四百四十二：局部字符串累加器（`s += x` 的 O(n²) → O(n)）----
 // A String local whose only writes are `s = expr` and `s += expr` is emitted as a
@@ -5550,9 +5636,14 @@ function checkStringUtf16Index(): string[] {
     && c.includes('uint64_t t = w & 0xC0C0C0C0C0C0C0C0ull;'));
   check('length has an ASCII word probe before the fold',
     c.includes('0x8080808080808080ull'));
+  // Stage 445 made the two memoisse entries MRU-ordered (a slot-1 hit promotes instead
+  // of returning in place), because round-robin eviction re-scanned a big source string
+  // on every fresh slice. The contract is still "memoised per pointer"; only the shape
+  // of the second lookup changed.
   check('length is memoised per string pointer',
     c.includes('if (as_str_len_memo[0].s == s) return as_str_len_memo[0].len;')
-    && c.includes('if (as_str_len_memo[1].s == s) return as_str_len_memo[1].len;'));
+    && c.includes('if (as_str_len_memo[1].s == s) {')
+    && c.includes('return as_str_len_memo[0].len;'));
   check('the code-unit cursor has two slots and a forward fast path',
     c.includes('static as_u16_cur as_u16_cursor[2];')
     && c.includes('if (as_u16_cursor[0].s == s && u >= as_u16_cursor[0].unit)')
