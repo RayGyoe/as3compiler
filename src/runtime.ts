@@ -7642,6 +7642,25 @@ static int as_u16_unit_of(const char* s, int byteoff) {
     // its last hit instead of re-counting from byte 0.
     if (as_u16_cursor[0].s == s && byteoff >= as_u16_cursor[0].byte) { u = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte; }
     else if (as_u16_cursor[1].s == s && byteoff >= as_u16_cursor[1].byte) { u = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte; }
+    // Backward resume, the mirror of the above: a caller whose byte offsets move DOWN
+    // (lastIndexOf stepping left, a caret moving up a document) used to re-walk from
+    // byte 0 on every call. Step back to the previous character start and subtract it.
+    else if (as_u16_cursor[0].s == s) {
+        u = as_u16_cursor[0].unit; b = as_u16_cursor[0].byte;
+        while (b > byteoff) {
+            b--;
+            while (b > 0 && ((unsigned char)s[b] & 0xC0) == 0x80) b--;
+            u -= (as_u16_width((unsigned char)s[b]) == 4) ? 2 : 1;
+        }
+    }
+    else if (as_u16_cursor[1].s == s) {
+        u = as_u16_cursor[1].unit; b = as_u16_cursor[1].byte;
+        while (b > byteoff) {
+            b--;
+            while (b > 0 && ((unsigned char)s[b] & 0xC0) == 0x80) b--;
+            u -= (as_u16_width((unsigned char)s[b]) == 4) ? 2 : 1;
+        }
+    }
     // ASCII remainder: the two index spaces coincide there, and one word-wise probe per
     // 8 bytes replaces the character walk (measured: benchmarks/bigscan, 180 KB ASCII).
     if (as_u16_prefix_ascii(s + b, (size_t)(byteoff - b))) u += byteoff - b;
@@ -7774,9 +7793,10 @@ static int as_str_lastIndexOf_from(const char* s, const char* sub, int from) {
     int sublen = (int)strlen(sub);
     if (sublen == 0) return from;
     // ASCII fast path: units == bytes, so the search is a plain backwards byte scan from
-    // the last possible START at or before the from argument. The general path below must
-    // walk FORWARD (a backwards walk would pay one byte->unit translation per candidate),
-    // so on ASCII input this turns one comparison per character into one per candidate.
+    // the last possible START at or before the from argument -- every byte is a character
+    // boundary and the answer needs no translation at all. The general path below scans
+    // backwards too, but it has to step over continuation bytes and translate the hit, so
+    // ASCII stays the cheaper route (measured: benchmarks/bigscan, 176 KB).
     if (as_u16_prefix_ascii(s, (size_t)len)) {
         int last = len - sublen;
         if (last < 0) return -1;
@@ -7785,16 +7805,22 @@ static int as_str_lastIndexOf_from(const char* s, const char* sub, int from) {
             if (s[i] == sub[0] && strncmp(s + i, sub, (size_t)sublen) == 0) return i;
         return -1;
     }
-    // One forward walk instead of stepping backwards unit by unit: stepping back would
-    // cost a byte->unit translation per candidate, i.e. O(n^2) on a CJK string.
-    int best = -1, u = 0;
-    const unsigned char* p = (const unsigned char*)s;
-    while (*p != 0 && u <= from) {
-        if (strncmp((const char*)p, sub, (size_t)sublen) == 0) best = u;
-        int w = as_u16_width(*p);
-        p += w; u += (w == 4) ? 2 : 1;
+    // Non-ASCII: scan BACKWARDS over byte offsets and translate only the hit. A byte
+    // that is a continuation (10xxxxxx) can never start a match, so skipping it keeps
+    // every candidate on a character boundary and strncmp cannot match a needle that
+    // starts inside a character. The upper bound is the BYTE offset of the from
+    // argument: unit indices are monotone in byte offset, so a start at or below that
+    // byte is exactly a start at or below unit from (an astral lead included -- its low
+    // half is the same character). Walking FORWARD from byte 0, which is what this used
+    // to do, cost O(n) per call even when the match sat right next to the argument
+    // (benchmarks/cjkscan: the from-descending phase went 1903 ms to 11 ms over 4000
+    // calls on 176000 code units, while the ASCII twin of the same shape cost 68 ms).
+    int last = as_u16_byte_of(s, from);
+    for (int i = last; i >= 0; i--) {
+        if (((unsigned char)s[i] & 0xC0) == 0x80) continue;
+        if (s[i] == sub[0] && strncmp(s + i, sub, (size_t)sublen) == 0) return as_u16_unit_of(s, i);
     }
-    return best;
+    return -1;
 }
 static char* as_str_substring(const char* s, int from, int to) {
     if (s == NULL) return "";

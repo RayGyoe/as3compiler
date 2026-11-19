@@ -391,14 +391,75 @@ function checkAsciiScan(): string[] {
   check('candidates are compared with the needle, walking down to 0',
     lastIndexOf.includes('for (int i = last; i >= 0; i--)')
     && lastIndexOf.includes('if (s[i] == sub[0] && strncmp(s + i, sub, (size_t)sublen) == 0) return i;'));
-  check('the general path still walks FORWARD (a backward walk would translate per candidate)',
-    lastIndexOf.includes('while (*p != 0 && u <= from) {')
-    && lastIndexOf.indexOf('while (*p != 0 && u <= from) {') > lastIndexOf.indexOf('as_u16_prefix_ascii'));
+  // Stage 444 inverted this: the general path used to walk FORWARD from byte 0, which
+  // cost O(n) per call no matter where the hit was (55x the ASCII path on a 176 KB CJK
+  // document). It now scans candidates BACKWARD and translates only the hit.
+  check('the general path scans BACKWARD from the byte offset of from',
+    lastIndexOf.includes('int last = as_u16_byte_of(s, from);')
+    && lastIndexOf.includes('for (int i = last; i >= 0; i--) {'));
+  check('...and the O(n)-per-call forward walk is gone',
+    !lastIndexOf.includes('while (*p != 0 && u <= from) {'));
 
   console.log(`     [asciiscan] ${ok} ASCII-path shape check(s) passed`);
   return bad;
 }
 registerGroup('unit: emit/AsciiScan', checkAsciiScan);
+
+// ---- 阶段四百四十四：非 ASCII 串上的码元翻译 ----
+// The three sites that must agree: `as_u16_unit_of` resumes in BOTH directions,
+// `as_str_lastIndexOf_from`'s general path scans backwards over character starts, and
+// neither ever translates per candidate. The failure modes here are silent -- a stale
+// or poisoned cursor yields a plausible-looking but wrong code-unit index -- so the
+// shape is pinned instead of trusting the benchmarks (benchmarks/cjkscan only sees the
+// aggregate time, and examples/string-cjk-scan.as only sees the answers of one shape).
+function checkCjkScan(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [cjkscan] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [cjkscan] ${label}`); }
+  };
+  const pre = RUNTIME_PREAMBLE.replace(/\r\n/g, '\n');
+  const between = (from: string, to: string): string => {
+    const i = pre.indexOf(from);
+    if (i < 0) return '';
+    const j = pre.indexOf(to, i + from.length);
+    return j < 0 ? '' : pre.slice(i, j);
+  };
+  const unitOf = between('static int as_u16_unit_of(', 'static int as_u16_emit_surrogate(');
+  const lastIndexOf = between('static int as_str_lastIndexOf_from(', 'static char* as_str_substring(');
+  check('both sites were found in the preamble', unitOf !== '' && lastIndexOf !== '');
+
+  // --- unit_of: a second, mirrored resume for callers whose offsets move DOWN
+  const back = unitOf.split('while (b > byteoff) {').length - 1;
+  check('unit_of resumes backwards from a cursor, for both slots', back === 2);
+  check('a backwards step lands on a character start (skip continuation bytes)',
+    unitOf.includes('while (b > 0 && ((unsigned char)s[b] & 0xC0) == 0x80) b--;'));
+  check('a 4-byte character costs TWO units when stepping back',
+    unitOf.split('u -= (as_u16_width((unsigned char)s[b]) == 4) ? 2 : 1;').length - 1 === 2);
+  check('the forward resume still comes FIRST in the chain (monotone callers unaffected)',
+    unitOf.indexOf('byteoff >= as_u16_cursor[0].byte') < unitOf.indexOf('while (b > byteoff) {'));
+  check('the cursor is stored at the requested offset, not at the walked-to one',
+    unitOf.includes('as_u16_cursor_set(s, u, byteoff);'));
+
+  // --- lastIndexOf: candidates, not characters
+  check('the upper bound is the BYTE offset of from (units are monotone in bytes)',
+    lastIndexOf.includes('int last = as_u16_byte_of(s, from);'));
+  check('continuation bytes are skipped, so a candidate cannot start inside a character',
+    lastIndexOf.includes('if (((unsigned char)s[i] & 0xC0) == 0x80) continue;'));
+  check('the first needle byte rejects a candidate before strncmp runs',
+    lastIndexOf.includes('if (s[i] == sub[0] && strncmp(s + i, sub, (size_t)sublen) == 0)'));
+  check('exactly ONE translation per call, and only on a hit',
+    lastIndexOf.split('as_u16_unit_of(').length - 1 === 1
+    && lastIndexOf.includes('return as_u16_unit_of(s, i);'));
+  check('the ASCII fast path is tried first and is untouched',
+    lastIndexOf.indexOf('if (as_u16_prefix_ascii(s, (size_t)len)) {') > 0
+    && lastIndexOf.indexOf('if (as_u16_prefix_ascii(s, (size_t)len)) {') < lastIndexOf.indexOf('int last = as_u16_byte_of(s, from);'));
+
+  console.log(`     [cjkscan] ${ok} non-ASCII shape check(s) passed`);
+  return bad;
+}
+registerGroup('unit: runtime/CjkScan', checkCjkScan);
 
 // ---- 阶段四百四十二：局部字符串累加器（`s += x` 的 O(n²) → O(n)）----
 // A String local whose only writes are `s = expr` and `s += expr` is emitted as a
