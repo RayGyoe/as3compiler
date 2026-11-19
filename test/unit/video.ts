@@ -225,9 +225,10 @@ function checkVideoSurface(): string[] {
   // the readback route costs 9.6 ms/frame on a 4K P010 source, so it is worth a lot of
   // machinery -- but only if the machinery stays honest about what it did.
   const zc = readNorm(join(root, 'vendor', 'video_d3d.cc'));
-  check('the zero-copy seam is D3D-gated with NULL fallbacks (other builds still link)',
+  check('the zero-copy seam is backend-gated with NULL fallbacks (other builds still link)',
     glue.includes('#if defined(ASC_RENDER_D3D) && ASC_RENDER_D3D && defined(ASC_USE_SKIA)') &&
-    glue.includes('static void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,'));
+    glue.includes('#elif defined(ASC_RENDER_METAL) && ASC_RENDER_METAL && defined(ASC_USE_SKIA)') &&
+    glue.includes('static void* sk_video_zc_image(void* ctx, void* tex, int slice, int w, int h,'));
   check('the staging texture carries BOTH share flags (SHARED_NTHANDLE alone is E_INVALIDARG)',
     zc.includes('D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE'));
   check('the staging texture is shared through IDXGIResource1::CreateSharedHandle',
@@ -257,19 +258,80 @@ function checkVideoSurface(): string[] {
   check('Skia\'s release callback is epoch-checked',
     zc.includes('t->stream->epoch == t->epoch') && zc.includes('s->epoch++'));
   check('the zero-copy attempt precedes the readback and both remain',
-    glue.indexOf('zc_img = sk_video_d3d_image(') > 0 &&
-    glue.indexOf('zc_img = sk_video_d3d_image(') < glue.indexOf('av_hwframe_transfer_data(v->sw_frame') &&
+    glue.indexOf('zc_img = sk_video_zc_image(') > 0 &&
+    glue.indexOf('zc_img = sk_video_zc_image(') < glue.indexOf('av_hwframe_transfer_data(v->sw_frame') &&
     glue.includes('av_hwframe_transfer_data(v->sw_frame, v->frame, 0)'));
   check('the table entry is dropped before FFmpeg releases the device',
-    glue.indexOf('sk_video_d3d_forget(v->hw_dev11)') > 0 &&
-    glue.indexOf('sk_video_d3d_forget(v->hw_dev11)') < glue.indexOf('av_buffer_unref(&v->hw_device)'));
+    glue.indexOf('sk_video_zc_forget(v->hw_dev11)') > 0 &&
+    glue.indexOf('sk_video_zc_forget(v->hw_dev11)') < glue.indexOf('av_buffer_unref(&v->hw_device)'));
   check('AS_VIDEO_STATS separates zero-copy frames from readback frames',
-    glue.includes('d3d11va-zero-copy') && glue.includes('zc=%lld starved=%lld'));
+    glue.includes('AS_VIDEO_HW_NAME "-zero-copy"') && glue.includes('zc=%lld starved=%lld'));
   check('a hardware frame\'s 10-bit-ness is read from its frames context',
     glue.includes('hf->sw_format == AV_PIX_FMT_P010LE'));
   const manifestWithSeam = readNorm(join(root, 'examples', 'video', 'video.build.json'));
   check('the Windows video manifest compiles the zero-copy seam',
     manifestWithSeam.includes('"${win:../../vendor/video_d3d.cc}"'));
+
+  // ---- zero copy on Apple: VideoToolbox -> CVMetalTextureCache (video.md §16.13) ----
+  // Same promise, different platform: the decoder's CVPixelBuffer is an IOSurface, so
+  // the planes can be wrapped as MTLTextures with no blit and no CPU touch. The pins
+  // below are the pieces that make it correct rather than merely fast.
+  const mtlSeam = readNorm(join(root, 'vendor', 'video_metal.mm'));
+  const indexSrc = readNorm(join(root, 'src', 'index.ts'));
+  check('the GPU decode surface is a per-platform constant, not a hardcoded D3D11',
+    glue.includes('#define AS_VIDEO_HW_PIX AV_PIX_FMT_VIDEOTOOLBOX') &&
+    glue.includes('#define AS_VIDEO_HW_PIX AV_PIX_FMT_D3D11') &&
+    glue.includes('if (*p == AS_VIDEO_HW_PIX) { pick = *p; break; }') &&
+    !glue.includes('if (*p == AV_PIX_FMT_D3D11) { pick = *p; break; }'));
+  check('a hardware frame is reached through the field that actually carries it',
+    glue.includes('void* zc_tex = (void*)v->frame->data[3];') &&          // Apple: CVPixelBuffer
+    glue.includes('const int zc_slice = (int)(intptr_t)v->frame->data[1];')); // D3D: array slice
+  // The identity is only needed where the seam keys a table by the decoder's device.
+  // Apple has one process-wide MTLDevice, so AS_VIDEO_ZC_DEVICE keeps the D3D pointer
+  // out of the Apple build (where the type does not even exist).
+  check('the per-stream device identity is D3D-only',
+    glue.includes('#define AS_VIDEO_ZC_DEVICE 1') && glue.includes('#define AS_VIDEO_ZC_DEVICE 0') &&
+    glue.includes('#if AS_VIDEO_ZC_DEVICE') &&
+    glue.includes('if (zc_dev == NULL) return 0;') &&
+    /#if AS_VIDEO_ZC && AS_VIDEO_ZC_DEVICE\n  \{\n    const AVHWDeviceContext\* hwc/.test(glue));
+  // The plane layout must come from the BUFFER, not from the caller's ten_bit flag:
+  // 'x420' stores its ten bits in the high half of a 16-bit word (the P010 packing),
+  // and a stream mislabelled here would be sampled with the wrong matrix.
+  check('the plane layout is derived from the CVPixelBuffer format, not from ten_bit',
+    mtlSeam.includes('CVPixelBufferGetPixelFormatType(pb)') &&
+    mtlSeam.includes('case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:') &&
+    mtlSeam.includes('*y_fmt = kPlaneR16; *uv_fmt = kPlaneRG16;') &&
+    mtlSeam.includes('case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:') &&
+    mtlSeam.includes('*y_fmt = kPlaneR8; *uv_fmt = kPlaneRG8;'));
+  check('the wrap is a YUVA texture pair, never a copy',
+    mtlSeam.includes('CVMetalTextureCacheCreateTextureFromImage(') &&
+    mtlSeam.includes('CVMetalTextureGetTexture(ytex)') &&
+    mtlSeam.includes('SkImages::TextureFromYUVATextures(') &&
+    mtlSeam.includes('SkYUVAInfo::PlaneConfig::kY_UV') &&
+    !/sws_scale|memcpy/.test(mtlSeam));
+  // The MTLTextures are views into the pixel buffer's IOSurface: releasing the buffer
+  // before Skia drops the image is a use-after-free that paints a corrupt frame rather
+  // than crashing, so the token holds it for exactly the image's lifetime.
+  check('the pixel buffer outlives the image (release callback holds it)',
+    mtlSeam.includes('token->pb = (CVPixelBufferRef)CFRetain(pb);') &&
+    /static void zc_release\(void\* ctx\)/.test(mtlSeam) &&
+    mtlSeam.includes('if (t->pb != NULL) CFRelease(t->pb);') &&
+    mtlSeam.includes('SkImages::TextureFromYUVATextures(\n        static_cast<GrRecordingContext*>(ctx), yuva, nullptr, zc_release, token);'));
+  // A buffer whose plane HEIGHT is aligned up would be stretched by an w*h YUVAInfo.
+  check('a padded plane geometry falls back instead of stretching the picture',
+    mtlSeam.includes('CVPixelBufferGetWidthOfPlane(pb, 0)') &&
+    mtlSeam.includes('if ((int)pw != w || (int)ph != h || (int)cw != w / sx || (int)ch != h / sy) {'));
+  check('the cache belongs to the same MTLDevice Skia renders on',
+    mtlSeam.includes('extern "C" void* sk_mtl_device_ptr(void);') &&
+    mtlSeam.includes('CVMetalTextureCacheCreate(kCFAllocatorDefault, empty, (id<MTLDevice>)dev,') &&
+    readNorm(join(root, 'vendor', 'metal_glue.mm')).includes('void* sk_mtl_device_ptr(void) { return (void*)g_device; }'));
+  check('the seam is injected only where a GrDirectContext can exist',
+    indexSrc.includes("const hasMetal = cfg.defines.some((d) => d.split('=')[0].trim() === 'ASC_RENDER_METAL');") &&
+    cli.includes("cfg.sources.push(resolve(vendorDir, 'video_metal.mm'));"));
+  check('the macOS video manifest compiles the zero-copy seam',
+    manifestWithSeam.includes('"${mac:../../vendor/video_metal.mm}"') &&
+    manifestWithSeam.includes('"${mac:ASC_RENDER_METAL=1}"') &&
+    manifestWithSeam.includes('"${mac:../../vendor/metal_glue.mm}"'));
 
   // ---- native HDR presentation (video.md §16.12) ----
   // An scRGB swapchain is a promise the GPU can keep and the pixels still be wrong: the
@@ -347,8 +409,8 @@ function checkVideoSurface(): string[] {
   check('the probe leaves its entry initialised for the first real frame',
     zc.includes('zc_make_stage(s, nullptr, sfmt, w, h)') &&
     /extern "C" int sk_video_d3d_probe\(void\* ctx, void\* dev11, int w, int h, int ten_bit\)/.test(zc));
-  check('a build without the D3D seam still answers the probe (with 0)',
-    glue.includes('static int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit)') &&
+  check('a build without a zero-copy seam still answers the probe (with 0)',
+    glue.includes('static int sk_video_zc_probe(void* ctx, void* dev, int w, int h, int ten_bit)') &&
     glue.includes('return 0;'));
   // Audio-only streams have no video context at all: the gate must not stop them.
   check('the "decoder not open" gate only applies to streams with video',

@@ -1222,6 +1222,15 @@ async function main(): Promise<void> {
         for (const f of ['VideoToolbox', 'CoreVideo', 'CoreMedia', 'CoreFoundation', 'Security', 'Metal']) {
           if (!cfg.frameworks.includes(f)) cfg.frameworks.push(f);
         }
+        // Zero-copy seam for VideoToolbox (video.md §16.13). It is a SEPARATE file from
+        // video_glue.c because it has to include Metal/CoreVideo and Skia's C++ headers,
+        // and video_glue.c must stay a plain C translation unit that knows nothing about
+        // either. Only injected when the Metal backend is compiled in: without a
+        // GrDirectContext there is no texture to hand a frame to, and the seam would just
+        // return NULL for every frame (the CPU readback route is then the only route).
+        const hasMetal = cfg.defines.some((d) => d.split('=')[0].trim() === 'ASC_RENDER_METAL');
+        if (hasMetal && !cfg.sources.some((p) => basename(p) === 'video_metal.mm'))
+          cfg.sources.push(resolve(vendorDir, 'video_metal.mm'));
       }
       if (!cfg.defines.some((d) => d === 'ASC_HAVE_VIDEO' || d.startsWith('ASC_HAVE_VIDEO='))) cfg.defines.push('ASC_HAVE_VIDEO');
       // The runtime decoder choice rides in a define, the same way the GPU backend

@@ -6,7 +6,7 @@
 > （`src/emit.ts:16607`），`Video.attachNetStream()` 是空函数（`src/emit.ts:16630`）。全仓没有解复用器、
 > 没有视频解码器、没有视频时钟。
 >
-> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16）；V3 硬解 + 零拷贝已接通（2026-11-14，见 §16.8/§16.9）；HDR10+/HLG 的 SDR 上色已实现但默认关（见 §16.10）；V2 与传输面未排期。**
+> **本文状态：V1 已落地并实测通过（2026-11-13，见 §16）；V3 硬解 + 零拷贝已接通（Windows 2026-11-14 见 §16.8/§16.9，macOS 2026-11-19 见 §16.13）；HDR10+/HLG 的 SDR 上色已实现但默认关（见 §16.10）；V2 与传输面未排期。**
 > §1 是**实现前**的快照（2026-11-12），保留它是因为「起点是什么」决定了后面每条取舍；
 > 现在的代码状态以 §16 为准：`NetStream` / `Video` / `NetConnection` 已按 AIR 语义实现，
 > 解码走 FFmpeg 软解，`examples/video/` 的 31 条断言在真窗口里全绿。
@@ -225,8 +225,9 @@ CPU 内存——那是「出口接错」的开销，不是硬解的开销。真�
 Windows 的 `d3d11va` 同样复用 `h264`。所以「探测失败 → 换回软解」是一次后端切换，demux 与解析代码
 一行不动。自写 VT/MF 要做同样的回退，得自己维护两套状态机。
 
-> **实现现状（2026-11-13）**：V1 是**纯软解**——`video-backend` 只接受 `auto`/`soft`，两者等价，
-> `auto` 目前没有可探测的硬解后端（V2 = macOS VT + `CVMetalTextureCache` 零拷贝，V3 = Windows D3D11VA）。
+> **实现现状（2026-11-13 写、2026-11-19 更新）**：V1 是**纯软解**——`video-backend` 只接受 `auto`/`soft`，两者等价；
+> 当年 `auto` 没有可探测的硬解后端（V2 = macOS VT + `CVMetalTextureCache` 零拷贝，V3 = Windows D3D11VA），
+> **两条现已实现并实测**（Windows §16.8/§16.9，macOS §16.13），`auto` 也改成了「能零拷贝才翻硬解」。
 > 这不等于「4K 播不动」：软解 4K 10-bit HEVC 实测 8.8 ms/帧（单线程）、8 线程下被完全隐藏，
 > 用户报的「4K 卡到不行」的真实根因是转换两次 + 单线程 + 24 Hz 帧时钟 + CPU 光栅，逐条实测与
 > 修复见 §16.7。硬解在这里买到的是 `conv` 那 6 ms 与 CPU 占用，不是「能不能播」。
@@ -610,7 +611,7 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 
 | 端 | 解复用 | 解码 | 编码（publish） | 输出 | 备注 |
 |---|---|---|---|---|---|
-| macOS arm64 | FFmpeg | **`VideoToolbox`（目标态，未实现）**：h264、hevc、mpeg1/2/4、h263、prores、vp9；其余软解回退 | `h264_videotoolbox` + `aac`（系统硬编） | **`CVPixelBuffer`（NV12）→ `CVMetalTextureCache` 按 plane 给两张 `MTLTexture` → `GrBackendTexture[2]` → `SkImages::TextureFromYUVATextures`（零拷贝，§10.2，目标态）** | arm64 软解走 NEON，无需额外汇编依赖 |
+| macOS arm64 | FFmpeg | **VideoToolbox（默认，已实现）**：h264、hevc、mpeg1/2/4、h263、prores、vp9；其余软解回退 | `h264_videotoolbox` + `aac`（系统硬编） | **`CVPixelBuffer`（IOSurface）→ `CVMetalTextureCache` 按 plane 给两张 `MTLTexture` → `GrBackendTexture[2]` → `SkImages::TextureFromYUVATextures`（零拷贝，§16.13）** | arm64 软解走 NEON，无需额外汇编依赖 |
 | Windows x64 | FFmpeg | **D3D11VA（默认）**：h264、hevc、mpeg2、vc1、vp9、av1、wmv3；其余软解回退（DXVA2 留老系统） | `h264_mf` + `aac`（MediaFoundation，**未实机验证**） | `ID3D11Texture2D`（`DXGI_FORMAT_NV12`，Y/UV 是**同一资源的两个 plane slice**）→ 拆成 R8/RG8 两张 → `GrBackendTexture[2]` → **`TextureFromYUVATextures`**（§10.3 的平面切片差异） | 软解 SIMD 需 nasm/yasm（见 `checks.ts`） |
 | Linux | FFmpeg | 软解；VAAPI 可选（h264/hevc/vp9/av1，**未验证**） | `h264_vaapi`（**需 GPU**；无软编兜底 → 缺 render node 时 `publish()` 报错） | 软解：`AV_PIX_FMT_YUV420P` → **`TextureFromYUVAPixmaps`**（每帧上传，§10.1 ②）；VAAPI：`AV_PIX_FMT_VAAPI` → `EGLImage` → 纹理（与 Android 同形，未验证） | 有 ELF 目标即能编 |
 | Web（`--target wasm --package web`） | 浏览器 | **浏览器原生**（`<video>` / WebCodecs） | 浏览器（`MediaRecorder` / WebCodecs）；需 `NetStream.appendBytes` 才能自己产码流 | canvas → WebGL/WebGPU | **不把 FFmpeg 编进 wasm** |
@@ -619,11 +620,13 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 | **Android（预留，未支持 target）** | FFmpeg | **MediaCodec**（FFmpeg 侧只有编解码器包装，**没有统一的 hwaccel 框架**）；其余软解回退 | `h264_mediacodec`（未验证） | `AHardwareBuffer` → `EGLImage` → GL/`GrBackendTexture` → `TextureFromYUVATextures` | 需 NDK 编译；**这一端是唯一需要单独写硬件桥的**，不能假定与桌面同形 |
 
 > **实现状态（2026-11-19 核对代码与实测）**：本表「解码」「输出」两列写的是**目标形态**，不是各端都已落地。
-> 截至 v0.4.419，**只有 Windows x64 的 D3D11VA 硬解 + 零拷贝**在实机上完成并测过（§16.8、§16.9；4K HDR10+
-> 60 Hz 真窗口 0.27 ms/帧）。**macOS 目前是纯软解 + `sws`→BGRA**：`as_video_hw_create()`（`vendor/video_glue.c:928`）
-> 只创建 `AV_HWDEVICE_TYPE_D3D11VA` 设备，`vendor/video_d3d.cc` 是唯一的零拷贝接缝，所以 4K 10-bit 的 `conv`
-> （实测 6.13 ms/帧）在 macOS 上每帧都要付。iOS / Android / Linux-VAAPI 三行同属目标态（两个移动端连 target
-> 都还没支持）。§4 的「实现现状」注记与这里同口径，不要只读表格就当已实现。
+> 截至 v0.4.421，**Windows x64 的 D3D11VA 硬解 + 零拷贝**（§16.8、§16.9；4K HDR10+ 60 Hz 真窗口 0.27 ms/帧）
+> 与 **macOS arm64 的 VideoToolbox 硬解 + 零拷贝**（§16.13；同一台机器、4K 10-bit 60 Hz 真窗口 0.13 ms/帧）
+> 都在实机上完成并测过。macOS 的接缝是 `vendor/video_metal.mm`，与 `vendor/video_d3d.cc` 平行：
+> 两者都是「解码出的 GPU 画面 → Skia 的 YUVA 纹理」，只是前者的载体是 `CVPixelBuffer`（本来就在 IOSurface 里，
+> 连 blit 都不需要），后者要先在 D3D11/D3D12 两侧拆 plane。iOS / Android / Linux-VAAPI 三行仍属目标态
+> （两个移动端连 target 都还没支持；iOS 与 macOS 共用同一份接缝，只差权限与 target）。§4 的「实现现状」注记
+> 与这里同口径，不要只读表格就当已实现。
 >
 > **移动端是「未来要算进去的第六/七端」**（用户 2026-11-12 裁定）：现在**不实现**，但**接口面别写死**。
 > 具体代价：iOS 几乎白送（VT 与 macOS 同一套后端，只多一层权限/生命周期），Android 最难（MediaCodec
@@ -684,12 +687,13 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 
 ### 10.2 硬解零拷贝：调用链、生命周期与帧池
 
-macOS / iOS（一份 glue 两端共用）：
+macOS / iOS（一份 glue 两端共用）——**已按此实现**，`vendor/video_metal.mm`，实测见 §16.13：
 
 ```
-AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
-  → CVMetalTextureCacheCreateTextureFromImage(plane 0)  → MTLTexture (R8Unorm)
-  → CVMetalTextureCacheCreateTextureFromImage(plane 1)  → MTLTexture (RG8Unorm)
+AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)：data[3] 就是 CVPixelBufferRef（不必 av_hwframe_map）
+  → CVPixelBuffer（'420v' 8-bit NV12 / 'x420' 10-bit / 'x422' ProRes 4:2:2）
+  → CVMetalTextureCacheCreateTextureFromImage(plane 0)  → MTLTexture (R8Unorm / R16Unorm)
+  → CVMetalTextureCacheCreateTextureFromImage(plane 1)  → MTLTexture (RG8Unorm / RG16Unorm)
   → GrBackendTexture(w, h, mipmapped, GrMtlTextureInfo{tex})        // include/gpu/GrBackendSurface.h:181
   → GrYUVABackendTextures(SkYUVAInfo{w, h, kY_UV, k420, cs}, tex[2], origin)
   → SkImages::TextureFromYUVATextures(ctx, yuva, imageColorSpace, releaseProc, releaseCtx)
@@ -709,6 +713,13 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
   **拷进一张自有纹理**（一次 GPU blit）再让 VT 回收；后者更稳，`pause()` 长驻时应该走它；
 - `avcodec_receive_frame` 返回 `EAGAIN` 时不能假设「等一会就有」——池耗尽的表现就是阻塞或丢帧，
   需要「显示端已释放」的回执才能继续喂。
+
+**实现后的两处修正（相对本节最初的设计稿）**：① 不需要 `av_hwframe_map`——FFmpeg 的 videotoolbox
+解码器把 `CVPixelBufferRef` 直接放进 `AVFrame.data[3]`，`av_hwframe_map` 只会在别的 hw 格式上才有意义；
+② plane 的像素格式由 `CVPixelBufferGetPixelFormatType` 决定（`420v/420f` → R8/RG8、`x420` → R16/RG16、
+`x422` → R16/RG16 4:2:2），**不能**用调用方的 `ten_bit` 标志推断；未知布局直接返回 NULL 走回读。
+另外释放回调除了 `CVMetalTexture` 还要 `CFRetain` 住 `CVPixelBuffer` 本身——纹理只是它 IOSurface 的视图，
+Skia 可能很多帧之后才采样。
 
 ### 10.3 色彩空间与平台差异
 
@@ -759,8 +770,8 @@ AVFrame(AV_PIX_FMT_VIDEOTOOLBOX)  --av_hwframe_map-->  CVPixelBuffer (NV12)
 |---|---|---|
 | V0 | **本文落定 + 裁剪实测**：`air`/`mid`/`broad` 各编一份、各量一次链接体积；VT 硬解的边际代价；软/硬解 1080p 吞吐 | **已完成 2026-11-12**：数字入 §3/§7；`vendor/provision/ffmpeg-static.sh`（入 git）可复现 |
 | V1 | **解码 seam + 软解 + 按需注入门 + 三档格式面**：`as_video_*` 带 `backend`+`formats`；落地 `usesVideoCodec` / `video` / `video-formats`；容器 `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`，视频 `h264,hevc,vp9,av1` 软解，音频 `aac,mp3,opus,vorbis,flac`；`onMetaData` + 音频出声 | `examples/video.as` 能播自带样片；与 `adl` 逐项对齐（`videoWidth/Height`、`time`、`onMetaData`）；**格式矩阵自测**：每个容器×编码至少一个样本能出声出画；不碰视频的示例体积不变（§5.8）  **已完成 2026-11-13**（实现现状、实测数字与复现方法见 §16；4K 素材的代价拆分见 §16.7） |
-| V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：把 `TextureFromYUVATextures` 临时换成 `TextureFromYUVAPixmaps`，user CPU 与墙钟必须出现可测差异（拿不出差异 = 零拷贝没真做到）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
-| V3 | **Windows D3D11VA 后端 + 零拷贝上屏 + 自适应默认**（7 个 hwaccel）+ 缓冲状态（`Buffer.Empty`/`Buffer.Flush`）—— 解码、零拷贝与自适应默认均已完成（§16.8、§16.9）；另加一份 opt-in 的 HDR→SDR 上色（§16.10）；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
+| V2 | **macOS 硬解 + 零拷贝上屏**：`videotoolbox` 后端覆盖 8 个 hwaccel（h264/hevc/mpeg1/2/4/h263/prores/vp9）+ `CVMetalTextureCache` 纹理桥 → `SkImages::TextureFromYUVATextures`（§10.2）；探测失败静默回退软解 **已完成 2026-11-19**（`vendor/video_metal.mm`，三路 A/B、颜色对照、`AS_VIDEO_ZC=0` 回读对照见 §16.13） | 同片源 A/B：user CPU、墙钟、纹理桥耗时；人为禁掉 VT 必须静默回退而非黑屏；HEVC 1080p 软/硬双跑对比；**零拷贝举证**：改源码替换（`TextureFromYUVAPixmaps`）或运行时 `AS_VIDEO_ZC=0` 走回读，必须出现可测差异（拿不出差异 = 零拷贝没真做到）——本轮走后者：10.7 → 0.13 ms/帧、进程 CPU 8.76 → 0.56 s（§16.13.1）；暂停 30 s 后恢复不得因帧池耗尽卡住（§10.2） |
+| V3 | **硬件解码 + 零拷贝上屏 + 自适应默认**：Windows D3D11VA（7 个 hwaccel，§16.8、§16.9）与 macOS VideoToolbox（8 个 hwaccel，§16.13）两条后端，各自带零拷贝接缝与「能零拷贝才翻硬解」的自适应默认；另含缓冲状态（`Buffer.Empty`/`Buffer.Flush`）与一份 opt-in 的 HDR→SDR 上色（§16.10）；`pause`/`seek` 与 `NetStream.Play.*` 的序列在 V1 已就位（§16.2） | 逐项对齐 `adl`；三端同一份 `.as` 行为一致（后端差异只允许在像素格式内部） |
 | V4 | 传输（**读**）：`http:` 渐进式 → **HLS**（`hls`+`mpegts`+`crypto`，已包含在 `broad` 档）→ RTMP/RTSP（FFmpeg 原生协议，**不引 librtmp**） | 对齐 AIR 的 `NetStream.Play.*`；HLS 直播切片延迟与追帧策略写成可复现测试 |
 | V5 | **publish 输出面（写）**：`NetStream.publish()` + `appendBytes()`（AIR 原生 API，可绕过采集设备直接堆已编码数据）+ `flv` 封装 + 硬编 H.264/AAC + `rtmp`/`rtmps` 推流；构建侧已在 V0 付完（§6.1） | 用 `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` 当收流端做可重复验收；`appendBytes` 路径不依赖任何采集设备；缺硬编的机器必顶报明确错误（不静默） |
 | V6（增强，opt-in） | `all` 档（VVC、`libdav1d`、DASH 需 `libxml2`）、多音轨/字幕轨选择、`StageVideo` | 明确标注为增强，默认不启用 |
@@ -1181,14 +1192,16 @@ P010 用 sws 降到 8-bit I420，却仍按 10-bit 矩阵（`kBT2020_10bit_Limite
 
 #### 16.9.5 开关与默认
 
-- 零拷贝**只在 Windows + D3D12 后端 + `ASC_USE_SKIA`** 编译进来（`video_d3d.cc` 写在
-  `examples/video/video.build.json` 的 `${win:…}` 里）；其他构建里 `sk_video_d3d_image` 是静态
+- 零拷贝只在「GPU 窗口 + `ASC_USE_SKIA`」构建里编译进来：Windows 是 D3D（`video_d3d.cc` 写在
+  `examples/video/video.build.json` 的 `${win:…}` 里），macOS 是 `ASC_RENDER_METAL=1` 且注入
+  `video_metal.mm`（同一份清单的 `${mac:…}`，§16.13）。其他构建里 `sk_video_zc_image` 是静态
   兜底函数，返回 NULL，**不改变任何行为**。
 - 运行时 `AS_VIDEO_ZC=0|off` 关掉零拷贝（做 A/B 用）；默认开。
 - **默认解码是自适应**（`AS_VIDEO_DECODE` 未设 = `auto`）：能零拷贝就硬解，不能就软解，判据与
-  时点见 §16.9.6。`soft`/`cpu` 强制软解，`hw`/`d3d11va` 强制硬解（不要求零拷贝）。
-- `AS_VIDEO_STATS=1` 的 `decode=` 列区分三态：`soft` / `d3d11va-readback` /
-  `d3d11va-zero-copy`，并多两列 `zc=<帧数>` `starved=<饿死次数>`。
+  时点见 §16.9.6。`soft`/`cpu` 强制软解，`hw`/`d3d11va`/`videotoolbox` 强制硬解（不要求零拷贝）。
+- `AS_VIDEO_STATS=1` 的 `decode=` 列区分三态：`soft` / `<backend>-readback` /
+  `<backend>-zero-copy`（`<backend>` 在 Windows 是 `d3d11va`、macOS 是 `videotoolbox`），并多两列
+  `zc=<帧数>` `starved=<饿死次数>`。
 
 #### 16.9.6 自适应默认：软解起步、首个帧边界翻牌
 
@@ -1221,6 +1234,9 @@ P010 用 sws 降到 8-bit I420，却仍按 10-bit 矩阵（`kBT2020_10bit_Limite
 | `examples/video-headless.as` 默认（无窗口 ⇒ 软解） | — | — | — | 24 断言全绿 |
 
 无窗口时不会去建 D3D11 设备：`grctx == NULL` 就不升级，判定保持未决，无头程序一分钱不花。
+
+**macOS 走同一条状态机**：只是「建 D3D11 设备 + 共享 staging + 探针」换成「取 `MTLDevice` + 建
+`CVMetalTextureCache` + 试包一帧」，判据、时点、失败后的退路一字不改（实测见 §16.13.4）。
 
 ### 16.10 HDR10+ / HLG 在 SDR 屏幕上：能做，但默认关（2026-11-14 实测）
 
@@ -1594,8 +1610,139 @@ ASC_HDR=1 ASC_GPU_DUMP_AT=1 ASC_GPU_DUMP=temp/pq.bmp ./temp/hdrvid.exe
 ASC_HDR=1 ASC_HDR_WHITE=100 ASC_GPU_DUMP_AT=1 ./temp/hdrvid.exe
 # 核本身的精确性（不经 sws）
 clang -O0 -I vendor -o temp/pqprobe.exe temp/pqprobe.c vendor/video_hdr.c && ./temp/pqprobe.exe
-node --test --test-name-pattern='video' test/unit/*.ts      # 105 条
+node --test --test-name-pattern='video' test/unit/*.ts      # 115 条
 ```
+
+### 16.13 macOS 的零拷贝：VideoToolbox → CVMetalTextureCache（2026-11-19 实测）
+
+§16.9 把 Windows 的 `AV_PIX_FMT_D3D11 → 系统内存` 那一步拿掉了。macOS 上**同一个坑换了形状**：
+硬解帧是 `CVPixelBuffer`，它本身就是一块 `IOSurface`，FFmpeg 回读时仍然要 `av_hwframe_transfer_data`
+把它搬进系统内存，再 `sws` 转成 Skia 能采样的平面。所以「硬解在本机会不会赢」这个问题，
+macOS 和 Windows 上是**同一个问题**，答案也由同一把尺子量。
+
+#### 16.13.1 三路对照：同一支二进制、同一份 4K 10-bit 素材、真窗口 60 Hz、连续 12 s
+
+素材（本机自造，`ffmpeg` 的 `testsrc2` 转码，非第三方）：3840×2160 HEVC `yuv420p10le`、30 fps、360 帧、
+20 MB。窗口 1600×900，`stage.frameRate = 60`。
+
+| 路径 | 每帧 CPU 成本 | 应用帧 | 最差帧间隔 | 进程 CPU（12 s 墙钟） |
+|---|---|---|---|---|
+| 软解（默认，`threads=8`） | `conv=4.08` + `upload=1.30` ≈ **5.4 ms** | 706 ≈ **60.0 fps** | **63 ms** | 8.76 s（7.64 user + 1.12 sys） |
+| 硬解 + 回读（`AS_VIDEO_DECODE=hw AS_VIDEO_ZC=0`） | `hw=0.68` + `conv=8.5…8.9` + `upload=1.3…1.85` ≈ **10.7 ms** | 702 ≈ 59.9 fps | 34 ms | — |
+| **硬解 + 零拷贝（默认 `auto`）** | `dec=0.01` + `conv=0.05` + `upload=0.01` + `copy=0.06` ≈ **0.13 ms** | 707 ≈ **60.0 fps** | **24 ms** | **0.56 s**（0.39 + 0.17） |
+
+三路各跑 3 轮交错，上表是**中位数**（每帧成本的轮间波动 ≤ 5%，帧数差 ±3 帧）。`copy` 是提交开销
+（`CVMetalTextureCacheCreateTextureFromImage` ×2 + `TextureFromYUVATextures`），GPU 侧的工作是异步的，
+不进这个数。
+
+读法：
+
+- **回读在本机只花 0.68 ms**（Windows 同素材上要 11.25 ms），但硬解仍然比软解慢一倍：多出来的钱在
+  `conv` 上——`8.5` vs `4.08`。两路都要过一次 `sws` 到 I420（Skia 的 YUV 着色器只吃 8 位 4:2:0），
+  而**半平面 P010 → I420 比平面 yuv420p10le → I420 贵约一倍**。这是实测数字，机制未逐指令验证，
+  但结论与机制无关：**只把解码搬上 GPU、转换留在 CPU，就还是输**。
+- 零拷贝同时省掉回读**和**那次转换，所以「哪一段更贵」不再重要：每帧 0.13 ms，进程 CPU 降到 12 s 里
+  0.56 s（1.4% 一核），软解是 8.76 s（73%）。最差帧间隔也从 63 ms 降到 24 ms——对 60 Hz 就是
+  「每一帧都在下一帧到之前画完」。
+- 8 位素材同样成立（同一支二进制、3840×2160 H.264、30 fps）：软解 `conv=1.56 + upload=1.56` ≈ 3.1 ms，
+  回读 `hw=1.06 + conv=0.95 + upload=2.54` ≈ 4.6 ms，零拷贝 **0.06 ms**。
+
+#### 16.13.2 链路：Windows 四环，macOS 一环
+
+实现在 `vendor/video_metal.mm`（Objective-C++，Apple only），对 `vendor/video_glue.c` 暴露与
+`vendor/video_d3d.cc` 平行的四个 C 接口：`sk_video_mtl_image()` / `sk_video_mtl_probe()` /
+`sk_video_mtl_stats()` / `sk_video_mtl_forget()`。「FFmpeg 的 C 接缝里不认识 Skia」这条规矩不变。
+
+§16.9.2 的四环在这里只剩一环，因为载体不同：
+
+1. **解码切片 → 自己的共享 staging**：**不需要**。D3D11 的切片是 Texture2DArray 的一个 subresource，
+   必须 `CopySubresourceRegion` 到自己能共享的 staging 上；`CVPixelBuffer` 的 IOSurface **本来就是**
+   `MTLTexture` 的存储，`CVMetalTextureCacheCreateTextureFromImage` 只是把同一块内存包一层，**零 blit**。
+2. **GPU 侧同步**：**不需要**。Windows 是因为 D3D11 解码器与 D3D12 渲染器是两个设备，才需要共享 fence；
+   这里解码器与 Skia 在同一个 `MTLDevice` 上（`sk_mtl_device_ptr()` 就是 metal_glue 的那个 `g_device`），
+   Metal 自己的 hazard tracking 就够了。
+3. **plane 拆分**：**由 CV 直接给出**。`Y` 取 plane 0、`UV` 取 plane 1，各自一张纹理，不需要
+   `CopyTextureRegion` + barrier。
+4. **包成 SkImage**：`GrBackendTexture[2]` + `SkYUVAInfo(kY_UV, 420/422, yuv_cs)` →
+   `SkImages::TextureFromYUVATextures`，与 Windows 同一行代码、同一个颜色枚举。
+
+#### 16.13.3 四个必须显式处理的点（都是踩出来的，不是推测）
+
+1. **plane 布局从 `CVPixelBuffer` 的格式来，不从调用方的 `ten_bit` 来**。`x420`（10 位 4:2:0）把十位样本
+   放在 16 位字的**高位**（与 P010 同口径），所以 `R16Unorm`/`RG16Unorm` 采出来就是 0..1 的归一化值，
+   BT.2020 10-bit 矩阵照用；`x422` 是 4:2:2（ProRes 走这条，色度垂直不降采样）；`420v`/`420f` 是 8 位。
+   **证据不是文档，而是实测**：`AS_VIDEO_DEBUG=1` 在首帧打印 Y 平面采样最大值，本机读数是
+   `max=55296`（0xD800）——远大于 1023，说明十位确实在高位；若读数是 ≤1023 就是低位对齐，那
+   `R16Unorm` 会画出暗 60 多倍的画面（“能跑但颜色错”）。
+2. **`CVPixelBuffer` 的生命周期跟着 SkImage 走**。两张 `MTLTexture` 是它 IOSurface 的**视图**，
+   Skia 的 `SkImage` 又可能在显示列表里活很多帧；token 里 `CFRetain` 住像素缓冲，Skia 的释放回调里
+   才 `CFRelease`。漏了它不会崩，而是**画出被覆写过的帧**——最坏的那种 bug。
+3. **plane 几何必须等于画面几何**。行对齐由 `bytesPerRow` 承担（CV 会带进纹理），但 `plane` 的
+   **高度**若被对齐放大，用 `w×h` 的 YUVAInfo 包它就是把画面拉伸几个像素。这里显式比对
+   `CVPixelBufferGetWidthOfPlane/HeightOfPlane`，不等就返回 NULL 走回读，**不**赌「大概对」。
+4. **零拷贝只存在于 GPU 窗口**。`as_skia_gr_context()` 在 `ASC_RENDER_METAL` 下取
+   `sk_metal_get_context()`，它由 `sk_mtl_init()` 在窗口创建时建立；所以清单要同时有
+   `ASC_RENDER_WINGPU=1` + `ASC_RENDER_METAL=1` + `metal_glue.mm`。纯 CPU 光栅窗口（没有 GPU 后端）
+   的 `grctx` 是 NULL，视频仍走 `sws → BGRA`——那条路上 4K 10-bit 的 `conv` 是 16.6 ms/帧（本机实测），
+   与本节无关但要说清：**是「没开 GPU 窗口」，不是「零拷贝不可用」**。
+
+#### 16.13.4 自适应默认与 Windows 共用一把尺子
+
+`as_video_maybe_upgrade()`（§16.9.6）没有为 macOS 复制一份：`AS_VIDEO_DECODE` 未设即 `auto`，
+在**首个帧边界**问一次 `as_video_zc_available()`，能零拷贝才重开成硬解并 seek 回 0，否则一直软解
+（本机实测：`auto` 打出 `[video] auto: upgraded to GPU decode (3840x2160, P010)`，随后
+`decode=videotoolbox-zero-copy zc=357`）。两条平台差异只有一处、且是**数据**形态的：
+`AS_VIDEO_ZC_DEVICE` 在 Windows 是 1（接缝按 ID3D11Device 建表），在 Apple 是 0（一个进程一个
+MTLDevice，没有身份可传），所以 `hw_dev11` 在 Apple 上始终是 NULL、类型上也不引用 `AVD3D11VADeviceContext`。
+
+HDR 仍然保持 CPU 解码：`sk_gpu_hdr_active()` 在非 D3D 后端恒为 0，而 `AS_VIDEO_HDR=1` 时
+`as_video_hdr_wanted()` 为 1，`as_video_maybe_upgrade()` 直接标记 decided 不升级——与 §16.9.6 同一条判据。
+
+#### 16.13.5 颜色：两条独立路线画同一帧，差 ≤ 3
+
+零拷贝的快是可以骗人的（画错也很快），所以颜色必须单独比。`BitmapData.draw(video)` 走的是与上屏
+同一条内容分支，把两条路线各自画的 66 个采样点取出来比（320×180 缩略、固定网格）：
+
+| | 平均 R/G/B | 彩条读数（红/绿/黄/蓝/品/青） |
+|---|---|---|
+| 软解（`sws` → I420 → Skia YUV） | 113.6 / 118.5 / 137.4 | `255/0/0`、`0/255/0`、`254/254/0`、`0/0/254`、`254/0/253`、`0/255/255` |
+| 零拷贝（Skia 直接采 R16/RG16） | 113.3 / 117.3 / 137.4 | `252/0/0`、`0/255/0`、`252/255/0`、`0/1/253`、`254/0/252`、`0/255/253` |
+
+平均差 < 1.5，饱和色块差 ≤ 3（10 位 → 8 位的舍入不同：sws 与 Skia 用的不是同一个抖动）。若色矩阵
+或取值范围标错（例如 limited 当 full、BT.2020 当 BT.709），整幅会偏十几到几十，这个表会立刻炸。
+8 位路线同样比过（`420v` → R8/RG8）：平均 112.7/118.7/137.2 vs 113.6/117.9/138.7。
+
+#### 16.13.6 复现
+
+```bash
+# 夹具（本机自造，不进仓库）
+ffmpeg -f lavfi -i "testsrc2=size=3840x2160:rate=30:duration=12" \
+       -c:v libx265 -pix_fmt yuv420p10le -preset ultrafast -tag:v hvc1 temp/vt/sdr4k10.mp4
+# 探针（真窗口 60 Hz、12 s、enterFrame 记最差间隔）→ temp/vt/bench10g
+node src/index.ts temp/vt/bench10.as --manifest temp/vt/play.build.json -o temp/vt/bench10g
+
+AS_VIDEO_STATS=1 AS_VIDEO_DECODE=soft ./temp/vt/bench10g                    # 软解
+AS_VIDEO_STATS=1 AS_VIDEO_DECODE=hw AS_VIDEO_ZC=0 ./temp/vt/bench10g       # 硬解 + 回读
+AS_VIDEO_STATS=1 ./temp/vt/bench10g                                        # 自适应（零拷贝）
+/usr/bin/time -l env AS_VIDEO_DECODE=soft ./temp/vt/bench10g               # 进程 CPU
+
+node --test --test-name-pattern='video' test/unit/video.ts                 # 115 条
+```
+
+`temp/vt/play.build.json` 与 `examples/video/video.build.json` 的 macOS 分支是同形清单
+（`ASC_RENDER_WINGPU=1` + `ASC_RENDER_METAL=1` + `metal_glue.mm` + `video_metal.mm`）。
+
+#### 16.13.7 未做与边界
+
+- **iOS 未实测**：接缝本身与 macOS 同源（同一个 `AV_PIX_FMT_VIDEOTOOLBOX`），但 iOS 的
+  `MTLPixelFormatR16Unorm` 可过滤性、以及「AOT 不能在设备上下发可执行码」都还没验证，**不宣称可用**。
+- **`AS_VIDEO_ZC=0` 是唯一的多路共用的关闭手段**：`AS_VIDEO_DECODE=hw` 不受它影响（强制硬解仍会尝试
+  零拷贝），A/B 时必须两个一起给。
+- **多流共用一张纹理缓存**：`sk_video_mtl_forget()` 在任一条流关闭时丢掉整个 `CVMetalTextureCache`，
+  另一条流下一帧重建（微秒级）。已在飞行的 `SkImage` 各自持有 `MTLTexture` 引用，不受影响；
+  但这是「为了简单」而不是「最优」，若将来出现多流高频开关再改成引用计数。
+- **HDR 输出仍只有 Windows**：macOS 没有 scRGB 交换链这一步（§16.12 是 D3D 侧实现），
+  所以 macOS 上 `AS_VIDEO_HDR=1` 走的是 CPU tone map + BGRA，与零拷贝互斥——两条路线本来就不同时存在。
 
 ---
 

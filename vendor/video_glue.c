@@ -106,33 +106,86 @@ static float sk_gpu_hdr_white(void) { return 0.0f; }
 extern void sk_image_delete(void* image);
 #endif
 
-// Zero copy (V3 step 2, video.md §16.9): hand the D3D11 decoder slice straight to
-// the renderer's D3D12 device instead of reading it back. Only the Windows D3D12
-// backend has an implementation (vendor/video_d3d.cc); everywhere else the compile
-// silently has no such symbol and the measured CPU route stays the only route.
+// Zero copy (V3 step 2, video.md §16.9): hand the decoder's GPU picture straight to the
+// renderer's GPU instead of reading it back into system memory. Two backends implement
+// it and each is a separate translation unit behind a flat C ABI:
+//   * Windows/D3D12 -> vendor/video_d3d.cc : ID3D11Texture2D slice -> D3D12 plane textures
+//   * macOS/iOS     -> vendor/video_metal.mm : CVPixelBuffer (IOSurface) -> MTLTexture
+// Both return NULL to mean "no zero-copy this frame", which sends the frame down the
+// measured CPU route instead of failing. Everywhere else the compile has no such symbol
+// at all and the CPU route stays the only route.
 #if defined(ASC_RENDER_D3D) && ASC_RENDER_D3D && defined(ASC_USE_SKIA)
 #define AS_VIDEO_ZC 1
+#define AS_VIDEO_ZC_DEVICE 1   // the seam keys its table by the decoder's GPU device
 extern void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
                                 int ten_bit, int yuv_cs);
 extern int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit);
 extern void sk_video_d3d_stats(long long* frames, long long* starved);
 extern void sk_video_d3d_forget(void* d3d11_device);
+static void* sk_video_zc_image(void* ctx, void* tex, int slice, int w, int h, int ten_bit,
+                              int yuv_cs) {
+  return sk_video_d3d_image(ctx, tex, slice, w, h, ten_bit, yuv_cs);
+}
+static int sk_video_zc_probe(void* ctx, void* dev, int w, int h, int ten_bit) {
+  return sk_video_d3d_probe(ctx, dev, w, h, ten_bit);
+}
+static void sk_video_zc_stats(long long* frames, long long* starved) {
+  sk_video_d3d_stats(frames, starved);
+}
+static void sk_video_zc_forget(void* dev) { sk_video_d3d_forget(dev); }
+#elif defined(ASC_RENDER_METAL) && ASC_RENDER_METAL && defined(ASC_USE_SKIA)
+#define AS_VIDEO_ZC 1
+// No per-stream identity: the MTLDevice is process-wide and the seam's texture cache
+// is keyed to it, so there is nothing to hand over (and nothing to forget by address).
+#define AS_VIDEO_ZC_DEVICE 0
+extern void* sk_video_mtl_image(void* ctx, void* cvbuf, int w, int h, int ten_bit,
+                                int yuv_cs);
+extern int sk_video_mtl_probe(void* ctx, int w, int h, int ten_bit);
+extern void sk_video_mtl_stats(long long* frames, long long* starved);
+extern void sk_video_mtl_forget(void* device);
+static void* sk_video_zc_image(void* ctx, void* tex, int slice, int w, int h, int ten_bit,
+                              int yuv_cs) {
+  (void)slice;   // a CVPixelBuffer is the whole frame; the D3D slice index has no analogue
+  return sk_video_mtl_image(ctx, tex, w, h, ten_bit, yuv_cs);
+}
+static int sk_video_zc_probe(void* ctx, void* dev, int w, int h, int ten_bit) {
+  (void)dev;
+  return sk_video_mtl_probe(ctx, w, h, ten_bit);
+}
+static void sk_video_zc_stats(long long* frames, long long* starved) {
+  sk_video_mtl_stats(frames, starved);
+}
+static void sk_video_zc_forget(void* dev) { sk_video_mtl_forget(dev); }
 #else
 #define AS_VIDEO_ZC 0
-static void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
-                                int ten_bit, int yuv_cs) {
+#define AS_VIDEO_ZC_DEVICE 0
+static void* sk_video_zc_image(void* ctx, void* tex, int slice, int w, int h, int ten_bit,
+                              int yuv_cs) {
   (void)ctx; (void)tex; (void)slice; (void)w; (void)h; (void)ten_bit; (void)yuv_cs;
   return NULL;
 }
-static int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit) {
-  (void)ctx; (void)dev11; (void)w; (void)h; (void)ten_bit;
+static int sk_video_zc_probe(void* ctx, void* dev, int w, int h, int ten_bit) {
+  (void)ctx; (void)dev; (void)w; (void)h; (void)ten_bit;
   return 0;
 }
-static void sk_video_d3d_stats(long long* frames, long long* starved) {
+static void sk_video_zc_stats(long long* frames, long long* starved) {
   if (frames != NULL) *frames = 0;
   if (starved != NULL) *starved = 0;
 }
-static void sk_video_d3d_forget(void* d3d11_device) { (void)d3d11_device; }
+static void sk_video_zc_forget(void* dev) { (void)dev; }
+#endif
+
+// The GPU decode surface and device type differ per platform, and so does the frame
+// field that carries the picture: D3D11 keeps the texture in data[0] and the array
+// slice index in data[1], VideoToolbox keeps a CVPixelBufferRef in data[3].
+#ifdef __APPLE__
+#define AS_VIDEO_HW_PIX AV_PIX_FMT_VIDEOTOOLBOX
+#define AS_VIDEO_HW_DEV AV_HWDEVICE_TYPE_VIDEOTOOLBOX
+#define AS_VIDEO_HW_NAME "videotoolbox"
+#else
+#define AS_VIDEO_HW_PIX AV_PIX_FMT_D3D11
+#define AS_VIDEO_HW_DEV AV_HWDEVICE_TYPE_D3D11VA
+#define AS_VIDEO_HW_NAME "d3d11va"
 #endif
 
 #if !defined(ASC_USE_SKIA)
@@ -863,30 +916,31 @@ static void as_video_audio_out(as_video* v, AVFrame* f) {
 }
 
 // ---------------------------------------------------------------------------
-// Hardware decode: D3D11VA (video.md §12 V3, §16.8)
+// Hardware decode: D3D11VA on Windows, VideoToolbox on Apple (video.md §12 V3, §16.8)
 // ---------------------------------------------------------------------------
-// What this does and does not buy: the decode moves off the CPU, but every frame is
-// still transferred back to system memory before the colour conversion, so the
-// textures Skia sees are the same as on the software path. Zero-copy needs the plane
-// split described in §10.2 and is a separate step.
+// What this does and does not buy: the decode moves off the CPU, but a frame that has
+// no zero-copy route is still transferred back to system memory before the colour
+// conversion, so the textures Skia sees are the same as on the software path -- and
+// the transfer is what makes hardware LOSE (§16.8.3). The zero-copy seam
+// (vendor/video_d3d.cc / vendor/video_metal.mm) is what removes it.
 //
 // AS_VIDEO_DECODE=soft forces the software path (A/B diagnosis); unset or "auto"
 // tries the GPU and falls back without failing the stream -- a machine without a
-// usable D3D11 device has to keep playing the file.
-// AS_VIDEO_DECODE=hw|d3d11va|auto opts INTO the GPU decoder; unset or "soft" keeps the
-// software one. The default is software on purpose, and it is a measurement, not a
-// preference: on this host (32 cores, d3d11va live) the 4K HEVC HDR10+ file costs
-// hw=11.25 ms + conv=3.36 ms per frame for the GPU->system-memory transfer and the
-// colour pass, against dec+conv+upload = 6.7 ms per frame for the 8-thread software
-// decoder. The readback is what makes hardware lose -- it exists because zero-copy
-// is not implemented yet (§16.8), and once it is, this default flips.
+// usable GPU device has to keep playing the file.
+// AS_VIDEO_DECODE=hw|d3d11va|videotoolbox|auto forces the GPU decoder; unset or
+// "soft" keeps the software one.
+// Why the default had to change (§16.9): on the Windows host the 4K HEVC HDR10+ file
+// costs hw=11.25 ms + conv=3.36 ms per frame for the GPU->system-memory transfer and
+// the colour pass, against dec+conv+upload = 6.7 ms per frame for the 8-thread
+// software decoder. The readback is what makes hardware lose, and with the zero-copy
+// seam in place it is gone (§16.9.1: 0.27 ms/frame).
 // 0 = software, 1 = hardware forced, 2 = decide from what this machine can do.
 // Unset is AUTO, not software: §16.9 made software-vs-hardware a question with a
 // measured answer, so the default has to be "answer it", not "always software".
 static int as_video_decode_mode(void) {
   const char* want = getenv("AS_VIDEO_DECODE");
   if (want != NULL && (strcmp(want, "soft") == 0 || strcmp(want, "cpu") == 0)) return 0;
-  if (want != NULL && want[0] != 0 && strcmp(want, "auto") != 0) return 1;   // hw/d3d11va
+  if (want != NULL && want[0] != 0 && strcmp(want, "auto") != 0) return 1;   // hw/<backend>
   return 2;
 }
 
@@ -895,9 +949,9 @@ static enum AVPixelFormat as_video_get_format(AVCodecContext* ctx,
   (void)ctx;
   enum AVPixelFormat pick = AV_PIX_FMT_NONE;
   for (const enum AVPixelFormat* p = list; *p != AV_PIX_FMT_NONE; p++) {
-    if (*p == AV_PIX_FMT_D3D11) { pick = *p; break; }
+    if (*p == AS_VIDEO_HW_PIX) { pick = *p; break; }
   }
-  // No D3D11 surface offered (unsupported profile, or a build without the hwaccel):
+  // No GPU surface offered (unsupported profile, or a build without the hwaccel):
   // fall back to the first SOFTWARE format, never to another hardware one. Returning
   // dxva2_vld here is what produced "Invalid setup for format dxva2_vld: does not
   // match the type of the provided device context" -- the device we attached is
@@ -922,37 +976,35 @@ static enum AVPixelFormat as_video_get_format(AVCodecContext* ctx,
   return pick;
 }
 
-// Create the D3D11 device this stream would decode into, and report the ID3D11Device
-// behind it (the zero-copy probe needs that identity). Returns NULL when the build or
-// the driver cannot provide one -- such a machine must still play video, in software.
-static AVBufferRef* as_video_hw_create(const AVCodec* dec, void** dev11_out) {
-  if (dev11_out != NULL) *dev11_out = NULL;
-  int have_d3d11 = 0;
+// Create the GPU device this stream would decode into, and report the identity the
+// zero-copy seam keys its table by (Windows only: a D3D11VA device is per-stream,
+// while the Metal one is process-wide). Returns NULL when the build or the driver
+// cannot provide one -- such a machine must still play video, in software.
+static AVBufferRef* as_video_hw_create(const AVCodec* dec, void** zc_dev_out) {
+  if (zc_dev_out != NULL) *zc_dev_out = NULL;
+  int have_dev = 0;
   // Ask the BUILD what it registered instead of assuming: an "--enable-hwaccel=h264_d3d11va"
   // list produced a build whose only d3d11 entry was the legacy D3D11VA_VLD one, and
-  // nothing but this probe tells them apart (§16.8).
+  // nothing but this probe tells them apart (§16.8). Same question on Apple, where the
+  // videotoolbox hwaccels are an opt-out of the FFmpeg build (§16.13).
   for (int i = 0;; i++) {
     const AVCodecHWConfig* cfg = avcodec_get_hw_config(dec, i);
     if (cfg == NULL) break;
-    if (cfg->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+    if (cfg->device_type == AS_VIDEO_HW_DEV &&
         (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0) {
-      have_d3d11 = 1;
+      have_dev = 1;
       break;
     }
   }
-  if (!have_d3d11) return NULL;
+  if (!have_dev) return NULL;
   AVBufferRef* dev = NULL;
-  if (av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) return NULL;
-  // The ID3D11Device behind it, kept as an identity for the zero-copy seam's table
-  // (video_d3d.cc). It is NOT retained here: FFmpeg owns the device, and the entry is
-  // dropped BEFORE this stream releases it (see as_video_free_state) so the two sides
-  // never disagree about its lifetime.
-#if AS_VIDEO_ZC
+  if (av_hwdevice_ctx_create(&dev, AS_VIDEO_HW_DEV, NULL, NULL, 0) < 0) return NULL;
+#if AS_VIDEO_ZC && AS_VIDEO_ZC_DEVICE
   {
     const AVHWDeviceContext* hwc = (const AVHWDeviceContext*)dev->data;
-    if (hwc != NULL && hwc->type == AV_HWDEVICE_TYPE_D3D11VA) {
+    if (hwc != NULL && hwc->type == AS_VIDEO_HW_DEV) {
       const AVD3D11VADeviceContext* d3d = (const AVD3D11VADeviceContext*)hwc->hwctx;
-      if (d3d != NULL && dev11_out != NULL) *dev11_out = (void*)d3d->device;
+      if (d3d != NULL && zc_dev_out != NULL) *zc_dev_out = (void*)d3d->device;
     }
   }
 #endif
@@ -966,16 +1018,21 @@ static AVBufferRef* as_video_hw_create(const AVCodec* dec, void** dev11_out) {
 // Is a hardware frame going to reach the screen WITHOUT a readback? That is the only
 // shape in which the GPU wins: hardware plus av_hwframe_transfer_data measured
 // 13.4 ms/frame against software's 6.6 ms on the same 4K HDR10+ file (§16.8.3).
-static int as_video_zc_available(void* grctx, void* dev11, int w, int h, int ten_bit) {
+static int as_video_zc_available(void* grctx, void* zc_dev, int w, int h, int ten_bit) {
 #if AS_VIDEO_ZC
-  if (grctx == NULL || dev11 == NULL) return 0;
+  if (grctx == NULL) return 0;
+  // Windows keys the seam by the stream's own D3D11 device; Apple has nothing to key
+  // by (one MTLDevice for the process), so zc_dev stays NULL there by design.
+#if AS_VIDEO_ZC_DEVICE
+  if (zc_dev == NULL) return 0;
+#endif
   if (!as_video_zc_wanted()) return 0;
   // An HDR window changes what the decoder's frames have to become (linear F16 through
   // the CPU mapping), so the zero-copy route has nothing it can deliver there.
   if (sk_gpu_hdr_active()) return 0;
-  return sk_video_d3d_probe(grctx, dev11, w > 0 ? w : 16, h > 0 ? h : 16, ten_bit);
+  return sk_video_zc_probe(grctx, zc_dev, w > 0 ? w : 16, h > 0 ? h : 16, ten_bit);
 #else
-  (void)grctx; (void)dev11; (void)w; (void)h; (void)ten_bit;
+  (void)grctx; (void)zc_dev; (void)w; (void)h; (void)ten_bit;
   return 0;
 #endif
 }
@@ -984,7 +1041,7 @@ static int as_video_zc_available(void* grctx, void* dev11, int w, int h, int ten
 // zero-copy entry (it names the device), then drop our reference to the device.
 static void as_video_hw_detach(as_video* v) {
   if (v->vc != NULL) { av_buffer_unref(&v->vc->hw_device_ctx); v->vc->get_format = NULL; }
-  if (v->hw_dev11 != NULL) { sk_video_d3d_forget(v->hw_dev11); v->hw_dev11 = NULL; }
+  if (v->hw_dev11 != NULL) { sk_video_zc_forget(v->hw_dev11); v->hw_dev11 = NULL; }
   if (v->hw_device != NULL) av_buffer_unref(&v->hw_device);
 }
 
@@ -1082,7 +1139,8 @@ static void as_video_maybe_upgrade(as_video* v, void* grctx) {
     if (v->hw_device == NULL) {
       v->hw_refused = 1;
       if (getenv("AS_VIDEO_DEBUG") != NULL)
-        fprintf(stderr, "[video] auto: no usable D3D11VA device, staying in software\n");
+        fprintf(stderr, "[video] auto: no usable %s device, staying in software\n",
+                AS_VIDEO_HW_NAME);
       return;
     }
     const int ok = as_video_zc_available(grctx, v->hw_dev11, v->w, v->h, v->src_10bit);
@@ -1110,14 +1168,15 @@ static void as_video_maybe_upgrade(as_video* v, void* grctx) {
 static void as_video_free_state(as_video* v) {
   if (getenv("AS_VIDEO_STATS") != NULL && (v->n_vframes > 0 || v->n_aframes > 0)) {
     long long zc_frames = 0, zc_starved = 0;
-    sk_video_d3d_stats(&zc_frames, &zc_starved);
+    sk_video_zc_stats(&zc_frames, &zc_starved);
     fprintf(stderr,
             "[video] %s video_frames=%lld audio_frames=%lld w=%d h=%d pts=%.3f "
             "threads=%d decode=%s zc=%lld starved=%lld cost/frame: dec=%.2fms conv=%.2fms "
             "upload=%.2fms hw=%.2fms copy=%.2fms hdr=%s",
             v->url[0] ? v->url : "?", v->n_vframes, v->n_aframes, v->w, v->h, v->frame_pts,
             v->vc != NULL ? v->vc->thread_count : 0,
-            v->zc_used ? "d3d11va-zero-copy" : (v->hw_used ? "d3d11va-readback" : "soft"),
+            v->zc_used ? AS_VIDEO_HW_NAME "-zero-copy"
+                       : (v->hw_used ? AS_VIDEO_HW_NAME "-readback" : "soft"),
             zc_frames, zc_starved,
             v->n_vframes > 0 ? v->t_dec_ms / (double)v->n_vframes : 0.0,
             v->n_vframes > 0 ? v->t_conv_ms / (double)v->n_vframes : 0.0,
@@ -1158,11 +1217,16 @@ static void as_video_free_state(as_video* v) {
   if (v->frame != NULL) av_frame_free(&v->frame);
   if (v->aframe != NULL) av_frame_free(&v->aframe);
   if (v->sw_frame != NULL) av_frame_free(&v->sw_frame);
-  // Drop the zero-copy table entry BEFORE FFmpeg releases the device it names: every
+  // Drop the zero-copy entry BEFORE FFmpeg releases the device it names: every
   // image of this stream is already gone (drop_image and the queue above), so Skia's
   // release callbacks have run, and a device that is later re-created at the same
   // address must not inherit this entry's command context and textures.
-  if (v->hw_dev11 != NULL) { sk_video_d3d_forget(v->hw_dev11); v->hw_dev11 = NULL; }
+  //
+  // Called even when hw_dev11 is NULL -- on Apple it is NULL by design (the MTLDevice
+  // is process-wide), and the seam still has a CVMetalTextureCache of its own to drop.
+  // Both implementations accept NULL (D3D returns early, Metal ignores the argument).
+  sk_video_zc_forget(v->hw_dev11);
+  v->hw_dev11 = NULL;
   // Our own reference only: the decoder context holds its own, and it is released
   // below by avcodec_free_context.
   if (v->hw_device != NULL) av_buffer_unref(&v->hw_device);
@@ -1188,25 +1252,32 @@ static int as_video_drain_video(as_video* v, void* grctx, int* frames_out, doubl
     v->t_dec_ms += as_video_ms() - t_dec0;
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
     if (rc < 0) { as_vs_error(v, "video decode", rc); v->failed = 1; break; }
-    if (v->frame->format == AV_PIX_FMT_D3D11) {
-      // Zero copy first (V3 step 2, video.md §16.9): decoder texture -> D3D12 plane
-      // textures -> SkImage, never through system memory. NULL is a normal answer and
-      // the readback below is the fallback -- no GPU backend, both texture slots still
-      // referenced by Skia, a driver that refused the shared staging texture.
+    if (v->frame->format == AS_VIDEO_HW_PIX) {
+      // Zero copy first (V3 step 2, video.md §16.9): the decoder's GPU picture becomes
+      // an SkImage without ever touching system memory. NULL is a normal answer and the
+      // readback below is the fallback -- no GPU backend, the seam's slots still
+      // referenced by Skia, a plane layout the seam cannot describe.
       void* zc_img = NULL;
+#ifdef __APPLE__
+      // VideoToolbox keeps the CVPixelBufferRef in data[3]; data[0] is not the picture.
+      void* zc_tex = (void*)v->frame->data[3];
+      const int zc_slice = 0;
+#else
+      void* zc_tex = (void*)v->frame->data[0];
+      const int zc_slice = (int)(intptr_t)v->frame->data[1];
+#endif
       if (getenv("AS_VIDEO_DEBUG") != NULL && !v->zc_traced) {
         v->zc_traced = 1;
-        fprintf(stderr, "[zc] %s build=%d grctx=%p data0=%p want=%d w=%d h=%d ten=%d\n",
-                v->url, AS_VIDEO_ZC, grctx, v->frame->data[0], as_video_zc_wanted(),
+        fprintf(stderr, "[zc] %s build=%d grctx=%p tex=%p want=%d w=%d h=%d ten=%d\n",
+                v->url, AS_VIDEO_ZC, grctx, zc_tex, as_video_zc_wanted(),
                 v->frame->width, v->frame->height, as_video_ten_bit(v->frame));
       }
-      if (grctx != NULL && v->frame->data[0] != NULL && as_video_zc_wanted() &&
+      if (grctx != NULL && zc_tex != NULL && as_video_zc_wanted() &&
           v->hdr == NULL && !sk_gpu_hdr_active()) {
         const double t_z0 = as_video_ms();
-        zc_img = sk_video_d3d_image(grctx, (void*)v->frame->data[0],
-                                    (int)(intptr_t)v->frame->data[1],
-                                    v->frame->width, v->frame->height,
-                                    as_video_ten_bit(v->frame), as_video_sk_cs(v->frame));
+        zc_img = sk_video_zc_image(grctx, zc_tex, zc_slice,
+                                   v->frame->width, v->frame->height,
+                                   as_video_ten_bit(v->frame), as_video_sk_cs(v->frame));
         v->t_zc_ms += as_video_ms() - t_z0;
         if (zc_img != NULL) {
           v->n_zc++;

@@ -8,7 +8,8 @@
 > no demuxer, no video decoder, and no video clock.
 >
 > **Status: V1 is implemented and verified (2026-11-13, see §16); V3 hardware decode and its zero-copy path are
-> wired up and measured (2026-11-14, see §16.8/§16.9); HDR10+/HLG tone mapping exists but is off by default (§16.10); V2 and the transport surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
+> wired up and measured on Windows (2026-11-14, see §16.8/§16.9) and on macOS/VideoToolbox (2026-11-19, see §16.13);
+> HDR10+/HLG tone mapping exists but is off by default (§16.10); V2 and the transport surface are not scheduled.** §1 is the **pre-implementation** snapshot (2026-11-12), kept because the starting
 > point is what motivated every trade-off below; §16 is the authoritative description of the code as it stands:
 > `NetStream` / `Video` / `NetConnection` follow AIR semantics, decode goes through FFmpeg (software), and the
 > 31 assertions in `examples/video/` all pass in a real window.
@@ -250,9 +251,10 @@ hwaccel, so **the software decoder is already in the binary**. Windows `d3d11va`
 "probe failed → switch back to software" is one backend swap with the demux and parsing code untouched. Doing the
 same fallback with hand-written VT/MF means maintaining two state machines.
 
-> **Where the implementation stands (2026-11-13)**: V1 is **software only** — `video-backend` accepts
-> `auto`/`soft` and they are identical, because `auto` has no hardware backend to probe yet (V2 = macOS VT +
-> `CVMetalTextureCache` zero copy, V3 = Windows D3D11VA). That does not mean "4K cannot play": software 4K
+> **Where the implementation stands (written 2026-11-13, updated 2026-11-19)**: V1 is **software only** —
+> `video-backend` accepts `auto`/`soft` and they are identical; at the time `auto` had no hardware backend to probe
+> (V2 = macOS VT + `CVMetalTextureCache` zero copy, V3 = Windows D3D11VA). **Both have since landed and been
+> measured** (Windows §16.8/§16.9, macOS §16.13), and `auto` now means "go hardware only when zero copy works". That does not mean "4K cannot play": software 4K
 > 10-bit HEVC measures 8.8 ms/frame on one thread and is fully hidden with 8 threads. The reported "4K stutters
 > to the point of being unwatchable" traced to converting twice + single-threaded decode + a 24 Hz frame clock +
 > CPU raster, measured and fixed item by item in §16.7. What hwaccel buys here is the 6 ms of `conv` and the CPU
@@ -667,7 +669,7 @@ drop `video-formats` to `air` (which excludes HEVC/DTS/TrueHD); no code change n
 
 | Target | Demux | Decode | Encode (publish) | Output | Notes |
 |---|---|---|---|---|---|
-| macOS arm64 | FFmpeg | **VideoToolbox (target shape, not implemented)**: h264, hevc, mpeg1/2/4, h263, prores, vp9; the rest software | `h264_videotoolbox` + `aac` (system hardware) | **`CVPixelBuffer` → `CVMetalTextureCache` → `GrBackendTexture` (zero copy, target shape)** | arm64 software decode uses NEON, no extra assembler needed |
+| macOS arm64 | FFmpeg | **VideoToolbox (default, implemented)**: h264, hevc, mpeg1/2/4, h263, prores, vp9; the rest software | `h264_videotoolbox` + `aac` (system hardware) | **`CVPixelBuffer` (IOSurface) → `CVMetalTextureCache` planes → `MTLTexture` ×2 → `GrBackendTexture[2]` → `SkImages::TextureFromYUVATextures` (zero copy, §16.13)** | arm64 software decode uses NEON, no extra assembler needed |
 | Windows x64 | FFmpeg | **D3D11VA (default)**: h264, hevc, mpeg2, vc1, vp9, av1, wmv3; the rest software (DXVA2 for older systems) | `h264_mf` + `aac` (MediaFoundation, **not verified on hardware**) | `ID3D11Texture2D` → `GrBackendTexture` | software SIMD needs nasm/yasm (see `checks.ts`) |
 | Linux | FFmpeg | software; VAAPI optional (h264/hevc/vp9/av1, **unverified**) | `h264_vaapi` (**needs a GPU**; no software fallback → `publish()` errors without a render node) | `AV_PIX_FMT_YUV420P` → Skia YUV direct render | builds via the ELF target |
 | Web (`--target wasm --package web`) | browser | **browser-native** (`<video>` / WebCodecs) | browser (`MediaRecorder` / WebCodecs); needs `NetStream.appendBytes` to produce its own bitstream | canvas → WebGL/WebGPU | **do not compile FFmpeg into wasm** |
@@ -676,13 +678,15 @@ drop `video-formats` to `air` (which excludes HEVC/DTS/TrueHD); no code change n
 | **Android (reserved, no target yet)** | FFmpeg | **MediaCodec** (FFmpeg only wraps it as a codec, **there is no unified hwaccel framework**); otherwise software | `h264_mediacodec` (unverified) | `AHardwareBuffer` → `EGLImage` → `GrBackendTexture` | needs an NDK build; **the one target that needs a bespoke hardware bridge** — do not assume it is shaped like the desktop ones |
 
 **Implementation status (checked against code and measurements, 2026-11-19)**: the Decode and Output columns describe the
-**target shape**, not what each target already does. As of v0.4.419 **only Windows x64 has D3D11VA hardware decode plus
-zero copy** landed and measured on hardware (§16.8, §16.9; 4K HDR10+ at 60 Hz in a real window, 0.27 ms/frame).
-**macOS is software decode + `sws`→BGRA today**: `as_video_hw_create()` (`vendor/video_glue.c:928`) only creates an
-`AV_HWDEVICE_TYPE_D3D11VA` device, and `vendor/video_d3d.cc` is the only zero-copy seam, so the 4K 10-bit `conv`
-(measured 6.13 ms/frame) is paid on every frame on macOS. iOS / Android / Linux-VAAPI are target shapes too (the two
-mobile targets are not even supported as `--target` values). §4's "implementation status" note says the same thing: do not
-read the table alone and assume it is all landed.
+**target shape**, not what each target already does. As of v0.4.421 **Windows x64 has D3D11VA hardware decode plus zero
+copy** landed and measured on hardware (§16.8, §16.9; 4K HDR10+ at 60 Hz in a real window, 0.27 ms/frame), and so does
+**macOS arm64 with VideoToolbox** (§16.13; same machine class, 4K 10-bit at 60 Hz in a real window, 0.13 ms/frame).
+macOS's seam is `vendor/video_metal.mm`, the parallel of `vendor/video_d3d.cc`: both turn a decoded GPU picture into
+Skia YUVA textures, but the Apple side's carrier is a `CVPixelBuffer` (already an IOSurface, so no blit at all) while
+the Windows side has to split plane slices across D3D11/D3D12. iOS / Android / Linux-VAAPI are still target shapes (the
+two mobile targets are not even supported as `--target` values; iOS shares the macOS seam, differing only in permissions
+and target). §4's "implementation status" note says the same thing: do not read the table alone and assume it is all
+landed.
 
 **The format surface is asymmetric across targets** (recorded explicitly — we must not claim "identical on all
 targets"):
@@ -745,8 +749,8 @@ the native manifest carries the FFmpeg `link-libs`, the web manifest does not. T
 |---|---|---|
 | V0 | **Settle this document + trim measurement**: build each profile, measure linked size, the hwaccel marginal cost, and 1080p throughput for both decode paths | **done 2026-11-12**: numbers in §3/§7; reproducible via `vendor/provision/ffmpeg-static.sh` (tracked) |
 | V1 | **Decode seam + software + the injection gate + three format profiles**: `as_video_*` takes `backend` and `formats`; land `usesVideoCodec` / `video` / `video-formats`; containers `mov,flv,matroska,mpegts,mp3,aac,ogg,wav`, video `h264,hevc,vp9,av1` software, audio `aac,mp3,opus,vorbis,flac`; `onMetaData` + audible audio | `examples/video.as` plays a bundled sample; item-by-item parity with `adl` (`videoWidth/Height`, `time`, `onMetaData`); **format matrix self-test**: at least one clip per container×codec yields both sound and picture; examples that do not touch video keep their size (§5.8)  **Completed 2026-11-13** (implementation status, measured numbers and reproduction: §16; the cost split of a real 4K source: §16.7) |
-| V2 | **macOS hardware decode + zero-copy presentation**: `videotoolbox` backend covering all 8 hwaccels (h264/hevc/mpeg1/2/4/h263/prores/vp9) + `CVMetalTextureCache` bridge; probe failure falls back silently | A/B on the same source: user CPU, wall clock, bridge cost; forcing VT off must fall back silently rather than produce a black screen; HEVC 1080p run both ways |
-| V3 | **Windows D3D11VA backend** (7 hwaccels) + `pause/seek` + buffering states + the `NetStream.Play.*` event sequence | parity with `adl`; identical behaviour from one `.as` on all three targets (backend differences confined to pixel formats) |
+| V2 | **macOS hardware decode + zero-copy presentation**: `videotoolbox` backend covering all 8 hwaccels (h264/hevc/mpeg1/2/4/h263/prores/vp9) + `CVMetalTextureCache` bridge; probe failure falls back silently  **Completed 2026-11-19** (`vendor/video_metal.mm`; the three-route A/B, the colour comparison and the `AS_VIDEO_ZC=0` readback control are in §16.13) | A/B on the same source: user CPU, wall clock, bridge cost; forcing VT off must fall back silently rather than produce a black screen; HEVC 1080p run both ways; **zero-copy proof**: either a source swap (`TextureFromYUVAPixmaps`) or the `AS_VIDEO_ZC=0` readback route must show a measurable difference (no difference = zero copy was not really happening) — this round used the latter: 10.7 → 0.13 ms/frame, process CPU 8.76 → 0.56 s (§16.13.1) |
+| V3 | **Hardware decode + zero-copy presentation + an adaptive default**: a Windows D3D11VA backend (7 hwaccels, §16.8/§16.9) and a macOS VideoToolbox one (8 hwaccels, §16.13), each with its own zero-copy seam and with the "hardware only when zero copy works" default; plus `pause/seek`, buffering states and the `NetStream.Play.*` event sequence | parity with `adl`; identical behaviour from one `.as` on all three targets (backend differences confined to pixel formats) |
 | V4 | Transport (**read**): `http:` progressive → **HLS** (`hls`+`mpegts`+`crypto`, already in `broad`) → RTMP/RTSP (FFmpeg's native protocols, **no librtmp**) | AIR's `NetStream.Play.*` sequence; HLS live latency/catch-up policy captured as a reproducible test |
 | V5 | **publish output surface (write)**: `NetStream.publish()` + `appendBytes()` (a native AIR API that feeds already-encoded data, bypassing capture devices) + `flv` muxing + hardware H.264/AAC + `rtmp`/`rtmps` pushing; the build side was already paid in V0 (§6.1) | verify against `ffmpeg -listen 1 -i rtmp://127.0.0.1:1935/live/x` as the receiving end; the `appendBytes` path needs no capture device; a machine without a hardware encoder must fail with a clear error, never silently |
 | V6 (enhancement, opt-in) | `all` profile (VVC, `libdav1d`, DASH via `libxml2`), multi-audio/subtitle track selection, `StageVideo` | explicitly labelled enhancement, off by default |
@@ -1166,14 +1170,16 @@ FFmpeg frees the device the address can be reused, and a stale entry means a dea
 
 #### 16.9.5 Switches and defaults
 
-- Zero copy is compiled in **only on Windows with the D3D12 backend and `ASC_USE_SKIA`** (`video_d3d.cc` is a
-`${win:…}` source in `examples/video/video.build.json`). Every other build gets a static stub returning NULL,
-so nothing changes for it.
+- Zero copy is compiled in only for builds with a GPU window and `ASC_USE_SKIA`: on Windows that is D3D
+(`video_d3d.cc`, a `${win:…}` source in `examples/video/video.build.json`), on macOS it needs
+`ASC_RENDER_METAL=1` and `video_metal.mm` injected (the `${mac:…}` entries of the same manifest, §16.13). Every
+other build gets a static stub returning NULL, so nothing changes for it.
 - `AS_VIDEO_ZC=0|off` turns it off at runtime (for A/B); it is on by default.
 - **The default decoder is adaptive** (`AS_VIDEO_DECODE` unset = `auto`): hardware when zero copy works,
 software when it does not — see §16.9.6 for the test and the moment it runs. `soft`/`cpu` force the CPU;
-`hw`/`d3d11va` force the GPU (and do not require zero copy).
-- `AS_VIDEO_STATS=1` reports three decode states — `soft`, `d3d11va-readback`, `d3d11va-zero-copy` — plus
+`hw`/`d3d11va`/`videotoolbox` force the GPU (and do not require zero copy).
+- `AS_VIDEO_STATS=1` reports three decode states — `soft`, `<backend>-readback`, `<backend>-zero-copy`
+(`<backend>` is `d3d11va` on Windows and `videotoolbox` on macOS) — plus
 `zc=<frames>` and `starved=<count>`.
 
 #### 16.9.6 The adaptive default: start in software, decide at the first frame boundary
@@ -1214,6 +1220,10 @@ Three routes with one binary ("default" = no `AS_VIDEO_*` set):
 
 With no window there is no D3D11 device at all: `grctx == NULL` leaves the decision undecided (not
 "software"), so a headless program pays nothing and a windowed app that paints later still gets the GPU.
+
+**macOS runs the same state machine**: only "create a D3D11 device + shared staging + probe" becomes
+"take the `MTLDevice` + create a `CVMetalTextureCache` + try to wrap one frame"; the test, the moment and the
+fallback after a failure are unchanged (measured in §16.13.4).
 
 ### 16.10 HDR10+ / HLG on an SDR screen: supported, and off by default (measured 2026-11-14)
 
@@ -1657,8 +1667,150 @@ ASC_HDR=1 ASC_GPU_DUMP_AT=1 ASC_GPU_DUMP=temp/pq.bmp ./temp/hdrvid.exe
 ASC_HDR=1 ASC_HDR_WHITE=100 ASC_GPU_DUMP_AT=1 ./temp/hdrvid.exe
 # the kernel itself, without sws
 clang -O0 -I vendor -o temp/pqprobe.exe temp/pqprobe.c vendor/video_hdr.c && ./temp/pqprobe.exe
-node --test --test-name-pattern='video' test/unit/*.ts      # 105 checks
+node --test --test-name-pattern='video' test/unit/*.ts      # 115 checks
 ```
+
+### 16.13 Zero copy on macOS: VideoToolbox → CVMetalTextureCache (measured 2026-11-19)
+
+§16.9 removed the Windows step `AV_PIX_FMT_D3D11 → system memory`. On macOS the **same wall has a different
+shape**: a hardware frame is a `CVPixelBuffer`, which is itself an `IOSurface`, and FFmpeg's readback still runs
+`av_hwframe_transfer_data` to move it into system memory before `sws` turns it into planes Skia can sample. So
+"does hardware decode win on this host" is the **same question** on both platforms, and the same ruler answers it.
+
+#### 16.13.1 Three routes: one binary, one 4K 10-bit source, real window at 60 Hz, 12 s continuous
+
+The source (built locally with `ffmpeg` from `testsrc2`, not third-party): 3840×2160 HEVC `yuv420p10le`, 30 fps,
+360 frames, 20 MB. Window 1600×900, `stage.frameRate = 60`.
+
+| Route | Per-frame CPU cost | App frames | Worst frame gap | Process CPU (12 s wall) |
+|---|---|---|---|---|
+| Software (default, `threads=8`) | `conv=4.08` + `upload=1.30` ≈ **5.4 ms** | 706 ≈ **60.0 fps** | **63 ms** | 8.76 s (7.64 user + 1.12 sys) |
+| Hardware + readback (`AS_VIDEO_DECODE=hw AS_VIDEO_ZC=0`) | `hw=0.68` + `conv=8.5…8.9` + `upload=1.3…1.85` ≈ **10.7 ms** | 702 ≈ 59.9 fps | 34 ms | — |
+| **Hardware + zero copy (default `auto`)** | `dec=0.01` + `conv=0.05` + `upload=0.01` + `copy=0.06` ≈ **0.13 ms** | 707 ≈ **60.0 fps** | **24 ms** | **0.56 s** (0.39 + 0.17) |
+
+Each route ran three interleaved rounds; the table is the **median** (per-frame cost varies ≤ 5 % between rounds,
+frame counts by ±3). `copy` is submission cost (`CVMetalTextureCacheCreateTextureFromImage` ×2 +
+`TextureFromYUVATextures`); the GPU work is asynchronous and does not appear there.
+
+How to read it:
+
+- **The readback costs only 0.68 ms here** (11.25 ms for the same kind of source on Windows), and hardware decode
+  *still* loses to software by 2×: the money moved into `conv` — `8.5` against `4.08`. Both routes make one `sws`
+  pass to I420 (Skia's YUV shader only takes 8-bit 4:2:0), and **semi-planar P010 → I420 measures about twice
+  planar yuv420p10le → I420**. That is a measured number, not an instruction-level explanation, but the conclusion
+  does not depend on the mechanism: **moving only the decode onto the GPU and leaving the conversion on the CPU
+  still loses.**
+- Zero copy removes the readback **and** that conversion, so which of the two was more expensive stops mattering:
+  0.13 ms/frame, process CPU down to 0.56 s out of 12 s (1.4 % of a core) against software's 8.76 s (73 %). The
+  worst frame gap drops from 63 ms to 24 ms — at 60 Hz that is "every frame is painted before the next one lands".
+- 8-bit sources behave the same (same binary, 3840×2160 H.264, 30 fps): software `conv=1.56 + upload=1.56` ≈ 3.1 ms,
+  readback `hw=1.06 + conv=0.95 + upload=2.54` ≈ 4.6 ms, zero copy **0.06 ms**.
+
+#### 16.13.2 The chain: four stages on Windows, one here
+
+The implementation is `vendor/video_metal.mm` (Objective-C++, Apple only) and it exposes four C entry points to
+`vendor/video_glue.c`, parallel to `vendor/video_d3d.cc`: `sk_video_mtl_image()` / `sk_video_mtl_probe()` /
+`sk_video_mtl_stats()` / `sk_video_mtl_forget()`. The rule "the FFmpeg C seam knows nothing about Skia" is unchanged.
+
+Of §16.9.2's four stages only one survives, because the carrier is different:
+
+1. **Decoded slice → own shared staging: not needed.** A D3D11 slice is one subresource of a Texture2DArray and has
+   to be `CopySubresourceRegion`'d into a staging texture that can be shared; a `CVPixelBuffer`'s IOSurface **is**
+   the `MTLTexture`'s storage, so `CVMetalTextureCacheCreateTextureFromImage` only wraps that memory — **zero blit**.
+2. **GPU-side sync: not needed.** Windows needs a shared fence because the D3D11 decoder and the D3D12 renderer are
+   two devices; here the decoder and Skia are on the same `MTLDevice` (`sk_mtl_device_ptr()` returns metal_glue's
+   `g_device`), so Metal's own hazard tracking covers it.
+3. **Plane split: the CV cache hands it over.** Plane 0 is Y, plane 1 is UV, one texture each — no
+   `CopyTextureRegion` and no barrier.
+4. **Wrap into an SkImage**: `GrBackendTexture[2]` + `SkYUVAInfo(kY_UV, 420/422, yuv_cs)` →
+   `SkImages::TextureFromYUVATextures`, the same line of code and the same colour enum as Windows.
+
+#### 16.13.3 Four things that must be handled explicitly (all found by testing, not guessed)
+
+1. **The plane layout comes from the `CVPixelBuffer`'s format, not from the caller's `ten_bit`.** `x420` (10-bit
+   4:2:0) stores its ten significant bits in the **high** half of a 16-bit word (the P010 packing), so
+   `R16Unorm`/`RG16Unorm` sample a normalised 0..1 value and the BT.2020 10-bit matrix applies unchanged; `x422` is
+   4:2:2 (the ProRes path, no vertical chroma decimation); `420v`/`420f` are 8-bit. **The evidence is a measurement,
+   not the documentation**: `AS_VIDEO_DEBUG=1` prints the max Y-plane sample of the first frame, and this host reads
+   `max=55296` (0xD800) — far above 1023, so the ten bits really are high-aligned. A reading of ≤ 1023 would mean
+   low-aligned, and `R16Unorm` would then paint a picture ~60× too dark ("runs, but the colour is wrong").
+2. **The `CVPixelBuffer`'s lifetime follows the SkImage.** Both `MTLTexture`s are **views** into its IOSurface, and
+   the `SkImage` can live in the display list for many frames; the token `CFRetain`s the pixel buffer and Skia's
+   release callback is the only `CFRelease`. Without it nothing crashes — it **paints a frame that has been
+   overwritten**, which is the worst kind of bug.
+3. **Plane geometry must equal picture geometry.** Row padding is carried by `bytesPerRow` (the CV cache hands it to
+   the texture), but a plane **height** aligned upwards would be stretched by an `w×h` YUVAInfo. The code compares
+   `CVPixelBufferGetWidthOfPlane/HeightOfPlane` and returns NULL (readback route) on a mismatch instead of betting on
+   "close enough".
+4. **Zero copy only exists in a GPU window.** Under `ASC_RENDER_METAL`, `as_skia_gr_context()` returns
+   `sk_metal_get_context()`, which `sk_mtl_init()` creates with the window; a manifest therefore needs
+   `ASC_RENDER_WINGPU=1` + `ASC_RENDER_METAL=1` + `metal_glue.mm`. A pure CPU-raster window has a NULL `grctx` and
+   video stays on `sws → BGRA` — where 4K 10-bit costs `conv=16.6 ms/frame` (measured here). Unrelated to this
+   section, but worth stating plainly: that is "the GPU window is not on", not "zero copy is unavailable".
+
+#### 16.13.4 The adaptive default shares one ruler with Windows
+
+`as_video_maybe_upgrade()` (§16.9.6) was not duplicated for macOS: `AS_VIDEO_DECODE` unset means `auto`, which asks
+`as_video_zc_available()` once at the **first frame boundary** and only then reopens on the GPU and seeks back to 0;
+otherwise it stays software (measured here: `auto` prints
+`[video] auto: upgraded to GPU decode (3840x2160, P010)` and later `decode=videotoolbox-zero-copy zc=357`). The two
+platforms differ in exactly one place, and it is a **data**-shaped one: `AS_VIDEO_ZC_DEVICE` is 1 on Windows (the
+seam keys its table by the ID3D11Device) and 0 on Apple (one MTLDevice per process, no identity to pass), so
+`hw_dev11` is always NULL on Apple and the Apple build never references `AVD3D11VADeviceContext`.
+
+HDR keeps the CPU decode for the same reason as §16.9.6: `sk_gpu_hdr_active()` is 0 on every non-D3D backend, and
+with `AS_VIDEO_HDR=1` `as_video_hdr_wanted()` is 1, so `as_video_maybe_upgrade()` marks the question decided and
+never upgrades.
+
+#### 16.13.5 Colour: two independent routes draw the same frame, within 3
+
+Zero copy being fast proves nothing about being right (a wrong picture is fast too), so the colour is compared
+separately. `BitmapData.draw(video)` uses the same content branch as presentation, so 66 fixed sample points from
+each route (320×180 thumbnail, fixed grid) can be compared directly:
+
+| | Mean R/G/B | Colour-bar readings (red/green/yellow/blue/magenta/cyan) |
+|---|---|---|
+| Software (`sws` → I420 → Skia YUV) | 113.6 / 118.5 / 137.4 | `255/0/0`, `0/255/0`, `254/254/0`, `0/0/254`, `254/0/253`, `0/255/255` |
+| Zero copy (Skia samples R16/RG16) | 113.3 / 117.3 / 137.4 | `252/0/0`, `0/255/0`, `252/255/0`, `0/1/253`, `254/0/252`, `0/255/253` |
+
+Mean difference < 1.5, saturated bars within 3 (10-bit → 8-bit rounding differs: sws and Skia do not share a dither).
+A wrong matrix or range (limited read as full, BT.2020 as BT.709) would shift the whole frame by tens and blow this
+table up immediately. The 8-bit route was compared the same way (`420v` → R8/RG8): 112.7/118.7/137.2 against
+113.6/117.9/138.7.
+
+#### 16.13.6 Reproduce
+
+```bash
+# Fixture (built locally, not committed)
+ffmpeg -f lavfi -i "testsrc2=size=3840x2160:rate=30:duration=12" \
+       -c:v libx265 -pix_fmt yuv420p10le -preset ultrafast -tag:v hvc1 temp/vt/sdr4k10.mp4
+# Probe (real window, 60 Hz, 12 s, enterFrame records the worst gap) -> temp/vt/bench10g
+node src/index.ts temp/vt/bench10.as --manifest temp/vt/play.build.json -o temp/vt/bench10g
+
+AS_VIDEO_STATS=1 AS_VIDEO_DECODE=soft ./temp/vt/bench10g                    # software
+AS_VIDEO_STATS=1 AS_VIDEO_DECODE=hw AS_VIDEO_ZC=0 ./temp/vt/bench10g       # hardware + readback
+AS_VIDEO_STATS=1 ./temp/vt/bench10g                                        # adaptive (zero copy)
+/usr/bin/time -l env AS_VIDEO_DECODE=soft ./temp/vt/bench10g               # process CPU
+
+node --test --test-name-pattern='video' test/unit/video.ts                 # 115 checks
+```
+
+`temp/vt/play.build.json` is the same shape as the macOS branch of `examples/video/video.build.json`
+(`ASC_RENDER_WINGPU=1` + `ASC_RENDER_METAL=1` + `metal_glue.mm` + `video_metal.mm`).
+
+#### 16.13.7 Not done, and the boundaries
+
+- **iOS is not measured**: the seam is the same lineage (same `AV_PIX_FMT_VIDEOTOOLBOX`), but whether
+  `MTLPixelFormatR16Unorm` is filterable there, and the fact that iOS forbids shipping executable code, are both
+  unverified — **not claimed to work**.
+- **`AS_VIDEO_ZC=0` is the only shared off switch**: `AS_VIDEO_DECODE=hw` ignores it (forced hardware still tries
+  zero copy), so an A/B needs both.
+- **All streams share one texture cache**: `sk_video_mtl_forget()` drops the whole `CVMetalTextureCache` when any
+  stream closes and the next frame rebuilds it (microseconds). In-flight `SkImage`s each hold their own `MTLTexture`
+  reference, so they are unaffected; this is "for simplicity", not "optimal", and it becomes refcounting if
+  many-stream, high-rate open/close ever shows up.
+- **HDR output is still Windows-only**: macOS has no scRGB swap-chain step (§16.12 is the D3D side), so on macOS
+  `AS_VIDEO_HDR=1` means CPU tone map + BGRA, mutually exclusive with zero copy — the two routes never coexist.
 
 ---
 

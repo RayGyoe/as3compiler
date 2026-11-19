@@ -13,7 +13,9 @@
     "../../vendor/video_glue.c",
     "../../vendor/video_hdr.c",
     "${win:../../vendor/d3d_glue.cc}",
-    "${win:../../vendor/video_d3d.cc}"
+    "${win:../../vendor/video_d3d.cc}",
+    "${mac:../../vendor/metal_glue.mm}",
+    "${mac:../../vendor/video_metal.mm}"
   ],
   "include-paths": [
     "../../vendor/skia",
@@ -92,7 +94,9 @@
     "ASC_USE_WINDOW=1",
     "ASC_HAVE_AUDIO=1",
     "${win:ASC_RENDER_WINGPU=1}",
-    "${win:ASC_RENDER_D3D=1}"
+    "${win:ASC_RENDER_D3D=1}",
+    "${mac:ASC_RENDER_WINGPU=1}",
+    "${mac:ASC_RENDER_METAL=1}"
   ],
   "objects": []
 }

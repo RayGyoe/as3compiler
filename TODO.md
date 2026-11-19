@@ -1458,9 +1458,9 @@ SimpleButton 的命中测试走阶段三十五的 `as_pick_hit` 扩展。
 **依据**：异步网络/音视频/键盘鼠标状态查询，独立于几何/事件基础，重活。
 
 - [x] `flash.net`：**URLLoader**（`load()`/`data`/`close`，异步本地文件读取（COMPLETE/IO_ERROR 下一帧 tick），`data` 为 GC 跟踪字符串）、**URLVariables**（`dynamic class`，未声明字符串键属性 + `toString()` 序列化）、**URLRequest**（`url`/`method`/`data`/`contentType`）
-- [ ] `flash.media`：**Sound**（`load`/`play`，依赖后端解码）、**SoundChannel**、**Video**（V1 已完成 2026-11-13，见下；V2/V3 硬解与传输面仍未排期）
+- [ ] `flash.media`：**Sound**（`load`/`play`，依赖后端解码）、**SoundChannel**、**Video**（V1 已完成 2026-11-13，见下；V2 缓冲状态与传输面仍未排期；V3 硬解已双端落地——Windows D3D11VA 与 macOS VideoToolbox 均带零拷贝，阶段四百四十六）
   - **2026-10-06 音频调研完成并立项**（[`docs/zh-cn/audio.md`](docs/zh-cn/audio.md) / [`docs/en/audio.md`](docs/en/audio.md)，**阶段九十六**）：现状是阶段九十三留下的**空壳**（`play()` 恒返回空 `SoundChannel`、`loadCompressedDataFromByteArray`/`stop` 为 no-op），全仓无音频后端与解码器。**关键实测**：vendored SDL2 未编 CoreAudio（`libSDL2.a` 只含 `SDL_dummyaudio.o`，`nm` 零 AudioUnit 符号）⇒ `SDL_OpenAudioDevice` 会成功返回但**永不发声**，故后端点需另选。已裁决后端 = **miniaudio**（单头文件、一处覆盖 CoreAudio + Emscripten Web Audio、内置 MP3 解码）、范围 = **A~D 全量**（`[Embed]` 缺口独立延后）。属**补遗留**非增强。
-  - **2026-11-13 V1 已落地并实测**（[`docs/zh-cn/video.md`](docs/zh-cn/video.md) §16 / [`docs/en/video.md`](docs/en/video.md) §16）：`NetConnection`/`NetStream`/`Video` 的 AIR 面（`play`/`pause`/`resume`/`seek`/`close`、`onMetaData`、`NetStream.Play.Start`/`Buffer.Full`/`Play.Stop`/`Play.Failed`、`Video.attachNetStream` 上屏）已实现，解码走 FFmpeg（`vendor/video_glue.c` 纯 C seam + 生成 C 里的状态机），**按需注入**并有 `video`/`video-formats`/`video-backend` 与 `--video`/`--no-video` 开关；缺口如实保留在 V2（`Buffer.Empty`/`Buffer.Flush` 的完整缓冲状态面、`StageVideo`、`publish`/编码）、V3（Windows D3D11VA 硬解、传输面）与 V4（三端硬解替换软解）
+  - **2026-11-13 V1 已落地并实测**（[`docs/zh-cn/video.md`](docs/zh-cn/video.md) §16 / [`docs/en/video.md`](docs/en/video.md) §16）：`NetConnection`/`NetStream`/`Video` 的 AIR 面（`play`/`pause`/`resume`/`seek`/`close`、`onMetaData`、`NetStream.Play.Start`/`Buffer.Full`/`Play.Stop`/`Play.Failed`、`Video.attachNetStream` 上屏）已实现，解码走 FFmpeg（`vendor/video_glue.c` 纯 C seam + 生成 C 里的状态机），**按需注入**并有 `video`/`video-formats`/`video-backend` 与 `--video`/`--no-video` 开关；缺口如实保留在 V2（`Buffer.Empty`/`Buffer.Flush` 的完整缓冲状态面、`StageVideo`、`publish`/编码）、V3（传输面；硬解已在 Windows D3D11VA + macOS VideoToolbox 两端完成，见 `video.md` §16.9 / §16.13）与 V4（三端硬解替换软解）
   - **2026-11-11 视频调研完成，未排期**（[`docs/zh-cn/video.md`](docs/zh-cn/video.md) / [`docs/en/video.md`](docs/en/video.md)）：现状是**响亮地零支持**——`NetStream_play()` 直接 `as_throw`「media transport and FLV decoding are not supported」，`Video_attachNetStream()` 是空函数，全仓无解复用器/解码器/视频时钟。**已裁决选型 = FFmpeg 裁剪**（`--disable-everything` + 只留 `mov`/`flv` demuxer 与 `h264`/`aac`/`mp3`/`vp6f` decoder，静态增量 1.5–3 MB 量级）；理由是一套代码覆盖 macOS/Windows/Linux + 格式面一次到位；**但长期应被硬解替换**（V4，`as_video_decode_*` 换实现、AS3 侧不改），三条依据见 `video.md` §4.3：体积对 34 KB 产物是 50–90× 膨胀、专利费归属、**零拷贝**（软解 720p NV12 每帧上传 GPU 约 41 MB/s 且串行在渲染线程）；且平台代码是**两套不是三套**（web 走浏览器、WASI 报错）。**两条必须一起读的约束**：①FFmpeg 是 **LGPL-2.1+**，静态链接分发触发 §6「可重新链接」义务，且 **LGPL 不授予 H.264/AAC 专利许可**（硬解时该风险在 OS 厂商，软解时落回我们自己）；②**web 目标默认不编 FFmpeg**，走浏览器 `<video>`/`WebCodecs`，用清单 `targets.<target>` 分层区分。渲染侧**不需要新工作**：YUV 直通（[`docs/zh-cn/yuv-direct-render.md`](docs/zh-cn/yuv-direct-render.md)）四端都已具备。属**补遗留**（AIR 有、我们没有），`NetStream.publish`（编码）/`StageVideo`/HEVC/AV1/VP9 明确延后或列为增强。
 - [x] `flash.ui`：**Keyboard**（键码常量子集 + `isAccessible`）、**Mouse**（静态 `hide`/`show` + 只读 `cursor`/`supportsCursor`/`supportsNativeCursor`）
 
@@ -20903,7 +20903,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`DoABC` 的一般方法仍不执行**（烘焙剪辑的时间轴自走只能由用户代码/帧脚本驱动） | 未开始（2026-10-06 阶段九十五·九 实测登记；**2026-10-15 阶段一百六十四 按实测收窄**；**2026-10-19 阶段一百九十一 再收窄：符号类的基类绑定已落地**） | **已收窄的那一半**：皮肤符号**自己的时间轴脚本**（`stop()`/`gotoAndStop()`/`addEventListener`/`currentFrame` 那一族）已由阶段一百五十六 在**编译期解码**并复用发射器落地，真机 `agreebtn` 点一下即到第 3 帧；且 `adl` 新建剪辑本来就 `isPlaying == false`、上屏跨 12 帧也不自走，两端在「起始停帧」上一致。**残余**：`lib/skin.swc` 的 255 个 `DoABC` 模块里那 **254 个类的一般方法**（TweenLite / StringCore / DownLoader…）仍**不执行**（需要一个完整的 AVM2/反编译器，属独立立项），因此 `play()`/`gotoAndPlay()` 的自走仍只能由用户代码驱动。**绝不静默**：`swcBake.notes` 报明多帧 sprite / op 的烘焙口径与「起始停帧」，ABC 普查工具 `temp/abccensus.ts`。 | 属 `DoABC` 解读（反编译器或 AVM2 解释器）这一独立立项；在那之前维持「资源取自 SWC、代码来自 `.as`」的现实形态 |
 | `TextFormat` 的 `indent` / `blockIndent` / `bullet` / `display` / `tabStops` **只存不用**（排版读取路径不消费） | **部分完成**（2026-10-30 阶段三百三十一：7 个缺字段全部补齐、ctor 扩到 AIR 的 13 参顺序、`as_tf_fmt_clone`/`_empty`/`==` 同步搬字段；残留是这五项的**排版效果**） | 字段表见 `src/symbols.ts`；`src/emit.ts` 里 `indent`/`blockIndent`/`bullet`/`tabStops` 只出现在**构造 / 克隆 / 相等 / 合并 / 清空**五处，没有任何一处把它们送进 Skia 的 `ParagraphStyle`/`TextStyle`，`vendor/` 侧也 grep 不到 `setTextIndent`；`display` 同样只存值。⇒ 用 `indent` / 项目符号 / 制表位排版的工程**能编译、能原值读回**，但版面与 `adl` 不同且**不报明**（静默）。`leftMargin`/`rightMargin` 是否真进排版也未逐项验证 | 先 `adl` 逐项实测可观测效果（`indent`/`blockIndent` 对 `textWidth`/`textHeight`/行首位置，`bullet` 对首行前缀，`tabStops` 对制表位，`display` 对行盒），再按实测接 `ParagraphStyle::setTextIndent` 等；`leftMargin`/`rightMargin` 同一批量 |
 | **Stage3D 的 Windows 后端**（`air-starling-demo` 已实机跑通收口；剩背面剔除/绕序 A/B 与 `firstIndex`） | **部分完成**（2026-10-09 阶段一百二十六 登记；**2026-10-16 阶段一百七十三 实机收口**；2026-10-10 前置① **AGAL → HLSL 翻译器**随阶段一百三十一 落地（v0.4.104）、前置② **`vendor/stage3d_d3d.cc`** 随阶段一百三十二 落地（v0.4.105）并在 `examples/shmup-stage3d` 上实机跑通） | **已完成的两半**：① AGAL→HLSL（`AGALTranslator.translate(bytes, "hlsl")` ⇒ `target 2`，由 `ASC_S3D_HLSL` 选中，生成物过真 `D3DCompile`）；② D3D12 胶水（`vendor/stage3d_d3d.cc` 与 `stage3d_glue.mm` 同一套 `s3d_*` ABI/语义；与 2D **共用 `ID3D12Device`/命令队列**；`air-app.ts` 的 Windows 拒绝已删，改为推 `stage3d_d3d.cc` + `ASC_S3D_HLSL=1` + `d3d12`/`dxgi`/`d3dcompiler`）。**实测**：demo 开窗、281 帧 / 5 s、零 PSO/合成错误，且 `ASC_GPU_DUMP` 的 presented back buffer 里能看到 Stage3D 精灵。**2026-10-16 阶段一百七十三 收口**：`examples/air-starling-demo` 已在 Windows 目标上**编 + 链 + 跑通**（26 draw / 246 tri，几何无一丢弃；与同机 `adl 51.4.1` 窗口在客户端坐标下 logo 包围盒同为 `x32..173 y10..196`、按钮节距同为 69 px）。根因是**常量缓冲原先每帧槽只有一份**：D3D12 在 GPU **执行**命令列表时才读常量 ⇒ 一帧内所有 draw 都读到**最后一次**上传的 mvp（12 个按钮全被最后一个按钮的矩阵变换）。改为**按 draw 版本化的常量区域**（`S3D_CB_REGION` 4096 B/次上传 = 256 float4；draw 绑 `GetGPUVirtualAddress() + cbOffV/cbOffF`；**游标在 `s3d_batch_end` 归零而非 `batch_begin`**——一帧的首次上传发生在批次打开之前，在 begin 归零会抹掉它、实测前两个 draw 共用区域 0；`s3d_wait_slot` 留在 `s3d_upload_constants` 内保护那次上传）。同轮修**显示度量口径**：`fullScreenWidth/Height` 与 `Capabilities.screenResolutionX/Y` 是**逻辑点（DIP）**（改用 `SDL_GetDisplayBounds`，与 `adl` 报的 2560×1707 逐值相同；原 `SDL_GetCurrentDisplayMode` 报物理 3840×2560。**2026-10-20 阶段二百零六 更正**：当时这只是**纸面**修好 —— 该值在胶水里是**缓存**，三条 `sk_window_show*` 路径仍用显示模式回填它，故只有**没开过窗**的进程才走到 DIP 分支；真应用（开窗后）仍报 3840×2560，且 `Screen.bounds` 是唯一的 DIP 读者（两套空间被**对调**）。现为**唯一写入者** `sk_refresh_display_size_cache()`，由 `unit: platform/DisplayMetrics` 钉住）、`screenDPI` 按平台基线 96/72（`adl` 在 150% 下报 96 而非 SDL 的 144）。**仍缺**：① `Screen.bounds`/`visibleBounds` 按 AIR 应是**物理像素**而我们仍报逻辑值（`sk_display_pixel_bounds` 未实装，故 `Screen` 系列与本仓另一条 `sk_display_bounds` 的空间口径仍不一致）；② **背面剔除/绕序**仍是纸面决定（`FrontCounterClockwise=FALSE` + 正高度 viewport）无 A/B 实测；③ `Context3D.drawTriangles` 的 `firstIndex` **被忽略**（`(void)firstIndex;`，索引缓冲整段上传）——对 Starling（恒 `drawTriangles(ib, 0, n)`）无影响，对别的 Stage3D 应用是潜在偏离；④ mip-drop/透明混合/立方体贴图已移植并有文本钉子但**未在 D3D12 上单独复测**。详见阶段一百七十三 与 `docs/zh-cn/{display3d.md,win32.md}` §10.1/§3.5 | ① **已完成（2026-10-16）**：在 Windows 目标上编 + 链 + 跑通 `examples/air-starling-demo`（覆盖 `setProgram` 切换、深度/模具、多流 `drawTriangles`、纹理图集），红什么修什么；② **仍待**：背面剔除做一次一次性 A/B（同场景 `setCulling("back")` 开/关的像素对照）+ `drawTriangles` 的 `firstIndex` 行同义对齐 + `Screen.bounds` 的物理像素口径。**成本低**（A/B 是一次跑） |
-| **测试门禁不稳定**：同一套件、同一代码，不同次运行报出 **3 个不同的红**（`example: stage86.as`、`unit: emit/StringConcatFlat`、`unit: reflection/ClassValueOperand`），重跑全绿 | 未开始（2026-10-09 阶段一百二十六 **实测发现**，根因未定） | 现象：本阶段开头 `npm run test:unit` 连跑两次均 **90/92**（那两个单元组红）、`npm run test:examples` **164/165**（stage86 红）；最终 `npm test` **258/258 全绿**，其后 `npm run test:unit` 单跑/连跑 3 次、`node --test --test-name-pattern=… test/unit.ts` 单进程形态、以及各用例单独跑**全绿**。**已排除的假说**：① 陈旧产物 —— 在用例将使用的产物路径上埋一个假二进制，实测被**无条件重建并覆盖**（脚本变回 Mach-O、用例仍绿）；② `-o` 序号 —— 同一示例用 `001-` 与全量跑的 `113-` 两条路径手工跑，两条都绿；③ 断言陈旧 —— `examples/stage86.as` 的 `NativeApplication` 断言已改为 `com.example::NoSuchClass`（注释引 `adl 51.4.1` 实测）后仍曾红。**未排除**：进程/文件级并行与共享 `temp/` 下的交互。**补记（2026-10-10，阶段一百三十 全量回归实测）**：本机换成 Windows 后**没有复现**这 3 个红（它们首次观测于 macOS，也未再出现）；同一轮把**本机必然红项**逐条定位并分类完毕，且**与本行不同源**：① **5 条 CRLF 假失败**（`test/unit/platform.ts` 的 `backendparity`、`numeric.ts` 的 `noreturn`、`stage3d.ts` 的 3 条 —— 它们用 `\n` 字面量正则直接 `readFileSync` CRLF 检出的 `runtime.ts`/`stage3d_glue.mm`/`stage3d_webgl.cc`，文本归一成 LF 后**当场变绿**，而 CI 是 LF 检出）；② 2 条 **macOS 硬编码断言**（`test/unit/transport.ts` 要求 `link-paths` 结尾 `vendor/curl/lib/macos-arm64` 与 `Security`/`SystemConfiguration` frameworks）；③ 2 条 linkset 缺 `zlib.h` 的 include；④ **examples 层整体无法链接**（套件默认编译器是 `cc`，且 `src/build.ts:676` 在 win32 刻意不加 `-lz`，而每份生成 C 的 RUNTIME_PREAMBLE 都 `#include <zlib.h>` 并引用 `compress`/`uncompress`）。⇒ 结论分两半：（a）本机 Windows 上 `node test.ts` **无法全绿**，那是**已知的环境红**（可复现、可解释），**不是**门禁自身不可靠；（b）本行那 3 个 macOS 侧偶发**仍未定案**（本轮**不得**把它与 (a) 混为一谈）。| **必须先定案再修**：把这三例各自连跑 N 次（含 `npm test` 单进程与 `node --test test/unit/*.ts` 多进程两种形态）做统计，定位是否与并发/共享临时路径/产物 mtime 有关；定案前**不得**把这 3 个红当作「已修」或「无关紧要」——门禁不可靠会让真缺陷与假红混在一起（本轮**真的**发生过一次真缺陷在**全绿**下溜过：见本节「九、自查发现的真缺陷」）。三个红与本次 diff **无关**（首次观测发生在任何代码改动之前），但也不能据此静默放过。**补记（2026-10-14，阶段一百五十一）**：那条「**未排除**：进程/文件级并行与共享 `temp/` 下的交互」现在**可操纵**了——示例层驱动已并发化（`test/examples.ts` 改异步 `execFile` + 有界池，默认 `min(核数,8)`），用 **`ASC_TEST_JOBS=1`** 可精确回到**单进程串行**形态（并行态 ~3 分钟 / 串行态 ~13 分钟），两态跑同一套件即可判定某个红是否与并行有关。该改动**不移出本行**（根因仍未定案）。**本机口径**：跑 Windows 全量回归前须先把 LLVM 放上 PATH（`export PATH="/c/Program Files/LLVM/bin:$PATH"`，否则 `spawnSync clang ENOENT`）并把上述 9 条环境红当作已知基线 |
+| **测试门禁不稳定**：同一套件、同一代码，不同次运行报出 **3 个不同的红**（`example: stage86.as`、`unit: emit/StringConcatFlat`、`unit: reflection/ClassValueOperand`），重跑全绿 | 未开始（2026-10-09 阶段一百二十六 **实测发现**，根因未定） | 现象：本阶段开头 `npm run test:unit` 连跑两次均 **90/92**（那两个单元组红）、`npm run test:examples` **164/165**（stage86 红）；最终 `npm test` **258/258 全绿**，其后 `npm run test:unit` 单跑/连跑 3 次、`node --test --test-name-pattern=… test/unit.ts` 单进程形态、以及各用例单独跑**全绿**。**已排除的假说**：① 陈旧产物 —— 在用例将使用的产物路径上埋一个假二进制，实测被**无条件重建并覆盖**（脚本变回 Mach-O、用例仍绿）；② `-o` 序号 —— 同一示例用 `001-` 与全量跑的 `113-` 两条路径手工跑，两条都绿；③ 断言陈旧 —— `examples/stage86.as` 的 `NativeApplication` 断言已改为 `com.example::NoSuchClass`（注释引 `adl 51.4.1` 实测）后仍曾红。**未排除**：进程/文件级并行与共享 `temp/` 下的交互。**补记（2026-10-10，阶段一百三十 全量回归实测）**：本机换成 Windows 后**没有复现**这 3 个红（它们首次观测于 macOS，也未再出现）；同一轮把**本机必然红项**逐条定位并分类完毕，且**与本行不同源**：① **5 条 CRLF 假失败**（`test/unit/platform.ts` 的 `backendparity`、`numeric.ts` 的 `noreturn`、`stage3d.ts` 的 3 条 —— 它们用 `\n` 字面量正则直接 `readFileSync` CRLF 检出的 `runtime.ts`/`stage3d_glue.mm`/`stage3d_webgl.cc`，文本归一成 LF 后**当场变绿**，而 CI 是 LF 检出）；② 2 条 **macOS 硬编码断言**（`test/unit/transport.ts` 要求 `link-paths` 结尾 `vendor/curl/lib/macos-arm64` 与 `Security`/`SystemConfiguration` frameworks）；③ 2 条 linkset 缺 `zlib.h` 的 include；④ **examples 层整体无法链接**（套件默认编译器是 `cc`，且 `src/build.ts:676` 在 win32 刻意不加 `-lz`，而每份生成 C 的 RUNTIME_PREAMBLE 都 `#include <zlib.h>` 并引用 `compress`/`uncompress`）。⇒ 结论分两半：（a）本机 Windows 上 `node test.ts` **无法全绿**，那是**已知的环境红**（可复现、可解释），**不是**门禁自身不可靠；（b）本行那 3 个 macOS 侧偶发**仍未定案**（本轮**不得**把它与 (a) 混为一谈）。| **必须先定案再修**：把这三例各自连跑 N 次（含 `npm test` 单进程与 `node --test test/unit/*.ts` 多进程两种形态）做统计，定位是否与并发/共享临时路径/产物 mtime 有关；定案前**不得**把这 3 个红当作「已修」或「无关紧要」——门禁不可靠会让真缺陷与假红混在一起（本轮**真的**发生过一次真缺陷在**全绿**下溜过：见本节「九、自查发现的真缺陷」）。三个红与本次 diff **无关**（首次观测发生在任何代码改动之前），但也不能据此静默放过。**补记（2026-10-14，阶段一百五十一）**：那条「**未排除**：进程/文件级并行与共享 `temp/` 下的交互」现在**可操纵**了——示例层驱动已并发化（`test/examples.ts` 改异步 `execFile` + 有界池，默认 `min(核数,8)`），用 **`ASC_TEST_JOBS=1`** 可精确回到**单进程串行**形态（并行态 ~3 分钟 / 串行态 ~13 分钟），两态跑同一套件即可判定某个红是否与并行有关。该改动**不移出本行**（根因仍未定案）。**补记（2026-11-19，阶段四百四十六）**：同一棵树、同一条命令又观测到一次，**第一次 5 红 / 第二次全绿**，5 红各自单跑皆绿（`example: file-ops.as` 的 `fixture link to a directory is visible through stat`、`unit: render/AirAppFonts` 的 `Unexpected end of JSON input`、`unit: SWC StaticText` 的探针输出体 `1 !== 0`、`unit: desktop/file dialog` 的 `saved bytes ignore caller mutation`、`unit: reach/edge` 的 `main class 'app.Main' is not declared under src/`）。**新增证据**：5 个红的形态全部指向 `temp/` 同名夹被**并发重写**（读到空 JSON / 探针二进制被覆盖后运行 / `rmSync` 与随后读取交错），即本行「未排除」的那条假说；仍**不移出本行**（尚未拿到进程级证据，且无法解释为何只在全量并发态出现）。**本机口径**：跑 Windows 全量回归前须先把 LLVM 放上 PATH（`export PATH="/c/Program Files/LLVM/bin:$PATH"`，否则 `spawnSync clang ENOENT`）并把上述 9 条环境红当作已知基线 |
 | `x.ns::[expr]` / `x.@[expr]` 的孩子轴按**本地名**匹配（命名空间未建模） | 未开始（2026-10-07 阶段一百零八 实测登记；**已文档化的近似**） | 本子集把自定义命名空间**编译期透明化**（限定词丢弃、前缀不进匹配），故：`<n:item>`（ns=`urn:x`）测 `x.ns::["item"]` 得 **2 = AIR**（阶段一百零八 已让前缀不阻碍本地名匹配），但 `x.item`（无限定）**也给 2**（AIR 为 **0** —— 无前缀的属性名只匹配无命名空间的节点），即「同局部名、不同 uri」无法区分。另：`Namespace` 值本身是**透明占位**（`new Namespace(prefix, uri)` 1/2 参构造器未实现，只认 0 参；`.uri`/`.prefix` 未建模），写示例只能走 `xml.namespace()` | 若要精确：给节点存 `(prefix, uri)` 与一张**作用域内命名空间表**，孩子轴比较「uri + 局部名」，`Namespace` 成为真对象（`uri`/`prefix`/2 参构造器）。**成本高**（XML 与 Namespace 两个模型都要改）；当前 away3d DAEParser 的用法（`xml.namespace()` + `ns::[expr]`）结果已与 AIR 一致，故列为「已知近似」而非阻塞项 |
 | 内置类名**部分**可作 **Class 值**（`trace(BitmapData)` / `var c:Class = BitmapData` / `BitmapData is Class` 已落地；**原始包装类仍不可**） | **部分完成**（2026-10-07 阶段一百一十二 登记；**2026-10-09 阶段一百二十七 落地内建引用类型的 Class 值**） | `adl 51.4.1`：`trace(BitmapData)` ⇒ `[class BitmapData]`、`BitmapData is Class` ⇒ true、`var c:Class = Object; 5 is c` ⇒ true（`temp/pkg1/oracle/adl-pkg1.txt` C1/C4/C7/E2/E3/E8/E9 + `adl-na.txt` 的 `NA=[class NativeApplication]`）。**已落地（阶段一百二十七）**：每个内建类都进注册表并发出 `_cls` 常量、内建类名可在**值位置**解析、`is`/`as` 与字符串转换逐项对 `adl`。**仍不可**：**原始包装类**（`String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class`）作 Class 值 —— `var c:Class = String;` 仍是**响亮**的 `Codegen error: undefined variable 'String' at top level`（`adl` 里 `[class String]` 合法，见 `adl-pkg1.txt` C6）；它们的 `_cls` 需要先有「原始包装类的静态度量」（`int`/`uint` 还要独立 box tag，见反射口径那行）⇒ 与「`getQualifiedClassName(5)` 应给 `int`」同源，宜同批 | 先做 `int`/`uint` 的独立 box tag（反射行已列），再让 `String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class` 各自进注册表（`reflectFqn` 已能用 `adl` 实测：`String`/`Array`/`Boolean`/`Date`/`RegExp` 无包、`int`/`uint` 短名）。**成本中**。 |
 | AIR 的**数值解析/格式化极值**仍与 `adl` 有残差（语言层，窄口径） | 未开始（2026-10-08 阶段一百一十九 `tonum2` 双端探针实测；**2026-10-10 阶段一百三十四 扩证**） | **扩证（2026-10-10，阶段一百三十四）**：原记载「32 行里只剩 1 行不同」是**窄口径**——本轮把矩阵扩到 **48 行**（`temp/qfix/nfAot.as` 双端对照，adl 侧 `temp/qfix/gcadl/result13.txt`），**10 行不同**：① **打印侧**：denormal 不做最短表示（`5e-324` adl 给 `4.9406564584124654e-324`、`1e-323` 给 `9.881312916824931e-324`）；`1.7976931348623157e308` adl 给 **`1.79769313486231e+308`**（**15 位有效数字且截断**，非四舍五入、也不保证回环）；`1234567890123456789` adl 给 **`1234567890123456800`**（十进制最短 + 补零）而我们给精确 double `1234567890123456768`；② **解析侧**：`Number("1.7976931348623157e308")` adl 给 **Infinity**（17 位有效数字即溢出）；`Number("9.999999999999999")` adl 给 **10**（17 位口径的舍入）；`Number("1e100")` 差 1 ulp；③ **同值异文**（`temp/qfix/gcadl/nf3Main.as`）：内联 `String(Number("1e100"))` 给 `1e+100`，而经**变量/数组**取同一字符串再 `Number(...)` 给 `1.00000000000000e+100` —— AVM2 的**运行期** `stringToDouble` 与 mxmlc 的**编译期**常量折叠不是同一个转换器（`0.1+0.2` 亦被 mxmlc 折成 `0.3`），黑盒无法再收敛，必须按 avmplus 的 `doubleToString`/`stringToDouble` **逐字节移植**。其余 38 行（零/负零/常规指数/前导空白/`Infinity` 字面）逐字一致 | **暂缓（2026-10-10 阶段一百三十四 决定不随本轮落地，如实报明）**：原建议「优先 `%.15g`、必要时回退 `%.17g`」**与实测不符**（`1.79769313486231e+308` 是 15 位**截断**且不回环；同值异文说明两条转换链不同源）。真正要做的是移植 avmplus 的 `MathUtils::convertDoubleToString` 与 `stringToDouble` 两段算法 + 全量极值矩阵钉子，属**独立立项**（影响面是所有 `trace(number)` 文本，且要动 `as_str_from_double`/`as_str_to_number`/`as_parse_*` 三方），本轮的工作量大头在配合 `catch`/`undefined`/`parseInt` 三处**已对 `adl` 收口**的改动做全量回归，故不夹带此高风险项。证据已随本行扩写留档 |
@@ -23408,6 +23408,89 @@ UTF-8，还逐行一次 `strlen`。新增 `as_tf_units_to_bytes(const char* s, i
 回归；③ **读一手源码定归属**：`Curl_ws_accept` 里那 4 行就是「谁吃了字节」的判据，比猜 curl 行为快；
 ④ **对齐 AIR 才算修复**：先量 AIR 在同样输入下的行为，再决定这是 bug 还是「本来如此」；
 ⑤ **「不丢」与「不晚」是两件事**：只修握手的 `rest` 会从丢帧变成延迟投递，两处必须同时改。
+
+### 阶段四百四十六：macOS 的 VideoToolbox 硬解 + 零拷贝（v0.4.420 → v0.4.421）✅ 已完成
+
+**立项依据**：§16.9 在 Windows 上证明了「硬解要赢，必须先拿掉回读」，而 macOS 这一侧的接缝一直空着——
+§9 的 macOS 行写着「目标态，未实现」，`as_video_hw_create()` 只认 `AV_HWDEVICE_TYPE_D3D11VA`，
+所以 4K 10-bit 的 `conv`（实测 6.13–4.08 ms/帧）每帧都付。本轮把 `vendor/video_d3d.cc` 的等价物
+写在 `vendor/video_metal.mm`，并把 C 侧改成**后端无关的接缝**，而不是在 `video_glue.c` 里撒 `#ifdef __APPLE__`。
+
+**一、逐帧成本（本机 arm64、同一支二进制、4K 10-bit HEVC 30 fps 源、1600×900 真窗口 60 Hz、12 s、3 轮交错取中位）**
+
+| 路径 | 每帧 CPU | 应用帧 | 最差帧间隔 | 进程 CPU |
+|---|---|---|---:|---:|
+| 软解 8 线程 | `conv=4.08` + `upload=1.30` ≈ **5.4 ms** | 706（60.0 fps） | 63 ms | 8.76 s |
+| 硬解 + 回读（`AS_VIDEO_ZC=0`） | `hw=0.68` + `conv=8.5` + `upload=1.5` ≈ **10.7 ms** | 702 | 34 ms | — |
+| **硬解 + 零拷贝（`auto`）** | `dec=0.01` + `conv=0.05` + `upload=0.01` + `copy=0.06` ≈ **0.13 ms** | 707 | **24 ms** | **0.56 s** |
+
+进程 CPU 差 **15.6×**（8.76 → 0.56 s），每帧成本差 **41×**。8 位素材同形（软 3.1 / 回读 4.6 / 零拷贝 0.06 ms）。
+**关键中间结论**：本机回读只要 0.68 ms（Windows 同素材 11.25 ms），但硬解仍然输给软解一倍，多出来的钱在
+`conv`（8.5 vs 4.08）——半平面 P010 → I420 比平面 yuv420p10le → I420 贵约一倍（实测，机制未逐指令验证）。
+所以「只把解码搬上 GPU」在两端都不成立，**必须是零拷贝**。
+
+**二、链路：Windows 四环，macOS 一环**
+
+`CVPixelBuffer` 本身就是 `IOSurface`，`CVMetalTextureCacheCreateTextureFromImage` 只是给同一块内存包一层
+`MTLTexture`——不需要 §16.9.2 的 ①共享 staging 复制、②跨设备 fence、③plane 拆分，只剩 ④`TextureFromYUVATextures`。
+四张 plane 布局由 `CVPixelBufferGetPixelFormatType` 决定：`420v/420f` → R8/RG8、`x420` → R16/RG16、
+`x422` → R16/RG16（4:2:2）；未知布局（`x444`/RGBA）返回 NULL 走回读，不猜。
+
+**三、四个必须显式处理的点**
+
+1. **十位在高位**：`[zc] ten-bit Y sample max=55296`（实测，不是查文档），所以 `R16Unorm` 采出即归一化值；
+   若按低位断言就会画出暗 60 倍的画面。
+2. **`CVPixelBuffer` 生命周期**：两张 `MTLTexture` 是它 IOSurface 的视图，token `CFRetain`、Skia 释放回调
+   `CFRelease`；漏了不崩，而是画出被覆写的帧。
+3. **plane 几何必须等于画面几何**：`CVPixelBufferGetWidthOfPlane/HeightOfPlane` 不等就返回 NULL，不用 `w×h`
+   硬包（对齐放大的平面会被拉伸）。
+4. **零拷贝只存在于 GPU 窗口**：`ASC_RENDER_WINGPU=1` + `ASC_RENDER_METAL=1` + `metal_glue.mm` 才让
+   `as_skia_gr_context()` 非 NULL；缺了它 `auto` **静默**落在 `videotoolbox-readback`（首次踩到就是这个现象）。
+
+**四、接缝的形状（可审阅的三条）**
+
+- `AS_VIDEO_ZC` = D3D **或** Metal + `ASC_USE_SKIA`；`AS_VIDEO_ZC_DEVICE` 区分「按设备建表」（D3D，1）与
+  「一个进程一个 MTLDevice」（Metal，0，`hw_dev11` 恒 NULL，Apple 侧不引用 `AVD3D11VADeviceContext`）。
+- `as_video_zc_available()` 的 `zc_dev == NULL` 早退**在 `#if AS_VIDEO_ZC_DEVICE` 里**——Metal 传 NULL 是设计。
+- `sk_video_zc_forget(v->hw_dev11)` **无条件**调用：Metal 没有设备身份，但有一张 `CVMetalTextureCache` 要丢。
+- `AS_VIDEO_HW_PIX/DEV/NAME` 把平台常量收敛成三行，`as_video_get_format()`、`as_video_hw_create()` 与
+  `decode=` 统计列共用；`AS_VIDEO_DECODE=videotoolbox` 与 `d3d11va` 等价。
+
+**五、语义与颜色**
+
+- 颜色不靠「看起来对」：`BitmapData.draw(video)` 走与上屏同一条内容分支，66 点采样，软解
+  `113.6/118.5/137.4` vs 零拷贝 `113.3/117.3/137.4`，彩条差 ≤3（10 位→8 位舍入不同）；8 位同形
+  （`112.7/118.7/137.2` vs `113.6/117.9/138.7`）。矩阵/范围标错会整幅偏十几到几十，这张表会立刻炸。
+- `examples/video-headless.as` **24 断言全绿**（无窗口 ⇒ `grctx` NULL ⇒ 保持软解，一分钱不花）；
+  `examples/video/VideoPlayer.as` **31 断言全绿**（GPU 窗口路径）。
+- `examples/video/video.build.json` 补上 `${mac:…}` 三行（`metal_glue.mm` / `video_metal.mm` /
+  `ASC_RENDER_WINGPU=1` / `ASC_RENDER_METAL=1`），让这个示例在 macOS 上走**与 Windows 对称**的 GPU 窗口，
+  否则新接缝在示例里永远编不进来（`video_glue.c` 落到 NULL 兜底分支）。
+
+**六、测试与文档**
+
+- `unit: video/` **115 条**（原 105 + 10 条新钉）：plane 布局取自 `CVPixelBuffer` 而非 `ten_bit`、
+  YUVA 包裹不含 `sws_scale/memcpy`、释放回调持有像素缓冲、平面几何不等则回退、缓存绑在同一个 MTLDevice、
+  `video_metal.mm` 只在 `ASC_RENDER_METAL` 时注入、清单 `${mac:…}` 三行、`AS_VIDEO_HW_PIX` 双分支、
+  硬件帧从 `data[3]`（Apple）取而不是 `data[0]`（D3D）。
+  旧钉子 `sk_video_d3d_image`/`sk_video_d3d_probe`/`sk_video_d3d_forget` 按**契约变更**改写为 `sk_video_zc_*`。
+- 文档：`docs/zh-cn/video.md` + `docs/en/video.md` 新增 **§16.13**（三路对照、四环→一环、四个坑、颜色表、
+  复现命令、未做清单），§9 的 macOS 行从「目标态」改为已实现，§4「实现现状」、§10.2 的链路注释、§12 V2/V3 行、
+  §16.9.5 开关表与 §16.9.6 状态机同步为**双后端**口径。
+- **全量回归**：`node test.ts` **729 项 / 729 过 / 0 红**，exit 0（`temp/node-test-s446b.log`，581 s）。
+  **需要如实记一笔**：同一棵树的**前一次**全量跑出 5 个红——`example: file-ops.as`
+  （`fixture link to a directory is visible through stat`）、`unit: render/AirAppFonts`（`Unexpected end of JSON
+  input`）、`unit: SWC StaticText`（探针输出体断言 `1 !== 0`）、`unit: desktop/file dialog`（`saved bytes ignore
+  caller mutation`）、`unit: reach/edge`（`main class 'app.Main' is not declared under src/`）。**5 个各自单跑
+  全绿**（`node --test --test-name-pattern=... <file>`），紧接着的这次全量也全绿，**两次之间没有任何代码改动**
+  ⇒ 与 `### 遗留待开发` 里「测试门禁不稳定（同一命令、同一代码报出不同的红、重跑全绿，根因未定）」是同一类，
+  本次只作为**第二个观测点**记入，**不宣称已修、也不把它当噪声**（5 个红的形态都指向 `temp/` 下同名夹被并发
+  重写：空 JSON / 探针二进制被覆盖 / rmSync 与读取交错）。
+
+**closure**：① 「同一个问题的答案可能换个平台换个形状」——Windows 上是跨设备共享，macOS 上根本没有那一步，
+  所以**先问载体、再套方案**，不要照抄四环；② 「便宜的中间步骤」会让人误判：回读 0.68 ms 看着无痛，
+  真正的钱在它之后那次 `sws`，所以**收益必须按整条链量，不按最贵的一环量**；③ 平台常量收敛成 `AS_VIDEO_HW_*`
+  三行之后，`get_format`/`hw_create`/`STATS` 三处不可能再各自漂移——**能力差异要落在数据上，不要落在 `#ifdef` 里**。
 
 ### 阶段四百四十五：码元定位的采样检查点 + 长度 memo 的 MRU（v0.4.419 → v0.4.420）✅ 已完成
 

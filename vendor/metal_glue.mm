@@ -99,6 +99,12 @@ static sk_sp<GrDirectContext> g_context = nullptr;
 // and Metal is process-wide (not per-window), so a single getter suffices.
 void* sk_metal_get_context(void) { return g_context.get(); }
 
+// The MTLDevice behind that context, for the VideoToolbox zero-copy seam
+// (vendor/video_metal.mm): a CVMetalTextureCache must be created against the SAME
+// device Skia renders on, or the sampled texture and the canvas live on two devices.
+// Borrowed, not retained: metal_glue owns the device for the process's lifetime.
+void* sk_mtl_device_ptr(void) { return (void*)g_device; }
+
 // The one MTLCommandQueue every GPU producer in the process shares, created on
 // first use and deliberately never released (process lifetime).
 //
