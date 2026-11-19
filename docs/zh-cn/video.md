@@ -610,7 +610,7 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 
 | 端 | 解复用 | 解码 | 编码（publish） | 输出 | 备注 |
 |---|---|---|---|---|---|
-| macOS arm64 | FFmpeg | **VideoToolbox（默认）**：h264、hevc、mpeg1/2/4、h263、prores、vp9；其余软解回退 | `h264_videotoolbox` + `aac`（系统硬编） | `CVPixelBuffer`（NV12）→ `CVMetalTextureCache` 按 plane 给两张 `MTLTexture` → `GrBackendTexture[2]` → **`SkImages::TextureFromYUVATextures`**（零拷贝，§10.2） | arm64 软解走 NEON，无需额外汇编依赖 |
+| macOS arm64 | FFmpeg | **`VideoToolbox`（目标态，未实现）**：h264、hevc、mpeg1/2/4、h263、prores、vp9；其余软解回退 | `h264_videotoolbox` + `aac`（系统硬编） | **`CVPixelBuffer`（NV12）→ `CVMetalTextureCache` 按 plane 给两张 `MTLTexture` → `GrBackendTexture[2]` → `SkImages::TextureFromYUVATextures`（零拷贝，§10.2，目标态）** | arm64 软解走 NEON，无需额外汇编依赖 |
 | Windows x64 | FFmpeg | **D3D11VA（默认）**：h264、hevc、mpeg2、vc1、vp9、av1、wmv3；其余软解回退（DXVA2 留老系统） | `h264_mf` + `aac`（MediaFoundation，**未实机验证**） | `ID3D11Texture2D`（`DXGI_FORMAT_NV12`，Y/UV 是**同一资源的两个 plane slice**）→ 拆成 R8/RG8 两张 → `GrBackendTexture[2]` → **`TextureFromYUVATextures`**（§10.3 的平面切片差异） | 软解 SIMD 需 nasm/yasm（见 `checks.ts`） |
 | Linux | FFmpeg | 软解；VAAPI 可选（h264/hevc/vp9/av1，**未验证**） | `h264_vaapi`（**需 GPU**；无软编兜底 → 缺 render node 时 `publish()` 报错） | 软解：`AV_PIX_FMT_YUV420P` → **`TextureFromYUVAPixmaps`**（每帧上传，§10.1 ②）；VAAPI：`AV_PIX_FMT_VAAPI` → `EGLImage` → 纹理（与 Android 同形，未验证） | 有 ELF 目标即能编 |
 | Web（`--target wasm --package web`） | 浏览器 | **浏览器原生**（`<video>` / WebCodecs） | 浏览器（`MediaRecorder` / WebCodecs）；需 `NetStream.appendBytes` 才能自己产码流 | canvas → WebGL/WebGPU | **不把 FFmpeg 编进 wasm** |
@@ -618,6 +618,13 @@ FFmpeg 不带 `--enable-gpl` 时是 **LGPL-2.1-or-later**。我们的项目是 *
 | **iOS（预留，未支持 target）** | FFmpeg | **VideoToolbox**（与 macOS 同源，同一套 `videotoolbox` hwaccel） | `h264_videotoolbox` + `aac` | 同 macOS：`CVPixelBuffer` → 两张 `MTLTexture` → `TextureFromYUVATextures`（§10.2） | **与 macOS 共用一份 glue**，差别只在设备/权限。AOT 上 iOS 本来禁不了（不能下发可执行码），这条路径只在「编译期已固定」的形态下成立 |
 | **Android（预留，未支持 target）** | FFmpeg | **MediaCodec**（FFmpeg 侧只有编解码器包装，**没有统一的 hwaccel 框架**）；其余软解回退 | `h264_mediacodec`（未验证） | `AHardwareBuffer` → `EGLImage` → GL/`GrBackendTexture` → `TextureFromYUVATextures` | 需 NDK 编译；**这一端是唯一需要单独写硬件桥的**，不能假定与桌面同形 |
 
+> **实现状态（2026-11-19 核对代码与实测）**：本表「解码」「输出」两列写的是**目标形态**，不是各端都已落地。
+> 截至 v0.4.419，**只有 Windows x64 的 D3D11VA 硬解 + 零拷贝**在实机上完成并测过（§16.8、§16.9；4K HDR10+
+> 60 Hz 真窗口 0.27 ms/帧）。**macOS 目前是纯软解 + `sws`→BGRA**：`as_video_hw_create()`（`vendor/video_glue.c:928`）
+> 只创建 `AV_HWDEVICE_TYPE_D3D11VA` 设备，`vendor/video_d3d.cc` 是唯一的零拷贝接缝，所以 4K 10-bit 的 `conv`
+> （实测 6.13 ms/帧）在 macOS 上每帧都要付。iOS / Android / Linux-VAAPI 三行同属目标态（两个移动端连 target
+> 都还没支持）。§4 的「实现现状」注记与这里同口径，不要只读表格就当已实现。
+>
 > **移动端是「未来要算进去的第六/七端」**（用户 2026-11-12 裁定）：现在**不实现**，但**接口面别写死**。
 > 具体代价：iOS 几乎白送（VT 与 macOS 同一套后端，只多一层权限/生命周期），Android 最难（MediaCodec
 > 不是 hwaccel 而是逐帧 surface，纹理桥要另写）——所以 `as_video_*` 的 `backend` 参数必须够抽象，

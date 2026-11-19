@@ -667,13 +667,22 @@ drop `video-formats` to `air` (which excludes HEVC/DTS/TrueHD); no code change n
 
 | Target | Demux | Decode | Encode (publish) | Output | Notes |
 |---|---|---|---|---|---|
-| macOS arm64 | FFmpeg | **VideoToolbox (default)**: h264, hevc, mpeg1/2/4, h263, prores, vp9; the rest software | `h264_videotoolbox` + `aac` (system hardware) | `CVPixelBuffer` → `CVMetalTextureCache` → `GrBackendTexture` | arm64 software decode uses NEON, no extra assembler needed |
+| macOS arm64 | FFmpeg | **VideoToolbox (target shape, not implemented)**: h264, hevc, mpeg1/2/4, h263, prores, vp9; the rest software | `h264_videotoolbox` + `aac` (system hardware) | **`CVPixelBuffer` → `CVMetalTextureCache` → `GrBackendTexture` (zero copy, target shape)** | arm64 software decode uses NEON, no extra assembler needed |
 | Windows x64 | FFmpeg | **D3D11VA (default)**: h264, hevc, mpeg2, vc1, vp9, av1, wmv3; the rest software (DXVA2 for older systems) | `h264_mf` + `aac` (MediaFoundation, **not verified on hardware**) | `ID3D11Texture2D` → `GrBackendTexture` | software SIMD needs nasm/yasm (see `checks.ts`) |
 | Linux | FFmpeg | software; VAAPI optional (h264/hevc/vp9/av1, **unverified**) | `h264_vaapi` (**needs a GPU**; no software fallback → `publish()` errors without a render node) | `AV_PIX_FMT_YUV420P` → Skia YUV direct render | builds via the ELF target |
 | Web (`--target wasm --package web`) | browser | **browser-native** (`<video>` / WebCodecs) | browser (`MediaRecorder` / WebCodecs); needs `NetStream.appendBytes` to produce its own bitstream | canvas → WebGL/WebGPU | **do not compile FFmpeg into wasm** |
 | WASI (`--target wasm`) | none | none | none | — | **fail loudly** ("this backend does not support video"), never silently degrade |
 | **iOS (reserved, no target yet)** | FFmpeg | **VideoToolbox** (same lineage as macOS, same `videotoolbox` hwaccels) | `h264_videotoolbox` + `aac` | `CVPixelBuffer` → `CVMetalTextureCache` → `GrBackendTexture` | **shares one glue with macOS**; the difference is devices/permissions. Note iOS forbids shipping executable code, so this path only holds when everything is fixed at build time |
 | **Android (reserved, no target yet)** | FFmpeg | **MediaCodec** (FFmpeg only wraps it as a codec, **there is no unified hwaccel framework**); otherwise software | `h264_mediacodec` (unverified) | `AHardwareBuffer` → `EGLImage` → `GrBackendTexture` | needs an NDK build; **the one target that needs a bespoke hardware bridge** — do not assume it is shaped like the desktop ones |
+
+**Implementation status (checked against code and measurements, 2026-11-19)**: the Decode and Output columns describe the
+**target shape**, not what each target already does. As of v0.4.419 **only Windows x64 has D3D11VA hardware decode plus
+zero copy** landed and measured on hardware (§16.8, §16.9; 4K HDR10+ at 60 Hz in a real window, 0.27 ms/frame).
+**macOS is software decode + `sws`→BGRA today**: `as_video_hw_create()` (`vendor/video_glue.c:928`) only creates an
+`AV_HWDEVICE_TYPE_D3D11VA` device, and `vendor/video_d3d.cc` is the only zero-copy seam, so the 4K 10-bit `conv`
+(measured 6.13 ms/frame) is paid on every frame on macOS. iOS / Android / Linux-VAAPI are target shapes too (the two
+mobile targets are not even supported as `--target` values). §4's "implementation status" note says the same thing: do not
+read the table alone and assume it is all landed.
 
 **The format surface is asymmetric across targets** (recorded explicitly — we must not claim "identical on all
 targets"):
