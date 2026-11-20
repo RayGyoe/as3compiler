@@ -23599,6 +23599,43 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
 
+### 阶段四百五十：发布产物不带 trace——编译期 + 运行期两层闸门（v0.4.424 → v0.4.425）✅ 已完成
+
+**问题**：黑窗没了之后，`trace()` 在发布版里也**无处可去**，但它仍在：每条 trace 发射成真实
+的 `printf` + `fflush(stdout)`，格式化照做、格式串照进 `.rodata`（真应用实测生成 C 里
+**1020 处 printf**），每次调用都做一次注定失败的写。AIR 的发布产物不带 trace 输出，
+Qt/Flutter/UE/Chromium 也都按“编译期决定代码在不在 + 运行期决定要不要输出”两层处理。
+
+**修法**（两层，缺一不可）：
+
+- **编译期**：`src/build.ts` 新增 `BuildConfig.trace` 与清单字段 `trace: "on"|"off"`
+  （非法值硬报错），`traceEnabled(cfg)` 缺省按**产物**推断：`package` 为
+  `exe`/`app`/`dmg` → `off`，其余 `on`（所以 `as-aot foo.as --run` 与 examples 全部不变）。
+  发射侧 `#define ASC_TRACE 0/1`（与 `ASC_STACKTRACE` 同形态，`#ifndef` 缺省 1）。
+- **关闭时不删参数**：`emitTrace` 在 `ASC_TRACE 0` 下发射
+  `do { (void)(arg1); (void)(arg2); } while (0)` —— AS3 调用的每个参数都要左到右求值，
+  `trace(++i)` 必须仍让 `i` 自增；纯表达式随后被 `-O2` 删干净。删整条语句属改语义，红线。
+- **运行期**：开着 trace 的构建包一层 `if (as_trace_on()) { printf(...); fflush(stdout); }`，
+  `as_trace_on()` 在 runtime 前导里（`static inline` 避免无 trace 语句时的
+  `-Wunused-function`），静态缓存 `getenv("ASC_TRACE")`，**只有字面量 `0` 关闭**。flush 放在
+  闸门**内**：被静默的 trace 不该还花一次 syscall。
+- `src/codegen.ts` / `src/emit.ts`：`generateC(..., trace = true)` 透传到 `Emitter.traceOn`。
+
+**证据**（真应用 `--package exe`）：生成 C `#define ASC_TRACE 0`，`printf(` 从 **1020 → 335**
+（剩余均为运行时 OOM/GC 诊断）；exe 启动、渲染、关闭 exit 0。小例子双态实测：默认带 trace 时
+输出 `hello 1 2.5 true / i=1 / 7`；同一 exe 加 `ASC_TRACE=0` 后**无输出**（`i` 的自增仍发生）；
+`--package exe` 编出的版本编译期就不带 printf（只剩 `do { (void)(...); } while (0)`）。
+
+**单元钉子**：`unit: emit/TraceGate` 10 钉（ASC_TRACE 两值；有 trace 时 printf 在
+`as_trace_on()` 门内且 flush 同在门内、无裸 `};`；关闭时无 printf/无闸门调用/保留 no-op；
+副作用参数仍求值；无参 trace 为空 no-op；格式串不入产物）、`unit: build/TracePolicy` 8 钉
+（缺省推断、exe/app/dmg 全关、raw/web/xcode-project 保留、显式值双向覆盖、清单解析、
+非字符串值报错点名字段）。另修 `unit: crash/hardening` 的 `emitTrace` 切片锚点——它按固定
+4200 字符窗口取 `traceFormat`，`emitTrace` 长出闸门后窗口取错，改为直接锚 `traceFormat`。
+
+**回归**：`node test.ts` **727 / 733 过**（4 跳过）；唯一红仍是 `unit: emit/StringAccumulator`
+（并发会话的字符串累加器工作，与本阶段无关）。
+
 ### 阶段四百四十九：Windows 发布版不再弹控制台窗——PE 子系统（v0.4.423 → v0.4.424）✅ 已完成
 
 **问题**：用 `--package exe` 出的发布版从资源管理器双击，会额外弹一个黑窗，里面滚着运行时 trace

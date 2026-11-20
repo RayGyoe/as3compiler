@@ -36,7 +36,11 @@ export function generateC(
   features: readonly string[] = [],
   // `--air-app` document class short name: only its instance may use the
   // constructor-time stage fallback (see Emitter.docRootClass).
-  docRootClass?: string
+  docRootClass?: string,
+  // Whether this artifact carries `trace()` (阶段四百五十). Release packaging
+  // passes false; see build.ts::traceEnabled for the policy and emit.ts::emitTrace
+  // for what "off" means (arguments still evaluate, output vanishes).
+  trace: boolean = true
 ): CodegenResult {
   // mxmlc rejects a non-void function that can fall off the end; without this
   // check we emitted a C function that reaches `}` with no `return` (undefined
@@ -45,7 +49,7 @@ export function generateC(
   const symbols = new SymbolTable();
   symbols.features = features;
   symbols.collect(program, embedFieldInits);
-  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml, aneDescriptors, docRootClass);
+  const emitter = new Emitter(program, symbols, keepGlobal, swcResources, swcBake, embedResources, appDescriptorXml, aneDescriptors, docRootClass, trace);
   const c = emitter.run();
   return { c, exports: [...symbols.exports] };
 }

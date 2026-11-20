@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsSubsystem, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, objectCacheKey, objectCachePath, objectCacheDir, objectCacheEnabled, isObjectCacheStep, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsSubsystem, traceEnabled, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, objectCacheKey, objectCachePath, objectCacheDir, objectCacheEnabled, isObjectCacheStep, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -4010,3 +4010,52 @@ function sweepOwnScratch(): void {
     if (e.endsWith(`-${process.pid}`)) rmSync(join(baseDir, e), { recursive: true, force: true });
   }
 }
+
+// ---- trace in release artifacts (阶段四百五十) ---------------------------------
+// The policy is "the artifact decides": release packaging means no trace output,
+// a plain run/build keeps it. Pinned here (not in examples) because the difference
+// is a build-level decision, and because the failure mode is silent -- a release exe
+// with trace still compiles and still behaves, it just carries output nobody reads.
+function checkTracePolicy(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [trace] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [trace] ${label}`); }
+  };
+  const cfg = (over: Partial<BuildConfig> = {}): BuildConfig =>
+    ({ ...defaultBuildConfig(), target: 'native', ...over });
+
+  check('the default is "let the artifact decide"', defaultBuildConfig().trace === '');
+  check('a plain build keeps trace (as-aot foo.as --run behaves as it always did)',
+    traceEnabled(cfg()) === true);
+  check('every release package drops trace (exe / app / dmg)',
+    !traceEnabled(cfg({ package: 'exe' })) &&
+    !traceEnabled(cfg({ package: 'app' })) &&
+    !traceEnabled(cfg({ package: 'dmg' })));
+  check('...while non-release packages keep it (raw / web / xcode-project)',
+    traceEnabled(cfg({ package: 'raw' })) &&
+    traceEnabled(cfg({ package: 'web' })) &&
+    traceEnabled(cfg({ package: 'xcode-project' })));
+
+  check('an explicit "on" overrides release packaging in both directions',
+    traceEnabled(cfg({ package: 'exe', trace: 'on' })) === true &&
+    traceEnabled(cfg({ package: 'raw', trace: 'off' })) === false);
+
+  const manifestPath = join(root, 'examples', 'trace.pin.json');
+  const fromManifest = (m: Manifest): BuildConfig => applyManifest(defaultBuildConfig(), m, manifestPath);
+  check('a manifest may spell either value',
+    fromManifest({ trace: 'off' } as Manifest).trace === 'off' &&
+    fromManifest({ trace: 'on' } as Manifest).trace === 'on');
+  check('a manifest value reaches the decision (not just the field)',
+    traceEnabled(fromManifest({ trace: 'off' } as Manifest)) === false &&
+    traceEnabled(fromManifest({ package: 'exe', trace: 'on' } as Manifest)) === true);
+  let badValue = '';
+  try { fromManifest({ trace: true } as unknown as Manifest); } catch (e) { badValue = String(e); }
+  check('a non-string value fails loudly and names the field (a boolean is not a policy)',
+    badValue.includes("'trace'") && badValue.includes('true'));
+
+  console.log(`     [trace] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: build/TracePolicy', checkTracePolicy);

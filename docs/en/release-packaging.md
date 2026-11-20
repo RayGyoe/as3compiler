@@ -122,6 +122,29 @@ top-level windows after launching it the way Explorer does reported **zero** `Co
 windows, leaving only the app's own `SDL_app` window, and the process closed with exit code 0. The
 32-bit `/LARGEADDRESSAWARE` bit (0x0020) is still set.
 
+### trace: release artifacts carry none (two gates)
+
+Once the console window is gone, `trace()` has nowhere to go in a release build — but that does not
+mean it is absent: the default `printf` + `fflush(stdout)` still formats and still issues a write
+that is bound to fail. Release artifacts therefore gate trace in two layers (stage 450):
+
+1. **Compile time**: `package` `exe`/`app`/`dmg` emits `#define ASC_TRACE 0`, so neither the
+   `printf` nor its format strings reach the binary. **Arguments are still evaluated** —
+   `trace(++i)` still increments `i`, and only pure expressions are eliminated by `-O2`. Dropping
+   the statement outright would change program semantics, which is not an optimisation.
+2. **Runtime**: builds that do carry trace (`--run`, `--package raw`) wrap it in `as_trace_on()`, so
+   `ASC_TRACE=0` in the environment silences output without a rebuild — the layer Qt
+   (`QT_LOGGING_RULES`), glog (`GLOG_v`) and Rust (`RUST_LOG`) all provide. Only the literal `0`
+   disables it; any other value keeps output on.
+
+The manifest field `trace: "on" | "off"` overrides the inference in either direction. Measured on a
+real application: the release build's generated C went from **1020 to 335** `printf(` sites (the
+rest are the runtime's own OOM/GC diagnostics), and the exe started, rendered and closed normally.
+
+Third-party SDKs (Zoom, the segment AI SDK, …) printing to stdout are outside this mechanism — they
+belong to their own extensions, and the only thing that silences them is having no console to write
+to.
+
 An unsigned exe remains buildable but emits an explicit SmartScreen warning. To sign:
 
 ```json

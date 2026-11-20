@@ -158,6 +158,27 @@ stdout 写的东西（Zoom 的 `cmd debug:` 行、分段 AI SDK 的 GLFW 横幅�
 `SDL_app` 窗口；关闭后进程 exit code 0。32 位镜像的 `/LARGEADDRESSAWARE` 位（0x0020）
 仍保留。
 
+### trace：发布产物不带 trace（两层闸门）
+
+黑窗没了之后，`trace()` 在发布版里也**无处可去**——但这不等于它不存在：默认发射的
+`printf` + `fflush(stdout)` 仍然会格式化、仍然会调一次必然失败的写。所以发布产物的
+trace 由两层闸门控制（阶段四百五十）：
+
+1. **编译期**：`package` 为 `exe`/`app`/`dmg` 时发射 `#define ASC_TRACE 0`，`printf` 与
+   它的格式串根本不进二进制。**参数照旧求值**——`trace(++i)` 仍然会让 `i` 自增，只有
+   纯表达式会被 `-O2` 删干净；删掉整条语句就是改程序语义，不属优化范畴。
+2. **运行期**：编译期开着 trace 的构建（普通 `--run`、`--package raw`）额外包一层
+   `as_trace_on()`；环境变量 `ASC_TRACE=0` 可在不重编的前提下静默输出（Qt 的
+   `QT_LOGGING_RULES`、glog 的 `GLOG_v`、Rust 的 `RUST_LOG` 都是这一层）。只有字面量
+   `0` 关闭，其他值一律保持输出。
+
+清单字段 `trace: "on" | "off"` 覆盖上述推断，两个方向都可以。真应用实测：发布版生成的 C
+从 `printf(` **1020 处降到 335 处**（剩下的都是运行时的 OOM/GC 诊断），exe 启动、渲染、
+关闭均正常。
+
+第三方 SDK（Zoom、分段 AI 等）自己往 stdout 写的日志不在此机制范围内——它们属于各自的
+扩展库，只能靠“没有控制台可写”来消除。
+
 清单无签名配置时 exe 仍可构建运行，但会明确警告未签名、可能触发 SmartScreen。
 要签名时配置：
 

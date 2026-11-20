@@ -8502,6 +8502,40 @@ static ASC_TLS int as_frame_guard = 0;
 typedef struct { const char* cls; const char* meth; } as_aframe;
 static ASC_TLS as_aframe as_astack[512];
 static ASC_TLS int as_astack_depth = 0;
+// ASC_TRACE: does this artifact carry "trace()" at all (阶段四百五十)?
+//
+// The emitter spells it out on every build: 0 for release packaging ("package:
+// exe/app/dmg"), 1 otherwise. With 0 the emitter emits no printf for a trace and
+// no format string reaches .rodata -- a release artifact carries no trace output,
+// which is what AIR release artifacts do too and what a GUI-subsystem exe or a
+// .app can even receive (there is no console to print to).
+//
+// Defaults to 1 so a preamble consumer that never sees the define keeps the
+// historical behaviour (the same rule ASC_STACKTRACE below follows).
+#ifndef ASC_TRACE
+#define ASC_TRACE 1
+#endif
+#if ASC_TRACE
+// Runtime half of the gate: "ASC_TRACE=0" in the environment silences trace on a
+// machine whose build still carries it, with no rebuild. This is the layer Qt
+// (QT_LOGGING_RULES), glog (GLOG_v) and RUST_LOG all provide; the compile-time
+// define is the layer that decides whether the cost exists at all.
+//
+// Cached statically: one getenv per process, and the branch after that is a load
+// of a warm cache line. Only the exact string "0" disables -- ASC_TRACE=1, unset
+// and any other value all keep the output, so an accidental value cannot
+// silently swallow a build's diagnostics.
+// static inline: a build that carries trace but contains no trace statement must not
+// earn a -Wunused-function warning from the preamble.
+static inline int as_trace_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* v = getenv("ASC_TRACE");
+        on = (v != NULL && v[0] == '0' && v[1] == 0) ? 0 : 1;
+    }
+    return on;
+}
+#endif
 // ASC_STACKTRACE is opted IN by the emitter only when the compilation actually
 // references Error.getStackTrace (see Emitter.usesStackTrace). The per-call
 // frame push/pop is pure overhead for the common program that never reads a

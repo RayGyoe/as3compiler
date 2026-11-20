@@ -13,7 +13,7 @@ import { aneHostDirName, aneHostLibName, anePlatformForBuild, anePlatformHint, r
 import { AS3_GAPS, collectScriptVars } from './emit.ts';
 import { ctypeToString, qualifiedName } from './symbols.ts';
 import type { Program, Stmt } from './ast.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, runObjectCacheStep, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, hostVendorKey, type BuildConfig } from './build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileSteps, runCompile, runObjectCacheStep, buildWebCompileSteps, webCompileStepsEnv, featureMacros, validateFeatures, knownFeatures, applyFeatureDeps, deploySkiaIcuData, ICU_DATA_NAME, cleanObjectScratch, icuDataPaths, writeIcuAssembly, editDistance, hostVendorKey, traceEnabled, type BuildConfig } from './build.ts';
 import { checkFailure, requireCheck, type CheckCtx } from './checks.ts';
 import type { Target, Package, Manifest } from './build.ts';
 import { generateBootstrap, prepareAirApp, airManifest, parseGpuBackend, type GpuBackend } from './air-app.ts';
@@ -1089,7 +1089,7 @@ async function main(): Promise<void> {
   if (opts.airApp) {
     try { appDescriptorXml = readFileSync(opts.airApp, 'utf8'); } catch { appDescriptorXml = undefined; }
   }
-  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? [], cfg.features, docRootClass);
+  const { c, exports } = generateC(program, cfg.exports, swcResources, swcBake, embedResources, embedFieldInits, appDescriptorXml, aneResolution?.descriptors ?? [], cfg.features, docRootClass, traceEnabled(cfg));
   mkdirSync(dirname(cPath), { recursive: true });
   writeFileSync(cPath, c);
 

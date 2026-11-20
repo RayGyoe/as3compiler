@@ -79,8 +79,13 @@ function checkCrashHardening(): string[] {
   // Every %s branch of trace goes through the guard. Counted, not spot-checked:
   // the defect is "one branch was forgotten", so the pin is that no bare value is
   // pushed for a %s format any more.
+  //
+  // Sliced from traceFormat itself, not from emitTrace: since 阶段四百五十 emitTrace
+  // first decides whether the printf exists at all (ASC_TRACE / as_trace_on) and only
+  // then calls traceFormat, so a fixed window starting at emitTrace measures the
+  // wrong thing the moment that gate grows.
   const em = read('src/emit.ts');
-  const trAt = em.indexOf('private emitTrace(args: Expr[]): string {');
+  const trAt = em.indexOf('private traceFormat(args: Expr[]): string {');
   const trBody = trAt >= 0 ? em.slice(trAt, trAt + 4200) : '';
   check('emitTrace wraps every %s argument in as_str_or_null',
     trBody.includes('const s9 = (code: string) => `as_str_or_null(${code})`;') &&

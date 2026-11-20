@@ -784,6 +784,9 @@ export class Emitter {
   // runtime emits empty as_astack_enter/leave (ASC_STACKTRACE 0) so call-heavy
   // code pays no per-call frame cost. See runtime.ts ASC_STACKTRACE.
   private usesStackTrace = false;
+  // `trace()` in this artifact (阶段四百五十). False for release packaging: the
+  // printf/fflush pair is not emitted, the argument expressions still are.
+  private traceOn: boolean;
 
   constructor(
     program: Program,
@@ -794,7 +797,8 @@ export class Emitter {
     embedResources: readonly EmbedResourceSpec[] = [],
     appDescriptorXml: string | undefined = undefined,
     aneDescriptors: readonly AneDescriptor[] = [],
-    docRootClass: string | undefined = undefined
+    docRootClass: string | undefined = undefined,
+    trace: boolean = true
   ) {
     this.program = program;
     this.symbols = symbols;
@@ -814,6 +818,7 @@ export class Emitter {
     this.appDescriptorXml = appDescriptorXml;
     this.aneDescriptors = aneDescriptors;
     this.docRootClass = docRootClass;
+    this.traceOn = trace;
     this.usesStackTrace = this.scanStackTrace(program);
     const subclassed = new Set<string>();
     for (const info of this.symbols.classes.values()) {
@@ -853,6 +858,10 @@ export class Emitter {
     // scanStackTrace). Must precede RUNTIME_PREAMBLE, whose ASC_STACKTRACE
     // #ifndef defaults to 1 when this define is absent.
     this.line(`#define ASC_STACKTRACE ${this.usesStackTrace ? 1 : 0}`);
+    // Same shape for trace (阶段四百五十): the define decides whether the printf
+    // exists at all. RUNTIME_PREAMBLE's `#ifndef ASC_TRACE` defaults to 1, so a
+    // translation unit that never sees this line keeps the historical behaviour.
+    this.line(`#define ASC_TRACE ${this.traceOn ? 1 : 0}`);
     this.line(RUNTIME_PREAMBLE.trimEnd());
     this.line('');
     this.emitAnePreamble();
@@ -36165,12 +36174,15 @@ void FileStream_writeObject(void* _this, as_value v) {
           break;
         }
         if (this.isTraceStmt(stmt.expr)) {
-          // Statement position is the one place the per-call flush can be a statement
-          // of its own. A side-effecting argument was already hoisted by the
-          // sequenceValueExpr above, so what remains is the printf and its flush.
+          // Statement position is the one place a trace can be a statement of its own
+          // (a side-effecting argument was already hoisted by sequenceValueExpr above).
+          // emitTrace now returns the whole statement -- the runtime-gated printf and
+          // its flush, or the ASC_TRACE=0 no-op that still evaluates the arguments --
+          // so this branch only has to place it.
           const te = this.emitExpr(stmt.expr);
-          this.line(`${te.code};`);
-          this.line('fflush(stdout);');
+          // The runtime-gated form ends in `}`, which already terminates the
+          // statement: appending a `;` would produce `};`.
+          this.line(te.code.endsWith('}') ? te.code : `${te.code};`);
           this.discardedExprNode = outerDiscarded;
           break;
         }
@@ -41551,7 +41563,30 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   private emitTrace(args: Expr[]): string {
-    return `printf(${this.traceFormat(args)})`;
+    if (this.traceOn) {
+      // Statement shape: `if (as_trace_on()) { printf(...); fflush(stdout); }`.
+      //
+      // The runtime gate is the second of two layers (阶段四百五十). The first is
+      // ASC_TRACE=0, which removes the whole thing; this one keeps the printf in
+      // the artifact for a build that ships with trace but wants it silenced on a
+      // field machine (`ASC_TRACE=0` in the environment, no rebuild). Same shape
+      // Qt gives qDebug() (compile-time QT_NO_DEBUG_OUTPUT + runtime category
+      // rules); the enabled path is unchanged printf text, so it still reads as the
+      // plain statement a reader recognizes.
+      //
+      // Both the printf and the flush are inside the branch: silencing trace must
+      // silence the per-line fflush(stdout) too, or a hot loop would still pay a
+      // syscall per trace it decided not to print.
+      return `if (as_trace_on()) { printf(${this.traceFormat(args)}); fflush(stdout); }`;
+    }
+    // ASC_TRACE=0: the call is gone, the ARGUMENTS are not. AS3 evaluates every
+    // argument of a call left to right, so `trace("i=" + (++i))` must still bump
+    // `i`; dropping the whole statement would be a semantic change, and §2.4
+    // forbids translating a program into a different one. `(void)` keeps the
+    // value from warning and lets -O2 delete the expression when it is pure.
+    if (args.length === 0) return 'do { } while (0)';
+    const evaluated = args.map((a) => `(void)(${this.emitExpr(a).code});`).join(' ');
+    return `do { ${evaluated} } while (0)`;
   }
 
   // `trace` flushes the moment it runs, for the same reason AIR shows a trace line
@@ -41560,10 +41595,10 @@ void FileStream_writeObject(void* _this, as_value v) {
   // 4 KB with. Measured during this stage: a windowed run reported nothing at all
   // after its window was force-closed, with every assertion already written.
   //
-  // The flush is a SECOND STATEMENT of the trace statement (see the ExprStmt case),
-  // not a comma expression around the printf: `trace` stays a plain `printf(...)`
-  // statement, which is the shape a reader recognizes and the shape the null-string
-  // pins assert, and a statement is where a statement can go.
+  // The flush lives INSIDE emitTrace since stage 四百五十, because the runtime gate
+  // has to enclose it as well (see there); it is still a plain statement inside the
+  // branch, not a comma expression around the printf, so the emitted text keeps the
+  // shape a reader recognizes.
   private isTraceStmt(expr: Expr): boolean {
     return expr.kind === 'Call' && expr.callee.kind === 'Var' && expr.callee.name === 'trace';
   }

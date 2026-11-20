@@ -197,6 +197,16 @@ export interface BuildConfig {
   // 'windows' (see index.ts) because that build IS a GUI application. An explicit
   // manifest value wins over both.
   windowsSubsystem: 'console' | 'windows' | '';
+  // `trace()` in the release artifact (阶段四百五十). A release build ships no
+  // trace output -- AIR release artifacts don't either, and a desktop app has no
+  // console to write to after the GUI-subsystem change. Off by default whenever
+  // the artifact IS a release (package exe/app/dmg); an explicit manifest value
+  // wins, so a build that needs the diagnostics can keep them.
+  //
+  // Off is not "print nothing": the emitter still evaluates every argument that
+  // can have a side effect (`trace(++i)` must still increment), it only drops the
+  // printf/fflush pair and its format strings. See emit.ts::emitTrace.
+  trace: 'on' | 'off' | '';
   // Video backend gate (docs/zh-cn/video.md §5): whether the FFmpeg archives are
   // part of the link set, which profile they were built as, and which decoder the
   // runtime asks for. Resolved by `applyVideoGate` in index.ts, never by hand.
@@ -248,6 +258,7 @@ export function defaultBuildConfig(): BuildConfig {
     timestampServer: 'http://timestamp.digicert.com',
     architecture: '',
     windowsSubsystem: '',
+    trace: '',
     video: 'auto',
     videoFormats: 'broad',
     videoBackend: 'auto',
@@ -310,6 +321,7 @@ interface ManifestFields {
   'company-name'?: string;
   'legal-copyright'?: string;
   'windows-subsystem'?: 'console' | 'windows';
+  trace?: 'on' | 'off';
   icon?: string;
   'air-icons'?: Record<string, string>;
   'deployment-target'?: string;
@@ -653,6 +665,12 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
     }
     next.windowsSubsystem = s;
   }
+  if (m.trace !== undefined) {
+    if (m.trace !== 'on' && m.trace !== 'off') {
+      throw new Error(`manifest 'trace' must be "on" or "off" (got ${JSON.stringify(m.trace)}) — ${manifestPath}`);
+    }
+    next.trace = m.trace;
+  }
   if (m.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(m.icon, ht, manifestPath));
   if (m['air-icons']) {
     next.airIcons = Object.fromEntries(Object.entries(m['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
@@ -736,6 +754,7 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   if (L['company-name']) next.companyName = L['company-name'];
   if (L['legal-copyright']) next.legalCopyright = L['legal-copyright'];
   if (L['windows-subsystem']) next.windowsSubsystem = L['windows-subsystem'];
+  if (L.trace) next.trace = L.trace;
   if (L.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(L.icon, ht, manifestPath));
   if (L['air-icons']) {
     next.airIcons = Object.fromEntries(Object.entries(L['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
@@ -865,6 +884,21 @@ export function linkTrimFlags(cfg: BuildConfig): string[] {
 export function windowsSubsystem(cfg: BuildConfig): 'console' | 'windows' {
   if (cfg.windowsSubsystem !== '') return cfg.windowsSubsystem;
   return cfg.package === 'exe' ? 'windows' : 'console';
+}
+
+// Does this build carry `trace()` at all? A release artifact does not: `package:
+// 'exe' | 'app' | 'dmg'` means "what the user installs", and those have no
+// console to print to (the Windows exe is GUI subsystem, a .app has no terminal
+// attached). The default is therefore OFF there and ON everywhere else, so
+// `as-aot foo.as --run` and the example suite behave exactly as before.
+//
+// Not a "feature" (--features): a feature turns an AIR SUPERSET capability ON,
+// this turns a diagnostic OFF, and mixing the two would make `--features no-trace`
+// look like an enhancement (§1.5). It is a manifest field with an artifact-derived
+// default, the same shape as `windows-subsystem`.
+export function traceEnabled(cfg: BuildConfig): boolean {
+  if (cfg.trace !== '') return cfg.trace === 'on';
+  return cfg.package !== 'exe' && cfg.package !== 'app' && cfg.package !== 'dmg';
 }
 
 // 32-bit Windows builds opt into the 4 GB user address space

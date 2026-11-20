@@ -5905,3 +5905,57 @@ function checkSwitchDefaultFallthrough(): string[] {
   return bad;
 }
 registerGroup('unit: emit/SwitchDefaultFallthrough', checkSwitchDefaultFallthrough);
+// ---- trace: two-layer gate (阶段四百五十) --------------------------------------
+// A release artifact carries no trace output. Two layers, and each one is checked
+// here because each can silently regress into the other's job:
+//   * compile time (ASC_TRACE=0): the printf is not emitted at all, but the
+//     ARGUMENTS still are -- `trace(x++)` must still advance x, or the translation
+//     changed the program's meaning (§2.4);
+//   * runtime (`as_trace_on()`): a build that ships trace can be silenced on a
+//     field machine with ASC_TRACE=0 and no rebuild, printf AND flush together.
+function checkTraceGate(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [tracegate] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [tracegate] ${label}`); }
+  };
+  const src = 'var i:int = 0;\ntrace("n", 1);\n';
+  const on = generateC(parse(src)).c;
+  const off = generateC(parse(src), [], [], undefined, [], undefined, undefined, [], [], undefined, false).c;
+  const mainOf = (c: string): string => c.slice(c.indexOf('int main('));
+
+  check('a normal build defines ASC_TRACE 1 (and the preamble default agrees)',
+    on.includes('#define ASC_TRACE 1') && RUNTIME_PREAMBLE.includes('#ifndef ASC_TRACE'));
+  check('a release build defines ASC_TRACE 0',
+    off.includes('#define ASC_TRACE 0'));
+
+  check('the shipped form boxes the printf behind as_trace_on()',
+    mainOf(on).includes('if (as_trace_on()) { printf('));
+  check('the flush is INSIDE the gate (a silenced trace must not pay a syscall per line)',
+    mainOf(on).includes('printf(') && mainOf(on).includes('fflush(stdout); }') &&
+    !mainOf(on).split('\n').some((l) => l.trim() === 'fflush(stdout);'));
+  check('the gated form does not leave a bare `};` statement terminator',
+    !mainOf(on).includes('};'));
+
+  check('with ASC_TRACE 0 there is no printf and no gate call at all',
+    !mainOf(off).includes('printf(') && !mainOf(off).includes('as_trace_on()'));
+  check('...but the statement spot is still occupied by a no-op',
+    mainOf(off).includes('do {'));
+
+  // Semantics, not cosmetics: the argument of a disabled trace is still evaluated.
+  const sideOff = generateC(parse('var i:int = 0;\ntrace("i=" + (++i));\n'), [], [], undefined, [], undefined, undefined, [], [], undefined, false).c;
+  check('a side-effecting argument still runs when trace is compiled out',
+    sideOff.indexOf('(++g_i)') >= 0 || sideOff.indexOf('(++i)') >= 0);
+  const emptyOff = generateC(parse('trace();\n'), [], [], undefined, [], undefined, undefined, [], [], undefined, false).c;
+  check('an argument-less trace compiles to an empty no-op, not to a stray `(void)`',
+    mainOf(emptyOff).includes('do { } while (0)'));
+
+  const offMain = mainOf(off);
+  check('the disabled trace leaves no format string behind',
+    !offMain.includes('"%s %d\n"') && !offMain.includes('as_str_or_null("n")'));
+
+  console.log(`     [tracegate] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/TraceGate', checkTraceGate);
