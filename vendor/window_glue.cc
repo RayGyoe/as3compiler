@@ -1131,6 +1131,10 @@ static void sk_service_destroy(void) {
   for (int i = 0; i < SK_MAX_WINDOWS; i++) {
     WinCtx* c = &g_wins[i];
     if (!c->used || !c->destroy_pending) continue;
+    if (getenv("ASC_GL_TRACE") != nullptr) {
+      fprintf(stderr, "window_glue: [trace] service_destroy i=%d gpu=%d\n", i, c->is_gpu);
+      fflush(stderr);
+    }
 #ifdef ASC_USE_NATIVE_DRAG
     sk_drag_detach(i);
 #endif
@@ -1153,6 +1157,10 @@ static void sk_service_destroy(void) {
 #endif
     }
     if (c->win != NULL) SDL_DestroyWindow(c->win);
+    if (getenv("ASC_GL_TRACE") != nullptr) {
+      fprintf(stderr, "window_glue: [trace] window_destroyed i=%d\n", i);
+      fflush(stderr);
+    }
     sk_close_cb cb = c->on_close;
     int was_main = (i == g_main);
     memset(c, 0, sizeof(*c));
@@ -1160,6 +1168,10 @@ static void sk_service_destroy(void) {
     // Notify last: the AS3 side frees its surface and dispatches Event.CLOSE, and
     // a listener is free to open another window from there.
     if (cb != NULL) cb(i);
+    if (getenv("ASC_GL_TRACE") != nullptr) {
+      fprintf(stderr, "window_glue: [trace] close_cb_done i=%d\n", i);
+      fflush(stderr);
+    }
   }
 }
 

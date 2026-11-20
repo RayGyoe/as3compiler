@@ -23599,6 +23599,31 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
 
+### 阶段四百四十七：GPU 窗口销毁卡死——销毁前放弃 Ganesh 上下文（v0.4.421 → v0.4.422）✅ 已完成
+
+**问题**：真应用（GL 后端）偶发在销毁 GPU 窗口时主线程 100% CPU 不返回，窗口报 Responding=False，
+只能强杀；用户观察到的是「点关闭没反应」。
+
+**定位**（新增 `ASC_GL_TRACE=1` 门控探针）：`sk_gpu_destroy()` 里 `flushAndSubmit(GrSyncCpu::kYes)`
+**成功返回**，随后释放 SkSurface / GrDirectContext 时卡死。Skia 的 `checkGlError` 一直读 `glGetError`
+直到没有错误为止；驱动在该上下文上持续回 `GL_OUT_OF_MEMORY` 时这个循环永不结束，于是窗口永远关不掉。
+
+**修法**：这个上下文几行之后就要 `wglDeleteContext`，没必要让 Ganesh 逐条 `glDelete*` 回收资源——
+先 `abandonContext()` 再放 surface / ctx，释放退化成纯指针操作，GL 对象由 `wglDeleteContext` 一次性回收。
+
+**证据**：入会 → 离开会议 → 关闭主窗口全流程，`service_destroy` / `destroy enter` / `flush` /
+`surface-reset` / `ctx-reset` / `delete-context` / `window_destroyed` / `close_cb_done` 全部走完，
+主窗口继续渲染并正常退出；`bin-aotuild-aot.bat gl` 重编出的正式 exe 启动 → 关闭 exit 干净。
+会中稳态 90 秒实测：Ganesh resource cache 恒为 **74 项 / 161.82 MB** 不增长、`glGetError` 零条
+⇒ **不是纹理泄漏**，卡死是驱动侧上下文失效时的排错死循环。
+
+**诊断能力**：`ASC_GL_TRACE=1` 打印 begin / flush / destroy 各步、进入时已挂起的 GL 错误（限次排空，
+不会变成它要观测的那个死循环）、以及每 120 帧的 resource cache 用量。默认零输出；开关结果静态缓存，
+不进提交热路径。
+
+**回归**：`node test.ts` **723 / 729 过**（4 跳过）。2 红是 `unit: emit/StringAccumulator`：把本改动的
+两个 vendor 文件 stash 掉、在同一棵树上复跑仍红 6 条 pin ⇒ **与本改动无关**，属并发会话的字符串累加器工作。
+
 ### 阶段四百四十四：非 ASCII 串的 `lastIndexOf` 候选反向扫（v0.4.418 → v0.4.419）✅ 已完成
 
 **立项依据**：阶段四百四十一条的结论是「`strings` 的 GC 是 59%，翻译层约 11%，`as_u16_*` 未进前

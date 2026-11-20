@@ -144,6 +144,15 @@ static void gl_stats_frame_done(void) {
   }
 }
 
+// ASC_GL_TRACE=1 turns on the window-teardown trace and the frame-begin/flush
+// probe lines. Read once and cached, the same way g_gl_stats_on is: getenv() is a
+// linear scan of the environment block and these probes sit in the submit path.
+static int g_gl_trace_on = -1;
+static int gl_trace_on(void) {
+  if (g_gl_trace_on < 0) g_gl_trace_on = (getenv("ASC_GL_TRACE") != nullptr) ? 1 : 0;
+  return g_gl_trace_on;
+}
+
 static GLWin* gl_slot(int win_id) {
   if (win_id < 0 || win_id >= SK_GL_MAX_WINDOWS) return nullptr;
   return g_gl[win_id].used ? &g_gl[win_id] : nullptr;
@@ -178,6 +187,30 @@ static int gl_make_current(GLWin* w) {
     return 0;
   }
   return 1;
+}
+
+// Diagnostic probe (ASC_GL_TRACE=1): report GL errors that are already pending on
+// entry to a path that hands work to Ganesh. Skia's own checkGlError loops until
+// no error is reported, so a context that keeps answering GL_OUT_OF_MEMORY turns
+// that loop into a live-lock with no log at all; reading a bounded number of times
+// here says whether the error predates the call. The bound is deliberate — an
+// unbounded drain would be the very live-lock this is meant to observe.
+static void gl_trace_pending(const char* tag) {
+  if (!gl_trace_on()) return;
+  int seen = 0;
+  for (int i = 0; i < 32; i++) {
+    GLenum e = glGetError();
+    if (e == GL_NO_ERROR) break;
+    seen++;
+    if (seen <= 4) {
+      fprintf(stderr, "gl_glue: [trace] %s err=0x%04x\n", tag, (unsigned)e);
+    }
+  }
+  if (seen > 0) {
+    fprintf(stderr, "gl_glue: [trace] %s drained=%d cur=%p\n", tag, seen,
+            (void*)wglGetCurrentContext());
+    fflush(stderr);
+  }
 }
 
 // Ask the driver for vsync. Optional in both directions: WGL_EXT_swap_control is
@@ -490,14 +523,51 @@ void sk_gpu_destroy(int win_id) {
 
   if (w->ctx != nullptr) {
     gl_make_current(w);
+    if (gl_trace_on()) {
+      fprintf(stderr, "gl_glue: [trace] destroy enter win=%d hglrc=%p cur=%p\n",
+              win_id, (void*)w->hglrc, (void*)wglGetCurrentContext());
+      fflush(stderr);
+    }
+    gl_trace_pending("destroy-before-flush");
     // Submit whatever is queued before the context disappears; kYes is a CPU
     // sync, which is what "nothing is still in flight" requires here.
     w->ctx->flushAndSubmit(GrSyncCpu::kYes);
+    if (gl_trace_on()) {
+      fprintf(stderr, "gl_glue: [trace] destroy flushed win=%d\n", win_id);
+      fflush(stderr);
+    }
+    gl_trace_pending("destroy-after-flush");
+    // The GL context is deleted a few lines below, so there is nothing for Ganesh
+    // to release through the driver: abandon first, then drop the references.
+    // Without this the surface/context teardown walks the resource cache and calls
+    // glDelete* on a context the driver has already given up on. That is where
+    // closing a GPU window used to hang -- Skia's checkGlError loops until
+    // glGetError reports no error, and a context stuck on GL_OUT_OF_MEMORY keeps
+    // reporting it, so the loop never ends and the window never closes. Abandoning
+    // makes both releases pure pointer work; wglDeleteContext below reclaims the
+    // GL objects in one go.
+    w->ctx->abandonContext();
     w->surface.reset();
+    if (gl_trace_on()) {
+      fprintf(stderr, "gl_glue: [trace] destroy surface-reset win=%d\n", win_id);
+      fflush(stderr);
+    }
     w->ctx.reset();
+    if (gl_trace_on()) {
+      fprintf(stderr, "gl_glue: [trace] destroy ctx-reset win=%d\n", win_id);
+      fflush(stderr);
+    }
   }
   if (wglGetCurrentContext() == w->hglrc) wglMakeCurrent(NULL, NULL);
+  if (gl_trace_on()) {
+    fprintf(stderr, "gl_glue: [trace] destroy make-current-null win=%d\n", win_id);
+    fflush(stderr);
+  }
   if (w->hglrc != NULL) wglDeleteContext(w->hglrc);
+  if (gl_trace_on()) {
+    fprintf(stderr, "gl_glue: [trace] destroy delete-context win=%d\n", win_id);
+    fflush(stderr);
+  }
   if (w->hdc != NULL && w->hwnd != NULL) ReleaseDC(w->hwnd, w->hdc);
   w->hglrc = NULL;
   w->hdc = NULL;
@@ -608,6 +678,10 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
   if (w == nullptr || w->ctx == nullptr) return nullptr;
   if (width <= 0 || height <= 0) return nullptr;
   if (!gl_make_current(w)) return nullptr;
+  if (gl_trace_on()) {
+    fprintf(stderr, "gl_glue: [trace] begin win=%d %dx%d\n", win_id, width, height);
+    fflush(stderr);
+  }
 
   // A resize needs no allocation dance here, unlike D3D12's ResizeBuffers: the
   // default framebuffer follows the window by itself. Only the Skia wrapper has to
@@ -661,7 +735,32 @@ void sk_gpu_flush(int win_id) {
   if (w == nullptr || w->ctx == nullptr || w->surface == nullptr) return;
   if (!gl_make_current(w)) return;
 
+  gl_trace_pending("frame-begin");
+  if (gl_trace_on()) {
+    fprintf(stderr, "gl_glue: [trace] flush enter win=%d\n", win_id);
+    fflush(stderr);
+  }
   w->ctx->flushAndSubmit(GrSyncCpu::kNo);
+  if (gl_trace_on()) {
+    fprintf(stderr, "gl_glue: [trace] flush done win=%d\n", win_id);
+    fflush(stderr);
+  }
+  gl_trace_pending("frame-end");
+  // Ganesh's resource cache is the one number that turns "does this window leak
+  // GPU memory" from a guess into a measurement: a value that climbs without
+  // settling over a long session means images/textures are being retained, which
+  // is what a driver eventually answers with GL_OUT_OF_MEMORY.
+  if (gl_trace_on()) {
+    static long gl_trace_frames = 0;
+    if (++gl_trace_frames % 120 == 0) {
+      int rcount = 0;
+      size_t rbytes = 0;
+      w->ctx->getResourceCacheUsage(&rcount, &rbytes);
+      fprintf(stderr, "gl_glue: [trace] cache win=%d resources=%d bytes=%.2fMB\n",
+              win_id, rcount, (double)rbytes / (1024.0 * 1024.0));
+      fflush(stderr);
+    }
+  }
 
   // Before the present call below, which blocks on vblank (see above).
   gl_stats_frame_done();
