@@ -23599,6 +23599,43 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
 
+### 阶段四百四十九：Windows 发布版不再弹控制台窗——PE 子系统（v0.4.423 → v0.4.424）✅ 已完成
+
+**问题**：用 `--package exe` 出的发布版从资源管理器双击，会额外弹一个黑窗，里面滚着运行时 trace
+和各个 ANE 的 SDK 自己往 stdout 写的东西（Zoom 的 `cmd debug:`、分段 AI SDK 的 GLFW 横幅）。
+桌面上看起来就是「发布的还是调试版」。
+
+**根因**：跟资源、图标、版本号都无关——是 PE 头的 `Subsystem` 字段。我们的原生 Windows exe
+一直是 `IMAGE_SUBSYSTEM_WINDOWS_CUI`（0x3，实测 `llvm-readobj --file-headers`），Windows 于是
+认为它是命令行程序、启动时配一个控制台。`--package exe` 只往二进制里塞资源，从未碰过这个字段。
+（对齐口径：AIRSDK 的 `adl.exe` 本身就是 CUI，而装好的 AIR 应用是 GUI——两个阶段本来就不同。）
+
+**修法**：
+
+- `src/build.ts`：新增 `BuildConfig.windowsSubsystem`（`'console' | 'windows' | ''`）与清单字段
+  `windows-subsystem`（非法值硬报错，不静默回落——回落就是黑窗回来）；缺省按**产物**推断：
+  `package: 'exe'` 得 `windows`，其余保持 `console`（`as-aot foo.as --run` 仍是命令行程序，
+  argv 逐字不变）。
+- `src/build.ts::windowsLinkFlags`：`windows` 时同时加 `/SUBSYSTEM:WINDOWS` 与
+  `/ENTRY:mainCRTStartup`。后者不是可选项：生成 C 是 `int main(void)`，GUI 子系统的默认入口叫
+  `WinMainCRTStartup`，只给子系统不给入口会链接失败。LAA 位逻辑不变（32 位仍带）。
+- `src/index.ts`：`--air-app` 构建在清单合并完成后补默认 `windows`（AIR 应用本身就是 GUI，
+  日常的 raw 构建也不该弹黑窗），显式清单值仍优先。
+
+**证据**（真应用 `--package exe`，v0.4.424）：同一份应用同一套资源，PE 头
+`Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI (0x3)` → `IMAGE_SUBSYSTEM_WINDOWS_GUI (0x2)`，
+`Characteristics` 仍含 `IMAGE_FILE_LARGE_ADDRESS_AWARE (0x20)`。以资源管理器方式
+（`Start-Process`，无 job console）启动后枚举可见顶层窗口：`ConsoleWindowClass` 计数 **0**，
+只剩应用自己的 `SDL_app` 窗口 `[拓麦会议]- [TalkMED Meeting]`；`CloseMainWindow` 后
+`exit code 0`。生成的 `dist\` 目录同步重建（556.7 MB，28 项）。
+
+**单元钉子**：新增 `unit: build/WindowsSubsystem` 15 钉（推断两向 + 显式值双向优先；console 构建
+argv 里不含 `SUBSYSTEM`/`ENTRY`；`windows` 必带两个旗标且顺序相邻；32/64 位与 LAA 组合；
+wasm 恒空；编译步不带；两条链接路径都带；清单两个合法值 + 非法值报错且点名字段）。
+
+**回归**：`node test.ts` **726 / 731 过**（4 跳过）；唯一红仍是 `unit: emit/StringAccumulator`
+（并发会话的字符串累加器工作，与本阶段无关）。
+
 ### 阶段四百四十八：Windows 发布的公司/版权元信息（v0.4.422 → v0.4.423）✅ 已完成
 
 **问题**：`--package exe` 产出的 exe 文件属性页「公司」恒为空、也没有「版权」——`CompanyName` 在

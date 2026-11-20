@@ -974,6 +974,7 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `display-name` | string | 应用显示名（填 `CFBundleName` / Windows 资源，缺省取产物名） |
 | `company-name` | string | Windows VERSIONINFO `CompanyName`；`--air-app` 从 `<publisher>` 继承，缺省空串（不臆造厂商） |
 | `legal-copyright` | string | Windows VERSIONINFO `LegalCopyright`；`--air-app` 从 `<copyright>` 继承。源文件含非 ASCII 时资源命令自动加 `/C 65001` |
+| `windows-subsystem` | `"console"` \| `"windows"` | PE 子系统。缺省按产物推断：`package: "exe"` 与 `--air-app` 构建得 `windows`（不分配控制台窗），其余保持 `console`（`as-aot foo.as --run` 仍是命令行程序）。`windows` 会同时加 `/SUBSYSTEM:WINDOWS` 与 `/ENTRY:mainCRTStartup` |
 | `icon` | string | 已完成的平台图标路径：macOS 为 `.icns`，Windows 为 `.ico`；相对清单目录解析 |
 | `air-icons` | `{ "imageNNxNN": string }` | AIR 描述符 PNG 图标组；`app`/`dmg` 转成 `.icns`，`exe` 转成 PNG-compressed ICO |
 | `deployment-target` | string | macOS 最低系统版本（填 `LSMinimumSystemVersion` / `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
@@ -1318,6 +1319,7 @@ Xcode 工程共用这些字段；`--air-app` 会从描述符提供缺省值，�
 | `bundle-id` | 应用标识（填 `CFBundleIdentifier`，缺省 `com.example.<product>`） | ✅ 已实现 |
 | `display-name` | 应用显示名（填 `CFBundleName`，缺省取产物名） | ✅ 已实现 |
 | `company-name` / `legal-copyright` | Windows VERSIONINFO 公司与版权（AIR `<publisher>` / `<copyright>` 继承） | ✅ 已实现 |
+| `windows-subsystem` | Windows PE 子系统（`windows` = 发布版不弹控制台；缺省按 `package: "exe"` / `--air-app` 推断） | ✅ 已实现 |
 | `icon` | 图标 `.icns` 路径（拷入 `Resources` + 填 `CFBundleIconFile`） | ✅ 已实现 |
 | `deployment-target` | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） | ✅ 已实现 |
 | `permissions` | Android `AndroidManifest.xml` 权限 / iOS `Info.plist` 用途描述 | 规划 |

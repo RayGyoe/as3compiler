@@ -10,7 +10,7 @@ import { join, dirname, resolve, sep, basename, delimiter } from 'node:path';
 import { tmpdir, platform as osPlatform } from 'node:os';
 import { lex } from '../../src/lexer.ts';
 import { RUNTIME_PREAMBLE } from '../../src/runtime.ts';
-import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, objectCacheKey, objectCachePath, objectCacheDir, objectCacheEnabled, isObjectCacheStep, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
+import { defaultBuildConfig, loadManifest, applyManifest, applyManifestOverlay, buildCompileCommand, buildCompileSteps, buildWebCompileSteps, effectiveDefines, validateFeatures, knownFeatures, windowsTargetTriple, hostVendorKey, linkTrimFlags, exportDynamicFlags, windowsLinkFlags, windowsSubsystem, windowsZlibArgs, icuDataPaths, writeIcuAssembly, icuArchiveDataVersion, objectDir, cleanObjectScratch, objectCacheKey, objectCachePath, objectCacheDir, objectCacheEnabled, isObjectCacheStep, ensureOutDir, deploySkiaIcuData, ICU_DATA_NAME, emccPath, webToolchainError, webCompileStepsEnv } from '../../src/build.ts';
 import type { BuildConfig, Target, Manifest } from '../../src/build.ts';
 import { airManifest, prepareAirApp, parseAirApp, parseGpuBackend } from '../../src/air-app.ts';
 import type { GpuBackend } from '../../src/air-app.ts';
@@ -3223,6 +3223,92 @@ function checkWindowsLinkFlags(): string[] {
 }
 
 registerGroup('unit: build/WindowsLAA', checkWindowsLinkFlags);
+
+// ---- Windows PE subsystem: a packaged app must not get a console --------------
+// 阶段四百四十九。每一条原生 Windows exe 以前都是 IMAGE_SUBSYSTEM_WINDOWS_CUI，于是
+// 从 Explorer 双击发布版会额外分配一个黑窗，里面是运行时 trace 加 ANE SDK 自己往
+// stdout 写的东西（Zoom 的 `cmd debug:`、分段 AI SDK 的 GLFW 横幅）。adl.exe 是 CUI，
+// 装好的 AIR 应用不是 —— 这个差异只能靠 /SUBSYSTEM 表达。
+function checkWindowsSubsystem(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [winsub] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [winsub] ${label}`); }
+  };
+  const cfg = (over: Partial<BuildConfig> = {}): BuildConfig =>
+    ({ ...defaultBuildConfig(), target: 'native', architecture: '32', ...over });
+  const has = (a: string[], flag: string): boolean => a.includes(flag);
+
+  check("a plain native build infers 'console' (as-aot foo.as --run stays a CLI program)",
+    windowsSubsystem(cfg()) === 'console');
+  check("package 'exe' infers 'windows' (a packaged app is double-clicked in Explorer)",
+    windowsSubsystem(cfg({ package: 'exe' })) === 'windows');
+  check('an explicit manifest value wins over the inference in BOTH directions',
+    windowsSubsystem(cfg({ package: 'exe', windowsSubsystem: 'console' })) === 'console' &&
+    windowsSubsystem(cfg({ windowsSubsystem: 'windows' })) === 'windows');
+
+  const real = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const raw = windowsLinkFlags(cfg());
+    check('a console build carries no /SUBSYSTEM at all (byte-identical argv to before)',
+      !raw.some((x) => x.includes('SUBSYSTEM')) && !raw.some((x) => x.includes('ENTRY')) &&
+      has(raw, '-Wl,/LARGEADDRESSAWARE'));
+
+    const exe = windowsLinkFlags(cfg({ package: 'exe' }));
+    check("a packaged 32-bit exe asks for /SUBSYSTEM:WINDOWS plus /ENTRY:mainCRTStartup",
+      has(exe, '-Wl,/SUBSYSTEM:WINDOWS') && has(exe, '-Wl,/ENTRY:mainCRTStartup'));
+    check('...and keeps the 32-bit LAA bit alongside it', has(exe, '-Wl,/LARGEADDRESSAWARE'));
+
+    const exe64 = windowsLinkFlags(cfg({ package: 'exe', architecture: '64' }));
+    check('a 64-bit packaged exe gets the subsystem flags and no LAA',
+      has(exe64, '-Wl,/SUBSYSTEM:WINDOWS') && !has(exe64, '-Wl,/LARGEADDRESSAWARE'));
+
+    // /SUBSYSTEM:WINDOWS alone would make lld-link look for WinMainCRTStartup and
+    // fail: the generated C defines `int main(void)`. The ENTRY flag is what keeps
+    // the ordinary CRT startup, so it has to be requested together, never alone.
+    check('the entry flag is always requested WITH the subsystem flag, never alone',
+      exe.indexOf('-Wl,/ENTRY:mainCRTStartup') === exe.indexOf('-Wl,/SUBSYSTEM:WINDOWS') + 1);
+
+    check('no compile step carries a subsystem flag (link-only, like LAA)',
+      JSON.stringify(buildCompileSteps(cfg({ package: 'exe' }), 'a.c', 'a.exe').slice(0, -1))
+        .indexOf('SUBSYSTEM') === -1);
+    check('the link step carries it on both link paths',
+      buildCompileCommand(cfg({ package: 'exe' }), 'a.c', 'a.exe').some((x) => x.includes('SUBSYSTEM')) &&
+      (() => { const s = buildCompileSteps(cfg({ package: 'exe' }), 'a.c', 'a.exe'); return s[s.length - 1].some((x) => x.includes('SUBSYSTEM')); })());
+
+    check('wasm never asks (there is no PE subsystem)',
+      JSON.stringify(windowsLinkFlags(cfg({ package: 'exe', target: 'wasm' }))) === '[]');
+  } finally {
+    Object.defineProperty(process, 'platform', { value: real, configurable: true });
+  }
+  // Host-dependent by design, so the pin states the contract rather than a
+  // constant: off win32 the flag list is empty (nothing to declare), on win32 a
+  // packaged build must carry the subsystem pair.
+  const onWin = process.platform === 'win32';
+  const here = windowsLinkFlags(cfg({ package: 'exe' }));
+  check(onWin
+    ? 'on a win32 host a packaged app carries the subsystem pair'
+    : 'off win32 the list is empty even for a packaged app',
+  onWin ? here.includes('-Wl,/SUBSYSTEM:WINDOWS') : here.length === 0);
+
+  const manifestPath = join(root, 'examples', 'windows-subsystem.pin.json');
+  const fromManifest = (m: Manifest): BuildConfig => applyManifest(defaultBuildConfig(), m, manifestPath);
+  check("a manifest may force 'windows' on a raw build",
+    fromManifest({ 'windows-subsystem': 'windows' } as Manifest).windowsSubsystem === 'windows');
+  check("a manifest may force 'console' on a packaged build",
+    fromManifest({ 'windows-subsystem': 'console' } as Manifest).windowsSubsystem === 'console');
+  let badValue = '';
+  try { fromManifest({ 'windows-subsystem': 'gui' } as unknown as Manifest); } catch (e) { badValue = String(e); }
+  check('an unknown value fails loudly and names the field (a silent fallback here would restore the black window)',
+    badValue.includes("'windows-subsystem'") && badValue.includes('gui'));
+
+  if (ok > 0) console.log(`[winsub] ${ok} Windows subsystem checks passed`);
+  return bad;
+}
+
+registerGroup('unit: build/WindowsSubsystem', checkWindowsSubsystem);
 
 // ---- Windows zlib from the curl tree (CI windows-exe smoke) ----------------------
 // 生成的 C 无条件 `#include <zlib.h>` 并链接 z；macOS/Linux 走系统 zlib

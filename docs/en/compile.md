@@ -1078,6 +1078,7 @@ kebab-case.
 | `display-name` | string | App display name (fills `CFBundleName` / Windows resources, default product name) |
 | `company-name` | string | Windows VERSIONINFO `CompanyName`; `--air-app` inherits `<publisher>`, default empty (never a fabricated vendor) |
 | `legal-copyright` | string | Windows VERSIONINFO `LegalCopyright`; `--air-app` inherits `<copyright>`. A non-ASCII source adds `/C 65001` to the resource command |
+| `windows-subsystem` | `"console"` \| `"windows"` | PE subsystem. Inferred from the artifact when absent: `package: "exe"` and `--air-app` builds get `windows` (no console window is allocated), everything else stays `console` (so `as-aot foo.as --run` is still a command-line program). `windows` adds both `/SUBSYSTEM:WINDOWS` and `/ENTRY:mainCRTStartup` |
 | `icon` | string | Finished platform icon: `.icns` on macOS or `.ico` on Windows; relative to the manifest |
 | `air-icons` | `{ "imageNNxNN": string }` | AIR descriptor PNG set; converted to `.icns` for `app`/`dmg` or PNG-compressed ICO for `exe` |
 | `deployment-target` | string | macOS minimum version (`LSMinimumSystemVersion` / `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) |
@@ -1445,6 +1446,7 @@ defaults and explicit manifest values win:
 | `ndk-abi` | Android target ABI list (e.g. `arm64-v8a`) | planned |
 | `air-icons` | AIR PNG set converted to `.icns` / ICO during packaging | ✅ implemented |
 | `company-name` / `legal-copyright` | Windows VERSIONINFO company and copyright (inherited from AIR `<publisher>` / `<copyright>`) | ✅ implemented |
+| `windows-subsystem` | Windows PE subsystem (`windows` = a packaged build opens no console window; inferred from `package: "exe"` / `--air-app` when absent) | ✅ implemented |
 | `version` / `build-version` | Release version and macOS build version | ✅ implemented |
 | `signing-identity` | DMG Developer ID / exe Authenticode certificate | ✅ implemented |
 | `notary-profile` / `entitlements` | Apple notary Keychain profile / signing entitlements | ✅ implemented |

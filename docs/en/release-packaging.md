@@ -34,7 +34,8 @@ regeneration. Relative paths resolve from the manifest that declares them. Chang
 product name or version therefore only requires editing `app.xml`.
 
 New/extended manifest keys are `air-icons`, `version`, `build-version`, `company-name`,
-`legal-copyright`, `signing-identity`, `notary-profile`, `entitlements` and `timestamp-server`.
+`legal-copyright`, `windows-subsystem`, `signing-identity`, `notary-profile`, `entitlements` and
+`timestamp-server`.
 Relative paths resolve from the manifest. `company-name`/`legal-copyright` only reach the resource
 when the descriptor or manifest actually supplies them: the default stays an empty company, never a
 fabricated vendor.
@@ -96,6 +97,30 @@ command gains the input codepage `/C 65001` (`/c 65001` for `rc.exe`): llvm-rc r
 under its default codepage (`Non-ASCII 8-bit codepoint ... can't be interpreted in the current
 codepage`), and `rc.exe` would read the bytes as ANSI and store mojibake. Pure-ASCII scripts keep
 the bare command line they always had.
+
+### Subsystem: a release build must not open a console
+
+The resources and the version strings live inside the exe, but the extra black window on
+double-click is a different PE header field: the subsystem. Every native Windows exe used to be
+`IMAGE_SUBSYSTEM_WINDOWS_CUI` (0x3), so a packaged app launched from Explorer was handed a console
+window that carried the runtime's traces plus whatever the ANEs' SDKs print to stdout (Zoom's
+`cmd debug:` lines, the segment AI SDK's GLFW banner). `adl.exe` is a CUI program; an installed AIR
+application is not — and only `/SUBSYSTEM` can express that difference.
+
+The choice is now inferred from the artifact: `package: "exe"` and `--air-app` builds get
+`IMAGE_SUBSYSTEM_WINDOWS_GUI` (0x2), everything else stays `console`. A manifest may override it in
+either direction with `windows-subsystem`. The `windows` value adds `/SUBSYSTEM:WINDOWS` **and**
+`/ENTRY:mainCRTStartup` — the entry flag is required, because the generated C defines
+`int main(void)` while a GUI subsystem defaults to `WinMainCRTStartup`, and shipping the subsystem
+flag alone fails to link. Arguments, exit codes and inherited stdout handles are unchanged (a GUI
+exe started from cmd still inherits the console's handles, which is why `ASC_GL_TRACE=1` stderr
+diagnostics keep working).
+
+Measured on a real application (stage 449): the same app and resources moved from
+`Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI (0x3)` to `WINDOWS_GUI (0x2)`; enumerating visible
+top-level windows after launching it the way Explorer does reported **zero** `ConsoleWindowClass`
+windows, leaving only the app's own `SDL_app` window, and the process closed with exit code 0. The
+32-bit `/LARGEADDRESSAWARE` bit (0x0020) is still set.
 
 An unsigned exe remains buildable but emits an explicit SmartScreen warning. To sign:
 

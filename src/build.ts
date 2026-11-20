@@ -183,6 +183,20 @@ export interface BuildConfig {
   // aarch64); it is inert on macOS/wasm. Empty for non-AIR builds (let clang pick
   // its host default).
   architecture: string;
+  // Windows PE subsystem (阶段四百四十九). Every native Windows exe used to come
+  // out IMAGE_SUBSYSTEM_WINDOWS_CUI, so a desktop app opened from Explorer was
+  // handed a console window: a black box carrying the runtime's traces plus
+  // everything the ANEs' SDKs print to stdout (Zoom's `cmd debug:` lines, the
+  // segment AI SDK's GLFW banner). `adl.exe` is a CUI program, an installed AIR
+  // app is not -- this field is where that difference lives.
+  //
+  // Empty means "decide from the artifact": `package: 'exe'` (a packaged desktop
+  // app) gets 'windows', everything else keeps 'console', so a plain `as-aot
+  // foo.as --run` stays a command-line program and its stdout keeps arriving on
+  // the terminal the way it always has. `--air-app` additionally defaults to
+  // 'windows' (see index.ts) because that build IS a GUI application. An explicit
+  // manifest value wins over both.
+  windowsSubsystem: 'console' | 'windows' | '';
   // Video backend gate (docs/zh-cn/video.md §5): whether the FFmpeg archives are
   // part of the link set, which profile they were built as, and which decoder the
   // runtime asks for. Resolved by `applyVideoGate` in index.ts, never by hand.
@@ -233,6 +247,7 @@ export function defaultBuildConfig(): BuildConfig {
     entitlements: null,
     timestampServer: 'http://timestamp.digicert.com',
     architecture: '',
+    windowsSubsystem: '',
     video: 'auto',
     videoFormats: 'broad',
     videoBackend: 'auto',
@@ -294,6 +309,7 @@ interface ManifestFields {
   'display-name'?: string;
   'company-name'?: string;
   'legal-copyright'?: string;
+  'windows-subsystem'?: 'console' | 'windows';
   icon?: string;
   'air-icons'?: Record<string, string>;
   'deployment-target'?: string;
@@ -627,6 +643,16 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   if (m['display-name']) next.displayName = m['display-name'];
   if (m['company-name']) next.companyName = m['company-name'];
   if (m['legal-copyright']) next.legalCopyright = m['legal-copyright'];
+  // Validated, not trusted: the value becomes a linker flag, and a typo silently
+  // falling back to the console subsystem would put the black window back on a
+  // release build -- the exact symptom this field exists to remove (§2.5).
+  if (m['windows-subsystem'] !== undefined) {
+    const s = m['windows-subsystem'];
+    if (s !== 'console' && s !== 'windows') {
+      throw new Error(`manifest 'windows-subsystem' must be "console" or "windows" (got ${JSON.stringify(s)}) — ${manifestPath}`);
+    }
+    next.windowsSubsystem = s;
+  }
   if (m.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(m.icon, ht, manifestPath));
   if (m['air-icons']) {
     next.airIcons = Object.fromEntries(Object.entries(m['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
@@ -709,6 +735,7 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   if (L['display-name']) next.displayName = L['display-name'];
   if (L['company-name']) next.companyName = L['company-name'];
   if (L['legal-copyright']) next.legalCopyright = L['legal-copyright'];
+  if (L['windows-subsystem']) next.windowsSubsystem = L['windows-subsystem'];
   if (L.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(L.icon, ht, manifestPath));
   if (L['air-icons']) {
     next.airIcons = Object.fromEntries(Object.entries(L['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
@@ -826,6 +853,20 @@ export function linkTrimFlags(cfg: BuildConfig): string[] {
   return flags;
 }
 
+// Which PE subsystem the exe declares. 'windows' tells Windows the program owns
+// its own windows and must NOT be given a console; 'console' is the CUI default
+// (what `adl.exe` and every `as-aot foo.as --run` binary are).
+//
+// The choice is a property of the ARTIFACT, so it is resolved here and not at the
+// call site: `package: 'exe'` is by definition a desktop app the user double-clicks
+// in Explorer, and an explicit `windows-subsystem` in a manifest overrides the
+// inference for the two cases this cannot see (a hand-rolled manifest that builds a
+// GUI app without packaging, or a console tool shipped via `--package exe`).
+export function windowsSubsystem(cfg: BuildConfig): 'console' | 'windows' {
+  if (cfg.windowsSubsystem !== '') return cfg.windowsSubsystem;
+  return cfg.package === 'exe' ? 'windows' : 'console';
+}
+
 // 32-bit Windows builds opt into the 4 GB user address space
 // (`/LARGEADDRESSAWARE`). This is the same choice AIR itself makes, not a
 // micro-optimisation: the AIRSDK 51.4.1 `adl.exe` is x86 *with* the LAA bit set,
@@ -842,12 +883,25 @@ export function linkTrimFlags(cfg: BuildConfig): string[] {
 // this existed, i.e. a hard 2 GB ceiling for a program that maps CEF, D3D12 and
 // the Skia GPU backend.
 //
-// Link-only, and 32-bit-only: a compile step has no use for it, and x86_64 /
-// arm64 images are large-address-aware by definition.
+// Link-only, and 32-bit-only for the LAA bit: a compile step has no use for it,
+// and x86_64 / arm64 images are large-address-aware by definition.
+//
+// `/SUBSYSTEM:WINDOWS` needs one more flag to work with this codebase: the entry
+// point must be named `WinMainCRTStartup` by default, and our generated C has
+// `int main(void)`. Naming `mainCRTStartup` keeps the CRT startup that calls
+// `main` and only changes how Windows starts the process -- measured: the PE read
+// `Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI (0x3)` before, `WINDOWS_GUI (0x2)` after,
+// with the argument list, exit code and inherited stdout handles all unchanged
+// (a GUI exe launched from cmd still inherits the console's handles, which is why
+// `ASC_GL_TRACE=1` diagnostics keep reaching stderr).
 export function windowsLinkFlags(cfg: BuildConfig): string[] {
   if (process.platform !== 'win32' || cfg.target !== 'native') return [];
-  if (cfg.architecture !== '32') return [];
-  return ['-Wl,/LARGEADDRESSAWARE'];
+  const flags: string[] = [];
+  if (windowsSubsystem(cfg) === 'windows') {
+    flags.push('-Wl,/SUBSYSTEM:WINDOWS', '-Wl,/ENTRY:mainCRTStartup');
+  }
+  if (cfg.architecture === '32') flags.push('-Wl,/LARGEADDRESSAWARE');
+  return flags;
 }
 
 // Export ONE symbol into the executable's DYNAMIC symbol table, so that

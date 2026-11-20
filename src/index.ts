@@ -739,6 +739,11 @@ async function main(): Promise<void> {
     const dcShort = dcParts.pop() as string;
     const dcPkg = dcParts.length > 0 ? dcParts.join('.') : null;
     docRootClass = qualifiedName(dcShort, dcPkg);
+    // An AIR application is a GUI program, so on Windows it must not be handed a
+    // console window (阶段四百四十九). Filled only when nothing has spoken yet:
+    // a generated or user manifest that names `windows-subsystem` explicitly wins,
+    // and `--package exe` would reach the same answer through windowsSubsystem().
+    if (cfg.windowsSubsystem === '') cfg.windowsSubsystem = 'windows';
     program = { body: [], imports: [] };
     const bootSrc = generateBootstrap(air.info, air.mainClass);
     featureScanTexts.push(bootSrc);

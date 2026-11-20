@@ -49,7 +49,8 @@ argv 执行，不拼 shell 命令；路径中的空格无需另写转义。
 清单所在目录解析。日常改名、改版本只编辑 `app.xml`。
 
 新增/扩展的构建清单字段：`air-icons`、`version`、`build-version`、`company-name`、
-`legal-copyright`、`signing-identity`、`notary-profile`、`entitlements`、`timestamp-server`。
+`legal-copyright`、`windows-subsystem`、`signing-identity`、`notary-profile`、`entitlements`、
+`timestamp-server`。
 路径均相对清单目录。缺省 bundle id 仍是 `com.example.<product>`，Windows 最低版本为 10.0。
 `company-name`/`legal-copyright` 只在描述符或清单真的给出时才落进资源；缺省仍是公司名为空串，
 不臆造厂商。
@@ -135,6 +136,27 @@ RC 源文件按 UTF-8 写盘。脚本里一旦出现非 ASCII 字符（中文公
 `/c 65001`）：llvm-rc 在默认代码页下会直接拒绝这类文件
 （`Non-ASCII 8-bit codepoint ... can't be interpreted in the current codepage`），
 而 rc.exe 会按 ANSI 代码页读成乱码。纯 ASCII 脚本保持原有命令行不变。
+
+### 子系统：发布版不应带控制台窗
+
+资源与版本号都在 exe 里，但“双击后多出一个黑窗”是**另一个** PE 头字段：子系统。以前每条
+原生 Windows exe 都是 `IMAGE_SUBSYSTEM_WINDOWS_CUI`（0x3），于是发布版从资源管理器双击
+启动时 Windows 会分配一个控制台窗口，里面滚动的是运行时 trace 与各个 ANE 的 SDK 自己往
+stdout 写的东西（Zoom 的 `cmd debug:` 行、分段 AI SDK 的 GLFW 横幅）。`adl.exe` 是 CUI
+程序，装好的 AIR 应用不是——差异只能用 `/SUBSYSTEM` 表达。
+
+现在按产物推断：`package: "exe"` 与 `--air-app` 构建得到 `IMAGE_SUBSYSTEM_WINDOWS_GUI`（0x2），
+其余仍是 `console`。清单可用 `windows-subsystem` 显式覆盖两个方向。`windows` 会同时加
+`/SUBSYSTEM:WINDOWS` 与 `/ENTRY:mainCRTStartup`——后者是必须的：我们的生成 C 是
+`int main(void)`，而 GUI 子系统的默认入口叫 `WinMainCRTStartup`，只给子系统不给入口会
+链接失败。参数、退出码与继承的 stdout 句柄都不变（GUI 程序从 cmd 启动时仍继承控制台
+句柄，所以 `ASC_GL_TRACE=1` 的 stderr 诊断照常可见）。
+
+真机实测（阶段四百四十九）：同一份应用、同一套资源，PE 头从
+`Subsystem: IMAGE_SUBSYSTEM_WINDOWS_CUI (0x3)` 变为 `WINDOWS_GUI (0x2)`；从资源管理器
+方式启动后枚举可见顶层窗口，`ConsoleWindowClass` 计数为 **0**，应用只剩自己的
+`SDL_app` 窗口；关闭后进程 exit code 0。32 位镜像的 `/LARGEADDRESSAWARE` 位（0x0020）
+仍保留。
 
 清单无签名配置时 exe 仍可构建运行，但会明确警告未签名、可能触发 SmartScreen。
 要签名时配置：
