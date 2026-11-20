@@ -23599,6 +23599,47 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
 
+### 阶段四百四十八：Windows 发布的公司/版权元信息（v0.4.422 → v0.4.423）✅ 已完成
+
+**问题**：`--package exe` 产出的 exe 文件属性页「公司」恒为空、也没有「版权」——`CompanyName` 在
+`generateWindowsResourceScript` 里有参数却**没有任何调用方传**，`LegalCopyright` 根本不存在。AIR 时代
+这些字符串只出现在安装器里，所以移植时被漏掉；一旦以原生 PE 发布，它们就是用户能看见的元信息。
+
+**顺带挖出的真问题**：把真实的 `<copyright>` 接进 VERSIONINFO 后，`llvm-rc` 当场拒绝——
+`Non-ASCII 8-bit codepoint ... can't be interpreted in the current codepage`。原因不是编码写错，而是描述符里
+夹了一个不可见的 U+200E（同名症状也会由中文 `<publisher>` 触发）。所以元信息接线与代码页处理必须同时做，
+否则「接上去」就等于「打不出包」。
+
+**修法**：
+
+- `src/air-app.ts`：解析 `<publisher>` / `<copyright>`，按其他描述符字符串的口径**逐字**带出（不解实体，
+  与 `<name>`/`<title>` 一致），有值时生成清单写 `company-name` / `legal-copyright`。
+- `src/build.ts`：新增 `BuildConfig.companyName` / `legalCopyright` 与同名清单字段，`targets.<目标>` 可覆盖；
+  缺省空串——**不臆造厂商名**。
+- `src/windows-release.ts`：`VERSIONINFO` 增 `LegalCopyright`，调用方传 `companyName`；脚本只要含非 ASCII
+  字符就给资源命令加输入代码页 `/C 65001`（`rc.exe` 形态 `/c 65001`），纯 ASCII 脚本命令行逐字不变。
+
+**证据**（真应用 `--package exe` 全链路，v0.4.423 编译器）：属性页读出
+`CompanyName=[eDoctor Healthcare Communications]`、`LegalCopyright=[Copyright (C) 2026 By eDoctor ...]`、
+`ProductName=[TalkMED Meeting]`、`FileVersion=[1.9.37]`；资源命令为
+`llvm-rc /C 65001 /fo ...`；产物启动 → 关闭 exit 干净。
+
+**单元钉子**：新增 `unit: windows-release/metadata` 15 钉（描述符逐字带出、清单合并与 `targets` 覆盖、
+缺省空串、`CompanyName`/`LegalCopyright` 发射与转义、代码页决策 × llvm-rc / rc.exe 两种 argv 形态）。
+
+**顺带修掉的宿主缺陷**：`examples/s3d-multiwindow.as` 在非 darwin 宿主上恒红——它的清单把 macOS 输入写死
+（`metal_glue.mm` / `stage3d_glue.mm` / `sdl2/include/macos-arm64` / `ASC_RENDER_METAL`），于是 Windows 上
+拿 macOS 的 SDL 头去编译，`SDL_config.h` 直接 `#error you should run git checkout -f SDL_config.h`。改成与
+`video.build.json` 同款的宿主模板（`${mac:}` Metal + `stage3d_glue.mm`，`${win:}` D3D12 + `stage3d_d3d.cc` +
+`ASC_S3D_HLSL`，`${host}` 选 SDL/Skia 库目录，`${lib:png}` 这类按平台加前缀，另加
+`${win:../vendor/curl/lib/${host}}`——生成的 C 无条件链 `z`，Windows 的 `z.lib` 只在 curl 的静态树里）。
+macOS 一侧展开结果逐项不变（同样的四个源、同样的 defines、同样的 frameworks），Windows 一侧实测
+**编译 + 链接通过**（10.9 MB exe）。`unit: build/manihost` 的统计因此从 5 个写死平台键的清单降到 4 个，
+且该清单现在真被那条检查覆盖（支持路径存在性 + `-lNAME` 可解析）。
+
+**回归**：`node test.ts` **725 / 730 过**（4 跳过）。剩下 1 红是 `unit: emit/StringAccumulator`
+（6 条 pin），属并发会话的字符串累加器工作，与本阶段无关。
+
 ### 阶段四百四十七：GPU 窗口销毁卡死——销毁前放弃 Ganesh 上下文（v0.4.421 → v0.4.422）✅ 已完成
 
 **问题**：真应用（GL 后端）偶发在销毁 GPU 窗口时主线程 100% CPU 不返回，窗口报 Responding=False，

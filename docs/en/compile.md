@@ -1076,6 +1076,8 @@ kebab-case.
 | `preload-excludes` | string[] | Host paths or fnmatch patterns **removed** from that image (→ `emcc --exclude-file`; also `--package web` only). A directory preload has no per-file opt-out, so files that must not ship are named here instead; patterns match the **host path** the preload walk yields (absolute), so they resolve relative to the manifest dir too. A path containing `*?[` is a PATTERN, not a literal (`weird[1].png` drops the unrelated `weird1.png`); escape it as `[[]` `[]]` `[*]` `[?]` to match literally. A pattern that matches nothing is silently ignored. `--air-app` uses it to pull the page-fetched fonts back out of the FS (see [`html5-web.md`](html5-web.md) §6), and automatically excludes the **current build's output directory** pointed to by `-o` — otherwise `-o temp/<x>` would preload the very `.c`/`.o`/artifact being written into the image (measured on Flappy-Starling: 1.9 MB → 36 MB); with no `-o` specified it makes no guesses at all |
 | `bundle-id` | string | App identifier (`app`/`dmg`/`xcode-project` fill `CFBundleIdentifier`, default `com.example.<product>`) |
 | `display-name` | string | App display name (fills `CFBundleName` / Windows resources, default product name) |
+| `company-name` | string | Windows VERSIONINFO `CompanyName`; `--air-app` inherits `<publisher>`, default empty (never a fabricated vendor) |
+| `legal-copyright` | string | Windows VERSIONINFO `LegalCopyright`; `--air-app` inherits `<copyright>`. A non-ASCII source adds `/C 65001` to the resource command |
 | `icon` | string | Finished platform icon: `.icns` on macOS or `.ico` on Windows; relative to the manifest |
 | `air-icons` | `{ "imageNNxNN": string }` | AIR descriptor PNG set; converted to `.icns` for `app`/`dmg` or PNG-compressed ICO for `exe` |
 | `deployment-target` | string | macOS minimum version (`LSMinimumSystemVersion` / `MACOSX_DEPLOYMENT_TARGET`, default `12.0`) |
@@ -1442,6 +1444,7 @@ defaults and explicit manifest values win:
 | `resources` | extra files to copy into the bundle / project resource directory | planned |
 | `ndk-abi` | Android target ABI list (e.g. `arm64-v8a`) | planned |
 | `air-icons` | AIR PNG set converted to `.icns` / ICO during packaging | ✅ implemented |
+| `company-name` / `legal-copyright` | Windows VERSIONINFO company and copyright (inherited from AIR `<publisher>` / `<copyright>`) | ✅ implemented |
 | `version` / `build-version` | Release version and macOS build version | ✅ implemented |
 | `signing-identity` | DMG Developer ID / exe Authenticode certificate | ✅ implemented |
 | `notary-profile` / `entitlements` | Apple notary Keychain profile / signing entitlements | ✅ implemented |

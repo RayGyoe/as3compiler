@@ -972,6 +972,8 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 | `preload-excludes` | string[] | 从上述镜像里**排除**的宿主路径或 fnmatch 模式（→ `emcc --exclude-file`，同样是 `--package web` 专属）。emcc 的目录 preload 没有逐文件开关，只能反向命名要排除的文件；模式匹配的是 preload 遍历产出的**宿主路径**（绝对），故同样相对清单目录解析。**路径里含 `*?[` 时它是模式而非字面量**（`weird[1].png` 会排掉无关的 `weird1.png`），要按字面排除需转义为 `[[]` `[]]` `[*]` `[?]`；无命中的模式静默忽略。`--air-app` 用它把已由页面 `fetch` 的字体撤出 FS（见 [`html5-web.md`](html5-web.md) §6），并自动排除 `-o` 指向的**本次构建输出目录**——否则 `-o temp/<x>` 会把正在写的 `.c`/`.o`/产物自己也 preload 进镜像（Flappy-Starling 实测 1.9 MB → 36 MB）；未指定 `-o` 时不做任何猜测 |
 | `bundle-id` | string | 应用标识（`app`/`dmg`/`xcode-project` 填 `CFBundleIdentifier`，缺省 `com.example.<product>`） |
 | `display-name` | string | 应用显示名（填 `CFBundleName` / Windows 资源，缺省取产物名） |
+| `company-name` | string | Windows VERSIONINFO `CompanyName`；`--air-app` 从 `<publisher>` 继承，缺省空串（不臆造厂商） |
+| `legal-copyright` | string | Windows VERSIONINFO `LegalCopyright`；`--air-app` 从 `<copyright>` 继承。源文件含非 ASCII 时资源命令自动加 `/C 65001` |
 | `icon` | string | 已完成的平台图标路径：macOS 为 `.icns`，Windows 为 `.ico`；相对清单目录解析 |
 | `air-icons` | `{ "imageNNxNN": string }` | AIR 描述符 PNG 图标组；`app`/`dmg` 转成 `.icns`，`exe` 转成 PNG-compressed ICO |
 | `deployment-target` | string | macOS 最低系统版本（填 `LSMinimumSystemVersion` / `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） |
@@ -1315,6 +1317,7 @@ Xcode 工程共用这些字段；`--air-app` 会从描述符提供缺省值，�
 |---|---|---|
 | `bundle-id` | 应用标识（填 `CFBundleIdentifier`，缺省 `com.example.<product>`） | ✅ 已实现 |
 | `display-name` | 应用显示名（填 `CFBundleName`，缺省取产物名） | ✅ 已实现 |
+| `company-name` / `legal-copyright` | Windows VERSIONINFO 公司与版权（AIR `<publisher>` / `<copyright>` 继承） | ✅ 已实现 |
 | `icon` | 图标 `.icns` 路径（拷入 `Resources` + 填 `CFBundleIconFile`） | ✅ 已实现 |
 | `deployment-target` | macOS 最低系统版本（填 `MACOSX_DEPLOYMENT_TARGET`，默认 `12.0`） | ✅ 已实现 |
 | `permissions` | Android `AndroidManifest.xml` 权限 / iOS `Info.plist` 用途描述 | 规划 |

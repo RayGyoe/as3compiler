@@ -69,6 +69,7 @@ export interface WindowsResourceOptions {
   displayName: string;
   version: string;
   companyName?: string;
+  legalCopyright?: string;
   bundleId?: string;
   fileDescription?: string;
   productName?: string;
@@ -92,6 +93,12 @@ export interface WindowsResourceCommandOptions {
   compiler?: WindowsResourceCompiler;
   compilerPath?: string;
   includePaths?: readonly string[];
+  // Input codepage. Needed as soon as the script carries a character outside
+  // ASCII: llvm-rc refuses such a file outright ("Non-ASCII 8-bit codepoint ...
+  // can't be interpreted in the current codepage"), and rc.exe would read the
+  // UTF-8 bytes through the ANSI codepage and store mojibake. 65001 (UTF-8) is
+  // what prepareWindowsResources passes when, and only when, it emits non-ASCII.
+  codepage?: number;
 }
 
 export interface WindowsSignOptions {
@@ -216,6 +223,7 @@ export function generateWindowsResourceScript(options: WindowsResourceOptions): 
     '    BLOCK "040904b0"',
     '    BEGIN',
     rcValue('CompanyName', options.companyName ?? ''),
+    rcValue('LegalCopyright', options.legalCopyright ?? ''),
     rcValue('FileDescription', options.fileDescription ?? displayName),
     rcValue('FileVersion', options.version),
     rcValue('InternalName', internalName),
@@ -245,6 +253,10 @@ export function buildWindowsResourceCommand(options: WindowsResourceCommandOptio
   const args: string[] = [];
   if (compiler === 'rc') args.push('/nologo');
   for (const path of options.includePaths ?? []) args.push('/I', path);
+  // rc.exe spells the codepage switch lowercase; llvm-rc documents /C. Both are
+  // case-insensitive in practice, but each is emitted the way its own tool
+  // documents it so a future strict parser does not have to guess.
+  if (options.codepage !== undefined) args.push(compiler === 'rc' ? '/c' : '/C', String(options.codepage));
   args.push('/fo', options.outputPath, options.sourcePath);
   return { command, args };
 }
@@ -399,6 +411,8 @@ export function prepareWindowsResources(cfg: BuildConfig, base: string, dry = fa
   const script = generateWindowsResourceScript({
     displayName,
     version,
+    companyName: cfg.companyName || undefined,
+    legalCopyright: cfg.legalCopyright || undefined,
     bundleId: cfg.bundleId || undefined,
     originalFilename: `${productName}.exe`,
     iconPath,
@@ -409,7 +423,15 @@ export function prepareWindowsResources(cfg: BuildConfig, base: string, dry = fa
     writeFileSync(manifestPath, manifest);
     writeFileSync(sourcePath, script);
   }
-  const resourceCommand = buildWindowsResourceCommand({ sourcePath, outputPath: objectPath });
+  const resourceCommand = buildWindowsResourceCommand({
+    sourcePath,
+    outputPath: objectPath,
+    // A non-ASCII VERSIONINFO string (a Chinese <publisher>, a curly quote in
+    // <copyright>) cannot be read by llvm-rc under its default codepage, so the
+    // script and the compiler have to agree on UTF-8. Pure-ASCII scripts keep the
+    // bare command line they always had.
+    codepage: /[^\x00-\x7f]/.test(script) ? 65001 : undefined,
+  });
   runWindowsCommand(resourceCommand, dry);
   return { objectPath, resourceCommand };
 }

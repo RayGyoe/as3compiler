@@ -24,7 +24,8 @@
 // 纯 C 构建（无 GPU）也能跑：此时 `driverInfo` 里没有 Metal，读回按既有惯例是黑的，断言走
 // `vertex-texture.as` 同款分支（示例套件里它是 compile+link only，见 test/examples.ts）。
 //
-// 跑法（macOS Metal 构建，见 docs/zh-cn/compile.md §3.5）：
+// 跑法（清单按宿主展开：macOS 走 Metal，Windows 走 D3D12；见
+// docs/zh-cn/compile.md §3.5）：
 //   node src/index.ts examples/s3d-multiwindow.as \
 //        --manifest examples/s3d-multiwindow.build.json --run
 import flash.display.Stage;

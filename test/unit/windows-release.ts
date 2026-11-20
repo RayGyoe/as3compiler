@@ -14,7 +14,8 @@ import {
   prepareWindowsResources,
   redactWindowsCommand,
 } from '../../src/windows-release.ts';
-import { defaultBuildConfig } from '../../src/build.ts';
+import { defaultBuildConfig, applyManifest, applyManifestOverlay, type Manifest } from '../../src/build.ts';
+import { parseAirApp } from '../../src/air-app.ts';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { registerGroup, root } from '../harness.ts';
@@ -202,5 +203,85 @@ registerGroup('unit: windows-release/build-adapter', () => {
   const prepared = prepareWindowsResources(cfg, base, true);
   if (prepared.objectPath !== `${base}.res`) bad.push('resource object feeds the link as a .res');
   if (existsSync(`${base}.rc`) || existsSync(`${base}.manifest`)) bad.push('dry-run writes no Windows resources');
+  return bad;
+});
+
+// Company and copyright are VERSIONINFO strings a PE shows in its properties page.
+// Before this group they were either hardcoded empty (CompanyName) or not emitted at
+// all (LegalCopyright), so a released executable claimed no company. The pins below
+// cover all three seams: descriptor parsing, manifest plumbing, resource emission.
+registerGroup('unit: windows-release/metadata', () => {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [win-meta] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [win-meta] ${label}`); }
+  };
+
+  const info = parseAirApp(`<application>
+    <id>com.example.prune</id><filename>Prune</filename>
+    <publisher>A&amp;B Labs</publisher>
+    <copyright>Copyright (C) 2026 A&amp;B</copyright>
+    <initialWindow><content>Prune.swf</content></initialWindow>
+  </application>`);
+  // childText keeps descriptor text verbatim, exactly like <name>/<title>: decoding
+  // entities here alone would make these two fields the only decoded strings in
+  // AirAppInfo. Pinned so a future decode-everything change has to touch this pin too.
+  check('descriptor <publisher> is carried verbatim (no per-field entity decoding)',
+    info.publisher === 'A&amp;B Labs');
+  check('descriptor <copyright> is carried verbatim (no per-field entity decoding)',
+    info.copyright === 'Copyright (C) 2026 A&amp;B');
+  const bare = parseAirApp('<application><id>com.example.prune</id><filename>Prune</filename></application>');
+  check('a descriptor without <publisher>/<copyright> parses to empty strings',
+    bare.publisher === '' && bare.copyright === '');
+
+  const manifestPath = join(root, 'temp', 'win-meta', 'Prune.build.json');
+  const cfg = applyManifest(defaultBuildConfig(), {
+    'company-name': info.publisher,
+    'legal-copyright': info.copyright,
+    version: '1.2.3',
+    targets: { native: { 'company-name': 'Layered Ltd' } },
+  } as Manifest, manifestPath);
+  check('manifest company-name/legal-copyright reach the build config',
+    cfg.companyName === 'A&amp;B Labs' && cfg.legalCopyright === 'Copyright (C) 2026 A&amp;B');
+  const layered = applyManifestOverlay(cfg, {
+    'company-name': info.publisher,
+    targets: { native: { 'company-name': 'Layered Ltd' } },
+  } as Manifest, manifestPath, 'native');
+  check('a targets.<name> block may override company-name', layered.companyName === 'Layered Ltd');
+  check('company-name defaults to empty, not a fabricated vendor',
+    defaultBuildConfig().companyName === '' && defaultBuildConfig().legalCopyright === '');
+
+  const rc = generateWindowsResourceScript({
+    displayName: 'Prune',
+    version: '1.2.3',
+    companyName: 'A&B <Labs>',
+    legalCopyright: 'Copyright (C) 2026 "A&B"',
+  });
+  check('VERSIONINFO carries the company name', rc.includes('VALUE "CompanyName", "A&B <Labs>"'));
+  check('VERSIONINFO carries LegalCopyright escaped like every other RC string',
+    rc.includes('VALUE "LegalCopyright", "Copyright (C) 2026 \\"A&B\\""'));
+  check('an absent company/copyright still emits both keys, empty (no missing-field surprise)',
+    generateWindowsResourceScript({ displayName: 'X', version: '1' })
+      .includes('VALUE "LegalCopyright", ""'));
+
+  // Non-ASCII VERSIONINFO text (a Chinese <publisher>, an invisible bidi mark inside
+  // <copyright>) is a hard failure for llvm-rc under its default codepage, so the
+  // resource command has to opt into UTF-8 whenever, and only whenever, the script
+  // needs it. Both halves are pinned: the decision and the argv it produces.
+  check('a UTF-8 codepage switch is only emitted for a non-ASCII script',
+    buildWindowsResourceCommand({ sourcePath: 'a.rc', outputPath: 'a.res' }).args.join('|') === '/fo|a.res|a.rc');
+  const utf8 = buildWindowsResourceCommand({ sourcePath: 'a.rc', outputPath: 'a.res', codepage: 65001 });
+  check('llvm-rc receives the documented /C form', utf8.args.join('|') === '/C|65001|/fo|a.res|a.rc');
+  const utf8rc = buildWindowsResourceCommand({ sourcePath: 'a.rc', outputPath: 'a.res', codepage: 65001, compiler: 'rc' });
+  check('rc.exe receives its lowercase /c form', utf8rc.args.join('|') === '/nologo|/c|65001|/fo|a.res|a.rc');
+  const chinese = prepareWindowsResources({ ...defaultBuildConfig(), package: 'exe', version: '1.2.3', companyName: '拓麦' }, join(root, 'temp', 'win-meta', 'Cn'), true);
+  check('a non-ASCII company name turns the codepage switch on',
+    chinese.resourceCommand.args.includes('65001'));
+  const ascii = prepareWindowsResources({ ...defaultBuildConfig(), package: 'exe', version: '1.2.3', companyName: 'Prune' }, join(root, 'temp', 'win-meta', 'En'), true);
+  check('an ASCII-only script keeps the previous bare command line',
+    !ascii.resourceCommand.args.includes('65001'));
+
+  if (ok > 0) console.log(`[win-meta] ${ok} checks passed`);
   return bad;
 });

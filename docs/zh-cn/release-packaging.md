@@ -39,6 +39,8 @@ argv 执行，不拼 shell 命令；路径中的空格无需另写转义。
 | `<name>` | 显示名，回退 `<filename>` |
 | `<versionNumber>` | `CFBundleShortVersionString` / Windows VERSIONINFO |
 | `<versionLabel>` | `CFBundleVersion`，缺省 `0` |
+| `<copyright>` | Windows VERSIONINFO `LegalCopyright` |
+| `<publisher>` | Windows VERSIONINFO `CompanyName` |
 | `<icon><imageNNxNN>` | 各尺寸 PNG，macOS 生成 `.icns`，Windows 生成 PNG-compressed ICO |
 
 有效优先级是 **环境变量（仅签名凭据）→ 显式构建清单 → AIR 描述符 → 默认值**。
@@ -46,9 +48,11 @@ argv 执行，不拼 shell 命令；路径中的空格无需另写转义。
 合并；因此签名与 entitlements 不会被 `<filename>.build.json` 的重新生成覆盖。相对路径按各自
 清单所在目录解析。日常改名、改版本只编辑 `app.xml`。
 
-新增/扩展的构建清单字段：`air-icons`、`version`、`build-version`、`signing-identity`、
-`notary-profile`、`entitlements`、`timestamp-server`。路径均相对清单目录。缺省 bundle id 仍是
-`com.example.<product>`，Windows 最低版本为 10.0。
+新增/扩展的构建清单字段：`air-icons`、`version`、`build-version`、`company-name`、
+`legal-copyright`、`signing-identity`、`notary-profile`、`entitlements`、`timestamp-server`。
+路径均相对清单目录。缺省 bundle id 仍是 `com.example.<product>`，Windows 最低版本为 10.0。
+`company-name`/`legal-copyright` 只在描述符或清单真的给出时才落进资源；缺省仍是公司名为空串，
+不臆造厂商。
 
 `--doctor` 在相应发布形态下检查系统签名工具、Developer ID 私钥、离线 keychain profile 查询、
 `llvm-rc` 与 `signtool`。真实公证只在 `--package dmg` 时发起网络请求。
@@ -113,14 +117,24 @@ xcrun notarytool store-credentials "my-notary" \
 ## 5. Windows 图标、版本、manifest 与签名
 
 `--package exe` 使用原生 `llvm-rc`（或 `rc.exe`）把资源编译成 `.res`，再交给既有
-clang/MSVC ABI 链接命令；生成侧逻辑已单测，但真实 PE 运行与签名必须在 Windows 验证。
+clang/MSVC ABI 链接命令。整条链路已在 Windows 真机上对真实应用跑通（阶段四百四十八）：
+资源 exe 能启动、能干净关闭，文件属性页显示版本、产品名、公司与版权；未签名的 exe
+仍会明确告警。
 
 资源包括：
 
 - 描述符多尺寸 PNG 合成的 PNG-compressed ICO（含 256×256）；
-- `VERSIONINFO`：合法化后的四段 `FileVersion`/`ProductVersion`，原始版本文案；
+- `VERSIONINFO`：合法化后的四段 `FileVersion`/`ProductVersion`，原始版本文案，以及
+  `ProductName`/`FileDescription`（显示名，缺省 `<filename>`）、`CompanyName`（`<publisher>`）、
+  `LegalCopyright`（`<copyright>`）、`InternalName`（`<id>`）；
 - 显式启用的 `longPathAware`、Windows 10 兼容性 GUID；
 - `PerMonitorV2` DPI awareness + PerMonitorV1 回退，避免 Windows 10 位图拉伸。
+
+RC 源文件按 UTF-8 写盘。脚本里一旦出现非 ASCII 字符（中文公司名，或 `<copyright>` 里
+夹带的不可见方向标记），资源命令会自动追加输入代码页 `/C 65001`（`rc.exe` 形态为
+`/c 65001`）：llvm-rc 在默认代码页下会直接拒绝这类文件
+（`Non-ASCII 8-bit codepoint ... can't be interpreted in the current codepage`），
+而 rc.exe 会按 ANSI 代码页读成乱码。纯 ASCII 脚本保持原有命令行不变。
 
 清单无签名配置时 exe 仍可构建运行，但会明确警告未签名、可能触发 SmartScreen。
 要签名时配置：
@@ -141,6 +155,8 @@ clang/MSVC ABI 链接命令；生成侧逻辑已单测，但真实 PE 运行与�
 
 macOS CI 增加 `.app` 构建、运行与 ad-hoc `codesign --verify` 冒烟；Windows CI 增加真实
 `llvm-rc` 资源链接、exe 运行与未签名告警冒烟。CI 不需要发布密钥。真实 Authenticode 与 Apple
-公证仍在持有凭据的发布机上验证。
+公证仍在持有凭据的发布机上验证——Windows 侧的资源与 VERSIONINFO 已由阶段四百四十八的真机
+构建补上证据（含 `CompanyName`/`LegalCopyright` 与中文公司名的 UTF-8 代码页处理），
+Authenticode 本机仍未执行（无证书）。
 
 非目标：App Store、MSI/MSIX、universal2、自动更新和装饰性 DMG 布局。

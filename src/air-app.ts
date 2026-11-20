@@ -36,6 +36,12 @@ export interface AirAppInfo {
   // the initial window. Icons remain descriptor-relative until the generated
   // manifest resolves them (the same rule as every other path field).
   name: string;
+  // <publisher>/<copyright>: Windows VERSIONINFO CompanyName and LegalCopyright.
+  // AIR itself only shows these in the installer/app-manager UI, but a native PE
+  // exposes them in the file properties page, so the release packager fills them
+  // from the descriptor instead of leaving the company blank.
+  publisher: string;
+  copyright: string;
   icons: Record<string, string>;
   visible: boolean;
   resizable: boolean;
@@ -286,6 +292,8 @@ export function parseAirApp(xml: string): AirAppInfo {
   const versionLabel = childText(doc, 'versionLabel') ?? '';
   const filename = childText(doc, 'filename') ?? '';
   const name = childText(doc, 'name') ?? '';
+  const publisher = childText(doc, 'publisher') ?? '';
+  const copyright = childText(doc, 'copyright') ?? '';
   const icons: Record<string, string> = {};
   const iconBlock = doc.match(/<icon\b[^>]*>([\s\S]*?)<\/icon>/);
   if (iconBlock) {
@@ -367,7 +375,7 @@ export function parseAirApp(xml: string): AirAppInfo {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new AirAppError('air-app.xml <initialWindow> width/height must be positive integers');
   }
-  return { id, versionNumber, versionLabel, filename, content, title: title || filename, name: name || filename, icons, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, style, architecture: architectureStr, fonts, extensionIDs };
+  return { id, versionNumber, versionLabel, filename, content, title: title || filename, name: name || filename, publisher, copyright, icons, visible, resizable, width, height, displayResolution: resolutionStr, renderMode, depthAndStencil, style, architecture: architectureStr, fonts, extensionIDs };
 }
 
 // <x>/<y> of <initialWindow>, both xs:int — so a negative coordinate is legal and means
@@ -1420,6 +1428,11 @@ export function prepareAirApp(appXmlPath: string, mainClassOpt: string | null, v
   // manifest still win when that manifest is used without --air-app.
   generated['bundle-id'] = info.id;
   generated['display-name'] = info.name;
+  // VERSIONINFO company/copyright: only emitted when the descriptor has them, so a
+  // descriptor without <publisher> keeps the previous blank-company output instead
+  // of gaining an empty string field nobody asked for.
+  if (info.publisher) generated['company-name'] = info.publisher;
+  if (info.copyright) generated['legal-copyright'] = info.copyright;
   if (info.versionNumber) generated.version = info.versionNumber;
   if (info.versionLabel) generated['build-version'] = info.versionLabel;
   if (Object.keys(info.icons).length > 0) generated['air-icons'] = info.icons;

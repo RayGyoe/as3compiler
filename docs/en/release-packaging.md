@@ -25,15 +25,19 @@ without producing a release or contacting Apple. External tools receive argv arr
 ## Metadata and manifest fields
 
 `--air-app` now maps `<id>`, `<name>` (fallback `<filename>`), `<versionNumber>`,
-`<versionLabel>` and `<icon><imageNNxNN>` into release metadata. Precedence is
+`<versionLabel>`, `<copyright>` (VERSIONINFO `LegalCopyright`), `<publisher>` (VERSIONINFO
+`CompanyName`) and `<icon><imageNNxNN>` into release metadata. Precedence is
 **environment (signing overrides only) → explicit build manifest → AIR descriptor → defaults**.
 With `--air-app app.xml --manifest release.json`, the explicit manifest is a **release overlay**
 applied after the generated one, so signing and entitlements survive `<filename>.build.json`
 regeneration. Relative paths resolve from the manifest that declares them. Changing the normal
 product name or version therefore only requires editing `app.xml`.
 
-New/extended manifest keys are `air-icons`, `version`, `build-version`, `signing-identity`,
-`notary-profile`, `entitlements` and `timestamp-server`. Relative paths resolve from the manifest.
+New/extended manifest keys are `air-icons`, `version`, `build-version`, `company-name`,
+`legal-copyright`, `signing-identity`, `notary-profile`, `entitlements` and `timestamp-server`.
+Relative paths resolve from the manifest. `company-name`/`legal-copyright` only reach the resource
+when the descriptor or manifest actually supplies them: the default stays an empty company, never a
+fabricated vendor.
 `--doctor` checks the applicable platform tools, Developer ID private key, offline keychain profile,
 `llvm-rc` and `signtool`; only an actual DMG build contacts Apple's notary service.
 
@@ -75,10 +79,23 @@ Timeouts and rejected submissions abort the release.
 
 ## Windows resources and Authenticode
 
-`llvm-rc` compiles the generated RC into a `.res` consumed by the existing clang/MSVC ABI link.
+`llvm-rc` compiles the generated RC into a `.res` consumed by the existing clang/MSVC ABI link. The
+whole path has been measured on Windows against a real application (stage 448): the resource-bearing
+exe starts, closes cleanly, and its properties page shows version, product name, company and
+copyright.
+
 Resources include a PNG-compressed multi-size ICO, VERSIONINFO (four numeric fields plus original
-version text), Windows 10 compatibility, `longPathAware`, and PerMonitorV2 with V1 DPI fallback.
-Windows 10 is the minimum declared version.
+version text, `ProductName`/`FileDescription` from the display name, `CompanyName` from
+`<publisher>`, `LegalCopyright` from `<copyright>`, `InternalName` from `<id>`), Windows 10
+compatibility, `longPathAware`, and PerMonitorV2 with V1 DPI fallback. Windows 10 is the minimum
+declared version.
+
+The RC source is written as UTF-8. As soon as it carries a non-ASCII character (a Chinese company
+name, or the invisible directional mark some descriptors put inside `<copyright>`), the resource
+command gains the input codepage `/C 65001` (`/c 65001` for `rc.exe`): llvm-rc rejects such a file
+under its default codepage (`Non-ASCII 8-bit codepoint ... can't be interpreted in the current
+codepage`), and `rc.exe` would read the bytes as ANSI and store mojibake. Pure-ASCII scripts keep
+the bare command line they always had.
 
 An unsigned exe remains buildable but emits an explicit SmartScreen warning. To sign:
 
@@ -95,5 +112,7 @@ Environment overrides: `ASC_SIGN_IDENTITY`, `ASC_WIN_CERT_FILE`, `ASC_WIN_CERT_P
 then `signtool verify /pa` runs. Passwords are replaced with `<redacted>` in logs.
 
 macOS CI builds/runs/verifies an ad-hoc `.app`; Windows CI builds/runs a resource-bearing unsigned exe
-without publishing secrets. Real Authenticode and Apple notarization remain release-machine checks.
+without publishing secrets. Stage 448 adds real-machine evidence for the Windows resources and
+VERSIONINFO (including `CompanyName`/`LegalCopyright` and the UTF-8 codepage path for non-ASCII
+publisher names); Authenticode itself has still not run here (no certificate).
 App Store, MSI/MSIX, universal2, auto-update and decorative DMG layouts are out of scope.

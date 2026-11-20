@@ -923,8 +923,18 @@ test('example: s3d-multiwindow.as (windowed GPU: compile+link only)', async (t) 
   // singleton. The example asserts what is observable from AS3 -- two stages with
   // their own stage3Ds, two Context3Ds with their own back buffers and their own
   // content, Stage3D.x/y bounds (#2006) and visible -- and it must keep compiling
-  // and linking against the Metal + stage3d glue, which no other example walks in
-  // this direction (two simultaneous contexts).
+  // and linking against a window GPU backend PLUS a stage3d backend, which no other
+  // example walks in this direction (two simultaneous contexts).
+  //
+  // The manifest is host-portable (${mac:} Metal + stage3d_glue.mm, ${win:} D3D12 +
+  // stage3d_d3d.cc), because this suite runs on both. It used to spell the macOS
+  // inputs literally, so on Windows the same case compiled macOS SDL headers and died
+  // at `SDL_config.h: #error` -- a red that said nothing about the product. The
+  // compile+link half is what a suite can check on either host; the pixel half needs
+  // a real window on either.
+  // (Manual run: `node src/index.ts examples/s3d-multiwindow.as
+  //  --manifest examples/s3d-multiwindow.build.json --run`; the pixel-level
+  //  "each window shows its own surface" evidence lives in TODO.md's stage section.)
   // (Manual run: `node src/index.ts examples/s3d-multiwindow.as
   //  --manifest examples/s3d-multiwindow.build.json --run`; the pixel-level
   //  "each window shows its own surface" evidence lives in TODO.md's stage section.)

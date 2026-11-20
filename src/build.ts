@@ -160,6 +160,11 @@ export interface BuildConfig {
   // configuration*, not CLI flags — carried by the build manifest.
   bundleId: string;          // e.g. com.example.app (fills CFBundleIdentifier)
   displayName: string;       // human-readable app name (fills CFBundleName)
+  // Windows PE VERSIONINFO strings. Sourced from <publisher>/<copyright> by --air-app;
+  // a hand-written manifest may also carry them. Blank leaves the resource script's
+  // CompanyName/LegalCopyright empty, which is what AIR-era builds emitted.
+  companyName: string;       // fills VERSIONINFO CompanyName
+  legalCopyright: string;    // fills VERSIONINFO LegalCopyright
   icon: string | null;       // finished .icns/.ico path; null = use AIR icons or none
   // AIR <icon> PNG files, keyed by their element name (image16x16, ...).
   // Kept separate from `icon`: that field is an already-finished platform icon,
@@ -216,6 +221,8 @@ export function defaultBuildConfig(): BuildConfig {
     preloadExcludes: [],
     bundleId: '',
     displayName: '',
+    companyName: '',
+    legalCopyright: '',
     icon: null,
     airIcons: {},
     deploymentTarget: '12.0',
@@ -285,6 +292,8 @@ interface ManifestFields {
   'preload-excludes'?: string[];
   'bundle-id'?: string;
   'display-name'?: string;
+  'company-name'?: string;
+  'legal-copyright'?: string;
   icon?: string;
   'air-icons'?: Record<string, string>;
   'deployment-target'?: string;
@@ -360,6 +369,8 @@ const MANIFEST_FIELD_NAMES: Record<keyof ManifestFields | 'targets', true> = {
   'preload-excludes': true,
   'bundle-id': true,
   'display-name': true,
+  'company-name': true,
+  'legal-copyright': true,
   icon: true,
   'air-icons': true,
   'deployment-target': true,
@@ -398,7 +409,8 @@ const TARGET_LAYER_FIELDS: ReadonlySet<string> = new Set([
   'video', 'video-formats', 'video-backend',
   'swc-paths',
   'ane-paths', 'ane-platform',
-  'bundle-id', 'display-name', 'icon', 'air-icons', 'deployment-target',
+  'bundle-id', 'display-name', 'company-name', 'legal-copyright',
+  'icon', 'air-icons', 'deployment-target',
   'version', 'build-version', 'signing-identity', 'notary-profile',
   'entitlements', 'timestamp-server',
 ]);
@@ -613,6 +625,8 @@ export function applyManifest(cfg: BuildConfig, m: Manifest, manifestPath: strin
   }
   if (m['bundle-id']) next.bundleId = m['bundle-id'];
   if (m['display-name']) next.displayName = m['display-name'];
+  if (m['company-name']) next.companyName = m['company-name'];
+  if (m['legal-copyright']) next.legalCopyright = m['legal-copyright'];
   if (m.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(m.icon, ht, manifestPath));
   if (m['air-icons']) {
     next.airIcons = Object.fromEntries(Object.entries(m['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
@@ -693,6 +707,8 @@ export function applyManifestOverlay(cfg: BuildConfig, m: Manifest, manifestPath
   if (L['preload-excludes']) next.preloadExcludes = T(L['preload-excludes']).map((p) => resolveFromManifest(manifestPath, p));
   if (L['bundle-id']) next.bundleId = L['bundle-id'];
   if (L['display-name']) next.displayName = L['display-name'];
+  if (L['company-name']) next.companyName = L['company-name'];
+  if (L['legal-copyright']) next.legalCopyright = L['legal-copyright'];
   if (L.icon) next.icon = resolveFromManifest(manifestPath, expandTemplateText(L.icon, ht, manifestPath));
   if (L['air-icons']) {
     next.airIcons = Object.fromEntries(Object.entries(L['air-icons']).map(([k, p]) => [k, resolveFromManifest(manifestPath, p)]));
