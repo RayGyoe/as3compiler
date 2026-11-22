@@ -3163,6 +3163,53 @@ function checkInitialWindowStyle(): string[] {
   check('a transparent frame is presented through a CALayer, never SDL_RenderPresent',
     /if \(c->transparent\) \{ sk_mac_present_layer\(c, pixels, w, h, rowBytes\); return; \}/.test(glueWin)
     && /static void sk_mac_present_layer\(WinCtx\* c, void\* pixels, int w, int h, int rowBytes\);/.test(glueWin));
+  // ---- Windows transparent window: a layered window composited by UpdateLayeredWindow ----
+  // SDL's Windows renderer backs an OPAQUE swapchain, so alpha-0 pixels would show black
+  // instead of letting the desktop through (measured vs adl 51.4.1, temp/reviewwin: adl's
+  // unpainted area shows the desktop, ours showed black before this path). Like macOS,
+  // a transparent Windows frame bypasses SDL's renderer entirely -- here to a 32-bit
+  // premultiplied-BGRA DIB section handed to UpdateLayeredWindow (ULW_ALPHA).
+  check('a transparent Windows frame is presented through UpdateLayeredWindow, never SDL_RenderPresent',
+    /if \(c->transparent\) \{ sk_win_present_layered\(c, pixels, w, h, rowBytes\); return; \}/.test(glueWin)
+    && /static void sk_win_present_layered\(WinCtx\* c, void\* pixels, int w, int h, int rowBytes\);/.test(glueWin)
+    && /static void sk_win_present_layered\(WinCtx\* c, void\* pixels, int w, int h, int rowBytes\) \{/.test(glueWin));
+  // The extended style is what lets ULW own the window's visual; toggling it off restores
+  // an ordinary opaque window. Without WS_EX_LAYERED the window stays an opaque swapchain.
+  check('the Windows native window becomes layered (WS_EX_LAYERED) when transparent, and back when not',
+    /#elif defined\(_WIN32\)/.test(glueWin)
+    && /LONG ex = GetWindowLongPtrA\(hwnd, GWL_EXSTYLE\);/.test(glueWin)
+    && /LONG want = on \? \(ex \| WS_EX_LAYERED\) : \(ex & ~\(LONG\)WS_EX_LAYERED\);/.test(glueWin)
+    && /if \(want != ex\) SetWindowLongPtrA\(hwnd, GWL_EXSTYLE, want\);/.test(glueWin));
+  // The Skia surface is MakeN32Premul and Windows N32 is BGRA, so its pixels are ALREADY
+  // the premultiplied BGRA layout ULW wants: a straight row copy, NOT a per-pixel
+  // premultiply (a second premultiply would darken every semi-transparent pixel).
+  check('the DIB is 32-bit top-down BGRA and the premultiplied frame is copied row-wise (no re-premultiply)',
+    /bmi\.bmiHeader\.biBitCount = 32;/.test(glueWin)
+    && /bmi\.bmiHeader\.biHeight = -h;/.test(glueWin)
+    && /CreateDIBSection\(screen, &bmi, DIB_RGB_COLORS, &bits, NULL, 0\)/.test(glueWin)
+    && /memcpy\(dst \+ \(size_t\)y \* dstRow, src \+ \(size_t\)y \* rowBytes, \(size_t\)dstRow\);/.test(glueWin));
+  // AC_SRC_ALPHA tells the compositor the source carries per-pixel premultiplied alpha;
+  // ULW_ALPHA (not ULW_COLORKEY) is what blends it over the desktop. The window's screen
+  // position is read each frame so a moved window keeps compositing at the right place.
+  check('ULW composites with per-pixel alpha (AC_SRC_ALPHA + ULW_ALPHA) at the live window position',
+    /blend\.AlphaFormat = AC_SRC_ALPHA;/.test(glueWin)
+    && /GetWindowRect\(hwnd, &rc\);/.test(glueWin)
+    && /UpdateLayeredWindow\(hwnd, screen, &ptDst, &size, \(HDC\)c->layered_dc, &ptSrc, 0, &blend, ULW_ALPHA\);/.test(glueWin));
+  // No D3D swapchain is created on the layered window: the renderer is skipped entirely
+  // for a transparent Windows window (present_frame routes straight to ULW).
+  check('a transparent Windows window skips SDL renderer creation (no opaque swapchain on the layered window)',
+    /static int sk_attach_cpu\(WinCtx\* c\) \{\n#if defined\(_WIN32\)/.test(glueWin)
+    && /if \(c->transparent\) \{ c->ren = NULL; c->tex = NULL; return 1; \}/.test(glueWin));
+  // The DIB + DC are freed before the ctx memset on teardown (a layered window can be
+  // closed and reopened by the program, so this is not just process-lifetime cleanup).
+  check('the layered DIB and DC are released on window teardown',
+    /if \(c->layered_dc != NULL\) \{ DeleteDC\(\(HDC\)c->layered_dc\); c->layered_dc = NULL; \}/.test(glueWin)
+    && /if \(c->layered_bmp != NULL\) \{ DeleteObject\(\(HBITMAP\)c->layered_bmp\); c->layered_bmp = NULL; \}/.test(glueWin));
+  // Linux still has no layered path: it must REPORT once, never hand back a silent opaque
+  // window that ignores the flag (AGENTS.md §2.5). The Windows branch is #elif, so the
+  // report-once #else survives for every other non-Apple backend.
+  check('a backend with no transparent implementation still reports once (never a silent opaque window)',
+    /fprintf\(stderr, "window_glue: transparent windows are not implemented on this backend\\n"\);/.test(glueWin));
   // Layer-HOSTING (setLayer:) is the load-bearing bit: with a plain wantsLayer SDLView
   // keeps filling its backing store with opaque black every display pass.
   check('the content view is made layer-hosting so SDLView stops painting its opaque store',

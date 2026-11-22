@@ -61,7 +61,7 @@
 | Frame pacing? | A dedicated thread calls `DwmFlush()` to ride the compositor clock, then `RedrawWindow`; `Present(0,0)` **does not block** | `vsync.rs`, `platform.rs:446`, `directx_renderer.rs:245` |
 | Why is it fast? | Upstream's answer is "batch more, issue fewer draw calls"; `gpui-fast`'s is "**an entire frame can do nothing**" — retained views, retained layout nodes, scroll-layer tiles. Frame cost tracks **how much of the window changed**, not how much is on screen | §9 |
 | What is "120 FPS"? | Upstream docs explicitly demote it to a **frame-budget statement** (8.33 ms per frame on a 120 Hz panel), not "rebuild 120 times a second" | `gpui-kit/website/docs/fps.md:28` |
-| What is portable to us? | ① the **DirectComposition** transparency/composition chain (it fills our unimplemented `<transparent>` on Windows); ② the vsync-thread / non-blocking-Present **decoupling idea**; ③ the structural rule that text and vectors must be batched. **Not** its hand-written pipeline | §10 |
+| What is portable to us? | ① the **DirectComposition** transparency/composition chain (the `<transparent>` gap was closed by stage four-hundred-fifty-four via `WS_EX_LAYERED`+`UpdateLayeredWindow`; DComp is an optional alternative for a GPU-composited path); ② the vsync-thread / non-blocking-Present **decoupling idea**; ③ the structural rule that text and vectors must be batched. **Not** its hand-written pipeline | §10 |
 
 > That it uses D3D11 while we use D3D12 is **not a difference of taste**: Skia m124 has exactly one
 > Direct3D backend on Windows (D3D12), and we are unwilling to give up the device/queue we share with
@@ -353,8 +353,9 @@ comp_device.Commit()?;
 
 The payoff: **frame alpha blending is done by DWM in premultiplied space**, so transparency, rounded/shadowed
 edges, and HiDPI scaling are composited at the compositor's quality, and resizing does not produce the
-GDI-era flicker or tearing. **This is also the correct answer for our own `<transparent>` on Windows** (see
-§10).
+GDI-era flicker or tearing. **Our own `<transparent>` on Windows was implemented in stage four-hundred-fifty-four
+via `WS_EX_LAYERED` + per-frame `UpdateLayeredWindow`** (the CPU-raster path is sufficient); DComp is an
+optional alternative for a GPU-composited path that avoids the per-frame DIB copy (see §10).
 
 For triage, the environment variable `GPUI_DISABLE_DIRECT_COMPOSITION` falls the whole chain back to
 `CreateSwapChainForHwnd` (`Scaling = NONE`, `AlphaMode = IGNORE`, `SWAP_EFFECT_FLIP_SEQUENTIAL`).
@@ -630,7 +631,7 @@ Current state is in [`win32.md`](win32.md): `CreateSwapChainForHwnd` (`FLIP_DISC
 
 | Verdict | Item | Reasoning |
 |---|---|---|
-| **Adopt** | The **DirectComposition** chain: `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition` (`PREMULTIPLIED`) + a visual at the root | It closes the gap recorded in row 24 of the `win32.md` checklist: **`<transparent>` is unimplemented on Windows**. The old idea (`WS_EX_LAYERED` + per-frame `UpdateLayeredWindow` alpha) needs a CPU readback or an extra D3D target, whereas DComp lets DWM composite on the GPU and additionally handles rounded windows (`DWMWA_WINDOW_CORNER_PREFERENCE`) and shadow edges. **This is the single most valuable item in this document for us** |
+| **Adopt** | The **DirectComposition** chain: `WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition` (`PREMULTIPLIED`) + a visual at the root | The row-24 **`<transparent>` gap in the `win32.md` checklist was closed by stage four-hundred-fifty-four via `WS_EX_LAYERED` + per-frame `UpdateLayeredWindow`** (CPU-raster path: the Skia surface is already premultiplied BGRA, copied row-wise into a DIB with no extra readback). DComp lets DWM composite on the GPU, avoids the per-frame DIB copy, and additionally handles rounded windows (`DWMWA_WINDOW_CORNER_PREFERENCE`) and shadow edges — an **optional alternative for a GPU-composited path** (not yet implemented) |
 | **Adopt (evaluate)** | Present decoupling: dedicated `DwmFlush` thread + `Present(0,0)` | Our `Present(1,0)` pins the UI thread to vblank; during drag/resize, `win32.md` §2.8 already shows frames can only be driven by the SDL event watch. Whether decoupling improves frame-time distribution needs measurement (the `ASC_GPU_STATS=1` instrumentation exists). Risks are tearing and one frame of latency, and AIR's `frameRate` semantics describe the **application's own cadence**, which need not be locked to the compositor — confirm `adl` behaviour before touching it |
 | **Adopt (cheap)** | Three back buffers | `win32.md` already records that `BufferCount=2` lets the compositor hold both buffers while moving a window, stalling submission. GPUI uses three |
 | **Adopt (new, cheapest of all)** | **An oracle-style regression**: run the same input through two arms (retained / forced to forget everything every frame), compare the complete result frame by frame, and assert that the retained arm **actually reused** | Our 37 CheckUi checks are **point tests**: they can only prove the path I thought of. The failure mode of retained UI is "a dependency was not recorded, so something that should have been rebuilt was not", which only a random history catches (§9.6). Concretely for asaotui: run one description tree through reconcile twice (once forced to rebuild everything) and compare the UiNode tree, rects and paint order; the retained arm must also assert it did not rebuild, or it passes by never retaining. `probes/frame` plus one env switch is enough |

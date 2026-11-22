@@ -55,7 +55,7 @@
 | 帧节奏？ | 独立线程 `DwmFlush()` 对齐合成时钟后 `RedrawWindow`；`Present(0,0)` **不阻塞** | `vsync.rs`、`platform.rs:446`、`directx_renderer.rs:245` |
 | 凭什么「快」？ | 上游的答案是「压批、少 draw call」；`gpui-fast` 的答案是「**整帧可以什么都不做**」——保留视图 + 保留布局节点 + 滚动层 tile。帧耗时与「这一帧窗口里变了多少」成正比，而不与「屏幕上有多少东西」成正比 | §9 |
 | "120 FPS" 是什么？ | 官方文档明确降级为**帧预算话术**（120 Hz 屏上 8.33 ms/帧），不是"每秒重建 120 次" | `gpui-kit/website/docs/fps.md:28` |
-| 可移植给我们的是什么？ | ① DComp 这条**透明窗/合成链**（正对我们 `<transparent>` 在 Windows 未实现的缺口）；② vsync 线程与非阻塞 Present 的**解耦思路**；③ 「文字/矢量必须批化」的结构约束。**不是**它的自绘管线 | §10 |
+| 可移植给我们的是什么？ | ① DComp 这条**透明窗/合成链**（`<transparent>` 缺口已由阶段四百五十四 用 `WS_EX_LAYERED`+`UpdateLayeredWindow` 填上，DComp 是 GPU 合成路径的可选替代）；② vsync 线程与非阻塞 Present 的**解耦思路**；③ 「文字/矢量必须批化」的结构约束。**不是**它的自绘管线 | §10 |
 
 > 它用 D3D11、我们用 D3D12，这个差别**不是取向不同**：Skia m124 在 Windows 上只有 D3D12 一条
 > Direct3D 后端，而我们又不肯丢掉与 Stage3D 共用的 device/queue。完整的机制对照、我们为 D3D12
@@ -326,8 +326,9 @@ comp_device.Commit()?;
 ```
 
 收益：**帧的 alpha 混合由 DWM 用 premultiplied 做**，所以透明窗、圆角/阴影边缘、高 DPI 缩放都由合成器
-高质量处理，且 resize 不会出现 GDI 那套闪烁/撕裂。**这也是我们 `<transparent>` 在 Windows 上的正解**
-（见 §10）。
+高质量处理，且 resize 不会出现 GDI 那套闪烁/撕裂。**我们 `<transparent>` 在 Windows 上已由阶段四百五十四
+用 `WS_EX_LAYERED`+逐帧 `UpdateLayeredWindow` 落地**（CPU 光栅路径足够）；DComp 是 GPU 合成路径下免逐帧
+DIB 拷贝的可选替代（见 §10）。
 
 排障用开关：环境变量 `GPUI_DISABLE_DIRECT_COMPOSITION` 让整条链回落到
 `CreateSwapChainForHwnd`（`Scaling = NONE`、`AlphaMode = IGNORE`、`SWAP_EFFECT_FLIP_SEQUENTIAL`）。
@@ -572,7 +573,7 @@ taffy 节点常驻。
 
 | 结论 | 内容 | 理由 |
 |---|---|---|
-| **该借** | **DirectComposition 这条链**：`WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition`（`PREMULTIPLIED`）+ visual 挂根 | 它直接填掉我们 `win32.md` 核对表第 24 行那个缺口：**`<transparent>` 在 Windows 未实现**。旧思路（`WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow` alpha）要 CPU 回读或额外 D3D 目标，而 DComp 让 DWM 用 GPU 合成，且顺带解决圆角窗（`DWMWA_WINDOW_CORNER_PREFERENCE`）/阴影边界。**这是本文对我们最高价值的单点** |
+| **该借** | **DirectComposition 这条链**：`WS_EX_NOREDIRECTIONBITMAP` + `CreateSwapChainForComposition`（`PREMULTIPLIED`）+ visual 挂根 | `win32.md` 核对表第 24 行的 **`<transparent>` 缺口已由阶段四百五十四 用 `WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow` 填上**（CPU 光栅路径：Skia surface 本就是预乘 BGRA，逐行直拷进 DIB，无需额外回读）。DComp 让 DWM 用 GPU 合成、免逐帧 DIB 拷贝，且顺带解决圆角窗（`DWMWA_WINDOW_CORNER_PREFERENCE`）/阴影边界，是 **GPU 合成路径下的可选替代**（尚未落地） |
 | **该借（需评估）** | Present 解耦：独立 `DwmFlush` 线程 + `Present(0,0)` | 我们 `Present(1,0)` 把 UI 线程锁在 vblank 上；拖动/resize 时 `win32.md` §2.8 已经证明帧只能靠 SDL event watch 驱动。解耦能否改善帧时间分布，需实测（`ASC_GPU_STATS=1` 现成口径）。风险是 tearing 与一帧延迟，而 AIR 的 `frameRate` 语义是**应用自己的节拍**，未必需要跟合成器锁死——这一点得先确认 `adl` 行为再动 |
 | **该借（轻）** | 3 个 back buffer | 我们 `win32.md` §2.x 已记录 `BufferCount=2` 在合成器搬窗时会同时扣住两个 buffer → 提交卡顿。gpui 用 3 |
 | **该借（新，本轮最便宜）** | **oracle 式回归**：同一份输入跑两条臂（保留 / 每帧强制全忘），逐帧比完整结果，并断言「保留臂确实复用到了」 | 我们的 CheckUi 37 项是**定点钉子**，只能证明「我想到的那条路对」；保留式 UI 真正的失效模式是「漏记一个依赖 ⇒ 该重建没重建」，只有随机史抓得到（§9.6）。落到 asaotui 上：同一棵描述树跑两遍 reconcile，比 UiNode 树形 / rect / 绘制序；主动臂还要断言「确实没重建」——否则会靠「全重建」通过。现成的 `probes/frame` 加一个 env 开关就能做 |

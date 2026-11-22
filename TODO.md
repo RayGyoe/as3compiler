@@ -20306,6 +20306,12 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-23 追加（阶段四百五十四：Windows 透明窗原生实现）**：**改写 1 行 / 移出 0 行 / 新登记 0 行** ⇒
+> 主表 **保持 84 行**（`未开始` 65 / `部分完成` 18 / `调研完成·实现暂缓` 1 不变）。改写的是「窗口几何的 Windows 端残余」：
+> 其 ① `<transparent>` 的 Windows 原生实现本阶段落地（`WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow`，`ULW_ALPHA`+`AC_SRC_ALPHA`，
+> 透明窗绕过 SDL renderer、预乘 BGRA DIB 逐行直拷），从该行移出；该行收窄到只剩 ②（`closing` 可取消序 / `resizeToScreen`
+> 每屏 DPI），状态仍 `部分完成`。adl 51.4.1 双端探针四种 alpha 情形全匹配（`temp/reviewwin`），钉 `unit: platform/InitialWindowStyle` +7。
+
 > **2026-11-23 追加（阶段四百五十三：不透明位图预乘角落 localized 修复）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
 > 主表 **85 → 84 行**（`未开始` 66 → **65**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。移出的是阶段四百五十二新登记的
 > 「copyPixels 透明源→不透明目标预乘」行——本轮 adl 预乘 sweep 定案 AIR 内部存预乘、`getPixel32` 读取反预乘（不透明
@@ -20954,7 +20960,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **ANE 附属 DLL 的 `LoadLibrary` 搜索路径未设置**（主项「整包解包 + `getExtensionDirectory()`」已于阶段三百九十一修复并移出） | 未开始（2026-11-09 阶段三百九十一 修主项时留存的子点；2026-11-15 阶段四百一十九 审计遗留表时独立成行） | 阶段三百九十一（提交 `2b3517d`）解决了「扩展随包数据文件在不在 `getExtensionDirectory(id)` 目录」——整包原样解开（`catalog.xml`/`library.swf`/`mimetype`/`META-INF/`），未知/空 id `#1508`、`null` `#2007` 文案逐字对齐，编译期拒绝逃出扩展目录的条目名。但**没有改 `LoadLibrary` 的搜索路径**：ANE 的附属 DLL（非系统 DLL）若不在默认搜索路径上仍会加载失败，需 `LOAD_LIBRARY_SEARCH_*` / `SetDllDirectory`。实测的那个真项目导入表只有系统 DLL + `asaot.dll`，故当前不受影响 | 在 `ExtensionContext.call` 首次 `LoadLibrary` 前把扩展目录加入 DLL 搜索路径（`SetDllDirectory` 或 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`）；先造一个带附属 DLL 的 ANE 实测复现再动手。见 `docs/{zh-cn,en}/ane.md` §5 |
 | **Linux / WASI 的 `Capabilities.os` 仍是裸家族名**（AIR 在这两端同样带版本；**macOS 已收口**） | 未开始（2026-10-18 阶段一百八十九 登记；**2026-10-19 阶段一百九十六 收口 macOS 一端**） | 阶段一百八十九 已把 Windows 的「版本→名字」表从 `Adobe AIR.dll` 里量出来逐字复现（18 个名字 + `"Windows"` 兜底，版本改取 `ntdll!RtlGetVersion` 以绕开无清单进程的 `6.2` 谎报）。**macOS 本轮实测收口**：`Capabilities.os` 与 `adl 51.4.1` **逐字相同** = `Mac OS <major>.<minor>.<patch>`（本机 `Mac OS 26.6.2`，走 `uname` 后按 AIR 的「家族名 + 版本」形态拼），双端孪生探针第一行即 `CAP_os=Mac OS 26.6.2` 两端一致（`temp/nwmac/nwmac-{adl,aot}.txt`）。剩下 Linux / WASI 两端仍**没有真值可核**（本机无 `adl` for Linux），故不臆造、留 ⚠️ 报明（`src/runtime.ts` 的 `as_cap_os` 注释与 [`docs/zh-cn/win32.md`](docs/zh-cn/win32.md) §3.12 都写了）。 | 收口需要一台 Linux 跑 `adl` 取真值 + 一张发行版/内核→名字表（WASI 无 `adb` 对应物，按期如实报明即可）；在那之前下游「取 `os.split(" ")[1]` 当版本」的行为在 Windows 与 macOS 上都已修好 |
 | SWC **库里非符号类的代码**（库自带的基类/工具类）不参与编译 ⇒ 符号的工程基类缺失时只能回落成 `MovieClip` 子类 | 未开始（2026-10-19 阶段一百九十六 修复 SWC 示例时实测登记） | 阶段一百九十一 起，符号类按它 `DoABC` 里的**真基类**绑定（`skin.swc` 的四个组合框都继承 App 自己的 `com.vsdevelop.controls.ComBoBox`，`swc.ts` 的 `availableProjectBase`）。但库的**其余**类（含这个基类在库里的那份副本）是 ABC 代码，不参与编译（`docs/zh-cn/swc.md` §3.3 明列范围外）⇒ 当**编译单元里没有**这个基类时（`examples/swc-*.as` 这类只烘美术的示例，或 App 少编译了一个文件），我们改成「烘成 `MovieClip`/`SimpleButton` 子类 + **响亮告警一次**」，而 `adl` 在同一份输入上**照跑不误**（AIR 会执行库里自带的那个基类）⇒ 按 §1.5 硬判据是**遗留缺陷**。本行只登记**没修的那部分**：库内基类的**行为**（它自己的字段/方法与 `this["title"]` 之类的动态访问）我们一律没有，符号只能退化成纯美术子类 | 立项：把 SWC 的 `DoABC` 里**非符号类**也编译进来（需要 `swc.ts` 把库内 ABC 里的类声明/方法解码成 AST 并注入程序，等价于把 `abc.ts` 的范围从「符号类的帧脚本+方法」扩到「整库 ABC」），那之后 `availableProjectBase` 的回落可以只留给「App 与库都没有」的真缺失。验收：以 `temp/skin.swc` 为输入，`ComBox`/`AIAsrComBox` 的 `currentLabels`/`title`/`selectedIndex` 行为与 `adl` 逐项对照 |
-| **窗口几何的 Windows 端残余**（Windows 端 `<transparent>` 仍未实现 / 四类未测面剩下的两项） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：原来列的四处里，① 最大化尺寸口径 **已定** —— 那是 `WS_MAXIMIZEBOX` 这一位（在 ⇒ 可用区 `2576x1675`，不在 ⇒ 整块显示器 `2576x1723`，adl 与我们在两档描述符下**逐字相同**），② 横向边框 **已修**（`b_left` 四处同源），③ 描述符成员 **已接线**（`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>`），只剩下面两处；**2026-10-23 阶段二百五十七 再收窄**：① 的**生成侧与 macOS 侧已接线**，剩下的只是 Windows 的原生实现） | **① `<transparent>` 的 Windows 端**：描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions.transparent` → `sk_window_set_transparent`、合成步清 alpha 0、macOS 的 `NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明，**全部已在阶段二百五十七 落地**；Windows 侧仍要 `WS_EX_LAYERED` + 逐帧 alpha（当前**报明一次**，不给假透明窗）；**② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没接线/没量」：① Windows 端需要一张分层窗（`WS_EX_LAYERED` + 逐帧 alpha）并把同样的「清 alpha 0」口径搬过去；② `closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
+| **窗口几何的 Windows 端残余**（四类未测面剩下的两项：`closing` 可取消序 / `resizeToScreen` 每屏 DPI） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：最大化尺寸口径 **已定**（`WS_MAXIMIZEBOX` 位，adl 与我们两档描述符逐字相同）、横向边框 **已修**（`b_left` 四处同源）、描述符成员 **已接线**；**阶段二百五十七 再收窄**：`<transparent>` 生成侧与 macOS 侧已接线；**2026-11-23 阶段四百五十四 三收窄**：① `<transparent>` 的 **Windows 原生实现已落地**（`WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow`，`ULW_ALPHA`+`AC_SRC_ALPHA`，绕过 SDL renderer，预乘 BGRA DIB 逐行直拷；adl 双端四种 alpha 情形全匹配，`temp/reviewwin`；钉 `unit: platform/InitialWindowStyle` +7），**移出本行**，只剩 ②） | **② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没量」：`closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
@@ -23618,6 +23624,40 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   **−17%**（阶段四百四十三）把它抵平到 **196–202**。也就是说「UTF-8 存储 + 对齐 UTF-16 特性」
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
+
+### 阶段四百五十四：Windows 透明窗原生实现——WS_EX_LAYERED + 逐帧 UpdateLayeredWindow（v0.4.428 → v0.4.429）✅ 已完成
+
+**问题**（「窗口几何的 Windows 端残余」行的 ①）：`<transparent>true` 的初始窗在 macOS 真透明（阶段二百五十七），
+Windows 端胶水只**报明一次**「transparent windows are not implemented on this backend」，给的是不透明窗——
+alpha-0 区画黑而非透出桌面。adl 51.4.1 双端探针（`temp/reviewwin`）视觉证实：adl 右半 alpha-0 透出桌面终端文字，
+我方同区是黑底。
+
+**定语义**（adl 51.4.1，`temp/reviewwin/adl/Trans.as` + AOT 孪生）：透明窗四种 alpha 情形——① 不透明像素实心；
+② alpha-0 透出桌面；③ 半透明叠不透明（绿 0.5 叠红 = 橄榄）；④ 半透明叠桌面（蓝 0.5 叠桌面文字 = 透蓝）。
+判别核心是 ②④：alpha-0 与半透明都必须让桌面按 per-pixel alpha 透出来。
+
+**修复**（`vendor/window_glue.cc`，仅 `_WIN32`）：透明窗**绕过 SDL renderer**（其 Windows 交换链不透明，alpha-0 会画黑），
+改走分层窗：① `sk_window_apply_transparent` 的 Windows 分支给 HWND 加 `WS_EX_LAYERED`（`GetWindowLongPtrA`/
+`SetWindowLongPtrA` GWL_EXSTYLE，关掉时摘除）；② 新增 `sk_win_present_layered`：把 Skia `MakeN32Premul` surface 的像素
+（Windows N32 即 BGRA，**已是预乘 BGRA**，ULW 正是要这个布局——逐行直拷进 32 位 top-down DIB section，**不再预乘**，
+二次预乘会把半透明像素压暗）经 `UpdateLayeredWindow`（`ULW_ALPHA` + `BLENDFUNCTION{AC_SRC_OVER,0,255,AC_SRC_ALPHA}`）
+按窗口实时屏幕位置（每帧 `GetWindowRect`）合成；DIB/DC 跨帧复用、仅尺寸变化时重建；③ `present_frame` 加 `_WIN32`
+透明分支路由到 ULW；④ `sk_attach_cpu` 对透明窗跳过 renderer 创建（不在分层窗上建 D3D 交换链）；⑤ `sk_service_destroy`
+释放 DIB/DC。Linux 仍走 `#else` 报明一次（不静默给假透明窗）。
+
+**同机 A/B**：修后 AOT 四种 alpha 情形与 adl 逐字一致（`temp/reviewwin/aot-wide.png` vs `adl-trans2.png`：红矩形实心、
+橄榄绿方、右半蓝方透桌面文字、alpha-0 透桌面）。高 DPI（150%）物理窗 600×450 正确合成。
+
+**验收**：`unit: platform/InitialWindowStyle` +7 钉（ULW 路由 bypass SDL_RenderPresent / WS_EX_LAYERED toggle /
+32 位 top-down DIB 逐行直拷不再预乘 / AC_SRC_ALPHA+ULW_ALPHA 实时位置 / 透明窗跳过 renderer / 销毁释放 DIB/DC /
+Linux 仍报明一次），全组 46 绿；全 platform 组无破坏。**全量回归**：`node test.ts` ⇒ **tests 739 / pass 734 /
+fail 1 / skipped 4**，唯一红是并发会话的 `unit: emit/StringAccumulator`（非本轮改动）；日志 `temp/node-test-full.log`。
+
+**经验**：① macOS 透明走 CALayer 绕过 SDL renderer，Windows 同构地走 ULW 绕过——**SDL renderer 的交换链不透明**是
+两端共同的根因，「清 alpha 0」alone 不够（backing 不透明照样画黑）；② Skia surface 本就是预乘 BGRA，ULW 正要预乘
+BGRA，**逐行直拷即可**，别画蛇添足再预乘（会压暗半透明）；③ 真机截屏是唯一能验收透明的证据，且**截屏区域要对齐
+DPI 物理尺寸**——150% 下逻辑 400×300 的窗物理 600×450，按逻辑尺寸截会裁掉右半蓝方造成「缺失」假象；④ 探针清单
+必须含 `window_glue.cc` + SDL2 + `ASC_USE_WINDOW`，否则链到 stub 瞬退（exit 0 无窗），与「透明没实现」是两回事。
 
 ### 阶段四百五十三：不透明位图预乘角落——localized 修复（v0.4.427 → v0.4.428）✅ 已完成
 

@@ -419,6 +419,17 @@ struct WinCtx {
   // Both NULL on every other backend and on a non-transparent window.
   void* vib_eff;
   void* vib_host;
+#if defined(_WIN32)
+  // Windows transparent-window present path: a layered window (WS_EX_LAYERED) the
+  // OS composites from a 32-bit premultiplied-BGRA DIB section via UpdateLayeredWindow
+  // (see sk_win_present_layered). The DIB + its DC persist across frames and are
+  // rebuilt only on a size change. All NULL/0 on a non-transparent window.
+  void* hwnd;
+  void* layered_dc;
+  void* layered_bmp;
+  void* layered_bits;
+  int layered_w, layered_h;
+#endif
   // The three style-affecting flags the descriptor / NativeWindowInitOptions carry.
   // AIR's win32 mapping is THICKFRAME <=> resizable, MAXIMIZEBOX <=> maximizable,
   // MINIMIZEBOX <=> minimizable (measured off the real window, temp/nwwin/wstyle.exe),
@@ -597,6 +608,10 @@ static Uint32 sk_pixfmt_for_surface(void* surface) {
 // Defined with the other transparency glue further down (it needs sk_nsrect).
 static void sk_mac_present_layer(WinCtx* c, void* pixels, int w, int h, int rowBytes);
 #endif
+#if defined(_WIN32)
+// Defined with the other transparency glue further down (it needs the win32 DIB API).
+static void sk_win_present_layered(WinCtx* c, void* pixels, int w, int h, int rowBytes);
+#endif
 
 static void present_frame(WinCtx* c, void* pixels, int w, int h, int rowBytes) {
 #if defined(__APPLE__)
@@ -604,6 +619,11 @@ static void present_frame(WinCtx* c, void* pixels, int w, int h, int rowBytes) {
   // store is opaque, so the frame is handed to a CALayer instead (rationale in
   // sk_mac_ensure_transparent below).
   if (c->transparent) { sk_mac_present_layer(c, pixels, w, h, rowBytes); return; }
+#endif
+#if defined(_WIN32)
+  // A transparent Windows window is composited by UpdateLayeredWindow, not SDL's
+  // renderer (whose swapchain is opaque, so alpha-0 pixels would show black).
+  if (c->transparent) { sk_win_present_layered(c, pixels, w, h, rowBytes); return; }
 #endif
   SDL_Renderer* ren = c->ren;
   SDL_Texture* tex = c->tex;
@@ -1141,6 +1161,12 @@ static void sk_service_destroy(void) {
     SDL_DelEventWatch(live_resize_watch, c);
     if (c->tex != NULL) SDL_DestroyTexture(c->tex);
     if (c->ren != NULL) SDL_DestroyRenderer(c->ren);
+#if defined(_WIN32)
+    // Free the layered-window DIB + DC before the memset below zeroes the ctx.
+    if (c->layered_dc != NULL) { DeleteDC((HDC)c->layered_dc); c->layered_dc = NULL; }
+    if (c->layered_bmp != NULL) { DeleteObject((HBITMAP)c->layered_bmp); c->layered_bmp = NULL; }
+    c->layered_bits = NULL;
+#endif
     // Release the GPU state before the window it draws into: the backend drops
     // this window's surfaces there (and the shared device/context once the last
     // GPU window is gone). On Metal the view owning the layer must also go before
@@ -2558,6 +2584,78 @@ static void sk_mac_present_layer(WinCtx* c, void* pixels, int w, int h, int rowB
 // filled; dropping that plus a clear background is what lets the window's own alpha
 // channel show the desktop through. The CONTENT VIEW's layer must be non-opaque too,
 // or CoreAnimation paints a black rectangle behind whatever the renderer draws.
+#if defined(_WIN32)
+// A transparent window is composited by the OS from a premultiplied-BGRA DIB via
+// UpdateLayeredWindow (ULW_ALPHA), NOT through SDL's renderer: SDL's Windows
+// renderer backs an opaque swapchain, so alpha-0 pixels would show black instead
+// of letting the desktop through (measured against adl 51.4.1, temp/reviewwin:
+// adl's unpainted area shows the desktop, ours showed black). The Skia surface is
+// MakeN32Premul and Windows N32 is BGRA, so its pixels are ALREADY in the exact
+// premultiplied BGRA layout ULW wants -- a straight row copy, no per-pixel
+// premultiply. The DIB/DC persist across frames and are rebuilt only on a size
+// change; the window's screen position is read each frame so a moved window keeps
+// compositing at the right place.
+static void sk_win_present_layered(WinCtx* c, void* pixels, int w, int h, int rowBytes) {
+  if (c->win == NULL || pixels == NULL || w <= 0 || h <= 0) return;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+  HWND hwnd = (HWND)info.info.win.window;
+  if (hwnd == NULL) return;
+  // (Re)build the DIB section only when the frame size changes.
+  if (c->layered_dc == NULL || c->layered_w != w || c->layered_h != h) {
+    if (c->layered_dc != NULL) { DeleteDC((HDC)c->layered_dc); c->layered_dc = NULL; }
+    if (c->layered_bmp != NULL) { DeleteObject((HBITMAP)c->layered_bmp); c->layered_bmp = NULL; }
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;  // top-down: row 0 is the top of the frame
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HDC screen = GetDC(NULL);
+    HBITMAP bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HDC dc = CreateCompatibleDC(screen);
+    ReleaseDC(NULL, screen);
+    if (bmp == NULL || dc == NULL || bits == NULL) {
+      if (bmp != NULL) DeleteObject(bmp);
+      if (dc != NULL) DeleteDC(dc);
+      return;
+    }
+    SelectObject(dc, bmp);
+    c->layered_dc = dc;
+    c->layered_bmp = bmp;
+    c->layered_bits = bits;
+    c->layered_w = w;
+    c->layered_h = h;
+  }
+  // Copy the premultiplied BGRA frame into the DIB (the surface row may be padded).
+  unsigned char* dst = (unsigned char*)c->layered_bits;
+  const unsigned char* src = (const unsigned char*)pixels;
+  const int dstRow = w * 4;
+  for (int y = 0; y < h; y++) {
+    memcpy(dst + (size_t)y * dstRow, src + (size_t)y * rowBytes, (size_t)dstRow);
+  }
+  // Composite at the window's current screen position; ULW owns the window's
+  // entire visual. The size is the physical pixel size of the frame.
+  RECT rc;
+  GetWindowRect(hwnd, &rc);
+  POINT ptDst = { rc.left, rc.top };
+  POINT ptSrc = { 0, 0 };
+  SIZE size = { w, h };
+  BLENDFUNCTION blend;
+  blend.BlendOp = AC_SRC_OVER;
+  blend.BlendFlags = 0;
+  blend.SourceConstantAlpha = 255;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  HDC screen = GetDC(NULL);
+  UpdateLayeredWindow(hwnd, screen, &ptDst, &size, (HDC)c->layered_dc, &ptSrc, 0, &blend, ULW_ALPHA);
+  ReleaseDC(NULL, screen);
+}
+#endif
+
 static void sk_window_apply_transparent(SDL_Window* win, int on) {
   if (win == NULL) return;
 #if defined(__APPLE__)
@@ -2591,10 +2689,25 @@ static void sk_window_apply_transparent(SDL_Window* win, int on) {
       }
     }
   }
+#elif defined(_WIN32)
+  // Windows: a transparent window is a layered window (WS_EX_LAYERED) that the OS
+  // composites from a premultiplied-BGRA surface via UpdateLayeredWindow (the
+  // per-frame present is sk_win_present_layered). Adding the extended style is what
+  // lets ULW take over the window's visual; without it the window stays an opaque
+  // SDL swapchain and alpha-0 pixels show black (measured vs adl 51.4.1). Toggling
+  // it back off restores an ordinary opaque window.
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+  HWND hwnd = (HWND)info.info.win.window;
+  if (hwnd == NULL) return;
+  LONG ex = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
+  LONG want = on ? (ex | WS_EX_LAYERED) : (ex & ~(LONG)WS_EX_LAYERED);
+  if (want != ex) SetWindowLongPtrA(hwnd, GWL_EXSTYLE, want);
 #else
   // Not implemented on this backend. REPORT it once rather than hand back an opaque
   // window that silently ignores the flag (AGENTS.md §2.5: never a silent wrong
-  // semantic). Windows would need DwmExtendFrameIntoClientArea + a layered surface.
+  // semantic).
   (void)win;
   if (on) {
     static int reported = 0;
@@ -2742,6 +2855,13 @@ static int sk_open_window(int w, int h, const char* title, int decorated, int vi
 // Attach a renderer + streaming texture to a window that renders on the CPU.
 // The main window uses this too unless the app asked for the Metal backend.
 static int sk_attach_cpu(WinCtx* c) {
+#if defined(_WIN32)
+  // A transparent Windows window is composited by UpdateLayeredWindow, not SDL's
+  // renderer (whose swapchain is opaque). Skip the renderer entirely so no D3D
+  // swapchain is created on the layered window; present_frame routes straight to
+  // sk_win_present_layered and do_resize only rebuilds the AS3 surface.
+  if (c->transparent) { c->ren = NULL; c->tex = NULL; return 1; }
+#endif
   // Prefer the hardware renderer (Metal) — the final blit and present are far
   // cheaper there than in SDL_RENDERER_SOFTWARE, which is the real ceiling at
   // high Stage.frameRate. Fall back to software when no GPU is available.
