@@ -1195,6 +1195,59 @@ build manifest: unknown field 'link-lib' (did you mean 'link-libs'?)
 > 这条只保证**键名认识**，不保证「这个键在当前形态下有用」：`font-urls` 在 `target=native` 里本就无效，
 > 不会被拒。仓库内 31 份自带清单（手写示例与 `--air-app` 快照）全部通过，钉子见 `unit: build/ManifestUnknownKeys`。
 
+### 4.5 元素循环的版本化（`Vector`/`Array` 逐元素访问，阶段四百五十一）
+
+这是 §1.1 意义上的**形态转换**，不是前端做优化：它改的是「边界/空指针检查放在哪」，
+不是「检查做不做」，向量化本身仍由 `-O2` 完成。动机是遗留项 #65——`Vector`/`Array` 的
+逐元素访问守卫把循环挡在向量化之外（同形裸 C 的数倍慢）。
+
+**为什么守卫挡路**：`c[j]=a[j]+b[j]` 的循环体里有 `set` ⇒ 与输入 `Vector` 别名 ⇒
+`v->length` 不能被证明循环不变 ⇒ 每元素的 `#1125` 边界检查 + `as_req_obj` 空指针守卫
+只能留在循环内，LLVM 于是拒绝向量化。归约循环（`s+=a[j]`，无 store）反而不慢，正因为
+无别名时 clang 自己就把检查提外了。
+
+**做法（循环版本化）**：对一个「合格」的数值元素循环，发射**两个版本**——
+
+```c
+int _fastok = (start >= 0);
+_fastok = _fastok && (a != NULL) && (bound <= ((as_vector_number*)a)->length);  /* 每个接收者一次 */
+/* Array 读接收者再加：_fastok && as_array_all_num(a, bound)（[0,bound) 全是 tag-1 数值） */
+if (_fastok) {
+  double* _fastp = a->data;            /* 数据指针提进 C 局部（依赖分析才能识别数组边界） */
+  int _fastj = start;                  /* 归纳变量用 C 局部影子（全局内存归纳变量 LLVM 不认） */
+  for (; _fastj < bound; _fastj = _fastj + 1) { /* 头条件形，非 for(;;)+break（早退循环不被向量化） */
+    /* 裸 _fastp[_fastj] 读写，无逐元素守卫 */
+  }
+  g_j = _fastj;                        /* 写回 AS3 变量（var 是函数作用域，循环后仍可见） */
+} else {
+  /* 原样：每元素 as_vector_number_set/get + as_req_obj，#1125/#1009 时机逐字保留 */
+}
+```
+
+「合格」的判据（`analyzeFastLoop`，全部满足才版本化，否则**原样保留**逐元素检查）：
+init 是 `int`/`uint` 循环变量（`var j:int=0` 或复用 `for (j=0;…)`）、cond 为 `j < bound`、
+update 为 `j++`/`j+=1`；start/bound 是**纯数值读**；循环体只含数值变量声明/赋值、
+`recv[j]` 形式的元素读写与 `+ - * / %` 算术，**不得有任何调用**、不得写循环变量/边界/接收者。
+预检是**纯检查**（不改状态），通过才走快分支；不通过（越界、负起点、混合 Array、接收者为空）
+一律落回慢分支，异常时机与部分副作用与 AIR 逐字一致。
+
+**同机实测**（Windows，`24 × 1M` 元素，`clang -O2 -ffp-contract=off`，`temp/review65/`）：
+
+| 形状 | 改前 | 改后 | 同形裸 C | `-Rpass` |
+|---|---|---|---|---|
+| `Vector.<Number>` `c[j]=a[j]+b[j]*1.5` | 24 ms | **12–13 ms** | 10–12 ms | width 2 / interleave 2 |
+| `Vector.<int>` `ic[j]=ia[j]+ib[j]` | 19–20 ms | **3–5 ms** | 4–6 ms | width 4 / interleave 2 |
+| `Array`(Number) 同形 | 122–134 ms | **84–87 ms** | —（装箱表示） | 未向量化 |
+
+`Vector` 两形已**与裸 C 平手**（收益由 `-O2` 自动向量化拿到，故增强项 E10 显式 SIMD 不排期）。
+`Array` 仍慢一截是**表示税**：元素是 24 字节装箱 `as_value`（tag+num+ptr），非 2 的幂步长，
+LLVM 不向量化这种跨步访问；要再进一步得改 `as_value` 布局（牵动 GC/语义，超出本轮）。
+
+**钉子**：`unit: emit/FastLoop` 14 钉（预检/影子/提指针/写回/快分支裸访问/慢分支留守卫/
+负起点门/读 Array 预扫/写-only Array 只查长度/含调用不版本化/改边界不版本化/复用循环变量）；
+`examples/fast-element-loop.as` 钉两路的**可观测语义**（结果一致、`#1125` 时机一致、
+循环后变量可见、混合 Array 的 null 强转 0）。非合格循环与所有非元素访问路径**逐字节不变**。
+
 ## 5. 多目标后端
 
 | 目标 | 编译命令 | 产物 |

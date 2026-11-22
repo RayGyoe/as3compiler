@@ -3405,3 +3405,95 @@ function checkTextColorRun(): string[] {
   return bad;
 }
 registerGroup('unit: render/TextColorRun', checkTextColorRun);
+
+// #86 (stage 452): an opaque BitmapData (transparent=false) never stores a non-FF
+// alpha. AIR forces 0xFF on WRITE -- measured on adl 51.4.1 (temp/review86):
+// setPixels of 0x80FF0000 reads back 0xFFFF0000 and draws opaque (drawAlpha=ff)
+// onto a transparent target, so the forcing is write-side, not a read mask.
+// setPixel32/fillRect/ctor already forced it; setPixels (all three sub-paths) and
+// setVector were the raw-upload gaps. getPixel32/getPixels stay RAW reads -- the
+// invariant lives entirely on the write side.
+function checkOpaqueAlpha(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (cond: boolean, label: string) => {
+    if (cond) { ok++; console.log(`PASS  [opaquealpha] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [opaquealpha] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.BitmapData;\n' +
+    'import flash.geom.Rectangle;\n' +
+    'import flash.utils.ByteArray;\n' +
+    'var bd:BitmapData = new BitmapData(4, 4, false, 0);\n' +
+    'var ba:ByteArray = new ByteArray();\n' +
+    'bd.setPixels(new Rectangle(0, 0, 4, 4), ba);\n' +
+    'var v:Vector.<uint> = new Vector.<uint>();\n' +
+    'bd.setVector(new Rectangle(0, 0, 4, 4), v);\n' +
+    'bd.setPixel32(0, 0, 0x80FF0000);\n' +
+    'bd.fillRect(new Rectangle(0, 0, 4, 4), 0x80FF0000);\n' +
+    'var g:ByteArray = bd.getPixels(new Rectangle(0, 0, 4, 4));\n')).c.replace(/\r\n/g, '\n');
+  check('setPixels LE opaque forces alpha via word-wise OR',
+    c.includes('else { unsigned* dw = (unsigned*)d; const unsigned* sw = (const unsigned*)s; for (int x = 0; x < cw; x++) dw[x] = sw[x] | 0xFF000000u; }'));
+  check('setPixels LE transparent keeps the pure memcpy fast path',
+    c.includes('if (bd->transparent) { memcpy(d, s, rowBytes); }'));
+  check('setPixels BE forces alpha only when opaque',
+    c.includes('dw[x] = bd->transparent ? w : (w | 0xFF000000u);'));
+  check('setPixels per-cell fallback forces alpha when opaque',
+    c.includes('if (!bd->transparent) a = 0xFFu;'));
+  check('setVector forces alpha only when opaque',
+    c.includes('bd->transparent ? v->data[si] : (v->data[si] | 0xFF000000u);'));
+  check('setPixel32 still forces alpha when opaque',
+    c.includes('bd->transparent ? color : (0xFF000000u | (color & 0xFFFFFFu));'));
+  check('fillRect still forces alpha when opaque',
+    c.includes('unsigned a = bd->transparent ? (color >> 24) : 0xFFu;'));
+  check('constructor fillColor still forces alpha when opaque',
+    c.includes('unsigned a = transparent ? (fillColor >> 24) : 0xFFu;'));
+  check('getPixel32 stays a RAW read (forcing is write-side, not a read mask)',
+    c.includes('return ((unsigned*)bd->pixels)[y * bd->width + x];'));
+  console.log(`[opaquealpha] ${ok} opaque-alpha checks passed`);
+  return bad;
+}
+registerGroup('unit: render/OpaqueAlpha', checkOpaqueAlpha);
+
+// Stage 453: the opaque-bitmap premultiplied corner. AIR stores BitmapData pixels
+// PREMULTIPLIED and un-premultiplies on getPixel32; for an opaque bitmap (alpha FF)
+// that read is identity, so transferring semi-transparent content into it leaves the
+// RGB darkened by the source alpha. The adl 51.4.1 premul sweep (temp/review86) showed
+// only TWO paths diverged from our straight storage: copyPixels mergeAlpha=false into
+// an opaque dest (must premultiply RGB round-half-up + force FF), and copyChannel of the
+// ALPHA channel into an opaque dest (alpha is immutable FF). draw / mergeAlpha=true /
+// transparent round-trips already matched, so this is a localized fix, NOT a global
+// switch to premultiplied storage.
+function checkOpaquePremul(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (cond: boolean, label: string) => {
+    if (cond) { ok++; console.log(`PASS  [opaquepremul] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [opaquepremul] ${label}`); }
+  };
+  const c = generateC(parse(
+    'import flash.display.BitmapData;\n' +
+    'import flash.geom.Rectangle;\n' +
+    'import flash.geom.Point;\n' +
+    'var src:BitmapData = new BitmapData(2, 2, true, 0);\n' +
+    'var od:BitmapData = new BitmapData(2, 2, false, 0);\n' +
+    'var r:Rectangle = new Rectangle(0, 0, 2, 2);\n' +
+    'var p:Point = new Point(0, 0);\n' +
+    'od.copyPixels(src, r, p);\n' +
+    'od.copyPixels(src, r, p, null, null, true);\n' +
+    'od.copyChannel(src, r, p, 8, 8);\n')).c.replace(/\r\n/g, '\n');
+  check('copyPixels mergeAlpha=false premultiplies RGB for an opaque dest (round-half-up)',
+    c.includes('unsigned rr = (((s >> 16) & 0xFFu) * sa + 127u) / 255u;') &&
+    c.includes('unsigned gg = (((s >> 8) & 0xFFu) * sa + 127u) / 255u;') &&
+    c.includes('unsigned bb = ((s & 0xFFu) * sa + 127u) / 255u;'));
+  check('the opaque copyPixels store forces alpha FF over the premultiplied RGB',
+    c.includes('*dp = 0xFF000000u | (rr << 16) | (gg << 8) | bb;'));
+  check('the premul branch is gated on the dest being opaque',
+    c.includes('if (!bd->transparent) {') &&
+    c.includes('} else if (sa == 0) { *dp = 0; } else { *dp = (s & 0x00FFFFFFu) | (sa << 24); }'));
+  check('copyChannel forces alpha FF on an opaque dest (ALPHA channel is immutable)',
+    c.includes('if (!bd->transparent) *d |= 0xFF000000u;'));
+  console.log(`[opaquepremul] ${ok} opaque-premul checks passed`);
+  return bad;
+}
+registerGroup('unit: render/OpaquePremul', checkOpaquePremul);

@@ -561,6 +561,14 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
   "a bitmap built by `new BitmapData` + `setPixels` must actually paint on the display list, and must repaint when its
   pixels change" (a `TextField` probe gates the display-list half on a real raster backend; requires
   `examples/bitmap-setpixels-endian.build.json` to link Skia)
+- `examples/bitmap-opaque-alpha.as` — **write-side alpha forcing** for opaque bitmaps (`transparent=false`, stage 452):
+  `setPixels` (LE/BE) / `setVector` / `setPixel32` clamp a non-255 alpha to `0xFF` (adl 51.4.1 settles it as write-side:
+  an opaque source `draw`n onto a transparent target gives `drawAlpha=ff`); a transparent bitmap keeps its source alpha;
+  any mismatch throws (non-zero exit)
+- `examples/bitmap-opaque-premul.as` — the premultiplied corner of semi-transparent content into an **opaque bitmap**
+  (stage 453): AIR stores premultiplied and un-premultiplies on `getPixel32` (opaque alpha=FF => identity); `copyPixels`
+  (mergeAlpha=false) premultiplies the RGB by the source alpha (round-half-up) then forces FF (`0x80FF0000`->`0xFF800000`),
+  `copyChannel`(ALPHA) into opaque is a no-op; draw / mergeAlpha=true / transparent round-trips already match; mismatch throws
 - `examples/stage83.as` — Stage3D alignment hardening (CubeTexture/RectangleTexture, render-to-texture pixel assertions, instanced drawing)
 - `examples/vertex-texture.as` — AGAL4 vertex texture fetch: the three translators' vertex sampler declarations, the `tex`/`tld` stage and version gates (#3622/#3803/#3805/#3757, verbatim with `adl`), and on a real Metal device a 2x2 texture's texel mapping, NEAREST vs LINEAR, CLAMP vs REPEAT and per-vertex interpolation. Ships `vertex-texture.build.json` (hand-verified like `stage83.as`)
 - `examples/s3d-multiwindow.as` — **multi-window Stage3D** (stage four-hundred-thirty-six): each window's `Stage` owns

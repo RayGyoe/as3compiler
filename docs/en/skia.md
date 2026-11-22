@@ -92,6 +92,26 @@ Historical lesson: `BitmapData.draw(TextField)`'s read-back once took channels d
 (treating `kN32` as BGRA), swapping red and blue on macOS (a red-background `TextField` read back as blue).
 Regression: `examples/bitmapdraw-channel.as`.
 
+**Opaque-bitmap alpha invariant (forced on write)**: a `transparent=false` `BitmapData` always stores `0xFF`
+alpha internally — AIR forces it on the **write** side (measured on adl 51.4.1: `setPixels(0x80FF0000)` reads
+back `0xFFFF0000`, and `draw` onto a transparent target gives `drawAlpha=ff`, proving write-side forcing rather
+than a read mask). The constructor `fillColor`, `setPixel32`, `fillRect`, `setPixels` (all three LE/BE/per-cell
+sub-paths) and `setVector` clamp alpha to `0xFF` when `!transparent`; `getPixel32`/`getPixels`/`getVector` stay
+**raw reads** — the invariant lives entirely on the write side. A transparent bitmap (`transparent=true`) keeps
+the source alpha untouched. The transparent LE path keeps the pure memcpy (the camera fast path); the opaque one
+does a word-wise OR `0xFF000000` instead (vectorized by -O2, a no-op for the already-FF alpha of ANE video frames).
+Regression: `examples/bitmap-opaque-alpha.as`, `unit: render/OpaqueAlpha`.
+
+**Premultiplied corner (fixed in stage 453)**: AIR stores `BitmapData` pixels **premultiplied** and un-premultiplies
+on `getPixel32` (`R_out = R_stored*255/alpha`); an opaque bitmap's alpha is FF, so that read is identity. A transparent
+bitmap's straight storage + raw read is **round-trip equivalent** to AIR's premultiplied storage + un-premul read, so
+most paths already matched; the adl 51.4.1 premul sweep (`temp/review86/`) showed only two diverging paths into an
+opaque target: `copyPixels` (mergeAlpha=false) premultiplies the RGB by the (modulated) source alpha (round-half-up
+`(c*sa+127)/255`) then forces FF (`0x80FF0000` -> `0xFF800000`), and `copyChannel` of ALPHA is a no-op (alpha is
+immutable FF). This is a **localized fix, not a global switch to premultiplied storage** (draw composites premultiplied
+via Skia, mergeAlpha=true already does premul math, transparent round-trips match).
+Regression: `examples/bitmap-opaque-premul.as`, `unit: render/OpaquePremul`.
+
 There are two more boundaries of the same kind, handled with the same principle:
 
 - **Image decoding** (`sk_image_decode_argb` / `sk_image_decode_bytes_argb`): `readPixels` writes directly

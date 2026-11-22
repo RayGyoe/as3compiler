@@ -620,6 +620,12 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/bitmap-setpixels-clip.as` — `BitmapData.setPixels` 的**矩形裁剪**与**大块拷贝**（阶段三百七十四）：
   矩形越界时 AIR 只按**落在位图内的格子**消耗字节（`64x48` 上的 `rect(60,44,10,10)` 只读 16 个字、完全界外静默无操作），
   同时验证整幅/子矩形走的 bulk 路径与逐格 `setPixel32` 逐点等价（1080p 一帧从 7.2ms 降到 0.8ms，`adl` 1.5ms）
+- `examples/bitmap-opaque-alpha.as` — 不透明位图（`transparent=false`）的 **alpha 写入侧强制**（阶段四百五十二）：
+  `setPixels`（LE/BE）/`setVector`/`setPixel32` 写进非 255 alpha 时压成 `0xFF`（adl 51.4.1 定案写入侧：不透明源 `draw` 到
+  透明目标 `drawAlpha=ff`），透明位图原样保留源 alpha；任一不符即 throw（非零退出）
+- `examples/bitmap-opaque-premul.as` — 半透明内容进**不透明位图**的预乘角落（阶段四百五十三）：AIR 内部存预乘、
+  `getPixel32` 反预乘（不透明 alpha=FF 故恒等）；`copyPixels`(mergeAlpha=false) 按源 alpha 预乘 RGB（round-half-up）再强制 FF
+  （`0x80FF0000`→`0xFF800000`）、`copyChannel`(ALPHA) 进不透明是 no-op；draw/mergeAlpha=true/透明往返已匹配；不符即 throw
 - `examples/stage83.as` — Stage3D 对齐加固（CubeTexture/RectangleTexture、render-to-texture 像素断言、实例化绘制）
 - `examples/vertex-texture.as` — AGAL4 顶点纹理取值（VTF）：三翻译器的顶点 sampler 声明、`tex`/`tld` 的 stage/version 门控（#3622/#3803/#3805/#3757，与 `adl` 逐字一致）、Metal 真机上 2x2 纹理的纹素映射/NEAREST-LINEAR/CLAMP-REPEAT/逐顶点插值；随附 `vertex-texture.build.json`（与 `stage83.as` 一样是手工验收）
 - `examples/s3d-upload-bounds.as` — 六个上传入口的边界契约（实测对齐 `adl`：`data == null` →

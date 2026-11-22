@@ -1301,6 +1301,66 @@ even allow `target`/`package`.
 > inert for `target=native` and is not rejected. All 31 manifests shipped in this repo (hand-written examples
 > and `--air-app` snapshots alike) load cleanly; the pin is `unit: build/ManifestUnknownKeys`.
 
+### 4.5 Versioned element loops (`Vector`/`Array` per-element access, stage four-hundred-fifty-one)
+
+This is a **shape transformation** in the sense of §1.1, not the front end doing optimization: it
+changes *where* the bounds/null checks live, not *whether* they run; vectorization itself is still
+left to `-O2`. The motivation is backlog item #65 — the per-element access guards on `Vector`/`Array`
+kept loops out of the vectorizer (several times slower than the equivalent bare C).
+
+**Why the guards block it**: a body like `c[j]=a[j]+b[j]` contains a `set` ⇒ it may alias the input
+`Vector` ⇒ `v->length` cannot be proven loop-invariant ⇒ the per-element `#1125` bounds check and
+`as_req_obj` null guard must stay inside the loop, so LLVM refuses to vectorize. A reduction loop
+(`s+=a[j]`, no store) is *not* slow precisely because, with no aliasing, clang hoists the checks itself.
+
+**Approach (loop versioning)**: for a *qualified* numeric element loop, emit **two versions** —
+
+```c
+int _fastok = (start >= 0);
+_fastok = _fastok && (a != NULL) && (bound <= ((as_vector_number*)a)->length);  /* once per receiver */
+/* Array READ receivers add: _fastok && as_array_all_num(a, bound)  ([0,bound) all tag-1 numbers) */
+if (_fastok) {
+  double* _fastp = a->data;            /* hoist the data pointer into a C local (bounds analysis) */
+  int _fastj = start;                  /* induction in a C local shadow (LLVM ignores memory IVs) */
+  for (; _fastj < bound; _fastj = _fastj + 1) { /* header form, not for(;;)+break (early-exit loops */
+    /* raw _fastj] reads/writes, no per-element guards */   /* are not vectorized) */
+  }
+  g_j = _fastj;                        /* write back to the AS3 var (var is function-scoped) */
+} else {
+  /* unchanged: per-element as_vector_number_set/get + as_req_obj, #1125/#1009 timing verbatim */
+}
+```
+
+"Qualified" (`analyzeFastLoop`; all must hold, otherwise the per-element checks are kept **as-is**):
+the init is an `int`/`uint` loop var (`var j:int=0` or a reused `for (j=0;…)`), cond is `j < bound`,
+update is `j++`/`j+=1`; start/bound are **pure numeric reads**; the body contains only numeric var
+decls/assignments, `recv[j]` element reads/writes and `+ - * / %` arithmetic, with **no calls** and no
+writes to the loop var/bound/receivers. The pre-check is **pure** (mutates nothing); only when it
+passes does the fast branch run. Any failure (out of bounds, negative start, mixed Array, null
+receiver) falls back to the slow branch, with exception timing and partial side effects identical
+to AIR.
+
+**Same-machine measurements** (Windows, `24 × 1M` elements, `clang -O2 -ffp-contract=off`, `temp/review65/`):
+
+| shape | before | after | bare C | `-Rpass` |
+|---|---|---|---|---|
+| `Vector.<Number>` `c[j]=a[j]+b[j]*1.5` | 24 ms | **12–13 ms** | 10–12 ms | width 2 / interleave 2 |
+| `Vector.<int>` `ic[j]=ia[j]+ib[j]` | 19–20 ms | **3–5 ms** | 4–6 ms | width 4 / interleave 2 |
+| `Array`(Number) same shape | 122–134 ms | **84–87 ms** | — (boxed repr) | not vectorized |
+
+Both `Vector` shapes are now **at parity with bare C** (the win comes from `-O2` auto-vectorization,
+so enhancement E10 explicit SIMD is not scheduled). `Array` stays slower because of a
+**representation tax**: elements are 24-byte boxed `as_value` (tag+num+ptr), a non-power-of-two
+stride LLVM will not vectorize; going further requires changing the `as_value` layout (touches
+GC/semantics, out of scope here).
+
+**Pins**: `unit: emit/FastLoop` 14 pins (pre-check / shadow / hoisted pointer / write-back / raw fast
+branch / guarded slow branch / negative-start gate / read-Array pre-scan / write-only Array length
+check / no versioning with a call / no versioning when the bound is mutated / reused loop var);
+`examples/fast-element-loop.as` pins the **observable semantics** of both branches (identical
+results, identical `#1125` timing, loop var visible afterwards, null→0 coercion in a mixed Array).
+Non-qualified loops and every non-element-access path are **byte-identical** to before.
+
 ## 5. Multi-target Backends
 
 | Target | Compile command | Artifact |

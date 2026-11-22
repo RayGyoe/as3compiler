@@ -81,6 +81,22 @@ Skia 的一切围绕 `SkCanvas`（画布）组织。绘制调用 `canvas->drawRe
 历史教训：`BitmapData.draw(TextField)` 的读回曾直接按 `q[0]=B, q[2]=R` 取通道（把 `kN32` 当成 BGRA），
 在 macOS 上把红蓝互换（红背景 `TextField` 被读成蓝色）。回归：`examples/bitmapdraw-channel.as`。
 
+**不透明位图的 alpha 不变量（写入侧强制）**：`transparent=false` 的 `BitmapData` 内部像素恒为 `0xFF`
+alpha——AIR 在**写入侧**强制（adl 51.4.1 实测：`setPixels(0x80FF0000)` 读回 `0xFFFF0000`，且 `draw` 到透明
+目标 `drawAlpha=ff`，证明是写入侧而非读取侧屏蔽）。构造器 `fillColor`、`setPixel32`、`fillRect`、`setPixels`
+（LE/BE/逐格三子路径）、`setVector` 都在 `!transparent` 时把 alpha 压成 `0xFF`；`getPixel32`/`getPixels`/`getVector`
+保持**纯读**，不变量完全落在写入侧。透明位图（`transparent=true`）原样保留源 alpha。LE 透明路径保留纯
+memcpy（摄像头快路径），不透明改逐字 OR `0xFF000000`（-O2 向量化，对 ANE 帧恒 FF 的 alpha 是 no-op）。回归：
+`examples/bitmap-opaque-alpha.as`、`unit: render/OpaqueAlpha`。
+
+**预乘角落（阶段四百五十三已修）**：AIR `BitmapData` 内部存**预乘**像素、`getPixel32` 读取时反预乘
+（`R_out=R_stored*255/alpha`）；不透明位图 alpha 恒 FF，反预乘是恒等。透明位图的 straight 存储 + 纯读与 AIR
+预乘存储 + 反预乘读是**往返等价**的，故绝大多数路径本就匹配；adl 51.4.1 预乘 sweep（`temp/review86/`）里唯一
+分歧的两条是 `copyPixels`(mergeAlpha=false) 与 `copyChannel`(ALPHA) 进不透明目标：前者按（调制后的）源 alpha
+预乘 RGB（round-half-up `(c*sa+127)/255`）再强制 FF（`0x80FF0000` → `0xFF800000`），后者 alpha 不可变 FF（写
+ALPHA 通道是 no-op）。这是 **localized 修复而非全局改预乘存储**（draw 走 Skia 预乘合成、mergeAlpha=true 内部预乘
+数学、透明往返都已匹配）。回归：`examples/bitmap-opaque-premul.as`、`unit: render/OpaquePremul`。
+
 同类边界还有两处，处理原则一致：
 
 - **图像解码**（`sk_image_decode_argb` / `sk_image_decode_bytes_argb`）：`readPixels` 直接写进 ARGB 缓冲，

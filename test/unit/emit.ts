@@ -2911,13 +2911,17 @@ function checkRenderBitmapLivePixels(): string[] {
   //     ANEVideo pushes a 1080p frame through here per camera stream per frame,
   //     where the per-cell loop measured 7.2 ms/frame against adl's 1.8 and the
   //     row copy measures 0.8 (temp/vidcopy). littleEndian is the real call shape
-  //     and is byte-for-byte the source, so it degenerates to memcpy; bigEndian
-  //     is the same rows with each word byte-swapped. Anything the bulk path
-  //     cannot serve (short array) falls through to the exact loop above.
+  //     and is byte-for-byte the source, so for a TRANSPARENT bitmap it degenerates
+  //     to memcpy; an OPAQUE bitmap (transparent=false) instead ORs 0xFF000000 into
+  //     each word (stage 452: AIR forces alpha on write, temp/review86). bigEndian
+  //     is the same rows with each word byte-swapped (and alpha forced when opaque).
+  //     Anything the bulk path cannot serve (short array) falls through to the
+  //     exact loop above.
   check('setPixels takes a bulk copy path',
     sp.includes('(long long)ba->length - (long long)ba->position >= need'));
-  check('the bulk path is a row-wise memcpy in littleEndian',
-    sp.includes('if (le) { memcpy(d, s, rowBytes); }'));
+  check('the bulk LE path keeps memcpy for transparent and forces alpha for opaque',
+    sp.includes('if (bd->transparent) { memcpy(d, s, rowBytes); }') &&
+    sp.includes('else { unsigned* dw = (unsigned*)d; const unsigned* sw = (const unsigned*)s; for (int x = 0; x < cw; x++) dw[x] = sw[x] | 0xFF000000u; }'));
   check('the bulk path byte-swaps each word in bigEndian',
     sp.includes('(v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24)'));
   check('a short array still falls through to the per-cell EOFError path',
@@ -5959,3 +5963,58 @@ function checkTraceGate(): string[] {
   return bad;
 }
 registerGroup('unit: emit/TraceGate', checkTraceGate);
+
+// Stage 451 (#65): loop-versioned raw element access. A qualified numeric
+// element loop gets a one-time pure pre-check + a fast branch with a C-local
+// induction shadow and hoisted data pointers (so -O2 can vectorize); the slow
+// branch keeps every per-element #1125/#1009 guard verbatim. These pins lock the
+// shape so a future refactor cannot silently drop the guards or the versioning.
+function checkFastLoop(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [fastloop] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [fastloop] ${label}`); }
+  };
+  const mainOf = (c: string): string => c.slice(c.indexOf('int main('));
+  const vecSrc = (elem: string) =>
+    `var a:Vector.<${elem}> = new Vector.<${elem}>(100, true);\n` +
+    `var b:Vector.<${elem}> = new Vector.<${elem}>(100, true);\n` +
+    `var c:Vector.<${elem}> = new Vector.<${elem}>(100, true);\n` +
+    `for (var j:int = 0; j < 100; j++) c[j] = a[j] + b[j];\n`;
+  const fastRegion = (c: string): string => {
+    const m = mainOf(c);
+    const i = m.indexOf('if (_fastok');
+    const e = m.indexOf('} else {', i);
+    return i < 0 ? '' : m.slice(i, e);
+  };
+
+  const vn = mainOf(generateC(parse(vecSrc('Number'))).c);
+  check('Vector.<Number> loop emits the one-time pre-check', vn.includes('int _fastok') && vn.includes('<= ((as_vector_number*)'));
+  check('...a C-local induction shadow in header form (not for(;;)+break)', /for \(; \(_fastj\d+ < /.test(vn));
+  check('...hoisted data pointers (local base for the dependence analysis)', /double\* _fastp\d+ = g_\w+->data;/.test(vn));
+  check('...the final shadow value is written back to the AS3 var', /g_j = _fastj\d+;/.test(vn));
+  check('...the fast branch reads/writes raw (no per-element helper)', !fastRegion(vn).includes('as_vector_number_get') && !fastRegion(vn).includes('as_vector_number_set'));
+  check('...the slow branch keeps the guarded helpers + null guard', vn.includes('as_vector_number_set(') && vn.includes('as_req_obj'));
+  check('...the pre-check rejects a negative start', /int _fastok\d+ = \(0 >= 0\);/.test(vn));
+
+  const vi = mainOf(generateC(parse(vecSrc('int'))).c);
+  check('Vector.<int> loop hoists an int data pointer', /int\* _fastp\d+ = g_\w+->data;/.test(vi));
+  check('Vector.<int> fast branch is raw too', !fastRegion(vi).includes('as_vector_int_get'));
+
+  const arrRead = mainOf(generateC(parse('var aa:Array = [1,2,3];\nvar s:Number = 0;\nfor (var j:int = 0; j < 3; j++) s += aa[j];\n')).c);
+  check('a READ Array loop pre-scans all-num (mixed arrays fall back at runtime)', arrRead.includes('as_array_all_num('));
+  const arrWrite = mainOf(generateC(parse('var ca:Array = new Array(100);\nfor (var j:int = 0; j < 100; j++) ca[j] = j * 0.5;\n')).c);
+  check('a WRITE-ONLY Array loop only checks length (holes get overwritten)', !arrWrite.includes('as_array_all_num(') && /<= g_ca->length/.test(arrWrite));
+
+  const callBody = mainOf(generateC(parse(vecSrc('Number').replace('c[j] = a[j] + b[j];', 'c[j] = Math.sqrt(a[j]);'))).c);
+  check('a body with a call is NOT versioned (guards stay per-element)', !callBody.includes('_fastok'));
+  const boundMut = mainOf(generateC(parse('var a:Vector.<Number> = new Vector.<Number>(100, true);\nvar c:Vector.<Number> = new Vector.<Number>(100, true);\nvar n:int = 100;\nfor (var j:int = 0; j < n; j++) { n = 50; c[j] = a[j]; }\n')).c);
+  check('a body that mutates the bound is NOT versioned', !boundMut.includes('_fastok'));
+  const reused = mainOf(generateC(parse('var a:Vector.<Number> = new Vector.<Number>(100, true);\nvar c:Vector.<Number> = new Vector.<Number>(100, true);\nvar j:int = 0;\nfor (j = 0; j < 100; j++) c[j] = a[j];\n')).c);
+  check('a reused loop var (`for (j = 0;…)`) is versioned too', reused.includes('_fastok'));
+
+  console.log(`     [fastloop] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/FastLoop', checkFastLoop);

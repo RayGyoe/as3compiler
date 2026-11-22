@@ -20306,6 +20306,21 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-23 追加（阶段四百五十三：不透明位图预乘角落 localized 修复）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **85 → 84 行**（`未开始` 66 → **65**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。移出的是阶段四百五十二新登记的
+> 「copyPixels 透明源→不透明目标预乘」行——本轮 adl 预乘 sweep 定案 AIR 内部存预乘、`getPixel32` 读取反预乘（不透明
+> alpha=FF 故反预乘是恒等），分歧仅 `copyPixels`(mergeAlpha=false) 与 `copyChannel`(ALPHA) 进不透明目标两条路径，
+> localized 修齐（**非**全局改预乘存储：draw/mergeAlpha=true/透明往返本就匹配），与 adl 51.4.1 逐字一致。
+
+> **2026-11-23 追加（阶段四百五十二：不透明位图写入侧 alpha 强制）**：**移出 2 行 / 改写 0 行 / 新登记 1 行** ⇒
+> 主表 **86 → 85 行**（`未开始` 66 不变 / `部分完成` 18 / `已完成` 1 → **0** / `调研完成·实现暂缓` 1）。移出的两行：
+> ① 原 #86「`transparent=false` 位图 alpha」——本阶段修好（`setPixels` 三子路径 + `setVector` 写入侧强制 `0xFF`，
+> adl 51.4.1 双端探针定案 AIR 是**写入侧**：不透明源 `draw` 到透明目标 `drawAlpha=ff`）；② #65「Vector/Array 元素循环
+> 向量化」——阶段四百五十一已修，按表头「已完成项一经落地即从本表移出」补移出。**新登记 1 行**是同轮探针量到的更深
+> 分歧：`copyPixels` 把透明源拷进不透明目标时 AIR 按源 alpha **预乘** RGB 再置 FF（adl `FF800000` vs 我方 `80FF0000`），
+> 牵涉预乘存储模型，非简单 alpha 强制可修，另立阶段。**口径**：主表项数以实际行数为准——本轮实测 86 行（`部分完成` 实为 18，
+> 历史注记的 20 已漂移）。
+
 > **2026-11-16 追加（阶段四百三十六：Stage3D 上屏合成按窗口化）**：**新登记 0 行 / 改写 0 行 / 移出 1 行** ⇒
 > 主表 **88 → 87 行**（`未开始` 67 → **66**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。移出的正是同一天登记的那行
 > 「Stage3D 上屏合成是进程级单例」——现已根治：`Context3D` 补 `_stage3d`/`bbScale`/`bbLW`/`bbLH`，`present()` 改发
@@ -20860,6 +20875,14 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 > 该项 150 轮时修好后读数是 `0 ms`（`getTimer` 1 ms 分辨率下护栏失效），故抬到 2000 轮，
 > 旧读数按 ×13.3 换算。
 
+> **2026-11-22 追加（复核毕业：初始窗框/客户区单位）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **87 → 86 行**（`未开始` 66 → **65**，`部分完成` 20 / `调研完成·实现暂缓` 1 不变）。该行修复其实
+> 早已于 **v0.4.357（2026-11-08）** 落地（`--air-app` 定义 `ASC_WINDOW_FRAME_SIZE`，`Stage_showWindow`
+> 入口 `sk_frame_insets_new_window` 量边框后把描述符外框减成客户区；当时只改写了专题事实表第 6 行，
+> 主表行漏移，属**过期残留**）。本轮用户要求复核，Windows 真机重测（150% DPI，探针 `temp/review72/`，
+> 描述符 366×630）：物理读数 outer=549×945 / client=525×886 ⇒ 逻辑 **bounds=366×630、client=350×591**，
+> `noScale` 下 `stage.stageWidth/Height=350×591` —— 与 adl 孪生探针 W1/W1b 逐字一致。毕业，不再占表。
+
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
 | **同一字体字号下纯文本字段与富文本字段的 `textHeight` 可相差 0.5–1 px**（light 快路径报 AIR 模型盒 `rhalf(asc)+rhalf(desc)+leading`，SkParagraph 路径报 Skia `InternalLineMetrics::height()`——对同一个人工 strut 盒**再取整一次**） | 未开始（2026-11-16 阶段四百三十五 全量 macOS 回归发现；`examples/text-underline.as` 用例①红，Courier New 12：无下划线 13.5 / 有下划线 14） | 两条布局路径对「行盒高度」的最终取整不一致：`vendor/skia_text_glue.cc` 的 `sk_set_air_strut` 已把 Skia 的行盒强制成 AIR 的 `am.model + leading`，但 `ParagraphImpl::addLine` 存的是 `InternalLineMetrics::height()` = `round(descent-ascent+leading)`，所以 Skia 侧多了一次 0.5 进位；light 路径 `sk_text_light_new` 存的是未取整的模型值。凡 `am.model + leading` 非整数即触发，与下划线无关——下划线只是把该字段从 light 路径踢到 paragraph 路径，从而让两个值同时出现。证据 `temp/tu/ul.as`（`a.textHeight=13.5 b.textHeight=14 a.textWidth=57.609375 b.textWidth=57.609375`） | **2026-11-16 用户裁决：示例侧放宽，不追完全对齐**（`examples/text-underline.as` 已改 ±1 px 容差 + `textHeight/N` 步进），分歧本身仍留在表里等 adl 定标。先装 AIR SDK 跑 adl 定真值：① 若 AIR 报 13.5 ⇒ paragraph 路径的 `textHeight` 不能再取 Skia 的取整值，须由 AIR 盒自行累加（改 `sk_textlayout_height`/`textHeight` 的 `tops[k]` 来源）；② 若 AIR 报 14 ⇒ light 路径的 `height` 改成与 Skia 同口径取整（并复核所有文本示例的双端读数）。两种改法都先做**双端全量**再落盘，别只修单侧 |
@@ -20923,17 +20946,15 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | `TextField.textWidth` 的字形累进口径与 AIR 有残差 | 未开始（2026-10-09 阶段一百二十八 三端探针实测，`temp/bakeprobe/`） | 同字体同字号（`_typewriter` 12）同一串：`adl 51.4.1` 给 `14.5`，我们给 `14.40234375`（= 14 + 103/256，看着像 26.6 定点累加；`adl` 的 14.5 更接近其内部 twip/半像素口径）。与本表「`TextField.textWidth` 不含行尾空格（AIR 含）」是**同一族**（字形累进与度量舍入），但根因不同：那条是**取哪些字形**，这条是**每个字形的进位数**。像素影响仅限用 `textWidth` 做布局/换行的代码（本阶段探针的包围盒因字段宽度显式给出而不受影响）。 | 先扩大实测样本（多字号 × 多串 × 单字形）定 AIR 的进位舍入口径（是否 `ceil`/half-px/twip 取整），再决定是否复刻；与「设备字体度量表」那条同批评估更省。**成本低（测量）~中（复刻）**。 |
 | **`flash.data` 加密数据库未支持**（`open(path, mode, …, encryptionKey)`、`reencrypt()`、带密钥的 `attach`） | 未开始（2026-10-12 阶段一百三十九 落地 A–D 时按 §1.5 硬判据登记为**欠账**；同轮四个示例的三端验收见 [`docs/zh-cn/flash-data.md`](docs/zh-cn/flash-data.md) §10.4） | **`adl 51.4.1` 实测**：带密钥建库后宿主机 `sqlite3` 打不开（首 16 字节 = 密文而非 `SQLite format 3\0`、报 `file is not a database`）；明文库与带密钥库的字节 16–23 **唯一差别是 byte 20 `0x00`→`0x20`** ⇒ AIR 加密 = **AES-CCM + 16 字节裸密钥 + 每页保留 32 B**（密钥来自 `writeUTFBytes(16 字符口令)`），与 SQLCipher（PBKDF2 + AES-256-CBC + HMAC + 明文 salt、保留 48 B）**密钥派生/算法/页布局三轴全不兼容**；我们现状：非空密钥一律 **`SQLError #3138` 响亮拒绝**（绝**不**静默写明文库） | 若要做：按 avmplus 的加密页编解码逐字节移植（每页 nonce/MAC 布局需逆向实证），或整体换 SQLCipher （**语义不等价**，等于换引擎）。**明确不做**的替代方案：静默忽略密钥 / 静默写明文 —— 那会把「安全属性丢失」变成无声的数据流失，违反 §1.5。**成本高、优先级低**（目标应用零 `import flash.data`、包装层不传密钥；本轮示例与 ADR 已把该缺口写死为「响亮报错」） |
 | **`Error` 家族实例的 `.message` 不做任何转换**（AIR 存**原值**） | 未开始（2026-10-14 阶段一百五十二 实测登记；「关闭应用即崩溃」修复的副产物） | `adl 51.4.1` 实测（`temp/errnull/`，Q1–Q11）：`Error(null).message === null`、`Error(undefined).message === undefined`、`Error(5).message === 5`（`typeof` 为 `"number"`）、`Error("").message === ""` **全为 true** —— AIR 把实参原样存进实例上**未类型化**的槽，只在**使用**时才字符串化（`5 + ""` → `"5"`、`{}` → `"[object Object]"`）。本构建的 `Error` 类把 `message` 定为 **`char*` String 槽**（构造期 `as_str_from_*` 转换，且 `NULL` → 字面 `"null"`）⇒ `Error(5).message` 我们 `"5"`（String ⇒ `=== 5` 为 false）、`Error(undefined).message` 我们 `"null"`（AIR `undefined`）；`new Error(x)` 形式**同样**（双端证据 `temp/errcall/` 的 E4/N4 两行）。**可观测面**＝严格相等、`typeof e.message`、以及把 `.message` 当动态值的分派 | 立项：把 `message`（连带核对 `name`/`errorID` 的槽形状）改成 **`as_value` 原值槽**，构造期**不**转换。代价：全仓 `e.message` 读点（catch 日志/UI 文案，真应用 talkmed 约百处）从静态 `String` 变成动态装箱（性能 + 新的 `#1009` 面），须与「`catch (e:*)` 的值保真」同批、并做全量回归。**当前有意不改** —— 保持 String 槽正是为了让 `e.message` 永不为 `NULL`（AIR 对 `null` 消息抛 `#1009`，我们若让槽可为 NULL 会把「类型错误」降级成 `strlen(NULL)` 的**内存错误**） |
-| **首页 tab 首标签偶尔掉第一个汉字**（`adl` 稳定 `打开网页`，我方**偶尔** `开网页`：首个汉字「打」整字消失、其余三字位置不变） | 未开始（2026-10-15 阶段一百六十五 巡检副产物，**间歇 1/6 次观测**；已排除与 C 名改写相关——同二进制重跑即正常、两版 C 规范化后逐字节相同 `temp/tkmeet-mac/ab.safe.diff`；复跑harness `temp/tkmeet-mac/labelprobe.py` 4/4 绿；待定方向：数据面（多字节串首部丢字节/BOM 误跳）vs 渲染面（字形图集缓存/GC 时序）；**修法**：加「数据到手即打印长度与首字符」探针 + 复现窗口） |
+| **首页 tab 首标签偶尔掉第一个汉字**（`adl` 稳定 `打开网页`，我方**偶尔** `开网页`：首个汉字「打」整字消失、其余三字位置不变） | 未开始（2026-10-15 阶段一百六十五 巡检副产物，**间歇 1/6 次观测，macOS 侧**；2026-11-22 Windows 真机复核 6/6 未复现（首 tab「打开网页」逐次完整，`temp/review62-tab4..6.png` + 前三次整窗目视）；已排除与 C 名改写相关——同二进制重跑即正常、两版 C 规范化后逐字节相同 `temp/tkmeet-mac/ab.safe.diff`；复跑harness `temp/tkmeet-mac/labelprobe.py` 4/4 绿；待定方向：数据面（多字节串首部丢字节/BOM 误跳）vs 渲染面（字形图集缓存/GC 时序）；**修法**：加「数据到手即打印长度与首字符」探针 + 复现窗口） |
 | **时间轴回退只认「同一 (父, 深度, 角色)」复用**（这是我们**已实现的** AIR 口径；登记的是**残留 D43b**：向前 `Move` 记录**带新字符**时 `adl` 保留原对象身份，我们换新对象——因为烘培出的类把一个角色的图**画进类里**，换角色必然换实例） | 未开始 / **D43b**（2026-10-16 阶段一百七十二 登记，**回退方向已修**） | `adl 51.4.1` 实测：`temp/btnprobe/Rewind2.as` 中「`_over(5) → _up(1)`」深度 2/3 的 `label1`/`label2` **对象编号不变**、深度 1 因角色 524→518 而换新实例（`instance8 → instance28`）；我方 `Rewind3.as` 回退方向已一致。**未修的那条**：`Move` + 新字符在 `adl` 里是**同一个对象换图**（编号 `#0` 不变）、我方造新对象（`#4`）。它不会丢 App 写入的文字（只有角色真变了才触发），故仅登记。差异清单 **D43 / R30** |
 | **`ROLL_OVER` / `ROLL_OUT`（含冒泡的 `mouseOver`/`mouseOut`）事件不派发** | 未开始（2026-10-16 阶段一百七十二 登记；**2026-10-23 阶段二百六十三 实测收窄**） | `adl` 会在这两个时机派发：指针进入/离开一个**可交互**对象（`mouseEnabled`）时对该对象派发 `rollOver`/`rollOut`，若 `bubbles` 允许再冒泡成 `mouseOver`/`mouseOut`。我们 `src/emit.ts` 只派发 `mouseOut` 的**制度性替代物**——指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台上)` 的顺序补一轮（见 `emit.ts` 的`Stage_dispatchMouse`），**没有**逐对象 hover 迁移的发射点，故依赖 `ROLL_OVER`/`ROLL_OUT` 监听的组件收不到通知。**同族里已修的两条不要与本行混记**：`Stage.MOUSE_LEAVE` **已派发**（`src/emit.ts:17682` 的`Event_new("mouseLeave", ...)` 发在舞台自身，`d43` 表内的 `mouseLeave` 一栏已对齐）；「指针移出窗口不 roll-out」**已修**（`vendor/window_glue.cc` 接 `SDL_WINDOWEVENT_LEAVE`，带「指针仍严格在客户区内则不算离开」的守卫）。TalkMED 目前全用 `CLICK`，故真机未暴露。差异清单 **D43 表内** | 在 `Stage_dispatchMouse` 的 hover 迁移点补两个发射点：目标由 `_hover` 变为新对象时，对旧对象发 `rollOut`（`bubbles=true`）、对新对象发 `rollOver`（`bubbles=true`），按 `adl` 的 `mouseOut → rollOut` 顺序；事件类的 `stageX/stageY`、`localX/localY` 与 `buttonDown` 三个字段与 `mouseOut` 同源，复用同一条构造路径。**成本中低**，但**必须先写双端探针**量定「进入/离开嵌套可交互子件时父件是否也收到」（`adl` 的 roll-over 不冒泡穿透到父件的 hover 链，与 `mouseOver` 的冒泡是两件事） |
-| **`Vector`/`Array` 的逐元素访问守卫把循环挡在向量化之外**（元素级 `Vector.<Number>` 比同形裸 C 慢 **5.4×**、`Vector.<int>` 慢 **12×**） | 未开始（2026-10-22 实测登记） | 实测（`temp/simdprobe/`，Apple M2 Max，`24 × 1M` 元素，`-O2 -ffp-contract=off`）：`c[j]=a[j]+b[j]*1.5` 我们 **38–47 ms** vs **同形裸标量 C 6.3–6.8 ms**；`ic[j]=ia[j]+ib[j]` 我们 **34–36 ms** vs C **2.9–4.0 ms**。**根因不是算力/向量宽度**：把逐元素访问换成裸 `->data[j]`（**其余一字不动**）即 **7 ms / 3 ms**，`-Rpass` 同时显示 clang **自动**给出 `vectorization width: 2`（f64）、**`width: 4`**（int32）且 `interleaved count: 4` —— **与手写 NEON 同形**。生成 C 的 `main` 内层每元素带 **3** 个 `cbz` 空指针守卫 + **4** 次 `length` 比较 + 5 个分支。**为什么挡不住**：循环体里有 `set` ⇒ 与输入 `Vector` **别名** ⇒ `v->length` 不能被证明循环不变 ⇒ 检查留在循环内。**反例（解释了为什么归约不慢）**：归约循环体无 store ⇒ 无别名 ⇒ clang 自动提外检查并向量化 ⇒ `s+=a[j]*b[j]` 我们 **21–22 ms** 与 C **22.3 ms** 持平（这正解释了 `spectralnorm` 的 0.80×），且校验和与 C 的 `volatile` 串行实现**逐位相同** ⇒ 无重结合、语义未破。另有 **~21%**（38→30）来自顶层脚本变量落内存（同三循环放进函数即 30 ms）。**顺带结论**：增强项 E10（显式 SIMD）因此**不排期**——它要的收益已由 `-O2` 自动拿到，剩下的全靠本条 | 方向：**可证明无别名时才把边界/空指针检查提到循环外**（循环体不得对任何 `Vector`/`Array` 写字，且不得调用无法证明不写它们的函数；否则**原样保留**逐元素检查，语义零变化）。**先定调**：这属 §1.1 的「形态转换」还是「前端做优化」需先明确（它改的是**检查放在哪**、不是**检查做不做**）。若做，须同时钉住两条反向钉子：① 有跨 `Vector` 写入/别名时必须**回退**到逐元素检查；② 无跨 `Vector` 写入时必须**确已提外**。**成本中**（需要一个循环级别的别名/写集分析）；探针可提成 `benchmarks/` 一项 |
 | **Windows 32 位（i686）AOT 目标不可构建**（`--target` 只有 `native`/`wasm`，没有位宽轴） | 未开始（2026-10-17 阶段一百七十八·四 实测登记） | 宿主侧**已就绪并实测**：`lib/bin/windows-x86/asaot.{dll,lib}` 由 `build-asaot.bat` 默认一并产出（`machine=x86`、53 导出、导入库记 `asaot.dll`、0 个 `Adobe`），32 位探针扩展真链上它（`machine=x86`、32 个 FRE 全来自 `asaot.dll`，`temp/ane-e2e/x86/`），`--ane-platform Windows-x86` 的链接行确实是 `-L …\lib\bin\windows-x86`；依赖前缀 `build-tools/win-deps-prefix-x86`（含 `zlibstatic.lib`/`zlib.h`）也是齐的。**缺的是**：`--target` 的位宽轴、`c-compiler` 只能给单个可执行名（注入不了 `--target=i686-…`）、`cxxCompiler()` 从它派生名字 ⇒ 需要先立一条 32 位宿主工具链。**影响**：只声明 `Windows-x86` 的 ANE（真 `ANEWinCore.ane` 就带这一项）无法端到端 |
 | **Windows ARM64 依赖构建路径未在本机验证**（`build-windows-deps.ps1 -Arch arm64` 的**产物**没造出来过：本机没有 ARM64 工具集） | 未开始（2026-10-17 阶段一百七十八·五 实测登记） | **已验证**：`-Arch arm64` 在缺工具集时**退出 1** 并点名要装的组件（`MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools`）、**不发生任何下载**；`-Arch x86` 正向自检通过（证明判据非一律拒绝）；`vcvarsall.bat arm64` **退出码 0 却什么都不装** ⇒ 该分支**只能**读文件判（已如此实现：MSVC `lib\arm64` 非空 / `cl.exe` 的 `.Source` 匹配 `\arm64\cl.exe` / SDK `Lib\<ver>\um\arm64` 存在）。**未验证**：装好组件后 `vendor/*/windows-arm64` 的真实产物与其 COFF 机器字段（应为 `0xaa64`）；Skia 的 `extra_cflags` 三元组是否真被 gn 采纳到每个 obj（上游 win 分支 arm64 **不传架构旗标**、`bin` 路径写死 `HostX64` ⇒ 在 x64 宿主上会静默产 x64 对象）。**与 AIR 无关的部分已查清**：AIR 没有 Windows ARM64 运行时（51.4.1 的每个 Windows 运行时各只认一个平台键：`win/` 那份 `Windows-x86`、`win64/` 那份 `Windows-x86-64`），故 ANE 宿主宽度是**闭集**，`lib/bin/windows-arm64` 刻意不建 | 在装了 ARM64 组件的 Windows 上跑 `-Arch arm64`，用 `Assert-LibBitness` 逐库读机器字段应为 `0xaa64`；若 Skia 出了 x64 obj，须把三元组从 `extra_cflags` 迁到工具链自身（arm64 分支补 `--target=`）。**成本低-中** |
 | **ANE 附属 DLL 的 `LoadLibrary` 搜索路径未设置**（主项「整包解包 + `getExtensionDirectory()`」已于阶段三百九十一修复并移出） | 未开始（2026-11-09 阶段三百九十一 修主项时留存的子点；2026-11-15 阶段四百一十九 审计遗留表时独立成行） | 阶段三百九十一（提交 `2b3517d`）解决了「扩展随包数据文件在不在 `getExtensionDirectory(id)` 目录」——整包原样解开（`catalog.xml`/`library.swf`/`mimetype`/`META-INF/`），未知/空 id `#1508`、`null` `#2007` 文案逐字对齐，编译期拒绝逃出扩展目录的条目名。但**没有改 `LoadLibrary` 的搜索路径**：ANE 的附属 DLL（非系统 DLL）若不在默认搜索路径上仍会加载失败，需 `LOAD_LIBRARY_SEARCH_*` / `SetDllDirectory`。实测的那个真项目导入表只有系统 DLL + `asaot.dll`，故当前不受影响 | 在 `ExtensionContext.call` 首次 `LoadLibrary` 前把扩展目录加入 DLL 搜索路径（`SetDllDirectory` 或 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`）；先造一个带附属 DLL 的 ANE 实测复现再动手。见 `docs/{zh-cn,en}/ane.md` §5 |
 | **Linux / WASI 的 `Capabilities.os` 仍是裸家族名**（AIR 在这两端同样带版本；**macOS 已收口**） | 未开始（2026-10-18 阶段一百八十九 登记；**2026-10-19 阶段一百九十六 收口 macOS 一端**） | 阶段一百八十九 已把 Windows 的「版本→名字」表从 `Adobe AIR.dll` 里量出来逐字复现（18 个名字 + `"Windows"` 兜底，版本改取 `ntdll!RtlGetVersion` 以绕开无清单进程的 `6.2` 谎报）。**macOS 本轮实测收口**：`Capabilities.os` 与 `adl 51.4.1` **逐字相同** = `Mac OS <major>.<minor>.<patch>`（本机 `Mac OS 26.6.2`，走 `uname` 后按 AIR 的「家族名 + 版本」形态拼），双端孪生探针第一行即 `CAP_os=Mac OS 26.6.2` 两端一致（`temp/nwmac/nwmac-{adl,aot}.txt`）。剩下 Linux / WASI 两端仍**没有真值可核**（本机无 `adl` for Linux），故不臆造、留 ⚠️ 报明（`src/runtime.ts` 的 `as_cap_os` 注释与 [`docs/zh-cn/win32.md`](docs/zh-cn/win32.md) §3.12 都写了）。 | 收口需要一台 Linux 跑 `adl` 取真值 + 一张发行版/内核→名字表（WASI 无 `adb` 对应物，按期如实报明即可）；在那之前下游「取 `os.split(" ")[1]` 当版本」的行为在 Windows 与 macOS 上都已修好 |
 | SWC **库里非符号类的代码**（库自带的基类/工具类）不参与编译 ⇒ 符号的工程基类缺失时只能回落成 `MovieClip` 子类 | 未开始（2026-10-19 阶段一百九十六 修复 SWC 示例时实测登记） | 阶段一百九十一 起，符号类按它 `DoABC` 里的**真基类**绑定（`skin.swc` 的四个组合框都继承 App 自己的 `com.vsdevelop.controls.ComBoBox`，`swc.ts` 的 `availableProjectBase`）。但库的**其余**类（含这个基类在库里的那份副本）是 ABC 代码，不参与编译（`docs/zh-cn/swc.md` §3.3 明列范围外）⇒ 当**编译单元里没有**这个基类时（`examples/swc-*.as` 这类只烘美术的示例，或 App 少编译了一个文件），我们改成「烘成 `MovieClip`/`SimpleButton` 子类 + **响亮告警一次**」，而 `adl` 在同一份输入上**照跑不误**（AIR 会执行库里自带的那个基类）⇒ 按 §1.5 硬判据是**遗留缺陷**。本行只登记**没修的那部分**：库内基类的**行为**（它自己的字段/方法与 `this["title"]` 之类的动态访问）我们一律没有，符号只能退化成纯美术子类 | 立项：把 SWC 的 `DoABC` 里**非符号类**也编译进来（需要 `swc.ts` 把库内 ABC 里的类声明/方法解码成 AST 并注入程序，等价于把 `abc.ts` 的范围从「符号类的帧脚本+方法」扩到「整库 ABC」），那之后 `availableProjectBase` 的回落可以只留给「App 与库都没有」的真缺失。验收：以 `temp/skin.swc` 为输入，`ComBox`/`AIAsrComBox` 的 `currentLabels`/`title`/`selectedIndex` 行为与 `adl` 逐项对照 |
 | **窗口几何的 Windows 端残余**（Windows 端 `<transparent>` 仍未实现 / 四类未测面剩下的两项） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：原来列的四处里，① 最大化尺寸口径 **已定** —— 那是 `WS_MAXIMIZEBOX` 这一位（在 ⇒ 可用区 `2576x1675`，不在 ⇒ 整块显示器 `2576x1723`，adl 与我们在两档描述符下**逐字相同**），② 横向边框 **已修**（`b_left` 四处同源），③ 描述符成员 **已接线**（`<maximizable>`/`<minimizable>`/`<systemChrome>`/`<x>`/`<y>`/`<minSize>`/`<maxSize>`），只剩下面两处；**2026-10-23 阶段二百五十七 再收窄**：① 的**生成侧与 macOS 侧已接线**，剩下的只是 Windows 的原生实现） | **① `<transparent>` 的 Windows 端**：描述符 → `ASC_WINDOW_TRANSPARENT` → 主窗、`NativeWindowInitOptions.transparent` → `sk_window_set_transparent`、合成步清 alpha 0、macOS 的 `NSWindow setOpaque:NO` + 内容视图及其子视图 layer 全设非不透明，**全部已在阶段二百五十七 落地**；Windows 侧仍要 `WS_EX_LAYERED` + 逐帧 alpha（当前**报明一次**，不给假透明窗）；**② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没接线/没量」：① Windows 端需要一张分层窗（`WS_EX_LAYERED` + 逐帧 alpha）并把同样的「清 alpha 0」口径搬过去；② `closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
-| **初始窗的框/客户区单位**（描述符 `<width>/<height>` 是**框**，我们当**客户区** ⇒ 窗大一圈、舞台也大一圈） | 未开始（2026-10-19 阶段二百零五 实测登记；**两端同源，非 Windows 专属**） | Windows 实机孪生探针（`temp/nwwin/wprobe/`，`<width>366</width><height>630</height>`）：adl `bounds=366x630` + `stage=350x591`；我们 `bounds=382x669` + `stage=366x630`，**恰好差 16x39 = 左右边框 8+8 与标题栏 31 + 下边框 8**。根因在生成侧：引导代码把描述符的 `width`/`height` 当**客户区**交给 `Stage_showWindow`（它拿同一对数去置 `design_w/h`、`lw/lh`、`pw/ph`），窗口又按同一对数开 ⇒ **两道都大一圈**（AIR 的 `stage` 才是客户区，`NativeWindow.bounds` 是框）。macOS 走同一条生成路径 ⇒ 同一缺陷在 macOS 上应表现为差一个 `32pt` 标题栏，**本机不可实测** | 需与之俱动：① 窗口按**框**尺寸建（或建完读回客户区再定尺寸）；② 舞台/表面用**真实客户区**；③ `Stage.stageWidth/Height` 与 `design_*` 的口径一次对齐；④ 全 GUI 示例 + 像素 harness 同批回归（改的是**每扇窗的初始几何**）。半修（只改窗口不改舞台）会得到**被缩放**的画面，比现状更糟 ⇒ 必须成批做，先立项再动手。 |
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
@@ -20947,7 +20968,6 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`DisplayObject.mask` 的非矢量遮罩只有包围盒精度**（`Bitmap`/`TextField` 当遮罩时 AIR 按**像素**模板裁剪，我们退回它的包围盒并 `as_shell_unsupported` 报一次；纯描边遮罩的描边带、遮罩自带 `filters`/`blendMode` 的呈现同样只取几何） | 未开始（2026-10-29 阶段三百一十八 落地二值模板时登记；本阶段把矢量遮罩（含子件并集、离屏遮罩、别的容器）逐条对齐了 adl，这三档 adl 侧未实测、实现上也还没接） | `docs/zh-cn/skia.md` §6.15 的实测表是已对齐的九条；缺的三档分别是「遮罩是 `Bitmap`/`TextField`」「遮罩只有描边」「遮罩自身带滤镜/混合」 | 先按 §6.15 的探针套路（`temp/mask/MaskProbe*.as`）补测这三档的 adl 口径，再把 `as_mask_ink` 的路径收集扩到像素模板（`SkImage` → `SkShader` 裁剪或 `saveLayer` + `kDstIn`），并把报明换成真实现 |
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 | `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | **部分完成**（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
-| **`transparent=false` 的 `BitmapData`：adl 在 `getPixel32()`/`getPixels()` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的 alpha** | 未开始（2026-11-05 阶段三百七十四 的像素 oracle 量到） | `temp/vidcopy/` 的 DUMP 直接可见：同一份 `setPixels` 输入，adl 读回 `FF030201`、AOT 读回 `04030201`（低三字节相同）。这是本轮改动**之前**就存在的分歧——逐格循环与新的 bulk 路径给出同一个值，所以不是修 `setPixels` 引入的。影响面：`transparent=false` 的位图如果被写进非 255 的 alpha（ANE 帧的 alpha 恒为 255，所以 meeting 客户端的摄像头预览不受影响），AOT 下会整块半透明、AIR 下不透明。`examples/bitmap-setpixels-endian.as` 用的是 `transparent=false` 但源 alpha 恰好 255，所以既有钉子没有暴露它。 | 两条路选一条：① 在**写入侧**强制（`setPixels`/`setPixel32`/`fillRect`/`copyPixels`/`draw` 等所有入口，`!transparent` 时把 alpha 压成 255）；② 在**读取侧**强制（`getPixel32`/`getPixels` 时屏蔽）。AIR 到底是哪一侧还没测——这决定 `BitmapData` 内部是否允许存在带 alpha 的像素（会连带影响 `draw()` 的合成与 `Bitmap.bitmapData` 上屏）。**动手前先补一组双端探针**：`transparent=false` 位图 `setPixel32(0,0,0x80FF0000)` 之后，(a) `getPixel32` 读回什么、(b) `BitmapData.draw` 到另一张图上得到什么、(c) 作为 `Bitmap` 上屏后采样到什么。三处一致才敢选侧。 |
 | **Windows `NativeDragManager.doDrag` 的 `dragImage` 不渲染**（macOS 已实现 RGBA 拖动图像 + offset；Windows 传入 `dragImage` 报明未实现、改用系统光标） | 未开始（2026-11-15 阶段四百三十 E3 验证 OLE 拖放时确认；`desktop-file-interaction.md` 早已登记此限制） | OLE 拖动图像走 shell **私有协议**：`IDataObject` 须提供注册格式 `DragImageBits`（`DRAGIMAGEBITS` 结构 = 尺寸 + 光标 offset + 32bpp 预乘 alpha `HBITMAP`），`IDropSource` 须实现 `IDropSourceHelper`（`GiveFeedback` 回 `DRAGDROP_S_USEDEFAULTCURSORS`）。`DRAGIMAGEBITS`/`IDropSourceHelper`/其 IID **都不在公开 Windows SDK 头**（`shlobj.h`/`shobjidl.h`/`shlguid.h` 实测无），属 reverse-engineered 接口。`vendor/native_drag_win.cc` 的 `sk_drag_begin` 已收到 rgba/尺寸/offset 但 `(void)` 忽略，`Data` 是只读快照（私有格式需可变态）。drag-IN（`IDropTarget`）与 drag-OUT（`DoDragDrop`）本身已实测可用，仅缺拖动图像。 | 需先按 Wine/ReactOS 的 `IDropSourceHelper` IID 与 `DRAGIMAGEBITS` 布局核实私有协议，把 `Data` 扩成携带 `DragImageBits` 格式（`HBITMAP` 由 rgba 建 32bpp DIB section、预乘 alpha、随 `Data` 释放），`Source` 增 `IDropSourceHelper`。**必须真机拖出到资源管理器/编辑器目视验收**（本机无法程序化模拟交互拖拽）；协议核实前不盲改，避免崩掉已可用的 drag-OUT 路径。当前按 §1.5 报明（`as_shell_unsupported`），不静默降级 |
 
 
@@ -23598,6 +23618,130 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   **−17%**（阶段四百四十三）把它抵平到 **196–202**。也就是说「UTF-8 存储 + 对齐 UTF-16 特性」
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
+
+### 阶段四百五十三：不透明位图预乘角落——localized 修复（v0.4.427 → v0.4.428）✅ 已完成
+
+**问题**（阶段四百五十二新登记行）：`copyPixels` 把透明源拷进 `transparent=false` 目标，adl `getPixel32` 读回
+`FF800000`（预乘 RGB）、我方 `80FF0000`（straight）。当时判「牵涉预乘存储模型、不能只 OR alpha」，另立本阶段。
+
+**定模型**（adl 51.4.1 预乘 sweep，`temp/review86/` Premul/Premul2/Premul3，File API 出口）：遍历源 alpha
+{0x20,0x80,0xFF} × {copyPixels merge=false/true、draw、setPixel32、copyChannel} × {透明/不透明目标}。结论：
+**AIR `BitmapData` 内部存预乘，`getPixel32` 读取时反预乘**（`R_out=R_stored*255/alpha`）；不透明位图 alpha 恒 FF
+故反预乘是恒等。关键：**透明位图的 straight 存储 + 纯读 与 AIR 预乘存储 + 反预乘读 是往返等价的**，所以
+绝大多数路径本就匹配；sweep 里唯一分歧的两条是：① `copyPixels`(mergeAlpha=false) 进不透明目标（源 RGB 需要
+按源 alpha 预乘暗化 + 强制 FF）；② `copyChannel`(ALPHA) 进不透明目标（alpha 不可变 FF，写 ALPHA 通道是 no-op）。
+`draw`（走 Skia 预乘合成）、`mergeAlpha=true`（内部预乘数学 + 不透明 oa=255）、`setPixel32`（强制 FF 保留 straight）、
+透明目标 copyPixels（straight 往返）**都已匹配**。
+
+**舍入定案**：AIR 预乘用 round-half-up `(c*sa+127)/255`（源 R=1,alpha=0x80 → 1；R=3 → 2 证实，非截断）；
+alphaBitmapData 先调制源 alpha（`(sa*ma)>>8`）再预乘（src 0x80FF0000 + mask 0x80 → sa=0x40 → R=0x40）。
+
+**修复**（`src/emit.ts`，localized、仅不透明目标）：① `copyPixels` mergeAlpha=false 分支加 `if (!bd->transparent)`
+臂：逐通道 `(c*sa+127)/255` 预乘 + `*dp = 0xFF000000u | (rr<<16)|(gg<<8)|bb`；透明目标保留原 straight 往返。
+② `copyChannel` 每格写入后 `if (!bd->transparent) *d |= 0xFF000000u;`（不透明 alpha 恒 FF）。**不**改全局存储模型
+（那会牵动 GC/语义/所有读写点，而 sweep 证明只有这两条路径需要改）。
+
+**同机 A/B**：修后 sweep 全案与 adl 逐字一致（copyOpaque `ff200000`/`ff800000`/`ffff0000`、舍入 R=1→`ff010000`/
+R=3→`ff020000`、alphaBmp `ff400000`、copyChannelAlpha `ff0000ff`、copyTrans/draw/merge/setPix 保持不变）。
+
+**验收**：`unit: render/OpaquePremul` 4 钉（预乘 round-half-up + 强制 FF + 透明分支保留 + copyChannel 强制）；
+`examples/bitmap-opaque-premul.as` 自校验（不符即 throw）绿。**全量回归**：`node test.ts` ⇒ **tests 739 / pass 734 /
+fail 1 / skipped 4**，唯一红是并发会话的 `unit: emit/StringAccumulator`（非本轮改动）；日志 `temp/node-test-full.log`。
+
+**经验**：① 「预乘存储」听起来像要全局改，但 **sweep 先行**把它收窄成两条路径的 localized 修复——透明往返等价是
+关键洞察，别被「存储模型不同」吓成重写；② 舍入必须实测（R=1/3 区分 trunc vs round），不能凭「应该是截断」猜；
+③ 不透明位图的 alpha 是**不可变 FF**，任何写 alpha 的入口（setPixels/setVector/setPixel32/fillRect/copyPixels/copyChannel）
+都要守住这条不变量。
+
+### 阶段四百五十二：不透明位图写入侧 alpha 强制（v0.4.426 → v0.4.427）✅ 已完成
+
+**问题**（遗留表 #86）：`transparent=false` 的 `BitmapData` 被写进非 255 的 alpha 时，AOT 保留源字 alpha、
+AIR 强制 `0xFF` ⇒ AOT 整块半透明、AIR 不透明。`setPixel32`/`fillRect`/构造器早已在写入侧强制，唯独 bulk 的
+`setPixels`（LE memcpy / BE 字节 swap / 短数组逐格三子路径）与 `setVector` 绕过了它。
+
+**定侧**（动手前先补双端探针，表头要求）：adl 的 `trace` 不走 stdout、flashlog 也不收（mm.cfg 的
+`TraceOutputFileEnable` 对 AIR adl 无效），改用 **AIR `File` API** 把结果写进 `applicationStorageDirectory`
+（`temp/review86/adl/Probe.as`）绕开 trace 路由。判别探针：不透明位图 `setPixels(0x80FF0000)` 后 `draw` 到
+**透明**目标——adl `drawAlpha=ff`（不透明）⇒ AIR 内部像素恒 FF，是**写入侧**强制而非读取侧屏蔽（读取侧的话
+draw 会按源 alpha 0x80 合成出半透明）。`setPixel32=ff00ff00` 也与我方现有写入侧一致。
+
+**修复**（`src/emit.ts`，写入侧、仅 `!transparent`）：`setPixels` LE 透明保留纯 memcpy（摄像头快路径），
+不透明改逐字 `dw[x] = sw[x] | 0xFF000000u`（-O2 向量化，对 ANE 帧恒 FF 的 alpha 是 no-op）；BE 与逐格路径
+同样按 `bd->transparent` 三目强制；`setVector` 存 `bd->transparent ? v->data[si] : (v->data[si] | 0xFF000000u)`。
+`getPixel32`/`getPixels`/`getVector` 保持**纯读**——不变量完全落在写入侧，读侧自动返回 FF。
+
+**同机 A/B**（adl 51.4.1 vs AOT，`temp/review86/`）：`getPixel32` `ffff0000`、`drawAlpha` `ff`、
+`setVector` `ff0000ff`、`beSetPixels` `ff0000ff`、`transparentKeeps` `80ff0000` ——修后**五项逐字一致**
+（修前 `getPixel32=80ff0000`/`drawAlpha=80`/`setVector=800000ff`/`beSetPixels=800000ff`）。
+
+**新登记**（同轮探针量到、更深）：`copyPixels` 透明源→不透明目标，adl `FF800000`（R=0x80 是源红 FF 按
+源 alpha 0x80 **预乘**后的值）vs 我方 `80FF0000`（straight）。这不是 alpha 强制能修——盲目 OR `0xFF000000`
+会得 `FFFF0000`（straight RGB）仍错；牵涉 AIR 预乘存储模型，须先做 copyPixels/copyChannel/draw 的预乘 sweep
+再统一改，另立阶段（已入表）。
+
+**验收**：`unit: render/OpaqueAlpha` 9 钉（setPixels 三子路径 + setVector + 既有 setPixel32/fillRect/ctor 强制 +
+getPixel32 纯读）；`examples/bitmap-opaque-alpha.as` 自校验（不符即 throw ⇒ 非零退出）绿。旧钉
+`unit: render/BitmapLivePixels` 的「LE bulk 是无条件 memcpy」按新契约翻转（透明保留 memcpy、不透明逐字 OR）后复绿。
+**全量回归**（修复后复验一次）：`node test.ts` ⇒ **tests 737 / pass 732 / fail 1 / skipped 4**，唯一红是并发会话的
+`unit: emit/StringAccumulator`（非本轮改动）；日志 `temp/node-test-full.log`。
+
+**经验**：① adl 拿不到 trace 时，AIR `File`/`FileStream` 写 `applicationStorageDirectory` 是可靠的 oracle 出口，
+别在 mm.cfg/flashlog 路由上耗时间；② 「写入侧 vs 读取侧」要用 **draw 到透明目标的 alpha** 判别，单看 getPixel32
+两侧都给 FF、分不出来；③ 修 alpha 强制时探到 copyPixels 的预乘分歧——**不能顺手 OR alpha**（RGB 会错），
+照实登记另立阶段，比静默改错语义安全。
+
+### 阶段四百五十一：`Vector`/`Array` 元素循环版本化——守卫提外，交 `-O2` 向量化（v0.4.425 → v0.4.426）✅ 已完成
+
+**问题**（遗留表 #65）：`Vector`/`Array` 的逐元素访问守卫把循环挡在向量化之外。同机 Windows
+实测（`24 × 1M`，`clang -O2 -ffp-contract=off`）：`Vector.<Number>` 24 ms vs 裸 C 12 ms（2×）、
+`Vector.<int>` 19–20 vs 4–5 ms（≈4×）、Array(Number) 122–134 vs 12 ms（≈11×）。根因与 M2 归因一致：
+循环体有 `set` ⇒ 与输入别名 ⇒ `v->length` 不能证明循环不变 ⇒ 每元素 `#1125` 边界检查 +
+`as_req_obj` 空指针守卫留在循环内，LLVM 拒绝向量化。
+
+**定调**：这是 AGENTS §1.1 的**形态转换**（改「检查放在哪」，不改「检查做不做」），向量化仍由
+`-O2` 完成，不是前端做优化。做法是**循环版本化**：合格循环发射快/慢两个版本，快分支前做一次性
+**纯检查**（`start >= 0`、每个接收者非空且 `bound <= length`；Array 读接收者再加 `as_array_all_num`
+预扫），通过才走裸访问快分支，否则原样走逐元素守卫的慢分支——`#1125`/`#1009` 的异常时机与部分
+副作用逐字保留。
+
+**三个让 LLVM 真向量化缺一不可的形态点**（都由 `-Rpass-analysis=loop-vectorize` 实测定位）：
+
+1. **C 局部归纳影子**：顶层脚本变量落全局 `g_j`，内存携带的归纳变量 LLVM 的 SCEV 不认
+   （`loop induction variable could not be identified`）。快分支用 `int _fastj` 局部影子 carrying
+   归纳，循环后 `g_j = _fastj` 写回（AS3 var 函数作用域，循环后仍可见）。
+2. **数据指针提进 C 局部**：`->data` 从全局结构指针加载，依赖分析 `cannot identify array bounds`。
+   循环前 `double* _fastp = a->data;`，快分支用 `_fastp[_fastj]`（体无调用、元素 store 不能改
+   `->data` 字段，提外语义不变）。
+3. **头条件形而非 `for(;;)+break`**：早退循环被 `Cannot vectorize early exit loop` 拒绝。cond 已被
+   合格判据证明为纯，可放头部 `for (; _fastj < bound; _fastj = _fastj + 1)`。
+
+**合格判据**（`analyzeFastLoop`，全满足才版本化）：init 为 `int`/`uint` 循环变量（`var j:int=0`
+或复用 `for (j=0;…)`，后者从作用域取静态类型）；cond `j < bound`、update `j++`/`j+=1`；start/bound
+纯数值读；体只含数值变量声明/赋值、`recv[j]` 元素读写、`+ - * / %` 算术，**无调用**、不写循环
+变量/边界/接收者。Array 区分读/写接收者：**写-only** 的 Array 初始全是 hole（undefined），会被数值
+覆盖，故只查 `bound <= length`、不做 all_num 预扫；读接收者才预扫（混合 Array 运行时落回慢分支）。
+
+**实现**：`src/emit.ts` 新增 `analyzeFastLoop`/`fastElemBind` 与 `fastLoop`/`fastSubst`/`fastData`
+三个发射期状态；`emitFor` 发射版本化两分支；`emitIndex`/`emitAssign` 的 Vector/Array 读写钩子在
+快分支用裸 `_fastp[idx]`（Array 读 `.num`、写 `as_v_num`）。`src/runtime.ts` 新增
+`as_array_all_num(a, n)`（逐元素 `tag == 1`；tag 8/9 int64/uint64 走 union 不能读 `.num`，故排除）。
+
+**证据**（同机 Windows，`temp/review65/`）：`Vector.<Number>` 24 → **12–13 ms**（裸 C 10–12，
+`-Rpass` width 2 / interleave 2）、`Vector.<int>` 19–20 → **3–5 ms**（裸 C 4–6，width 4 / interleave 2）
+——**两形均与裸 C 平手**；Array(Number) 122–134 → **84–87 ms**。Array 余差是**表示税**：元素是
+24 字节装箱 `as_value`（tag+num+ptr），非 2 的幂步长，LLVM 不向量化这种跨步访问；再进一步须改
+`as_value` 布局（牵动 GC/语义，超出本轮）。增强项 E10（显式 SIMD）因此**不排期**——收益已由
+`-O2` 自动拿到。
+
+**单元钉子**：`unit: emit/FastLoop` 14 钉（预检/影子/提指针/写回/快分支裸访问/慢分支留守卫/
+负起点门/读 Array 预扫/写-only Array 只查长度/含调用不版本化/改边界不版本化/复用循环变量）。
+**示例**：`examples/fast-element-loop.as` 钉两路的可观测语义（结果一致、`#1125` 时机一致、循环后
+变量可见、混合 Array 的 null 强转 0、越界与负起点都落慢分支并抛 `#1125`）。非合格循环与所有非
+元素访问路径**逐字节不变**。文档：`docs/{zh-cn,en}/compile.md` §4.5。
+
+**回归**：`node test.ts` **730 / 735 过**（4 跳过）；唯一红仍是 `unit: emit/StringAccumulator`
+（并发会话的字符串累加器工作，与本阶段无关）。新增 `unit: emit/FastLoop` 与
+`example: fast-element-loop.as` 均绿。
 
 ### 阶段四百五十：发布产物不带 trace——编译期 + 运行期两层闸门（v0.4.424 → v0.4.425）✅ 已完成
 

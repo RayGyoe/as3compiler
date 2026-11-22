@@ -695,6 +695,21 @@ export class Emitter {
   // were hoisted into sequenced prelude statements so AS3's left-to-right
   // evaluation order is preserved. Maps the AST node to its value temp.
   private hoistedAssigns = new Map<Expr, { tmp: string; type: CType }>();
+  // Stage 451 loop versioning: while emitting the FAST branch of a qualified
+  // counted for-loop, element accesses on these receivers indexed by the loop
+  // var emit raw data reads/stores instead of the checked accessors.
+  private fastLoop: { loopVar: string; binds: Map<string, 'vec' | 'arr'> } | null = null;
+  // Stage 451: inside the fast version of a qualified loop the induction var is
+  // shadowed by a C local (a memory-carried global IV defeats LLVM's SCEV, so the
+  // loop would not vectorize); reads of the AS3 var resolve to the shadow and the
+  // final value is written back after the loop (AS3 var is function-scoped).
+  private fastSubst: Map<string, { code: string; type: CType }> | null = null;
+  // Stage 451: receiver data pointers hoisted into C locals for the fast loop
+  // (LLVM's dependence analysis cannot identify array bounds through a pointer
+  // loaded from a global struct; a local base pointer lets it runtime-check
+  // aliasing and vectorize). Element stores cannot retarget ->data (no calls in
+  // the qualified body), so hoisting is semantics-preserving.
+  private fastData: Map<string, string> | null = null;
   // Non-const static fields whose initializer must run at runtime (in main).
   private staticFieldInits: { cname: string; fname: string; f: FieldInfo }[] = [];
   // AS3 class-body static initializer blocks (`static var x:int; { x = 1; }`) and
@@ -25049,8 +25064,18 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('unsigned char* d = dp + (((size_t)(cy0 + y) * (size_t)bd->width) + (size_t)cx0) * 4u;');
     this.line('const unsigned char* s = sp + (size_t)y * rowBytes;');
-    this.line('if (le) { memcpy(d, s, rowBytes); }');
-    this.line('else { unsigned* dw = (unsigned*)d; for (int x = 0; x < cw; x++) { unsigned v; memcpy(&v, s + (size_t)x * 4u, 4u); dw[x] = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); } }');
+    // An opaque bitmap (transparent=false) never stores a non-FF alpha: AIR forces
+    // 0xFF on WRITE (adl 51.4.1, temp/review86: setPixels of 0x80FF0000 reads back
+    // 0xFFFF0000 and draws opaque onto a transparent target). setPixel32/fillRect
+    // already force it; setPixels must too. The transparent LE case keeps the pure
+    // memcpy (the camera fast path); opaque LE does a word-wise OR instead, which
+    // -O2 vectorizes and is a no-op for the already-FF alpha of ANE video frames.
+    this.line('if (le) {');
+    this.indent++;
+    this.line('if (bd->transparent) { memcpy(d, s, rowBytes); }');
+    this.line('else { unsigned* dw = (unsigned*)d; const unsigned* sw = (const unsigned*)s; for (int x = 0; x < cw; x++) dw[x] = sw[x] | 0xFF000000u; }');
+    this.indent--;
+    this.line('} else { unsigned* dw = (unsigned*)d; for (int x = 0; x < cw; x++) { unsigned v; memcpy(&v, s + (size_t)x * 4u, 4u); unsigned w = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); dw[x] = bd->transparent ? w : (w | 0xFF000000u); } }');
     this.indent--;
     this.line('}');
     this.line('ba->position += (int)need;');
@@ -25069,6 +25094,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('unsigned a, r, g, b;');
     this.line('if (le) { a = src[3]; r = src[2]; g = src[1]; b = src[0]; }');
     this.line('else { a = src[0]; r = src[1]; g = src[2]; b = src[3]; }');
+    this.line('if (!bd->transparent) a = 0xFFu;');
     this.line('((unsigned*)bd->pixels)[py * bd->width + px] = (a << 24) | (r << 16) | (g << 8) | b;');
     this.line('} }');
     this.indent--;
@@ -25161,7 +25187,20 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     // mergeAlpha=false: straight source RGB, the (modulated) alpha REPLACES dest.
     // A zero alpha clears the RGB too (AIR stores premultiplied: alpha 0 => 0x0).
-    this.line('if (sa == 0) { *dp = 0; } else { *dp = (s & 0x00FFFFFFu) | (sa << 24); }');
+    // OPAQUE dest (transparent=false): AIR stores PREMULTIPLIED RGB with alpha FF
+    // (adl 51.4.1 premul sweep, temp/review86): the source RGB is darkened by the
+    // (modulated) source alpha, round-half-up (c*sa+127)/255 -- R=1,a=128 -> 1,
+    // R=3 -> 2. getPixel32 of an opaque bitmap is identity-unpremul, so it reads
+    // back the premultiplied value (0x80FF0000 -> 0xFF800000). A transparent dest
+    // keeps the straight round-trip below.
+    this.line('if (!bd->transparent) {');
+    this.indent++;
+    this.line('unsigned rr = (((s >> 16) & 0xFFu) * sa + 127u) / 255u;');
+    this.line('unsigned gg = (((s >> 8) & 0xFFu) * sa + 127u) / 255u;');
+    this.line('unsigned bb = ((s & 0xFFu) * sa + 127u) / 255u;');
+    this.line('*dp = 0xFF000000u | (rr << 16) | (gg << 8) | bb;');
+    this.indent--;
+    this.line('} else if (sa == 0) { *dp = 0; } else { *dp = (s & 0x00FFFFFFu) | (sa << 24); }');
     this.indent--;
     this.line('} else {');
     this.indent++;
@@ -25219,6 +25258,10 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('unsigned v = (((unsigned*)src->pixels)[sy * src->width + sx] >> ss) & 0xFFu;');
     this.line('unsigned* d = &((unsigned*)bd->pixels)[dy * bd->width + dx];');
     this.line('*d = (*d & ~mask) | (v << ds);');
+    // An opaque dest's alpha is immutable FF: copying the ALPHA channel into a
+    // transparent=false bitmap is a no-op on alpha (adl 51.4.1, temp/review86:
+    // copyChannel ALPHA -> opaque keeps 0xFF0000FF, never the source 0x80).
+    this.line('if (!bd->transparent) *d |= 0xFF000000u;');
     this.indent--;
     this.line('} }');
     this.indent--;
@@ -25285,7 +25328,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (px < 0 || py < 0 || px >= bd->width || py >= bd->height) continue;');
     this.line('int si = yy * rw + xx;');
     this.line('if (si >= v->length) { as_throw(RangeError_new((char*)"Error #2006: The supplied index is out of bounds.", 2006)); return; }');
-    this.line('((unsigned*)bd->pixels)[py * bd->width + px] = v->data[si];');
+    // Same opaque-alpha rule as setPixels/setPixel32: force 0xFF on write.
+    this.line('((unsigned*)bd->pixels)[py * bd->width + px] = bd->transparent ? v->data[si] : (v->data[si] | 0xFF000000u);');
     this.indent--;
     this.line('} }');
     this.indent--;
@@ -36825,6 +36869,134 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.breakTargets.pop();
   }
 
+  // Stage 451: qualify a counted for-loop for semantically-equivalent versioning.
+  // The body whitelist (no calls, no length mutations, no receiver/bound/loop-var
+  // reassignment, numeric-only arithmetic) makes every element access provably in
+  // bounds and non-null for the whole loop once a pure pre-check passes, so the
+  // fast branch may drop the per-element #1125/#1009 guards and let -O2 vectorize.
+  // Anything doubtful returns null and the loop keeps the checked accessors.
+  private analyzeFastLoop(stmt: Extract<Stmt, { kind: 'For' }>): { loopVar: string; start: Expr; bound: Expr; binds: Map<string, 'vec' | 'arr'>; reads: Set<string> } | null {
+    const init = stmt.init, cond = stmt.cond, upd = stmt.update;
+    if (!init || !cond || !upd) return null;
+    const localTypes = new Map<string, CType>();
+    const varType = (name: string): CType | null => {
+      const lt = localTypes.get(name);
+      if (lt) return lt;
+      try { return this.emitVar(name).type; } catch { return null; }
+    };
+    const numeric = (t: CType | null): boolean => !!t && (t.kind === 'number' || t.kind === 'int' || t.kind === 'uint');
+    let j: string, start: Expr;
+    if (init.kind === 'VarDecl' && init.init) {
+      const it = init.type ? this.rt(init.type) : (init.init.kind === 'Num' && init.init.isInt ? { kind: 'int' } as CType : null);
+      if (!it || (it.kind !== 'int' && it.kind !== 'uint')) return null;
+      j = init.name; start = init.init;
+      localTypes.set(j, it);
+    } else if (init.kind === 'ExprStmt' && init.expr.kind === 'Assign' && init.expr.op === '=' && init.expr.target.kind === 'Var') {
+      // Reused loop var (`for (j = 0; …)`): AS3 var is function-scoped, so the
+      // declaration lives outside; its static type comes from the scope.
+      j = init.expr.target.name; start = init.expr.value;
+      const jt = varType(j);
+      if (!jt || (jt.kind !== 'int' && jt.kind !== 'uint')) return null;
+    } else return null;
+    if (cond.kind !== 'Binary' || cond.op !== '<') return null;
+    if (cond.left.kind !== 'Var' || cond.left.name !== j) return null;
+    const bound = cond.right;
+    const okUpd = (upd.kind === 'Update' && upd.op === '++' && upd.target.kind === 'Var' && upd.target.name === j) ||
+      (upd.kind === 'Assign' && upd.op === '+=' && upd.target.kind === 'Var' && upd.target.name === j && upd.value.kind === 'Num' && upd.value.value === 1);
+    if (!okUpd) return null;
+    if (!this.isPureExpr(cond)) return null;
+    const binds = new Map<string, 'vec' | 'arr'>();
+    const reads = new Set<string>();
+    const protectedNames = new Set<string>([j]);
+    const assigned = new Set<string>();
+    const names = (e: Expr, out: Set<string>): void => {
+      switch (e.kind) {
+        case 'Var': out.add(e.name); return;
+        case 'Binary': names(e.left, out); names(e.right, out); return;
+        case 'Unary': names(e.operand, out); return;
+        case 'Index': names(e.object, out); names(e.index, out); return;
+        case 'Assign': names(e.target, out); names(e.value, out); return;
+        default: return;
+      }
+    };
+    names(start, protectedNames);
+    names(bound, protectedNames);
+    if (start.kind === 'Var' && start.name === j) return null;
+    // start/bound must be pure numeric reads (no member/call/string reads).
+    const numReads = (e: Expr): boolean => {
+      switch (e.kind) {
+        case 'Num': return true;
+        case 'Var': return numeric(varType(e.name));
+        case 'Binary': return ['+', '-', '*', '/', '%'].includes(e.op) && numReads(e.left) && numReads(e.right);
+        case 'Unary': return (e.op === '-' || e.op === '+') && numReads(e.operand);
+        default: return false;
+      }
+    };
+    if (!this.isPureExpr(start) || !numReads(start) || !this.isPureExpr(bound) || !numReads(bound)) return null;
+    const walkE = (e: Expr, writeTarget = false): boolean => {
+      switch (e.kind) {
+        case 'Num': return true;
+        case 'Var': { const t = varType(e.name); return numeric(t) || (!!t && (t.kind === 'vector' || t.kind === 'array')); }
+        case 'Unary': return (e.op === '-' || e.op === '+') && walkE(e.operand);
+        case 'Binary': return ['+', '-', '*', '/', '%'].includes(e.op) && walkE(e.left) && walkE(e.right);
+        case 'Update': {
+          if (e.target.kind !== 'Var' || !numeric(varType(e.target.name))) return false;
+          assigned.add(e.target.name);
+          return true;
+        }
+        case 'Index': {
+          if (e.object.kind !== 'Var' || e.index.kind !== 'Var' || e.index.name !== j) return false;
+          const t = varType(e.object.name);
+          if (!t) return false;
+          if (t.kind === 'vector') { if (!numeric(t.elem)) return false; binds.set(e.object.name, 'vec'); }
+          else if (t.kind === 'array') binds.set(e.object.name, 'arr');
+          else return false;
+          // Only READ receivers need the all-num pre-scan; a write-only Array
+          // may start full of holes (they get overwritten with numbers).
+          if (!writeTarget) reads.add(e.object.name);
+          protectedNames.add(e.object.name);
+          return true;
+        }
+        case 'Assign': {
+          if (e.target.kind === 'Var') {
+            if (!numeric(varType(e.target.name))) return false;
+            assigned.add(e.target.name);
+            return walkE(e.value);
+          }
+          if (e.target.kind === 'Index') return walkE(e.target, true) && walkE(e.value);
+          return false;
+        }
+        default: return false;
+      }
+    };
+    const walkS = (s: Stmt): boolean => {
+      switch (s.kind) {
+        case 'Block': return s.body.every(walkS);
+        case 'Empty': return true;
+        case 'ExprStmt': return walkE(s.expr);
+        case 'VarDecl': {
+          const lt = s.type ? this.rt(s.type) : null;
+          if (!lt || !numeric(lt) || !s.init || protectedNames.has(s.name)) return false;
+          if (!walkE(s.init)) return false;
+          localTypes.set(s.name, lt);
+          assigned.add(s.name);
+          return true;
+        }
+        default: return false;
+      }
+    };
+    if (!walkS(stmt.body)) return null;
+    for (const a of assigned) if (protectedNames.has(a)) return null;
+    if (binds.size === 0) return null;
+    return { loopVar: j, start, bound, binds, reads };
+  }
+
+  // Stage 451: does this Index target match the active fast-loop binding?
+  private fastElemBind(target: Extract<Expr, { kind: 'Index' }>, kind: 'vec' | 'arr'): boolean {
+    return !!this.fastLoop && target.object.kind === 'Var' && this.fastLoop.binds.get(target.object.name) === kind &&
+      target.index.kind === 'Var' && target.index.name === this.fastLoop.loopVar;
+  }
+
   private emitFor(stmt: Extract<Stmt, { kind: 'For' }>, continueLabel: string | null): void {
     this.pushScope();
     const depth = this.tryFrames.length;
@@ -36868,6 +37040,97 @@ void FileStream_writeObject(void* _this, as_value v) {
     // takes the statement-level `valueCtx = false` pass that `ExprStmt` uses.
     const condPrelude = stmt.cond ? this.captureSequence(stmt.cond, true, true) : [];
     const updPrelude = stmt.update ? this.captureSequence(stmt.update, false, true) : [];
+    // Stage 451 loop versioning: the pre-check is a PURE read (short-circuit &&,
+    // never throws). When it passes, the whitelist guarantees every element access
+    // stays in bounds and non-null for the whole loop, so the fast branch emits raw
+    // data accesses and -O2 vectorizes; when it fails, the slow branch keeps the
+    // checked accessors verbatim (#1125/#1009 timing and partial side effects
+    // unchanged). The optimization itself stays with -O2 (AGENTS.md §1.1).
+    const fast = this.analyzeFastLoop(stmt);
+    if (fast) {
+      // The normal path puts `init` in the for-header; the versioned form uses
+      // for(;;) in both branches, so the init runs once here, before the pre-check.
+      if (init) this.line(`${init};`);
+      const ok = this.tmpName('fastok');
+      const startCode = this.emitExpr(fast.start).code;
+      const boundCode = this.emitExpr(fast.bound).code;
+      this.line(`int ${ok} = (${startCode} >= 0);`);
+      for (const [name, kind] of fast.binds) {
+        const rv = this.emitVar(name);
+        if (kind === 'vec') {
+          const key = this.vectorCName((rv.type as Extract<CType, { kind: 'vector' }>).elem);
+          this.line(`${ok} = ${ok} && (${rv.code} != NULL) && (${boundCode} <= ((as_vector_${key}*)${rv.code})->length);`);
+        } else if (fast.reads.has(name)) {
+          this.line(`${ok} = ${ok} && as_array_all_num(${rv.code}, ${boundCode});`);
+        } else {
+          this.line(`${ok} = ${ok} && (${rv.code} != NULL) && (${boundCode} <= ${rv.code}->length);`);
+        }
+      }
+      const jv = this.emitVar(fast.loopVar);
+      const jf = this.tmpName('fastj');
+      // Same for(;;) shape as the slow form below: cond/update preludes run per
+      // iteration INSIDE the body (the update's self-modification is hoisted by
+      // captureSequence, so the update slot itself stays empty). The fast version
+      // carries the induction in a C local shadow (see fastSubst).
+      const emitVersion = (fastBranch: boolean): void => {
+        if (fastBranch) {
+          this.line(`${this.cTypeName(jv.type)} ${jf} = ${startCode};`);
+          this.fastLoop = { loopVar: fast.loopVar, binds: fast.binds };
+          this.fastSubst = new Map([[fast.loopVar, { code: jf, type: jv.type }]]);
+          // Header-condition form, NOT for(;;)+break: an early-exit loop is
+          // refused by LLVM's vectorizer ("Cannot vectorize early exit loop").
+          // The qualifier proved the cond pure, so it is safe in the header.
+          this.fastData = new Map();
+          for (const [name, kind] of fast.binds) {
+            const rv = this.emitVar(name);
+            const fp = this.tmpName('fastp');
+            const et = kind === 'vec' ? this.cTypeName((rv.type as Extract<CType, { kind: 'vector' }>).elem) : 'as_value';
+            this.line(`${et}* ${fp} = ${rv.code}->data;`);
+            this.fastData.set(name, fp);
+          }
+          const hc = this.clauseParens(this.condExpr(this.emitExpr(stmt.cond!)));
+          this.line(`for (; ${hc}; ${jf} = ${jf} + 1) {`);
+          this.indent++;
+          const savedHoisted = new Map(this.hoistedAssigns);
+          this.emitStmt(stmt.body);
+          this.hoistedAssigns.clear();
+          for (const [k, v] of savedHoisted) this.hoistedAssigns.set(k, v);
+          this.indent--;
+          this.line('}');
+          this.line(`${jv.code} = ${jf};`);
+          this.fastSubst = null;
+          this.fastLoop = null;
+          this.fastData = null;
+          return;
+        }
+        this.line('for (;;) {');
+        this.indent++;
+        this.emitLines(condPrelude);
+        this.line(`if (!(${this.clauseParens(this.condExpr(this.emitExpr(stmt.cond!)))})) break;`);
+        this.emitStmt(stmt.body);
+        this.emitLines(updPrelude);
+        if (updPrelude.length === 0 && stmt.update) {
+          const outerUpd = this.discardedExprNode;
+          this.discardedExprNode = stmt.update;
+          this.line(`(void)(${this.emitExpr(stmt.update).code});`);
+          this.discardedExprNode = outerUpd;
+        }
+        this.indent--;
+        this.line('}');
+      };
+      this.line(`if (${ok}) {`);
+      this.indent++;
+      emitVersion(true);
+      this.indent--;
+      this.line('} else {');
+      this.indent++;
+      emitVersion(false);
+      this.indent--;
+      this.line('}');
+      this.breakTargets.pop();
+      this.popScope();
+      return;
+    }
     const cond = stmt.cond ? this.condExpr(this.emitExpr(stmt.cond)) : '';
     if (condPrelude.length === 0 && updPrelude.length === 0) {
       this.continueTargets.push({ depth, label: null, used: false });
@@ -39197,6 +39460,8 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   private emitVar(name: string): { code: string; type: CType } {
+    const fs = this.fastSubst?.get(name);
+    if (fs) return fs;
     if (name === 'this') {
       if (!this.currentClass) throw new CodegenError("'this' used outside a class method");
       // Inside a closure that captured `this`, the receiver lives in the env
@@ -40406,14 +40671,23 @@ void FileStream_writeObject(void* _this, as_value v) {
           return this.storeThenValue(`as_vec_set_impl((void*)(${recv}), ${this.toStringExpr(idxExpr)}, ${bv})`, bv, elem);
         }
         const idx = this.convert(idxExpr, { kind: 'int' });
+        const vecFast = this.fastElemBind(target, 'vec') && (elem.kind === 'number' || elem.kind === 'int' || elem.kind === 'uint');
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
           const ev = this.convert(v, elem);
+          if (vecFast) {
+            const fp = target.object.kind === 'Var' ? this.fastData?.get(target.object.name) : undefined;
+            return this.storeThenValue(fp ? `(${fp}[${idx}] = ${ev})` : `(((as_vector_${key}*)${obj.code})->data[${idx}] = ${ev})`, ev, elem);
+          }
           return this.storeThenValue(`as_vector_${key}_set(${recv}, ${idx}, ${ev})`, ev, elem);
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
         const cv = this.convert(combined, elem);
+        if (vecFast) {
+          const fp = target.object.kind === 'Var' ? this.fastData?.get(target.object.name) : undefined;
+          return this.storeThenValue(fp ? `(${fp}[${idx}] = ${cv})` : `(((as_vector_${key}*)${obj.code})->data[${idx}] = ${cv})`, cv, elem);
+        }
         return this.storeThenValue(`as_vector_${key}_set(${recv}, ${idx}, ${cv})`, cv, elem);
       }
       if (obj.type.kind === 'array') {
@@ -40428,11 +40702,19 @@ void FileStream_writeObject(void* _this, as_value v) {
         if (expr.op === '=') {
           const v = this.emitExpr(expr.value);
           const bv = this.boxExpr(v);
+          if (this.fastElemBind(target, 'arr') && (v.type.kind === 'number' || v.type.kind === 'int' || v.type.kind === 'uint')) {
+            const fp = target.object.kind === 'Var' ? this.fastData?.get(target.object.name) : undefined;
+            return this.storeThenValue(fp ? `(${fp}[${idx}] = ${bv})` : `(${obj.code}->data[${idx}] = ${bv})`, bv, { kind: 'any' });
+          }
           return this.storeThenValue(`as_array_set(${recv}, ${idx}, ${bv})`, bv, { kind: 'any' });
         }
         const op = COMPOUND_BASE[expr.op];
         const combined = this.emitBinary({ kind: 'Binary', op, left: target, right: expr.value });
         const b = this.boxExpr(combined);
+        if (this.fastElemBind(target, 'arr') && (combined.type.kind === 'number' || combined.type.kind === 'int' || combined.type.kind === 'uint')) {
+          const fp = target.object.kind === 'Var' ? this.fastData?.get(target.object.name) : undefined;
+          return this.storeThenValue(fp ? `(${fp}[${idx}] = ${b})` : `(${obj.code}->data[${idx}] = ${b})`, b, { kind: 'any' });
+        }
         return this.storeThenValue(`as_array_set(${recv}, ${idx}, ${b})`, b, { kind: 'any' });
       }
       // ByteArray[i] = v writes a byte at an absolute index (AVM2's index form,
@@ -45161,6 +45443,13 @@ void FileStream_writeObject(void* _this, as_value v) {
         return { code: `as_vec_get_impl((void*)(${recv}), ${this.toStringExpr(idxExpr)})`, type: { kind: 'any' } };
       }
       const idx = this.convert(idxExpr, { kind: 'int' });
+      // Stage 451 fast branch: bounds/null proven once before the loop.
+      if (this.fastLoop && expr.object.kind === 'Var' && this.fastLoop.binds.get(expr.object.name) === 'vec' &&
+          expr.index.kind === 'Var' && expr.index.name === this.fastLoop.loopVar &&
+          (obj.type.elem.kind === 'number' || obj.type.elem.kind === 'int' || obj.type.elem.kind === 'uint')) {
+        const fp = expr.object.kind === 'Var' ? this.fastData?.get(expr.object.name) : undefined;
+        return { code: fp ? `${fp}[${idx}]` : `(((as_vector_${this.vectorCName(obj.type.elem)}*)${obj.code})->data[${idx}])`, type: obj.type.elem };
+      }
       return { code: `as_vector_${this.vectorCName(obj.type.elem)}_get(${recv}, ${idx})`, type: obj.type.elem };
     }
     if (obj.type.kind === 'array') {
@@ -45172,6 +45461,12 @@ void FileStream_writeObject(void* _this, as_value v) {
         return { code: `as_array_key_get(${recv}, ${this.toStringExpr(idxExpr)})`, type: { kind: 'any' } };
       }
       const idx = this.convert(idxExpr, { kind: 'int' });
+      // Stage 451 fast branch: the all-num pre-scan proved [0,bound) is tag 1.
+      if (this.fastLoop && expr.object.kind === 'Var' && this.fastLoop.binds.get(expr.object.name) === 'arr' &&
+          expr.index.kind === 'Var' && expr.index.name === this.fastLoop.loopVar) {
+        const fp = expr.object.kind === 'Var' ? this.fastData?.get(expr.object.name) : undefined;
+        return { code: fp ? `${fp}[${idx}].num` : `(${obj.code}->data[${idx}].num)`, type: { kind: 'number' } };
+      }
       return { code: `as_array_get(${recv}, ${idx})`, type: { kind: 'any' } };
     }
     // ByteArray[index] reads a byte at an absolute index (AGALMiniAssembler's

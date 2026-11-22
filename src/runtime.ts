@@ -4180,6 +4180,16 @@ static void as_array_ensure(as_array* a, int need) {
     // points at a white object" true for fresh blocks.
     for (int i = 0; i < a->length; i++) gc_write_barrier_value(nd[i]);
 }
+// Loop-versioning pre-scan (stage 451): true when [0,n) of the array is entirely
+// tag-1 numbers, so a counted loop may read .num directly in its fast branch.
+// Null / out-of-range / any non-number tag (incl. holes) answers false and the
+// loop keeps the checked accessor path. int/uint box as tag 1 too; tag 8/9 ride
+// in the pointer union and must NOT read .num, so they fail the scan.
+static bool as_array_all_num(as_array* a, int n) {
+    if (a == NULL || n < 0 || n > a->length) return false;
+    for (int i = 0; i < n; i++) if (a->data[i].tag != 1) return false;
+    return true;
+}
 static as_value as_array_get(as_array* a, int i) {
     // A missing index is AIR's undefined, not null: 'var e:*=[1,2,3,4]; e.length=2;
     // e[3]' is undefined (=== undefined true, == null true) and 'x' + e[3] is
