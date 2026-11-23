@@ -468,6 +468,18 @@ true、`"name"` 为 false），`toString()` 是常量 `"function Function() {}"`
 **残留**：大数（`Number.MAX_VALUE`）AIR 的 D2A 只给约「最短往返位数 + precision」个有效位再补零（带 off-by-one/two），
 我们给全部精确位——这是独立的「有效位截断」行为，需移植 D2A 的 BigInteger 停止边界，已另登记（与「数值解析/格式化极值」行同源但面不同）。
 
+**8. `int`/`uint` 的 `+ - *` 在 double 上计算，只在落 int/uint 槽时回绕（阶段四百五十五 · adl 51.4.1 实测）。**
+AIR 的整数算术不在 int32 上溢出回绕：`2147483647 + 1` 得 `2147483648`、`2000000000 * 2` 得 `4000000000`、
+`4294967295u + 1` 得 `4294967296`、`-1 * 0` 得 `-0`（`1/(-1*0)` 为 `-Infinity`）——这些值在 Number 上下文
+（装箱 / 比较 / 除法 / `String()` / `Number` 槽）里都是**未回绕**的；只有赋给 `int`/`uint` 槽（含复合赋值、索引、位运算操作数）
+才按 ES3 `ToInt32`/`ToUint32` 回绕（`var x:int = 2147483647 + 1` 得 `-2147483648`）。`is int`/`is uint` 是**值域检查**
+（`2147483648 is int` 为 false、`is uint` 为 true；`-0 is int` 为 true），与原子 tag 无关。实现采「反向双值」：默认发射
+double 形态（结果类型 `number`，Number 上下文天然正确），另携 `intCode`（无符号回绕的 native int32 形态，**定义良好**，
+取代旧的有符号溢出 UB）专供 int/uint 落槽 / 索引 / 位运算——`intForm` 沿嵌套 int 链（`h*31+k`）传播，真 `Number` 操作数断链，
+故阶段四百五十一的整型快循环与 `(h*31+k)|0` 哈希热路径**性能零回归**（vecint 1ms、inthash 0–1ms 实测）。一元负对 `uint`
+同样走 double（`-2147483649u` 不再回绕成 `2147483647`）；`int` 一元负保留 native `-1` 可读形态。钉 `unit: emit/IntArithOverflow`
+（8 检查）+ `examples/int-overflow.as`，oracle `temp/qcn/adl`。
+
 ### 3.10 生成 C 的默认警告集归零（阶段三百六十四 · clang 默认诊断 + mxmlc 51.4.1 实测）
 
 一份 41.4 万行的真实产物（`bin-aot/TalkMED Meeting.c`）用 `clang -O2` 编译时报了 **725 条警告**。它们

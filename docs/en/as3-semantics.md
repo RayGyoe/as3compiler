@@ -402,6 +402,21 @@ digits and zero-pads the rest (with an off-by-one/two), while we emit every exac
 separately (same D2A root as the "number parsing/formatting extremes" row, different surface).
 
 
+**8. `int`/`uint` `+ - *` is computed in double and wraps only on store to an int/uint slot (stage 455, adl 51.4.1).**
+AIR integer arithmetic does not wrap on int32 overflow: `2147483647 + 1` is `2147483648`, `2000000000 * 2` is
+`4000000000`, `4294967295u + 1` is `4294967296`, and `-1 * 0` is `-0` (`1/(-1*0)` is `-Infinity`). In every Number
+context (boxing / comparison / division / `String()` / a `Number` slot) these values are **unwrapped**; only assignment
+to an `int`/`uint` slot (including compound assignment, indices, and bitwise operands) wraps via ES3 `ToInt32`/`ToUint32`
+(`var x:int = 2147483647 + 1` is `-2147483648`). `is int`/`is uint` are **value-domain checks** (`2147483648 is int` is
+false, `is uint` is true; `-0 is int` is true), independent of the atom tag. The implementation uses a "reverse dual
+value": the default emitted form is double (result type `number`, correct in every Number context), and an `intCode`
+(the native int32 unsigned-wrap form, **defined C**, replacing the old signed-overflow UB) rides along for int/uint
+stores / indices / bitwise consumers. `intForm` propagates through nested int chains (`h*31+k`); a real `Number`
+operand breaks the chain, so the stage-451 integer fast loops and the `(h*31+k)|0` hash hot path keep **zero perf
+regression** (measured vecint 1ms, inthash 0–1ms). Unary minus on a `uint` also goes through double (`-2147483649u` no
+longer wraps to `2147483647`); `int` unary minus keeps the readable native `-1` form. Pinned by `unit: emit/IntArithOverflow`
+(8 checks) + `examples/int-overflow.as`, oracle `temp/qcn/adl`.
+
 ### 3.10 Generated C compiles with zero default warnings (stage 364, clang default diagnostics + mxmlc 51.4.1)
 
 A real 414k-line product file (`bin-aot/TalkMED Meeting.c`) produced **725 warnings** under plain

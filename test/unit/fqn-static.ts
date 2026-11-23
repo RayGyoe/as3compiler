@@ -95,8 +95,11 @@ function checkFqnStaticClassRef(): string[] {
     && !dynamic(wr));
 
   const compd = body('pkg.C.field += 5;');
+  // #33: the int store now wraps via defined unsigned arithmetic (the intCode
+  // fast form); the FQN-folding intent is unchanged — both the read and the
+  // write fold to the direct `pkg_C_field` symbol, never a dynamic dispatch.
   check('static field compound assignment: FQN folds in the same direct read/write',
-    compd.includes('(void)((pkg_C_cinit(), pkg_C_field = ((pkg_C_cinit(), pkg_C_field) + 5)));') && !dynamic(compd));
+    compd.includes('(void)((pkg_C_cinit(), pkg_C_field = (int)((unsigned)((pkg_C_cinit(), pkg_C_field)) + (unsigned)(5))));') && !dynamic(compd));
 
   const setter = body('C.s = 3;\npkg.C.s = 4;');
   check('static setter: both spellings call the same static setter',

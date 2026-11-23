@@ -20306,6 +20306,12 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-23 追加（阶段四百五十五：int/uint 算术 double 计算 + 落槽回绕）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **84 → 83 行**（`未开始` 65 → **64**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。移出的是 #33「int/uint 算术
+> 在 C 侧按 int32 回绕」——本阶段以反向双值发射修齐（默认 double 形态 + 无符号回绕 intCode 供 int 落槽/索引/位运算），
+> adl 51.4.1 实测 Number 上下文未回绕、int/uint 槽 ToInt32/ToUint32 回绕、`-0` 保留、`is int`/`is uint` 值域检查全匹配，
+> 整型快循环与哈希热路径性能零回归（vecint 1ms / inthash 0–1ms）。钉 `unit: emit/IntArithOverflow`（8）+ `examples/int-overflow.as`。
+
 > **2026-11-23 追加（阶段四百五十四：Windows 透明窗原生实现）**：**改写 1 行 / 移出 0 行 / 新登记 0 行** ⇒
 > 主表 **保持 84 行**（`未开始` 65 / `部分完成` 18 / `调研完成·实现暂缓` 1 不变）。改写的是「窗口几何的 Windows 端残余」：
 > 其 ① `<transparent>` 的 Windows 原生实现本阶段落地（`WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow`，`ULW_ALPHA`+`AC_SRC_ALPHA`，
@@ -20923,7 +20929,6 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | Proxy 拦截器收到的 `name` 恒为**原始 String**（`adl` 传的是装箱 String） | 未开始（2026-10-03 阶段九十四·一 实测登记，不动语义） | `adl 51.4.1` 实测（探针 `KeyProxy`）：点号/方括号**字符串键**与 `delete`/写 传入的 `name` 是**装箱** String（`typeof==="object"`、`v is String===false`、但 `v == "foo"` 为 **true**）；**数字键**（`p[3]`/`p[0.5]`）与 **`in` 运算符**传的是**原始** String（`typeof==="string"`）。我们一律传原始 String ⇒ 差异只落在「用户代码对 `name` 做 `typeof`/严格相等/`===` 比较」时。**这条不是理论差异**：GSAP `VarsCore.deleteProperty` 的 `_props.indexOf(prop)`（`_props` 是原始 String 数组、`indexOf` 走严格相等）在 AIR 里对点号传入的装箱 `name` **恒返回 -1**，因此 `delete vars.foo` 在 AIR 里返回 **false** 且不删（实测 `d1..d5`：`delete` 得 false、`_props`/`_values` 原封不动），而我们返回 true 并真的删掉——我们「更正确」，但**与 AIR 不一致** | 要复刻须引入**装箱 String 对象**：①运行时造一个 boxing 助手（GCF 跟踪、`as_string_vt` 已有对象形态，须补 `as_v_eq`/`as_v_str_val`/`typeof`/`is String`/字典键强转五处）；②在**调用点**按访问形态选原始或装箱（点号/字符串键/`delete` → 装箱；数字键/`in` → 原始）——即 emit 侧要按形态分派。**风险评估**：收益仅限 `typeof`/严格相等这类少见用法，而改动横跨运行时装箱、比较与字典键三处**全局**路径，回归面覆盖全部示例 ⇒ 暂不动，如实记账 |
 | `with` 的 String/`Vector` 接收者体内的赋值/自增/`delete` 写形态仍无左值路径 | **部分完成**（2026-10-30 阶段三百四十 登记；**2026-10-31 阶段三百四十五**：Function/类/RegExp 三类接收者的成员面已全部落地并移出本行，见该阶段 note；行内只剩 String/`Vector` 体内写形态） | 读取/调用面（八种接收者，`temp/proxyany/MainW.as` + `oursW.as`）与三类新接收者（`temp/with3/`，双端 diff=IDENTICAL）都已对齐；缺的是静态 String/`Vector` 发射器的左值形态：`with (s) { length = 5 }` 这类体内写目前是响亮 CodegenError（Function 接收者已按 `#1074`/`#1037` 分类落地，见 `withAssignFrom` 的 builtin 分支） | `builtin` 写路径按成员分类：`length` 按 AIR 实测分类（String 的 `length` 只读 `#1074`？需先 `adl` 量清）、方法名 `#1037`、未知名落词法/隐式全局；String/`Vector` 各有 `as_str_*`/`as_vector_*` 的 set 助手或直接 C 槽写 |
 | VM 抛错文案与未捕获打印格式与 `adl` **不逐字一致**（编号/异常类/时机一致） | 未开始（2026-10-03 阶段九十四·二 实测登记；**既有全局差异**，with 只是又新增 4 个发射点） | `adl 51.4.1` 实测（探针 `temp/errprobe/`）：`e.message` 对 VM 抛错是**短式**——`with (null)` → `Error #1009`、`with (undefined)` → `Error #1010`、`f()`（`f:Function = null`）→ `Error #1006`、`throw new Error("custom")` → `custom`（自定义 `Error` 保留用户文案）、`throw new TypeError("tmsg",1234)` → `tmsg`；`Error.getErrorMessage(1009)` 同样是 `Error #1009`；`String(e)`/`e.toString()` = `TypeError: Error #1009`；**未捕获**打印恰好是 `<异常类名>: <message>`（无前缀）。本子集自阶段「异常」起用带描述的长文案（`Error #1009: Cannot access a property or method of a null object reference.` 等，约 36 处发射点），未捕获走 `Uncaught exception: <message>`；`e.name` 在本子集是**编译期错误**（未声明）。**结论**：编号、异常类与抛出时机全部一致，仅**文案与打印前缀**不同，故登记为遗留而非误实现。 | 若要逐字对齐：把 VM 抛错文案统一改为短式 `Error #<id>`（`Error.getErrorMessage` 走同一表；用户文案的自定义 `Error` 保持原样），未捕获打印改为 `<类名>: <message>`，并给 `Error` 补 `name`/`getErrorMessage`。属跨切面改动（约 36 个发射点 + runtime 助手），宜单独立项、一次性对齐 + 全量 `test.ts` 回归 |
-| **int/uint 算术在 C 侧按 int32 回绕，AIR 在 double 里算、只在落到 int 槽时才回绕**（`adl 51.4.1`：`2147483647 + 1` 得 `2147483648`、`2000000000 * 2` 得 `4000000000`、`46341 * 46341` 得 `2147488281`、`-1 * 0` 得 **`-0`**；同一批值赋回 `int` 变量时才是 `-2147483648` / `-294967296`） | 未开始（2026-10-30 阶段三百三十四 顺带量到并登记） | 证据：`temp/qcn/Main10.as`、`Main11.as`（adl，运行期从 Array/Vector 取值以排除 `mxmlc` 常量折叠）× `temp/qcn/ours/m10.as`（我们）。**不溢出的形态两侧一致**（`5+5`、`7%2`、`100-3`、`-5` 都是 `int`），分歧只在结果超出 int32 或需要保留 `-0` 时：我们输出 `-294967296` / `1` / `-2`，AIR 输出 `4000000000` / `4611686014132420600` / `4294967294`。根因是发射层给 int×int 直接发 C 的 `int` 运算：C 的 int 加法/乘法溢出是 UB（实际回绕），而 AIR 走 ES3 的 double 加法后按值域归一 | 修法（跨切面，须独立阶段）：`+`/`-`/`*` 的 int×int 发射改 double 运算并保持结果类型为 double，**只在写入 `int`/`uint` 槽（或显式 `int()`/`uint()`）时**才 `as_to_int32`/`as_to_uint32`；同时要重新量 `%`/位运算（实测 `7 % 2` 仍是 `int`、`uint` 的 `%` 语义未测）与所有依赖 int 算术的示例（哈希、索引、坐标取整），并复核 `-0` 在 `trace` 外的可见面。**风险高**：影响所有整型热点路径的生成形态，须先有性能对照再落地。
 | 本子集的 `String` 是 **UTF-8 字节索引**（非 UTF-16 码元索引）。**阶段九十四·十六 追加**：`displayAsPassword` 的星号数也随此口径——我们「一字节一个 `*`」，`adl` 是「一个 UTF-16 码元一个 `*`」，故 CJK 密码我们显示 3 倍星号（实测 `_typewriter` 12 的 `中文ab`：adl 4 颗 / 我们 12 颗）。**阶段三百九十三 已修掉这半边**：星号串改为每**码元**一颗（代理对 2 颗、CR/LF 原样），`as_tf_layout_text` 不再逐字节替换，`as_tf_utf16_index`/`as_tf_byte_index` 的密码恒等短路一并删除（adl 51.4.1 对照：masked `中文ab` `textWidth` 20.00 = `****`、`😀` 10.00 = `**`；本仓修前 40.00/20.00）。本行**现在只剩编辑索引那半边**（`caretIndex`/选区/行表仍是字节域） | 未开始（既有全局口径；2026-10-03 阶段九十四·四 实测复核） | `"中".length` 我们给 **3**、`adl` 给 **1**；`charAt`/`charCodeAt`/`substr`/索引赋值全部按 **UTF-8 字节**推进（星形平面 `"😀"` 我们 `length` 为 4、`charCodeAt(0)` 为 240）。这是「C 里就是 `char*`」这一表示的**直接后果**，不是 AMF/多字节代码引入的：`writeMultiByte`/AMF 的字符串长度恰好也按 UTF-8 字节计，故这两处**反而与 `adl` 一致**。**阶段九十四·七 追加证据（可编辑文本侧）**：编辑索引（`caretIndex`/`selectionBeginIndex`/`selectionEndIndex`）同源——`adl 51.4.1` 实测 `Option+8` 提交 `"•"`（U+2022，UTF-8 三字节）后光标只 `+1`，我们 `+3`（`temp/editprobe/` 的 Ed3 差异表：`op(1,1,1) len=1` vs `(3,3,3) len=3`）。影响面 = 「对含非 ASCII 的字符串做长度/索引运算」的 AS3 代码（真实工程里主要是截断、切片与定长协议字段） | 要忠实须把 `as_str_*` 全面改成 UTF-16 码元索引：字符串本体可继续存 UTF-8（或改存 UTF-16），但**全部**索引/长度/切片/`charCodeAt`/正则/`TextField.text` 长度都要经过码元换算表 ⇒ 触及运行时字符串层与全部示例的回归面 |
 | `URLStream.readObject` 要求 `Loader` **已完成**（AMF 值须已完整缓冲） | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `URLStream` 的读取在本运行时是**缓冲式**：`readObject` 直接从已下载的字节缓冲解（此前也如此），若加载**在飞**（`_job != NULL`）则**响亮抛错**并说明「本子集需要 URLStream 已完成加载」。`adl` 支持流式（边下边解） | 若要流式须让 AMF 读侧与异步 IO 的增量到达打通（读侧要能「不够就等下一块」——与既有 `as_async` 的 pump 模型耦合），成本中；真实工程（`as3swf` 读远程 SWF）通常先整体下载再解析 |
 | `wasm`/`web` 目标**不链接 `iconv`** ⇒ 除 `utf-8`/`unicode` 外的字符集**响亮抛错** | 未开始（2026-10-03 阶段九十四·四 主动登记的实现边界） | `build.ts` 的 `platformLinkLibs()` 只在 **darwin** 追加 `iconv`；`AS_HAVE_ICONV=0`（`__EMSCRIPTEN__`/`__wasi__`）时 `writeMultiByte`/`readMultiByte` 遇到非 UTF-8/UTF-16 字符集走 `as_throw_charset_unsupported`（**不静默降级**成 UTF-8——静默会给错字节）。工程的真实用法里 `gbk`/`gb2312`/`shift-jis`/`IBM437`/`iso-8859-*` 都有使用 ⇒ web 目标上这些路径当前**不可用** | emscripten 侧需带 `iconv` 或内置精简代码页表（GBK/Big5/Shift-JIS 三张表即可覆盖工程里的字符集），或改链 ICU/`libiconv` 到 wasm。成本中，且**只影响非 UTF-8 字符集**的 web 构建 |
@@ -23624,6 +23629,42 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   **−17%**（阶段四百四十三）把它抵平到 **196–202**。也就是说「UTF-8 存储 + 对齐 UTF-16 特性」
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
+
+### 阶段四百五十五：int/uint 算术 double 计算 + 落槽回绕——反向双值发射，保整型热点零回归（v0.4.429 → v0.4.430）✅ 已完成
+
+**问题**（遗留表 #33 行）：发射层给 int×int / uint×uint 直接发 C 的 `int`/`unsigned` 运算，结果类型也标 int/uint。
+C 的有符号 int 溢出是 UB（实际回绕），而 AIR 在 **double** 里算、只在落 int/uint 槽时才回绕。adl 51.4.1 实测
+（`temp/qcn/adl`）：`2147483647+1` 得 `2147483648`、`2000000000*2` 得 `4000000000`、`4294967295u+1` 得 `4294967296`、
+`-1*0` 得 `-0`（`1/(-1*0)`=`-Infinity`）；我们此前输出 `-2147483648` / `-294967296` / `0` / `0`。
+
+**定语义**（adl 51.4.1）：① `+ - *` 的 int/uint 操作数在 double 上计算，Number 上下文（装箱/比较/除法/`String()`/
+`Number` 槽）见未回绕值；② 只有落 int/uint 槽（含复合赋值/索引/位运算操作数）才按 ES3 ToInt32/ToUint32 回绕；
+③ `/` 恒 double、位运算恒 int32（AIR 同口径，非缺陷）；④ `is int`/`is uint` 是**值域检查**（`2147483648 is int`=false、
+`is uint`=true、`-0 is int`=true），与原子 tag 无关——运行时 `as_v_is_int32`/`as_v_is_uint32` 已是值域判定，无需改。
+
+**修复**（`src/emit.ts`，反向双值）：`emitArith` 重写——int/uint 操作数默认发 **double 形态**（结果类型 `number`，
+Number 上下文天然正确），另携 `intCode`（**无符号回绕**的 native int32 形态，定义良好 C，取代有符号溢出 UB）+ `intKind`。
+`intForm` 沿嵌套 int 链（`h*31+k`）传播（操作数是 int/uint 型**或**自身携 intCode 即有 native 形态），真 Number 操作数断链。
+`convert`/`toInt32Expr`/`toUint32Expr` 优先取 intCode（int/uint 落槽、索引、位运算消费），无 intCode 才走 ToInt32/ToUint32
+helper（只损性能不损正确性）。一元负：`uint` 走 double（`-2147483649u` 不再回绕成 `2147483647`），`int` 保留 native `-1`
+可读形态（全 double 形态曾破坏 3 组负数字面量钉，且 `-INT_MIN` 罕见角落已由落槽/二元路径覆盖）。switch 标签按判别式类型
+强制转换，含 ToInt32/ToUint32 helper 的常量标签经新 `constSwitchLabel` 折成纯整数字面量（否则非法 C `case` 标签）。
+
+**性能零回归**（硬约束「不要破坏性能」，AGENTS.md §1.4）：首版嵌套链丢 intCode 致 inthash 1→63ms（`|0` 对 double 走
+ToInt32 helper）；补 intForm 链传播 + 位运算 intCode 后，`temp/qcn/bench.as` 实测 **vecint 1 / vecnum 11 / arrnum 21 /
+inthash 0–1 ms**（与阶段四百五十一基线一致），`accNumber=8000000000`、`accInt=-589934592`、`ovf=2147483648`✔。
+阶段四百五十一的整型快循环与 `(h*31+k)|0` 哈希热路径生成形态不变（仍 native int）。
+
+**验收**：新单元组 `unit: emit/IntArithOverflow`（8 检查：Number 上下文未回绕 / int 槽无符号回绕 / uint 槽 / -0 /
+混合 int+uint / 哈希链 native / 位运算 / uint 一元负 double）全绿；更新 `unit: fqn-static` 复合赋值钉（FQN 折叠意图保留）；
+新示例 `examples/int-overflow.as`（assert-throw，输出 `int-overflow: OK` EXIT=0）。**全量回归**：`node test.ts` ⇒
+**tests 741 / pass 736 / fail 1 / skipped 4**，唯一红是并发会话的 `unit: emit/StringAccumulator`（非本轮改动）；
+日志 `temp/qcn/full.log`。文档同步 `docs/{zh-cn,en}/as3-semantics.md` §3.9 注记 8 + README 双语义行/示例清单。
+
+**经验**：① 反向双值（默认 double + 可选 intCode）是「语义正确底线 + 性能」的最优解——Number 上下文天然正确，
+int 消费点取 native 形态保速度，缺 intCode 只损性能不损正确性；② intCode **必须沿链传播**，否则嵌套哈希循环退化
+（实测 63× slowdown）；③ 一元负全 double 虽语义更纯但生成 C 不可读（`-1`→`(int)(-((unsigned)(1)))`）且破坏负数钉，
+int 保留 native 是正确取舍；④ `is int`/`is uint` 值域语义两端早已一致，勿误改原子 tag。
 
 ### 阶段四百五十四：Windows 透明窗原生实现——WS_EX_LAYERED + 逐帧 UpdateLayeredWindow（v0.4.428 → v0.4.429）✅ 已完成
 

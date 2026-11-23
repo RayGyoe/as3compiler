@@ -6018,3 +6018,56 @@ function checkFastLoop(): string[] {
   return bad;
 }
 registerGroup('unit: emit/FastLoop', checkFastLoop);
+
+// #33 (stage 455): int/uint arithmetic is computed in DOUBLE (AIR wraps only on
+// store to an int/uint slot). The default emitted form is double so every Number
+// context sees the un-wrapped value; a native unsigned-wrap intCode rides along
+// for int-store / index / bitwise consumers (the stage-451 fast-loop fast path).
+// adl 51.4.1 truth: temp/qcn/adl (2147483647+1 == 2147483648, -1*0 == -0,
+// 4294967295+1 == 4294967296; int slot stores wrap to -2147483648 / 0).
+function checkIntArithOverflow(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [intovf] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [intovf] ${label}`); }
+  };
+  const gen = (src: string): string => generateC(parse(src)).c.replace(/\r\n/g, '\n');
+  const mainOf = (c: string): string => c.slice(c.indexOf('int main('));
+
+  const addBox = mainOf(gen('var a:int = 2147483647;\nvar b:int = 1;\ntrace(a + b);'));
+  check('int+int boxes the un-wrapped double (AIR 2147483648, not -2147483648)',
+    addBox.includes('as_str_from_double((((double)(g_a)) + ((double)(g_b))))'));
+
+  const intStore = mainOf(gen('var a:int = 2147483647;\nvar b:int = 1;\nvar x:int = a + b;'));
+  check('int slot store wraps via defined unsigned int (intCode, no ToInt32 helper)',
+    intStore.includes('g_x = (int)((unsigned)(g_a) + (unsigned)(g_b));') && !intStore.includes('as_to_int32'));
+
+  const numStore = mainOf(gen('var a:int = 2000000000;\nvar b:int = 2;\nvar n:Number = a * b;'));
+  check('Number store keeps the un-wrapped double product (AIR 4000000000)',
+    numStore.includes('g_n = (((double)(g_a)) * ((double)(g_b)));'));
+
+  const uintBox = mainOf(gen('var u:uint = 4294967295;\nvar v:uint = 1;\ntrace(u + v);'));
+  check('uint+uint boxes the un-wrapped double (AIR 4294967296)',
+    uintBox.includes('as_str_from_double((((double)(g_u)) + ((double)(g_v))))'));
+
+  const uintStore = mainOf(gen('var u:uint = 4294967295;\nvar v:uint = 1;\nvar w:uint = u + v;'));
+  check('uint slot store wraps via unsigned int (intCode)',
+    uintStore.includes('g_w = ((unsigned)(g_u) + (unsigned)(g_v));'));
+
+  const hash = mainOf(gen('var h:int = 0;\nvar k:int = 7;\nh = (h * 31 + k) | 0;'));
+  check('nested int chain keeps native int through bitwise (hash loop, no ToInt32 on double)',
+    hash.includes('(int)((unsigned)((int)((unsigned)(g_h) * (unsigned)(31))) + (unsigned)(g_k))') && !hash.includes('as_to_int32'));
+
+  const negZero = mainOf(gen('var f:int = -1;\nvar g:int = 0;\ntrace(1 / (f * g));'));
+  check('int*int is a double product so -0 survives (AIR 1/(-1*0) == -Infinity)',
+    negZero.includes('(((double)(g_f)) * ((double)(g_g)))'));
+
+  const cmp = mainOf(gen('var a:int = 2147483647;\nvar b:int = 1;\ntrace((a + b) == 2147483648);'));
+  check('int+int compares as double against a large literal (no premature wrap)',
+    cmp.includes('(((double)(g_a)) + ((double)(g_b))) == 2147483648u'));
+
+  console.log(`     [intovf] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: emit/IntArithOverflow', checkIntArithOverflow);

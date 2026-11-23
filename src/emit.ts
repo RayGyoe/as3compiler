@@ -302,6 +302,21 @@ function isSwitchLabelConst(e: Expr | null): boolean {
   }
 }
 
+// Compile-time value of a constant switch label (Num / unary +/-/~). Used to fold
+// a coerced Number label into a plain C integer constant expression (#33): a uint
+// unary minus beyond int32 coerces via a ToInt32 helper call, which is not a valid
+// `case` label, so the constant is evaluated here and emitted as a literal.
+function constSwitchLabel(e: Expr | null): number | null {
+  if (e === null) return null;
+  if (e.kind === 'Num') return e.value;
+  if (e.kind === 'Unary' && (e.op === '-' || e.op === '+' || e.op === '~')) {
+    const v = constSwitchLabel(e.operand);
+    if (v === null) return null;
+    return e.op === '-' ? -v : e.op === '+' ? v : ~v;
+  }
+  return null;
+}
+
 // A left-associative String `+` chain (`"a" + b + "c" + ...`) nests one
 // `as_str_concat(...)` per term, so N terms cost N levels of C bracket nesting.
 // Every C compiler caps bracket nesting (`clang`'s default `-fbracket-depth=256`);
@@ -38192,7 +38207,16 @@ void FileStream_writeObject(void* _this, as_value v) {
         this.line('default: ;');
       } else {
         const t = this.emitExpr(c.test);
-        this.line(`case ${t.code}: ;`);
+        // #33: coerce the label to the discriminant's integer type. An int label
+        // keeps its native form (same-kind convert); a Number label (e.g. a uint
+        // unary minus beyond int32) coerces via ToInt32/ToUint32 — fold that to a
+        // plain integer literal so the case stays a valid C constant expression.
+        let labelCode = this.convert(t, disc.type);
+        if (labelCode.includes('as_to_int32(') || labelCode.includes('as_to_uint32(')) {
+          const v = constSwitchLabel(c.test);
+          if (v !== null) labelCode = disc.type.kind === 'uint' ? String(v >>> 0) : String(v | 0);
+        }
+        this.line(`case ${labelCode}: ;`);
       }
       this.indent++;
       for (const s of c.body) this.emitStmt(s);
@@ -39173,6 +39197,15 @@ void FileStream_writeObject(void* _this, as_value v) {
         // and the C `-` cannot be applied to the boxed as_value struct.
         if (o.type.kind === 'any') {
           return { code: `(${expr.op}as_v_num_val(${o.code}))`, type: { kind: 'number' } };
+        }
+        // #33: unary minus on a UINT operand is a Number in AS3 (AIR atomizes
+        // -uint as Number/uint-valued). A native C negation of an unsigned literal
+        // wraps (-2147483649u == 2147483647u), so emit the double form. An int
+        // operand keeps native negation (readable `-1`, matches AIR for every
+        // value except the rare -INT_MIN overflow, which the int-store wrap path
+        // and binary arithmetic already cover).
+        if (expr.op === '-' && o.type.kind === 'uint') {
+          return { code: `(-((double)(${o.code})))`, type: { kind: 'number' } };
         }
         return { code: `(${expr.op}${o.code})`, type: o.type };
       }
@@ -40172,21 +40205,45 @@ void FileStream_writeObject(void* _this, as_value v) {
     return null;
   }
 
-  // Numeric arithmetic with AS3 type rules: int op int -> int, uint op uint -> uint,
-  // any mix involving Number (or int/uint mix) -> Number. Mixed int/uint is promoted
-  // to double in C to avoid unsigned wrap-around pitfalls.
-  private emitArith(l: { code: string; type: CType }, r: { code: string; type: CType }, op: string): { code: string; type: CType } {
+  // Numeric arithmetic with AS3 type rules (#33): int/uint arithmetic is computed
+  // in DOUBLE (result type number) and only wraps on store to an int/uint slot;
+  // a native unsigned-wrap intCode rides along for that store / index / bitwise
+  // fast path. Any mix involving Number (or int/uint mix) -> Number, promoted to
+  // double in C to avoid unsigned wrap-around pitfalls.
+  private emitArith(l: { code: string; type: CType; intCode?: string; intKind?: string }, r: { code: string; type: CType; intCode?: string; intKind?: string }, op: string): { code: string; type: CType; intCode?: string; intKind?: string } {
     // A 64-bit operand that got here (a caller other than emitBinary) takes the
     // 64-bit path rather than silently degrading to double.
     if (this.is64(l.type) || this.is64(r.type)) {
       const e64 = this.emitBinary64(l, r, op);
       if (e64) return e64;
     }
-    if (l.type.kind === 'int' && r.type.kind === 'int') {
-      return { code: `(${l.code} ${op} ${r.code})`, type: { kind: 'int' } };
-    }
-    if (l.type.kind === 'uint' && r.type.kind === 'uint') {
-      return { code: `(${l.code} ${op} ${r.code})`, type: { kind: 'uint' } };
+    // #33: AIR computes int/uint arithmetic in DOUBLE and only wraps when the
+    // value lands in an int/uint slot (adl 51.4.1: 2147483647+1 == 2147483648,
+    // 2000000000*2 == 4000000000, -1*0 == -0 with 1/(-1*0) == -Infinity). The
+    // DEFAULT result is therefore the double form (type number) so every Number
+    // context — boxing, comparison, division, Number store, String() — sees the
+    // un-wrapped value. intCode carries the native int32 wrap for the int-store
+    // fast path: ToInt32 of the exact double sum/difference of two int32 equals
+    // the unsigned-wrap reinterpret, so an int slot / index / bitwise consumer
+    // keeps native int speed (this preserves the stage-451 fast element loops and
+    // scalar int hot paths). intForm propagates through nested int chains
+    // (h*31+k): an operand has a native int form when it is int/uint-typed OR
+    // itself carries intCode; a real Number operand breaks the chain (Number
+    // arithmetic stays double). Unsigned wrap is defined C — signed int overflow
+    // is UB (the original #33 defect).
+    const intForm = (e: { code: string; type: CType; intCode?: string; intKind?: string }): { code: string; kind: string } | null => {
+      if (e.type.kind === 'int') return { code: e.code, kind: 'int' };
+      if (e.type.kind === 'uint') return { code: e.code, kind: 'uint' };
+      if (e.intCode) return { code: e.intCode, kind: e.intKind || 'int' };
+      return null;
+    };
+    const dblForm = (e: { code: string; type: CType }): string => e.type.kind === 'number' ? `(${e.code})` : `((double)(${e.code}))`;
+    const lf = intForm(l), rf = intForm(r);
+    if (lf && rf && lf.kind === rf.kind) {
+      const nat = lf.kind === 'int'
+        ? `(int)((unsigned)(${lf.code}) ${op} (unsigned)(${rf.code}))`
+        : `((unsigned)(${lf.code}) ${op} (unsigned)(${rf.code}))`;
+      return { code: `(${dblForm(l)} ${op} ${dblForm(r)})`, type: { kind: 'number' }, intCode: nat, intKind: lf.kind };
     }
     const wide = (k: string): boolean => k === 'int' || k === 'uint' || k === 'int64' || k === 'uint64';
     const lc = wide(l.type.kind) ? `((double)(${l.code}))` : l.code;
@@ -45781,7 +45838,11 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   // Convert a value to a 32-bit signed int for bitwise ops (AS3 ToInt32).
-  private toInt32Expr(e: { code: string; type: CType }): string {
+  private toInt32Expr(e: { code: string; type: CType; intCode?: string; intKind?: string }): string {
+    // #33: an int×int arithmetic result carries its native int32 wrap (intCode);
+    // a bitwise consumer is exactly an int32 context, so use the native form
+    // (keeps `(h*31+k)|0` hash loops at native int speed, no ToInt32 helper).
+    if (e.intCode) return e.intKind === 'int' ? e.intCode : `((int)(${e.intCode}))`;
     switch (e.type.kind) {
       case 'int': return e.code;
       case 'uint': return `((int)(${e.code}))`;
@@ -45799,7 +45860,8 @@ void FileStream_writeObject(void* _this, as_value v) {
   }
 
   // Convert a value to a 32-bit unsigned int for the unsigned shift `>>>`.
-  private toUint32Expr(e: { code: string; type: CType }): string {
+  private toUint32Expr(e: { code: string; type: CType; intCode?: string; intKind?: string }): string {
+    if (e.intCode) return e.intKind === 'uint' ? e.intCode : `((unsigned int)(${e.intCode}))`;
     switch (e.type.kind) {
       case 'uint': return e.code;
       case 'int': return `((unsigned int)(${e.code}))`;
@@ -45953,7 +46015,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     return this.convert(e, target);
   }
 
-  private convert(e: { code: string; type: CType }, target: CType): string {
+  private convert(e: { code: string; type: CType; intCode?: string; intKind?: string }, target: CType): string {
     // dynamic -> concrete: unbox at runtime.
     if (e.type.kind === 'any' && target.kind !== 'any') {
       return this.unboxAny(e, target);
@@ -46064,8 +46126,19 @@ void FileStream_writeObject(void* _this, as_value v) {
       const where = this.currentClass ? ` in ${this.currentClass}${this.currentMethod ? '.' + this.currentMethod : ''}` : '';
       throw new CodegenError(`cannot convert ${this.describeType(e.type)} to ${target.kind}${where}`);
     }
-    if (target.kind === 'int') return e.type.kind === 'number' ? `as_to_int32(${e.code})` : `((int)(${e.code}))`;
-    if (target.kind === 'uint') return e.type.kind === 'number' ? `as_to_uint32(${e.code})` : `((unsigned int)(${e.code}))`;
+    if (target.kind === 'int') {
+      // #33 int-store fast path: an int×int / uint×uint arithmetic result carries
+      // its native int32 wrap (intCode); storing to an int slot is exactly where
+      // AIR wraps too, so the native form is both correct and fast (no ToInt32
+      // helper call in the stage-451 hot loops). Without intCode the double form
+      // goes through the ES3 ToInt32 helper.
+      if (e.intCode) return e.intKind === 'int' ? e.intCode : `((int)(${e.intCode}))`;
+      return e.type.kind === 'number' ? `as_to_int32(${e.code})` : `((int)(${e.code}))`;
+    }
+    if (target.kind === 'uint') {
+      if (e.intCode) return e.intKind === 'uint' ? e.intCode : `((unsigned int)(${e.intCode}))`;
+      return e.type.kind === 'number' ? `as_to_uint32(${e.code})` : `((unsigned int)(${e.code}))`;
+    }
     // 64-bit slots: every scalar source converts exactly through to64Expr (the
     // dynamic `*` case was already unboxed above).
     if (target.kind === 'int64' || target.kind === 'uint64') return this.to64Expr(e, target.kind);
