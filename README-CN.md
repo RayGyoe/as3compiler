@@ -212,7 +212,8 @@ error 103，而异命名空间的元素/属性四种写法**全部**报 103；`a
 三重组合探针已验证恢复并正常退出。
 
 **一键发布打包（阶段三百零六～三百零八）**：`--package app` 直接产出继承 AIR `<id>`/`<name>`/
-`<versionNumber>`/`<versionLabel>`/`<icon>` 的 macOS `.app` 并 ad-hoc 签名；`--package dmg` 对嵌套原生库与
+`<versionNumber>`/`<versionLabel>`/`<icon>`/`<copyright>`（→ `NSHumanReadableCopyright`，阶段四百五十六）
+的 macOS `.app` 并 ad-hoc 签名；`--package dmg` 对嵌套原生库与
 ANE 最深层优先做 Developer ID + Hardened Runtime 签名，依次完成 app/DMG 公证、staple、UDZO 镜像和
 Gatekeeper 验收；`--package exe` 在 Windows 上生成 ICO、VERSIONINFO、DPI/长路径 application manifest，
 并可选 Authenticode。凭据只从清单非密字段、环境变量与钥匙串读取，密码日志强制脱敏。`xcode-project`

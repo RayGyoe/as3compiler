@@ -26,9 +26,17 @@ export interface MacPlistOptions {
   buildVersion: string;
   deploymentTarget: string;
   iconName: string | null;
+  // AIR `<copyright>` -> NSHumanReadableCopyright, the string Finder's Get Info
+  // and the standard About panel show. Empty means the descriptor said nothing,
+  // and then the KEY IS ABSENT rather than present-and-blank (same rule as the
+  // Windows VERSIONINFO: never fabricate a legal notice).
+  copyright: string;
 }
 
-function xml(text: string): string {
+// Shared by both Info.plist writers (this file and xcode-project.ts): a plist is
+// XML, so an unescaped `&` in a copyright line is a malformed bundle, not a
+// cosmetic defect. Exported so the two cannot drift apart.
+export function plistXml(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
@@ -46,6 +54,10 @@ export function appInfoPlist(options: MacPlistOptions): string {
     ['CFBundleVersion', options.buildVersion],
   ];
   if (options.executable !== null) entries.splice(1, 0, ['CFBundleExecutable', options.executable]);
+  // Unlike llvm-rc on Windows (which refuses non-ASCII without /C 65001), a plist
+  // is UTF-8 XML: a Chinese copyright -- or the invisible U+200E a real descriptor
+  // carried -- needs no code page handling and travels verbatim.
+  if (options.copyright) entries.push(['NSHumanReadableCopyright', options.copyright]);
   if (options.deploymentTarget) entries.push(['LSMinimumSystemVersion', options.deploymentTarget]);
   if (options.iconName !== null) entries.push(['CFBundleIconFile', options.iconName]);
   const lines = [
@@ -54,7 +66,7 @@ export function appInfoPlist(options: MacPlistOptions): string {
     '<plist version="1.0">',
     '<dict>',
   ];
-  for (const [key, value] of entries) lines.push(`\t<key>${key}</key>`, `\t<string>${xml(value)}</string>`);
+  for (const [key, value] of entries) lines.push(`\t<key>${key}</key>`, `\t<string>${plistXml(value)}</string>`);
   lines.push('\t<key>NSHighResolutionCapable</key>', '\t<true/>', '</dict>', '</plist>', '');
   return lines.join('\n');
 }
@@ -155,6 +167,7 @@ export function createMacApp(cfg: BuildConfig, compiledBinary: string, base: str
     buildVersion: layout.buildVersion,
     deploymentTarget: cfg.deploymentTarget,
     iconName: icon ? 'AppIcon' : null,
+    copyright: cfg.legalCopyright,
   }));
   prepareAneBundles(layout.appPath);
   return layout;
@@ -186,6 +199,9 @@ function prepareAneBundles(appPath: string): void {
       buildVersion: '1',
       deploymentTarget: '',
       iconName: null,
+      // The app's copyright is not the extension's: an ANE bundle gets the
+      // minimal identity codesign needs and no borrowed legal notice.
+      copyright: '',
     }).replace('<string>APPL</string>', '<string>BNDL</string>'));
   }
 }

@@ -1314,6 +1314,23 @@ function checkXcodeProjectParity(): string[] {
   check('a --features macro reaches GCC_PREPROCESSOR_DEFINITIONS (ASC_USE_SVG=1)',
     defines.includes('"ASC_USE_SVG=1"'));
 
+  // ---- AIR <copyright> on the Xcode path too (阶段四百五十六) ----
+  // --package app and --package xcode-project are two ways to ship the SAME
+  // macOS bundle; a legal notice that only one of them carries is a defect.
+  const projPlist = readFileSync(join(proj.projectPath, 'Info.plist'), 'utf8');
+  check('no configured copyright writes NO copyright key in the Xcode Info.plist',
+    !projPlist.includes('NSHumanReadableCopyright'));
+  const legalC = join(outDir, 'Legal.c');
+  writeFileSync(legalC, 'int main(void) { return 0; }\n');
+  const legalProj = generateXcodeProject(
+    { ...defaultBuildConfig(), package: 'xcode-project', legalCopyright: 'Copyright (C) 2026 A&B <Labs>' },
+    legalC, outDir, 'Legal');
+  const legalPlist = readFileSync(join(legalProj.projectPath, 'Info.plist'), 'utf8');
+  check('a configured copyright reaches the Xcode Info.plist',
+    legalPlist.includes('<key>NSHumanReadableCopyright</key>'));
+  check('…XML-escaped through the SAME escaper the script-built .app uses',
+    legalPlist.includes('Copyright (C) 2026 A&amp;B &lt;Labs&gt;'));
+
   if (ok > 0) console.log(`[xcode] ${ok} xcode-project parity checks passed`);
   return bad;
 }

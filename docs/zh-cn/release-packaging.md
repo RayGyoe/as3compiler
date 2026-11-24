@@ -39,8 +39,8 @@ argv 执行，不拼 shell 命令；路径中的空格无需另写转义。
 | `<name>` | 显示名，回退 `<filename>` |
 | `<versionNumber>` | `CFBundleShortVersionString` / Windows VERSIONINFO |
 | `<versionLabel>` | `CFBundleVersion`，缺省 `0` |
-| `<copyright>` | Windows VERSIONINFO `LegalCopyright` |
-| `<publisher>` | Windows VERSIONINFO `CompanyName` |
+| `<copyright>` | Windows VERSIONINFO `LegalCopyright`；macOS `Info.plist` 的 `NSHumanReadableCopyright` |
+| `<publisher>` | Windows VERSIONINFO `CompanyName`（macOS 无对应的可见字段，不写） |
 | `<icon><imageNNxNN>` | 各尺寸 PNG，macOS 生成 `.icns`，Windows 生成 PNG-compressed ICO |
 
 有效优先级是 **环境变量（仅签名凭据）→ 显式构建清单 → AIR 描述符 → 默认值**。
@@ -52,8 +52,11 @@ argv 执行，不拼 shell 命令；路径中的空格无需另写转义。
 `legal-copyright`、`windows-subsystem`、`signing-identity`、`notary-profile`、`entitlements`、
 `timestamp-server`。
 路径均相对清单目录。缺省 bundle id 仍是 `com.example.<product>`，Windows 最低版本为 10.0。
-`company-name`/`legal-copyright` 只在描述符或清单真的给出时才落进资源；缺省仍是公司名为空串，
-不臆造厂商。
+`company-name`/`legal-copyright` 只在描述符或清单真的给出时才落进产物；缺省仍是公司名为空串，
+不臆造厂商。**`legal-copyright` 是双端字段**（阶段四百五十六）：Windows 进 VERSIONINFO，
+macOS 进 `NSHumanReadableCopyright`——描述符没写时**整个键不出现**，而不是留一个空版权。
+`company-name` 仍是 Windows 独有：Finder 简介与关于面板只显示名称、版本、版权，macOS 没有
+「公司」这一栏，故不臆造一个键去放它。
 
 `--doctor` 在相应发布形态下检查系统签名工具、Developer ID 私钥、离线 keychain profile 查询、
 `llvm-rc` 与 `signtool`。真实公证只在 `--package dmg` 时发起网络请求。
@@ -72,8 +75,24 @@ MyApp.app/
 ```
 
 `Info.plist` 含 `CFBundleExecutable`、`CFBundleIdentifier`、`CFBundleName`、两个版本字段、
-`NSHighResolutionCapable=true` 和 `LSMinimumSystemVersion`。描述符图标经 iconset + `iconutil`
+`NSHighResolutionCapable=true` 和 `LSMinimumSystemVersion`；描述符给了 `<copyright>` 时再加
+`NSHumanReadableCopyright`（阶段四百五十六）。描述符图标经 iconset + `iconutil`
 转换；每个声明尺寸都必须是真实 PNG 且尺寸相符，不会拿别的尺寸静默顶替。
+
+**版权在 macOS 的两条路径**（阶段四百五十六）：`--package app`/`dmg` 与 `--package xcode-project`
+写的是同一份 `Info.plist` 语义，故共用 `app-bundle.ts` 导出的同一个 XML 转义器——真实版权行里的
+`&`、`<`、引号若不转义就是**坏 plist**，不是外观问题。与 Windows 的 `llvm-rc` 不同，plist 是
+UTF-8 XML：中文版权、乃至真描述符里夹的不可见 U+200E **无需代码页处理**，逐字带出即可
+（Windows 侧那一步 `/C 65001` 见 §5）。嵌套 ANE 的 `BNDL` plist **不继承** app 的版权。
+
+实测（macOS arm64，`--air-app` 描述符带中文 `<copyright>`）：`PlistBuddy -c "Print
+:NSHumanReadableCopyright"` 从 `.app` 与 `.xcodeproj` 两份 plist 读回同一串（含 U+200E），
+`plutil -lint` 均 OK，ad-hoc 签名 `codesign --verify` 通过。`--package dmg` 走同一个
+`createMacApp`，故版权同样进公证前的那份 plist。
+
+**边界**：已存在的 `.xcodeproj` 走 smart-merge（只刷源文件清单、保留开发者手改），
+**不重写 `Info.plist`**。给旧工程新添 `<copyright>` 需删掉工程重建——这与 `<name>`/图标/版本
+在该路径上的既有行为一致，不是版权字段特有的限制。
 
 链接产物直接落在最终 `Contents/MacOS/` 路径，因此既有的可执行文件相对资源与 ANE 布局不需搬迁。
 带点号的 ANE 目录会被 `codesign` 识别为嵌套 bundle：打包器为其补最小 `BNDL` 类型

@@ -25,8 +25,10 @@ without producing a release or contacting Apple. External tools receive argv arr
 ## Metadata and manifest fields
 
 `--air-app` now maps `<id>`, `<name>` (fallback `<filename>`), `<versionNumber>`,
-`<versionLabel>`, `<copyright>` (VERSIONINFO `LegalCopyright`), `<publisher>` (VERSIONINFO
-`CompanyName`) and `<icon><imageNNxNN>` into release metadata. Precedence is
+`<versionLabel>`, `<copyright>` (Windows VERSIONINFO `LegalCopyright` **and** macOS
+`NSHumanReadableCopyright`), `<publisher>` (Windows VERSIONINFO `CompanyName`; macOS has no
+matching visible field, so nothing is written there) and `<icon><imageNNxNN>` into release
+metadata. Precedence is
 **environment (signing overrides only) → explicit build manifest → AIR descriptor → defaults**.
 With `--air-app app.xml --manifest release.json`, the explicit manifest is a **release overlay**
 applied after the generated one, so signing and entitlements survive `<filename>.build.json`
@@ -36,9 +38,12 @@ product name or version therefore only requires editing `app.xml`.
 New/extended manifest keys are `air-icons`, `version`, `build-version`, `company-name`,
 `legal-copyright`, `windows-subsystem`, `signing-identity`, `notary-profile`, `entitlements` and
 `timestamp-server`.
-Relative paths resolve from the manifest. `company-name`/`legal-copyright` only reach the resource
+Relative paths resolve from the manifest. `company-name`/`legal-copyright` only reach the artifact
 when the descriptor or manifest actually supplies them: the default stays an empty company, never a
-fabricated vendor.
+fabricated vendor. **`legal-copyright` is a two-platform field** (stage 456): VERSIONINFO on Windows,
+`NSHumanReadableCopyright` on macOS. With no copyright declared the **whole key is absent** rather
+than present-and-blank. `company-name` stays Windows-only: Finder's Get Info and the About panel show
+name, version and copyright, and macOS has no "company" slot to invent a key for.
 `--doctor` checks the applicable platform tools, Developer ID private key, offline keychain profile,
 `llvm-rc` and `signtool`; only an actual DMG build contacts Apple's notary service.
 
@@ -48,6 +53,29 @@ The bundle has the standard `Contents/{Info.plist,PkgInfo,MacOS,Resources}` layo
 are converted through an iconset and `iconutil`; each declared image must be a real PNG of its declared
 size. The executable is linked directly at its final `Contents/MacOS/` path so executable-relative
 assets and ANEs retain their existing layout.
+
+`Info.plist` carries `CFBundleExecutable`, `CFBundleIdentifier`, `CFBundleName`, both version fields,
+`NSHighResolutionCapable=true` and `LSMinimumSystemVersion`, plus `NSHumanReadableCopyright` when the
+descriptor declares `<copyright>` (stage 456).
+
+**Copyright on both macOS paths** (stage 456): `--package app`/`dmg` and `--package xcode-project`
+write the same `Info.plist` semantics, so they share the one XML escaper exported from
+`app-bundle.ts` — an unescaped `&`, `<` or quote in a real copyright line is a **malformed plist**, not
+a cosmetic defect. Unlike `llvm-rc` on Windows, a plist is UTF-8 XML: a Chinese copyright, or the
+invisible U+200E a real descriptor carried, needs **no code page step** and travels verbatim (the
+Windows `/C 65001` step is in the Windows section below). A nested ANE's `BNDL` plist does **not**
+inherit the app's copyright.
+
+Measured (macOS arm64, `--air-app` descriptor with a Chinese `<copyright>`):
+`PlistBuddy -c "Print :NSHumanReadableCopyright"` reads the same string back from both the `.app` and
+the `.xcodeproj` plist (U+200E included), `plutil -lint` reports OK for both, and the ad-hoc
+`codesign --verify` passes. `--package dmg` goes through the same `createMacApp`, so the copyright
+also reaches the plist that gets notarized.
+
+**Boundary**: an existing `.xcodeproj` takes the smart-merge path (refresh the source list only, keep
+the developer's hand edits) and does **not** rewrite `Info.plist`. Adding `<copyright>` to an old
+project requires deleting and regenerating it — the same existing behaviour as `<name>`, icons and
+versions on that path, not a limitation specific to the copyright field.
 
 Dotted ANE directories are nested code bundles to `codesign`. Packaging gives each ANE a minimal
 `BNDL` Info.plist, signs every ANE and then the outer app; it never uses `codesign --deep`.

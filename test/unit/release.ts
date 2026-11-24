@@ -60,28 +60,61 @@ registerGroup('release/AppBundle', () => {
     buildVersion: '42',
     deploymentTarget: cfg.deploymentTarget,
     iconName: 'AppIcon',
+    copyright: '',
   });
   check('bundle has a native executable path', layout.binaryPath.endsWith('Prune.app/Contents/MacOS/Prune'));
   check('plist carries short and build versions', plist.includes('<string>1.2.3</string>') && plist.includes('<string>42</string>'));
   check('plist escapes display-name XML', plist.includes('A &amp; &lt;B&gt;'));
   check('plist carries descriptor bundle id', plist.includes('com.example.prune'));
 
+  // ---- AIR <copyright> on macOS (阶段四百五十六) ----
+  // Windows got LegalCopyright in VERSIONINFO at 阶段四百四十八; the macOS side of
+  // the SAME descriptor field is NSHumanReadableCopyright, which is what Finder's
+  // Get Info and the About panel read. Measured before the fix: a real
+  // `--package app` bundle carried eight keys and no copyright at all.
+  check('a descriptor with no <copyright> writes NO copyright key (never a blank notice)',
+    !plist.includes('NSHumanReadableCopyright'));
+  const copyrighted = appInfoPlist({
+    executable: 'Prune', bundleId: cfg.bundleId, displayName: 'Prune',
+    version: cfg.version, buildVersion: '42', deploymentTarget: cfg.deploymentTarget,
+    iconName: null, copyright: 'Copyright (C) 2026 A&B <Labs> "quoted"',
+  });
+  check('a copyright reaches NSHumanReadableCopyright',
+    copyrighted.includes('<key>NSHumanReadableCopyright</key>'));
+  check('…XML-escaped, so & and <> cannot malform the plist',
+    copyrighted.includes('Copyright (C) 2026 A&amp;B &lt;Labs&gt; &quot;quoted&quot;'));
+  // llvm-rc refuses non-ASCII without /C 65001 (阶段四百四十八). A plist is UTF-8
+  // XML, so the same string needs no code page and the invisible U+200E a real
+  // descriptor carried travels verbatim rather than being scrubbed.
+  const cn = appInfoPlist({
+    executable: 'Prune', bundleId: cfg.bundleId, displayName: 'Prune',
+    version: cfg.version, buildVersion: '42', deploymentTarget: '',
+    iconName: null, copyright: '版权所有 \u200E(C) 2026 拓麦',
+  });
+  check('a non-ASCII copyright is carried verbatim (UTF-8 plist, no code page step)',
+    cn.includes('版权所有 \u200E(C) 2026 拓麦'));
+
   const out = join(root, 'temp', 'unit-release-app');
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
   const binary = join(out, 'input');
   writeFileSync(binary, '#!/bin/sh\nexit 0\n');
-  const app = createMacApp({ ...cfg, airIcons: {} }, binary, join(out, 'Prune'));
+  const app = createMacApp({ ...cfg, airIcons: {}, legalCopyright: 'Copyright (C) 2026 拓麦' }, binary, join(out, 'Prune'));
   check('bundle creates executable', existsSync(app.binaryPath));
   check('bundle writes Info.plist', existsSync(app.plistPath));
   check('bundle leaves no fake icon', !existsSync(app.iconPath));
   check('written plist is concrete, not Xcode variables', !readFileSync(app.plistPath, 'utf8').includes('$(EXECUTABLE_NAME)'));
   const ane = join(app.appPath, 'Contents', 'MacOS', 'extensions', 'com.example.volume');
   mkdirSync(ane, { recursive: true });
-  createMacApp({ ...cfg, airIcons: {} }, binary, join(out, 'Prune'));
+  createMacApp({ ...cfg, airIcons: {}, legalCopyright: 'Copyright (C) 2026 拓麦' }, binary, join(out, 'Prune'));
   const anePlist = readFileSync(join(ane, 'Info.plist'), 'utf8');
   check('reverse-DNS ANE directory becomes a signable bundle', anePlist.includes('com.example.volume') && anePlist.includes('BNDL'));
   check('ANE bundle does not invent an executable', !anePlist.includes('CFBundleExecutable'));
+  check('the written .app plist carries the configured copyright end to end',
+    readFileSync(app.plistPath, 'utf8').includes('<key>NSHumanReadableCopyright</key>'));
+  check('an ANE bundle does not inherit the app copyright', !anePlist.includes('NSHumanReadableCopyright'));
+  check('both macOS plist writers share ONE XML escaper (no drift between app and xcode)',
+    readFileSync(join(root, 'src', 'xcode-project.ts'), 'utf8').includes("import { plistXml } from './app-bundle.ts'"));
   const freHost = join(app.contentsPath, 'MacOS', 'libasaot.dylib');
   writeFileSync(freHost, 'test fixture, not a loadable dylib');
   check('ad-hoc inventory includes the standalone FRE host dylib', nestedNativeImages(app.appPath).includes(freHost));

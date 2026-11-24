@@ -196,7 +196,8 @@ covers the loader and import surface only — it has never been run on real Win7
 what is and is not proven is in [`win32.md`](docs/en/win32.md) §6.
 
 **One-command release packaging (stages 306–308)**: `--package app` builds a macOS `.app` from AIR
-`<id>`/`<name>`/`<versionNumber>`/`<versionLabel>`/`<icon>` metadata and ad-hoc signs it. `--package dmg` signs
+`<id>`/`<name>`/`<versionNumber>`/`<versionLabel>`/`<icon>`/`<copyright>` (→ `NSHumanReadableCopyright`,
+stage 456) metadata and ad-hoc signs it. `--package dmg` signs
 nested native libraries and ANEs deepest-first with Developer ID + Hardened Runtime, then notarizes and staples
 the app and UDZO DMG and runs Gatekeeper checks. `--package exe` adds ICO, VERSIONINFO, a DPI/long-path
 application manifest and optional Authenticode on Windows. Credentials stay in non-secret manifest fields,

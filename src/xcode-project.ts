@@ -17,6 +17,7 @@ import { dirname, join, resolve, basename } from 'node:path';
 import type { BuildConfig } from './build.ts';
 import { withNativeDesktopBackends, platformFrameworks, platformLinkLibs, fpFlags, perfFlags, debugInfoFlags, effectiveDefines, exportDynamicFlags, writeIcuAssembly } from './build.ts';
 import { parsePlist, serializePlist, asDict, asArray, scalarText, dictEntry, type PlistValue } from './pbxproj.ts';
+import { plistXml } from './app-bundle.ts';
 
 // A .xcodeproj is a directory containing project.pbxproj plus an optional
 // shared scheme (so `xcodebuild -scheme NAME` works from the command line).
@@ -314,7 +315,7 @@ export function generateXcodeProject(
   // with a raw `cc` output binary of the same product name (e.g. `air-native`),
   // which would otherwise make mkdirSync throw EEXIST. Referenced via
   // INFOPLIST_FILE relative to the project directory.
-  writeFileSync(join(projectPath, 'Info.plist'), infoPlist(displayName, iconName));
+  writeFileSync(join(projectPath, 'Info.plist'), infoPlist(displayName, iconName, cfg.legalCopyright));
 
   // Shared scheme so `xcodebuild -scheme NAME` resolves without opening Xcode.
   const schemeDir = join(projectPath, 'xcshareddata', 'xcschemes');
@@ -354,7 +355,7 @@ function esc(s: string): string {
 // A minimal but valid Info.plist for a macOS GUI application. Values that Xcode
 // derives (executable name, bundle id, min system version) are injected via
 // $(VAR) build settings so they stay in sync with the target configuration.
-function infoPlist(displayName: string, iconName: string | null): string {
+function infoPlist(displayName: string, iconName: string | null, copyright: string): string {
   const lines = [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
@@ -384,6 +385,13 @@ function infoPlist(displayName: string, iconName: string | null): string {
   if (iconName) {
     lines.push('\t<key>CFBundleIconFile</key>');
     lines.push('\t<string>' + iconName + '</string>');
+  }
+  // AIR <copyright>, the same field the script-built .app carries. A real
+  // copyright line contains `&` and quotes, so it goes through the shared plist
+  // escaper rather than the raw concatenation the fixed literals above use.
+  if (copyright) {
+    lines.push('\t<key>NSHumanReadableCopyright</key>');
+    lines.push('\t<string>' + plistXml(copyright) + '</string>');
   }
   lines.push('</dict>', '</plist>', '');
   return lines.join('\n');

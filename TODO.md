@@ -23630,6 +23630,85 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
 
+### 阶段四百五十六：macOS 发布版权元信息——Windows 近期修复的 mac 对齐审计（v0.4.430 → v0.4.431）✅ 已完成
+
+**立项依据**：用户「最近 windows 上修复了很多问题，看看有需要 mac 对齐的吗」。逐条核完 447–455
+九个提交（工作树干净、已与 `origin/main` 同步），**只有 448 的版权元信息在 mac 侧缺位**，其余要么
+平台无关、要么根因在 mac 不存在。审计结论先行，避免把「Windows 修了」误读成「mac 也坏了」：
+
+| 阶段 | mac 是否需要对齐 | 依据（本轮实测/核对） |
+|---|---|---|
+| 447 GPU 销毁卡死 | **否** | 根因是 Skia `checkGlError` 的 `glGetError` 死循环，**GL 专属**；`gl_glue.cc` 只在 `air-app.ts:788` 的 Windows 档进链集，mac 走 `metal_glue.mm`，无 `glDelete*` 循环 |
+| 448 公司/版权元信息 | **是（本阶段）** | `<copyright>` 已进 `cfg.legalCopyright`，但只有 `windows-release.ts` 消费 |
+| 449 PE 子系统 GUI | **否** | Mach-O 无 subsystem 字段；mac 的「双击不弹终端」等价物就是 `.app`，已有 |
+| 450 trace 闸门 | **否，已生效** | `traceEnabled` 已含 `app`/`dmg`；实测 mac `.app` 里 `trace("hello",name)` 编成 `do { (void)("hello"); (void)(g_name); } while (0)`——参数仍求值、输出编译掉 |
+| 451 元素循环向量化 | **否，已生效且更快** | mac arm64 实测 24×1M：`vecnum=8 ms` / `vecint=3 ms`（Windows 12–13 / 3–5）；`-Rpass=loop-vectorize` 确认 width 4（int）/ 2（double）、interleave 4 |
+| 452/453 不透明位图 alpha/预乘 | **否** | 全在 `src/emit.ts`，平台无关 |
+| 454 Windows 透明窗 | **否** | mac 早有 CALayer 路径（阶段二百五十七），vibrancy 是 opt-in 默认关、与 AIR 一致 |
+| 455 int/uint 回绕 | **否** | 同在 `emit.ts`；mac 探针里回绕同样成立（`vi1=-1557457583`） |
+
+**问题**：`--package app` 产出的 `.app`，Finder 简介与关于面板**没有版权行**。实测修前
+`node src/index.ts examples/hello.as --package app` 的 `Info.plist` 只有 8 个键，无
+`NSHumanReadableCopyright`。`<copyright>` 自阶段四百四十八 起就解析进了 `cfg.legalCopyright`
+（`air-app.ts:1435`），但**只有 Windows 的 VERSIONINFO 消费它**——macOS 两条打包路径
+（`app-bundle.ts` 的脚本 `.app`、`xcode-project.ts` 的 IDE 工程）都没接。
+
+**修法**：
+
+- `src/app-bundle.ts`：`MacPlistOptions` 增 `copyright`，非空才写 `NSHumanReadableCopyright`；
+  `createMacApp` 传 `cfg.legalCopyright`。**缺省整个键不出现**，不是留一个空版权（与 Windows
+  「不臆造厂商」同一条规则）。嵌套 ANE 的 `BNDL` plist 传空串——**app 的版权不是扩展的版权**。
+- 原本私有的 XML 转义器导出为 `plistXml`，`xcode-project.ts` 导入复用：两条 mac 路径写的是同一份
+  plist 语义，真实版权行里的 `&`/`<`/引号不转义就是**坏 plist**，两份转义器必然漂移。
+- `src/xcode-project.ts`：`infoPlist` 增第三参 `copyright`，走同一个 `plistXml`（该文件其余字面量
+  仍是原样拼接，不动）。
+- **`company-name` 仍是 Windows 独有**：Finder 简介/关于面板只有名称、版本、版权，macOS 没有
+  「公司」这一栏，不臆造一个键去放它。
+
+**与 Windows 的一处真实差异**：`llvm-rc` 见到非 ASCII 就拒绝，故 448 必须同时加 `/C 65001`；
+plist 是 **UTF-8 XML**，中文版权乃至真描述符里夹的不可见 U+200E **无需任何代码页处理**，逐字带出即可。
+
+**证据**（macOS arm64，真 `--air-app` 全链路，`temp/macalign/legal/`）：描述符
+`<copyright>版权所有 ‎(C) 2026 拓麦医疗</copyright>` → 生成清单 `legal-copyright` →
+`PlistBuddy -c "Print :NSHumanReadableCopyright"` 从 **`.app` 与 `.xcodeproj` 两份 plist** 读回同一串
+（含 U+200E），`plutil -lint` 均 **OK**，ad-hoc `codesign --verify` 通过。`--package dmg` 走同一个
+`createMacApp`，故版权同样进公证前的那份 plist。**边界**：已存在的 `.xcodeproj` 走 smart-merge
+（只刷源文件清单、保留手改），**不重写 `Info.plist`**；旧工程新添版权需删掉重建——这与
+`<name>`/图标/版本在该路径上的既有行为一致，已写进中英文档。
+
+**单元钉子**：`unit: release/AppBundle` +7（无版权不写键 / 有值写键 / XML 转义 / 非 ASCII 逐字 /
+端到端读盘 / ANE 不继承 / 两条路径共用一个转义器）；`unit: build/XcodeProjectParity` +3
+（缺省不写键 / 有值写键 / 同一个转义器）。两组全绿。
+
+**本轮审计另外发现的两处「两端共同缺口」（未修，也未登记进遗留表——尚缺 adl 对照实测）**：
+
+1. **透明 + GPU 窗口**：`present_frame` 只在 `!c->is_gpu` 时被调用（`window_glue.cc:1041`），
+   Metal 与 D3D12 两条 GPU 路径都不读 `c->transparent` ⇒ alpha-0 画黑，且**不报明**（只有 Linux
+   的 `#else` 分支会报一次）。**代码级判定，未实测**；要定性得先拿真窗口探针 + adl 对照。
+2. **「问 surface 自己」的像素格式原则没走到底**：CPU 掩码路径已改为读 `colorType()`，但
+   `sk_mac_present_layer`（`window_glue.cc:2557`）仍写死 `kCGImageAlphaPremultipliedLast`，
+   Windows 的 ULW 也写死 BGRA。`win32.md` 自己写着「macOS 未复测」。
+
+**收尾全量回归时又抓到一个真的 mac 缺口（本轮未修）**：`examples/yuv420-gpu/yuv420-gpu.build.json`
+当前是 **Windows 专用**，与它自己的提交信息（`66d5573`「清单修回双平台（`${win:}`/`${mac:}` 条件式）」）
+**不符**：该提交的实际内容把 `metal_glue.mm` 换成 `d3d_glue.cc`、SDL 头换成 `windows-x64`、
+`frameworks` 清空，甚至还新增了重复的 `d3d12`/`d3dcompiler`。实测（mac arm64）：
+`node src/index.ts examples/yuv420-gpu/src/Main.as --manifest examples/yuv420-gpu/yuv420-gpu.build.json`
+⇒ `SDL_syswm.h:54: fatal error: 'windows.h' file not found`——**与 448 在 `s3d-multiwindow` 上修过的
+同一个坑**。另有一层 durability 问题：该示例的回归用 `--air-app`（`test/examples.ts:885`），
+而 `--air-app` 会 **重写** `<filename>.build.json`，所以任何一次全量回归都会把手工维护的
+宿主模板冲掉（本轮在 mac 上就把它写回了 mac 专用版，已 `git checkout` 复原，证据存
+`temp/macalign/yuv420-gpu.build.json.mac-clobbered`）。`s3d-multiwindow` 之所以稳定，是因为它的
+回归走 `--manifest`。**修法需同时解决这两层**（宿主模板 + 回归不得回写 fixtures），否则修了也留不住。
+
+**一处差点误报**：`NativeWindow.transparent` 是**只读**属性（`emit.ts:7800` 只发 getter），
+运行期「关回不透明」这条路 AS3 根本走不到 ⇒ Windows 那句「关掉时摘除 `WS_EX_LAYERED`」是防御性
+代码，mac 的 layer-hosting 转换不可逆**不构成缺口**。核对 API 形状再下结论，别被对端的实现细节带跑。
+
+**经验**：① 「对端修了 N 个」不等于「本端坏了 N 个」——先按**根因是否在本端存在**分类，再谈对齐；
+② 跨端字段要查**消费端**而不是解析端：`legal-copyright` 解析了三个月，mac 侧一直是空转；
+③ 同一份产物的两条生成路径（脚本 / IDE）必须共用序列化原语，否则转义规则一定漂移。
+
 ### 阶段四百五十五：int/uint 算术 double 计算 + 落槽回绕——反向双值发射，保整型热点零回归（v0.4.429 → v0.4.430）✅ 已完成
 
 **问题**（遗留表 #33 行）：发射层给 int×int / uint×uint 直接发 C 的 `int`/`unsigned` 运算，结果类型也标 int/uint。
