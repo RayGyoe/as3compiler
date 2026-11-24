@@ -104,6 +104,7 @@ examples/air-native/air-native-offscreen
 # and friends next to their .as, examples/textfield/textfield.build.json, and
 # examples/web/hello-web.build.json (the canonical web manifest airManifest mirrors).
 examples/ane-app/ane-app.build.json
+examples/transparent-gpu/transparent-gpu.build.json
 examples/air-native/air-native.build.json
 examples/air-native/air-native-offscreen.build.json
 examples/shmup-stage3d/shmup-stage3d.build.json

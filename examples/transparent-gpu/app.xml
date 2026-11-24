@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<application xmlns="http://ns.adobe.com/air/application/51.0">
+  <id>demo.as3.transparentgpu</id>
+  <versionNumber>1.0</versionNumber>
+  <filename>transparent-gpu</filename>
+  <architecture>64</architecture>
+  <initialWindow>
+    <content>main.swf</content>
+    <title>transparent-gpu</title>
+    <systemChrome>none</systemChrome>
+    <transparent>true</transparent>
+    <visible>true</visible>
+    <x>120</x><y>120</y>
+    <width>300</width><height>200</height>
+    <resizable>false</resizable>
+    <renderMode>direct</renderMode>
+    <requestedDisplayResolution>high</requestedDisplayResolution>
+  </initialWindow>
+</application>

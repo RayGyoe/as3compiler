@@ -419,6 +419,12 @@ struct WinCtx {
   // Both NULL on every other backend and on a non-transparent window.
   void* vib_eff;
   void* vib_host;
+#if defined(__APPLE__)
+  // Set once the GPU transparent platform step has run (sk_mac_apply_gpu_transparent).
+  // The CPU path guards on vib_host instead; this one owns no extra view, so it needs
+  // its own latch to stay idempotent.
+  int content_hosted;
+#endif
 #if defined(_WIN32)
   // Windows transparent-window present path: a layered window (WS_EX_LAYERED) the
   // OS composites from a 32-bit premultiplied-BGRA DIB section via UpdateLayeredWindow
@@ -2416,10 +2422,20 @@ static void sk_layer_sync_scale(void* layer, double bs) {
   if (cur != bs) SK_SET_DBL(layer, "setContentsScale:", bs);
 }
 
-// The backing scale of the display this window is on right now (live NSWindow
-// query, the same one sk_window_device_scale uses). 0.0 when it cannot be read.
+// The scale this window's own layers must declare, read live from the NSWindow
+// (the same query sk_window_device_scale uses). 0.0 when it cannot be read.
 static double sk_window_live_scale(SDL_Window* win) {
-  return win != NULL ? sk_window_backing_scale(win) : 0.0;
+  if (win == NULL) return 0.0;
+  // Same gate as sk_window_device_scale / sk_client_size_live: a window without
+  // ALLOW_HIGHDPI renders at 1x, so its drawable IS its logical size and the layer
+  // must declare 1.0 -- NOT the display's backing scale. Measured (temp/transgpu):
+  // a 300x200 standard-resolution transparent window on a 2x panel handed a 300x200
+  // image to a layer declaring contentsScale=2, so the picture came out at HALF the
+  // window's linear size (painted bbox 200x200 device px inside a 600x400 capture),
+  // while adl fills the window. The opaque SDL path hid this because its renderer
+  // stretches the texture to the drawable -- measured as a 2px blurred band edge.
+  if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_ALLOW_HIGHDPI)) return 1.0;
+  return sk_window_backing_scale(win);
 }
 
 // Build the layer tree that replaces SDL's opaque backing store. Idempotent, and a
@@ -2521,6 +2537,48 @@ static void sk_mac_ensure_transparent(WinCtx* c) {
 #endif
   }
   c->vib_host = host;
+}
+
+// Defined with the rest of the transparency glue below (it also swizzles the
+// renderer's own view class); the GPU step needs it after the Metal view exists.
+static void sk_window_apply_transparent(SDL_Window* win, int on);
+
+// The GPU half of macOS transparency. Idempotent. Two steps, and BOTH are needed
+// -- measured as a four-way A/B (temp/transgpu, transparent <renderMode>direct</...>
+// window, unpainted third must be alpha 0 like adl 51.4.1):
+//
+//   neither                                -> {255: 240000}, unpainted (0,0,0,255)
+//   CAMetalLayer.opaque = NO only          -> unchanged (dead end)
+//   re-apply window/view opacity only      -> unchanged
+//   hosting only                           -> unchanged
+//   re-apply opacity + hosting             -> {0, 127, 255}, matches adl
+//
+// (1) sk_window_apply_transparent ran at window creation, BEFORE SDL_Metal_CreateView
+//     added its subview, so SDL_cocoametalview's -isOpaque override was never
+//     swizzled. Re-running it here reaches the view that actually presents.
+// (2) SDL's SDLView fills its backing store with opaque black every display pass, so
+//     the contentView must become layer-HOSTING with a non-opaque container -- the
+//     same fact sk_mac_ensure_transparent records. That function is unreachable here:
+//     it hangs off present_frame, which only runs when !c->is_gpu.
+//
+// Unlike the CPU path this must NOT hide SDL's subviews: the CAMetalLayer subview IS
+// the presenter. The AS3 side was already correct (the compose step clears to alpha 0
+// when w->transparent, src/emit.ts), so this is purely the platform half.
+static void sk_mac_apply_gpu_transparent(WinCtx* c) {
+  if (c == NULL || c->win == NULL || c->content_hosted) return;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info)) return;
+  if (info.subsystem != SDL_SYSWM_COCOA || info.info.cocoa.window == NULL) return;
+  sk_window_apply_transparent(c->win, 1);
+  void* view = SK_OBJ((void*)info.info.cocoa.window, "contentView");
+  if (view == NULL) return;
+  SK_SET_BOOL(view, "setWantsLayer:", 1);
+  void* container = SK_OBJ((void*)objc_getClass("CALayer"), "layer");
+  if (container == NULL) return;
+  SK_SET_BOOL(container, "setOpaque:", 0);
+  SK_SET_OBJ(view, "setLayer:", container);
+  c->content_hosted = 1;
 }
 
 // Re-pin every layer this path owns to the LIVE backing scale. Called from the
@@ -3036,6 +3094,13 @@ static int sk_attach_metal(WinCtx* c, int id) {
   }
   c->metal_view = view;
   c->is_gpu = 1;
+#if defined(__APPLE__)
+  // A transparent GPU window needs the contentView made layer-hosting; the CPU
+  // path's equivalent is unreachable from here (see sk_mac_apply_gpu_transparent).
+  // NativeWindow-created windows set `transparent` AFTER creation, so
+  // sk_window_set_transparent applies the same step for that order.
+  if (c->transparent) sk_mac_apply_gpu_transparent(c);
+#endif
   return 1;
 }
 #endif  // ASC_RENDER_METAL
@@ -4381,6 +4446,12 @@ void sk_window_set_transparent(int id, int on) {
   c->transparent = on ? 1 : 0;
   sk_window_apply_transparent(c->win, c->transparent);
   sk_renderer_apply_transparent(c->ren, c->transparent);
+#if defined(__APPLE__)
+  // A GPU window has no SDL_Renderer, so the line above is a no-op there and the
+  // hosting step is the whole platform side. Covers NativeWindowInitOptions, where
+  // the flag is written after the window (and its Metal view) already exists.
+  if (c->is_gpu && c->transparent) sk_mac_apply_gpu_transparent(c);
+#endif
   c->dirty = 1;
 }
 

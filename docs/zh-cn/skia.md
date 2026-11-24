@@ -1029,6 +1029,60 @@ talkmed meeting 的会议窗口同时播本地 1080p 采集 + 远端画面，帧
 新增 8 钉（裁剪先于游标、无重叠静默返回、逐格循环走裁剪后尺寸、bulk 条件、LE 走 memcpy、BE 走 bswap、
 短包回落顺序）。
 
+### 6.19 GPU 透明窗：contentView 必须 layer-hosting，且 opacity 要在 Metal 视图建好后重施（阶段四百五十八）
+
+**AIR 支持 `<transparent>true</transparent>` 配 `<renderMode>direct</renderMode>`**，所以这是对齐项不是增强。
+`adl 51.4.1` 实测（300x200 点窗口，左 1/3 不透明红、中 1/3 50% 蓝、右 1/3 **故意不画**，
+`requestedDisplayResolution=high`）：抓图 alpha 直方图 `{0: 80000, 127: 80000, 255: 80000}`，
+未画区 `(0,0,0,0)`。我们此前是 `{255: 240000}`——整幅不透明，未画区纯黑 `(0,0,0,255)`，
+50% 蓝被合成到黑底上变成 `(0,0,122,255)`，而 `nativeWindow.transparent` 照样回 `true`：**静默错语义**。
+
+**AS3 侧本来就是对的**：合成步在 `w->transparent` 时清 alpha 0 而不是舞台色（`src/emit.ts`）。
+丢的全在平台侧，而且是**两步缺一不可**：
+
+1. `sk_window_apply_transparent` 在建窗时跑过一次，那时 `SDL_Metal_CreateView` 还没加子视图，
+   所以 `SDL_cocoametalview` 的 `-isOpaque` 覆盖**没被 swizzle**。必须在 attach 之后重跑一次。
+2. SDL 的 `SDLView` 每次显示都把 backing store 刷成**不透明黑**（§6.7 的 CPU 透明路径早就记过这条），
+   所以 contentView 要改成 **layer-hosting + 非 opaque 容器层**。CPU 那份等价代码挂在
+   `present_frame` 上，而 `present_frame` 只在 `!c->is_gpu` 时调用 ⇒ GPU 窗口一次也没跑过它。
+
+**四态 A/B（全部实测，不是推断）**：
+
+| 改动 | 抓图 alpha |
+|---|---|
+| 原样 | `{255: 240000}` |
+| 只把 `CAMetalLayer.opaque = NO` | `{255: 240000}`（**死路**） |
+| 只重施 window/view opacity | `{255: 240000}` |
+| 只做 layer-hosting contentView | `{255: 240000}` |
+| **重施 opacity + layer-hosting** | **`{0, 127, 255}`，与 adl 同形** |
+
+落地在 `vendor/window_glue.cc::sk_mac_apply_gpu_transparent`，由 `sk_attach_metal`（描述符顺序）
+与 `sk_window_set_transparent`（`NativeWindowInitOptions` 顺序：标志写在窗口之后）两处调用，
+自带 `content_hosted` 闸门保证幂等。**不能隐藏 SDL 子视图**——CPU 透明路径那么做是对的，
+GPU 上那个 `CAMetalLayer` 子视图**就是呈现者**，隐藏即黑屏。
+
+**顺带修掉的第二条：标准分辨率透明窗内容只有半尺寸。** `sk_mac_sync_layer_scales` 用的是
+**显示器**的 backing scale，而窗口没有 `SDL_WINDOW_ALLOW_HIGHDPI` 时它的 drawable 就等于逻辑尺寸。
+`ASC_TRACE_TRANSPARENT` 实测 `img=300x200 layerbounds=300x200 scale=2.00` ⇒ 1x 的图按 2x 声明，
+画面只占窗口左上 1/4（抓图里 painted bbox 200x200 device px / 600x400）。不透明路径靠 SDL 渲染器
+把纹理拉满 drawable 掩盖了它（实测band 边缘有 2 px 模糊过渡）。修法是补上 `sk_window_device_scale`
+与 `sk_client_size_live` 已经在用的同一道闸门：没有该 flag 就声明 1.0。
+
+**零回归实测**：GPU 不透明窗仍是白底、`{255: 240000}`；程序化 resize 300→500 点后透明与不透明
+两条路的带边界**逐像素一致**（都在 300/600 device px，即默认 SHOW_ALL 的 1.5×）；修好的 GPU 透明窗
+3/3 次收到坐标正确的 `CLICK at 50,100`。
+
+**如实报明**：① 抓图的 RGB 与 adl 差一截（我们 `(234,51,35)` vs adl `(255,0,0)`），因为抓图落在
+显示器 P3 空间而我们给 layer 打了 sRGB 标签、adl 没打——那是既有色彩空间口径（§6.6 附近的 Ed26
+注记），本次**只判 alpha**，没有改动它。② Windows 的透明呈现走 CPU 路径的 `UpdateLayeredWindow`，
+**Windows 的 GPU 透明窗本轮未做也未实测**。③ 标准分辨率下画面仍是 1x 上采样（与不透明路径一致），
+那是 `<requestedDisplayResolution>` 的既有契约，不是本阶段的缺陷。
+
+回归：`examples/transparent-gpu/`（`--air-app` 编译+链接，判定要真窗口抓图，口径见其 README）
++ `unit: platform/TransparentGpu` **14 钉**（两步各自不可省、顺序、不隐藏子视图、幂等、
+`metal_glue` 不碰 opacity、`present_frame` 仍是 CPU-only、scale 闸门、Windows ULW 未动）。
+`unit: platform/PresentScale` 里那条钉住 `sk_window_live_scale` 旧函数体的断言按新契约重写。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

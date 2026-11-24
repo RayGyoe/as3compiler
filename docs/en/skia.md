@@ -907,6 +907,69 @@ semantic mutations (force visible only, force alpha only, drop the alpha restore
 > -- the Flutter `RepaintBoundary` mechanism. The full design lives in
 > [`repaint-boundary.md`](repaint-boundary.md).
 
+### 6.19 GPU transparent windows: the contentView must be layer-hosting, and opacity re-applied after the Metal view exists (stage four-hundred-fifty-eight)
+
+**AIR supports `<transparent>true</transparent>` together with `<renderMode>direct</renderMode>`**, so this is
+an alignment item, not an enhancement. Measured on `adl 51.4.1` (300x200-point window, left third opaque red,
+middle third 50% blue, right third **deliberately unpainted**, `requestedDisplayResolution=high`): the captured
+alpha histogram is `{0: 80000, 127: 80000, 255: 80000}` and the unpainted area reads `(0,0,0,0)`. Ours read
+`{255: 240000}` — fully opaque, unpainted area pure black `(0,0,0,255)`, the 50% blue composited over that black
+into `(0,0,122,255)`, while `nativeWindow.transparent` still answered `true`: a **silent wrong semantic**.
+
+**The AS3 side was already correct**: the compose step clears to alpha 0 rather than the stage colour when
+`w->transparent` (`src/emit.ts`). Everything missing was on the platform side, and it is **two steps, neither
+optional**:
+
+1. `sk_window_apply_transparent` ran at window creation, before `SDL_Metal_CreateView` added its subview, so
+   `SDL_cocoametalview`'s `-isOpaque` override **was never swizzled**. It has to run again after the attach.
+2. SDL's `SDLView` fills its backing store with **opaque black** on every display pass (the CPU transparent path
+   in §6.7 already records this fact), so the contentView must become **layer-hosting with a non-opaque
+   container layer**. The CPU equivalent hangs off `present_frame`, which is only called when `!c->is_gpu`
+   — so a GPU window never ran it.
+
+**Four-way A/B (all measured, none inferred)**:
+
+| change | captured alpha |
+|---|---|
+| as-is | `{255: 240000}` |
+| `CAMetalLayer.opaque = NO` only | `{255: 240000}` (**dead end**) |
+| re-apply window/view opacity only | `{255: 240000}` |
+| layer-hosting contentView only | `{255: 240000}` |
+| **re-apply opacity + layer-hosting** | **`{0, 127, 255}`, matches adl** |
+
+It lives in `vendor/window_glue.cc::sk_mac_apply_gpu_transparent`, called from `sk_attach_metal` (descriptor
+order) and `sk_window_set_transparent` (`NativeWindowInitOptions` order: the flag is written after the window
+exists), with its own `content_hosted` latch for idempotency. It must **not hide SDL's subviews** — that is
+correct for the CPU transparent path, but on GPU the `CAMetalLayer` subview **is the presenter**, so hiding it
+blanks the window.
+
+**Second defect fixed alongside: a standard-resolution transparent window drew at half size.**
+`sk_mac_sync_layer_scales` used the **display's** backing scale, while a window without
+`SDL_WINDOW_ALLOW_HIGHDPI` has a drawable equal to its logical size. `ASC_TRACE_TRANSPARENT` measured
+`img=300x200 layerbounds=300x200 scale=2.00` — a 1x image declared as 2x, so the picture covered only the
+top-left quarter (painted bbox 200x200 device px inside a 600x400 capture). The opaque path hid this because
+SDL's renderer stretches the texture to the drawable (measured as a 2px blurred band edge). The fix adds the
+same gate `sk_window_device_scale` and `sk_client_size_live` already use: without the flag, declare 1.0.
+
+**Zero-regression measurements**: an opaque GPU window is still white-backed with `{255: 240000}`; after a
+programmatic resize 300→500 points the band edges are **pixel-identical** between the transparent and opaque
+paths (both at 300/600 device px, i.e. the default SHOW_ALL 1.5x); the fixed GPU transparent window received a
+correctly positioned `CLICK at 50,100` in 3/3 runs.
+
+**Reported honestly**: (1) captured RGB differs from adl (ours `(234,51,35)` vs adl `(255,0,0)`) because the
+capture lands in the display's P3 space while we tag the layer sRGB and adl does not — that is the existing
+colour-space ruling (the Ed26 note near §6.6); this stage **judges alpha only** and did not change it.
+(2) Windows presents transparency through `UpdateLayeredWindow` on the CPU path; **Windows GPU transparency
+was neither implemented nor measured here**. (3) At standard resolution the picture is still a 1x upscale
+(same as the opaque path) — that is the existing `<requestedDisplayResolution>` contract, not a defect of
+this stage.
+
+Regression: `examples/transparent-gpu/` (`--air-app` compile+link; the verdict needs a real window capture,
+recipe in its README) + `unit: platform/TransparentGpu` **14 pins** (both steps mandatory, their order, no
+subview hiding, idempotency, `metal_glue` leaves opacity alone, `present_frame` still CPU-only, the scale gate,
+Windows ULW untouched). The `unit: platform/PresentScale` pin that froze the old body of
+`sk_window_live_scale` was rewritten to the new contract.
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.

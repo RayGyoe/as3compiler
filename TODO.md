@@ -23710,6 +23710,67 @@ plist 是 **UTF-8 XML**，中文版权乃至真描述符里夹的不可见 U+200
 ② 跨端字段要查**消费端**而不是解析端：`legal-copyright` 解析了三个月，mac 侧一直是空转；
 ③ 同一份产物的两条生成路径（脚本 / IDE）必须共用序列化原语，否则转义规则一定漂移。
 
+### 阶段四百五十八：GPU 透明窗真透明 + 标准分辨率透明窗不再半尺寸（v0.4.432 → v0.4.433）✅
+
+接阶段四百五十六/四百五十七那轮「Windows 修了这么多，mac 有要对齐的吗」的余波：当时把 454（Windows 透明窗）
+判为「mac 早有 CALayer 路径，无缺口」。**那个判断只对了一半**——mac 的透明只做在 **CPU 呈现路径**上，
+`<renderMode>direct</renderMode>` 的 GPU 窗从来没透明过。
+
+**定性：遗留缺陷，不是平台边界。** AIR 支持这个组合：`adl 51.4.1` 实测 300x200 点窗口（左 1/3 不透明红、
+中 1/3 50% 蓝、右 1/3 **故意不画**，`requestedDisplayResolution=high`），抓图 alpha 直方图
+`{0: 80000, 127: 80000, 255: 80000}`，未画区 `(0,0,0,0)`。我们是 `{255: 240000}`——整幅不透明、
+未画区纯黑 `(0,0,0,255)`、50% 蓝被合成到黑底上变成 `(0,0,122,255)`，而 `nativeWindow.transparent`
+照样回 `true`：**静默错语义**（AGENTS §1.5 红线）。
+
+**AS3 侧本来就是对的**：`emit.ts:33612` 在 `w->transparent` 时 `clear_transparent`，生成的 C 已核对。
+丢的全在平台侧，而且**两步缺一不可**：
+
+1. `sk_window_apply_transparent` 在建窗时跑过一次，那时 `SDL_Metal_CreateView` 还没加子视图 ⇒
+   `SDL_cocoametalview` 的 `-isOpaque` 覆盖**没被 swizzle**。必须在 attach 之后重跑。
+2. SDL 的 `SDLView` 每次显示把 backing store 刷成**不透明黑**，所以 contentView 要改成
+   **layer-hosting + 非 opaque 容器层**。CPU 那份等价代码（`sk_mac_ensure_transparent`）挂在
+   `present_frame` 上，而 `window_glue.cc:1041` 只在 `!c->is_gpu` 时调它 ⇒ GPU 窗一次也没跑过。
+
+**四态 A/B（全部实测）**：原样 ✗；只 `CAMetalLayer.opaque = NO` ✗（**死路**）；只重施 opacity ✗；
+只做 layer-hosting ✗；**两者都做 ✓**（与 adl 同形）。
+
+> **一处差点写错的归因**：实验补丁里「只做 hosting」那一态其实还留着重施 opacity 的调用，
+> 当时只回退了 `metal_glue.mm`，于是差点把结论写成「hosting 单独就够」。正式落地后按这条实现
+> 一测——仍是 `{255: 240000}`，才发现两步都要。**A/B 要回退的是被测的那一步，不是手边的文件。**
+
+**第二条缺陷（同一轮实测顺手抓到）**：`ASC_TRACE_TRANSPARENT=1` 打出
+`img=300x200 layerbounds=300x200 scale=2.00`——`sk_window_live_scale` 用的是**显示器**的 backing scale，
+而窗口没有 `SDL_WINDOW_ALLOW_HIGHDPI` 时它的 drawable 就等于逻辑尺寸 ⇒ 1x 的图按 2x 声明，
+画面只占窗口左上 1/4。不透明路径靠 SDL 渲染器把纹理拉满 drawable 掩盖了它（band 边缘 2 px 模糊）。
+修法是补上 `sk_window_device_scale` / `sk_client_size_live` 已经在用的同一道闸门。
+
+**修复**（`vendor/window_glue.cc`）：新增 `sk_mac_apply_gpu_transparent`（重施 opacity → 换 hosting 层，
+顺序不可换）+ `WinCtx.content_hosted` 幂等闸门；`sk_attach_metal`（描述符顺序）与
+`sk_window_set_transparent`（`NativeWindowInitOptions` 顺序：标志写在窗口之后）两处调用；
+`sk_window_live_scale` 加 `ALLOW_HIGHDPI` 闸门。**不隐藏 SDL 子视图**——CPU 透明路径那么做是对的，
+GPU 上那个 `CAMetalLayer` 子视图**就是呈现者**，隐藏即黑屏。`metal_glue.mm` **一行未改**。
+
+**零回归实测**：GPU 不透明窗仍白底 `{255: 240000}`；程序化 resize 300→500 点后透明与不透明两条路的
+带边界**逐像素一致**（都在 300/600 device px，即默认 SHOW_ALL 的 1.5×，不是拉伸缺陷）；
+修好的 GPU 透明窗 3/3 次收到坐标正确的 `CLICK at 50,100`；CPU 透明与 `high` 变体均与 adl 同形。
+
+**如实报明**：① 抓图 RGB 与 adl 差一截（`(234,51,35)` vs `(255,0,0)`）是既有色彩空间口径（抓图落 P3、
+我们给 layer 打 sRGB 标签而 adl 没打），本阶段**只判 alpha**，没动它；② **Windows 的 GPU 透明窗未做也未实测**
+（Windows 透明走 CPU 的 `UpdateLayeredWindow`，阶段四百五十四）；③ 标准分辨率下画面仍是 1x 上采样，
+那是 `<requestedDisplayResolution>` 的既有契约；④ 点击 harness 对 CPU 窗不可靠（透明与不透明对照都 0 命中），
+所以 **CPU 窗的输入不下结论**。
+
+**回归**：`examples/transparent-gpu/`（`--air-app` 编译+链接；判定要真窗口抓图，口径与数字见其 README；
+生成的清单入 `.gitignore`，避开阶段四百五十七那条撞名坑）+ `unit: platform/TransparentGpu` **14 钉**。
+`unit: platform/PresentScale` 里钉住 `sk_window_live_scale` 旧函数体的那条按新契约重写。
+
+**文档**：`docs/{zh-cn,en}/skia.md` §6.19（四态 A/B 表 + 两条缺陷 + 零回归 + 报明）；两份 README 的
+`supportsTransparency` 段补 GPU 口径，并顺手改掉「Windows 未实现透明」这句**阶段四百五十四之后的过时话**。
+
+**经验**：① 「对端有、本端也有」要**按后端分支**核对——同一个特性在 CPU 与 GPU 两条呈现路上是两份实现；
+② 平台缺陷的判据是**合成后的像素**，不是 AS3 读回来的属性值（`transparent` 回 true 而屏幕全黑）；
+③ A/B 回退要精确到被测步骤，否则会把「两步缺一不可」误记成「一步就够」。
+
 ### 阶段四百五十七：yuv420-gpu 宿主模板真的双平台 + 回归不再回写 fixtures（v0.4.432）✅
 
 接阶段四百五十六收尾时发现的那条。两个缺陷叠在一起，所以之前修了两次都没留住：

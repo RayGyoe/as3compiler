@@ -1166,8 +1166,15 @@ function checkPresentScale(): string[] {
   const iSync = wg.indexOf('sk_mac_sync_layer_scales(c);');
   check('the transparent present step re-pins the layer scale before it sets contents',
     iSync >= 0 && iContents > iSync);
+  // 阶段四百五十八 rewrote this pin's body: the scale is still read LIVE from the window
+  // every present, but it is now gated on SDL_WINDOW_ALLOW_HIGHDPI. Without that flag the
+  // window's drawable IS its logical size, so declaring the DISPLAY's backing scale put a
+  // 1x image on a 2x layer and showed the picture at half size (measured, temp/transgpu:
+  // img=300x200 scale=2.00 inside a 600x400 capture). Same gate sk_window_device_scale and
+  // sk_client_size_live already use.
   check('...from the window\'s LIVE backing scale, not from a value cached at creation',
-    /static double sk_window_live_scale\(SDL_Window\* win\) \{\n  return win != NULL \? sk_window_backing_scale\(win\) : 0\.0;/.test(wg)
+    /static double sk_window_live_scale\(SDL_Window\* win\) \{[\s\S]*?sk_window_backing_scale\(win\);/.test(wg)
+    && /static double sk_window_live_scale\(SDL_Window\* win\) \{[\s\S]*?SDL_WINDOW_ALLOW_HIGHDPI/.test(wg)
     && /static void sk_layer_sync_scale\(void\* layer, double bs\) \{/.test(wg)
     && /SK_SET_DBL\(layer, "setContentsScale:", bs\);/.test(wg));
   check('...and applies it to every layer this path owns (view, backdrop, frame host)',
@@ -1862,6 +1869,94 @@ registerGroup('unit: platform/NativeWindow', checkNativeWindow);
 registerGroup('unit: platform/BackendParity', checkBackendParity);
 registerGroup('unit: platform/WindowFrame', checkWindowFrame);
 registerGroup('unit: platform/PresentScale', checkPresentScale);
+
+// ---- Transparent window on the GPU backend (阶段四百五十八) ----
+// AIR supports <transparent>true</transparent> together with <renderMode>direct</...>:
+// measured on adl 51.4.1, a 300x200 window whose right third is unpainted captures as
+// alpha {0: 80000, 127: 80000, 255: 80000}. Ours captured {255: 240000} -- the unpainted
+// third was opaque black and a 50% blue came out composited over it. So this is an
+// alignment defect, not a platform limit (AGENTS §1.5).
+//
+// The pins below are the FOUR-WAY A/B that located it, written down so a later
+// "simplification" cannot quietly drop half of the fix:
+//   neither step                        -> {255: 240000}
+//   CAMetalLayer.opaque = NO only       -> {255: 240000}   (dead end)
+//   re-apply window/view opacity only   -> {255: 240000}
+//   layer-hosting contentView only      -> {255: 240000}
+//   both                                -> {0, 127, 255}   (matches adl)
+function checkTransparentGpu(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [transgpu] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [transgpu] ${label}`); }
+  };
+  const read = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const win = strip(read('window_glue.cc'));
+  const mtl = strip(read('metal_glue.mm'));
+  // One function body, up to the first column-0 closing brace.
+  const body = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const end = src.indexOf('\n}', i);
+    return end < 0 ? '' : src.slice(i, end);
+  };
+
+  const gpu = body(win, 'static void sk_mac_apply_gpu_transparent(WinCtx* c) {');
+  check('the GPU transparent step exists', gpu.length > 0);
+  // (1) opacity re-applied AFTER the Metal view exists, and before the layer swap.
+  const iApply = gpu.indexOf('sk_window_apply_transparent(c->win, 1);');
+  const iLayer = gpu.indexOf('"setLayer:"');
+  check('it re-applies window/view opacity (the Metal view was created after the first call)', iApply > 0);
+  check('...before replacing the contentView layer', iApply > 0 && iLayer > iApply);
+  // (2) layer-HOSTING contentView with a non-opaque container.
+  check('it makes the contentView layer-hosting with a fresh non-opaque CALayer',
+    /"setWantsLayer:", 1/.test(gpu) && /objc_getClass\("CALayer"\), "layer"/.test(gpu)
+    && /"setOpaque:", 0/.test(gpu) && iLayer > 0);
+  // The CPU path hides SDL's subviews; on GPU the CAMetalLayer subview IS the presenter.
+  check('it does NOT hide SDL subviews (that would blank the GPU window)',
+    !/"setHidden:"/.test(gpu));
+  check('it is idempotent through its own latch',
+    /c->content_hosted/.test(gpu) && /c->content_hosted = 1;/.test(gpu));
+
+  const attach = body(win, 'static int sk_attach_metal(WinCtx* c, int id) {');
+  check('the Metal attach runs it for a transparent window',
+    /if \(c->transparent\) sk_mac_apply_gpu_transparent\(c\);/.test(attach));
+  const setT = body(win, 'void sk_window_set_transparent(int id, int on) {');
+  check('NativeWindowInitOptions reaches it too (flag written after the window exists)',
+    /if \(c->is_gpu && c->transparent\) sk_mac_apply_gpu_transparent\(c\);/.test(setT));
+
+  // Measured dead end: setting the CAMetalLayer's own opacity changes nothing, so a
+  // change there is redundant -- and would suggest the hosting step is optional.
+  check('metal_glue does not touch the layer opacity (measured as a no-op)',
+    !/\.opaque\s*=/.test(mtl));
+  // The fact that makes a separate GPU step necessary at all.
+  check('present_frame is still CPU-only, so the CPU hosting path cannot cover GPU windows',
+    /if \(!c->is_gpu && painted\) present_frame\(/.test(win));
+  check('the CPU transparent path still hides SDL subviews (unchanged)',
+    /"setHidden:", 1/.test(body(win, 'static void sk_mac_ensure_transparent(WinCtx* c) {')));
+
+  // The second defect: a standard-resolution window's drawable IS its logical size, so
+  // its layer must declare 1.0 -- not the display's backing scale. Measured: img=300x200
+  // with scale=2.00 put the picture at HALF the window's linear size.
+  const live = body(win, 'static double sk_window_live_scale(SDL_Window* win) {');
+  check('the transparent layer scale is gated on ALLOW_HIGHDPI',
+    /SDL_GetWindowFlags\(win\) & SDL_WINDOW_ALLOW_HIGHDPI/.test(live));
+  check('...and a window without it declares 1.0, not the display scale',
+    /return 1\.0;/.test(live));
+
+  // Windows keeps its own route (UpdateLayeredWindow on the CPU path); untouched here.
+  check('the Windows layered-window present is still wired',
+    /sk_win_present_layered\(c, pixels, w, h, rowBytes\);/.test(win));
+
+  if (ok > 0) console.log(`[transgpu] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/TransparentGpu', checkTransparentGpu);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);
 registerGroup('unit: platform/CapabilitiesLocale', checkCapabilitiesLocale);

@@ -235,7 +235,7 @@ const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as
 // manifest nobody exercised had grown a Windows-only D3D backend. It is now
 // compile+link only, with the real manifest, and the assertions are a manual
 // windowed run (source header has the command).
-const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio', 'yuv420-gpu', 'video']);
+const SKIP_DIRS = new Set(['com', 'org', 'net', 'shmup-stage3d', 'air-starling-demo', 'Flappy-Starling', 'away3d-core', 'url-test', 'ane-app', 'audio', 'yuv420-gpu', 'transparent-gpu', 'video']);
 // The shared AS3 library root (阶段二百五十四). air-native used to VENDOR its
 // third-party sources inside its own source root (examples/air-native/src/com,
 // 352 tracked files), which made a library part of one app and forced this file
@@ -909,6 +909,29 @@ test('example: yuv420-gpu/ (--air-app + --features yuv420: compile+link only)', 
     '--target', 'native', '-o', scratchOut('yuv420-gpu-app')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  yuv420-gpu (--air-app + --features yuv420)');
+});
+
+// GPU transparent window (阶段四百五十八). Compile+link only, for the same reason as
+// yuv420-gpu above: the assertion is the COMPOSITED window's alpha, which only a real
+// window capture can read (BitmapData.draw reads the display list, not the window
+// server). The measured numbers and the capture recipe live in the example's README
+// and docs/zh-cn/skia.md §6.8. macOS-only: the fix is the Cocoa layer-hosting step,
+// and Windows' transparent present is UpdateLayeredWindow on the CPU path.
+test('example: transparent-gpu/ (--air-app: compile+link only)', async (t) => {
+  const xml = join(dir, 'transparent-gpu', 'app.xml');
+  const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
+  if (process.platform !== 'darwin' || !existsSync(xml) || !vendorLibs.every((p) => existsSync(p))) {
+    const why = process.platform !== 'darwin' ? 'needs a darwin host' : 'needs vendor/skia and vendor/sdl2';
+    console.log(`SKIP  transparent-gpu (${why})`);
+    t.skip(why);
+    return;
+  }
+  // In place is safe here: the generated manifest is gitignored (like air-native's),
+  // so --air-app rewriting it cannot clobber a tracked artifact.
+  await runAsync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'Main',
+    '--target', 'native', '-o', scratchOut('transparent-gpu-app')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  transparent-gpu (--air-app)');
 });
 
 test('example: native-window.as (windowed: compile+link only)', async (t) => {
