@@ -1152,16 +1152,16 @@ The fix records the stage-unit size on the **context** (`bbLW/bbLH`) and copies 
 `present()`, which always happens after the binding. The write-through in `configureBackBuffer` stays (it takes
 effect immediately when already bound, and bumps the serial to force a recomposite).
 
-### 11.3 adl Cannot Calibrate Dual-Window Semantics on This Machine
+### 11.3 adl Calibration (Including the Correction of an Erroneous Record)
 
-Per §2.4 the reference behaviour should have been measured on adl first; that turned out to be impossible here
-(`temp/s3d2win/`, AIR SDK 51.4.1, macOS):
-
-- **macOS adl has no Stage3D at all**: `requestContext3D("auto")` throws
-  `Error #3702: Context3D not available.` in a secondary window **and** in the initial window (reproduced with a
-  control probe, `S3DInit.as`), so the per-window pixel contract cannot be obtained from adl at all.
+- **Correction**: the earlier record "macOS adl has no Stage3D at all (`requestContext3D` throws `#3702`)" was
+  **wrong**. macOS AIR supports Stage3D through Metal; the `#3702` at the time came from a probe-configuration
+  problem, not a platform limitation. The multi-viewport pixel contract was obtained on **Windows adl**
+  (AIR SDK 51.4.1, `temp/s3dmulti/`); macOS goes through the same backend-neutral composite seam (Metal and
+  D3D12 share `as_skia_gpu_draw_texture`), so it is covered too.
 - `renderMode="gpu"` in `app.xml` gives `Error #1508: The value specified for argument renderMode is invalid.`
-  (`auto`/`direct`/`cpu` all start); adl reports `stage.stage3Ds.length` **4** where we lazily create one.
+  (`auto`/`direct`/`cpu` all start); adl reports `stage.stage3Ds.length` **4** — since stage four hundred
+  sixty-eight we lazily create four as well (before that we created one and composited only `[0]`, see §11.5).
 
 What could be measured was measured, and matches: `Stage3D.x/y` accepts `-8191` and `8191`, throws
 `ArgumentError` for `8192` / `-8192` / `9000` with `errorID` 2006 and the byte-exact message
@@ -1190,12 +1190,46 @@ with their own `stage3Ds`, two distinct `Context3D`s, each back buffer following
 including "the rejected value is not stored", and `visible` reading back. In the example suite it is
 **compile+link only** (window + GPU), the same handling as `native-window.as` and `yuv420-gpu/`.
 
-**Nails**: the `stage3d/multiwindow-surface` group in `test/unit/stage3d.ts` (16 nails) — not a single
+**Nails**: the `stage3d/multiwindow-surface` group in `test/unit/stage3d.ts` (**19 nails**, including the
+multi-viewport nails added in stage four hundred sixty-eight) — not a single
 process-wide `ASC_stage3d_*` left, the shape of `ASCWin`'s surface slot, the Present-skip fingerprint carrying
 the per-window serial, `Context3D._stage3d` plus its write barrier, `configureBackBuffer` taking the factor only
 from the owning window, the stage-unit size living on the context, `present` publishing to the owning window
 only, the compositor drawing at `x/y` gated on `visible`, `setScissorRectangle` using `bbScale`, the readback
 buffer freed on close, and the surface not being treated as a GC root.
+
+### 11.5 Multi-Viewport Parity (Stage Four Hundred Sixty-Eight)
+
+§11.1–11.4 fixed the routing **across windows**; within one window AIR also provides **four Stage3D
+viewports**, where we used to lazily create one and composite only `[0]`. This stage closes that gap:
+
+- `Stage_get_stage3Ds` lazily creates `ASC_S3D_MAX_VIEWPORTS` (=4) viewports, each carrying `_slot` (its index
+  in `stage3Ds`). `_slot` is both the surface-slot number and the composite layer. (The field is named `_slot`,
+  not `_index`: `index` is a reserved C identifier, see `sanitizeCIdent`.)
+- `ASCWin`'s single surface slot becomes `ASCS3DSlot s3d[4]` (one per viewport: `tex/pixels/w/h/lw/lh/ready`);
+  `as_s3d_publish`/`as_s3d_set_logical` pick the slot via `as_s3d_slot_of(context)` (= `Stage3D._slot`).
+  `s3d_serial` stays a single per-window counter bumped by ANY slot's present/configure (the Present-skip
+  fingerprint only needs "did anything change since the last render").
+- The compositor walks every ready viewport in **ascending index order** (`[0]` bottom, `[3]` top), each
+  positioned by its own `Stage3D.x/y` and gated on `visible`; the 2D display list is still drawn **on top of**
+  all viewports. Backend-neutral: Metal/D3D12 use `as_skia_gpu_draw_texture`, web `as_skia_gl_draw_texture`,
+  CPU `as_skia_canvas_draw_bgra`.
+
+**Measured adl contract** (Windows, `temp/s3dmulti/`): `stage3Ds.length==4`; `[0]`/`[1]` are two distinct
+`Context3D`s (`sameContext==false`), each `drawToBitmapData`-ing its own colour; `[0]` red @(0,0) and `[1]` green
+@(100,0) overlap, and the overlap samples **pure green (0,255,0)** — the higher index obscures the lower, and
+viewports are opaque to one another (matching the reference's "a viewport completely obscures any other Stage3D
+viewports positioned underneath it"). The AOT screenshot matches adl **byte for byte** (red-only red / overlap
+pure green / green-only green).
+
+**Nails**: the `stage3d/multiwindow-surface` group grows to **19 nails** (added "lazily create four indexed
+viewports", "composite loops in index order", "publish/configure route by `_slot`");
+`examples/s3d-multiviewport.as` (**16 nails**, one window, two viewports) is compile+link only.
+
+**One pre-existing behaviour (not changed here)**: the D3D12/Metal backends defer the colour clear until the
+first draw binds the target (`clearPending`, pinned by `stage3d/pending-clear-no-draw`), so a clear-only frame's
+back buffer is black — a probe must draw a quad to verify colour. That is a deliberate existing optimization,
+unrelated to multi-viewport.
 
 ## 12. Reference Links
 

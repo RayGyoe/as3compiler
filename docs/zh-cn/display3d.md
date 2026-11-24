@@ -1179,15 +1179,15 @@ GPU 窗口。于是两窗各自 `requestContext3D` 时是「最后 present 者�
 修法是把舞台尺寸记在 **context** 上（`bbLW/bbLH`），`present()` 时再回填到窗口：present 一定发生在
 窗口绑定之后。`configureBackBuffer` 里那次写窗口保留（已绑定时立刻生效，并 bump serial 强制重组）。
 
-### 11.3 adl 在这台机器上给不出双窗口径
+### 11.3 adl 定标口径（含一处错误记录的纠正）
 
-按 §2.4 的纪律本该先 adl 定标，实测做不到（`temp/s3d2win/`，AIR SDK 51.4.1，macOS）：
-
-- **macOS 的 adl 根本没有 Stage3D**：`requestContext3D("auto")` 在副窗**和初始窗**都抛
-  `Error #3702: Context3D not available.`（初始窗用 `S3DInit.as` 单独控制探针复现），所以「两窗各画什么」
-  的像素口径无法在 adl 上取得。
+- **纠正**：早期记录「macOS 的 adl 根本没有 Stage3D（`requestContext3D` 抛 `#3702`）」是**错误记录**。
+  macOS AIR 经 Metal 支持 Stage3D；当时的 `#3702` 来自探针配置问题，不是平台限制。多视口的像素
+  口径已在 **Windows adl**（AIR SDK 51.4.1，`temp/s3dmulti/`）取得；macOS 走同一套后端中性的合成缝
+  （Metal 与 D3D12 共用 `as_skia_gpu_draw_texture`），一并覆盖。
 - `app.xml` 写 `renderMode="gpu"` → `Error #1508: The value specified for argument renderMode is invalid.`
-  （`auto`/`direct`/`cpu` 都能起）；adl 的 `stage.stage3Ds.length` 是 **4**，我们只懒建 1 个。
+  （`auto`/`direct`/`cpu` 都能起）；adl 的 `stage.stage3Ds.length` 是 **4**——阶段四百六十八起我们
+  也懒建 4 个（此前只建 1 个、合成只取 `[0]`，见 §11.5）。
 
 能定标的照实定标了（`Stage3D.x/y` 的范围，两者一致）：`-8191` 与 `8191` 接受，`8192` / `-8192` / `9000`
 抛 `ArgumentError`，`errorID` 2006，文案逐字节 **`Error #2006: The supplied index is out of bounds.`**；
@@ -1214,11 +1214,42 @@ AS3 没有回读窗口像素的 API（AIR 也没有），所以「A 窗画的是
 「被拒的赋值不落库」、`visible` 读回。示例套件里它是 **compile+link only**（窗口 + GPU），与
 `native-window.as`、`yuv420-gpu/` 同一处置。
 
-**钉子**：`test/unit/stage3d.ts` 的 `stage3d/multiwindow-surface` 组（16 钉）——进程级
+**钉子**：`test/unit/stage3d.ts` 的 `stage3d/multiwindow-surface` 组（**19 钉**，含阶段四百六十八
+新增的多视口钉）——进程级
 `ASC_stage3d_*` 必须一个不剩、`ASCWin` 的表面槽形状、Present 跳过指纹带每窗序列、`Context3D._stage3d`
 与写屏障、`configureBackBuffer` 只从所属窗口取倍率、舞台尺寸记在 context、`present` 只发所属窗口、
 合成器按 `x/y` 画且被 `visible` 门控、`setScissorRectangle` 用 `bbScale`、关窗回收回读缓冲、表面不得
 当成 GC 根。
+
+### 11.5 多视口保真（阶段四百六十八）
+
+§11.1–11.4 修的是「跨窗口」的路由；同一窗口内 AIR 还给 **4 个 Stage3D 视口**，此前我们只懒建 1 个、
+合成只取 `[0]`。本阶段补齐：
+
+- `Stage_get_stage3Ds` 懒建 `ASC_S3D_MAX_VIEWPORTS`（=4）个视口，各带 `_slot`（= 它在 `stage3Ds`
+  里的索引）。`_slot` 既是表面槽号也是合成层号。（字段名用 `_slot` 而非 `_index`：`index` 是保留 C
+  标识符，见 `sanitizeCIdent`。）
+- `ASCWin` 的单格表面升级为 `ASCS3DSlot s3d[4]`（每视口一格：`tex/pixels/w/h/lw/lh/ready`）；
+  `as_s3d_publish`/`as_s3d_set_logical` 经 `as_s3d_slot_of(context)`（= `Stage3D._slot`）选槽。
+  `s3d_serial` 仍是每窗一个计数器，任何槽 present/configure 都 bump 它（Present 跳过指纹只需
+  「上次渲染后有没有变化」）。
+- 合成器按**索引升序**遍历全部就绪视口（`[0]` 底 `[3]` 顶），各按自己的 `Stage3D.x/y` 定位、被
+  `visible` 门控；2D 显示列表仍画在所有视口**之上**。后端中性：Metal/D3D12 走
+  `as_skia_gpu_draw_texture`、web 走 `as_skia_gl_draw_texture`、CPU 走 `as_skia_canvas_draw_bgra`。
+
+**adl 实测口径**（Windows，`temp/s3dmulti/`）：`stage3Ds.length==4`；`[0]`/`[1]` 是两个不同
+`Context3D`（`sameContext==false`），各 `drawToBitmapData` 到自己的颜色；`[0]` 红 @(0,0)、`[1]` 绿
+@(100,0) 重叠，重叠区采样 **纯绿 (0,255,0)**——索引大的盖索引小的、视口彼此不透明（与官方文档
+「a viewport completely obscures any other Stage3D viewports positioned underneath it」一致）。
+AOT 截屏与 adl **逐字一致**（红-only 红 / 重叠纯绿 / green-only 绿）。
+
+**钉子**：`stage3d/multiwindow-surface` 组扩到 **19 钉**（新增「懒建 4 个带 `_slot` 的视口」、
+「按索引序遍历合成」、「publish/configure 按 `_slot` 选槽」）；`examples/s3d-multiviewport.as`
+（**16 钉**，单窗双视口）compile+link only。
+
+**一处既有行为（不在本阶段改）**：D3D12/Metal 后端的 colour clear 延迟到首次 draw 绑定目标时才执行
+（`clearPending`，`stage3d/pending-clear-no-draw` 钉住），所以 clear-only 帧的后缓冲是黑的——探针
+必须画一个 quad 才能验颜色。这是既有的刻意优化，与多视口无关。
 
 ## 12. 参考链接
 

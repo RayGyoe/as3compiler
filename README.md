@@ -587,6 +587,13 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
   not stored), plus `visible` read-back and defaults. Window + GPU, so it is **compile+link only** in `test/examples.ts`;
   ships `s3d-multiwindow.build.json` (Metal + Skia + SDL2, hand-verified). The pixel-level "window A shows A's surface"
   claim can only be judged by an out-of-process screenshot cross-check (see `docs/en/display3d.md` §11)
+- `examples/s3d-multiviewport.as` — **multi-viewport Stage3D** (stage four-hundred-sixty-eight): AIR's desktop runtime
+  provides **four** Stage3D viewports (adl measures `stage.stage3Ds.length == 4`); `[0]`/`[1]` of one `Stage` are two
+  independent `Context3D`s, each painting its own colour. The compositor walks them in **ascending index order, bottom to
+  top** (`[0]` bottom, `[3]` top), viewports are opaque to one another and all sit below the 2D display list. Asserts
+  length 4, distinct contexts, each `drawToBitmapData`-ing its own colour, `x/y` bounds and `visible`. Window + GPU, so
+  **compile+link only**; the pixel-level "`[1]` obscures `[0]` in the overlap" is a screenshot cross-check (AOT matches
+  Windows adl byte for byte, see `docs/en/display3d.md` §11.5)
 - `examples/stage86.as` — `flash.utils` reflection (`getQualifiedClassName`/`getDefinitionByName`/dynamic instantiation)
 - `examples/stage87.as` — `Context3D` skeleton method completion (stencil/scissor/buffer upload readback/`drawTriangles`)
 - `examples/system-exit.as` — `flash.system.System.exit(code:uint)` (statements after the call still run to the frame boundary; the process status is `code`); the status half lives in `examples/system-exit-status.as` (in `SKIP_FILES`, because the example pool requires every example to exit 0) and is asserted to really exit **7** by the serial case in `test/examples.ts` (stage two hundred forty-five)

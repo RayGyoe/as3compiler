@@ -8758,6 +8758,12 @@ export class SymbolTable {
           // The Stage this slot belongs to (set by Stage_get_stage3Ds). x/y/visible
           // writes mark this owner render-dirty (阶段三百六十六 等价性验证).
           ['_owner', { type: { kind: 'object', className: 'Stage' }, init: null, visibility: 'private', owner: 'Stage3D', isStatic: false, isConst: false }],
+          // This viewport's index in stage.stage3Ds (0..ASC_S3D_MAX_VIEWPORTS-1).
+          // It is both the surface slot its Context3D publishes into and its
+          // composite layer — AIR composites viewports in index order, bottom to
+          // top (measured adl 51.4.1). Set by Stage_get_stage3Ds. (Named _slot, not
+          // _index: `index` is a reserved C identifier, see sanitizeCIdent.)
+          ['_slot', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'Stage3D', isStatic: false, isConst: false }],
         ]),
         methods: new Map([
           // AIR's signature is

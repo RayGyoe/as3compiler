@@ -2068,9 +2068,12 @@ function checkStage3dMultiWindowSurface(): string[] {
   check('no process-wide Stage3D composite state is left',
     !/ASC_stage3d_(?:lw|lh|tex|pixels|ready|serial)\b/.test(emitted));
 
-  // 2. 表面挂在**窗口**上（每个窗口一格），而不是挂在进程上。
-  check('every window carries its own Stage3D surface slot',
-    /void\* s3d_tex;\n\s*uint8_t\* s3d_pixels;\n\s*int s3d_w, s3d_h;\n\s*int s3d_lw, s3d_lh;\n\s*int s3d_ready;\n\s*uint64_t s3d_serial;/.test(emitted));
+  // 2. 表面挂在**窗口**上，且每个 Stage3D 视口一格（AIR 桌面 4 个，adl 实测
+  //    stage3Ds.length==4）——不是进程级、也不是每窗单格。
+  check('every window carries one Stage3D surface slot per viewport',
+    /#define ASC_S3D_MAX_VIEWPORTS 4/.test(emitted)
+    && /\} ASCS3DSlot;/.test(emitted)
+    && /ASCS3DSlot s3d\[ASC_S3D_MAX_VIEWPORTS\];/.test(emitted));
 
   // 3. 窗口的帧序列在快照比较里带上「这一帧的表面序列」——否则 A 窗 present 后 B 窗
   //    会命中 present-skip，屏幕上停在 B 的旧表面。
@@ -2106,16 +2109,20 @@ function checkStage3dMultiWindowSurface(): string[] {
     /as_s3d_publish\(o, w, h\)/.test(present.slice(0, 800))
     && /ASCWin\* wn = ASC_w\(as_s3d_win_id\(o\)\);/.test(present));
 
-  // 8. publish 用 context 上的舞台尺寸回填窗口（修复 6 的时序问题）。
-  check('publish() copies the stage-unit footprint from the context onto the window',
-    /wn->s3d_lw = o->bbLW; wn->s3d_lh = o->bbLH;/.test(present));
+  // 8. publish 用 context 上的舞台尺寸回填**所属视口槽**（修复 6 的时序问题）。
+  check('publish() copies the stage-unit footprint from the context onto the viewport slot',
+    /sl->lw = o->bbLW; sl->lh = o->bbLH;/.test(present));
 
-  // 9/10/11. 合成器读**本窗口**的表面，按 Stage3D.x/y 画，被 visible 门控，且每帧重读。
-  const composite = emitted.slice(emitted.indexOf('Stage3D* _s3 = as_vector_Stage3D_get(w->stage->stage3ds, 0);'));
-  check('the compositor re-reads x/y/visible from this window\u2019s Stage3D every frame',
+  // 9/10/11. 合成器按**索引序**遍历本窗口全部视口（[0] 底 [3] 顶，adl 实测重叠区
+  //     纯绿不混合），每格读对应 Stage3D.x/y、被 visible 门控、每帧重读。
+  const composite = emitted.slice(emitted.indexOf('Stage3D* _s3 = as_vector_Stage3D_get(w->stage->stage3ds, _si);'));
+  check('the compositor loops every viewport in index order (bottom to top)',
+    /for \(int _si = 0; _si < ASC_S3D_MAX_VIEWPORTS; _si\+\+\)/.test(emitted)
+    && /ASCS3DSlot\* _sl = &w->s3d\[_si\];/.test(emitted));
+  check('the compositor re-reads x/y/visible from each viewport\u2019s Stage3D every frame',
     /_s3x = _s3->x; _s3y = _s3->y; _s3vis = _s3->visible \? 1 : 0;/.test(composite));
-  check('the GPU composite draws this window\u2019s surface at Stage3D.x/y',
-    /as_skia_gpu_draw_texture\(canvas, w->s3d_tex, w->s3d_w, w->s3d_h, _s3x, _s3y, \(double\)w->s3d_lw, \(double\)w->s3d_lh\);/.test(emitted));
+  check('the GPU composite draws each viewport surface at its Stage3D.x/y',
+    /as_skia_gpu_draw_texture\(canvas, _sl->tex, _sl->w, _sl->h, _s3x, _s3y, \(double\)_sl->lw, \(double\)_sl->lh\);/.test(emitted));
   check('Stage3D.visible gates the composite on every backend',
     (emitted.match(/&& _s3vis\) \{/g) ?? []).length >= 3);
 
@@ -2132,14 +2139,24 @@ function checkStage3dMultiWindowSurface(): string[] {
   check('setScissorRectangle scales by this context\u2019s own back-buffer factor',
     /double sc = \(o->bbScale > 0\.0\) \? o->bbScale : 1\.0;/.test(emitted));
 
-  // 14. 关窗要回收回读缓冲（CPU 路径的 malloc），并把表面标成不可用。
-  check('closing a window releases its Stage3D readback buffer',
-    /if \(w->s3d_pixels != NULL\) \{ free\(w->s3d_pixels\); w->s3d_pixels = NULL; \}/.test(emitted)
-    && /w->s3d_tex = NULL; w->s3d_ready = 0;/.test(emitted));
+  // 14. 关窗要回收**每个视口**的回读缓冲（CPU 路径的 malloc），并把表面标成不可用。
+  check('closing a window releases every viewport\u2019s Stage3D readback buffer',
+    /for \(int _si = 0; _si < ASC_S3D_MAX_VIEWPORTS; _si\+\+\) \{ if \(w->s3d\[_si\]\.pixels != NULL\) \{ free\(w->s3d\[_si\]\.pixels\); w->s3d\[_si\]\.pixels = NULL; \} w->s3d\[_si\]\.tex = NULL; w->s3d\[_si\]\.ready = 0; \}/.test(emitted));
 
   // 15. 这块内存不是 GC 对象的（borrowed 后端纹理 / 窗口自己的 malloc），标了就崩。
-  check('the Stage3D surface is not treated as a GC root',
-    !/gc_mark[^;]*s3d_pixels/.test(emitted) && !/gc_mark[^;]*s3d_tex/.test(emitted));
+  check('the Stage3D surface slots are not treated as GC roots',
+    !/gc_mark[^;]*s3d\[/.test(emitted));
+
+  // 16. stage3Ds 懒建 4 个视口（不是 1 个），各带 _index（= 表面槽 = 合成层）。
+  check('Stage_get_stage3Ds lazily creates four indexed viewports',
+    /for \(int _i = 0; _i < ASC_S3D_MAX_VIEWPORTS; _i\+\+\) \{ Stage3D\* _s3 = Stage3D_new\(\); _s3->_owner = s; _s3->_slot = _i;/.test(emitted)
+    && /\['_slot', \{ type: \{ kind: 'int' \}/.test(symbols));
+
+  // 17. publish/set_logical 按 Context3D 的 Stage3D._index 选槽（as_s3d_slot_of）。
+  check('publish and configure route to the slot named by Stage3D._index',
+    /static int as_s3d_slot_of\(Context3D\* o\)/.test(emitted)
+    && /int i = o->_stage3d->_slot;/.test(emitted)
+    && /ASCS3DSlot\* sl = &wn->s3d\[as_s3d_slot_of\(o\)\];/.test(emitted));
 
   console.log(`     [stage3d] ${ok} check(s) passed`);
   return bad;

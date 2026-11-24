@@ -7362,9 +7362,9 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('gc_mark_ptr((void*)ASC_wins[i].type);');
     this.line('gc_mark_ptr((void*)ASC_wins[i].render_mode);');
     this.line('gc_mark_ptr((void*)ASC_wins[i].display_state);');
-    // ASCWin's Stage3D surface fields (s3d_tex/s3d_pixels) are deliberately NOT
-    // marked: s3d_tex is a raw backend texture owned by the Context3D's GPU context
-    // and s3d_pixels is a malloc'd readback buffer. Neither is GC-allocated, and
+    // ASCWin's Stage3D surface slots (s3d[].tex / s3d[].pixels) are deliberately NOT
+    // marked: tex is a raw backend texture owned by the Context3D's GPU context
+    // and pixels is a malloc'd readback buffer. Neither is GC-allocated, and
     // marking them would corrupt the heap's range check (阶段四百三十六).
     this.indent--;
     this.line('}');
@@ -29618,7 +29618,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // the real buffer size because of this.
     this.line('o->backBufferWidth = bbw; o->backBufferHeight = bbh; o->antiAlias = (int)antiAlias; o->enableDepthAndStencil = enableDepthAndStencil;');
     // The compositor needs the logical (stage-unit) size to place the target in
-    // the display list — see ASCWin.s3d_lw/lh. It is recorded on the CONTEXT and
+    // the display list — see ASCWin.s3d[].lw/lh. It is recorded on the CONTEXT and
     // copied to the window by present(): at this point the window may not exist
     // yet (see symbols.ts bbLW/bbLH), so writing through would lose it.
     this.line('o->bbLW = (int)width; o->bbLH = (int)height;');
@@ -30345,10 +30345,14 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void Context3D_set_enableErrorChecking(void* _this, bool value) { (void)_this; (void)value; }');
     this.line('');
     this.line('// ---- Stage3D: per-display slot; lazily creates a Context3D on request. ----');
+    // AIR's desktop runtime provides FOUR Stage3D viewports (measured adl 51.4.1:
+    // stage.stage3Ds.length == 4). The count is both the surface-slot array size and
+    // the number of composite layers; defined here, before its first use below.
+    this.line('#define ASC_S3D_MAX_VIEWPORTS 4');
     this.line('void Stage3D_ctor(Stage3D* o) {');
     this.indent++;
     this.line('EventDispatcher_ctor((EventDispatcher*)o, NULL);');
-    this.line('o->x = 0.0; o->y = 0.0; o->visible = true; o->context3d = NULL; o->renderMode = NULL;');
+    this.line('o->x = 0.0; o->y = 0.0; o->visible = true; o->context3d = NULL; o->renderMode = NULL; o->_slot = 0;');
     this.indent--;
     this.line('}');
     this.line('Stage3D* Stage3D_new(void) { Stage3D* o = (Stage3D*)gc_alloc(GCT_CLASS, sizeof(Stage3D)); o->vtable = &Stage3D_vt; Stage3D_ctor(o); return o; }');
@@ -30433,7 +30437,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('as_vector_Stage3D* Stage_get_stage3Ds(void* _this) {');
     this.indent++;
     this.line('Stage* s = (Stage*)_this;');
-    this.line('if (s->stage3ds == NULL) { s->stage3ds = as_vector_Stage3D_new(); gc_write_barrier((void*)s->stage3ds); Stage3D* _s3 = Stage3D_new(); _s3->_owner = s; as_vector_Stage3D_push(s->stage3ds, _s3); }');
+    this.line('if (s->stage3ds == NULL) {');
+    this.indent++;
+    // AIR's desktop runtime provides FOUR Stage3D viewports (measured adl 51.4.1:
+    // stage.stage3Ds.length == 4), not one. Each gets its own _index, which is both
+    // its surface slot and its composite layer (index order, bottom to top).
+    this.line('s->stage3ds = as_vector_Stage3D_new(); gc_write_barrier((void*)s->stage3ds);');
+    this.line('for (int _i = 0; _i < ASC_S3D_MAX_VIEWPORTS; _i++) { Stage3D* _s3 = Stage3D_new(); _s3->_owner = s; _s3->_slot = _i; as_vector_Stage3D_push(s->stage3ds, _s3); }');
+    this.indent--;
+    this.line('}');
     this.line('return s->stage3ds;');
     this.indent--;
     this.line('}');
@@ -32893,6 +32905,23 @@ void FileStream_writeObject(void* _this, as_value v) {
     // ASC_MAX_WINDOWS must match SK_MAX_WINDOWS in window_glue.cc / web_glue.cc.
     // ------------------------------------------------------------------
     this.line('#define ASC_MAX_WINDOWS 16');
+    // AIR's runtime stage provides a FIXED number of Stage3D viewports — desktop
+    // gives four (measured adl 51.4.1: stage.stage3Ds.length == 4). Each is an
+    // independent GPU surface with its own Context3D, positioned by Stage3D.x/y.
+    // They composite in INDEX order, bottom to top ([0] lowest, [3] highest), all
+    // BELOW the 2D display list, and are OPAQUE to one another (a viewport fully
+    // obscures the ones underneath — measured: overlap of [0] red / [1] green shows
+    // pure green, no blend). One surface slot per (window, viewport) follows.
+    // (ASC_S3D_MAX_VIEWPORTS is defined earlier, before the Stage3D class code.)
+    this.line('typedef struct {');
+    this.indent++;
+    this.line('void* tex;');        // borrowed backend render target, never freed here
+    this.line('uint8_t* pixels;');  // CPU-raster builds: readback BGRA buffer (owned)
+    this.line('int w, h;');         // render target size in device pixels
+    this.line('int lw, lh;');       // footprint in stage units (configureBackBuffer w/h)
+    this.line('int ready;');        // a frame has been published for this slot
+    this.indent--;
+    this.line('} ASCS3DSlot;');
     this.line('typedef struct {');
     this.indent++;
     // There is deliberately no `used` flag here: the glue layer owns window
@@ -32964,21 +32993,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('char* render_mode;');
     this.line('void* owner;');
     this.line('char* display_state;');
-    // ---- Stage3D composite surface (阶段四百三十六) ----
-    // ONE surface per window: the Stage3D of THIS window's stage publishes here
-    // from Context3D.present(), and ASC_window_render composites exactly this
-    // surface — never another window's. Before this the runtime held one global
-    // ASC_stage3d_tex/pixels pair, so two windows that each requested a Context3D
-    // both showed whichever one presented last, and Stage3D.x/y/visible could only
-    // be stored. (AIR allows up to four Stage3D instances per stage; this runtime
-    // still creates one slot per stage, so the surface is keyed by window rather
-    // than by (window, slot) — growing the slot count is a local change here.)
-    this.line('void* s3d_tex;');        // borrowed backend render target, never freed here
-    this.line('uint8_t* s3d_pixels;');  // CPU-raster builds: readback BGRA buffer (owned)
-    this.line('int s3d_w, s3d_h;');    // render target size in device pixels
-    this.line('int s3d_lw, s3d_lh;');  // footprint in stage units (configureBackBuffer w/h)
-    this.line('int s3d_ready;');        // a frame has been published for this window
-    this.line('uint64_t s3d_serial;');  // present/configure counter: the Present-skip key
+    // ---- Stage3D composite surfaces (阶段四百三十六 per-window; 多视口) ----
+    // One surface slot PER Stage3D viewport of THIS window's stage: each Context3D
+    // publishes into the slot named by its Stage3D._slot, and ASC_window_render
+    // composites all ready slots in index order (bottom to top), never another
+    // window's. The per-window routing fixed "last present wins" across windows;
+    // the slot array fixes it across the four viewports of ONE stage. s3d_serial is
+    // a single window counter bumped by ANY slot's present/configure — the
+    // Present-skip fingerprint only needs "did anything change since last render".
+    this.line('ASCS3DSlot s3d[ASC_S3D_MAX_VIEWPORTS];');
+    this.line('uint64_t s3d_serial;');  // present/configure counter (any slot): the Present-skip key
     this.indent--;
     this.line('} ASCWin;');
     this.line('static ASCWin ASC_wins[ASC_MAX_WINDOWS];');
@@ -32992,6 +33016,16 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('if (o == NULL || o->_stage3d == NULL || o->_stage3d->_owner == NULL) return -1;');
     this.line('return as_stage_window_id((Stage*)o->_stage3d->_owner);');
+    this.indent--;
+    this.line('}');
+    // The viewport slot (0..ASC_S3D_MAX_VIEWPORTS-1) this context publishes into:
+    // its Stage3D's index in stage.stage3Ds. AIR composites viewports in index order
+    // (bottom to top), so the slot index IS the composite layer.
+    this.line('static int as_s3d_slot_of(Context3D* o) {');
+    this.indent++;
+    this.line('if (o == NULL || o->_stage3d == NULL) return 0;');
+    this.line('int i = o->_stage3d->_slot;');
+    this.line('return (i >= 0 && i < ASC_S3D_MAX_VIEWPORTS) ? i : 0;');
     this.indent--;
     this.line('}');
     // The device pixel ratio of the window this context draws into. configureBackBuffer
@@ -33011,7 +33045,8 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('ASCWin* wn = ASC_w(as_s3d_win_id(o));');
     this.line('if (wn == NULL) return;');
-    this.line('wn->s3d_lw = lw; wn->s3d_lh = lh;');
+    this.line('ASCS3DSlot* sl = &wn->s3d[as_s3d_slot_of(o)];');
+    this.line('sl->lw = lw; sl->lh = lh;');
     this.line('wn->s3d_serial++;');
     this.indent--;
     this.line('}');
@@ -33025,30 +33060,31 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.indent++;
     this.line('ASCWin* wn = ASC_w(as_s3d_win_id(o));');
     this.line('if (wn == NULL || w <= 0 || h <= 0) return;');
+    this.line('ASCS3DSlot* sl = &wn->s3d[as_s3d_slot_of(o)];');
     this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GPU)');
-    this.line('wn->s3d_tex = as_s3d_get_render_target(o->gpu);');
-    this.line('wn->s3d_pixels = NULL;');
-    this.line('wn->s3d_w = w; wn->s3d_h = h;');
+    this.line('sl->tex = as_s3d_get_render_target(o->gpu);');
+    this.line('sl->pixels = NULL;');
+    this.line('sl->w = w; sl->h = h;');
     this.line('#else');
-    this.line('if (wn->s3d_pixels == NULL || wn->s3d_w != w || wn->s3d_h != h) {');
+    this.line('if (sl->pixels == NULL || sl->w != w || sl->h != h) {');
     this.indent++;
-    this.line('if (wn->s3d_pixels != NULL) free(wn->s3d_pixels);');
-    this.line('wn->s3d_pixels = (uint8_t*)malloc((size_t)w * (size_t)h * 4);');
-    this.line('wn->s3d_w = w; wn->s3d_h = h;');
+    this.line('if (sl->pixels != NULL) free(sl->pixels);');
+    this.line('sl->pixels = (uint8_t*)malloc((size_t)w * (size_t)h * 4);');
+    this.line('sl->w = w; sl->h = h;');
     this.indent--;
     this.line('}');
-    this.line('if (wn->s3d_pixels == NULL) return;');
-    this.line('as_s3d_readback_render(o->gpu, wn->s3d_pixels);');
+    this.line('if (sl->pixels == NULL) return;');
+    this.line('as_s3d_readback_render(o->gpu, sl->pixels);');
     this.line('#endif');
     // The logical footprint comes from the CONTEXT, never from the window: the
     // window may have been unbound when configureBackBuffer ran (a script configures
     // before showWindow claims slot 0), and copying it here is what makes that order
     // work. Without it the rect stayed 0x0 and the surface composited as nothing.
-    this.line('wn->s3d_lw = o->bbLW; wn->s3d_lh = o->bbLH;');
-    this.line('wn->s3d_ready = 1;');
+    this.line('sl->lw = o->bbLW; sl->lh = o->bbLH;');
+    this.line('sl->ready = 1;');
     this.line('wn->s3d_serial++;');
-    // Debug probe (ASC_S3D_TRACE=1): which window got which surface.
-    this.line('{ static int n = 0; if (n++ % 120 == 0 && getenv("ASC_S3D_TRACE") != NULL) fprintf(stderr, "s3d_trace present: win=%d w=%d h=%d tex=%p lw=%d lh=%d\\n", as_s3d_win_id(o), w, h, wn->s3d_tex, wn->s3d_lw, wn->s3d_lh); }');
+    // Debug probe (ASC_S3D_TRACE=1): which window/slot got which surface.
+    this.line('{ static int n = 0; if (n++ % 120 == 0 && getenv("ASC_S3D_TRACE") != NULL) fprintf(stderr, "s3d_trace present: win=%d slot=%d w=%d h=%d tex=%p lw=%d lh=%d\\n", as_s3d_win_id(o), as_s3d_slot_of(o), w, h, sl->tex, sl->lw, sl->lh); }');
     this.indent--;
     this.line('}');
     this.cblock(NATIVE_DRAG_BODY);
@@ -33656,36 +33692,49 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Stage3D object"). Reading them per frame — instead of caching the offset
     // when the back buffer was configured — makes a write that lands after the
     // last present take effect on the next frame, which is what AIR does.
-    this.line('double _s3x = 0.0, _s3y = 0.0; int _s3vis = 1;');
-    this.line('if (w->stage != NULL && w->stage->stage3ds != NULL && w->stage->stage3ds->length > 0) {');
+    // Composite EVERY ready Stage3D viewport of this window in INDEX order, so
+    // [0] lands bottom and [3] top (AIR's predefined order, measured adl: overlap
+    // of [0] red / [1] green shows pure green). Each viewport is opaque and offset
+    // by its own Stage3D.x/y; visible=false removes it. The 2D display list is
+    // drawn AFTER this loop, on top of all viewports. AIR's
+    // NativeWindowRenderMode.CPU documents that a software window does not
+    // composite StageVideo/Stage3D; in a GPU build there is no readback buffer
+    // anyway, so a GPU window draws the texture and a cpu-mode window draws nothing.
+    this.line('for (int _si = 0; _si < ASC_S3D_MAX_VIEWPORTS; _si++) {');
     this.indent++;
-    this.line('Stage3D* _s3 = as_vector_Stage3D_get(w->stage->stage3ds, 0);');
+    this.line('ASCS3DSlot* _sl = &w->s3d[_si];');
+    this.line('double _s3x = 0.0, _s3y = 0.0; int _s3vis = 1;');
+    this.line('if (w->stage != NULL && w->stage->stage3ds != NULL && _si < w->stage->stage3ds->length) {');
+    this.indent++;
+    this.line('Stage3D* _s3 = as_vector_Stage3D_get(w->stage->stage3ds, _si);');
     this.line('if (_s3 != NULL) { _s3x = _s3->x; _s3y = _s3->y; _s3vis = _s3->visible ? 1 : 0; }');
     this.indent--;
     this.line('}');
     this.line('#if defined(ASC_RENDER_METAL) || defined(ASC_RENDER_D3D)');
-    this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: is_gpu=%d ready=%d tex=%p w=%d h=%d lw=%d lh=%d xy=%.1f,%.1f vis=%d scale=%.4f win lw=%d lh=%d pw=%d ph=%d\\n", w->is_gpu, w->s3d_ready, w->s3d_tex, w->s3d_w, w->s3d_h, w->s3d_lw, w->s3d_lh, _s3x, _s3y, _s3vis, w->scale, w->lw, w->lh, w->pw, w->ph); }');
-    this.line('if (w->is_gpu && w->s3d_ready && w->s3d_tex != NULL && _s3vis) {');
+    this.line('if (w->is_gpu && _sl->ready && _sl->tex != NULL && _s3vis) {');
     this.indent++;
     // Source rect = the real render target (device pixels when wantsBestResolution
     // scaled it); dest rect = its logical footprint in stage units, which the canvas
     // scale above turns back into device pixels 1:1 — offset by the Stage3D's own x/y.
-    this.line('as_skia_gpu_draw_texture(canvas, w->s3d_tex, w->s3d_w, w->s3d_h, _s3x, _s3y, (double)w->s3d_lw, (double)w->s3d_lh);');
+    this.line('as_skia_gpu_draw_texture(canvas, _sl->tex, _sl->w, _sl->h, _s3x, _s3y, (double)_sl->lw, (double)_sl->lh);');
     this.indent--;
     this.line('}');
     this.line('#elif defined(ASC_RENDER_GPU)');
-    this.line('if (w->s3d_ready && w->s3d_tex != NULL && _s3vis) {');
+    this.line('if (_sl->ready && _sl->tex != NULL && _s3vis) {');
     this.indent++;
-    this.line('as_skia_gl_draw_texture(canvas, w->s3d_tex, w->s3d_w, w->s3d_h, _s3x, _s3y, (double)w->s3d_lw, (double)w->s3d_lh);');
+    this.line('as_skia_gl_draw_texture(canvas, _sl->tex, _sl->w, _sl->h, _s3x, _s3y, (double)_sl->lw, (double)_sl->lh);');
     this.indent--;
     this.line('}');
     this.line('#else');
-    this.line('if (w->s3d_ready && w->s3d_pixels != NULL && _s3vis) {');
+    this.line('if (_sl->ready && _sl->pixels != NULL && _s3vis) {');
     this.indent++;
-    this.line('as_skia_canvas_draw_bgra(canvas, w->s3d_pixels, w->s3d_w, w->s3d_h, _s3x, _s3y, (double)w->s3d_lw, (double)w->s3d_lh);');
+    this.line('as_skia_canvas_draw_bgra(canvas, _sl->pixels, _sl->w, _sl->h, _s3x, _s3y, (double)_sl->lw, (double)_sl->lh);');
     this.indent--;
     this.line('}');
     this.line('#endif');
+    this.line('if (getenv("ASC_S3D_TRACE") != NULL) { static int n = 0; if (n++ % 120 == 0) fprintf(stderr, "s3d_trace composite: win_slot=%d ready=%d tex=%p w=%d h=%d xy=%.1f,%.1f vis=%d\\n", _si, _sl->ready, _sl->tex, _sl->w, _sl->h, _s3x, _s3y, _s3vis); }');
+    this.indent--;
+    this.line('}');
     this.line('ASC_render_scale = w->scale;');
     // Window composition pass: the caret overlay is drawn only here (see the
     // ASC_caret_pass note). as_render_states above does NOT set it, so any bake
@@ -34546,12 +34595,11 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (planted && AS_SETJMP(as_frame_jmp) != 0) { as_frame_guard = 0; as_disp_depth = 0; as_astack_depth = 0; if (w->window != NULL) ((NativeWindow*)w->window)->_win = -1; w->stage = NULL; w->window = NULL; return; }');
     this.line('as_frame_guard = 1;');
     this.line('w->closed = 1;');
-    // Free the window's Stage3D readback buffer BEFORE the CLOSE dispatch: the
+    // Free the window's Stage3D readback buffers BEFORE the CLOSE dispatch: the
     // recovery path below (a listener that throws) returns early, so anything put
-    // after the dispatch would leak on that path. s3d_tex is borrowed from the
+    // after the dispatch would leak on that path. slot.tex is borrowed from the
     // context's backend and is only dropped, never freed (阶段四百三十六).
-    this.line('if (w->s3d_pixels != NULL) { free(w->s3d_pixels); w->s3d_pixels = NULL; }');
-    this.line('w->s3d_tex = NULL; w->s3d_ready = 0;');
+    this.line('for (int _si = 0; _si < ASC_S3D_MAX_VIEWPORTS; _si++) { if (w->s3d[_si].pixels != NULL) { free(w->s3d[_si].pixels); w->s3d[_si].pixels = NULL; } w->s3d[_si].tex = NULL; w->s3d[_si].ready = 0; }');
     this.line('if (w->surface != NULL) { as_skia_surface_delete(w->surface); w->surface = NULL; w->canvas = NULL; }');
     this.line('if (w->window != NULL) {');
     this.indent++;

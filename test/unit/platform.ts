@@ -502,9 +502,16 @@ function checkNativeWindow(): string[] {
       .includes('if (w->title != NULL && w->title[0] != 0) title = w->title;'));
   // 阶段四百三十六: the surface is the WINDOW's own slot now (no process-wide
   // ASC_stage3d_*), and the composite is gated on that window's Stage3D.visible.
+  // 阶段四百六十八: each window now holds FOUR viewport slots (ASCS3DSlot s3d[4]);
+  // the composite walks them in ascending index order ([0] bottom, [3] top) and the
+  // GPU gate reads the per-slot _sl->ready/_sl->tex, not a single w->s3d_*.
   check('Stage3D composites only into a GPU window (AIR: software windows do not)',
     body('static int ASC_window_render(int id) {')
-      .includes('if (w->is_gpu && w->s3d_ready && w->s3d_tex != NULL && _s3vis) {'));
+      .includes('if (w->is_gpu && _sl->ready && _sl->tex != NULL && _s3vis) {'));
+  check('the composite walks all four viewport slots in index order (bottom to top)',
+    body('static int ASC_window_render(int id) {')
+      .includes('for (int _si = 0; _si < ASC_S3D_MAX_VIEWPORTS; _si++) {')
+    && body('static int ASC_window_render(int id) {').includes('ASCS3DSlot* _sl = &w->s3d[_si];'));
   // A resize must not hand a GPU window a CPU surface it never draws into: the
   // next frame walks the is_gpu branch and would leak the replacement surface.
   const onResize = body('static void* ASC_window_on_resize(int id, int lw, int lh, int pw, int ph, double scale) {');

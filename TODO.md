@@ -20306,6 +20306,15 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-25 追加（阶段四百六十八：Stage3D 多视口保真）**：**移出 0 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **81 行不变**（`未开始` 62 / `部分完成` 17 / `调研完成·实现暂缓` 2）。多视口缺口此前**不是独立遗留行**，
+> 而是记于 `docs/display3d.md` §11.3「adl 的 stage3Ds.length 是 4，我们只懒建 1 个」一句；本阶段清偿后
+> `Stage_get_stage3Ds` 懒建 4 个带 `_slot` 的视口、`ASCWin` 升级为 `ASCS3DSlot s3d[4]`、合成器按索引升序
+> （`[0]` 底 `[3]` 顶）遍历全部就绪视口（后端中性，Metal/D3D12/web/CPU 共用同一合成缝）。Windows adl 实测
+> 重叠区纯绿（索引大盖索引小、视口彼此不透明），AOT 截屏与 adl 逐字一致（`temp/s3dmulti/`）。新增
+> `examples/s3d-multiviewport.as`（16 钉，compile+link only）、`stage3d/multiwindow-surface` 扩到 19 钉；并纠正
+> §11.3「macOS adl 无 Stage3D」的错误记录（macOS AIR 经 Metal 支持，详见 §11.5）。无表行变动。
+
 > **2026-11-25 追加（阶段四百六十七：WGL/GL 透明 GPU 窗）**：**移出 0 行 / 改写 0 行 / 新登记 0 行** ⇒
 > 主表 **81 行不变**（`未开始` 62 / `部分完成` 17 / `调研完成·实现暂缓` 2）。GL 透明缺口此前**不是独立遗留行**，
 > 而是记于阶段四百五十九/四百六十二 注记与 `docs/win32.md`「WGL 分支透明窗未实测」一句；本阶段清偿后把该现行

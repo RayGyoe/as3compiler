@@ -659,6 +659,11 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`；Windows 侧额外钉
   （越界 `ArgumentError #2006`，文案逐字，且被拒的赋值不落库）、`visible` 读回与默认值。窗口 + GPU，故在
   `test/examples.ts` 里是 **compile+link only**；随附 `s3d-multiwindow.build.json`（Metal + Skia + SDL2，手工验收），
   像素层「A 窗画的是 A 的表面」只能靠进程外截屏对拍（见 `docs/zh-cn/display3d.md` §11）
+- `examples/s3d-multiviewport.as` — **多视口 Stage3D**（阶段四百六十八）：AIR 桌面运行时给 **4 个** Stage3D
+  视口（adl 实测 `stage.stage3Ds.length == 4`），同一 `Stage` 的 `[0]`/`[1]` 是两个独立 `Context3D`、各画一色；
+  合成按**索引升序底→顶**（`[0]` 底 `[3]` 顶）、视口彼此不透明、全部在 2D 显示列表之下。断言 length=4、双 context
+  不同、各 `drawToBitmapData` 到自己的颜色、`x/y` 边界与 `visible`。窗口 + GPU，故 **compile+link only**；像素层
+  「重叠区 `[1]` 盖 `[0]`」靠截屏对拍（AOT 与 Windows adl 逐字一致，见 `docs/zh-cn/display3d.md` §11.5）
 - `examples/stage86.as` — `flash.utils` 反射（`getQualifiedClassName`/`getDefinitionByName`/动态实例化）
 - `examples/stage87.as` — `Context3D` 骨架补方法（stencil/scissor/缓冲上传读回/`drawTriangles`）
 - `examples/stage88.as` — AS3 语言特性缺口补齐（对象字面量字符串键、逻辑赋值、`for each`、命名空间等）

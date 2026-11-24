@@ -159,7 +159,7 @@ function scratchOut(label: string): string {
 // `s3d-multiwindow.as` is the fourth: it needs a real window AND a GPU context for
 // every assertion it makes (two stages, two Context3Ds, pixel readback), so it is
 // compiled+linked by the serial case below with its own Metal manifest.
-const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as', 's3d-multiwindow.as']);
+const SKIP_FILES = new Set(['boot-gui.as', 'entry-ui.as', 'system-exit-status.as', 's3d-multiwindow.as', 's3d-multiviewport.as']);
 // Third-party library directories (e.g. com/greensock) ship with full AIR apps
 // but depend on features outside this compiler's subset; they are not part of
 // the regression suite's input. `shmup-stage3d` is the stage 79-83 end-to-end
@@ -990,6 +990,28 @@ test('example: s3d-multiwindow.as (windowed GPU: compile+link only)', async (t) 
     '--manifest', manifest, '-o', scratchOut('s3d-multiwindow')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
   console.log('PASS  s3d-multiwindow (compile+link)');
+});
+
+test('example: s3d-multiviewport.as (windowed GPU: compile+link only)', async (t) => {
+  // 阶段四百六十八: AIR's desktop runtime provides FOUR Stage3D viewports (adl 51.4.1
+  // measures stage.stage3Ds.length == 4); the runtime used to lazily create one and
+  // composite only [0]. The example asserts what AS3 can observe -- length 4, two
+  // distinct Stage3D/Context3D on ONE stage, each viewport keeping its own rendered
+  // colour, Stage3D.x/y bounds (#2006) and visible -- and must keep compiling and
+  // linking against a window GPU backend plus a stage3d backend with two simultaneous
+  // contexts in the SAME window. The pixel-level "[1] obscures [0] in the overlap"
+  // half needs a real window (screenshot evidence in TODO.md's stage section).
+  const manifest = join(dir, 's3d-multiviewport.build.json');
+  const vendorLibs = ['skia', 'sdl2'].map((v) => join(root, 'vendor', v));
+  if (!existsSync(manifest) || !vendorLibs.every((p) => existsSync(p))) {
+    console.log('SKIP  s3d-multiviewport (needs the native Skia/SDL2 vendor libs)');
+    t.skip('needs vendor/skia and vendor/sdl2');
+    return;
+  }
+  await runAsync('node', ['src/index.ts', 'examples/s3d-multiviewport.as',
+    '--manifest', manifest, '-o', scratchOut('s3d-multiviewport')],
+    { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
+  console.log('PASS  s3d-multiviewport (compile+link)');
 });
 
 // The encoded-audio path: Sound.load(URLRequest) over a real .mp3 fixture, then

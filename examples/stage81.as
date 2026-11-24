@@ -35,7 +35,7 @@ check(Context3DWrapMode.CLAMP == "clamp", "WrapMode.CLAMP");
 // --- 2. Stage3D slot + requestContext3D + CONTEXT3D_CREATE ---
 var stage:Stage = new Stage();
 var slots:Vector.<Stage3D> = stage.stage3Ds;
-check(slots.length == 1, "stage3Ds has one slot");
+check(slots.length == 4, "stage3Ds has four slots (AIR desktop provides four viewports)");
 
 var s3d:Stage3D = slots[0];
 check(s3d != null, "stage3Ds[0] is a Stage3D");

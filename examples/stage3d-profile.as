@@ -38,7 +38,7 @@ function check(cond:Boolean, msg:String):void {
 // does the same); its stage3Ds vector is created lazily on first read.
 var st:Stage = new Stage();
 var s3d:Stage3D = st.stage3Ds[0];
-check(st.stage3Ds.length == 1, "stage3Ds has one slot");
+check(st.stage3Ds.length == 4, "stage3Ds has four slots (AIR desktop provides four viewports)");
 
 // Every constant exists and carries AIR's string value.
 check(Context3DProfile.BASELINE == "baseline", "BASELINE");
