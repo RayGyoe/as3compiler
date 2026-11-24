@@ -95,6 +95,12 @@ void sk_mtl_destroy(int id);
 int sk_gpu_init(int id, void* native_handle);
 void sk_gpu_destroy(int id);
 #endif
+#if defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GL)
+// Switch a window's transparent (offscreen/ULW) route after the GPU bind, for
+// NativeWindowInitOptions.transparent written after the window exists (stage 460
+// D3D12, stage 467 WGL).
+void sk_gpu_set_transparent(int id, int on);
+#endif
 
 // Cached primary-display size so Stage.fullScreenWidth/fullScreenHeight can be
 // read without holding SDL initialized. Populated lazily here and refreshed
@@ -261,12 +267,12 @@ int sk_window_get_display_size(int* w, int* h) {
 // different quantities on the same display (measured against adl: bounds
 // 0,0 1800x1169 vs visibleBounds 47,39 1753x1130 on a dock-left desktop).
 //
-// SPACE NOTE (open divergence, TODO.md): AIR reports Screen.bounds/visibleBounds in
+// SPACE NOTE (closed, stage 463): AIR reports Screen.bounds/visibleBounds in
 // PHYSICAL pixels (3840x2560 on the desktop where Stage.fullScreenWidth is 2560, i.e.
-// a 2560x1707 DIP space), while this query answers the same point space the Stage
-// property uses. It is deliberately left alone: the window frame/centering math shares
-// this function and is written in SDL's logical space, so converting only Screen would
-// break centering. See docs/zh-cn/win32.md 3.5.
+// a 2560x1707 DIP space). The Screen-only AIR-space view now lives in
+// sk_screen_bounds/sk_screen_usable_bounds below; THIS function deliberately stays
+// in SDL's logical space because the window frame/centering math shares it and is
+// written in that space. See docs/zh-cn/win32.md 3.5.
 //
 // These queries may run from inside the window event loop (AS3 code reading
 // Screen.mainScreen in a frame callback), so they must never call SDL_Quit —
@@ -303,6 +309,88 @@ int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h) {
   if (h) *h = r.h;
   return 1;
 }
+
+// ---------- AIR-space display rectangles (flash.display.Screen, stage 463) ----------
+// AIR reports Screen.bounds/visibleBounds in PHYSICAL pixels on Windows while
+// Stage.fullScreen* and Capabilities.screenResolution* stay in DIP (adl 51.4.1 on
+// this 150% desktop: bounds 0,0 3840x2560, visibleBounds 0,0 3840x2488, but
+// Capabilities 2560x1707). getScreensForRectangle matches in that SAME physical
+// space (a rect at 3000,2000 matches the screen on adl). These two queries are
+// the Screen-only physical view; sk_display_bounds above keeps the logical space
+// the window frame/centering math is written in. On macOS SDL already reports
+// points, which IS AIR's space there, so the queries alias the logical ones.
+#ifdef _WIN32
+// EnumDisplaySettingsW answers the REAL display mode even in a DPI-UNAWARE
+// process (measured temp/screenpx/physprobe: pels 3840x2560 while GetMonitorInfoW
+// is virtualized to 2560x1707), so `bounds` never depends on the build's DPI
+// awareness — a <requestedDisplayResolution>standard build is DPI-unaware and
+// must still report physical pixels like adl does. The work area has no
+// mode-based equivalent, so GetMonitorInfoW runs under a thread-local PMv2
+// awareness context (SetThreadDpiAwarenessContext, Win10 1703+) to un-virtualize
+// it in standard builds; where that API is absent the query answers whatever the
+// process awareness gives (high builds latch PMv2 via SDL anyway). The adapter
+// enumeration order is the same EnumDisplayDevices walk SDL's Windows backend
+// uses, so index i names the same display SDL_GetDisplayBounds(i) does.
+static int sk_screen_rect_win(int i, int usable, int* x, int* y, int* w, int* h) {
+  typedef HANDLE (WINAPI *set_thread_ctx_fn)(HANDLE);
+  set_thread_ctx_fn set_ctx = (set_thread_ctx_fn)(void*)GetProcAddress(
+    GetModuleHandleW(L"user32"), "SetThreadDpiAwarenessContext");
+  HANDLE old_ctx = NULL;
+  if (set_ctx != NULL) old_ctx = set_ctx((HANDLE)-4); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+  int found = 0;
+  DISPLAY_DEVICEW dd;
+  dd.cb = sizeof(dd);
+  int idx = 0;
+  for (DWORD k = 0; EnumDisplayDevicesW(NULL, k, &dd, 0); k++) {
+    if (!(dd.StateFlags & DISPLAY_DEVICE_ACTIVE)) continue;
+    if (idx++ != i) continue;
+    DEVMODEW dm;
+    dm.dmSize = sizeof(dm);
+    dm.dmDriverExtra = 0;
+    if (!EnumDisplaySettingsW(dd.DeviceName, (DWORD)-1 /*ENUM_CURRENT_MODE*/, &dm)) break;
+    int rx = dm.dmPosition.x, ry = dm.dmPosition.y;
+    int rw = (int)dm.dmPelsWidth, rh = (int)dm.dmPelsHeight;
+    if (usable) {
+      POINT pt;
+      pt.x = rx + rw / 2;
+      pt.y = ry + rh / 2;
+      HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi;
+      mi.cbSize = sizeof(mi);
+      if (GetMonitorInfoW(mon, &mi)) {
+        rx = mi.rcWork.left; ry = mi.rcWork.top;
+        rw = mi.rcWork.right - mi.rcWork.left;
+        rh = mi.rcWork.bottom - mi.rcWork.top;
+      }
+    }
+    if (x) *x = rx;
+    if (y) *y = ry;
+    if (w) *w = rw;
+    if (h) *h = rh;
+    found = 1;
+    break;
+  }
+  if (set_ctx != NULL && old_ctx != NULL) set_ctx(old_ctx);
+  // No Win32 answer (headless service session, exotic driver): fall back to the
+  // logical rectangle rather than a zero one — a 0x0 bounds matches no Screen.
+  if (!found) return usable ? sk_display_usable_bounds(i, x, y, w, h)
+                            : sk_display_bounds(i, x, y, w, h);
+  return 1;
+}
+int sk_screen_bounds(int i, int* x, int* y, int* w, int* h) {
+  return sk_screen_rect_win(i, 0, x, y, w, h);
+}
+int sk_screen_usable_bounds(int i, int* x, int* y, int* w, int* h) {
+  return sk_screen_rect_win(i, 1, x, y, w, h);
+}
+#else
+int sk_screen_bounds(int i, int* x, int* y, int* w, int* h) {
+  return sk_display_bounds(i, x, y, w, h);
+}
+int sk_screen_usable_bounds(int i, int* x, int* y, int* w, int* h) {
+  return sk_display_usable_bounds(i, x, y, w, h);
+}
+#endif
 
 // Query the refresh rate (Hz) of the display a given window occupies. The
 // per-window form (defined in the registry section below) supersedes an earlier
@@ -4436,6 +4524,36 @@ void sk_window_set_always_in_front(int id, int on) {
   SDL_SetWindowAlwaysOnTop(c->win, on ? SDL_TRUE : SDL_FALSE);
 }
 
+// NativeWindowInitOptions.type for a window the PROGRAM creates. AIR maps UTILITY and
+// LIGHTWEIGHT to a tool window (WS_EX_TOOLWINDOW): no taskbar button and no alt-tab entry;
+// NORMAL is an app window that does appear in the taskbar (stage 460). SDL creates every
+// window as a plain top-level one, which always gets a taskbar button, so without this a
+// UTILITY window shows up in the taskbar -- with an empty thumbnail for a transparent GPU
+// window. Applied after creation but before activate() shows the window, so the taskbar
+// button is never created for a tool window. (macOS utility-window styling is a separate,
+// unmeasured concern; this seam is the Windows extended-style mapping only.)
+void sk_window_set_type(int id, const char* type) {
+#ifdef _WIN32
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return;
+  const int tool = (type != NULL &&
+                    (strcmp(type, "utility") == 0 || strcmp(type, "lightweight") == 0)) ? 1 : 0;
+  SDL_SysWMinfo info;
+  SDL_VERSION(&info.version);
+  if (!SDL_GetWindowWMInfo(c->win, &info) || info.subsystem != SDL_SYSWM_WINDOWS) return;
+  HWND hwnd = info.info.win.window;
+  const LONG ex = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
+  const LONG want = tool ? ((ex | WS_EX_TOOLWINDOW) & ~(LONG)WS_EX_APPWINDOW)
+                         : (ex & ~(LONG)WS_EX_TOOLWINDOW);
+  if (want == ex) return;
+  SetWindowLongPtrA(hwnd, GWL_EXSTYLE, want);
+  SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+#else
+  (void)id; (void)type;
+#endif
+}
+
 // NativeWindowInitOptions.transparent for a window the PROGRAM creates (the initial
 // window takes the same path at creation time, from ASC_WINDOW_TRANSPARENT). Latched
 // on the context because the present step reads it every frame, and applied to the
@@ -4446,6 +4564,15 @@ void sk_window_set_transparent(int id, int on) {
   c->transparent = on ? 1 : 0;
   sk_window_apply_transparent(c->win, c->transparent);
   sk_renderer_apply_transparent(c->ren, c->transparent);
+#if defined(ASC_RENDER_D3D) || defined(ASC_RENDER_GL)
+  // A GPU window has no SDL_Renderer, so the line above is a no-op there and the
+  // offscreen/ULW route lives in the GPU backend (d3d_glue / gl_glue).
+  // NativeWindowInitOptions writes the flag after the GPU bind, so switch the route
+  // and rebuild the surfaces there (stage 460 D3D12, stage 467 WGL) -- otherwise the
+  // window keeps the opaque route sk_gpu_init built and a transparent frame presents
+  // as black with an empty DWM thumbnail.
+  if (c->is_gpu) sk_gpu_set_transparent(id, c->transparent);
+#endif
 #if defined(__APPLE__)
   // A GPU window has no SDL_Renderer, so the line above is a no-op there and the
   // hosting step is the whole platform side. Covers NativeWindowInitOptions, where

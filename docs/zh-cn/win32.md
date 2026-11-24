@@ -489,7 +489,18 @@ flip-model 交换链的 `Present` 会装一个不透明 DirectComposition 子视
 图像（实测 ULW 成功且像素 alpha 正确，屏幕却显示不透明黑）；而跳过 `Present` 又会挂设备
 （`DXGI_ERROR_DEVICE_HUNG`，flip-model 强制要求 Present）。故透明 GPU 窗改渲染到**离屏渲染目标**、交换链
 闲置不 Present，每帧读回成预乘 BGRA 交给 CPU 路径同一套 ULW 呈现。实测三带 alpha 与 adl 同形、不透明 GPU
-零回归、读回开销可忽略（透明与不透明帧率相等）。详见 [`skia.md`](skia.md) §6.20。WGL 分支的透明窗**未实测**。
+零回归、读回开销可忽略（透明与不透明帧率相等）。详见 [`skia.md`](skia.md) §6.20。**WGL/GL 分支已修（阶段四百六十七）**：
+GL 没有 flip-model 交换链，但分层窗走 `SwapBuffers` 时 DWM 同样不逐像素合成 alpha（实测 alpha-0 显黑、半透明显
+不透明），故同构改走离屏：`gl_build_surface` 透明分支用 `SkSurfaces::RenderTarget`（纹理-backed 离屏面，Skia 自管
+FBO，无需裸调 `glGenFramebuffers`/`wglGetProcAddress`），`gl_present_transparent` 用 `SkSurface::readPixels` 读回成
+预乘 BGRA（一并做 RGBA→BGRA + 原点翻转）交同一套 ULW，跳过 `SwapBuffers`。after-init 路线由 `sk_gpu_set_transparent`
+（GL 版）重建 surface。实测三带 alpha 与 D3D12/adl 同形、不透明 GL（FBO 0 + SwapBuffers）零回归。
+
+**阶段四百六十**：运行期 `new NativeWindow`（`NativeWindowInitOptions.transparent=true`）的透明 GPU 窗也走离屏
+路径——透明标志写在 GPU bind 之后，`sk_window_set_transparent` 经新增 `sk_gpu_set_transparent` seam 置 `layered`
++ 重建表面（镜像 macOS after-init）；此前这些窗走不透明交换链⇒黑底+空白任务栏缩略图。同阶段修 **UTILITY 窗误进
+任务栏**：`NativeWindowType.UTILITY`/`LIGHTWEIGHT` 映射 `WS_EX_TOOLWINDOW`（无任务栏按钮），`NORMAL` 才进任务栏
+（新增 `sk_window_set_type`）。实证 UTILITY 窗 `ex=0x80090`、NORMAL 窗 `ex=0x80010`。钉 `unit: platform/NativeWindowWin`。
 
 ### 3.1.1 第二个窗口后端：WGL/OpenGL（`--gpu-backend gl`）
 
@@ -640,8 +651,21 @@ CGDisplayModeGetWidth`），与 `CGDisplayBounds` 同空间 ⇒ 这次改动在�
 （`Stage.fullScreen*` 取可用区、`Capabilities.screenResolution*` 取整块，二者在 AIR 里本来就不同）仍在遗留表。
 
 `Capabilities.screenDPI` 同理是**常量基线**而非读取：Windows 96、其余平台 72（macOS 也是 72）。回答真实
-面板 DPI（144）会在**每一台** HiDPI 桌面上静默偏离。**残留偏离**：`Screen.bounds`/`visibleBounds` 按 AIR
-应是物理像素而我们仍报逻辑值（`sk_display_pixel_bounds` 未实装），已在 `TODO.md` 的 `遗留待开发` 登记。
+面板 DPI（144）会在**每一台** HiDPI 桌面上静默偏离。**`Screen.bounds`/`visibleBounds` 的偏离已修齐（阶段四百六十三）**：
+按 AIR 它们在 Windows 上是物理像素，现由 Screen 专用的 AIR 空间 seam `sk_screen_bounds`/`sk_screen_usable_bounds`
+回答（`vendor/window_glue.cc`）。Windows 查询用 `EnumDisplaySettingsW`——它在 **DPI-unaware 进程里也报真实显示模式**
+（实测 `temp/screenpx/physprobe`：pels 3840×2560，而 `GetMonitorInfoW` 被虚拟化到 2560×1707），故 `standard` 分辨率
+构建（DPI-unaware）也报物理像素；work area 用线程级 PMv2 上下文（`SetThreadDpiAwarenessContext`）去虚拟化。
+`sk_display_bounds` **保持逻辑空间不动**（窗口居中/几何共用）；`resizeToScreen` 读逻辑空间的专用 seam
+`as_display_resize_bounds`，窗体几何不变。adl A/B 逐值对齐（bounds 3840×2560、visibleBounds 3840×2488、Capabilities 仍 2560×1707、
+`getScreensForRectangle` 在物理空间匹配）。钉 `unit: platform/DisplayMetrics` + `examples/screen-bounds.as`。
+
+**`resizeToScreen` 的目标矩形是平台分歧（阶段四百六十六）**：adl 51.4.1 在 Windows 上把窗体落到 **DIP 全屏**
+`(0,0,2560,1707)`——**含任务栏**（`temp/screenpx/adl`），而 macOS 落到该屏 `visibleBounds`（`temp/nwmac/rts-out.txt`）。
+故 `as_display_resize_bounds` 在 `_WIN32` 走 `sk_display_bounds`（全屏逻辑）、其余平台走 `sk_display_usable_bounds`，
+逐字复现各自实测，而非把文档口径「visibleBounds」套到所有平台。AOT 探针实测 `RTS=0,0,2560,1707` 与 adl 一致。
+红叉 `closing` 的可取消序本就正确（`WM_CLOSE` → cancelable `closing`，`preventDefault` 则不关），外部
+`PostMessage(WM_CLOSE)` 运行时验收通过（`temp/rts`）。
 
 ### 3.6 Stage3D 资源的**延迟释放**必须绑到**下一次提交**（阶段一百七十四）
 

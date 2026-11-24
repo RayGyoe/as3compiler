@@ -37,6 +37,16 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef _WIN32
+/* Sibling-DLL dependency (stage 464): ProbeHelper.dll ships beside ProbeANE.dll
+ * in the extension's platform directory. The Win32 loader's default search order
+ * does NOT include the directory of a DLL loaded by full path, so this import is
+ * the reproduction of the search-path gap -- it loads only when the host uses
+ * LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR. Windows-only: build-ane.sh does not build the
+ * helper, so the macOS fixture is unchanged. */
+__declspec(dllimport) int ProbeHelperValue(void);
+#endif
+
 typedef struct {
     int calls;
     int dataReady;
@@ -553,6 +563,18 @@ static FREObject probe_bitmapDataErrors(FREContext ctx, void* funcData, uint32_t
     return out;
 }
 
+/* The sibling-DLL answer (stage 464): reaching this function at all proves the
+ * loader found ProbeHelper.dll beside ProbeANE.dll -- a failed dependency search
+ * fails the WHOLE library load (error 126), so there is no partial state here. */
+#ifdef _WIN32
+static FREObject probe_helperValue(FREContext ctx, void* funcData, uint32_t argc, FREObject argv[]) {
+    (void)ctx; (void)funcData; (void)argc; (void)argv;
+    FREObject out = NULL;
+    FRENewObjectFromInt32(ProbeHelperValue(), &out);
+    return out;
+}
+#endif
+
 static FRENamedFunction probe_functions[] = {
     { (const uint8_t*)"ping",           NULL, probe_ping },
     { (const uint8_t*)"addInt",         NULL, probe_addInt },
@@ -580,6 +602,9 @@ static FRENamedFunction probe_functions[] = {
     { (const uint8_t*)"nativeWindowHandle", NULL, probe_nativeWindowHandle },
     { (const uint8_t*)"writeBitmapData", NULL, probe_writeBitmapData },
     { (const uint8_t*)"bitmapDataErrors", NULL, probe_bitmapDataErrors },
+#ifdef _WIN32
+    { (const uint8_t*)"helperValue",    NULL, probe_helperValue },
+#endif
 };
 
 /* ---- the AIR protocol ----------------------------------------------------- */

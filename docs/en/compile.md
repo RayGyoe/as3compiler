@@ -1794,7 +1794,14 @@ Key implementation points:
   transforms (`noScale` fixes content, `showAll`/`noBorder` scale uniformly, `exactFit` scales non-uniformly;
   align's eight values allocate leftover space); under `noScale`, `stageWidth/Height` track the real window
   size and dispatch `Event.RESIZE`. Mouse/wheel coordinates need the inverse transform `(x-ox)/cx` to hit
-  correctly after scaling/offsetting.
+  correctly after scaling/offsetting. **The design size content scales against (`design_w/h`, stage 461)**:
+  the initial window takes the descriptor size, but a secondary `NativeWindow` is always **AIR's fixed 72×72**
+  (the Adobe dev guide's "72:1" relationship: a 10×10 rect draws at 10×10 in a 72×72 window and scales to
+  20×20 in a 144×144 one; independent of the creation size and the SWF metadata, adl `temp/nwsize` measured);
+  `showAll`/`noBorder`/`exactFit` scale against it, `noScale` does not scale but still positions by align.
+  **The default `align=""` (empty, used by secondary windows) CENTERS the content**; an explicit `StageAlign`
+  eight-value pins from the top-left baseline (`TL`→0,0; the initial window uses `TL`, unaffected). All four
+  scaleModes' rendered geometry matches adl pixel-for-pixel (`temp/nwsize` red/green marker bbox).
 - **Mouse wheel (stage forty-five)**: `SDL_MOUSEWHEEL` is forwarded via `on_wheel` (`SDL_GetMouseState`
   fetches coordinates, because wheel events carry no position); `ASC_window_on_wheel` routes to
   `Stage_dispatchWheel`: when a TextField is hit, it auto-scrolls (measured in adl: 1 delta = 1 line,

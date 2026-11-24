@@ -1025,6 +1025,52 @@ readback COPY_SOURCE + R/B swap + ULW hand-off, event wait, HDR gate). `unit: pl
 native-only exemption list registers the two new seams (GPU-glue internal; the generated C never references
 them and web never links d3d_glue).
 
+**Stage 460 follow-up: NativeWindow transparent GPU windows + UTILITY tool windows.** The `layered` flag above
+is set in `sk_gpu_init`, which only covers the **descriptor's initial window** (its transparent flag is known
+before creation). A runtime `new NativeWindow(NativeWindowInitOptions)` writes `transparent` AFTER the window
+(and its GPU bind) exists, through `sk_window_set_transparent`, so `layered` was still 0 at init ⇒ those windows
+took the opaque swapchain route: the alpha-0 the compose clears is painted **black** by the flip-model chain, and
+with `WS_EX_LAYERED` set but no ULW the DWM taskbar thumbnail is **empty** (the real talkmed-meeting app's
+Control/Camera windows looked "invisible" against the dark meeting background). The fix mirrors macOS's
+after-init `sk_mac_apply_gpu_transparent`: `window_glue`'s `sk_window_set_transparent` calls a new seam
+`sk_gpu_set_transparent` (in `d3d_glue`) for a GPU window — `d3d_drain_window` first, then set `layered` (except
+HDR) and `d3d_setup_surfaces` to rebuild; the fence ledger is independent of the surfaces and stays valid after
+the drain. Probe-verified: a NativeWindow transparent GPU window shows the desktop through the unpainted area
+(no more black).
+
+The same stage fixes **UTILITY windows wrongly appearing in the taskbar**: AIR maps `NativeWindowType.UTILITY`/
+`LIGHTWEIGHT` to a tool window (`WS_EX_TOOLWINDOW`, no taskbar button, no alt-tab); only `NORMAL` appears. SDL
+creates every window as a plain top-level one (always a taskbar button), so a new `sk_window_set_type` (called
+from `NativeWindow_ctor` via `as_window_set_type`) sets `WS_EX_TOOLWINDOW` and clears `WS_EX_APPWINDOW` for
+utility/lightweight, and clears `WS_EX_TOOLWINDOW` otherwise. Enumerating the windows' extended styles confirms:
+UTILITY `ex=0x80090` (TOOLWINDOW+LAYERED), NORMAL `ex=0x80010` (LAYERED only). The web `sk_window_set_type` is an
+empty stub (a browser window has no taskbar button). Pin: `unit: platform/NativeWindowWin` **13**.
+
+**Fixed in stage 461** (see [`compile.md`](compile.md) §7 window scaling): a NativeWindow's stage design size is
+always AIR's fixed **72×72** (the Adobe dev guide's "72:1" relationship — not the creation size, nor the SWF-header
+size), and the default `align=""` **centers** the content (an explicit `StageAlign` pins from the top-left); all four
+scaleModes' rendered geometry matches adl pixel-for-pixel.
+
+**Stage 467 addendum: the WGL/GL backend.** The offscreen/ULW fix above landed only on D3D12; the GL (WGL)
+backend had no transparent support at all. The root cause is the same class but a different symptom: GL has no
+flip-model swapchain, yet a layered window presented through `SwapBuffers` is likewise **not alpha-composited
+per pixel** by DWM — measured (`temp/gltrans`, 300×200) the unpainted alpha-0 region shows **black** and the 50%
+blue band shows **opaque** (rather than D3D12's "ULW overridden by a DComp visual"). The fix is isomorphic but
+takes Skia's portable path: `gl_build_surface`'s transparent branch builds a **texture-backed offscreen surface**
+via `SkSurfaces::RenderTarget` (`kRGBA_8888`/`kPremul`/`kBottomLeft`) instead of FBO 0 — Skia owns the FBO, so no
+raw `glGenFramebuffers`/`wglGetProcAddress` is needed (the GL 1.1 header + opengl32.dll do not export the FBO
+entry points, the floor on Win7-class machines); `gl_present_transparent` uses `SkSurface::readPixels` to read
+back **premultiplied BGRA** (readPixels also does the GPU→CPU readback, the RGBA→BGRA swap and the origin flip,
+so no manual row loop), handing it to the same `sk_window_present_layered_pixels`; `sk_gpu_flush`'s transparent
+branch takes it and **skips SwapBuffers**. The after-init route rebuilds the surface via the GL
+`sk_gpu_set_transparent`, and `window_glue`'s call gate widens from `ASC_RENDER_D3D` to
+`ASC_RENDER_D3D || ASC_RENDER_GL`. Measured across three paths: descriptor-transparent (init) three-band alpha
+matches D3D12/adl (the blue band blends with whatever is behind: (0,0,127) over black, (78,84,212) over the
+terminal); after-init transparent (UTILITY red + NORMAL green) both render; **opaque GL (FBO 0 + SwapBuffers)
+has zero regression**. Pinned by `unit: platform/TransparentGpuGl` **11** (seam externs, `layered` set,
+offscreen RenderTarget, opaque still FBO 0, flush skips SwapBuffers, readPixels BGRA premul + ULW hand-off,
+`sk_gpu_set_transparent`, dual-backend gate). GL has no HDR path, so there is no D3D-style transparent+HDR veto.
+
 ## 7. Multi-target: native and wasm
 
 - **native**: Skia statically links `libskia.a` (CPU raster), producing Mach-O/ELF/PE.

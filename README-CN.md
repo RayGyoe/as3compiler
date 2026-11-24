@@ -191,7 +191,9 @@ error 103，而异命名空间的元素/属性四种写法**全部**报 103；`a
 名字报错，只是**存法**与 `features` 相同（同一个文件、两套独立开关）。优先级：
 `--gpu-backend` > 上次清单里的值 > `ASC_GPU_BACKEND` 环境变量（原型期别名，输给钉住的值时会明确说）= `auto`。
 五种无效组合（非 `--air-app`、web、非 Windows 宿主、描述符没编进 GPU 窗口、Stage3D）都是**构建期拒绝**，
-不会「开了但什么都不变」。详见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6 与
+不会「开了但什么都不变」。两个后端都支持**透明 GPU 窗**（`<transparent>true</transparent>` + `<renderMode>direct</renderMode>`）：
+D3D12（阶段四百五十九/四百六十）与 WGL（阶段四百六十七）均走离屏渲染 + 读回 → `UpdateLayeredWindow`，
+不透明路径零回归（详见 [`skia.md`](docs/zh-cn/skia.md) §6.20）。详见 [`compile.md`](docs/zh-cn/compile.md) §3.4.6 与
 [`win32.md`](docs/zh-cn/win32.md) §3.1.1。**Win7 口径**（阶段二百七十二）：GL 构建的导入表已实测干净
 （13 个 DLL / 408 个符号，无 `d3d12.dll`/`dxgi.dll`/`d3dcompiler_47.dll`，subsystem 6.0），用
 `node scripts/win7-imports.ts <exe>` 可复核；**但这个结论只覆盖「加载器与导入面」，真机仍未跑过**，
@@ -371,8 +373,9 @@ Windows 交 `HWND`、macOS 交 `NSWindow*`；窗口已关闭或构建没有窗�
 
 **迁移一个现成 ANE 的完整流程**（双产物 + 重编换名、shim 头、三个工程属性、症状→病因对照表、
 以及全部缺口清单）见 [`docs/zh-cn/ane.md`](docs/zh-cn/ane.md)；最小可跑闭环见
-[`examples/ane/`](examples/ane)（72 条断言，命令行/清单直接指名包；**Windows 与 macOS 都真跑**，
-macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
+[`examples/ane/`](examples/ane)（73 条断言，命令行/清单直接指名包；**Windows 与 macOS 都真跑**，
+macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`；Windows 侧额外钉住**附属 DLL 搜索路径**——主 DLL 导入的同目录
+`ProbeHelper.dll` 经 `LoadLibraryExA` + `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` 加载，`helperValue=4242`，阶段四百六十四）与
 [`examples/ane-app/`](examples/ane-app)（13 条断言，走 `--air-app` + 描述符 `<extensions>`，其中两条钉住原生窗口句柄、
 两条钉住「第二帧必须顶掉第一帧」的像素刷新）。
 重编产物是一棵**暂存目录树**（`extension.xml` + `<平台>/<库>`，不打包），放进 `<appDir>/ext-aot/<扩展 id>/`
@@ -784,6 +787,7 @@ macOS 侧加载的是经 `dlopen` 的真 `ProbeANE.dylib`）与
 - `examples/wasm-native/` — `--target wasm`（WASI）产物，含 `--export` 与 `[WasmExport]` 导出面
 - `examples/vsyncevent.as` — `VsyncStateChangeAvailabilityEvent`（AIR 面 + `refreshRate` 增强面）与 `Stage.vsyncEnabled`
 - `examples/screen-mouse-event.as` — `flash.events.ScreenMouseEvent`（实测 11 参构造、只读 `screenX`/`screenY`、`clone` 只带构造级状态，以及动态写的 `#1074`/`#1037` 错误面）
+- `examples/screen-bounds.as` — `flash.display.Screen` 的 **AIR 空间矩形**（阶段四百六十三）：Windows 上 `bounds`/`visibleBounds` 是**物理像素**（150% 桌面 3840×2560 / 3840×2488）而 `Capabilities.screenResolution*`/`Stage.fullScreen*` 仍 DIP；钉与主机无关的结构不变量（包含关系、Rectangle 同一性、`getScreensForRectangle` 匹配空间）。`resizeToScreen` 的目标矩形是**平台分歧**（阶段四百六十六）：Windows 落 DIP 全屏含任务栏、macOS 落 `visibleBounds`，见 `docs/zh-cn/win32.md` §3.5
 - `examples/error-call.as` — 无 `new` 的 `Error(msg)` 是**构造**、其余类名调用是**运行时强转**（`#1034`），与 `catch (e:Error)` 的交互
 每个示例编译后会在旁边留下同名 `.c` 文件，可直接阅读编译器生成的 C 代码。
 

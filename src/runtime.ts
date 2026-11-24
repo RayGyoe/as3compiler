@@ -12595,6 +12595,11 @@ static inline int as_window_in_move_loop(void) { return sk_window_in_move_loop()
 extern int sk_display_count(void);
 extern int sk_display_bounds(int i, int* x, int* y, int* w, int* h);
 extern int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h);
+// AIR-space Screen rectangles (stage 463): PHYSICAL pixels on Windows, points on
+// macOS (where SDL already reports points). Separate from sk_display_bounds above,
+// which stays in the LOGICAL space the window frame/centering math is written in.
+extern int sk_screen_bounds(int i, int* x, int* y, int* w, int* h);
+extern int sk_screen_usable_bounds(int i, int* x, int* y, int* w, int* h);
 // Chrome insets of a NEW decorated window, in logical points, measured before the
 // initial window's surface is built (the descriptor's <width>/<height> is the frame).
 extern void sk_frame_insets_new_window(int decorated, int* t, int* l, int* b, int* r);
@@ -12655,6 +12660,7 @@ extern void sk_window_set_always_in_front(int id, int on);
 // to alpha 0 instead of the stage colour -- AIR does not fill the stage background
 // in this mode (measured on adl 51.4.1).
 extern void sk_window_set_transparent(int id, int on);
+extern void sk_window_set_type(int id, const char* type);
 // NativeWindow.minSize/maxSize. The limits live in the glue (0 = unlimited) and
 // are what the window manager enforces while the user drags an edge; the AS3 side
 // keeps its own copy because AIR's getters report the last value written, even on
@@ -13045,6 +13051,15 @@ static inline void as_window_set_transparent(int id, int on) {
     (void)id; (void)on;
 #endif
 }
+// NativeWindowInitOptions.type -> the OS window's taskbar presence (UTILITY/LIGHTWEIGHT
+// are tool windows with no taskbar button; NORMAL appears). See sk_window_set_type.
+static inline void as_window_set_type(int id, const char* type) {
+#ifdef ASC_USE_WINDOW
+    sk_window_set_type(id, type);
+#else
+    (void)id; (void)type;
+#endif
+}
 // NativeWindow.minSize/maxSize. The window manager owns the enforcement (a resize
 // drag must respect them), the AS3 side owns the values AIR's getters report — so
 // the two are kept in step by always going through these two calls.
@@ -13200,22 +13215,55 @@ static inline int as_screen_count(void) {
     return 1;
 #endif
 }
-// Full display rectangle. Without the window backend each query leaves the
+// Full display rectangle in AIR's Screen space (physical pixels on Windows,
+// points on macOS — stage 463). Without the window backend each query leaves the
 // out-params at zero and returns 0, matching the "0 in headless builds"
 // convention of Capabilities.screenResolutionX/Y.
 static inline int as_screen_bounds(int i, int* x, int* y, int* w, int* h) {
 #ifdef ASC_USE_WINDOW
-    return sk_display_bounds(i, x, y, w, h);
+    return sk_screen_bounds(i, x, y, w, h);
 #else
     (void)i;
     if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0;
     return 0;
 #endif
 }
-// Usable rectangle (menu bar / Dock excluded) — AIR's Screen.visibleBounds.
+// Usable rectangle (menu bar / Dock / taskbar excluded) — AIR's Screen.visibleBounds,
+// same AIR space as as_screen_bounds above.
 static inline int as_screen_usable_bounds(int i, int* x, int* y, int* w, int* h) {
 #ifdef ASC_USE_WINDOW
+    return sk_screen_usable_bounds(i, x, y, w, h);
+#else
+    (void)i;
+    if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0;
+    return 0;
+#endif
+}
+// Usable rectangle in the window-placement LOGICAL space (SDL points/DIP) — the
+// space as_window_set_bounds is written in. Screen.visibleBounds is AIR-space
+// (physical on Windows) and must NOT feed window geometry directly; resizeToScreen
+// reads this seam instead (stage 463).
+static inline int as_display_usable_bounds(int i, int* x, int* y, int* w, int* h) {
+#ifdef ASC_USE_WINDOW
     return sk_display_usable_bounds(i, x, y, w, h);
+#else
+    (void)i;
+    if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0;
+    return 0;
+#endif
+}
+// resizeToScreen's target rectangle, in the window-placement LOGICAL space. adl
+// 51.4.1 diverges by platform: Windows sizes the frame to the FULL display
+// (0,0,2560,1707 -- taskbar included, temp/screenpx/adl), while macOS sizes to
+// visibleBounds (temp/nwmac/rts-out.txt). Reproduce each measured behaviour rather
+// than the documented "visibleBounds" everywhere (stage 466).
+static inline int as_display_resize_bounds(int i, int* x, int* y, int* w, int* h) {
+#ifdef ASC_USE_WINDOW
+  #ifdef _WIN32
+    return sk_display_bounds(i, x, y, w, h);
+  #else
+    return sk_display_usable_bounds(i, x, y, w, h);
+  #endif
 #else
     (void)i;
     if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0;
@@ -13418,6 +13466,7 @@ static inline int as_window_os_display_state(int id) { (void)id; return -1; }
 static inline int as_window_is_active(int id) { (void)id; return 0; }
 static inline void as_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
 static inline void as_window_set_transparent(int id, int on) { (void)id; (void)on; }
+static inline void as_window_set_type(int id, const char* type) { (void)id; (void)type; }
 static inline void* as_window_native_handle(int id) { (void)id; return NULL; }
 static inline void as_window_get_limits(int id, int* mnw, int* mnh, int* mxw, int* mxh) {
     (void)id; if (mnw) *mnw = 0; if (mnh) *mnh = 0; if (mxw) *mxw = 0; if (mxh) *mxh = 0;
@@ -13442,6 +13491,8 @@ static inline int as_window_get_stage_full_size(int* w, int* h) { if (w) *w = 0;
 static inline int as_screen_count(void) { return 1; }
 static inline int as_screen_bounds(int i, int* x, int* y, int* w, int* h) { (void)i; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; return 0; }
 static inline int as_screen_usable_bounds(int i, int* x, int* y, int* w, int* h) { (void)i; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; return 0; }
+static inline int as_display_usable_bounds(int i, int* x, int* y, int* w, int* h) { (void)i; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; return 0; }
+static inline int as_display_resize_bounds(int i, int* x, int* y, int* w, int* h) { (void)i; if (x) *x = 0; if (y) *y = 0; if (w) *w = 0; if (h) *h = 0; return 0; }
 static inline int as_screen_color_depth(void) { return 32; }
 static inline double as_window_device_scale(int w, int h, int* pw, int* ph) { if (pw) *pw = w; if (ph) *ph = h; (void)w; (void)h; return 1.0; }
 static inline double as_window_display_refresh(int win) { (void)win; return 0.0; }

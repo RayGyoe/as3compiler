@@ -1237,6 +1237,16 @@ async function main(): Promise<void> {
         if (hasMetal && !cfg.sources.some((p) => basename(p) === 'video_metal.mm'))
           cfg.sources.push(resolve(vendorDir, 'video_metal.mm'));
       }
+      // Windows D3D12 zero-copy seam (video.md §16.8.3): video_glue.c references
+      // sk_video_d3d_* under ASC_RENDER_D3D, and those symbols live in video_d3d.cc.
+      // The WGL (gl) backend compiles the references out, so a gl link never needs the
+      // file; a D3D12 link does. Mirror the macOS video_metal.mm injection above so a
+      // D3D12 + video build links without the manifest having to name the file by hand.
+      if (process.platform === 'win32') {
+        const hasD3D = cfg.defines.some((d) => d.split('=')[0].trim() === 'ASC_RENDER_D3D');
+        if (hasD3D && !cfg.sources.some((p) => basename(p) === 'video_d3d.cc'))
+          cfg.sources.push(resolve(vendorDir, 'video_d3d.cc'));
+      }
       if (!cfg.defines.some((d) => d === 'ASC_HAVE_VIDEO' || d.startsWith('ASC_HAVE_VIDEO='))) cfg.defines.push('ASC_HAVE_VIDEO');
       // The runtime decoder choice rides in a define, the same way the GPU backend
       // does: the C side has one compile-time default and one switchable value.

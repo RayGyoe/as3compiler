@@ -414,6 +414,16 @@ int sk_display_usable_bounds(int i, int* x, int* y, int* w, int* h) {
   return 1;
 }
 
+// AIR-space Screen rectangles (stage 463): on Windows these are physical pixels,
+// but a page's CSS-pixel screen IS the space the browser reports, so the AIR-space
+// view aliases the logical queries here (same shape as the macOS alias).
+int sk_screen_bounds(int i, int* x, int* y, int* w, int* h) {
+  return sk_display_bounds(i, x, y, w, h);
+}
+int sk_screen_usable_bounds(int i, int* x, int* y, int* w, int* h) {
+  return sk_display_usable_bounds(i, x, y, w, h);
+}
+
 // Mirror the canvas' CSS box into the stage (fill mode only). Idempotent and cheap:
 // an unchanged box is dropped before it can reach the AS3 side, which matters
 // because the browser fires a resize event for changes we caused ourselves
@@ -659,6 +669,9 @@ void sk_window_set_always_in_front(int id, int on) { (void)id; (void)on; }
 // the compose step clears to alpha 0, which is harmless — the page background
 // shows through exactly as it does for any transparent canvas.
 void sk_window_set_transparent(int id, int on) { (void)id; (void)on; }
+// NativeWindowInitOptions.type has no browser counterpart (a page's window belongs to
+// the browser, no taskbar button to suppress); the as_window_set_type wrapper stubs it.
+void sk_window_set_type(int id, const char* type) { (void)id; (void)type; }
 // minSize/maxSize and the system move/resize drags have no browser counterpart:
 // a page's window belongs to the browser, so there is no frame to size-limit and
 // no frame to hand over to the pointer. "No limit" and "the drag did not start"

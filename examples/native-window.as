@@ -222,11 +222,13 @@ function phase7():void {
     w6.stage.stageWidth + "x" + w6.stage.stageHeight);
   eq("...and that size is the client area, not the 400x200 ctor default",
     w5.stage.stageWidth > 400, true);
-  // showAll 下舞台停在 design 矩形（400x200），这一步**不能**被上面的修复带偏。
+  // showAll 下舞台停在 design 矩形。AIR 给二级窗的 design 恒为 72x72（Adobe dev guide
+  // 的「72:1」关系，adl temp/nwsize 实测：与 bounds/创建尺寸/[SWF] 元数据均无关），
+  // 不是创建默认的 400x200。这一步**不能**被上面的 noScale 修复带偏。
   var w7:NativeWindow = new NativeWindow(opts);
   w7.bounds = new Rectangle(100, 100, 600, 400);
   eq("showAll still pins the stage to the design rect",
-    w7.stage.stageWidth + "x" + w7.stage.stageHeight, "400x200");
+    w7.stage.stageWidth + "x" + w7.stage.stageHeight, "72x72");
   w5.close();
   w6.close();
   w7.close();

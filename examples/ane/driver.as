@@ -15,6 +15,7 @@ import flash.external.ExtensionContext;
 import flash.events.StatusEvent;
 import flash.display.BitmapData;
 import flash.geom.Point;
+import flash.system.Capabilities;
 
 var passed:int = 0;
 
@@ -47,6 +48,14 @@ if (ctx != null) {
 
     // Strings.
     check("ping", ctx.call("ping") as String, "pong");
+
+    // 阶段四百六十四：附属 DLL 依赖。ProbeANE.dll 导入旁边的 ProbeHelper.dll，
+    // Win32 默认搜索路径不含「全路径加载的 DLL 自身目录」，宿主必须用
+    // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR 才能加载成功（否则整个库 126 失败）。
+    // 夹具的这半只在 Windows 构建（build-ane.sh 不编 helper），故按平台断言。
+    if (Capabilities.os.search("Windows") > -1) {
+        check("helperValue (sibling DLL)", int(ctx.call("helperValue")), 4242);
+    }
 
     // The FRE string length contract (docs/zh-cn/ane.md 5.1). AIR's header says the
     // length FREGetObjectAsUTF8 reports INCLUDES the null terminator; AIR does not

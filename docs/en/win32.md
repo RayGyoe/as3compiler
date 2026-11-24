@@ -502,8 +502,23 @@ the device (`DXGI_ERROR_DEVICE_HUNG` — a flip-model swapchain demands Present)
 renders into **offscreen render targets** with the swapchain idle (never Presented), and each frame is read
 back to premultiplied BGRA and handed to the same ULW present the CPU path uses. Measured: the three-band
 alpha matches adl, opaque GPU has zero regression, and readback overhead is negligible (transparent and
-opaque frame rates are equal). See [`skia.md`](skia.md) §6.20. Transparent windows on the WGL branch are
-**not measured**.
+opaque frame rates are equal). See [`skia.md`](skia.md) §6.20. **The WGL/GL branch is fixed (stage 467)**:
+GL has no flip-model swapchain, but a layered window presented through `SwapBuffers` is likewise not
+alpha-composited per pixel by DWM (measured: alpha-0 shows black, semi-transparent shows opaque), so it takes
+the same offscreen route: `gl_build_surface`'s transparent branch uses `SkSurfaces::RenderTarget` (a
+texture-backed offscreen surface; Skia owns the FBO, so no raw `glGenFramebuffers`/`wglGetProcAddress` is
+needed), and `gl_present_transparent` uses `SkSurface::readPixels` to read back premultiplied BGRA (doing the
+RGBA→BGRA swap and origin flip as well) into the same ULW present, skipping `SwapBuffers`. The after-init
+route rebuilds the surface via the GL `sk_gpu_set_transparent`. Measured: the three-band alpha matches
+D3D12/adl, and opaque GL (FBO 0 + SwapBuffers) has zero regression.
+
+**Stage 460**: a runtime `new NativeWindow` (`NativeWindowInitOptions.transparent=true`) GPU window also takes the
+offscreen route — the transparent flag is written after the GPU bind, so `sk_window_set_transparent` sets `layered`
+and rebuilds the surfaces through a new `sk_gpu_set_transparent` seam (mirroring macOS after-init); previously these
+windows took the opaque swapchain ⇒ black fill + an empty taskbar thumbnail. The same stage fixes **UTILITY windows
+wrongly appearing in the taskbar**: `NativeWindowType.UTILITY`/`LIGHTWEIGHT` map to `WS_EX_TOOLWINDOW` (no taskbar
+button), only `NORMAL` appears (new `sk_window_set_type`). Verified: UTILITY `ex=0x80090`, NORMAL `ex=0x80010`.
+Pin: `unit: platform/NativeWindowWin`.
 
 ### 3.1.1 The Second Window Backend: WGL/OpenGL (`--gpu-backend gl`)
 
@@ -686,9 +701,26 @@ AIR itself) that stays in the leftover table.
 
 `Capabilities.screenDPI` is likewise a **constant baseline** rather than a reading: 96 on Windows, 72
 elsewhere (macOS is 72 as well). Reporting the real panel DPI (144) would silently deviate on **every** HiDPI
-desktop. **Residual deviation**: per AIR, `Screen.bounds`/`visibleBounds` should be physical pixels while we
-still report logical values (`sk_display_pixel_bounds` is unimplemented), and that is logged in `TODO.md`'s
-`遗留待开发`.
+desktop. **The `Screen.bounds`/`visibleBounds` deviation is CLOSED (stage 463)**: per AIR they are physical
+pixels on Windows, and the Screen-only AIR-space seam `sk_screen_bounds`/`sk_screen_usable_bounds` now reports
+them (`vendor/window_glue.cc`). The Windows query uses `EnumDisplaySettingsW`, which answers the REAL display
+mode even in a **DPI-unaware** process (measured `temp/screenpx/physprobe`: pels 3840x2560 while
+`GetMonitorInfoW` is virtualized to 2560x1707) — so a `standard`-resolution build reports physical pixels too;
+the work area is un-virtualized with a thread-local PMv2 context (`SetThreadDpiAwarenessContext`).
+`sk_display_bounds` **stays logical** because the window frame/centering math shares it; `resizeToScreen`
+reads the dedicated logical-space seam `as_display_resize_bounds` so window geometry is unchanged. adl A/B is
+value-for-value identical (bounds 3840x2560, visibleBounds 3840x2488, Capabilities still 2560x1707,
+`getScreensForRectangle` matching in the physical space). Pinned by `unit: platform/DisplayMetrics` +
+`examples/screen-bounds.as`.
+
+**`resizeToScreen`'s target rectangle is a PLATFORM SPLIT (stage 466)**: adl 51.4.1 on Windows lands the frame
+at the **DIP FULL display** `(0,0,2560,1707)` — **taskbar included** (`temp/screenpx/adl`) — while macOS lands
+at that screen's `visibleBounds` (`temp/nwmac/rts-out.txt`). So `as_display_resize_bounds` uses
+`sk_display_bounds` (full logical) under `_WIN32` and `sk_display_usable_bounds` elsewhere, reproducing each
+measured behaviour rather than applying the documented "visibleBounds" everywhere. An AOT probe measures
+`RTS=0,0,2560,1707`, identical to adl. The red-X `closing` cancelable ordering was already correct
+(`WM_CLOSE` → cancelable `closing`, no close when `preventDefault`); a runtime acceptance via external
+`PostMessage(WM_CLOSE)` passes (`temp/rts`).
 
 ### 3.6 Stage3D Resource **Deferred Release** Must Be Bound to the **Next Submission** (stage one-hundred-seventy-four)
 

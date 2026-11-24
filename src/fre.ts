@@ -165,7 +165,33 @@ export const FRE_BODY = `
   // A bare name: "asaot.dll" is found beside the executable, which is the first
   // place the Win32 loader searches.
   typedef HMODULE as_fre_lib;
-  static as_fre_lib as_fre_lib_open(const char* path) { return LoadLibraryA(path); }
+  static as_fre_lib as_fre_lib_open(const char* path) {
+      // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR lets the loader resolve the library's OWN
+      // dependencies beside it -- an ANE's sibling DLLs (the fixture's
+      // ProbeHelper.dll next to ProbeANE.dll). The DEFAULT search order never
+      // includes the directory of a DLL loaded by full path, so a sibling import
+      // fails with 126 even though the file sits right next to it (measured:
+      // temp/ane-dep-before, stage 464). DEFAULT_DIRS keeps the application
+      // directory (asaot.dll beside the exe) and System32 searchable. The flags
+      // need KB2533623 (Win7 SP1+); a host without them answers
+      // ERROR_INVALID_PARAMETER (87), and plain LoadLibraryA is the fallback there.
+      //
+      // The path MUST be all backslashes first: the flags' load-directory
+      // derivation does not tolerate forward slashes, and the descriptor keeps
+      // AIR's '/' convention, so the joined path is mixed-separator. Measured
+      // (temp/screenpx/dllprobe2): the SAME file loads with pure backslashes and
+      // fails 126 with mixed ones -- the wrong directory gets added. Plain
+      // LoadLibraryA tolerates '/' (which is why this never bit before the flags).
+      char norm[2300];
+      size_t n = strlen(path);
+      if (n >= sizeof(norm)) n = sizeof(norm) - 1;
+      for (size_t i = 0; i < n; i++) norm[i] = (path[i] == '/') ? '\\\\' : path[i];
+      norm[n] = 0;
+      HMODULE lib = LoadLibraryExA(norm, NULL,
+          LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+      if (lib == NULL && GetLastError() == 87) lib = LoadLibraryA(norm);
+      return lib;
+  }
   static void*     as_fre_lib_sym(as_fre_lib lib, const char* name) { return (void*)GetProcAddress(lib, name); }
   // Windows reports WHY as a NUMBER, and the number is the whole diagnosis: 193
   // (ERROR_BAD_EXE_FORMAT) means the file IS there but this process cannot load it

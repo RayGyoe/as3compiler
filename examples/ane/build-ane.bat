@@ -82,6 +82,21 @@ where %CC% >nul 2>nul || set "PATH=C:\Program Files\LLVM\bin;%PATH%"
 
 if not exist "%SCRATCH%" mkdir "%SCRATCH%"
 
+echo [ane] compiling ProbeHelper.c -^> ProbeHelper.dll
+rem The SIBLING dependency (stage 464): ProbeANE.dll imports ProbeHelperValue from
+rem this DLL, which ships beside it in the platform directory. It is what reproduces
+rem the loader search-path gap -- the default Win32 search never looks in the
+rem directory of a DLL loaded by full path, so the host must load with
+rem LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR for ProbeANE.dll to load at all.
+pushd "%SCRATCH%"
+%CC% /nologo /LD /O2 /MD "%EX%ProbeHelper.c" /Fe:ProbeHelper.dll /link /INCREMENTAL:NO /MACHINE:X64
+if errorlevel 1 (
+  popd
+  echo [ane] FAILED - helper compile/link
+  exit /b 1
+)
+popd
+
 echo [ane] compiling ProbeANE.c -^> %DLL%
 rem /I shim BEFORE the extension's own directory: that is what redirects the AIR SDK
 rem header name to the asaot ABI (see the header comment).
@@ -94,7 +109,7 @@ pushd "%SCRATCH%"
 %CC% /nologo /LD /O2 /MD ^
   /I "%EX%shim" /I "%REPO%\lib" ^
   "%EX%ProbeANE.c" /Fe:%DLL% ^
-  /link /LIBPATH:"%REPO%\lib\bin\windows-x64" /INCREMENTAL:NO /MACHINE:X64 asaot.lib user32.lib
+  /link /LIBPATH:"%REPO%\lib\bin\windows-x64" /LIBPATH:"%SCRATCH%" /INCREMENTAL:NO /MACHINE:X64 asaot.lib user32.lib ProbeHelper.lib
 if errorlevel 1 (
   popd
   echo [ane] FAILED - compile/link
@@ -123,6 +138,13 @@ if not errorlevel 1 (
 findstr /c:"ProbeExtInitializer" "%SCRATCH%\dump.txt" >nul
 if errorlevel 1 (
   echo [ane] FAILED - %DLL% exports no ProbeExtInitializer
+  exit /b 1
+)
+rem The sibling import must be REAL: a ProbeANE.dll that lost the ProbeHelper.dll
+rem import would load fine and silently stop reproducing the search-path gap.
+findstr /c:"DLL Name: ProbeHelper.dll" "%SCRATCH%\dump.txt" >nul
+if errorlevel 1 (
+  echo [ane] FAILED - %DLL% does not import ProbeHelper.dll
   exit /b 1
 )
 
@@ -154,7 +176,14 @@ for %%T in ("%EX%ext-aot" "%EX%..\ane-app\ext-aot") do (
     echo [ane] FAILED - could not stage into %%~fT\%ID%\%PLAT%\
     exit /b 1
   )
-  echo [ane] staged -^> %%~fT\%ID%\%PLAT%\%DLL%
+  rem The sibling DLL stages beside the main one (whole-package staging copies it
+  rem to the run-time extensions/ tree automatically, src/ane.ts stage 391).
+  copy /y "%SCRATCH%\ProbeHelper.dll" "%%~fT\%ID%\%PLAT%\ProbeHelper.dll" >nul
+  if errorlevel 1 (
+    echo [ane] FAILED - could not stage ProbeHelper.dll into %%~fT\%ID%\%PLAT%\
+    exit /b 1
+  )
+  echo [ane] staged -^> %%~fT\%ID%\%PLAT%\%DLL% + ProbeHelper.dll
 )
 
 echo [ane] ok -- one compile, both trees

@@ -380,6 +380,10 @@ const EXAMPLE_ARGS: Record<string, string[]> = {
   // contract of the generated classes (Kind, Class-value identity, decoded
   // pixels), which only exists once those seams are real.
   'embed.as': ['--manifest', join(dir, 'embed.build.json')],
+  // screen-bounds.as（阶段四百六十三）读 flash.display.Screen 的 AIR 空间矩形，需要
+  // 窗口后端（ASC_USE_WINDOW + window_glue）才有真查询；纯 C 构建下 bounds 是零桩。
+  // 不开窗、只查询后退出，故可进并发池。
+  'screen-bounds.as': ['--manifest', join(dir, 'screen-bounds.build.json')],
   // 阶段一百二十八：bakecrisp 断言的**是像素**（`BitmapData.draw` 的 `getPixel32` 墨迹包围盒
   // /边框线宽/`pixdiff`），而纯 C 构建没有光栅后端（draw 是空桩 ⇒ 墨迹 0x0），故必须链 Skia。
   // 与 autobake.as 的区别正在此：那个只 trace、不做像素断言，三种构建下都能「过」。

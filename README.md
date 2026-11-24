@@ -188,7 +188,10 @@ in **our generated manifest** as `gpu-backend`, which AIR never reads. It is **n
 switches. Precedence:
 `--gpu-backend` > the value persisted in the previous manifest > `ASC_GPU_BACKEND` (prototype alias, says so when it
 loses) = `auto`. Five impossible combinations (no `--air-app`, web, non-Windows host, descriptor compiles no GPU
-window, Stage3D) are **refused at build time** rather than looking honoured. Details in
+window, Stage3D) are **refused at build time** rather than looking honoured. Both backends support **transparent
+GPU windows** (`<transparent>true</transparent>` + `<renderMode>direct</renderMode>`): D3D12 (stages 459/460) and
+WGL (stage 467) both render offscreen + read back → `UpdateLayeredWindow`, with zero regression on the opaque
+path (see [`skia.md`](docs/en/skia.md) §6.20). Details in
 [`compile.md`](docs/en/compile.md) and [`win32.md`](docs/en/win32.md) §3.1.1. **Win7 scope** (stage
 two-hundred-seventy-two): the GL build's import table is measured clean (13 DLLs / 408 symbols, no `d3d12.dll`/
 `dxgi.dll`/`d3dcompiler_47.dll`, subsystem 6.0) and re-checkable with `node scripts/win7-imports.ts <exe>`; **that
@@ -279,7 +282,7 @@ only stubs are exported and they **report loudly** when called, never silently r
 `FRE_ILLEGAL_STATE` with a self-report rather than a fabricated pointer.
 
 **The complete procedure for migrating an existing ANE** (dual products + rebuild-with-renaming, the shim header, the three project properties, a symptom→cause table, and the full list of gaps) is in
-[`docs/en/ane.md`](docs/en/ane.md); the smallest runnable loop is in [`examples/ane/`](examples/ane) (72 assertions, naming the package on the command line / in a manifest; **it really runs on both Windows and macOS**, and on macOS it loads a genuine `dlopen`ed `ProbeANE.dylib`) and
+[`docs/en/ane.md`](docs/en/ane.md); the smallest runnable loop is in [`examples/ane/`](examples/ane) (73 assertions, naming the package on the command line / in a manifest; **it really runs on both Windows and macOS**, and on macOS it loads a genuine `dlopen`ed `ProbeANE.dylib`; the Windows side additionally pins the **dependent-DLL search path** — the sibling `ProbeHelper.dll` imported by the main DLL loads via `LoadLibraryExA` + `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`, `helperValue=4242`, stage 464) and
 [`examples/ane-app/`](examples/ane-app) (13 assertions, going through `--air-app` + the descriptor's `<extensions>`, two of them pinning the native window handle and
 two pinning that a second frame really replaces the first).
 A rebuilt product is a **staging directory tree** (`extension.xml` + `<platform>/<library>`, unpackaged); dropping it into `<appDir>/ext-aot/<extension id>/`
@@ -701,6 +704,7 @@ the real app reached 1.5 GB of bake surfaces after 20 open/close cycles. It now 
 - `examples/wasm-native/` — `--target wasm` (WASI) products, including the `--export` and `[WasmExport]` export surfaces
 - `examples/vsyncevent.as` — `VsyncStateChangeAvailabilityEvent` (the AIR surface + the `refreshRate` enhancement surface) and `Stage.vsyncEnabled`
 - `examples/screen-mouse-event.as` — `flash.events.ScreenMouseEvent` (the measured 11-argument constructor, read-only `screenX`/`screenY`, `clone` carrying constructor-level state only, and the `#1074`/`#1037` dynamic-write errors)
+- `examples/screen-bounds.as` — `flash.display.Screen`'s **AIR-space rectangles** (stage 463): on Windows `bounds`/`visibleBounds` are **physical pixels** (3840x2560 / 3840x2488 on a 150% desktop) while `Capabilities.screenResolution*`/`Stage.fullScreen*` stay DIP; pins host-independent structural invariants (containment, Rectangle identity, `getScreensForRectangle` matching space). `resizeToScreen`'s target rectangle is a **platform split** (stage 466): Windows lands at the DIP full display including the taskbar, macOS at `visibleBounds` — see `docs/en/win32.md` §3.5
 - `examples/error-call.as` — a one-argument class call: no-`new` `Error(msg)` **constructs**, any other class name **coerces** (`#1034`), and how that interacts with `catch (e:Error)`
 
 Each example, after compilation, leaves a same-named `.c` file beside it so you can directly read the compiler-generated C code.

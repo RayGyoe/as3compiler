@@ -1120,6 +1120,13 @@ Implemented in `vendor/video_d3d.cc` (Windows/D3D12 only). `vendor/video_glue.c`
 `sk_video_d3d_image()` / `sk_video_d3d_stats()` / `sk_video_d3d_forget()` — integer and pointer handles, so the
 FFmpeg seam still knows nothing about Skia.
 
+**Build injection (stage 462):** `video_glue.c`'s references to `sk_video_d3d_*` compile only under
+`ASC_RENDER_D3D`; the WGL (`gl`) backend guards them out and never needs the file. So on Windows the video
+probe **auto-adds `video_d3d.cc` to sources when it sees `ASC_RENDER_D3D`** (symmetric with the macOS
+`video_metal.mm` injection), and a D3D12 + video app manifest no longer has to name it by hand. Previously
+only the macOS injection existed, so a Windows D3D12 + video build failed to link on exactly those four
+symbols (measured: the real meeting app switching `gl` -> `d3d12`).
+
 1. **Decoded slice → our own shared staging texture (D3D11 `CopySubresourceRegion`).** Handing the decoder's
 texture to D3D12 directly is not an option: `hwcontext_d3d11va.c` allocates a `D3D11_BIND_DECODER` array with
 no sharing flags, and DXVA does not promise a shareable decode surface. Copying to a same-format (NV12/P010)

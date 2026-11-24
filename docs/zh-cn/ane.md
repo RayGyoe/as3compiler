@@ -825,7 +825,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 ### 5.1 已修的缺陷（留作教训）
 
-八条都是**「`adl` 跑得对、我们跑不出」**那一类，都是在拿真实三方 ANE 做迁移时量出来的；
+九条都是**「`adl` 跑得对、我们跑不出」**那一类，都是在拿真实三方 ANE 做迁移时量出来的；
 现在都修了并配了行为钉。列在这儿的价值在于它们的共同形态：**都是「看起来对、结果错」**。
 
 | 缺陷 | 症状 | 修法 | 钉（条数） |
@@ -840,6 +840,7 @@ with this ID … com.example.nope`——**这是 §1.5 要求的行为**：能�
 
 | **C 面是 Windows 专用**（`LoadLibraryA` / `CRITICAL_SECTION` / `GetModuleFileNameA` / `Sleep`） | 在 Windows 上**看不见**（那些分支照常编过），在 macOS 上第一次编就红。而宿主库（缺陷 2 的另一半）做出来之后，这一半才第一次有消费者 | 在 `FRE_BODY` 里加一层平台 shim：`as_fre_lib_open`/`as_fre_lib_sym`/`as_fre_lib_err`（`dlopen`+`RTLD_NOW`+`RTLD_LOCAL` / `dlsym` / `dlerror`）、`as_fre_exe_dir`（macOS 用 `_NSGetExecutablePath`、Linux 用 `/proc/self/exe`——因为 install name 是 `@executable_path/`，只有知道 exe 在哪才知道库在哪）、状态队列的锁改成 `AS_FRE_Q_LOCK`/`AS_FRE_Q_UNLOCK` 两个宏（Windows 是 `CRITICAL_SECTION`，macOS 是**显式递归**的 `pthread_mutex_t`——`FREDispatchStatusEventAsync` 会从已经在 `as_fre_pump` 里的线程到达，普通互斥锁在那里**死锁**）、线程族给 pthread 实现 | `unit: fre/PlatformSplit`（8）——核心那条**按预处理器**判断：任何 Win32 专有名字只要落在「macOS 会编译的那一行」上就红。名单式断言只有写下它那天是对的，分支判断在下一次伸手拿 Win32 API 时仍然对 |
 | **`asaot.h` 的 POSIX 分支没有 `ASAOT_HOST` 这一态** | 第一次用 macOS 宿主库编程序，`clang` 在**每一行** FRE 函数上停住：`error: static declaration of 'FREGetObjectType' follows non-static declaration`。根因不是新代码——`asaot.h` 的 Windows 分支有**三态**（`ASAOT_BUILD` / `ASAOT_HOST` / 其余），POSIX 分支只有**一句** `visibility("default")`；而宿主程序**定义**那 51 个入口点、尺寸优化又把它们标成 `static`，于是「非 static 的声明」与「static 的定义」相撞。**Windows 上同一处不匹配只给一条警告**（`redeclared without 'dllimport' attribute`），这正是该分支长期没被发现的原因 | POSIX 分支补上第三态：`ASAOT_HOST` ⇒ `#define ASAOT_API static`（不是空——见括号里那条）。dylib 那一侧仍拿 `visibility("default")`，所以 `build-asaot.sh` 不需要 `-fvisibility=hidden` 也能导出那 53 个 | `unit: ane/HostLibrary`（20 之一）——钉住「POSIX 分支存在且生效」「dylib 分支仍带属性」以及**那条实测的报错原文写在注释里**（免得后人当 tidiness 删掉） |
+| **ANE 附属 DLL 不在加载搜索路径上**（阶段四百六十四） | 主 DLL 用全路径 `LoadLibraryA` 能加载，但它导入的**旁边**的附属 DLL（非系统 DLL）以 **126** 失败——Win32 默认搜索序**不含**「全路径加载的 DLL 自身目录」。夹具复现：`ProbeANE.dll` 导入旁边的 `ProbeHelper.dll`，修前整个库加载失败（`temp/ane-dep-before`）。真会议扩展的导入表只有系统 DLL + `asaot.dll`，故此前未暴露 | `as_fre_lib_open` 改 `LoadLibraryExA(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR \| LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`（KB2533623 缺失时 87 回落 `LoadLibraryA`），且**路径先归一化成纯反斜杠**：该 flag 的 load-directory 推导不容忍正斜杠，描述符保留 AIR 的 `/` 约定⇒混合分隔符路径会加错目录（`temp/screenpx/dllprobe2`：同一文件纯反斜杠能载、混合 126）。附属 DLL 随整包 staging 自动落地（阶段三百九十一） | `unit: fre/DllSearchPath`（4）+ `examples/ane/driver.as` 的 `helperValue (sibling DLL) = 4242`（Windows-only 夹具半边，73 项之一） |
 
 配套的一条诊断改进：加载失败的两处自报现在**带上 Win32 错误码**（`193` = 位宽不符、
 `126` = 找不到）。此前它们无条件归咎于「库没重编」——当一个纯位宽问题被套上「你重编错了」的

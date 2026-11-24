@@ -55,6 +55,7 @@
 #include "include/core/SkImage.h"
 #include "include/core/SkPaint.h"
 #include "include/gpu/GrTypes.h"
+#include "include/gpu/GpuTypes.h"
 #include "include/gpu/GrBackendSurface.h"
 #include "include/gpu/GrDirectContext.h"
 #include "include/gpu/gl/GrGLTypes.h"
@@ -101,12 +102,23 @@ typedef struct {
   HDC hdc;
   HGLRC hglrc;
   sk_sp<GrDirectContext> ctx;
-  // Wraps FBO 0 at the current physical size. Dropped and rebuilt when the window
-  // is resized (the framebuffer itself follows the window on its own).
+  // Wraps the render target at the current physical size: FBO 0 for an opaque
+  // window, a texture-backed offscreen surface for a transparent one (see
+  // `layered`). Dropped and rebuilt when the window is resized.
   sk_sp<SkSurface> surface;
   int width, height;
   uint64_t generation;
   int stencil_bits;
+  // Transparent-window route (stage 467, the WGL counterpart of d3d_glue's
+  // `layered`): a layered window (WS_EX_LAYERED) cannot composite per-pixel alpha
+  // through a WGL SwapBuffers -- DWM shows the swapchain opaque and alpha-0 pixels
+  // render BLACK (measured: temp/gltrans/before-crop.png). So a transparent window
+  // draws into an OFFSCREEN Skia render target, reads it back to premultiplied
+  // BGRA, and hands it to window_glue's UpdateLayeredWindow present, exactly as
+  // the D3D12 backend does (stage 459). `bgra` is the persistent readback staging.
+  int layered;
+  unsigned char* bgra;
+  size_t bgra_cap;
 } GLWin;
 
 static GLWin g_gl[SK_GL_MAX_WINDOWS];
@@ -253,6 +265,27 @@ static int gl_build_surface(GLWin* w) {
   w->surface.reset();
   if (w->width <= 0 || w->height <= 0) return 0;
 
+  // Transparent route (stage 467): a texture-backed OFFSCREEN render target, not
+  // FBO 0. A layered window's visual comes from UpdateLayeredWindow, so the frame
+  // is drawn here and read back to premultiplied BGRA in gl_present_transparent;
+  // SwapBuffers is never called for it. Skia owns the FBO behind this surface, so
+  // no raw glGenFramebuffers/wglGetProcAddress dance is needed (the GL 1.1 header
+  // and opengl32.dll do not export the FBO entry points). sampleCount 0 matches
+  // the D3D12 layered target, which also carries no MSAA/stencil.
+  if (w->layered) {
+    SkImageInfo info = SkImageInfo::Make(w->width, w->height,
+                                         kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+    w->surface = SkSurfaces::RenderTarget(w->ctx.get(), skgpu::Budgeted::kYes, info,
+                                          0, kBottomLeft_GrSurfaceOrigin, nullptr);
+    if (w->surface == nullptr) {
+      fprintf(stderr, "gl_glue: offscreen RenderTarget failed for %dx%d\n",
+              w->width, w->height);
+      fflush(stderr);
+      return 0;
+    }
+    return 1;
+  }
+
   GrGLFramebufferInfo fbInfo;
   fbInfo.fFBOID = 0;
   fbInfo.fFormat = SK_GL_RGBA8;
@@ -283,6 +316,12 @@ static int gl_build_surface(GLWin* w) {
 // --- the seam the generated C calls ---------------------------------------
 
 extern "C" {
+
+// window_glue.cc seams for the transparent-window route (stage 467), the same two
+// d3d_glue.cc uses: ask whether the window is transparent at init, and hand the
+// read-back premultiplied BGRA to the layered-window (ULW) present each frame.
+int sk_window_is_transparent(int id);
+void sk_window_present_layered_pixels(int id, void* pixels, int w, int h, int rowBytes);
 
 // The GrDirectContext that owns the window whose GL context is CURRENT, exposed
 // for YUV direct render (BitmapData.setYuv420). GL is the one backend with a
@@ -486,6 +525,13 @@ int sk_gpu_init(int win_id, void* native_handle) {
   w->height = (int)(rc.bottom - rc.top);
   if (w->width <= 0 || w->height <= 0) { w->width = 1; w->height = 1; }
 
+  // A transparent window renders offscreen and presents via ULW (stage 467), the
+  // WGL counterpart of d3d_glue's init reading the same flag. The descriptor's
+  // <transparent> is applied to the window before this attach, so the flag is
+  // already set here; NativeWindowInitOptions writes it AFTER the bind and reaches
+  // sk_gpu_set_transparent instead.
+  w->layered = sk_window_is_transparent(win_id);
+
   // Clear once before wrapping: a freshly created window framebuffer holds
   // uninitialised pixels, and a first frame that only partially covers it would
   // show them (the same reason Skia's reference clears here).
@@ -574,6 +620,33 @@ void sk_gpu_destroy(int win_id) {
   w->hwnd = NULL;
   w->width = w->height = 0;
   w->used = 0;
+  w->layered = 0;
+  free(w->bgra);
+  w->bgra = NULL;
+  w->bgra_cap = 0;
+}
+
+// Switch a window between the opaque (FBO 0 + SwapBuffers) and transparent
+// (offscreen + ULW) routes. The WGL counterpart of d3d_glue's sk_gpu_set_transparent
+// (stage 460): NativeWindowInitOptions writes `transparent` AFTER the GPU bind, so
+// window_glue calls this to rebuild the surface for the new route. GL has no HDR
+// path, so `on` maps straight to `layered` (no D3D-style hdr veto).
+void sk_gpu_set_transparent(int win_id, int on) {
+  GLWin* w = gl_slot(win_id);
+  if (w == nullptr || w->ctx == nullptr) return;
+  const int want = on ? 1 : 0;
+  if (w->layered == want) return;
+  if (!gl_make_current(w)) return;
+  // Drain queued work before the surface it targets is dropped.
+  w->ctx->flushAndSubmit(GrSyncCpu::kYes);
+  w->layered = want;
+  if (!gl_build_surface(w)) {
+    // Rebuild failed: fall back to the opaque route so the window still presents
+    // something rather than drawing into a dead surface (mirrors d3d_glue).
+    w->layered = 0;
+    gl_build_surface(w);
+  }
+  w->generation = ++g_gl_generation;
 }
 
 // Debug: write the just-drawn back buffer to a 24-bit BMP. The GL counterpart of
@@ -716,6 +789,40 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
   return (void*)canvas;
 }
 
+// Present a transparent window's offscreen frame through UpdateLayeredWindow
+// (stage 467), the WGL counterpart of d3d_glue's d3d_present_transparent. The
+// frame was drawn into the texture-backed offscreen surface (gl_build_surface's
+// layered branch); read it back to premultiplied BGRA and hand it to window_glue's
+// layered present. Skia's readPixels does the GPU->CPU readback AND the RGBA->BGRA
+// swap AND the origin flip (the surface is bottom-left, the dst image is top-down),
+// so no manual row loop is needed -- unlike the raw glReadPixels dump above.
+static void gl_present_transparent(GLWin* w, int win_id) {
+  if (w == nullptr || w->surface == nullptr) return;
+  const int width = w->width, height = w->height;
+  if (width <= 0 || height <= 0) return;
+  const size_t need = (size_t)width * 4 * height;
+  if (w->bgra_cap < need) {
+    free(w->bgra);
+    w->bgra = (unsigned char*)malloc(need);
+    w->bgra_cap = w->bgra != nullptr ? need : 0;
+  }
+  if (w->bgra == nullptr) return;
+  const SkImageInfo dst = SkImageInfo::Make(width, height,
+                                            kBGRA_8888_SkColorType, kPremul_SkAlphaType);
+  // readPixels syncs the GPU read itself (GrGLGpu issues glReadPixels and waits),
+  // so the flushAndSubmit the caller already did is enough ordering.
+  if (!w->surface->readPixels(dst, w->bgra, (size_t)width * 4, 0, 0)) {
+    static int warned = 0;
+    if (!warned) {
+      warned = 1;
+      fprintf(stderr, "gl_glue: transparent readPixels failed\n");
+      fflush(stderr);
+    }
+    return;
+  }
+  sk_window_present_layered_pixels(win_id, w->bgra, width, height, width * 4);
+}
+
 // Submit the frame and present it.
 //
 // flushAndSubmit, not flush: on the GL backend flush() only records the commands,
@@ -764,6 +871,14 @@ void sk_gpu_flush(int win_id) {
 
   // Before the present call below, which blocks on vblank (see above).
   gl_stats_frame_done();
+
+  // Transparent route (stage 467): read the offscreen frame back and present it
+  // through ULW; never SwapBuffers (a layered window's visual is the ULW surface,
+  // and a WGL swap on it would only block on vblank for pixels DWM ignores).
+  if (w->layered) {
+    gl_present_transparent(w, win_id);
+    return;
+  }
 
   gl_dump_backbuffer(w);
 

@@ -20306,6 +20306,61 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-25 追加（阶段四百六十七：WGL/GL 透明 GPU 窗）**：**移出 0 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **81 行不变**（`未开始` 62 / `部分完成` 17 / `调研完成·实现暂缓` 2）。GL 透明缺口此前**不是独立遗留行**，
+> 而是记于阶段四百五十九/四百六十二 注记与 `docs/win32.md`「WGL 分支透明窗未实测」一句；本阶段清偿后把该现行
+> 口径改为「WGL 分支已修（阶段四百六十七）」，并在 `skia.md` §6.20 补 GL 段。无表行变动。
+
+> **2026-11-25 追加（阶段四百六十六：窗口行为残差验收）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **82 → 81 行**（`部分完成` 18 → **17**，`未开始` 62 / `调研完成·实现暂缓` 2 不变）。移出的是「窗口几何的
+> Windows 端残余（closing 可取消序 / resizeToScreen 每屏 DPI）」行——本阶段两项都清偿：① 红叉 `closing` 可取消序
+> 外部 `PostMessage(WM_CLOSE)` 驱动运行时验收（`temp/rts`：`CLOSING_FIRED cancelable=true` → `preventDefault` →
+> `closed=false`，与 AIR 一致，本就正确无需改）；② `resizeToScreen` 实测 adl Windows 落在 **DIP 全屏** (0,0,2560,1707)
+> 含任务栏（非 usable），而 macOS 落 visibleBounds——新增平台分歧 seam `as_display_resize_bounds`（Windows 走
+> `sk_display_bounds` 全屏 / macOS 走 usable），AOT 探针实测 `RTS=0,0,2560,1707` 与 adl 逐字一致。钉
+> `unit: platform/DisplayMetrics` 改写 resizeToScreen 钉 + 新增平台分歧钉（13）。
+
+> **2026-11-25 追加（阶段四百六十五：Windows `doDrag` dragImage 根因核实）**：**移出 0 行 / 改写 1 行 / 新登记 0 行** ⇒
+> 主表 **82 行不变**（`未开始` 63 → **62**，`部分完成` 18 不变，`调研完成·实现暂缓` 1 → **2**）。改写的是「Windows
+> `NativeDragManager.doDrag` 的 `dragImage` 不渲染」行：本阶段把公开协商半段实测验证正确（`IDragSourceHelper::InitializeFromBitmap`
+> 返回 `S_OK`，helper 经 `SetData` 写 `DragImageBits`/`DragContext`，`Data` 须可变 + HGLOBAL/ISTREAM 互转），但渲染半段
+> 卡私有协议——`DoDragDrop`/`SHDoDragDrop` 从不向源取 `DragImageBits`（trace + 全屏像素扫描双重证实），WinForms/Avalonia
+> 证实需私有 `IDropSourceHelper` + `GiveFeedback` 驱动，IID/vtable 未核实。按 §1.5 回退不渲染的接线、保留显式
+> `as_shell_unsupported`，不交付「接受却不可见」的假绿；行状态改「调研完成·实现暂缓」，待私有协议核实后再实装。
+
+> **2026-11-25 追加（阶段四百六十四：ANE 附属 DLL 搜索路径）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **83 → 82 行**（`未开始` 64 → **63**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。移出的是「ANE 附属 DLL 的
+> `LoadLibrary` 搜索路径未设置」行——本阶段修齐：`as_fre_lib_open` 改 `LoadLibraryExA` +
+> `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`（87 回落），且路径先归一化纯反斜杠
+> （flag 的 load-directory 推导不容忍正斜杠，混合分隔符会加错目录——实测 `temp/screenpx/dllprobe2`）。
+> 夹具新增 Windows-only 附属 DLL（`ProbeHelper.dll`）复现修前 126（`temp/ane-dep-before`），修后
+> `examples/ane/driver.as` 73/73（含 `helperValue=4242`）、ane-app 孪生绿。钉 `unit: fre/DllSearchPath`（4）。
+
+> **2026-11-25 追加（阶段四百六十三：Screen.bounds/visibleBounds 物理像素口径）**：**移出 0 行 / 改写 1 行 / 新登记 0 行** ⇒
+> 主表 **83 行不变**（`未开始` 64 / `部分完成` 18 / `调研完成·实现暂缓` 1）。改写的是「Stage3D 的 Windows 后端」行：
+> 其子项①「`Screen.bounds`/`visibleBounds` 按 AIR 应是物理像素而我们仍报逻辑值（`sk_display_pixel_bounds` 未实装）」
+> 本阶段清偿——新增 AIR 空间 seam `sk_screen_bounds`/`sk_screen_usable_bounds`（Windows 走 `EnumDisplaySettingsW`，
+> 该 API 在 **DPI-unaware 进程里也报真实显示模式**，实测 `temp/screenpx/physprobe`；work area 用线程级 PMv2 上下文
+> 去虚拟化），`sk_display_bounds` **保持逻辑空间不动**（窗口居中/几何共用）。adl A/B 逐值对齐：bounds 3840×2560、
+> visibleBounds 3840×2488、Capabilities 仍 2560×1707、`getScreensForRectangle` 物理空间匹配。`resizeToScreen` 改读
+> 逻辑 usable-bounds seam 保持窗体几何不变（adl 实测其 Windows 落点是 DIP 整屏 0,0 2560×1707，归阶段四百六十六）。
+> 钉 `unit: platform/DisplayMetrics`（开放偏离钉→修齐不变量钉）+ `examples/screen-bounds.as`。
+
+> **2026-11-24 追加（阶段四百六十一：NativeWindow stage 设计尺寸 72×72 + 默认 align 居中）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **84 → 83 行**（`未开始` 65 → **64**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。移出的是阶段四百六十新登记的
+> 「NativeWindow stage 设计尺寸用创建尺寸」行——本阶段修齐：二级窗 `design_w/h` 恒为 **AIR 固定 72×72**（Adobe dev guide
+> 「72:1」关系，adl `temp/nwsize` 实测与创建尺寸/SWF 元数据均无关，**纠正上轮「=SWF 头尺寸」的误判**），且默认 `align=""`
+> 居中内容（显式 `StageAlign` 从左上基线，初始窗 `TL` 不受影响）。showAll/noScale/exactFit/noBorder 四模式渲染几何与 adl
+> 逐像素对齐。**注意**：主窗 `[SWF(width,height)]` 元数据设计尺寸丢弃是另一独立行（部分完成），与本项不同源，未动。
+
+> **2026-11-24 追加（阶段四百六十：NativeWindow 透明 GPU 窗离屏路径 + UTILITY 工具窗）**：**新登记 1 行 / 改写 0 行 / 移出 0 行** ⇒
+> 主表 **83 → 84 行**（`未开始` 64 → **65**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。本阶段修齐真实应用
+> （talkmed-meeting）透明窗与 AIR 的两处差异：① NativeWindow 透明 GPU 窗不可见+空白缩略图——`layered` 仅在 `sk_gpu_init`
+> 置位而 `NativeWindowInitOptions.transparent` 写在创建之后，新增 `sk_gpu_set_transparent` seam（置 layered + 重建离屏表面，
+> 镜像 macOS after-init）；② UTILITY 窗误进任务栏——新增 `sk_window_set_type`（UTILITY/LIGHTWEIGHT→`WS_EX_TOOLWINDOW`）。
+> **新登记 1 行**是同轮探针量到的预存核心 stage 语义分歧：NativeWindow showAll 设计尺寸用窗口创建尺寸（400×232）而非
+> AIR 的 SWF 头尺寸（72×72），`bounds` 改小后内容 letterbox——独立立项，不与本阶段捆绑。
+
 > **2026-11-23 追加（阶段四百五十五：int/uint 算术 double 计算 + 落槽回绕）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
 > 主表 **84 → 83 行**（`未开始` 65 → **64**，`部分完成` 18 / `调研完成·实现暂缓` 1 不变）。移出的是 #33「int/uint 算术
 > 在 C 侧按 int32 回绕」——本阶段以反向双值发射修齐（默认 double 形态 + 无符号回绕 intCode 供 int 落槽/索引/位运算），
@@ -20945,7 +21000,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | 时间轴子件的 **`name` 恒 `null`**（AIR 自动命名 `instanceN`） | 未开始（2026-10-06 阶段九十五·九 实测登记） | 多帧 sprite 的摆放记录里**没有 `Name` 字段**（SWF 只能给名字），AIR 在运行期按每个 SWF 的实例计数器自动命名（同一帧来回跳还会换号：`checkbom` 帧 2 的 Shape 由 `instance24` 变 `instance26`）；我们报 `null`。树形（个数/索引/类名/`x/y`）与像素不受影响，只有 `child.name` 可观测。证据 `temp/tlprobe/`（68 行 API 对照里该字段被显式归一化） | 要逐位一致须复刻 AIR 的命名计数器（含「同一帧重建也递增」的时机），收益仅限反射面；若做，宜与「子件类名身份」一并处理 |
 | **`DoABC` 的一般方法仍不执行**（烘焙剪辑的时间轴自走只能由用户代码/帧脚本驱动） | 未开始（2026-10-06 阶段九十五·九 实测登记；**2026-10-15 阶段一百六十四 按实测收窄**；**2026-10-19 阶段一百九十一 再收窄：符号类的基类绑定已落地**） | **已收窄的那一半**：皮肤符号**自己的时间轴脚本**（`stop()`/`gotoAndStop()`/`addEventListener`/`currentFrame` 那一族）已由阶段一百五十六 在**编译期解码**并复用发射器落地，真机 `agreebtn` 点一下即到第 3 帧；且 `adl` 新建剪辑本来就 `isPlaying == false`、上屏跨 12 帧也不自走，两端在「起始停帧」上一致。**残余**：`lib/skin.swc` 的 255 个 `DoABC` 模块里那 **254 个类的一般方法**（TweenLite / StringCore / DownLoader…）仍**不执行**（需要一个完整的 AVM2/反编译器，属独立立项），因此 `play()`/`gotoAndPlay()` 的自走仍只能由用户代码驱动。**绝不静默**：`swcBake.notes` 报明多帧 sprite / op 的烘焙口径与「起始停帧」，ABC 普查工具 `temp/abccensus.ts`。 | 属 `DoABC` 解读（反编译器或 AVM2 解释器）这一独立立项；在那之前维持「资源取自 SWC、代码来自 `.as`」的现实形态 |
 | `TextFormat` 的 `indent` / `blockIndent` / `bullet` / `display` / `tabStops` **只存不用**（排版读取路径不消费） | **部分完成**（2026-10-30 阶段三百三十一：7 个缺字段全部补齐、ctor 扩到 AIR 的 13 参顺序、`as_tf_fmt_clone`/`_empty`/`==` 同步搬字段；残留是这五项的**排版效果**） | 字段表见 `src/symbols.ts`；`src/emit.ts` 里 `indent`/`blockIndent`/`bullet`/`tabStops` 只出现在**构造 / 克隆 / 相等 / 合并 / 清空**五处，没有任何一处把它们送进 Skia 的 `ParagraphStyle`/`TextStyle`，`vendor/` 侧也 grep 不到 `setTextIndent`；`display` 同样只存值。⇒ 用 `indent` / 项目符号 / 制表位排版的工程**能编译、能原值读回**，但版面与 `adl` 不同且**不报明**（静默）。`leftMargin`/`rightMargin` 是否真进排版也未逐项验证 | 先 `adl` 逐项实测可观测效果（`indent`/`blockIndent` 对 `textWidth`/`textHeight`/行首位置，`bullet` 对首行前缀，`tabStops` 对制表位，`display` 对行盒），再按实测接 `ParagraphStyle::setTextIndent` 等；`leftMargin`/`rightMargin` 同一批量 |
-| **Stage3D 的 Windows 后端**（`air-starling-demo` 已实机跑通收口；剩背面剔除/绕序 A/B 与 `firstIndex`） | **部分完成**（2026-10-09 阶段一百二十六 登记；**2026-10-16 阶段一百七十三 实机收口**；2026-10-10 前置① **AGAL → HLSL 翻译器**随阶段一百三十一 落地（v0.4.104）、前置② **`vendor/stage3d_d3d.cc`** 随阶段一百三十二 落地（v0.4.105）并在 `examples/shmup-stage3d` 上实机跑通） | **已完成的两半**：① AGAL→HLSL（`AGALTranslator.translate(bytes, "hlsl")` ⇒ `target 2`，由 `ASC_S3D_HLSL` 选中，生成物过真 `D3DCompile`）；② D3D12 胶水（`vendor/stage3d_d3d.cc` 与 `stage3d_glue.mm` 同一套 `s3d_*` ABI/语义；与 2D **共用 `ID3D12Device`/命令队列**；`air-app.ts` 的 Windows 拒绝已删，改为推 `stage3d_d3d.cc` + `ASC_S3D_HLSL=1` + `d3d12`/`dxgi`/`d3dcompiler`）。**实测**：demo 开窗、281 帧 / 5 s、零 PSO/合成错误，且 `ASC_GPU_DUMP` 的 presented back buffer 里能看到 Stage3D 精灵。**2026-10-16 阶段一百七十三 收口**：`examples/air-starling-demo` 已在 Windows 目标上**编 + 链 + 跑通**（26 draw / 246 tri，几何无一丢弃；与同机 `adl 51.4.1` 窗口在客户端坐标下 logo 包围盒同为 `x32..173 y10..196`、按钮节距同为 69 px）。根因是**常量缓冲原先每帧槽只有一份**：D3D12 在 GPU **执行**命令列表时才读常量 ⇒ 一帧内所有 draw 都读到**最后一次**上传的 mvp（12 个按钮全被最后一个按钮的矩阵变换）。改为**按 draw 版本化的常量区域**（`S3D_CB_REGION` 4096 B/次上传 = 256 float4；draw 绑 `GetGPUVirtualAddress() + cbOffV/cbOffF`；**游标在 `s3d_batch_end` 归零而非 `batch_begin`**——一帧的首次上传发生在批次打开之前，在 begin 归零会抹掉它、实测前两个 draw 共用区域 0；`s3d_wait_slot` 留在 `s3d_upload_constants` 内保护那次上传）。同轮修**显示度量口径**：`fullScreenWidth/Height` 与 `Capabilities.screenResolutionX/Y` 是**逻辑点（DIP）**（改用 `SDL_GetDisplayBounds`，与 `adl` 报的 2560×1707 逐值相同；原 `SDL_GetCurrentDisplayMode` 报物理 3840×2560。**2026-10-20 阶段二百零六 更正**：当时这只是**纸面**修好 —— 该值在胶水里是**缓存**，三条 `sk_window_show*` 路径仍用显示模式回填它，故只有**没开过窗**的进程才走到 DIP 分支；真应用（开窗后）仍报 3840×2560，且 `Screen.bounds` 是唯一的 DIP 读者（两套空间被**对调**）。现为**唯一写入者** `sk_refresh_display_size_cache()`，由 `unit: platform/DisplayMetrics` 钉住）、`screenDPI` 按平台基线 96/72（`adl` 在 150% 下报 96 而非 SDL 的 144）。**仍缺**：① `Screen.bounds`/`visibleBounds` 按 AIR 应是**物理像素**而我们仍报逻辑值（`sk_display_pixel_bounds` 未实装，故 `Screen` 系列与本仓另一条 `sk_display_bounds` 的空间口径仍不一致）；② **背面剔除/绕序**仍是纸面决定（`FrontCounterClockwise=FALSE` + 正高度 viewport）无 A/B 实测；③ `Context3D.drawTriangles` 的 `firstIndex` **被忽略**（`(void)firstIndex;`，索引缓冲整段上传）——对 Starling（恒 `drawTriangles(ib, 0, n)`）无影响，对别的 Stage3D 应用是潜在偏离；④ mip-drop/透明混合/立方体贴图已移植并有文本钉子但**未在 D3D12 上单独复测**。详见阶段一百七十三 与 `docs/zh-cn/{display3d.md,win32.md}` §10.1/§3.5 | ① **已完成（2026-10-16）**：在 Windows 目标上编 + 链 + 跑通 `examples/air-starling-demo`（覆盖 `setProgram` 切换、深度/模具、多流 `drawTriangles`、纹理图集），红什么修什么；② **仍待**：背面剔除做一次一次性 A/B（同场景 `setCulling("back")` 开/关的像素对照）+ `drawTriangles` 的 `firstIndex` 行同义对齐 + `Screen.bounds` 的物理像素口径。**成本低**（A/B 是一次跑） |
+| **Stage3D 的 Windows 后端**（`air-starling-demo` 已实机跑通收口；剩背面剔除/绕序 A/B 与 `firstIndex`） | **部分完成**（2026-10-09 阶段一百二十六 登记；**2026-10-16 阶段一百七十三 实机收口**；2026-10-10 前置① **AGAL → HLSL 翻译器**随阶段一百三十一 落地（v0.4.104）、前置② **`vendor/stage3d_d3d.cc`** 随阶段一百三十二 落地（v0.4.105）并在 `examples/shmup-stage3d` 上实机跑通） | **已完成的两半**：① AGAL→HLSL（`AGALTranslator.translate(bytes, "hlsl")` ⇒ `target 2`，由 `ASC_S3D_HLSL` 选中，生成物过真 `D3DCompile`）；② D3D12 胶水（`vendor/stage3d_d3d.cc` 与 `stage3d_glue.mm` 同一套 `s3d_*` ABI/语义；与 2D **共用 `ID3D12Device`/命令队列**；`air-app.ts` 的 Windows 拒绝已删，改为推 `stage3d_d3d.cc` + `ASC_S3D_HLSL=1` + `d3d12`/`dxgi`/`d3dcompiler`）。**实测**：demo 开窗、281 帧 / 5 s、零 PSO/合成错误，且 `ASC_GPU_DUMP` 的 presented back buffer 里能看到 Stage3D 精灵。**2026-10-16 阶段一百七十三 收口**：`examples/air-starling-demo` 已在 Windows 目标上**编 + 链 + 跑通**（26 draw / 246 tri，几何无一丢弃；与同机 `adl 51.4.1` 窗口在客户端坐标下 logo 包围盒同为 `x32..173 y10..196`、按钮节距同为 69 px）。根因是**常量缓冲原先每帧槽只有一份**：D3D12 在 GPU **执行**命令列表时才读常量 ⇒ 一帧内所有 draw 都读到**最后一次**上传的 mvp（12 个按钮全被最后一个按钮的矩阵变换）。改为**按 draw 版本化的常量区域**（`S3D_CB_REGION` 4096 B/次上传 = 256 float4；draw 绑 `GetGPUVirtualAddress() + cbOffV/cbOffF`；**游标在 `s3d_batch_end` 归零而非 `batch_begin`**——一帧的首次上传发生在批次打开之前，在 begin 归零会抹掉它、实测前两个 draw 共用区域 0；`s3d_wait_slot` 留在 `s3d_upload_constants` 内保护那次上传）。同轮修**显示度量口径**：`fullScreenWidth/Height` 与 `Capabilities.screenResolutionX/Y` 是**逻辑点（DIP）**（改用 `SDL_GetDisplayBounds`，与 `adl` 报的 2560×1707 逐值相同；原 `SDL_GetCurrentDisplayMode` 报物理 3840×2560。**2026-10-20 阶段二百零六 更正**：当时这只是**纸面**修好 —— 该值在胶水里是**缓存**，三条 `sk_window_show*` 路径仍用显示模式回填它，故只有**没开过窗**的进程才走到 DIP 分支；真应用（开窗后）仍报 3840×2560，且 `Screen.bounds` 是唯一的 DIP 读者（两套空间被**对调**）。现为**唯一写入者** `sk_refresh_display_size_cache()`，由 `unit: platform/DisplayMetrics` 钉住）、`screenDPI` 按平台基线 96/72（`adl` 在 150% 下报 96 而非 SDL 的 144）。**仍缺**：① **背面剔除/绕序**仍是纸面决定（`FrontCounterClockwise=FALSE` + 正高度 viewport）无 A/B 实测；② `Context3D.drawTriangles` 的 `firstIndex` **被忽略**（`(void)firstIndex;`，索引缓冲整段上传）——对 Starling（恒 `drawTriangles(ib, 0, n)`）无影响，对别的 Stage3D 应用是潜在偏离；③ mip-drop/透明混合/立方体贴图已移植并有文本钉子但**未在 D3D12 上单独复测**。（原子项① `Screen.bounds` 物理像素口径已于 2026-11-25 阶段四百六十三 清偿：`sk_screen_bounds`/`sk_screen_usable_bounds` AIR 空间 seam。）详见阶段一百七十三 与 `docs/zh-cn/{display3d.md,win32.md}` §10.1/§3.5 | ① **已完成（2026-10-16）**：在 Windows 目标上编 + 链 + 跑通 `examples/air-starling-demo`（覆盖 `setProgram` 切换、深度/模具、多流 `drawTriangles`、纹理图集），红什么修什么；② **仍待**：背面剔除做一次一次性 A/B（同场景 `setCulling("back")` 开/关的像素对照）+ `drawTriangles` 的 `firstIndex` 行同义对齐。**成本低**（A/B 是一次跑） |
 | **测试门禁不稳定**：同一套件、同一代码，不同次运行报出 **3 个不同的红**（`example: stage86.as`、`unit: emit/StringConcatFlat`、`unit: reflection/ClassValueOperand`），重跑全绿 | 未开始（2026-10-09 阶段一百二十六 **实测发现**，根因未定） | 现象：本阶段开头 `npm run test:unit` 连跑两次均 **90/92**（那两个单元组红）、`npm run test:examples` **164/165**（stage86 红）；最终 `npm test` **258/258 全绿**，其后 `npm run test:unit` 单跑/连跑 3 次、`node --test --test-name-pattern=… test/unit.ts` 单进程形态、以及各用例单独跑**全绿**。**已排除的假说**：① 陈旧产物 —— 在用例将使用的产物路径上埋一个假二进制，实测被**无条件重建并覆盖**（脚本变回 Mach-O、用例仍绿）；② `-o` 序号 —— 同一示例用 `001-` 与全量跑的 `113-` 两条路径手工跑，两条都绿；③ 断言陈旧 —— `examples/stage86.as` 的 `NativeApplication` 断言已改为 `com.example::NoSuchClass`（注释引 `adl 51.4.1` 实测）后仍曾红。**未排除**：进程/文件级并行与共享 `temp/` 下的交互。**补记（2026-10-10，阶段一百三十 全量回归实测）**：本机换成 Windows 后**没有复现**这 3 个红（它们首次观测于 macOS，也未再出现）；同一轮把**本机必然红项**逐条定位并分类完毕，且**与本行不同源**：① **5 条 CRLF 假失败**（`test/unit/platform.ts` 的 `backendparity`、`numeric.ts` 的 `noreturn`、`stage3d.ts` 的 3 条 —— 它们用 `\n` 字面量正则直接 `readFileSync` CRLF 检出的 `runtime.ts`/`stage3d_glue.mm`/`stage3d_webgl.cc`，文本归一成 LF 后**当场变绿**，而 CI 是 LF 检出）；② 2 条 **macOS 硬编码断言**（`test/unit/transport.ts` 要求 `link-paths` 结尾 `vendor/curl/lib/macos-arm64` 与 `Security`/`SystemConfiguration` frameworks）；③ 2 条 linkset 缺 `zlib.h` 的 include；④ **examples 层整体无法链接**（套件默认编译器是 `cc`，且 `src/build.ts:676` 在 win32 刻意不加 `-lz`，而每份生成 C 的 RUNTIME_PREAMBLE 都 `#include <zlib.h>` 并引用 `compress`/`uncompress`）。⇒ 结论分两半：（a）本机 Windows 上 `node test.ts` **无法全绿**，那是**已知的环境红**（可复现、可解释），**不是**门禁自身不可靠；（b）本行那 3 个 macOS 侧偶发**仍未定案**（本轮**不得**把它与 (a) 混为一谈）。| **必须先定案再修**：把这三例各自连跑 N 次（含 `npm test` 单进程与 `node --test test/unit/*.ts` 多进程两种形态）做统计，定位是否与并发/共享临时路径/产物 mtime 有关；定案前**不得**把这 3 个红当作「已修」或「无关紧要」——门禁不可靠会让真缺陷与假红混在一起（本轮**真的**发生过一次真缺陷在**全绿**下溜过：见本节「九、自查发现的真缺陷」）。三个红与本次 diff **无关**（首次观测发生在任何代码改动之前），但也不能据此静默放过。**补记（2026-10-14，阶段一百五十一）**：那条「**未排除**：进程/文件级并行与共享 `temp/` 下的交互」现在**可操纵**了——示例层驱动已并发化（`test/examples.ts` 改异步 `execFile` + 有界池，默认 `min(核数,8)`），用 **`ASC_TEST_JOBS=1`** 可精确回到**单进程串行**形态（并行态 ~3 分钟 / 串行态 ~13 分钟），两态跑同一套件即可判定某个红是否与并行有关。该改动**不移出本行**（根因仍未定案）。**补记（2026-11-19，阶段四百四十六）**：同一棵树、同一条命令又观测到一次，**第一次 5 红 / 第二次全绿**，5 红各自单跑皆绿（`example: file-ops.as` 的 `fixture link to a directory is visible through stat`、`unit: render/AirAppFonts` 的 `Unexpected end of JSON input`、`unit: SWC StaticText` 的探针输出体 `1 !== 0`、`unit: desktop/file dialog` 的 `saved bytes ignore caller mutation`、`unit: reach/edge` 的 `main class 'app.Main' is not declared under src/`）。**新增证据**：5 个红的形态全部指向 `temp/` 同名夹被**并发重写**（读到空 JSON / 探针二进制被覆盖后运行 / `rmSync` 与随后读取交错），即本行「未排除」的那条假说；仍**不移出本行**（尚未拿到进程级证据，且无法解释为何只在全量并发态出现）。**本机口径**：跑 Windows 全量回归前须先把 LLVM 放上 PATH（`export PATH="/c/Program Files/LLVM/bin:$PATH"`，否则 `spawnSync clang ENOENT`）并把上述 9 条环境红当作已知基线 |
 | `x.ns::[expr]` / `x.@[expr]` 的孩子轴按**本地名**匹配（命名空间未建模） | 未开始（2026-10-07 阶段一百零八 实测登记；**已文档化的近似**） | 本子集把自定义命名空间**编译期透明化**（限定词丢弃、前缀不进匹配），故：`<n:item>`（ns=`urn:x`）测 `x.ns::["item"]` 得 **2 = AIR**（阶段一百零八 已让前缀不阻碍本地名匹配），但 `x.item`（无限定）**也给 2**（AIR 为 **0** —— 无前缀的属性名只匹配无命名空间的节点），即「同局部名、不同 uri」无法区分。另：`Namespace` 值本身是**透明占位**（`new Namespace(prefix, uri)` 1/2 参构造器未实现，只认 0 参；`.uri`/`.prefix` 未建模），写示例只能走 `xml.namespace()` | 若要精确：给节点存 `(prefix, uri)` 与一张**作用域内命名空间表**，孩子轴比较「uri + 局部名」，`Namespace` 成为真对象（`uri`/`prefix`/2 参构造器）。**成本高**（XML 与 Namespace 两个模型都要改）；当前 away3d DAEParser 的用法（`xml.namespace()` + `ns::[expr]`）结果已与 AIR 一致，故列为「已知近似」而非阻塞项 |
 | 内置类名**部分**可作 **Class 值**（`trace(BitmapData)` / `var c:Class = BitmapData` / `BitmapData is Class` 已落地；**原始包装类仍不可**） | **部分完成**（2026-10-07 阶段一百一十二 登记；**2026-10-09 阶段一百二十七 落地内建引用类型的 Class 值**） | `adl 51.4.1`：`trace(BitmapData)` ⇒ `[class BitmapData]`、`BitmapData is Class` ⇒ true、`var c:Class = Object; 5 is c` ⇒ true（`temp/pkg1/oracle/adl-pkg1.txt` C1/C4/C7/E2/E3/E8/E9 + `adl-na.txt` 的 `NA=[class NativeApplication]`）。**已落地（阶段一百二十七）**：每个内建类都进注册表并发出 `_cls` 常量、内建类名可在**值位置**解析、`is`/`as` 与字符串转换逐项对 `adl`。**仍不可**：**原始包装类**（`String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class`）作 Class 值 —— `var c:Class = String;` 仍是**响亮**的 `Codegen error: undefined variable 'String' at top level`（`adl` 里 `[class String]` 合法，见 `adl-pkg1.txt` C6）；它们的 `_cls` 需要先有「原始包装类的静态度量」（`int`/`uint` 还要独立 box tag，见反射口径那行）⇒ 与「`getQualifiedClassName(5)` 应给 `int`」同源，宜同批 | 先做 `int`/`uint` 的独立 box tag（反射行已列），再让 `String`/`Number`/`int`/`uint`/`Boolean`/`Array`/`Function`/`Class` 各自进注册表（`reflectFqn` 已能用 `adl` 实测：`String`/`Array`/`Boolean`/`Date`/`RegExp` 无包、`int`/`uint` 短名）。**成本中**。 |
@@ -20962,10 +21017,8 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`ROLL_OVER` / `ROLL_OUT`（含冒泡的 `mouseOver`/`mouseOut`）事件不派发** | 未开始（2026-10-16 阶段一百七十二 登记；**2026-10-23 阶段二百六十三 实测收窄**） | `adl` 会在这两个时机派发：指针进入/离开一个**可交互**对象（`mouseEnabled`）时对该对象派发 `rollOver`/`rollOut`，若 `bubbles` 允许再冒泡成 `mouseOver`/`mouseOut`。我们 `src/emit.ts` 只派发 `mouseOut` 的**制度性替代物**——指针离开舞台时按 `mouseOut → rollOut(按钮) → mouseLeave(舞台上)` 的顺序补一轮（见 `emit.ts` 的`Stage_dispatchMouse`），**没有**逐对象 hover 迁移的发射点，故依赖 `ROLL_OVER`/`ROLL_OUT` 监听的组件收不到通知。**同族里已修的两条不要与本行混记**：`Stage.MOUSE_LEAVE` **已派发**（`src/emit.ts:17682` 的`Event_new("mouseLeave", ...)` 发在舞台自身，`d43` 表内的 `mouseLeave` 一栏已对齐）；「指针移出窗口不 roll-out」**已修**（`vendor/window_glue.cc` 接 `SDL_WINDOWEVENT_LEAVE`，带「指针仍严格在客户区内则不算离开」的守卫）。TalkMED 目前全用 `CLICK`，故真机未暴露。差异清单 **D43 表内** | 在 `Stage_dispatchMouse` 的 hover 迁移点补两个发射点：目标由 `_hover` 变为新对象时，对旧对象发 `rollOut`（`bubbles=true`）、对新对象发 `rollOver`（`bubbles=true`），按 `adl` 的 `mouseOut → rollOut` 顺序；事件类的 `stageX/stageY`、`localX/localY` 与 `buttonDown` 三个字段与 `mouseOut` 同源，复用同一条构造路径。**成本中低**，但**必须先写双端探针**量定「进入/离开嵌套可交互子件时父件是否也收到」（`adl` 的 roll-over 不冒泡穿透到父件的 hover 链，与 `mouseOver` 的冒泡是两件事） |
 | **Windows 32 位（i686）AOT 目标不可构建**（`--target` 只有 `native`/`wasm`，没有位宽轴） | 未开始（2026-10-17 阶段一百七十八·四 实测登记） | 宿主侧**已就绪并实测**：`lib/bin/windows-x86/asaot.{dll,lib}` 由 `build-asaot.bat` 默认一并产出（`machine=x86`、53 导出、导入库记 `asaot.dll`、0 个 `Adobe`），32 位探针扩展真链上它（`machine=x86`、32 个 FRE 全来自 `asaot.dll`，`temp/ane-e2e/x86/`），`--ane-platform Windows-x86` 的链接行确实是 `-L …\lib\bin\windows-x86`；依赖前缀 `build-tools/win-deps-prefix-x86`（含 `zlibstatic.lib`/`zlib.h`）也是齐的。**缺的是**：`--target` 的位宽轴、`c-compiler` 只能给单个可执行名（注入不了 `--target=i686-…`）、`cxxCompiler()` 从它派生名字 ⇒ 需要先立一条 32 位宿主工具链。**影响**：只声明 `Windows-x86` 的 ANE（真 `ANEWinCore.ane` 就带这一项）无法端到端 |
 | **Windows ARM64 依赖构建路径未在本机验证**（`build-windows-deps.ps1 -Arch arm64` 的**产物**没造出来过：本机没有 ARM64 工具集） | 未开始（2026-10-17 阶段一百七十八·五 实测登记） | **已验证**：`-Arch arm64` 在缺工具集时**退出 1** 并点名要装的组件（`MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools`）、**不发生任何下载**；`-Arch x86` 正向自检通过（证明判据非一律拒绝）；`vcvarsall.bat arm64` **退出码 0 却什么都不装** ⇒ 该分支**只能**读文件判（已如此实现：MSVC `lib\arm64` 非空 / `cl.exe` 的 `.Source` 匹配 `\arm64\cl.exe` / SDK `Lib\<ver>\um\arm64` 存在）。**未验证**：装好组件后 `vendor/*/windows-arm64` 的真实产物与其 COFF 机器字段（应为 `0xaa64`）；Skia 的 `extra_cflags` 三元组是否真被 gn 采纳到每个 obj（上游 win 分支 arm64 **不传架构旗标**、`bin` 路径写死 `HostX64` ⇒ 在 x64 宿主上会静默产 x64 对象）。**与 AIR 无关的部分已查清**：AIR 没有 Windows ARM64 运行时（51.4.1 的每个 Windows 运行时各只认一个平台键：`win/` 那份 `Windows-x86`、`win64/` 那份 `Windows-x86-64`），故 ANE 宿主宽度是**闭集**，`lib/bin/windows-arm64` 刻意不建 | 在装了 ARM64 组件的 Windows 上跑 `-Arch arm64`，用 `Assert-LibBitness` 逐库读机器字段应为 `0xaa64`；若 Skia 出了 x64 obj，须把三元组从 `extra_cflags` 迁到工具链自身（arm64 分支补 `--target=`）。**成本低-中** |
-| **ANE 附属 DLL 的 `LoadLibrary` 搜索路径未设置**（主项「整包解包 + `getExtensionDirectory()`」已于阶段三百九十一修复并移出） | 未开始（2026-11-09 阶段三百九十一 修主项时留存的子点；2026-11-15 阶段四百一十九 审计遗留表时独立成行） | 阶段三百九十一（提交 `2b3517d`）解决了「扩展随包数据文件在不在 `getExtensionDirectory(id)` 目录」——整包原样解开（`catalog.xml`/`library.swf`/`mimetype`/`META-INF/`），未知/空 id `#1508`、`null` `#2007` 文案逐字对齐，编译期拒绝逃出扩展目录的条目名。但**没有改 `LoadLibrary` 的搜索路径**：ANE 的附属 DLL（非系统 DLL）若不在默认搜索路径上仍会加载失败，需 `LOAD_LIBRARY_SEARCH_*` / `SetDllDirectory`。实测的那个真项目导入表只有系统 DLL + `asaot.dll`，故当前不受影响 | 在 `ExtensionContext.call` 首次 `LoadLibrary` 前把扩展目录加入 DLL 搜索路径（`SetDllDirectory` 或 `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`）；先造一个带附属 DLL 的 ANE 实测复现再动手。见 `docs/{zh-cn,en}/ane.md` §5 |
 | **Linux / WASI 的 `Capabilities.os` 仍是裸家族名**（AIR 在这两端同样带版本；**macOS 已收口**） | 未开始（2026-10-18 阶段一百八十九 登记；**2026-10-19 阶段一百九十六 收口 macOS 一端**） | 阶段一百八十九 已把 Windows 的「版本→名字」表从 `Adobe AIR.dll` 里量出来逐字复现（18 个名字 + `"Windows"` 兜底，版本改取 `ntdll!RtlGetVersion` 以绕开无清单进程的 `6.2` 谎报）。**macOS 本轮实测收口**：`Capabilities.os` 与 `adl 51.4.1` **逐字相同** = `Mac OS <major>.<minor>.<patch>`（本机 `Mac OS 26.6.2`，走 `uname` 后按 AIR 的「家族名 + 版本」形态拼），双端孪生探针第一行即 `CAP_os=Mac OS 26.6.2` 两端一致（`temp/nwmac/nwmac-{adl,aot}.txt`）。剩下 Linux / WASI 两端仍**没有真值可核**（本机无 `adl` for Linux），故不臆造、留 ⚠️ 报明（`src/runtime.ts` 的 `as_cap_os` 注释与 [`docs/zh-cn/win32.md`](docs/zh-cn/win32.md) §3.12 都写了）。 | 收口需要一台 Linux 跑 `adl` 取真值 + 一张发行版/内核→名字表（WASI 无 `adb` 对应物，按期如实报明即可）；在那之前下游「取 `os.split(" ")[1]` 当版本」的行为在 Windows 与 macOS 上都已修好 |
 | SWC **库里非符号类的代码**（库自带的基类/工具类）不参与编译 ⇒ 符号的工程基类缺失时只能回落成 `MovieClip` 子类 | 未开始（2026-10-19 阶段一百九十六 修复 SWC 示例时实测登记） | 阶段一百九十一 起，符号类按它 `DoABC` 里的**真基类**绑定（`skin.swc` 的四个组合框都继承 App 自己的 `com.vsdevelop.controls.ComBoBox`，`swc.ts` 的 `availableProjectBase`）。但库的**其余**类（含这个基类在库里的那份副本）是 ABC 代码，不参与编译（`docs/zh-cn/swc.md` §3.3 明列范围外）⇒ 当**编译单元里没有**这个基类时（`examples/swc-*.as` 这类只烘美术的示例，或 App 少编译了一个文件），我们改成「烘成 `MovieClip`/`SimpleButton` 子类 + **响亮告警一次**」，而 `adl` 在同一份输入上**照跑不误**（AIR 会执行库里自带的那个基类）⇒ 按 §1.5 硬判据是**遗留缺陷**。本行只登记**没修的那部分**：库内基类的**行为**（它自己的字段/方法与 `this["title"]` 之类的动态访问）我们一律没有，符号只能退化成纯美术子类 | 立项：把 SWC 的 `DoABC` 里**非符号类**也编译进来（需要 `swc.ts` 把库内 ABC 里的类声明/方法解码成 AST 并注入程序，等价于把 `abc.ts` 的范围从「符号类的帧脚本+方法」扩到「整库 ABC」），那之后 `availableProjectBase` 的回落可以只留给「App 与库都没有」的真缺失。验收：以 `temp/skin.swc` 为输入，`ComBox`/`AIAsrComBox` 的 `currentLabels`/`title`/`selectedIndex` 行为与 `adl` 逐项对照 |
-| **窗口几何的 Windows 端残余**（四类未测面剩下的两项：`closing` 可取消序 / `resizeToScreen` 每屏 DPI） | 部分完成（2026-10-19 阶段二百零四 实测登记；**阶段二百零五 收窄**：最大化尺寸口径 **已定**（`WS_MAXIMIZEBOX` 位，adl 与我们两档描述符逐字相同）、横向边框 **已修**（`b_left` 四处同源）、描述符成员 **已接线**；**阶段二百五十七 再收窄**：`<transparent>` 生成侧与 macOS 侧已接线；**2026-11-23 阶段四百五十四 三收窄**：① `<transparent>` 的 **Windows 原生实现已落地**（`WS_EX_LAYERED` + 逐帧 `UpdateLayeredWindow`，`ULW_ALPHA`+`AC_SRC_ALPHA`，绕过 SDL renderer，预乘 BGRA DIB 逐行直拷；adl 双端四种 alpha 情形全匹配，`temp/reviewwin`；钉 `unit: platform/InitialWindowStyle` +7），**移出本行**，只剩 ②） | **② 四类未测面剩下的两项**：红叉 `closing` 的可取消序（`WM_CLOSE` 通路）与 `resizeToScreen` 在每屏 DPI（per-monitor v2）下的单位（本机单屏 150%，量不出跨屏差值）。另：手势拖拽（`startMove`/`startResize`）与 `minimize`/`restore`/`maximize` 的事件顺序在阶段二百零五 已端到端量过，不再是欠账 | 均属「AIR 有、我们没量」：`closing` 用外部 `PostMessage(WM_CLOSE)` 驱动（本机真实鼠标注入一直有失败率，绕开它），DPI 那项需多屏或改成注入式 DPI 假造。 |
 | **MRT（`setRenderToTexture(..., colorOutputIndex)` 与 AGAL 的 `oc1..oc3`）** | 部分完成（阶段二百二十六 分档实测登记：**这是 `standard` 档的越线条件**；`baselineExtended` 起 `adl` 仍抛 `#3779`） | 我方 `symbols.ts` 的 `Context3D.setRenderToTexture` 只有 4 形参（缺 `colorOutputIndex`）、`vendor/stage3d_d3d.cc` `NumRenderTargets=1`、`vendor/stage3d_glue.mm` 仅写 `colorAttachments[0]`、`stage3d_webgl.cc` 单渲染目标；而 HLSL 档的 `oc1..oc3` 出码早已存在（阶段八十三，仅未接上多附件）。完工判据：形参补齐 + MSL/GLSL 多附件 + 三后端同步，且 `adl` 的 `#3779` 在 `standard` 起不再出现 |
 | **`NativeMenu.addItem` 的重复项行为两份实测互相矛盾**（一份静默忽略、一份抛 `#2004`） | 未开始（2026-10-26 阶段二百八十九 实测登记；`ContextMenu` 侧已定案为**允许重复**并按实测落地） | `temp/deskprobe2/probe-plain.txt`（旧探针）：`addItem(it1)` 再来一次 ⇒ `num=1`（静默）；`temp/ctxprobe/api/out5.txt`/`out6.txt`（本阶段）：同一个调用 ⇒ `threw 2004`，且 `out6` 之后进程未再继续。两份都是本机 `adl 51.4.1`，无法据此判定哪份是版本/环境差异 ⇒ 本阶段**只记录不改**（`NativeMenu` 的改动会波及应用菜单，不在本轮范围）。解密方法：干净机器 + 干净 SDK，用最小程序只做这两行 |
 | **剪贴板的 `bitmap` / `fileList` / `filePromiseList` 三种格式不翻译**（`setData` 报明后返回 `false`，`hasFormat` 恒 `false`，值留在对象内） | 未开始（2026-10-27 阶段二百九十三 实测登记：这三种格式 `adl` 都能用） | `text`/`html`/`richText`/`url` 已与 Windows 剪贴板互译（`CF_UNICODETEXT` / `HTML Format` / `Rich Text Format` / `UniformResourceLocatorW`，见 `docs/zh-cn/desktop.md` §7.10）。缺的三种：`fileList` 要 `CF_HDROP`（`DROPFILES` + 多文件路径）、`bitmap` 要 `CF_DIB`/`CF_DIBV5` 与 `BitmapData` 像素格式互转（含 alpha 语义）、`filePromiseList` 在 Windows 上 AIR 自己就报 `supportsFilePromise=false` | 顺序：①`fileList`（真应用 `upLoadView` 用 `hasFormat(FILE_LIST_FORMAT)` 读拖进来的文件）②`bitmap`（`CF_DIBV5`）③`filePromiseList` 维持报明 |
@@ -20979,7 +21032,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 | **`DisplayObject.mask` 的非矢量遮罩只有包围盒精度**（`Bitmap`/`TextField` 当遮罩时 AIR 按**像素**模板裁剪，我们退回它的包围盒并 `as_shell_unsupported` 报一次；纯描边遮罩的描边带、遮罩自带 `filters`/`blendMode` 的呈现同样只取几何） | 未开始（2026-10-29 阶段三百一十八 落地二值模板时登记；本阶段把矢量遮罩（含子件并集、离屏遮罩、别的容器）逐条对齐了 adl，这三档 adl 侧未实测、实现上也还没接） | `docs/zh-cn/skia.md` §6.15 的实测表是已对齐的九条；缺的三档分别是「遮罩是 `Bitmap`/`TextField`」「遮罩只有描边」「遮罩自身带滤镜/混合」 | 先按 §6.15 的探针套路（`temp/mask/MaskProbe*.as`）补测这三档的 adl 口径，再把 `as_mask_ink` 的路径收集扩到像素模板（`SkImage` → `SkShader` 裁剪或 `saveLayer` + `kDstIn`），并把报明换成真实现 |
 | **`CubeTexture.uploadFromByteArray` 只报明、不落地**（`as_shell_unsupported`，立方体一个面都传不进去） | 未开始（2026-10-30 阶段三百二十 把六个上传入口的边界契约对齐时分离出来的：`adl` 支持逐面从 ByteArray 上传，本轮**未测**它的字节布局与 `side` 语义，故只登记） | 我们的立方体六面必须**一次性**齐备（`as_s3d_upload_cube_texture` 一次收六个快照），而 `createCubeTexture` 不给 `ctx` 句柄、面上传无法增量落地；`CubeTexture.uploadFromBitmapData` 是**可用**的（away3d 天空盒走它） | 先按 `temp/s3dupload/UploadProbe.as` 的形状补一面探针（六面逐面传 + 只传一面就读），再决定是「逐面快照 + 齐备才上传」还是「单面即时上传」 |
 | `scrollRect` 窗口边与内容边**重合**时，边界列的覆盖率是 `c²` 而不是 AIR 的 `c`（另：非重合的小数边还有 ±1/255 的覆盖率舍入差） | **部分完成**（2026-11-01 阶段三百四十九：**主缺陷已修** —— 尺寸取整与整像素吸附已逐格对齐） | 阶段三百四十九 量定并修好了两条：窗口 `width`/`height` 在**对象坐标**里 `rint`（四舍六入五成双），窗口自己的边按小数设备位置抗锯齿（`temp/clipround` 24 格双端逐像素；`w=100.5→100`、`119.5/120.5→120`、`scaleX=2` 时仍 200 设备像素、`x=20.5` 首列 50% 且不从 21 开始）。**剩下的这一条是覆盖率的组合口径**：对象 `x=20.25/20.5/20.75`、`w=100`、内容铺满窗口时，AIR 首列 alpha 是 `0.75/0.5/0.25`，我们是 `0.5625/0.25/0.0625` —— Skia 的 AA clip 把裁剪覆盖率与图元覆盖率**相乘**，而 AIR 的窗口等效于「按 `rint` 尺寸烘焙、再按小数原点合成一次」（覆盖率取交集而非相乘）。列数、位置、`scale` 口径已逐格相同，差的只是**一个边界列的 alpha**。非重合的小数右边还有 ±1/255 的覆盖率舍入（我们 `0xbf`、AIR `0xc0`） | 消掉乘法要给 `scrollRect` 做窗口烘焙：把内容画进 `rint(w)×rint(h)` 的离屏面，再按小数原点合成一次（与 `cacheAsBitmap` 同一套机械）。代价是每次窗口边落在非整像素就多一次离屏分配 ⇒ 必须只在「边不在整像素」时启用（整数几何零成本，已由本阶段的整像素快路保证）。动手前先量两种未测情形：① 内容**不**铺满窗口（边不重合时我们本来就对，改造不得把它弄错）② 半透明子树跨窗口边（烘焙 vs 逐图元的 alpha 语义不同），两者都进 `temp/clipround` 的格子再加钉子 |
-| **Windows `NativeDragManager.doDrag` 的 `dragImage` 不渲染**（macOS 已实现 RGBA 拖动图像 + offset；Windows 传入 `dragImage` 报明未实现、改用系统光标） | 未开始（2026-11-15 阶段四百三十 E3 验证 OLE 拖放时确认；`desktop-file-interaction.md` 早已登记此限制） | OLE 拖动图像走 shell **私有协议**：`IDataObject` 须提供注册格式 `DragImageBits`（`DRAGIMAGEBITS` 结构 = 尺寸 + 光标 offset + 32bpp 预乘 alpha `HBITMAP`），`IDropSource` 须实现 `IDropSourceHelper`（`GiveFeedback` 回 `DRAGDROP_S_USEDEFAULTCURSORS`）。`DRAGIMAGEBITS`/`IDropSourceHelper`/其 IID **都不在公开 Windows SDK 头**（`shlobj.h`/`shobjidl.h`/`shlguid.h` 实测无），属 reverse-engineered 接口。`vendor/native_drag_win.cc` 的 `sk_drag_begin` 已收到 rgba/尺寸/offset 但 `(void)` 忽略，`Data` 是只读快照（私有格式需可变态）。drag-IN（`IDropTarget`）与 drag-OUT（`DoDragDrop`）本身已实测可用，仅缺拖动图像。 | 需先按 Wine/ReactOS 的 `IDropSourceHelper` IID 与 `DRAGIMAGEBITS` 布局核实私有协议，把 `Data` 扩成携带 `DragImageBits` 格式（`HBITMAP` 由 rgba 建 32bpp DIB section、预乘 alpha、随 `Data` 释放），`Source` 增 `IDropSourceHelper`。**必须真机拖出到资源管理器/编辑器目视验收**（本机无法程序化模拟交互拖拽）；协议核实前不盲改，避免崩掉已可用的 drag-OUT 路径。当前按 §1.5 报明（`as_shell_unsupported`），不静默降级 |
+| **Windows `NativeDragManager.doDrag` 的 `dragImage` 不渲染**（macOS 已实现 RGBA 拖动图像 + offset；Windows 传入 `dragImage` 报明未实现、改用系统光标） | 调研完成·实现暂缓（2026-11-15 阶段四百三十 E3 确认；2026-11-25 阶段四百六十五 实测核实公开协商半段，渲染半段卡私有协议） | OLE 拖动图像走 shell **私有协议**：`IDataObject` 须提供注册格式 `DragImageBits`（`DRAGIMAGEBITS` 结构 = 尺寸 + 光标 offset + 32bpp 预乘 alpha `HBITMAP`），`IDropSource` 须实现 `IDropSourceHelper`（`GiveFeedback` 回 `DRAGDROP_S_USEDEFAULTCURSORS`）。`DRAGIMAGEBITS`/`IDropSourceHelper`/其 IID **都不在公开 Windows SDK 头**（`shlobj.h`/`shobjidl.h`/`shlguid.h` 实测无），属 reverse-engineered 接口。`vendor/native_drag_win.cc` 的 `sk_drag_begin` 已收到 rgba/尺寸/offset 但 `(void)` 忽略，`Data` 是只读快照（私有格式需可变态）。drag-IN（`IDropTarget`）与 drag-OUT（`DoDragDrop`）本身已实测可用，仅缺拖动图像。 | 需先按 Wine/ReactOS 的 `IDropSourceHelper` IID 与 `DRAGIMAGEBITS` 布局核实私有协议，把 `Data` 扩成携带 `DragImageBits` 格式（`HBITMAP` 由 rgba 建 32bpp DIB section、预乘 alpha、随 `Data` 释放），`Source` 增 `IDropSourceHelper`。**必须真机拖出到资源管理器/编辑器目视验收**（本机无法程序化模拟交互拖拽）；协议核实前不盲改，避免崩掉已可用的 drag-OUT 路径。**阶段四百六十五实测（2026-11-25）**：公开 `IDragSourceHelper::InitializeFromBitmap`（`CLSID_DragDropHelper` / IID `DE5BF786-477A-11D2-839D-00C04FD918D0`）返回 `S_OK`，helper 经 `IDataObject::SetData` 写入 `DragImageBits`(fmt 50110)+`DragContext`(fmt 49404)，故 `Data` 须可变、接受 HGLOBAL+ISTREAM 并按请求 tymed 互转供给——此公开协商半段已验证正确。但 `DoDragDrop`/`SHDoDragDrop` 拖动循环**从不**向源 `GetData` 取 `DragImageBits`（`ASC_DRAG_TRACE` 实测仅查 `CF_UNICODETEXT`），DPI-aware 全屏截图像素扫描无 64×64 红块 ⇒ 仅公开 `InitializeFromBitmap` 不渲染源侧图像。WinForms/Avalonia(#18668) 证实源侧图像须在 drop source 实现私有 `IDropSourceHelper` 并在 `GiveFeedback` 驱动 drag-image manager，其 IID/vtable 仍未核实。故回退不渲染的接线、保留显式 unsupported，不交付「接受 dragImage 却不可见」的假绿。当前按 §1.5 报明（`as_shell_unsupported`），不静默降级 |
 
 
 
@@ -23629,6 +23682,218 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   **−17%**（阶段四百四十三）把它抵平到 **196–202**。也就是说「UTF-8 存储 + 对齐 UTF-16 特性」
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
+
+### 阶段四百六十七：WGL/GL 透明 GPU 窗离屏读回 → UpdateLayeredWindow（v0.4.440 → v0.4.441）✅ 已完成
+
+**立项依据**：用户「WGL/GL 透明 GPU 窗也修了呗」。阶段四百五十九/四百六十 的透明 GPU 窗修复只落在 D3D12
+后端，GL（WGL）后端完全没有透明支持——真实应用当时是改切 D3D12 绕过的。本阶段把 GL 后端补齐。
+
+**根因（实测）**：GL 探针 `temp/gltrans`（300×200，右三分之一未画）修前截图：左红带不透明✓、中 50% 蓝带
+渲染成**不透明**、右三分之一渲染成**黑**（`before-crop.png`）。即分层窗（`WS_EX_LAYERED`）走 WGL `SwapBuffers`
+时 DWM **不逐像素合成 alpha**：alpha-0 像素显黑、半透明像素显不透明。与 D3D12 阶段四百五十九 同一类问题
+（swapchain 视觉压倒 ULW），只是 GL 这边表现为「可见但 alpha 丢失」。
+
+**修复**（镜像 D3D12，但用 Skia  portable 路径，不裸调 FBO）：
+- `vendor/gl_glue.cc`：`GLWin` 增 `layered`/`bgra`/`bgra_cap`。`gl_build_surface` 透明分支改用
+  `SkSurfaces::RenderTarget`（纹理-backed **离屏**面，`kRGBA_8888`/`kPremul`/`kBottomLeft`）而非 FBO 0——Skia 自管
+  FBO，故无需 `glGenFramebuffers`/`wglGetProcAddress`（GL 1.1 头 + opengl32.dll 不导出 FBO 入口）。新增
+  `gl_present_transparent`：`SkSurface::readPixels` 读回成 **BGRA 预乘**（readPixels 一并做 GPU→CPU 读回 +
+  RGBA→BGRA + 原点翻转），交 `sk_window_present_layered_pixels`（ULW）；`sk_gpu_flush` 透明分支走它并
+  **跳过 SwapBuffers**。`sk_gpu_init` 读 `sk_window_is_transparent` 定初始 `layered`；新增 `sk_gpu_set_transparent`
+  （after-init 路线，重建 surface）。不透明分支（FBO 0 + SwapBuffers）一字未动。
+- `vendor/window_glue.cc`：`sk_gpu_set_transparent` 声明与 `sk_window_set_transparent` 调用门控由
+  `ASC_RENDER_D3D` 扩为 `ASC_RENDER_D3D || ASC_RENDER_GL`。
+
+**验证（三路径像素核验）**：① 描述符透明（init）：after 红带 (255,0,0)、蓝带随背景混合（黑底 (0,0,127)、
+终端底 (78,84,212)=50%蓝）、右三分之一露桌面（透明）；before 右三分之一全黑。② after-init 透明
+（`temp/nwtrans` GL 重建，UTILITY 红 + NORMAL 绿）两窗均渲染。③ 不透明 GL（`temp/glopaque`）绿带 0x00CC44
+正常——零回归。钉 `unit: platform/TransparentGpuGl` **11**；`unit: platform` **34/34**。
+
+**文档**：`docs/{zh-cn,en}/win32.md`「WGL 分支透明窗未实测」→「已修」；`docs/{zh-cn,en}/skia.md` §6.20 补 GL 段。
+
+### 阶段四百六十六：窗口行为残差验收——closing 可取消序 + resizeToScreen 平台单位（v0.4.439 → v0.4.440）✅ 已完成
+
+**立项依据**：Windows 对齐缺口盘点第 4 项（用户批准 1–4 立项）。四类未测面剩下的两项：红叉 `closing` 的可取消序、
+`resizeToScreen` 每屏 DPI 单位。原则：先实测再修。
+
+**closing 可取消序（本就正确，验收通过）**：glue 侧 `SDL_WINDOWEVENT_CLOSE` → `close_request=1`，`ASC_win_poll`
+取走后 fire cancelable `"closing"`，未 `preventDefault` 才 `as_window_close`。运行时验收（`temp/rts`）：外部
+`closewatch.exe` `FindWindow`+`PostMessage(WM_CLOSE)`，AS3 `closing` 监听 `preventDefault` ⇒ `CLOSING_FIRED
+cancelable=true` → `PREVENTED` → `AFTER_WM_CLOSE closed=false`，与 AIR 一致。无需改代码，既有钉已守。
+
+**resizeToScreen（修）**：adl Windows 实测（`temp/screenpx/adl`）落在 **DIP 全屏** (0,0,2560,1707) **含任务栏**，
+而 macOS 落 `visibleBounds`（`temp/nwmac/rts-out.txt`）——平台分歧。原实现统一读 `as_display_usable_bounds`
+（usable，除任务栏）⇒ Windows 偏小。新增 seam `as_display_resize_bounds`（`runtime.ts`）：`_WIN32` 走
+`sk_display_bounds` 全屏逻辑、否则 usable；web/no-window 桩同步。`emit.ts` `resizeToScreen` 改调新 seam。
+AOT 探针实测 `RTS=0,0,2560,1707` 与 adl 逐字一致。
+
+**验证**：`unit: platform` **33/33**（`DisplayMetrics` 13 钉：改写 resizeToScreen 钉 + 新增平台分歧钉）。
+
+**文档**：`docs/{zh-cn,en}/win32.md` 窗口行为节；TODO 遗留表该行移出。
+
+### 阶段四百六十五：Windows `doDrag` dragImage 根因核实（调研完成·实现暂缓，未升版本）
+
+**立项依据**：Windows 对齐缺口盘点第 3 项。macOS 已有 RGBA 拖动图像 + offset，Windows 报明未实现。
+
+**实测核实（公开协商半段正确）**：公开 `IDragSourceHelper::InitializeFromBitmap`（`CLSID_DragDropHelper` /
+IID `DE5BF786-477A-11D2-839D-00C04FD918D0`）返回 `S_OK`，helper 经 `IDataObject::SetData` 写
+`DragImageBits`(fmt 50110)+`DragContext`(fmt 49404)。故 `Data` 须可变、接受 HGLOBAL+ISTREAM 并按请求 tymed
+互转供给——此半段验证正确。
+
+**渲染半段卡私有协议**：`DoDragDrop`/`SHDoDragDrop` 拖动循环**从不**向源 `GetData` 取 `DragImageBits`
+（`ASC_DRAG_TRACE` 仅查 `CF_UNICODETEXT`），DPI-aware 全屏截图像素扫描无 64×64 红块（`temp/dragimg`：
+`visual.c` 持 LMB+watchdog、`shot.ps1`、`redscan.ps1`）⇒ 仅公开 `InitializeFromBitmap` 不渲染源侧图像。
+WinForms/Avalonia(#18668) 证实需在 drop source 实现私有 `IDropSourceHelper` 并在 `GiveFeedback` 驱动
+drag-image manager，IID/vtable 未核实（不在公开 SDK 头）。
+
+**处置（§1.5 绝不静默）**：回退不渲染的接线（`vendor/native_drag_win.cc` + `src/native-drag.ts` 恢复 HEAD），
+保留显式 `as_shell_unsupported`，不交付「接受 dragImage 却不可见」的假绿。TODO 行改「调研完成·实现暂缓」，
+待私有协议核实后再实装。探针与像素扫描脚本留 `temp/dragimg` 供后续。
+
+### 阶段四百六十四：ANE 附属 DLL 的加载搜索路径（v0.4.438 → v0.4.439）✅ 已完成
+
+**立项依据**：Windows 对齐缺口盘点第 2 项（用户批准 1–4 立项）。ANE 主 DLL 用全路径 `LoadLibraryA` 加载，
+但它导入的**附属 DLL**（非系统 DLL，放在同一平台目录）会以 **126** 失败：Win32 默认搜索序不含「全路径
+加载的 DLL 自身目录」。macOS 的 POSIX 加载链早已收口，此为 Windows 独有缺口。真会议扩展导入表只有
+系统 DLL + `asaot.dll`，故此前未暴露。
+
+**复现先行**：共享夹具 `com.example.probe` 新增 Windows-only 半边——`ProbeHelper.c`（导出
+`ProbeHelperValue()=4242`），`ProbeANE.c` 以 `__declspec(dllimport)` 导入并注册 `helperValue`（`#ifdef _WIN32`
+守卫，macOS 夹具行为不变）；`build-ane.bat` 编 helper、链接、两树 staging、导入表守卫（`DLL Name:
+ProbeHelper.dll`）。修前跑 `examples/ane/driver.as`：**Win32 error 126**、`created=false`（`temp/ane-dep-before`）。
+
+**修复与第二层根因**：`src/fre.ts` `as_fre_lib_open` 改 `LoadLibraryExA(norm, NULL,
+LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)`（KB2533623 缺失时错误 87 回落
+`LoadLibraryA`）。首修后**仍 126**——隔离探针（`temp/screenpx/dllprobe2`）量出第二层根因：该 flag 的
+load-directory 推导**不容忍正斜杠**，而描述符保留 AIR 的 `/` 约定⇒拼接路径是混合分隔符，会加错目录；
+同一文件纯反斜杠能载、混合 126。故加载前先把 `/` 归一化成 `\\`。附属 DLL 随整包 staging（阶段三百九十一）
+自动落地，无需改 `src/ane.ts`。
+
+**验证**：修后 `examples/ane/driver.as` **73/73**（含 `helperValue (sibling DLL) = 4242`），`ane-app`
+（--air-app 孪生路由）绿；`unit: fre` **6/6**（新组 `DllSearchPath` 4 钉：flag 组合 + 87 回落 + 归一化先于
+加载 + 夹具导入守卫；`WIN32_IDENT` 补 `LoadLibraryExA`）。
+
+**文档**：`docs/{zh-cn,en}/ane.md` §5.1 新增第九条教训；TODO 遗留表该行移出。
+
+### 阶段四百六十三：Screen.bounds/visibleBounds 物理像素口径（v0.4.437 → v0.4.438）✅ 已完成
+
+**立项依据**：Windows 相对 macOS 的对齐缺口盘点（用户批准 1–4 项立项修复）第 1 项。AIR 在 Windows 上把
+`Screen.bounds`/`visibleBounds` 报成**物理像素**（150% 桌面 3840×2560 / 3840×2488），而 `Stage.fullScreen*` 与
+`Capabilities.screenResolution*` 仍是 DIP（2560×1707）——我们此前 Screen 与窗口居中共用 `sk_display_bounds`
+（SDL 逻辑空间），Screen 一路报逻辑值，是阶段一百七十三/二百零六 刻意留下的既知偏离（`sk_display_pixel_bounds` 欠账）。
+macOS 不受影响：SDL Cocoa 本来就报点，即 AIR 在那边的空间。
+
+**实测先行**（`temp/screenpx/`）：① adl 51.4.1 探针（`adl/Probe.as`）确认 bounds=(0,0,3840,2560)、
+visibleBounds=(0,0,3840,2488)、Capabilities 2560×1707、screenDPI 96、`getScreensForRectangle(3000,2000,…)`=1
+（**物理空间匹配**）、零面积/远界矩形=0；顺带量得 `resizeToScreen` 的 Windows 落点=(0,0,2560,1707)（DIP 整屏、
+含任务栏，归阶段四百六十六）。② Win32 探针（`physprobe.c`）量出关键事实：`EnumDisplaySettingsW` 当前模式在
+**DPI-UNAWARE 进程里也报物理 3840×2560**，而 `GetMonitorInfoW` 被虚拟化到 2560×1707 ⇒ standard 分辨率构建
+（DPI-unaware）也能报对物理像素；work area 无模式等价物，用 `SetThreadDpiAwarenessContext`(PMv2) 线程级上下文
+去虚拟化（Win10 1703+，缺失时回落进程度感知）。
+
+**修复**：`vendor/window_glue.cc` 新增 AIR 空间 seam `sk_screen_bounds`/`sk_screen_usable_bounds`（Windows 走
+`EnumDisplayDevicesW`+`EnumDisplaySettingsW`，与 SDL 同一枚举序；其余平台别名逻辑查询）；`sk_display_bounds`/
+`sk_display_usable_bounds` **保持逻辑空间不动**（窗口居中/几何共用，改它会打坏居中——阶段一百七十三 的教训）。
+`src/runtime.ts`：`as_screen_bounds`/`as_screen_usable_bounds` 改走新 seam，新增 `as_display_usable_bounds`
+（逻辑 usable，窗体放置专用）+ headless 零桩。`src/emit.ts`：`resizeToScreen` 改读逻辑 seam（保持 463 前行为
+逐位不变；Screen.visibleBounds 已是物理，直接喂窗体几何会大 1.5 倍）。`vendor/web_glue.cc` 补两个别名桩。
+
+**验证**：AOT 值探针与 adl **逐值对齐**（bounds 3840×2560 / visibleBounds 3840×2488 / cap 2560×1707 / dpi 96 /
+hit(3000,2000)=1 / hit(4000,2600)=0 / hit(0,0,0,0)=0）。`unit: platform` **33/33**（DisplayMetrics 的「开放偏离」
+钉改写为修齐不变量：AIR seam 接线 + awareness-independent 模式查询 + resizeToScreen 逻辑 seam + web 桩）。
+新示例 `examples/screen-bounds.as`（+ window manifest）钉与主机无关的结构不变量（包含关系/Rectangle 同一性/
+Screen 包装器每次新鲜/匹配空间）——物理数值在 100% 缩放机器上分不出空间，故数值由形状钉 + adl A/B 证据守。
+
+**文档**：`docs/{zh-cn,en}/win32.md` §3.5 残留偏离段改为已修齐；TODO 遗留表 Stage3D 行子项①清偿。
+
+### 阶段四百六十二：Windows D3D12 + 视频自动注入 video_d3d.cc（v0.4.436 → v0.4.437）✅ 已完成
+
+**立项依据**：用户报「真应用还是看不到窗口」。实测定位：真会议应用 manifest 用 `gpu-backend=gl`（WGL/OpenGL），
+而阶段四百六十的透明窗修复只落在 D3D12 后端，**GL 后端完全没有透明窗支持**（GL 探针截图纯桌面、窗全透明不可见）。
+用户选定「应用改切 d3d12」。切换后重建在链接期暴露一个**构建层缺口**：`video_glue.c` 对 `sk_video_d3d_*` 的引用
+只在 `ASC_RENDER_D3D` 下编译，需 `vendor/video_d3d.cc` 提供；video 探针只给 macOS 自动注入 `video_metal.mm`，
+**Windows D3D12 的 `video_d3d.cc` 从未自动注入**（`src` 全无引用，示例 manifest 靠手列）。gl 后端把这些引用守卫掉
+所以一直能链，切 d3d12 才暴露。
+
+**修复**：`src/index.ts` video 探针补 Windows 分支——检测到 `ASC_RENDER_D3D` 时自动把 `video_d3d.cc` 加进 sources
+（镜像 macOS `video_metal.mm` 注入，`!cfg.sources.some(...)` 防重复）。gl 路径不受影响（仅 `ASC_RENDER_D3D` 触发）。
+
+**验证**：真应用以 d3d12 重建成功（`temp/app-build-d3d12.log`），入会「测试-[2446-0511-93]」，TopControlView 透明控制条
+清晰可见（半透明深灰条 + 会议信息/通讯已加密/延时按钮，`temp/app-controlbar.png`）——「看不到窗口」修复。单元钉
+`test/unit/video.ts` +1（镜像 macOS 注入钉，video 组 116 钉全绿）。文档 `docs/{zh-cn,en}/video.md` §16.9.2 同步。
+真应用 manifest 的 `gpu-backend`/defines/sources/link-libs 改动在应用仓库工作树（不提交）。
+
+### 阶段四百六十一：NativeWindow stage 设计尺寸 72×72 + 默认 align 居中（v0.4.435 → v0.4.436）✅ 已完成
+
+**立项依据**：阶段四百六十修透明窗时探针量到的预存核心 stage 语义分歧（已登记遗留），用户「接着修尺寸分歧，
+先建 adl oracle」。真实应用 `Config.SCALE_MODE=NO_SCALE` 本身不受此 bug 影响（noScale 用客户区），但 showAll/
+exactFit/noBorder 的二级窗是确凿的 AIR 保真缺陷（adl 跑对我们跑错⇒遗留，§1.5）。
+
+**一、adl oracle（`temp/nwsize`，先定标再下手）**：主窗 + NativeWindow × 四 scaleMode，量 stageWidth/Height +
+渲染红/绿标记 bbox（`BitmapData.draw(stage)` **不应用** scaleMode 呈现变换，故用外部截图像素扫描）。关键实测：
+NativeWindow showAll `stageWidth=72` 恒定，**与 bounds（380×70/500×400）、创建尺寸、主 SWF `[SWF]` 元数据（300×200）均无关**；
+noScale `stageWidth=bounds`。**Adobe dev guide 确证**：「AIR 在窗口大小与缩放系数 **72:1** 之间任意选择关系」——72×72 窗
+10×10 矩形画 10×10、144×144 窗缩成 20×20。故 72×72 是 AIR 给二级窗的**固定常数**，**纠正阶段460「=SWF 头尺寸」的误判**。
+
+**二、根因（两处）**：① `NativeWindow_ctor` 把 `design_w/h` 设成窗口创建尺寸（默认 400×200），应为固定 72；
+② 内容缩放把默认 `align=""`（二级窗所用）当**左上**（ox=oy=0），AIR 实为**居中**。adl showAll 380×70 窗：scale=70/72=0.972，
+70×70 内容居中 x=(380-70)/2=155（物理 233）。
+
+**三、修法（`src/emit.ts`）**：① 二级窗 `w->design_w = 72; w->design_h = 72;`（初始窗仍取描述符，不动）；
+② 内容缩放默认 `ox=remx*0.5, oy=remy*0.5`（`align=""`/NULL 居中），显式非空 `StageAlign` 从左上基线（ox=oy=0）再八值分配
+（`TL`→0,0）。**初始窗 `Stage_ctor` 默认 `align="TL"`（非空）⇒不受影响**；noScale 不缩放但仍按 align 定位（design 72 馈 remx）。
+
+**四、实证（逐像素）**：`temp/nwsize` 四模式红/绿标记 bbox，adl vs 我方**完全一致**：showAll red[233,0,104×105]/green[233,0,14×14]、
+noScale red[231,0,108×105]/green[231,0,15×13]、exactFit red[0,0,570×105]/green[0,0,79×14]、noBorder red[0,0,570×105]/green[none]。
+
+**五、示例与钉**：`examples/native-window.as` w7 showAll 断言 `400x200`→`72x72`（旧断言钉住了 buggy 行为，假绿陷阱）；
+`unit: platform/NativeWindowWin` 加 3 钉（design=72 / align 居中 / 显式 align 左上基线）⇒ **16 钉**；`unit: platform` 全组 **33/33 绿**。
+全量回归 `node test.ts`：**746 测试 / 739 绿 / 5 跳过 / 2 红**（示例层全绿，含 native-window 的 72x72 新断言；耗时 539 s）。
+2 红为**非本阶段基线**：`emit/StringAccumulator`（并发会话）、`build/Yuv420HostManifest`（Windows 主机无 darwin 预编译 vendor 树）。
+
+**六、文档与核算**：`docs/{zh-cn,en}/compile.md` §7 窗口缩放补设计尺寸 + 默认 align 语义；`docs/{zh-cn,en}/skia.md` §6.20
+「遗留」段改「阶段461 已修」。遗留主表**移出 1 行 84→83**（`未开始` 65→64）。主窗 `[SWF(width,height)]` 元数据设计尺寸丢弃
+是另一独立行（部分完成），不同源未动。版本 0.4.435 → **0.4.436**。
+
+### 阶段四百六十：NativeWindow 透明 GPU 窗离屏路径（after-init）+ UTILITY 工具窗（v0.4.434 → v0.4.435）✅ 已完成
+
+**立项依据**：用户「真实应用 talkmed-meeting 测试这个透明窗口发现有 air 有差异的地方：1. 任务栏会显示这些窗口的
+缩略图。2. 这两个窗口在屏幕上不可见是否宽高问题？」。阶段四百五十九只修了**描述符初始窗**的 GPU 透明；真实应用
+的 Control/Camera 窗是运行期 `new NativeWindow`（UTILITY、transparent、renderMode direct）建的，暴露两处差异。
+
+**一、问题2「不可见 + 空白缩略图」——同一根因（探针实证 + 代码确证）**：`NativeWindow` 的 `as_window_create`
+（含 `sk_gpu_init`）在 `as_window_set_transparent` **之前**调用，而阶段459 的 `layered` 只在 `sk_gpu_init` 置位
+⇒ 这些窗 `layered=0` ⇒ 走不透明交换链 `Present`：compose 清的 alpha-0 被 flip-model 画成**黑**，且 `WS_EX_LAYERED`
+已置却无 ULW ⇒ DWM 缩略图**空白**。会议背景深色 ⇒ 黑窗看似「不可见」。探针 `temp/nwtrans`：应透明处变黑
+（adl 同探针为真透明、红/绿 rect 填满 380×70）。**修好离屏路径，不可见与空白缩略图同时解决**。
+
+**二、修法（镜像 macOS after-init）**：`d3d_glue` 新增 seam `sk_gpu_set_transparent(win_id, on)`：`d3d_drain_window`
+排空 GPU → 置 `layered`（`on && !hdr`）→ `d3d_setup_surfaces` 重建表面（失败回落不透明）；fence 账本独立于表面、
+排空后仍有效，无需重置。`window_glue` 的 `sk_window_set_transparent` 对 GPU 窗（`ASC_RENDER_D3D`）调它。探针实证：
+NativeWindow 透明 GPU 窗红/绿带周围**透出桌面**（不再黑底）。
+
+**三、问题1「任务栏出现这些窗」**：AIR 把 `NativeWindowType.UTILITY`/`LIGHTWEIGHT` 映射为工具窗
+（`WS_EX_TOOLWINDOW`，无任务栏按钮），`NORMAL` 才进任务栏；`window_glue` 此前**零类型→工具窗处理**，SDL 建的窗
+恒有任务栏按钮。新增 `sk_window_set_type`（`NativeWindow_ctor` 经 `as_window_set_type` 调用，runtime 真 wrapper +
+web 空桩）：utility/lightweight 置 `WS_EX_TOOLWINDOW` 清 `WS_EX_APPWINDOW`，其余清 `WS_EX_TOOLWINDOW`。
+**枚举窗口扩展样式实证**（`temp/nwtrans/verify-nw-style.ps1`）：UTILITY 窗 `ex=0x80090`（TOOL=True+LAYERED）、
+NORMAL 窗 `ex=0x80010`（TOOL=False+LAYERED）——UTILITY 不再进任务栏。
+
+**四、尺寸分歧——独立立项（用户问「是否宽高问题」）**：探针另量到 NativeWindow showAll 下 `bounds=380×70` 后
+内容被 letterbox 缩小（红 rect 仅 ~172×32）。adl oracle：`stage.stageWidth/Height=72×72`（=SWF 头设计尺寸）；
+我方 `design_w/h` 用窗口创建尺寸 400×232，`ASC_window_apply_stage_size` 对 showAll 取 `design_w/h` ⇒
+scale=min(570/400,105/232)=0.452。属**预存核心 stage 语义**（NativeWindow 设计尺寸来源），与透明/任务栏无关，
+**新登记遗留 1 行**（主表 83→84），与本轮修复捆绑。
+
+**五、回归与钉**：新增 `unit: platform/NativeWindowWin` **13 钉**（sk_gpu_set_transparent export/drain/重建/HDR 闸门、
+window_glue 调用 + extern、sk_window_set_type export/utility 映射/TOOLWINDOW±APPWINDOW、emit 调用、runtime 真 wrapper +
+stub）；`unit: platform/BackendParity` 加 `sk_gpu_set_transparent` 内部 seam 豁免（生成 C 不引用、metal 不实现），
+`sk_window_set_type` 走 web 空桩（与 set_transparent 同模式，非豁免）。`unit: platform` 全组 **33/33 绿**。
+全量回归 `node test.ts`：**746 测试 / 739 绿 / 5 跳过 / 2 红**（示例层全绿；耗时 552 s）。2 红为**非本阶段基线**：
+`emit/StringAccumulator`（并发会话）、`build/Yuv420HostManifest`（Windows 主机无 darwin 预编译 vendor 树）。
+
+**六、文档同步**：`docs/{zh-cn,en}/skia.md` §6.20 补阶段460 段、`docs/{zh-cn,en}/win32.md` §3.1 补注记。
+版本 0.4.434 → **0.4.435**。
 
 ### 阶段四百五十九：Windows GPU 透明窗——离屏渲染目标 + 读回 → UpdateLayeredWindow（v0.4.433 → v0.4.434）✅ 已完成
 

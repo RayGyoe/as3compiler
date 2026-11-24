@@ -685,8 +685,12 @@ function checkBackendParity(): string[] {
   // 只有 D3D12 后端有 scRGB 交换链，所以 metal_glue.mm 不实现它们是对的——
   // 其余构建由 video_glue.c 的 static 桩回答「不是 HDR」，SDR 路径逐字节不变。
   const HDR_SEAM = ['sk_gpu_hdr_active', 'sk_gpu_hdr_white'];
-  check('...and the only sk_gpu_* outside that seam is the HDR status pair',
-    [...metalDefs, ...d3dDefs].every((n) => gpuSeam.includes(n) || HDR_SEAM.includes(n)));
+  // 另一类 GPU 胶水内部 seam（阶段四百六十）：sk_gpu_set_transparent 由 window_glue.cc
+  // 在 NativeWindowInitOptions.transparent 写在 GPU bind 之后时调用（置 layered + 重建离屏
+  // 表面），**生成 C 从不引用**，metal_glue.mm 也不实现（macOS 走 sk_mac_apply_gpu_transparent）。
+  const GPU_INTERNAL_SEAM = ['sk_gpu_set_transparent'];
+  check('...and the only sk_gpu_* outside that seam are the HDR pair + the post-init transparent switch',
+    [...metalDefs, ...d3dDefs].every((n) => gpuSeam.includes(n) || HDR_SEAM.includes(n) || GPU_INTERNAL_SEAM.includes(n)));
   check('metal_glue.mm invents no HDR status (its builds answer SDR through the stub)',
     HDR_SEAM.every((n) => !metalDefs.has(n)));
   const videoGlue = readFileSync(join(root, 'vendor', 'video_glue.c'), 'utf8');
@@ -1712,10 +1716,26 @@ function checkDisplayMetrics(): string[] {
   check('the Stage/whole-display split is written at the glue site',
     glue.includes('sk_window_get_stage_full_size') && glue.includes('usable bounds'));
 
-  // The remaining half is a KNOWN divergence, so it has to be written down in both
-  // places rather than look like an oversight.
-  check('the Screen.bounds physical-pixel divergence is registered at the code site and in TODO.md',
-    glue.includes('SPACE NOTE (open divergence') && readSrc('TODO.md').includes('sk_display_pixel_bounds'));
+  // Stage 463 CLOSED the divergence: Screen.bounds/visibleBounds read the AIR-space
+  // seam (physical pixels on Windows), while window placement keeps the logical one.
+  // The Windows query must use EnumDisplaySettingsW, which answers the REAL display
+  // mode even in a DPI-unaware process (GetMonitorInfoW is virtualized there) — a
+  // standard-resolution build is DPI-unaware and must still report physical pixels.
+  check('Screen.bounds/visibleBounds read the AIR-space seam, not the placement seam',
+    runtime.includes('return sk_screen_bounds(i, x, y, w, h);') &&
+    runtime.includes('return sk_screen_usable_bounds(i, x, y, w, h);'));
+  check('the Windows AIR-space query uses the awareness-independent mode query',
+    /int sk_screen_bounds\(/.test(glue) && /EnumDisplaySettingsW/.test(glue) &&
+    glue.includes('SPACE NOTE (closed, stage 463)'));
+  check('resizeToScreen reads the LOGICAL resize seam, not AIR-space visibleBounds',
+    emit.includes('as_display_resize_bounds(screen->_display_index, &ux, &uy, &uw, &uh);') &&
+    !emit.includes('Rectangle* vb = Screen_get_visibleBounds((void*)screen);'));
+  check('the resize seam reproduces the adl platform split: Windows FULL display, macOS usable',
+    runtime.includes('static inline int as_display_resize_bounds(') &&
+    /as_display_resize_bounds[\s\S]{0,220}#ifdef _WIN32[\s\S]{0,80}return sk_display_bounds\(i, x, y, w, h\);[\s\S]{0,80}#else[\s\S]{0,80}return sk_display_usable_bounds\(i, x, y, w, h\);/.test(runtime));
+  check('the web backend defines the AIR-space Screen seam too',
+    readSrc('vendor/web_glue.cc').includes('int sk_screen_bounds(') &&
+    readSrc('vendor/web_glue.cc').includes('int sk_screen_usable_bounds('));
 
   console.log(`     [displaymetrics] ${ok} check(s) passed`);
   return bad;
@@ -2050,6 +2070,164 @@ function checkTransparentGpuWin(): string[] {
 }
 
 registerGroup('unit: platform/TransparentGpuWin', checkTransparentGpuWin);
+
+// Windows WGL/GL transparent window (stage 467), the GL counterpart of stage 459/460.
+// Measured on Windows 11 150% DPI with temp/gltrans (300x200, right third unpainted):
+// before the fix a layered GL window showed the SwapBuffers content OPAQUE -- the 50%
+// blue band read as solid and the unpainted right third rendered BLACK (alpha-0 pixels
+// of a WGL swapchain are not composited per-pixel by DWM). The fix mirrors D3D12: draw
+// into a texture-backed OFFSCREEN Skia render target, read it back to premultiplied
+// BGRA via SkSurface::readPixels (which does the GPU readback + RGBA->BGRA + origin
+// flip), and hand it to window_glue's ULW present; never SwapBuffers. After: red band
+// (255,0,0), 50% blue blends with the desktop behind (0,0,127 over black, (78,84,212)
+// over the terminal), right third shows the desktop (transparent). The opaque GL path
+// (FBO 0 + SwapBuffers) is byte-for-byte the same route. These pins keep a later
+// "simplification" from dropping the offscreen route or swapping a transparent window.
+function checkTransparentGpuGl(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [transgpugl] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [transgpugl] ${label}`); }
+  };
+  const read = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const winRaw = read('window_glue.cc');
+  const win = strip(winRaw);
+  const gl = strip(read('gl_glue.cc'));
+  const body = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const end = src.indexOf('\n}', i);
+    return end < 0 ? '' : src.slice(i, end);
+  };
+
+  // The same backend-neutral seam d3d_glue uses (pixels + window id only).
+  check('gl_glue declares the seam externs (C linkage)',
+    /int sk_window_is_transparent\(int id\);/.test(gl)
+    && /void sk_window_present_layered_pixels\(int id, void\* pixels, int w, int h, int rowBytes\);/.test(gl));
+  check('sk_gpu_init marks a transparent window layered',
+    /w->layered = sk_window_is_transparent\(win_id\);/.test(gl));
+
+  // The offscreen route: a texture-backed Skia render target, NOT FBO 0. Skia owns the
+  // FBO so no raw glGenFramebuffers/wglGetProcAddress is needed (GL 1.1 header floor).
+  const build = body(gl, 'static int gl_build_surface(GLWin* w) {');
+  check('a layered window builds an OFFSCREEN render target, not the window framebuffer',
+    /if \(w->layered\) \{/.test(build) && /SkSurfaces::RenderTarget\(/.test(build));
+  check('the offscreen target is premultiplied RGBA (ULW reads premultiplied BGRA back)',
+    /kRGBA_8888_SkColorType, kPremul_SkAlphaType/.test(build));
+  check('an opaque window still wraps FBO 0 (zero regression)',
+    /fbInfo\.fFBOID = 0;/.test(build) && /SkSurfaces::WrapBackendRenderTarget\(/.test(build));
+
+  // No SwapBuffers for a transparent window: present is ULW from the readback.
+  const flush = body(gl, 'void sk_gpu_flush(int win_id) {');
+  check('sk_gpu_flush reads back + presents via ULW and skips SwapBuffers when layered',
+    /if \(w->layered\) \{/.test(flush) && /gl_present_transparent\(w, win_id\);/.test(flush)
+    && /return;/.test(flush));
+  check('the opaque path still SwapBuffers (zero regression)',
+    /if \(!SwapBuffers\(w->hdc\)\)/.test(flush));
+
+  // The readback: SkSurface::readPixels to BGRA premultiplied, then the ULW hand-off.
+  const rb = body(gl, 'static void gl_present_transparent(GLWin* w, int win_id) {');
+  check('it reads back to the BGRA premultiplied layout ULW wants',
+    /kBGRA_8888_SkColorType, kPremul_SkAlphaType/.test(rb) && /->readPixels\(/.test(rb));
+  check('it hands the BGRA frame to window_glue\'s layered present',
+    /sk_window_present_layered_pixels\(win_id, w->bgra,/.test(rb));
+
+  // After-init route (NativeWindowInitOptions.transparent written after the GPU bind).
+  check('gl_glue implements sk_gpu_set_transparent (rebuilds the surface for the new route)',
+    /void sk_gpu_set_transparent\(int win_id, int on\) \{/.test(gl)
+    && /w->layered = want;/.test(body(gl, 'void sk_gpu_set_transparent(int win_id, int on) {')));
+  check('window_glue calls sk_gpu_set_transparent for BOTH Windows GPU backends',
+    /#if defined\(ASC_RENDER_D3D\) \|\| defined\(ASC_RENDER_GL\)/.test(winRaw)
+    && /if \(c->is_gpu\) sk_gpu_set_transparent\(id, c->transparent\);/.test(
+      body(win, 'void sk_window_set_transparent(int id, int on) {')));
+
+  if (ok > 0) console.log(`[transgpugl] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/TransparentGpuGl', checkTransparentGpuGl);
+
+// Stage 460: a NativeWindow writes NativeWindowInitOptions.transparent / .type AFTER
+// the window (and its GPU bind) exists. The transparent flag must switch the D3D
+// offscreen/ULW route post-init (else a transparent GPU window presents black with an
+// empty DWM thumbnail), and UTILITY/LIGHTWEIGHT must become tool windows (no taskbar
+// button). Both measured against adl 51.4.1 + a real-app probe (temp/nwtrans).
+function checkNativeWindowWin(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [nwwin] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [nwwin] ${label}`); }
+  };
+  const readV = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  const readS = (rel: string): string =>
+    readFileSync(join(root, 'src', rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const win = strip(readV('window_glue.cc'));
+  const d3d = strip(readV('d3d_glue.cc'));
+  // emit.ts / runtime.ts carry the C as TS string literals: the C block-comment strip
+  // would eat code between stray /* */ pairs inside those strings, so match them raw.
+  const emit = readS('emit.ts');
+  const rt = readS('runtime.ts');
+  const body = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const end = src.indexOf('\n}', i);
+    return end < 0 ? '' : src.slice(i, end);
+  };
+
+  // Fix 2: the offscreen route is re-selected when transparency is written post-init.
+  check('d3d_glue exports sk_gpu_set_transparent',
+    /void sk_gpu_set_transparent\(int win_id, int on\) \{/.test(d3d));
+  const settr = body(d3d, 'void sk_gpu_set_transparent(int win_id, int on) {');
+  check('it drains the GPU before rebuilding surfaces', /d3d_drain_window\(w\)/.test(settr));
+  check('it flips layered and rebuilds the surfaces for the new route',
+    /w->layered = want;/.test(settr) && /d3d_setup_surfaces\(w\)/.test(settr));
+  check('an HDR window is excluded from the offscreen route',
+    /const int want = \(on && !w->hdr\) \? 1 : 0;/.test(settr));
+  check('sk_window_set_transparent switches the D3D route for a GPU window',
+    /if \(c->is_gpu\) sk_gpu_set_transparent\(id, c->transparent\);/.test(
+      body(win, 'void sk_window_set_transparent(int id, int on) {')));
+  check('window_glue declares the D3D seam extern',
+    /void sk_gpu_set_transparent\(int id, int on\);/.test(win));
+
+  // Fix 1: UTILITY/LIGHTWEIGHT are tool windows (no taskbar button); NORMAL appears.
+  check('window_glue exports sk_window_set_type',
+    /void sk_window_set_type\(int id, const char\* type\) \{/.test(win));
+  const setty = body(win, 'void sk_window_set_type(int id, const char* type) {');
+  check('utility/lightweight map to a tool window',
+    /strcmp\(type, "utility"\) == 0 \|\| strcmp\(type, "lightweight"\) == 0/.test(setty));
+  check('a tool window sets WS_EX_TOOLWINDOW and clears WS_EX_APPWINDOW',
+    /WS_EX_TOOLWINDOW\) & ~\(LONG\)WS_EX_APPWINDOW/.test(setty));
+  check('a non-tool window clears WS_EX_TOOLWINDOW',
+    /ex & ~\(LONG\)WS_EX_TOOLWINDOW/.test(setty));
+  check('NativeWindow_ctor applies the window type to the OS window',
+    /as_window_set_type\(id, w->type\);/.test(emit));
+  check('runtime routes as_window_set_type to the glue under ASC_USE_WINDOW',
+    /sk_window_set_type\(id, type\);/.test(rt));
+  check('runtime has a no-window stub for as_window_set_type',
+    /static inline void as_window_set_type\(int id, const char\* type\) \{ \(void\)id; \(void\)type; \}/.test(rt));
+
+  // Stage 461: a secondary window's stage design size is AIR's fixed 72x72 (the "72:1"
+  // relationship), not the creation size; and the Flash default align "" centers content.
+  check('NativeWindow design size is AIR\'s fixed 72x72, not the creation size',
+    /w->design_w = 72; w->design_h = 72;/.test(emit));
+  check('the default align "" centers the content (remx/remy halved)',
+    /double ox = remx \* 0.5, oy = remy \* 0.5;/.test(emit));
+  check('an explicit StageAlign pins from the top-left baseline ("TL" stays 0,0)',
+    /if \(al != NULL && al\[0\] != 0\) \{/.test(emit) && /ox = 0.0; oy = 0.0;/.test(emit));
+
+  if (ok > 0) console.log(`[nwwin] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/NativeWindowWin', checkNativeWindowWin);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);
 registerGroup('unit: platform/CapabilitiesLocale', checkCapabilitiesLocale);

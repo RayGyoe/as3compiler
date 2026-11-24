@@ -1148,6 +1148,12 @@ AS_VIDEO_DECODE=hw AS_VIDEO_STATS=1 ./temp/probe-4k.exe # 硬解
 `sk_video_d3d_image()` / `sk_video_d3d_stats()` / `sk_video_d3d_forget()` 三个整数/指针接口，
 继续保持「FFmpeg 的 C 接缝里不认识 Skia」这条规矩。
 
+**构建注入（阶段四百六十二）**：`video_glue.c` 对 `sk_video_d3d_*` 的引用只在 `ASC_RENDER_D3D` 下编译，
+WGL（`gl`）后端把它们守卫掉、永远不需要这个文件。因此 video 探针在 Windows 上检测到 `ASC_RENDER_D3D`
+时**自动把 `video_d3d.cc` 加进 sources**（与 macOS 自动注入 `video_metal.mm` 对称），D3D12 + 视频的应用
+manifest 不必再手列它。此前只有 macOS 那条注入，Windows D3D12 + 视频会在链接期缺这四个符号
+（实测：真会议应用从 `gl` 切 `d3d12` 时暴露）。
+
 1. **解码切片 → 自己的共享 staging（D3D11，`CopySubresourceRegion`）**。
    不直接开放解码纹理是有原因的：FFmpeg 的 `hwcontext_d3d11va.c` 用 `D3D11_BIND_DECODER` 分配
    整块 Texture2DArray，**不带共享标志**，DXVA 也不保证解码面能共享。所以拷到一张同格式（NV12/P010）的

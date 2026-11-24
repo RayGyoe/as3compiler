@@ -332,6 +332,13 @@ function checkVideoSurface(): string[] {
     manifestWithSeam.includes('"${mac:../../vendor/video_metal.mm}"') &&
     manifestWithSeam.includes('"${mac:ASC_RENDER_METAL=1}"') &&
     manifestWithSeam.includes('"${mac:../../vendor/metal_glue.mm}"'));
+  // Windows D3D12 mirrors the macOS injection: video_glue.c references sk_video_d3d_*
+  // under ASC_RENDER_D3D (the WGL/gl backend compiles those references out), so a D3D12 +
+  // video link needs video_d3d.cc. Without the auto-injection such a build fails to link
+  // on exactly those four symbols (measured: the real meeting app switched gl -> d3d12).
+  check('the Windows D3D12 video seam is auto-injected like the macOS one',
+    indexSrc.includes("const hasD3D = cfg.defines.some((d) => d.split('=')[0].trim() === 'ASC_RENDER_D3D');") &&
+    indexSrc.includes("cfg.sources.push(resolve(vendorDir, 'video_d3d.cc'));"));
 
   // ---- native HDR presentation (video.md §16.12) ----
   // An scRGB swapchain is a promise the GPU can keep and the pixels still be wrong: the

@@ -7631,11 +7631,21 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     // than in as_window_create's signature because the flag belongs to a window the
     // program makes, exactly like alwaysInFront.
     this.line('if (w->transparent) as_window_set_transparent(id, 1);');
+    // NativeWindowInitOptions.type reaches the OS window too: UTILITY/LIGHTWEIGHT are
+    // tool windows (no taskbar button), NORMAL appears in the taskbar (stage 460).
+    this.line('as_window_set_type(id, w->type);');
     this.line('w->resizable = resizable;');
     this.line('w->maximizable = (options != NULL && options->maximizable) ? 1 : 0;');
     this.line('w->minimizable = (options != NULL && options->minimizable) ? 1 : 0;');
     this.line('w->display_state = (char*)"normal";');
-    this.line('w->design_w = (int)cw; w->design_h = (int)ch;');
+    // AIR fixes a secondary window's stage design size at 72x72 -- the "72:1" relationship
+    // the Adobe dev guide describes ("AIR chooses an arbitrary 72:1 relationship between
+    // window size and scale factor"): a 72x72 window draws a 10x10 rect at 10x10, a 144x144
+    // window scales it to 20x20. It is NOT the window's creation size nor the main SWF's
+    // design size (adl temp/nwsize: stageWidth stays 72 under showAll regardless of bounds
+    // or the [SWF] metadata). showAll/exactFit/noBorder scale against this 72x72; noScale
+    // ignores it and uses the client size. The initial window keeps its descriptor design.
+    this.line('w->design_w = 72; w->design_h = 72;');
     this.line('w->lw = (int)cw; w->lh = (int)ch;');
     // A secondary window gets its OWN Stage. adl gives that stage scaleMode
     // "showAll" and align "" — different from the compiler's initial-window
@@ -7894,9 +7904,16 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('ASCWin* w = ASC_w(id);');
     this.line('if (w == NULL) return;');
     this.line('if (screen == NULL) as_throw(Error_new((char*)"TypeError: Error #1009: Cannot access a property or method of a null object reference.", 1009));');
-    this.line('Rectangle* vb = Screen_get_visibleBounds((void*)screen);');
-    this.line('if (vb == NULL) return;');
-    this.line('as_window_set_bounds(id, (int)vb->x, (int)vb->y, (int)vb->width, (int)vb->height);');
+    // Window placement is written in SDL's LOGICAL space, so this reads a logical
+    // seam, NOT Screen.visibleBounds (which is AIR-space: physical pixels on Windows
+    // since stage 463). Feeding the physical rectangle here would size the frame
+    // 1.5x too big on a scaled desktop. adl 51.4.1 diverges by platform (stage 466):
+    // Windows lands at the DIP FULL display 0,0 2560x1707 (taskbar included,
+    // temp/screenpx/adl), macOS at visibleBounds (temp/nwmac/rts-out.txt). The
+    // as_display_resize_bounds seam reproduces each measured behaviour.
+    this.line('int ux = 0, uy = 0, uw = 0, uh = 0;');
+    this.line('as_display_resize_bounds(screen->_display_index, &ux, &uy, &uw, &uh);');
+    this.line('as_window_set_bounds(id, ux, uy, uw, uh);');
     // Same accounting as write_bounds: resizeToScreen is the app moving the window.
     this.line('{ ASCWin* rw = ASC_w(id); if (rw != NULL) rw->prog_writes++; }');
     this.indent--;
@@ -33581,13 +33598,17 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('else if (strcmp(sm, "exactFit") == 0) { cx = rx; cy = ry; }');
     this.indent--;
     this.line('}');
-    // Leftover space is distributed by Stage.align; "TL" (the AIR default) pins the
-    // content to the top-left corner, which is what NO_SCALE looks like in adl.
+    // Leftover space is distributed by Stage.align. The Flash default align "" (empty,
+    // which a NativeWindow's stage uses) CENTERS the content; an explicit StageAlign
+    // constant pins from the top-left baseline ("TL" -> 0,0). adl measured: a showAll
+    // NativeWindow (design 72x72) in 380x70 bounds centers its 70x70 content at x=155
+    // (temp/nwsize). The initial window uses "TL", so it stays top-left, unchanged.
     this.line('double remx = (double)lw - cx * (double)dw, remy = (double)lh - cy * (double)dh;');
-    this.line('double ox = 0.0, oy = 0.0;');
+    this.line('double ox = remx * 0.5, oy = remy * 0.5;');
     this.line('const char* al = st->align;');
-    this.line('if (al != NULL) {');
+    this.line('if (al != NULL && al[0] != 0) {');
     this.indent++;
+    this.line('ox = 0.0; oy = 0.0;');
     this.line('if (strcmp(al, "B") == 0 || strcmp(al, "BL") == 0 || strcmp(al, "BR") == 0) oy = remy;');
     this.line('else if (strcmp(al, "L") == 0 || strcmp(al, "R") == 0) oy = remy * 0.5;');
     this.line('if (strcmp(al, "R") == 0 || strcmp(al, "TR") == 0 || strcmp(al, "BR") == 0) ox = remx;');

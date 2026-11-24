@@ -1633,7 +1633,12 @@ Retina 高清渲染（`ASC_DISPLAY_HIGH=1`）：
   重建物理像素 surface 并重渲染（surface 所有权在 AS3 侧，回调返回新指针）。`scaleMode`/`align` 落地为
   真实画布变换（`noScale` 内容固定、`showAll`/`noBorder` 等比、`exactFit` 非等比；align 八值分配剩余
   空间），`noScale` 下 `stageWidth/Height` 跟随真实窗口尺寸并派发 `Event.RESIZE`。鼠标/滚轮坐标需
-  反变换 `(x-ox)/cx` 才能在缩放/偏移后正确命中。
+  反变换 `(x-ox)/cx` 才能在缩放/偏移后正确命中。**内容缩放的设计尺寸（`design_w/h`，阶段四百六十一）**：
+  初始窗取描述符尺寸，二级 `NativeWindow` 恒为 **AIR 固定的 72×72**（Adobe dev guide 的「72:1」关系：
+  72×72 窗里 10×10 矩形画 10×10，144×144 窗里缩成 20×20；与创建尺寸/SWF 元数据均无关，adl `temp/nwsize`
+  实测）；`showAll`/`noBorder`/`exactFit` 相对它缩放，`noScale` 不缩放但仍按 align 定位。**默认 `align=""`
+  （空，二级窗所用）居中内容**，显式 `StageAlign` 八值从左上基线分配剩余空间（`TL`→0,0；初始窗用 `TL`，
+  不受影响）。四 scaleMode 渲染几何与 adl 逐像素对齐（`temp/nwsize` 红/绿标记 bbox）。
 - **鼠标滚轮（阶段四十五）**：`SDL_MOUSEWHEEL` 经 `on_wheel` 转发（`SDL_GetMouseState` 取坐标，因滚轮
   事件不带位置），`ASC_window_on_wheel` 路由到 `Stage_dispatchWheel`：命中 TextField 时自动滚动
   （adl 实测：1 delta = 1 行、`scrollV -= delta`、钳制 `[1,maxScrollV]`），再派发冒泡 `MouseEvent.MOUSE_WHEEL`。

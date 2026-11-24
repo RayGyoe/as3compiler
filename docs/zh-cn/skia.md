@@ -1124,6 +1124,43 @@ seam 后端中立：`window_glue` 导出 `sk_window_is_transparent` / `sk_window
 不透明仍 GetBuffer/Present、手动轮转、flush 跳过 Present、读回 COPY_SOURCE + R/B 换序 + ULW 交接、事件等待、HDR 闸门）。
 `unit: platform/BackendParity` 的 native-only 豁免表登记这两个新 seam（属 GPU 胶水内部，生成 C 从不引用，web 不链接 d3d_glue）。
 
+**阶段四百六十补：NativeWindow 透明 GPU 窗 + UTILITY 工具窗。** 上面 `layered` 在 `sk_gpu_init` 置位，
+只覆盖**描述符初始窗**（透明标志在创建前已知）。运行期 `new NativeWindow(NativeWindowInitOptions)` 的
+`transparent` 写在窗口（及其 GPU bind）**之后**（经 `sk_window_set_transparent`），init 时 `layered` 还是 0
+⇒ 这些窗走不透明交换链路径：compose 清的 alpha-0 被 flip-model 画成**黑**，且 `WS_EX_LAYERED` 已置却无 ULW
+⇒ DWM 任务栏缩略图**空白**（真实应用 talkmed-meeting 的 Control/Camera 窗在深色会议背景上看似「不可见」）。
+修法镜像 macOS 的 after-init `sk_mac_apply_gpu_transparent`：`window_glue` 的 `sk_window_set_transparent`
+对 GPU 窗调新增 seam `sk_gpu_set_transparent`（`d3d_glue`）——先 `d3d_drain_window` 排空 GPU，置 `layered`
+（HDR 窗除外）再 `d3d_setup_surfaces` 重建表面；fence 账本独立于表面、排空后仍有效。探针实证：NativeWindow
+透明 GPU 窗红/绿带周围透出桌面（不再黑底）。
+
+同阶段另修 **UTILITY 窗误进任务栏**：AIR 把 `NativeWindowType.UTILITY`/`LIGHTWEIGHT` 映射为工具窗
+（`WS_EX_TOOLWINDOW`，无任务栏按钮、无 alt-tab），`NORMAL` 才进任务栏。SDL 建的窗都是普通顶层窗（恒有任务栏
+按钮），故新增 `sk_window_set_type`（`NativeWindow_ctor` 经 `as_window_set_type` 调用）：utility/lightweight
+置 `WS_EX_TOOLWINDOW` 清 `WS_EX_APPWINDOW`，其余清 `WS_EX_TOOLWINDOW`。枚举窗口扩展样式实证：UTILITY 窗
+`ex=0x80090`（TOOLWINDOW+LAYERED）、NORMAL 窗 `ex=0x80010`（仅 LAYERED）。web 侧 `sk_window_set_type` 为空桩
+（浏览器窗无任务栏按钮可言）。钉 `unit: platform/NativeWindowWin` **13**。
+
+**阶段四百六十一已修**（见 [`compile.md`](compile.md) §7 窗口缩放控制）：NativeWindow 的 stage 设计尺寸恒为
+AIR 固定的 **72×72**（Adobe dev guide 的「72:1」关系，非创建尺寸、亦非 SWF 头尺寸），且默认 `align=""` **居中**
+内容（显式 `StageAlign` 从左上基线）；showAll/noScale/exactFit/noBorder 四模式渲染几何与 adl 逐像素对齐。
+
+**阶段四百六十七补：WGL/GL 后端透明窗。** 上面两阶段的离屏/ULW 修复只落在 D3D12；GL（WGL）后端此前
+完全没有透明支持。根因同类但表现不同：GL 没有 flip-model 交换链，可分层窗走 `SwapBuffers` 时 DWM **同样不
+逐像素合成 alpha**——实测（`temp/gltrans` 300×200）alpha-0 的未画区显**黑**、50% 蓝带显**不透明**（而非 D3D12
+那种「ULW 被 DComp 视觉盖住」）。修法同构但走 Skia 可携路径：`gl_build_surface` 透明分支用
+`SkSurfaces::RenderTarget` 建**纹理-backed 离屏面**（`kRGBA_8888`/`kPremul`/`kBottomLeft`）而非 FBO 0——Skia 自管
+FBO，故无需裸调 `glGenFramebuffers`/`wglGetProcAddress`（GL 1.1 头 + opengl32.dll 不导出 FBO 入口，这是 Win7
+级机器的底线）；`gl_present_transparent` 用 `SkSurface::readPixels` 读回成 **BGRA 预乘**（readPixels 一并做
+GPU→CPU 读回 + RGBA→BGRA 换序 + 原点翻转，无需手写行循环），交同一套 `sk_window_present_layered_pixels`；
+`sk_gpu_flush` 透明分支走它并**跳过 SwapBuffers**。after-init 路线由 GL 版 `sk_gpu_set_transparent` 重建 surface，
+`window_glue` 的调用门控由 `ASC_RENDER_D3D` 扩为 `ASC_RENDER_D3D || ASC_RENDER_GL`。实测三路径：描述符透明
+（init）三带 alpha 与 D3D12/adl 同形（蓝带随背景混合：黑底 (0,0,127)、终端底 (78,84,212)）；after-init 透明
+（UTILITY 红 + NORMAL 绿）两窗均渲染；**不透明 GL（FBO 0 + SwapBuffers）零回归**。钉
+`unit: platform/TransparentGpuGl` **11**（seam extern、`layered` 置位、离屏 RenderTarget、不透明仍 FBO 0、
+flush 跳过 SwapBuffers、readPixels BGRA 预乘 + ULW 交接、`sk_gpu_set_transparent`、双后端门控）。GL 无 HDR
+路径，故无 D3D 那条 transparent+HDR 闸门。
+
 ## 7. 多目标：native 与 wasm
 
 - **native**：Skia 静态链接 `libskia.a`（CPU raster），产出 Mach-O/ELF/PE。

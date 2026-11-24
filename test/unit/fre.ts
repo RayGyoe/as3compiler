@@ -36,6 +36,7 @@ import { parse } from '../../src/parser.ts';
 import { generateC } from '../../src/codegen.ts';
 import { registerGroup, root, readNorm } from '../harness.ts';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 
 // One top-level C function: from its signature to the first closing brace that
 // sits at column 0 (emitted functions are not indented).
@@ -106,7 +107,7 @@ registerGroup('unit: fre/Utf8LengthContract', checkFreUtf8Length);
 // COMPILE, i.e. outside the Windows branch of every enclosing `#if defined(_WIN32)`.
 // A name list is only as complete as the day it was written; the branch test stays
 // right the next time a Win32 API is reached for.
-const WIN32_IDENT = /\b(HMODULE|HINSTANCE|DWORD|HANDLE|LPSTR|WINAPI|__declspec|GetModuleFileNameA|LoadLibraryA|GetProcAddress|GetLastError|CreateThread|OpenThread|WaitForSingleObject|CloseHandle|InitializeCriticalSection|EnterCriticalSection|TryEnterCriticalSection|LeaveCriticalSection|DeleteCriticalSection|GetCurrentThreadId|Sleep)\b/;
+const WIN32_IDENT = /\b(HMODULE|HINSTANCE|DWORD|HANDLE|LPSTR|WINAPI|__declspec|GetModuleFileNameA|LoadLibraryA|LoadLibraryExA|GetProcAddress|GetLastError|CreateThread|OpenThread|WaitForSingleObject|CloseHandle|InitializeCriticalSection|EnterCriticalSection|TryEnterCriticalSection|LeaveCriticalSection|DeleteCriticalSection|GetCurrentThreadId|Sleep)\b/;
 
 // The lines of `c` that macOS compiles AND that match `pattern`. Frames are the
 // enclosing `#if`s; `win` marks a frame whose test mentions _WIN32 and `negated`
@@ -497,3 +498,35 @@ function checkFreStatusQueue(): string[] {
   return failed;
 }
 registerGroup('unit: fre/StatusQueue', checkFreStatusQueue);
+
+// --- ANE 附属 DLL 的搜索路径（阶段四百六十四） ------------------------------
+//
+// Win32 默认搜索序不含「全路径加载的 DLL 自身目录」，ANE 的附属 DLL（夹具
+// ProbeHelper.dll 在 ProbeANE.dll 旁边）会以 126 失败——实测复现 temp/ane-dep-before。
+// 修法是 LoadLibraryExA + LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | DEFAULT_DIRS，且路径
+// 必须先归一化成纯反斜杠：该 flag 的 load-directory 推导不容忍正斜杠，混合分隔符
+// 路径会加错目录（temp/screenpx/dllprobe2：同一文件纯反斜杠能载、混合 126）。
+// 端到端由 examples/ane/driver.as 的 helperValue 断言守（73 项之一）。
+function checkFreDllSearch(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [fredll] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [fredll] ${label}`); }
+  };
+  const c = FRE_BODY;
+  check('the Windows loader searches the DLL\'s own directory for sibling dependencies',
+    c.includes('LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS'));
+  check('...via LoadLibraryExA, with the pre-KB2533623 fallback to plain LoadLibraryA',
+    /LoadLibraryExA\(norm, NULL,/.test(c)
+    && /GetLastError\(\) == 87\) lib = LoadLibraryA\(norm\);/.test(c));
+  check('the path is normalized to backslashes BEFORE the flagged load (mixed separators add the wrong directory)',
+    /norm\[i\] = \(path\[i\] == '\/'\) \? '\\\\' : path\[i\];/.test(c)
+    && c.indexOf('norm[n] = 0;') < c.indexOf('LoadLibraryExA(norm'));
+  check('the fixture really carries a sibling import (the reproduction cannot silently disappear)',
+    readFileSync(join(root, 'examples', 'ane', 'ProbeANE.c'), 'utf8').includes('__declspec(dllimport) int ProbeHelperValue(void);')
+    && readFileSync(join(root, 'examples', 'ane', 'build-ane.bat'), 'utf8').includes('DLL Name: ProbeHelper.dll'));
+  console.log(`     [fredll] ${ok} check(s) passed`);
+  return bad;
+}
+registerGroup('unit: fre/DllSearchPath', checkFreDllSearch);

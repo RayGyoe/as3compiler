@@ -928,6 +928,29 @@ int sk_gpu_init(int win_id, void* native_handle) {
   return 1;
 }
 
+// A NativeWindow writes NativeWindowInitOptions.transparent AFTER the window (and its
+// GPU bind) already exists, through sk_window_set_transparent -- so sk_gpu_init built
+// the surfaces assuming the opaque route (layered was still 0 then). Switch the route
+// and rebuild the surfaces to match (stage 460). Mirrors macOS's after-init
+// sk_mac_apply_gpu_transparent. Normally called right after creation, before any
+// frame, so the drain is immediate; the fence ledger is independent of the surfaces
+// and stays valid once the drain has completed every signalled value.
+void sk_gpu_set_transparent(int win_id, int on) {
+  D3DWin* w = d3d_slot(win_id);
+  if (w == nullptr || w->swapchain.get() == nullptr) return;
+  const int want = (on && !w->hdr) ? 1 : 0;
+  if (w->layered == want) return;
+  if (d3d_device_gone()) return;
+  if (!d3d_drain_window(w)) return;
+  w->layered = want;
+  if (!d3d_setup_surfaces(w)) {
+    // Rebuild failed (a device loss marks itself); fall back to the opaque route so
+    // the window still presents something rather than drawing into a dead surface.
+    w->layered = 0;
+    d3d_setup_surfaces(w);
+  }
+}
+
 // Release one window's GPU state. The shared backend goes when the last GPU
 // window does — after an explicit CPU sync, so no frame is still in flight against
 // a device we are about to drop.
