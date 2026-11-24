@@ -1126,6 +1126,18 @@ Merge order: default config → manifest top level → manifest `targets.<final 
 > The decision is printed during the build: `+ flash.text: text engine linked (...)` or
 > `- flash.text: no text in this program -- ...`.
 
+> **A host template and `--air-app` can collide on the file name** (stage four-hundred-fifty-seven):
+> `--air-app` writes its generated manifest to `<filename>.build.json` beside the descriptor. If the
+> project also hand-maintains a **same-named** host template (`${host}` / `${lib:}` / `${win:}` /
+> `${mac:}`; the placeholder table lives in the Chinese edition, §4), every `--air-app` run overwrites
+> it with a **single-host** version — `examples/yuv420-gpu/` was clobbered twice that way, and because
+> its regression runs `--air-app`, once per full-suite run. Two ways out: ① **gitignore the generated
+> file** (what `examples/air-native/air-native.build.json` does); ② when the template is a **tracked
+> artifact**, copy the descriptor + `src/` into scratch and run `--air-app` there (what the regression
+> now does, pinned by `unit: build/Yuv420HostManifest`). Note that `build/ExampleManifestHosts`
+> **cannot** catch this regression: it deliberately **skips** manifests that spell a platform key
+> literally, so "must not spell a platform key" needs its own pin.
+
 ### 4.1 Per-target layering (`targets`)
 
 Top-level fields are the **shared default**; the `targets.<target>` block takes effect only for the

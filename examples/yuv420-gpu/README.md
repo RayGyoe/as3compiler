@@ -12,9 +12,26 @@ node src/index.ts --air-app examples/yuv420-gpu/app.xml --main-class Main \
   --features yuv420 --target native -o temp/yuv420-gpu
 ```
 
-要求 macOS + Metal（`app.xml` 的 `<renderMode>direct</renderMode>`）+ vendor/skia、sdl2。
-`--features yuv420` 映射 `-D ASC_USE_YUV420=1`，与 `renderMode=direct` 映射的
-`-D ASC_RENDER_METAL=1` 叠加，`as_skia_gr_context()` 走 `sk_metal_get_context()`。
+要求 GPU 直渲（`app.xml` 的 `<renderMode>direct</renderMode>`）+ vendor/skia、sdl2：macOS 走 Metal、
+Windows 走 D3D12。`--features yuv420` 映射 `-D ASC_USE_YUV420=1`，与 `renderMode=direct` 映射的
+`-D ASC_RENDER_METAL=1` / `-D ASC_RENDER_D3D=1` 叠加，`as_skia_gr_context()` 走对应后端的 context。
+
+本目录另带一份**双平台宿主模板** [`yuv420-gpu.build.json`](yuv420-gpu.build.json)
+（`${mac:}` / `${win:}` / `${host}` / `${lib:}`），给不走 `--air-app` 的直接编译用：
+
+```sh
+node src/index.ts examples/yuv420-gpu/src/Main.as \
+  --manifest examples/yuv420-gpu/yuv420-gpu.build.json -o temp/yuv420-gpu
+```
+
+这条路只做**编译 + 链接**校验：`Main.as` 直编时没有 `--air-app` 的引导代码，产物不会
+实例化文档类（跑起来无输出、退 0）。要跑验色请用上面的 `--air-app` 命令。
+
+> **坑：`--air-app` 会回写同名清单**。它把生成的清单写到描述符旁的 `yuv420-gpu.build.json`，
+> 也就是上面那份模板的名字——所以在原地跑 `--air-app` 会把双平台模板冲成**单宿主**版
+> （已发生过两次，阶段四百五十七修正）。回归现在把描述符 + `src/` 拷到
+> `temp/regress-out/yuv420-gpu-fixture/` 再跑，生成物落在那里；手工跑完若发现
+> `git status` 里这份模板被改，`git checkout` 它即可。钉子在 `unit: build/Yuv420HostManifest`。
 
 ## 运行与判定
 

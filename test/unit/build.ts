@@ -3786,6 +3786,74 @@ function checkExampleManifestHosts(): string[] {
 
 registerGroup('unit: build/ExampleManifestHosts', checkExampleManifestHosts);
 
+// yuv420-gpu's tracked manifest is a HOST TEMPLATE, and it has been clobbered into
+// a single-host file twice (f2528c8 restored it, 66d5573 restored it again -- and
+// 66d5573's own committed content was Windows-only despite its message). Measured
+// on macOS: `--manifest examples/yuv420-gpu/yuv420-gpu.build.json` died at
+// `SDL_syswm.h:54: fatal error: 'windows.h' file not found`. The generic
+// ExampleManifestHosts sweep cannot catch that, because a manifest spelling a
+// literal platform key is SKIPPED by design -- so the guard has to be here, by name.
+function checkYuv420HostManifest(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [yuvhost] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [yuvhost] ${label}`); }
+  };
+  const rel = join('examples', 'yuv420-gpu', 'yuv420-gpu.build.json');
+  const file = join(root, rel);
+  const raw = readFileSync(file, 'utf8');
+  check('the tracked manifest spells NO literal platform key (a single-host rewrite goes red here)',
+    !/(macos-arm64|windows-x64|windows-x86)/.test(raw));
+
+  const expand = (platform: string): BuildConfig => {
+    const real = process.platform;
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    try { return applyManifest(defaultBuildConfig(), loadManifest(file), file); }
+    finally { Object.defineProperty(process, 'platform', { value: real, configurable: true }); }
+  };
+  const mac = expand('darwin');
+  const win = expand('win32');
+  const has = (c: BuildConfig, s: string): boolean => c.sources.some((p) => p.endsWith(s));
+
+  check('macOS expands to the Metal glue and drops the D3D one',
+    has(mac, 'metal_glue.mm') && !has(mac, 'd3d_glue.cc'));
+  check('Windows expands to the D3D glue and drops the Metal one',
+    has(win, 'd3d_glue.cc') && !has(win, 'metal_glue.mm'));
+  check('macOS names its own vendor tree and the Metal define',
+    mac.linkPaths.some((p) => p.endsWith(join('lib', 'macos-arm64')))
+    && mac.defines.includes('ASC_RENDER_METAL=1') && !mac.defines.includes('ASC_RENDER_D3D=1'));
+  check('Windows names its own vendor tree and the D3D define',
+    win.linkPaths.some((p) => p.endsWith(join('lib', 'windows-x64')))
+    && win.defines.includes('ASC_RENDER_D3D=1') && !win.defines.includes('ASC_RENDER_METAL=1'));
+  check('the Windows GPU link set is complete (Skia Ganesh D3D12 + its allocator archive)',
+    ['d3d12', 'dxgi', 'd3dcompiler', 'd3d12allocator'].every((l) => win.linkLibs.includes(l)));
+  check('macOS links objc and none of the Windows import libraries',
+    mac.linkLibs.includes('objc') && !mac.linkLibs.some((l) => l.startsWith('d3d')));
+  check('Windows carries the curl tree (standard zlib header + z.lib), macOS does not',
+    win.includePaths.some((p) => p.endsWith(join('curl', 'include')))
+    && !mac.includePaths.some((p) => p.endsWith(join('curl', 'include'))));
+  check('the four Skia image archives take the host prefix (libpng vs png)',
+    win.linkLibs.includes('libpng') && mac.linkLibs.includes('png') && !mac.linkLibs.includes('libpng'));
+  // airManifest pushes d3d12/d3dcompiler twice on Windows (base Skia set + the GPU
+  // set); the template lists each once. Same link line, no duplicate entries.
+  check('neither host expands to a duplicate link library',
+    new Set(win.linkLibs).size === win.linkLibs.length && new Set(mac.linkLibs).size === mac.linkLibs.length);
+  check('the yuv420-specific fields survive the templating',
+    mac.features.includes('yuv420') && win.features.includes('yuv420')
+    && mac.bundleId === 'demo.as3.yuv420gpu' && mac.version === '1.0');
+
+  // The other half of the defect: --air-app WRITES <filename>.build.json beside the
+  // descriptor, so running the regression in place undid the template every time.
+  const ex = readFileSync(join(root, 'test', 'examples.ts'), 'utf8');
+  check('the example regression runs --air-app on a scratch COPY, never on the fixture',
+    /const fx = join\(SCRATCH, 'yuv420-gpu-fixture'\)[\s\S]*?cpSync\(xml, join\(fx, 'app\.xml'\)\)[\s\S]*?'--air-app', join\(fx, 'app\.xml'\)/.test(ex));
+  if (ok > 0) console.log(`[yuvhost] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: build/Yuv420HostManifest', checkYuv420HostManifest);
+
 // `deploySkiaIcuData` copies Skia's ICU data beside the exe, and several builds share
 // one output directory in practice (`node test.ts` links every Skia example into the
 // same temp/regress-out/ under a 6-wide pool). The copy therefore has to survive a

@@ -23700,6 +23700,7 @@ plist 是 **UTF-8 XML**，中文版权乃至真描述符里夹的不可见 U+200
 宿主模板冲掉（本轮在 mac 上就把它写回了 mac 专用版，已 `git checkout` 复原，证据存
 `temp/macalign/yuv420-gpu.build.json.mac-clobbered`）。`s3d-multiwindow` 之所以稳定，是因为它的
 回归走 `--manifest`。**修法需同时解决这两层**（宿主模板 + 回归不得回写 fixtures），否则修了也留不住。
+→ **已在阶段四百五十七修完**（见下）。
 
 **一处差点误报**：`NativeWindow.transparent` 是**只读**属性（`emit.ts:7800` 只发 getter），
 运行期「关回不透明」这条路 AS3 根本走不到 ⇒ Windows 那句「关掉时摘除 `WS_EX_LAYERED`」是防御性
@@ -23708,6 +23709,53 @@ plist 是 **UTF-8 XML**，中文版权乃至真描述符里夹的不可见 U+200
 **经验**：① 「对端修了 N 个」不等于「本端坏了 N 个」——先按**根因是否在本端存在**分类，再谈对齐；
 ② 跨端字段要查**消费端**而不是解析端：`legal-copyright` 解析了三个月，mac 侧一直是空转；
 ③ 同一份产物的两条生成路径（脚本 / IDE）必须共用序列化原语，否则转义规则一定漂移。
+
+### 阶段四百五十七：yuv420-gpu 宿主模板真的双平台 + 回归不再回写 fixtures（v0.4.432）✅
+
+接阶段四百五十六收尾时发现的那条。两个缺陷叠在一起，所以之前修了两次都没留住：
+
+1. **提交内容是 Windows 专用**（`d3d_glue.cc`、写死 `windows-x64`、`frameworks: []`），与 `66d5573`
+   自己的标题「清单修回双平台」不符。mac 上 `--manifest` 构建实测挂在
+   `SDL_syswm.h:54: fatal error: 'windows.h' file not found`。
+2. **名字撞车**：`--air-app` 把生成的清单写到描述符旁的 `<filename>.build.json`——正是这份模板
+   的名字，而该示例的回归走 `--air-app` ⇒ **每跑一次全量就冲一次**。对比：
+   `examples/air-native/air-native.build.json` 入了 `.gitignore`（`.gitignore:107`），所以不受害。
+
+**改动**：
+
+- 清单改成宿主模板（照 `examples/s3d-multiwindow.build.json` 的现行形态）：
+  `${mac:…metal_glue.mm}` / `${win:…d3d_glue.cc}`、`sdl2/include/${host}`、`skia/lib/${host}`、
+  `${lib:png|jpeg|webp|webp_sse41}`、`${mac:objc}`、`${win:…}` 系统导入库与 curl 树、
+  `${mac:ASC_RENDER_METAL=1}` / `${win:ASC_RENDER_D3D=1}`；yuv420 专属字段（`features`、
+  `bundle-id`、`display-name`、`version`）保留。
+- **去重**：`airManifest` 在 Windows 上把 `d3d12`/`d3dcompiler` push 两次（基础 Skia 集
+  `air-app.ts:764` + GPU 集 `:833`），模板每个只列一次——链接行等价，不再带重复项。
+- **回归不再写 fixtures**：`test/examples.ts` 把 `app.xml` + `src/` 拷到
+  `temp/regress-out/yuv420-gpu-fixture/` 再跑 `--air-app`，生成物落在 scratch。
+
+**验收（macOS arm64 实测）**：
+
+- `--manifest` 直接编译 `src/Main.as`：**链接成功**（Metal / macos-arm64 / 正确的 `-l` 集）。
+- **Windows 侧用伪宿主展开对账**（`process.platform='win32'`，`architecture=64` ⇒ `windows-x64`）：
+  展开后的 `sources` / `include-paths` / `link-paths` / `defines` / `link-libs` 与**真实 airManifest 的
+  Windows 输出**（= 上一版提交内容）**集合逐项相同**；旧版带 2 个重复 `-l`，新版 0 个。
+  （没有 Windows 机器时，这是能拿到的最强证据；展开逻辑与真实构建同一份代码。）
+- **跑起来的验色**：`--air-app`（scratch 副本）构建后运行，`yuv420-gpu: OK`、六个 BT.601
+  采样全 PASS、**EXIT=0**，与 README 记录的输出一致。
+- 回归跑完 `git status` 里 **fixtures 不再被改**；`unit: build/Yuv420HostManifest` **12 条**全绿。
+
+**为何需要单独一条钉子**：通用的 `build/ExampleManifestHosts` **接不住**这类回退——它按设计
+**跳过**写死平台键的清单（只计数报告）。所以新组第一条就是「不得写死平台键」，再加两端展开、
+D3D 库集完整性、无重复 `-l`、以及「回归走 scratch 副本」的源级断言。
+
+**顺手记下的一条现有行为（本轮不改）**：`--air-app` 同时给 `--manifest` 时，清单的 `sources`
+是**追加**而非替换，于是三份 glue 被编两次、实测 `ld: 175 duplicate symbols`。不影响两条正路
+（单用 `--air-app` 或单用 `--manifest`），记在这里以免下次误诊。另：`--manifest` 直编 `Main.as`
+的产物**不会实例化文档类**（没有 `--air-app` 的引导代码），跑起来无输出、退 0——所以那条路
+只能做编译+链接校验，验色必须走 `--air-app`。
+
+**文档**：`docs/{zh-cn,en}/compile.md` §4 加「宿主模板与 `--air-app` 撞名」的告知与两种处置；
+`examples/yuv420-gpu/README.md` 补上 `--manifest` 路线、它只做编译+链接校验的原因，以及回写坑。
 
 ### 阶段四百五十五：int/uint 算术 double 计算 + 落槽回绕——反向双值发射，保整型热点零回归（v0.4.429 → v0.4.430）✅ 已完成
 

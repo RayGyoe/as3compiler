@@ -1083,6 +1083,15 @@ JSON 文件，对标 TypePHP 的 `project.yml`，用于固定可复用、可版�
 
 > **不是每个宿主都有预编译树**：Linux 宿主上 `${host}` 直接报错，这是刻意的——`vendor/` 只有 macos-arm64 / windows-x64 / windows-x86 / wasm 四套，静默退回 `windows-x64` 会去链一套 COFF 归档并报一堆无关的符号错误。
 
+> **宿主模板与 `--air-app` 会撞名**（阶段四百五十七）：`--air-app` 会把生成的清单写到
+> 描述符旁的 `<filename>.build.json`。若项目又手维护一份**同名**的宿主模板，那么每一次
+> `--air-app` 都会把它冲成**单宿主**版——`examples/yuv420-gpu/` 就这么被冲过两次，而它的
+> 回归又走 `--air-app`，于是每跑一次全量就冲一次。两种处置：① 生成物**入 `.gitignore`**
+> （`examples/air-native/air-native.build.json` 就是这么做的）；② 模板是**跟踪产物**时，
+> 把描述符 + `src/` 拷到 scratch 再跑 `--air-app`（回归现在这么做，钉在
+> `unit: build/Yuv420HostManifest`）。注意 `build/ExampleManifestHosts` **接不住**这类回退：
+> 它按设计**跳过**写死平台键的清单，所以“不得写死平台键”必须另钉一条。
+
 ### 4.2 链接时优化与分阶段优化（`lto` / `pgo`）
 
 这两项是**构建层开关，不是语言特性**：前端仍然只把 AS 翻译成可读的 C，一行优化都不手写（§1.1）；

@@ -14,7 +14,7 @@
 // so fanning them out would buy nothing), while these ~190 subprocess units were
 // awaited one at a time.
 import { execFile } from 'node:child_process';
-import { readdirSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, chmodSync } from 'node:fs';
+import { readdirSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, chmodSync, cpSync } from 'node:fs';
 import { availableParallelism } from 'node:os';
 import { join, resolve, relative, dirname, basename } from 'node:path';
 import { promisify } from 'node:util';
@@ -890,7 +890,21 @@ test('example: yuv420-gpu/ (--air-app + --features yuv420: compile+link only)', 
     t.skip('needs vendor/skia and vendor/sdl2');
     return;
   }
-  await runAsync('node', ['src/index.ts', '--air-app', xml, '--main-class', 'Main',
+  // --air-app REGENERATES <filename>.build.json beside the descriptor, and this
+  // example's tracked manifest is a hand-maintained HOST TEMPLATE (${mac:}/${win:}).
+  // Running it in place therefore overwrote the dual-platform template with a
+  // single-host one on every full-suite run -- measured: a macOS run turned it back
+  // into metal_glue.mm/macos-arm64, and the committed Windows-only version failed a
+  // macOS --manifest build at SDL_syswm.h's `#include <windows.h>` (阶段四百五十七).
+  // air-native sidesteps this by gitignoring its generated manifest; here the file
+  // is a tracked artifact, so the descriptor + sources are copied into scratch and
+  // the generator writes THERE.
+  const fx = join(SCRATCH, 'yuv420-gpu-fixture');
+  rmSync(fx, { recursive: true, force: true });
+  mkdirSync(fx, { recursive: true });
+  cpSync(xml, join(fx, 'app.xml'));
+  cpSync(join(dir, 'yuv420-gpu', 'src'), join(fx, 'src'), { recursive: true });
+  await runAsync('node', ['src/index.ts', '--air-app', join(fx, 'app.xml'), '--main-class', 'Main',
     '--features', 'yuv420',
     '--target', 'native', '-o', scratchOut('yuv420-gpu-app')],
     { cwd: root, timeout: 240_000, maxBuffer: 64 * 1024 * 1024 });
