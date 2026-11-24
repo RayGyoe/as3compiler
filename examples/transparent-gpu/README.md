@@ -1,9 +1,10 @@
-# transparent-gpu — GPU 透明窗（阶段四百五十八）
+# transparent-gpu — GPU 透明窗（阶段四百五十八 macOS / 四百五十九 Windows）
 
-`<transparent>true</transparent>` + `<renderMode>direct</renderMode>`：Metal 后端上让未画区域
-真正透出桌面。**AIR 支持这个组合**（`adl 51.4.1` 实测），所以它是对齐项而不是增强。
+`<transparent>true</transparent>` + `<renderMode>direct</renderMode>`：让未画区域真正透出桌面。
+macOS 走 Metal（§6.19），Windows 走 D3D12 离屏渲染目标 + 读回 → `UpdateLayeredWindow`（§6.20）。
+**AIR 支持这个组合**（`adl 51.4.1` 实测），所以它是对齐项而不是增强。
 
-对应文档：[docs/zh-cn/skia.md](../../docs/zh-cn/skia.md) §6.8。
+对应文档：[docs/zh-cn/skia.md](../../docs/zh-cn/skia.md) §6.19（macOS）/ §6.20（Windows）。
 
 ## 构建
 
@@ -52,3 +53,17 @@ alpha values: [(0, 80000), (127, 80000), (255, 80000)]
 `sk_window_apply_transparent`（否则 `SDL_cocoametalview` 的 `-isOpaque` 没被 swizzle）；
 ② contentView 改成 layer-hosting + 非 opaque 容器层（SDL 的 SDLView 每帧把 backing 刷成不透明黑）。
 四态 A/B 实测：只做其中任何一条都仍是全不透明。
+
+## Windows（D3D12，阶段四百五十九）
+
+Windows 的根因与 macOS 不同：**flip-model 交换链的 `Present` 装的不透明 DirectComposition 子视觉
+会压倒分层窗的 ULW 图像**（实测 ULW 返回 TRUE、读回像素 alpha 正确，屏幕却是不透明黑）；而跳过
+`Present` 又挂设备（`DXGI_ERROR_DEVICE_HUNG`）。修法是透明 GPU 窗渲染到**离屏渲染目标**、交换链闲置
+不 Present，每帧读回成预乘 BGRA 交给 CPU 路径同一套 ULW（`vendor/d3d_glue.cc::d3d_present_transparent`
++ `window_glue.cc::sk_window_present_layered_pixels`）。详见 §6.20。
+
+Windows 抓图不能用 macOS 的 `screencapture -l`（flip-model 交换链内容 GDI 不可截，但修好后走 ULW
+的分层窗**可以** GDI 截）：用固定坐标 `CopyFromScreen`（窗口固定在逻辑 (120,120)，150% DPI 下物理
+(180,180)、450x300）。判定同样是三带 alpha：左红 255 / 中蓝 127（桌面文字透过蓝带可见）/ 右未画 0
+（桌面直接透出）。**不透明 GPU 零回归**（仍走交换链 Present）；**读回开销可忽略**（透明与不透明帧率
+在 24/60 fps 下相等）。钉：`unit: platform/TransparentGpuWin` 16。

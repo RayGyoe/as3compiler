@@ -584,10 +584,14 @@ function checkBackendParity(): string[] {
   const webDefs = seamDefs(join('vendor', 'web_glue.cc'));
   const nativeOnly = [...nativeDefs].filter((n) => !webDefs.has(n));
 
-  // 唯一允许的 native 专属 seam 符号：GPU 窗口后端。它只在 ASC_RENDER_WINGPU 下
-  // 被声明/调用（具体是 Metal 还是 D3D12 由胶水内部选），而 web 从不定义该宏，
-  // 故不需要（也不该有）web 实现。
-  const NATIVE_ONLY = ['sk_window_show_metal', 'sk_window_show_gpu'];
+  // 允许的 native 专属 seam 符号分两类：
+  //  (a) GPU 窗口后端入口（show_metal/show_gpu）：只在 ASC_RENDER_WINGPU 下被生成 C
+  //      声明/调用（Metal 还是 D3D12 由胶水内部选），web 从不定义该宏，故无需 web 实现。
+  //  (b) GPU 胶水内部 seam（is_transparent/present_layered_pixels，阶段四百五十九）：
+  //      由 d3d_glue.cc 跨编译单元调用（透明 GPU 窗读回→ULW），**生成 C 从不引用**，
+  //      web 也从不链接 d3d_glue.cc，故同样无需 web 实现。
+  const NATIVE_ONLY = ['sk_window_show_metal', 'sk_window_show_gpu',
+    'sk_window_is_transparent', 'sk_window_present_layered_pixels'];
   const unlisted = nativeOnly.filter((n) => !NATIVE_ONLY.includes(n));
   check('every native-only sk_window_* seam symbol is a documented GPU-only one',
     unlisted.length === 0);
@@ -1957,6 +1961,95 @@ function checkTransparentGpu(): string[] {
 }
 
 registerGroup('unit: platform/TransparentGpu', checkTransparentGpu);
+
+// Windows GPU transparent window (stage 459). Measured on Windows 10 150% DPI with
+// examples/transparent-gpu (300x200, right third unpainted): a flip-model swapchain
+// Present installs an opaque DirectComposition child visual that OVERRIDES the layered
+// window's UpdateLayeredWindow image -- ULW returned TRUE with correct alpha-0 pixels,
+// yet the screen showed opaque black (the swapchain's visual). Skipping Present entirely
+// hung the device (DXGI_ERROR_DEVICE_HUNG): a flip-model swapchain demands Present. The
+// fix renders a transparent window into OFFSCREEN render targets (the swapchain stays
+// idle, never Presented), reads the frame back to premultiplied BGRA and hands it to
+// window_glue's ULW present. Captured alpha bands match the CPU path / adl oracle:
+// red {255}, 50% blue {127}, unpainted {0}. Readback overhead is negligible (transparent
+// vs opaque GPU fps equal at 24 and 60). These pins keep a later "simplification" from
+// dropping the offscreen route or reintroducing Present on a transparent window.
+function checkTransparentGpuWin(): string[] {
+  let ok = 0;
+  const bad: string[] = [];
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [transgpuwin] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [transgpuwin] ${label}`); }
+  };
+  const read = (rel: string): string =>
+    readFileSync(join(root, 'vendor', rel), 'utf8').replace(/\r\n/g, '\n');
+  const strip = (s: string): string =>
+    s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const win = strip(read('window_glue.cc'));
+  const d3d = strip(read('d3d_glue.cc'));
+  const body = (src: string, sig: string): string => {
+    const i = src.indexOf(sig);
+    if (i < 0) return '';
+    const end = src.indexOf('\n}', i);
+    return end < 0 ? '' : src.slice(i, end);
+  };
+
+  // The backend-neutral seam: window_glue owns the window + ULW present, d3d_glue owns
+  // the readback. No D3D12 state crosses (pixels + window id only).
+  check('window_glue exports a transparent query',
+    /int sk_window_is_transparent\(int id\) \{/.test(win));
+  check('window_glue exports a layered-pixels present',
+    /void sk_window_present_layered_pixels\(int id, void\* pixels, int w, int h, int rowBytes\) \{/.test(win));
+  check('the layered-pixels present routes through the CPU ULW path',
+    /sk_win_present_layered\(c, pixels, w, h, rowBytes\);/.test(
+      body(win, 'void sk_window_present_layered_pixels(int id, void* pixels, int w, int h, int rowBytes) {')));
+  check('d3d_glue declares the seam extern (C linkage)',
+    /extern int sk_window_is_transparent\(int id\);/.test(d3d)
+    && /extern void sk_window_present_layered_pixels\(int id, void\* pixels, int w, int h, int rowBytes\);/.test(d3d));
+
+  // The offscreen route is selected per window from the transparent flag.
+  check('sk_gpu_init marks a transparent window layered',
+    /g_d3d\[win_id\]\.layered = sk_window_is_transparent\(win_id\);/.test(d3d));
+  const setup = body(d3d, 'static int d3d_setup_surfaces(D3DWin* w) {');
+  check('a layered window builds OFFSCREEN render targets, not swapchain back buffers',
+    /if \(w->layered\) \{/.test(setup) && /D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET/.test(setup)
+    && /CreateCommittedResource/.test(setup));
+  check('the offscreen target starts in RENDER_TARGET state (Skia draws into it)',
+    /w->layered \? D3D12_RESOURCE_STATE_RENDER_TARGET/.test(setup));
+  check('an opaque window still takes swapchain back buffers (zero regression)',
+    /ghr = w->swapchain->GetBuffer\(\(UINT\)i, IID_PPV_ARGS\(&w->buffers\[i\]\)\);/.test(setup));
+
+  // No swapchain Present for a transparent window: rotation is manual, present is ULW.
+  const begin = body(d3d, 'void* sk_gpu_begin_frame(int win_id, int width, int height) {');
+  check('a layered window rotates back buffers manually (no GetCurrentBackBufferIndex)',
+    /if \(w->layered\) w->buffer_index = \(w->buffer_index \+ 1\) % SK_D3D_NUM_FRAMES;/.test(begin));
+  const flush = body(d3d, 'void sk_gpu_flush(int win_id) {');
+  check('sk_gpu_flush reads back + presents via ULW and skips Present for a layered window',
+    /if \(w->layered\) \{/.test(flush) && /d3d_present_transparent\(w, win_id\);/.test(flush)
+    && /return;/.test(flush));
+  check('the opaque path still Presents the swapchain (zero regression)',
+    /phr = w->swapchain->Present\(1, 0\);/.test(flush));
+
+  // The readback itself: PRESENT->COPY_SOURCE->PRESENT copy, RGBA->BGRA swizzle, ULW hand-off.
+  const rb = body(d3d, 'static void d3d_present_transparent(D3DWin* w, int win_id) {');
+  check('the readback copies through COPY_SOURCE and restores PRESENT',
+    /D3D12_RESOURCE_STATE_COPY_SOURCE/.test(rb) && /CopyTextureRegion/.test(rb));
+  check('it swaps R/B into the BGRA layout ULW wants (alpha kept premultiplied)',
+    /out\[x \* 4 \+ 0\] = row\[x \* 4 \+ 2\];/.test(rb) && /out\[x \* 4 \+ 3\] = row\[x \* 4 \+ 3\];/.test(rb));
+  check('it hands the BGRA frame to window_glue\'s layered present',
+    /sk_window_present_layered_pixels\(win_id, w->bgra,/.test(rb));
+  check('the readback fence waits on an event (not Sleep polling, which overshoots a tick)',
+    /SetEventOnCompletion\(fv, w->rb_event\)/.test(rb));
+  check('an HDR window is left on the ordinary present (transparent+HDR not measured)',
+    /if \(w->hdr\) return;/.test(rb));
+  check('d3d_create_swapchain drops the offscreen route for an HDR window (so it stays opaque)',
+    /if \(w->hdr\) w->layered = 0;/.test(body(d3d, 'static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {')));
+
+  if (ok > 0) console.log(`[transgpuwin] ${ok} check(s) passed`);
+  return bad;
+}
+
+registerGroup('unit: platform/TransparentGpuWin', checkTransparentGpuWin);
 registerGroup('unit: platform/NullRef', checkNullRef);
 registerGroup('unit: platform/Intervals', checkIntervals);
 registerGroup('unit: platform/CapabilitiesLocale', checkCapabilitiesLocale);

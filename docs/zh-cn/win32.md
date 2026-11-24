@@ -484,6 +484,13 @@ macOS 专属的 `metal_glue.mm` / `objc` / Cocoa `framework` 项在 Windows 上�
 `src/build.ts` 的 `-lm`/`-lz` 在 win32 归零（`m.lib`/`z.lib` 在 Windows 不存在）；
 `AS_HAVE_ICONV=0`（`<iconv.h>` 不在 CRT 里），但**非 UTF 字符集不等于是缺口**：`_WIN32` 下走系统自己的代码页转换器 `MultiByteToWideChar`/`WideCharToMultiByte`（`src/runtime.ts` 的 `as_multibyte_win_{decode,encode}`），覆盖 AIR 会用的每一条 ANSI 代码页（`gbk`/`gb2312`=936、`big5`=950、`shift-jis`=932、`euc-kr`=949、`cp125x`、`iso-8859-x`、`us-ascii`=20127、`macintosh`=10000），字节↔串策略与算术 UTF-16 路径共用一套。**编码必须带 `WC_NO_BEST_FIT_CHARS` + 默认字符 `?`**：不加时系统会把 `us-ascii` 里的 `'é'` 悄悄写成 `'e'`，而 AIR 与 iconv 都写 `'?'`（`examples/stage94d.as` 钉住）。只有这张表里没有的名字才**响亮**抛错（与 wasm 口径一致）。
 
+**透明窗（`<transparent>true</transparent>`）配 GPU 渲染**：D3D12 分支已支持（阶段四百五十九）。
+flip-model 交换链的 `Present` 会装一个不透明 DirectComposition 子视觉，压倒分层窗的 `UpdateLayeredWindow`
+图像（实测 ULW 成功且像素 alpha 正确，屏幕却显示不透明黑）；而跳过 `Present` 又会挂设备
+（`DXGI_ERROR_DEVICE_HUNG`，flip-model 强制要求 Present）。故透明 GPU 窗改渲染到**离屏渲染目标**、交换链
+闲置不 Present，每帧读回成预乘 BGRA 交给 CPU 路径同一套 ULW 呈现。实测三带 alpha 与 adl 同形、不透明 GPU
+零回归、读回开销可忽略（透明与不透明帧率相等）。详见 [`skia.md`](skia.md) §6.20。WGL 分支的透明窗**未实测**。
+
 ### 3.1.1 第二个窗口后端：WGL/OpenGL（`--gpu-backend gl`）
 
 D3D12 是**平台下限**问题：它要求 Win10 1507 + WDDM 2.0 + FL 11_0（`vendor/d3d_glue.cc` 只用 RTM API），

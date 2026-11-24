@@ -494,6 +494,17 @@ arithmetic UTF-16 path. **Encoding must pass `WC_NO_BEST_FIT_CHARS` with default
 system silently turns `'é'` in `us-ascii` into `'e'`, where AIR and iconv write `'?'` (pinned by
 `examples/stage94d.as`). Only names missing from that table **loudly** throw, the same contract as wasm).
 
+**Transparent windows (`<transparent>true</transparent>`) with GPU rendering**: supported on the D3D12
+branch (stage four-hundred-fifty-nine). A flip-model swapchain's `Present` installs an opaque
+DirectComposition child visual that overrides the layered window's `UpdateLayeredWindow` image (measured:
+ULW succeeds with correct pixel alpha, yet the screen shows opaque black); skipping `Present` instead hangs
+the device (`DXGI_ERROR_DEVICE_HUNG` — a flip-model swapchain demands Present). So a transparent GPU window
+renders into **offscreen render targets** with the swapchain idle (never Presented), and each frame is read
+back to premultiplied BGRA and handed to the same ULW present the CPU path uses. Measured: the three-band
+alpha matches adl, opaque GPU has zero regression, and readback overhead is negligible (transparent and
+opaque frame rates are equal). See [`skia.md`](skia.md) §6.20. Transparent windows on the WGL branch are
+**not measured**.
+
 ### 3.1.1 The Second Window Backend: WGL/OpenGL (`--gpu-backend gl`)
 
 D3D12 is a **platform-floor** problem: it needs Win10 1507 + WDDM 2.0 + FL 11_0 (`vendor/d3d_glue.cc` only uses

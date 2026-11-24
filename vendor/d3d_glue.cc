@@ -278,6 +278,26 @@ typedef struct {
   // A failed swapchain rebuild must not be attempted on every frame: without GPU
   // quiescence the old swapchain can make CreateSwapChainForHwnd fail repeatedly.
   double recreate_retry_at;
+  // A transparent window presents via UpdateLayeredWindow from an OFFSCREEN render
+  // target, not the swapchain (stage 459): a flip-model swapchain Present installs an
+  // opaque DirectComposition child visual that overrides the layered window's ULW
+  // image. The swapchain is still created but stays idle (never Presented); the frame
+  // is drawn into offscreen buffers, read back to premultiplied BGRA, and handed to
+  // window_glue's layered present.
+  int layered;
+  // Transparent-window readback (stage 459): a transparent GPU window composites
+  // via UpdateLayeredWindow, which needs CPU-side premultiplied BGRA. The opaque
+  // flip-model swapchain present cannot composite per-pixel alpha with the desktop,
+  // so each frame is read back here and handed to window_glue's layered present.
+  // Persistent across frames (the READBACK buffer stays mapped; rebuilt on resize).
+  gr_cp<ID3D12Resource> rb;
+  gr_cp<ID3D12Fence> rb_fence;
+  uint64_t rb_fence_val;
+  void* rb_mapped;
+  HANDLE rb_event;
+  int rb_w, rb_h;
+  unsigned char* bgra;
+  size_t bgra_cap;
 } D3DWin;
 
 static D3DWin g_d3d[SK_D3D_MAX_WINDOWS];
@@ -369,6 +389,13 @@ static void d3d_drop_gpu_state(int device_gone) {
     w->fence_event = NULL;
     w->fence.reset();
     w->swapchain.reset();
+    // Transparent readback (stage 459) is device memory too: drop it so a rebuild
+    // re-creates it on the new device. rb_mapped is cleared without Unmap (the
+    // mapping dies with the device; releasing rb frees it). bgra is CPU memory.
+    w->rb_mapped = nullptr;
+    w->rb.reset(); w->rb_fence.reset(); w->rb_fence_val = 0; w->rb_w = 0; w->rb_h = 0;
+    if (w->rb_event != NULL) { CloseHandle(w->rb_event); w->rb_event = NULL; }
+    free(w->bgra); w->bgra = nullptr; w->bgra_cap = 0;
     // used/hwnd/width/height are deliberately kept: the WINDOW still exists, so a
     // rebuild re-creates its swapchain at the same size instead of treating it as
     // closed (sk_gpu_destroy is the only path that clears `used`).
@@ -544,7 +571,23 @@ static int d3d_setup_surfaces(D3DWin* w) {
     w->surfaces[i].reset();
     w->buffers[i].reset();
 
-    HRESULT ghr = w->swapchain->GetBuffer((UINT)i, IID_PPV_ARGS(&w->buffers[i]));
+    HRESULT ghr;
+    if (w->layered) {
+      // Offscreen render target (stage 459): we own the resource via w->buffers[i]
+      // (a flip-model swapchain back buffer would be owned by the swapchain). Initial
+      // state RENDER_TARGET because Skia draws into it; the readback transitions it
+      // through PRESENT/COPY_SOURCE each frame.
+      D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+      D3D12_RESOURCE_DESC rd = {};
+      rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      rd.Width = (UINT)w->width; rd.Height = (UINT)w->height;
+      rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = fmt;
+      rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      ghr = g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+          D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&w->buffers[i]));
+    } else {
+      ghr = w->swapchain->GetBuffer((UINT)i, IID_PPV_ARGS(&w->buffers[i]));
+    }
     if (FAILED(ghr)) {
       fprintf(stderr, "d3d_glue: GetBuffer(%d) failed: 0x%08lx\n", i, (unsigned long)ghr);
       fflush(stderr);
@@ -561,7 +604,8 @@ static int d3d_setup_surfaces(D3DWin* w) {
     // sampleQualityLevel is 0 (the standard pattern, matching Skia's own
     // D3D12WindowContext_win.cpp reference) and protected is kNo.
     GrD3DTextureResourceInfo info(nullptr, nullptr,
-                                  D3D12_RESOURCE_STATE_PRESENT,
+                                  w->layered ? D3D12_RESOURCE_STATE_RENDER_TARGET
+                                             : D3D12_RESOURCE_STATE_PRESENT,
                                   fmt,
                                   1, 1, 0, GrProtected::kNo);
     // NOT the (resource, ...) constructor: that one ADOPTS the bare pointer without
@@ -672,6 +716,12 @@ static int d3d_create_swapchain(D3DWin* w, HWND hwnd, int cw, int ch) {
     w->width = cw;
     w->height = ch;
     w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+
+    // transparent + HDR is not a measured combination: an HDR window presents an F16
+    // scRGB swapchain, which the 8-bit layered-window readback cannot carry. Drop the
+    // offscreen route so such a window stays on the ordinary (opaque) swapchain Present
+    // rather than rendering into an offscreen target nothing presents (stage 459).
+    if (w->hdr) w->layered = 0;
 
     if (!d3d_setup_surfaces(w)) {
       if (hdr) {
@@ -825,6 +875,12 @@ __declspec(dllexport) extern "C" ID3D12CommandQueue* sk_d3d_shared_queue(void) {
 
 extern "C" {
 
+// window_glue.cc owns the window and the layered-window (ULW) present; these two
+// backend-neutral queries let a transparent GPU window route its read-back frame
+// through ULW instead of the opaque swapchain (stage 459). No D3D12 state crosses.
+extern int sk_window_is_transparent(int id);
+extern void sk_window_present_layered_pixels(int id, void* pixels, int w, int h, int rowBytes);
+
 // The process-wide D3D12 GrDirectContext, exposed for YUV direct render
 // (BitmapData.setYuv420): TextureFromYUVAPixmaps only needs a GrRecordingContext*,
 // and D3D12 is process-wide (not per-window), so a single getter suffices.
@@ -848,6 +904,10 @@ int sk_gpu_init(int win_id, void* native_handle) {
   // names — refuse rather than silently rebind (same rule as sk_mtl_init).
   if (g_d3d[win_id].used) return 0;
   if (!d3d_init_shared()) return 0;
+
+  // A transparent window renders offscreen and presents via ULW (stage 459); the
+  // swapchain below is created but never Presented, so it installs no DComp visual.
+  g_d3d[win_id].layered = sk_window_is_transparent(win_id);
 
   // The swapchain is created at the window's current CLIENT size. A later size
   // change is handled by sk_gpu_begin_frame's ResizeBuffers path, so this only has
@@ -899,6 +959,12 @@ void sk_gpu_destroy(int win_id) {
     w->draw.reset();
     w->hdr = 0;
     w->hdr_frames = 0;
+    // Transparent-window readback state (stage 459): unmap before releasing the
+    // READBACK buffer, then free the BGRA staging.
+    if (w->rb.get() != nullptr && w->rb_mapped != nullptr) { w->rb->Unmap(0, nullptr); w->rb_mapped = nullptr; }
+    w->rb.reset(); w->rb_fence.reset(); w->rb_fence_val = 0; w->rb_w = 0; w->rb_h = 0;
+    if (w->rb_event != NULL) { CloseHandle(w->rb_event); w->rb_event = NULL; }
+    free(w->bgra); w->bgra = nullptr; w->bgra_cap = 0;
     if (w->fence_event != NULL) CloseHandle(w->fence_event);
     w->fence.reset();
     w->swapchain.reset();
@@ -1020,7 +1086,9 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
     // per-window recovery path is executable without waiting for a driver/TDR.
     static int injectedResizeFailure = 0;
     HRESULT rhr;
-    if (!injectedResizeFailure && getenv("ASC_GPU_RESIZE_FAIL") != nullptr) {
+    if (w->layered) {
+      rhr = S_OK;  // offscreen targets rebuilt by d3d_setup_surfaces; no swapchain resize
+    } else if (!injectedResizeFailure && getenv("ASC_GPU_RESIZE_FAIL") != nullptr) {
       injectedResizeFailure = 1;
       rhr = E_OUTOFMEMORY;
     } else {
@@ -1065,7 +1133,8 @@ void* sk_gpu_begin_frame(int win_id, int width, int height) {
   // the standard flip-model acquire; skipping it would let the GPU read a resource
   // the CPU is already overwriting — visible as torn/black bands.
   const UINT64 current = w->fence_values[w->buffer_index];
-  w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
+  if (w->layered) w->buffer_index = (w->buffer_index + 1) % SK_D3D_NUM_FRAMES;
+  else w->buffer_index = w->swapchain->GetCurrentBackBufferIndex();
   if (w->fence.get() != nullptr &&
       w->fence->GetCompletedValue() < w->fence_values[w->buffer_index]) {
     D3D_OK_OR_WARN(w->fence->SetEventOnCompletion(w->fence_values[w->buffer_index],
@@ -1297,6 +1366,110 @@ static void d3d_dump_backbuffer(D3DWin* w) {
   rb->Unmap(0, nullptr);
 }
 
+// Read the offscreen frame back to CPU premultiplied BGRA and hand it to
+// window_glue's layered-window present (stage 459). A transparent window must
+// composite per-pixel alpha with the desktop, which a flip-model swapchain Present
+// cannot do: Present installs an opaque DirectComposition child visual that overrides
+// the layered window's ULW image (measured: ULW succeeds with correct alpha-0 pixels,
+// yet the swapchain's opaque visual is what shows). So a transparent window renders
+// into OFFSCREEN render targets (w->layered) and never Presents the swapchain; this
+// readback mirrors d3d_dump_backbuffer's copy (same queue, PRESENT -> COPY_SOURCE ->
+// PRESENT, the state SkSurfaces::flush(kPresent) leaves the target in) into a
+// PERSISTENT mapped READBACK buffer, then swaps the R8G8B8A8 frame's R/B into the BGRA
+// layout ULW wants (alpha is already premultiplied by Skia). Back-buffer rotation is
+// manual in sk_gpu_begin_frame because GetCurrentBackBufferIndex never advances without
+// Present. Readback overhead is negligible: measured transparent vs opaque GPU fps are
+// equal at both 24 and 60 fps (the frame rate, not the readback, paces the loop).
+static void d3d_present_transparent(D3DWin* w, int win_id) {
+  if (w == nullptr || g_device.get() == nullptr || g_queue.get() == nullptr) return;
+  // An HDR window presents an F16 scRGB back buffer; transparent+HDR is not a
+  // measured combination, so leave it on the ordinary (opaque) present rather than
+  // read back half floats into an 8-bit layered window.
+  if (w->hdr) return;
+  ID3D12Resource* bb = w->buffers[w->buffer_index].get();
+  if (bb == nullptr) return;
+  const UINT width = (UINT)w->width, height = (UINT)w->height;
+  if (width == 0 || height == 0) return;
+  const UINT rowPitch = (width * 4u + 255u) & ~255u;  // CopyTextureRegion: 256-byte rows
+  // (Re)build the persistent readback buffer + fence + BGRA staging on first use or
+  // resize. The READBACK heap stays mapped for the window's lifetime (no per-frame
+  // Map/Unmap); only the command allocator/list are per-frame, as in the dump.
+  if (w->rb.get() == nullptr || w->rb_w != (int)width || w->rb_h != (int)height) {
+    if (w->rb.get() != nullptr && w->rb_mapped != nullptr) { w->rb->Unmap(0, nullptr); w->rb_mapped = nullptr; }
+    w->rb.reset(); w->rb_fence.reset(); w->rb_fence_val = 0;
+    D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = (UINT64)rowPitch * height; bd.Height = 1; bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&w->rb)))) { w->rb.reset(); return; }
+    if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&w->rb_fence)))) { w->rb.reset(); return; }
+    if (w->rb_event == NULL) w->rb_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    const D3D12_RANGE readRange = { 0, (SIZE_T)rowPitch * height };
+    if (FAILED(w->rb->Map(0, &readRange, &w->rb_mapped))) w->rb_mapped = nullptr;
+    w->rb_w = (int)width; w->rb_h = (int)height;
+    const size_t need = (size_t)width * 4 * height;
+    if (w->bgra_cap < need) {
+      free(w->bgra);
+      w->bgra = (unsigned char*)malloc(need);
+      w->bgra_cap = w->bgra != nullptr ? need : 0;
+    }
+  }
+  if (w->rb.get() == nullptr || w->rb_mapped == nullptr || w->bgra == nullptr) return;
+  gr_cp<ID3D12CommandAllocator> alloc;
+  gr_cp<ID3D12GraphicsCommandList> list;
+  if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)))) return;
+  if (FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.get(), nullptr, IID_PPV_ARGS(&list)))) return;
+  D3D12_RESOURCE_BARRIER bar = {};
+  bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  bar.Transition.pResource = bb;
+  bar.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  bar.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+  bar.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1, &bar);
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = bb; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = w->rb.get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint.Footprint.Format = SK_D3D_SWAPCHAIN_FORMAT;
+  dst.PlacedFootprint.Footprint.Width = width; dst.PlacedFootprint.Footprint.Height = height;
+  dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = rowPitch;
+  list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  bar.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  bar.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+  list->ResourceBarrier(1, &bar);
+  if (FAILED(list->Close())) return;
+  ID3D12CommandList* lists[1] = { list.get() };
+  g_queue->ExecuteCommandLists(1, lists);
+  const uint64_t fv = ++w->rb_fence_val;
+  if (FAILED(g_queue->Signal(w->rb_fence.get(), fv))) return;
+  if (w->rb_fence->GetCompletedValue() < fv) {
+    // Event-based wait: Sleep(1) polling can overshoot by a whole timer tick (up to
+    // ~15 ms at the default resolution), which dominated the transparent frame time.
+    if (w->rb_event != NULL) {
+      w->rb_fence->SetEventOnCompletion(fv, w->rb_event);
+      WaitForSingleObject(w->rb_event, 1000);
+    } else {
+      for (int spin = 0; spin < 20000 && w->rb_fence->GetCompletedValue() < fv; ++spin) Sleep(1);
+    }
+  }
+  if (w->rb_fence->GetCompletedValue() < fv) return;  // GPU stalled: skip this frame's ULW
+  // R8G8B8A8 premultiplied -> BGRA premultiplied (swap R/B, keep A), tight w*4 rows.
+  const unsigned char* px = (const unsigned char*)w->rb_mapped;
+  for (UINT y = 0; y < height; ++y) {
+    const unsigned char* row = px + (SIZE_T)y * rowPitch;
+    unsigned char* out = w->bgra + (size_t)y * width * 4;
+    for (UINT x = 0; x < width; ++x) {
+      out[x * 4 + 0] = row[x * 4 + 2];
+      out[x * 4 + 1] = row[x * 4 + 1];
+      out[x * 4 + 2] = row[x * 4 + 0];
+      out[x * 4 + 3] = row[x * 4 + 3];
+    }
+  }
+  sk_window_present_layered_pixels(win_id, w->bgra, (int)width, (int)height, (int)(width * 4));
+}
+
 // Submit the frame's Ganesh work and present the back buffer.
 //
 // The two-step flush here is the D3D counterpart of Metal's flushAndSubmit, and
@@ -1352,6 +1525,16 @@ void sk_gpu_flush(int win_id) {
 
   // Before Present below, which is where the frame blocks on the display.
   d3d_stats_frame_done();
+
+  // A transparent window presents via ULW from the offscreen target (stage 459): the
+  // flip-model swapchain stays idle (Present would install an opaque DComp visual over
+  // the ULW image). Read the offscreen frame back to premultiplied BGRA, hand it to
+  // window_glue's layered present, signal the frame fence, and skip Present entirely.
+  if (w->layered) {
+    d3d_present_transparent(w, win_id);
+    D3D_OK_OR_WARN(g_queue->Signal(w->fence.get(), w->fence_values[w->buffer_index]));
+    return;
+  }
 
   d3d_dump_backbuffer(w);
 

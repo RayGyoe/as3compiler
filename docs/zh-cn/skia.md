@@ -1074,14 +1074,55 @@ GPU 上那个 `CAMetalLayer` 子视图**就是呈现者**，隐藏即黑屏。
 
 **如实报明**：① 抓图的 RGB 与 adl 差一截（我们 `(234,51,35)` vs adl `(255,0,0)`），因为抓图落在
 显示器 P3 空间而我们给 layer 打了 sRGB 标签、adl 没打——那是既有色彩空间口径（§6.6 附近的 Ed26
-注记），本次**只判 alpha**，没有改动它。② Windows 的透明呈现走 CPU 路径的 `UpdateLayeredWindow`，
-**Windows 的 GPU 透明窗本轮未做也未实测**。③ 标准分辨率下画面仍是 1x 上采样（与不透明路径一致），
+注记），本次**只判 alpha**，没有改动它。② Windows 的 CPU 透明呈现走 `UpdateLayeredWindow`；
+**Windows 的 GPU 透明窗见 §6.20（阶段四百五十九已修）**。③ 标准分辨率下画面仍是 1x 上采样（与不透明路径一致），
 那是 `<requestedDisplayResolution>` 的既有契约，不是本阶段的缺陷。
 
 回归：`examples/transparent-gpu/`（`--air-app` 编译+链接，判定要真窗口抓图，口径见其 README）
 + `unit: platform/TransparentGpu` **14 钉**（两步各自不可省、顺序、不隐藏子视图、幂等、
 `metal_glue` 不碰 opacity、`present_frame` 仍是 CPU-only、scale 闸门、Windows ULW 未动）。
 `unit: platform/PresentScale` 里那条钉住 `sk_window_live_scale` 旧函数体的断言按新契约重写。
+
+### 6.20 Windows GPU 透明窗：离屏渲染目标 + 读回 → UpdateLayeredWindow（阶段四百五十九）
+
+§6.19 修的是 macOS。Windows 的 GPU 透明窗（`<transparent>true</transparent>` + `<renderMode>direct</renderMode>`）
+此前同样**静默错语义**：`nativeWindow.transparent` 回 `true`，但未画区是不透明黑、50% 蓝被合成到黑底。
+根因与 macOS 不同，是 **flip-model 交换链与分层窗的根本冲突**：
+
+1. Windows 透明窗靠 `WS_EX_LAYERED` + `UpdateLayeredWindow`（ULW）按每像素 alpha 与桌面合成（§6.7 的 CPU 路径）。
+2. 但 GPU 窗走 flip-model 交换链的 `Present`，它会装一个**不透明的 DirectComposition 子视觉**，
+   **压倒**分层窗的 ULW 图像。实测：ULW 返回 `TRUE`、读回像素 alpha 完全正确（未画区 `(0,0,0,0)`），
+   屏幕上显示的却是交换链的不透明内容——ULW 被 DComp 视觉盖住。
+3. **死路实测**：干脆跳过 `Present` ⇒ `DXGI_ERROR_DEVICE_HUNG`（`0x887A002B`）——flip-model 交换链
+   **强制要求** `Present`，不 Present 就挂设备。所以「保留交换链 + 补 ULW」与「跳过 Present」两条都走不通。
+
+**修法：透明 GPU 窗改用离屏渲染目标，交换链闲置不 Present。** `D3DWin` 加 `layered` 标志
+（`sk_gpu_init` 按 `sk_window_is_transparent` 置位）：
+
+- `d3d_setup_surfaces` 对 `layered` 窗用 `CreateCommittedResource`（`RENDER_TARGET`）建**离屏纹理**，
+  不再 `GetBuffer` 取交换链背缓冲；交换链仍建但**从不 Present**（不 Present 就不装 DComp 视觉）。
+- `sk_gpu_begin_frame` 对 `layered` 窗**手动轮转**背缓冲（`(buffer_index+1)%N`，因为不 Present 时
+  `GetCurrentBackBufferIndex` 永不前进）；resize 重建离屏纹理而非 `ResizeBuffers`。
+- `sk_gpu_flush` 对 `layered` 窗跳过 `Present`：`d3d_present_transparent` 把离屏帧读回
+  （`PRESENT→COPY_SOURCE→PRESENT` 拷贝进**持久映射**的 READBACK 缓冲，fence 用**事件**精确唤醒，
+  不用 `Sleep(1)` 轮询——后者在默认定时器分辨率下会过冲一整个 tick），R8G8B8A8 的 R/B 换序成
+  ULW 要的 **BGRA 预乘**布局，交给 `window_glue` 的 `sk_window_present_layered_pixels`（复用 CPU 的 ULW 路径）。
+
+seam 后端中立：`window_glue` 导出 `sk_window_is_transparent` / `sk_window_present_layered_pixels`
+（只传 pixels + 窗口 id），`d3d_glue` extern 声明调用，**D3D12 状态不越界**。
+
+**实测**（Windows 10 150% DPI，`examples/transparent-gpu` 300x200，右 1/3 故意不画）：抓图三带
+红 `{255}` / 50% 蓝 `{127}`（桌面文字透过蓝带可见）/ 未画 `{0}`（桌面直接透出），与 CPU 路径及 adl oracle 同形。
+**零回归**：不透明 GPU 窗仍走交换链 `Present`（`layered` 分支不激活），背缓冲 dump 红/蓝/白正确、无设备丢失。
+**读回开销可忽略**：透明 vs 不透明 GPU 帧率在 24 fps（23.5 vs 23.5）与 60 fps（57.1 vs 56.8）下**相等**——
+ pace 循环的是 `stage.frameRate`，不是读回。
+
+**如实报明**：① transparent + HDR（F16 scRGB）不是实测组合，`layered` 窗若是 HDR 仍走普通（不透明）Present，
+不读回半浮点进 8 位分层窗。② 读回是 ULW 的固有成本（需 CPU 像素），与 CPU 透明路径同架构；不透明窗零开销。
+
+回归：`unit: platform/TransparentGpuWin` **16 钉**（seam 两 export + extern、`layered` 置位、离屏 RENDER_TARGET、
+不透明仍 GetBuffer/Present、手动轮转、flush 跳过 Present、读回 COPY_SOURCE + R/B 换序 + ULW 交接、事件等待、HDR 闸门）。
+`unit: platform/BackendParity` 的 native-only 豁免表登记这两个新 seam（属 GPU 胶水内部，生成 C 从不引用，web 不链接 d3d_glue）。
 
 ## 7. 多目标：native 与 wasm
 

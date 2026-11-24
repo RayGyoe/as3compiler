@@ -959,8 +959,8 @@ correctly positioned `CLICK at 50,100` in 3/3 runs.
 **Reported honestly**: (1) captured RGB differs from adl (ours `(234,51,35)` vs adl `(255,0,0)`) because the
 capture lands in the display's P3 space while we tag the layer sRGB and adl does not — that is the existing
 colour-space ruling (the Ed26 note near §6.6); this stage **judges alpha only** and did not change it.
-(2) Windows presents transparency through `UpdateLayeredWindow` on the CPU path; **Windows GPU transparency
-was neither implemented nor measured here**. (3) At standard resolution the picture is still a 1x upscale
+(2) Windows presents CPU transparency through `UpdateLayeredWindow`; **Windows GPU transparency is covered
+in §6.20 (fixed in stage four-hundred-fifty-nine)**. (3) At standard resolution the picture is still a 1x upscale
 (same as the opaque path) — that is the existing `<requestedDisplayResolution>` contract, not a defect of
 this stage.
 
@@ -969,6 +969,61 @@ recipe in its README) + `unit: platform/TransparentGpu` **14 pins** (both steps 
 subview hiding, idempotency, `metal_glue` leaves opacity alone, `present_frame` still CPU-only, the scale gate,
 Windows ULW untouched). The `unit: platform/PresentScale` pin that froze the old body of
 `sk_window_live_scale` was rewritten to the new contract.
+
+### 6.20 Windows GPU transparent windows: offscreen render targets + readback → UpdateLayeredWindow (stage four-hundred-fifty-nine)
+
+§6.19 fixed macOS. The Windows GPU transparent window (`<transparent>true</transparent>` +
+`<renderMode>direct</renderMode>`) was likewise **silently wrong**: `nativeWindow.transparent` returned
+`true`, yet the unpainted region was opaque black and a 50% blue composited over black. The root cause is
+different from macOS — a **fundamental conflict between a flip-model swapchain and a layered window**:
+
+1. A Windows transparent window composites per-pixel alpha with the desktop via `WS_EX_LAYERED` +
+   `UpdateLayeredWindow` (ULW) — the CPU path of §6.7.
+2. But a GPU window presents through a flip-model swapchain's `Present`, which installs an **opaque
+   DirectComposition child visual** that **overrides** the layered window's ULW image. Measured: ULW
+   returned `TRUE` and the read-back pixels had correct alpha (unpainted `(0,0,0,0)`), yet the screen showed
+   the swapchain's opaque content — the DComp visual covers ULW.
+3. **Measured dead end**: skipping `Present` entirely ⇒ `DXGI_ERROR_DEVICE_HUNG` (`0x887A002B`) — a
+   flip-model swapchain **demands** `Present`; without it the device hangs. So neither "keep the swapchain +
+   add ULW" nor "skip Present" works.
+
+**Fix: a transparent GPU window renders into offscreen render targets; the swapchain stays idle (never
+Presented).** `D3DWin` gains a `layered` flag (set in `sk_gpu_init` from `sk_window_is_transparent`):
+
+- `d3d_setup_surfaces` builds **offscreen textures** via `CreateCommittedResource` (`RENDER_TARGET`) for a
+  `layered` window instead of `GetBuffer`-ing swapchain back buffers; the swapchain is still created but
+  **never Presented** (no Present ⇒ no DComp visual).
+- `sk_gpu_begin_frame` **rotates the back buffers manually** for a `layered` window
+  (`(buffer_index+1)%N`, since `GetCurrentBackBufferIndex` never advances without Present); a resize rebuilds
+  the offscreen textures rather than calling `ResizeBuffers`.
+- `sk_gpu_flush` skips `Present` for a `layered` window: `d3d_present_transparent` reads the offscreen frame
+  back (a `PRESENT→COPY_SOURCE→PRESENT` copy into a **persistently mapped** READBACK buffer; the fence waits
+  on an **event**, not `Sleep(1)` polling, which overshoots a whole timer tick at the default resolution),
+  swaps the R8G8B8A8 frame's R/B into the **premultiplied BGRA** layout ULW wants, and hands it to
+  `window_glue`'s `sk_window_present_layered_pixels` (reusing the CPU ULW path).
+
+The seam is backend-neutral: `window_glue` exports `sk_window_is_transparent` /
+`sk_window_present_layered_pixels` (pixels + window id only); `d3d_glue` declares them extern and calls them.
+**No D3D12 state crosses the boundary.**
+
+**Measured** (Windows 10 150% DPI, `examples/transparent-gpu` 300x200, right third deliberately unpainted):
+the capture's three bands are red `{255}` / 50% blue `{127}` (desktop text visible through the blue band) /
+unpainted `{0}` (desktop shows straight through) — same shape as the CPU path and the adl oracle.
+**Zero regression**: an opaque GPU window still Presents the swapchain (the `layered` branch is inactive);
+its back-buffer dump is red/blue/white correctly with no device loss. **Readback overhead is negligible**:
+transparent vs opaque GPU frame rates are **equal** at 24 fps (23.5 vs 23.5) and 60 fps (57.1 vs 56.8) — the
+loop is paced by `stage.frameRate`, not the readback.
+
+**Reported honestly**: (1) transparent + HDR (F16 scRGB) is not a measured combination; an HDR `layered`
+window stays on the ordinary (opaque) Present rather than reading half floats back into an 8-bit layered
+window. (2) The readback is ULW's inherent cost (it needs CPU pixels), the same architecture as the CPU
+transparent path; opaque windows pay nothing.
+
+Regression: `unit: platform/TransparentGpuWin` **16 pins** (the two seam exports + extern declarations,
+`layered` set, offscreen RENDER_TARGET, opaque still GetBuffer/Present, manual rotation, flush skips Present,
+readback COPY_SOURCE + R/B swap + ULW hand-off, event wait, HDR gate). `unit: platform/BackendParity`'s
+native-only exemption list registers the two new seams (GPU-glue internal; the generated C never references
+them and web never links d3d_glue).
 
 ## 7. Multi-target: native and wasm
 

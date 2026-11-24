@@ -23630,6 +23630,49 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
 
+### 阶段四百五十九：Windows GPU 透明窗——离屏渲染目标 + 读回 → UpdateLayeredWindow（v0.4.433 → v0.4.434）✅ 已完成
+
+**立项依据**：用户「刚拉下来的几个修复 log 中修复了窗口透明问题，看看 windows 上是否工作正常」→ 复核结论
+「CPU 透明正常（阶段 454）、GPU 透明仍坏（阶段 458 全是 macOS，Windows 分支零行）」→ 用户「接着修 Windows GPU 透明」。
+
+**一、根因（实测确证，不是推断）**：Windows 透明窗靠 `WS_EX_LAYERED` + `UpdateLayeredWindow`（ULW）按每像素
+alpha 与桌面合成；但 GPU 窗走 flip-model 交换链的 `Present`，它装一个**不透明 DirectComposition 子视觉**，
+**压倒**分层窗的 ULW 图像。诊断钉：ULW 返回 `TRUE`、`WS_EX_LAYERED` 置位、读回像素 alpha 完全正确
+（红 `{255}` / 50% 蓝 `{127}` / 未画 `{0}`），屏幕却显示交换链的不透明黑——ULW 被 DComp 视觉盖住。
+**两条死路实测**：① 保留交换链 + 补 ULW ⇒ DComp 覆盖（上述）；② 跳过 `Present` ⇒ `DXGI_ERROR_DEVICE_HUNG`
+（`0x887A002B`）——flip-model 交换链**强制要求** Present。故唯一正解是**透明 GPU 窗不用交换链呈现**。
+
+**二、修法（离屏渲染目标，镜像 CPU 架构）**：`D3DWin` 加 `layered` 标志（`sk_gpu_init` 按
+`sk_window_is_transparent` 置位）：① `d3d_setup_surfaces` 对 layered 窗用 `CreateCommittedResource`
+（`RENDER_TARGET`）建离屏纹理，不再 `GetBuffer`；交换链仍建但**从不 Present**（不 Present 就不装 DComp 视觉）。
+② `sk_gpu_begin_frame` 手动轮转背缓冲（`(buffer_index+1)%N`，不 Present 时 `GetCurrentBackBufferIndex` 永不前进），
+resize 重建离屏纹理而非 `ResizeBuffers`。③ `sk_gpu_flush` 跳过 Present：`d3d_present_transparent` 读回离屏帧
+（`PRESENT→COPY_SOURCE→PRESENT` 拷进**持久映射** READBACK 缓冲，fence 用**事件**精确唤醒而非 `Sleep(1)` 轮询），
+R8G8B8A8 的 R/B 换序成 ULW 要的**预乘 BGRA**，交 `window_glue::sk_window_present_layered_pixels`（复用 CPU ULW）。
+seam 后端中立：window_glue 导出 `sk_window_is_transparent` / `sk_window_present_layered_pixels`（只传 pixels+id），
+d3d_glue extern 调用，D3D12 状态不越界。设备丢失/销毁路径同步清理读回资源（rb/rb_fence/rb_event/bgra）。
+
+**三、实测（Windows 10 150% DPI，`examples/transparent-gpu` 300x200，右 1/3 故意不画）**：抓图三带
+红 `{255}` / 蓝 `{127}`（桌面文字透过蓝带可见）/ 未画 `{0}`（桌面直接透出），与 CPU 路径及 adl oracle 同形。
+**零回归**：不透明 GPU 窗仍走交换链 Present（layered 分支不激活），背缓冲 dump 红/蓝/白正确、无设备丢失。
+**读回开销可忽略**：透明 vs 不透明 GPU 帧率在 24 fps（23.5 vs 23.5）与 60 fps（57.1 vs 56.8）下**相等**——
+pace 循环的是 `stage.frameRate`，不是读回（满足「不破坏性能」）。
+
+**四、如实报明**：① transparent + HDR（F16 scRGB）非实测组合，HDR layered 窗仍走普通（不透明）Present，
+不读回半浮点进 8 位分层窗。② WGL 分支透明窗未实测。③ 读回是 ULW 固有成本（需 CPU 像素），与 CPU 透明同架构；不透明窗零开销。
+
+**五、回归与钉**：新增 `unit: platform/TransparentGpuWin` **16 钉**（seam 两 export+extern、layered 置位、
+离屏 RENDER_TARGET、不透明仍 GetBuffer/Present、手动轮转、flush 跳过 Present、读回 COPY_SOURCE+R/B 换序+ULW 交接、
+事件等待、HDR 闸门）；`unit: platform/BackendParity` native-only 豁免表登记两新 seam（GPU 胶水内部，生成 C 不引用、
+web 不链接 d3d_glue）。`unit: platform` 全组 **32/32 绿**。**全量回归 `node test.ts`：745 测试 / 738 绿 / 5 跳过 / 2 红**
+（示例层全绿，vendor 改动无破坏；耗时 486 s）。这 2 红为**非本阶段基线**：
+`emit/StringAccumulator`（并发会话进行中，本阶段三文件 0 处 `as_sb_`）与 `build/Yuv420HostManifest`
+（Windows 主机无 darwin/x64 预编译 vendor 树，`vendor/lib/` 全空）。
+
+**六、文档同步**：`docs/{zh-cn,en}/skia.md` 新增 §6.20 + §6.19 ② 注记改指 §6.20；`docs/{zh-cn,en}/win32.md` §3.1
+加透明 GPU 窗注记；`examples/transparent-gpu/README.md` 加 Windows 段；`README-CN.md`/`README.md` 的
+`supportsTransparency` 条目「Windows GPU 透明未做」改为「已支持」。版本 0.4.433 → **0.4.434**。
+
 ### 阶段四百五十六：macOS 发布版权元信息——Windows 近期修复的 mac 对齐审计（v0.4.430 → v0.4.431）✅ 已完成
 
 **立项依据**：用户「最近 windows 上修复了很多问题，看看有需要 mac 对齐的吗」。逐条核完 447–455

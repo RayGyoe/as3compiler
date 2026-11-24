@@ -4458,4 +4458,25 @@ void sk_window_set_transparent(int id, int on) {
 // The main window's id, for the generated boot code (Stage.showWindow).
 int sk_window_main(void) { return g_main; }
 
+// Whether window `id` is transparent. The GPU backend asks so it can route a
+// transparent frame through the layered-window present instead of the opaque
+// swapchain (stage 459). Backend-neutral: no GPU state crosses the seam.
+int sk_window_is_transparent(int id) {
+  WinCtx* c = sk_slot(id);
+  return (c != NULL && c->win != NULL) ? c->transparent : 0;
+}
+
+// Present read-back GPU pixels through the layered-window (ULW) path. The GPU
+// backend reads its frame back to premultiplied BGRA and hands it here; ULW owns
+// the layered window's visual (a DXGI swapchain present cannot composite per-pixel
+// alpha with the desktop). Same compositing as the CPU transparent path (stage 454).
+void sk_window_present_layered_pixels(int id, void* pixels, int w, int h, int rowBytes) {
+#if defined(_WIN32)
+  WinCtx* c = sk_slot(id);
+  if (c != NULL && c->win != NULL && c->transparent) sk_win_present_layered(c, pixels, w, h, rowBytes);
+#else
+  (void)id; (void)pixels; (void)w; (void)h; (void)rowBytes;
+#endif
+}
+
 }  // extern "C"
