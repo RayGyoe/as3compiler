@@ -1067,6 +1067,48 @@ true。首帧 trace `[CityReflection] native planar reflection 693x411 (half of 
 直射——这是**配光**（太阳高度/色温/ambient 配比）而不是反射或阴影的缺陷；另外楼体窗洞、消防梯、
 路面补丁/裂缝/井盖等**内容细节**仍是低模。
 
+### 7.15 首个 HDR 后期客户端：`apps/endtime-m37` 挖出的三个 D3D12 缺陷（2026-11-25）
+
+`apps/endtime-m37`（《时间的尽头》黑洞移植）是第一个吃 **RGBA16F 场景 RT + 独立 D32 深度附件 +
+多级 bloom 金字塔** 的客户端（ocean-m34 用 RGBA32F、nyc 用 R32F 阴影图，都没同时踩这三点）。首跑
+崩在 `makeTargets()`：`Error #3684` / `GetDeviceRemovedReason 0x887a0001`。逐层定位到三个**真缺陷**，
+均在 `vendor/` 根部修（AGENTS §0），不是 demo 侧绕行：
+
+**① 深度纹理建了 RTV（`stage3d_d3d.cc` `s3d_create_texture_fmt`）。**
+`Context3DNative.createDepthTexture` 传 `renderable=1`，D3D12 据此 `isRT=1` → 对 `D32_FLOAT` 资源调
+`CreateRenderTargetView`。深度格式**不能**做 RTV（只能 DSV），该调用 `INVALID_CALL`，因 D3D12 错误
+异步上报，表现为后续 `CreateCommittedResource` 返回 `DEVICE_REMOVED`。修：`isRT = renderable && !isDepth`
+——深度资源只建 SRV（采样）+ DSV（绑定）。back-buffer 深度本就走 `isRT=0`，Metal 也早有 `!isDepth`
+守卫，故只 D3D12 触发。debug 层信息：`A resource cannot be bound as DEPTH_WRITE and NON_DEPTH_WRITE
+simultaneously` 即此。
+
+**② PSO 的 `DSVFormat` 硬编码 D24（`stage3d_d3d.cc` `s3d_select_pso`）。**
+`pd.DSVFormat` 原写死 `DXGI_FORMAT_D24_UNORM_S8_UINT`，而离屏 pass 绑的是 `createDepthTexture` 的
+D32/D16 ⇒ DSV 视图格式与 PSO 不符，`CreateGraphicsPipelineState` 返回 `E_INVALIDARG`。修：取
+`dsTex = renderOverride ? rtDepth : depth` 的格式作 `dsvFmt`，并把它加进 PSO key（与 `RTVFormats[0]`
+的 `rtfFmt` 同理——颜色与深度附件格式都烘进管线对象，key 必须同时携带）。`test/unit/stage3d.ts`
+的 key 结构钉同步加 `|%d` 字段，并新增「DSVFormat 随绑定深度格式」钉。
+
+**③ HLSL VS↔PS varying 寄存器错位（`shader_compiler.cc`）。**
+SPIRV-Cross 把 FS 输入结构 `SPIRV_Cross_Input` 从 reg0 紧凑排列。VS 输出
+`vN:TEXCOORD0(reg0), vUV:TEXCOORD1(reg1), vWp:TEXCOORD2(reg2)`，而只读 `vWp` 的 FS（如 NUMERAL_FS）
+把它排成 reg0 却仍带 TEXCOORD2。D3D12 要求同一语义在两阶段**硬件寄存器相同**，否则
+`CreateGraphicsPipelineState` 失败（debug 层：`Semantic 'TEXCOORD' ... mismatched hardware registers`）。
+修：新增 `align_hlsl_fs_inputs(fs_src, vs_src)`，在 `make_matrices_row_major` 之后把 FS 输入结构重建为
+**VS 输出的全部 varying、按 VS 寄存器序与类型**（跳过 `SV_*`；声明未读的 varying 合法）。Metal 按
+`[[user(locn)]]` location 链接、GL 按 location 链接，均不受影响；nyc/ocean 的 FS 读全部 varying（序一致）
+故此前未触发——这是「FS 读 varying 子集」才暴露的缺陷。
+
+**诊断闸门（保留，env 门控，默认关）**：`ASC_S3D_DEBUG=1` 在任何设备创建前启用 D3D12 debug 层
+（`d3d_glue.cc:d3d_init_shared`，设备与 Skia 共享故必须在此而非 `s3d_init_backend`）；PSO 失败路径
+排干 `ID3D12InfoQueue`（≤6 条 `D3D12: ...`）再 `ClearStoredMessages`；`ASC_SHADER_DUMP=1` 在
+`make_matrices_row_major` 后转储 HLSL VS/FS 源。三者把「设备移除/PSO 失败」从异步黑盒变成可读信息，
+是本轮定位三个缺陷的工具。
+
+**移植形状决策**（点图元→视空间四边形、无实例化→CPU 合并 swarm、无 normalMatrix→旋转烘进法线、
+additive 预乘 alpha=1、billboard 纹理垂直翻转）见 `asaot3d/three-api-design.md` §40.7（D236–D241、
+R119–R123）与 `asaot3d/apps/endtime-m37/README.md`。
+
 ## 8. 红线：AOT-only，AIR 侧如实报明
 
 **这条链 AIR（adl）走不了**——Adobe 的 `Context3D` 既没有浮点 RT，也没有 GLSL3 直通。所以：

@@ -409,6 +409,86 @@ static void make_matrices_row_major(std::string& src) {
   src.swap(out);
 }
 
+// ---- HLSL VS->PS varying register alignment --------------------------------
+// D3D12 links a vertex output to a pixel input by semantic name+index AND requires
+// the SAME hardware register in both stages. SPIRV-Cross packs each stage's struct
+// from register 0, so a fragment shader that reads only a SUBSET of the vertex
+// varyings lands them on lower registers than the vertex stage wrote: VS emits
+// vN:TEXCOORD0(reg0), vUV:TEXCOORD1(reg1), vWp:TEXCOORD2(reg2), but a FS reading
+// only vWp declares it first (reg0) while keeping TEXCOORD2. CreateGraphicsPipelineState
+// then refuses the pair ("Semantic 'TEXCOORD' ... mismatched hardware registers").
+// Rebuild the FS input struct to carry EVERY VS-output varying in the VS's register
+// order with the VS's types, so the used ones land on matching registers; the extra
+// members are declared but never read, which D3D allows. Metal links by location and
+// never needed this; the AGAL HLSL path gets the same effect by emitting all varyings.
+struct HlslMember { std::string type, name, sem; };
+
+static std::string hlsl_trim(const std::string& s) {
+  const size_t b = s.find_first_not_of(" \t\r\n");
+  if (b == std::string::npos) return "";
+  const size_t e = s.find_last_not_of(" \t\r\n");
+  return s.substr(b, e - b + 1);
+}
+
+static bool parse_hlsl_struct(const std::string& src, const char* struct_name,
+                              std::vector<HlslMember>* members) {
+  const std::string key = std::string("struct ") + struct_name;
+  const size_t s = src.find(key);
+  if (s == std::string::npos) return false;
+  const size_t open = src.find('{', s);
+  const size_t close = (open == std::string::npos) ? std::string::npos : src.find("};", open);
+  if (close == std::string::npos) return false;
+  const std::string body = src.substr(open + 1, close - open - 1);
+  size_t ls = 0;
+  while (ls < body.size()) {
+    size_t le = body.find('\n', ls);
+    if (le == std::string::npos) le = body.size();
+    const std::string line = hlsl_trim(body.substr(ls, le - ls));
+    ls = (le < body.size()) ? le + 1 : le;
+    if (line.empty() || line[0] == '/') continue;
+    const size_t colon = line.find(':');
+    const size_t semi = line.find(';');
+    if (colon == std::string::npos || semi == std::string::npos || semi < colon) continue;
+    const std::string decl = hlsl_trim(line.substr(0, colon));
+    const size_t sp = decl.find_last_of(" \t");
+    if (sp == std::string::npos) continue;
+    HlslMember m;
+    m.type = hlsl_trim(decl.substr(0, sp));
+    m.name = hlsl_trim(decl.substr(sp + 1));
+    m.sem = hlsl_trim(line.substr(colon + 1, semi - colon - 1));
+    if (!m.type.empty() && !m.name.empty() && !m.sem.empty()) members->push_back(m);
+  }
+  return true;
+}
+
+static void align_hlsl_fs_inputs(std::string& fs_src, const std::string& vs_src) {
+  std::vector<HlslMember> vsOut, fsIn;
+  if (!parse_hlsl_struct(vs_src, "SPIRV_Cross_Output", &vsOut)) return;
+  if (!parse_hlsl_struct(fs_src, "SPIRV_Cross_Input", &fsIn)) return;
+  // The VS output varyings (skip SV_Position / other builtins) in register order.
+  std::vector<HlslMember> want;
+  for (size_t i = 0; i < vsOut.size(); i++)
+    if (vsOut[i].sem.compare(0, 3, "SV_") != 0) want.push_back(vsOut[i]);
+  // Defensive: keep any FS input the VS does not write (a valid pair has none).
+  for (size_t i = 0; i < fsIn.size(); i++) {
+    bool found = false;
+    for (size_t j = 0; j < want.size(); j++) if (want[j].name == fsIn[i].name) { found = true; break; }
+    if (!found) want.push_back(fsIn[i]);
+  }
+  bool same = fsIn.size() == want.size();
+  if (same)
+    for (size_t i = 0; i < want.size(); i++)
+      if (fsIn[i].name != want[i].name || fsIn[i].sem != want[i].sem) { same = false; break; }
+  if (same) return;
+  std::string body = "\n";
+  for (size_t i = 0; i < want.size(); i++)
+    body += "    " + want[i].type + " " + want[i].name + " : " + want[i].sem + ";\n";
+  const size_t s = fs_src.find("struct SPIRV_Cross_Input");
+  const size_t open = fs_src.find('{', s);
+  const size_t close = fs_src.find("};", open);
+  fs_src = fs_src.substr(0, open + 1) + body + fs_src.substr(close);
+}
+
 int resource_array_size(spvc_compiler comp, spvc_type_id type_id) {
   spvc_type t = spvc_compiler_get_type_handle(comp, type_id);
   if (spvc_type_get_num_array_dimensions(t) == 0) return 1;
@@ -864,6 +944,10 @@ bool cross_compile(const std::vector<uint32_t>& spv, spvc_backend backend, int s
   result->source.assign(src);
   if (backend == SPVC_BACKEND_MSL) normalize_msl_param_refs(result->source);
   if (backend == SPVC_BACKEND_HLSL) make_matrices_row_major(result->source);
+  if (backend == SPVC_BACKEND_HLSL && getenv("ASC_SHADER_DUMP")) {
+    fprintf(stderr, "=== HLSL %s ===\n%s\n=== end HLSL %s ===\n",
+            stage == 0 ? "VS" : "FS", result->source.c_str(), stage == 0 ? "VS" : "FS");
+  }
   // Reflection must run AFTER compile: the automatic resource indices are assigned
   // during code generation, so querying earlier returns unset decorations.
   if (backend == SPVC_BACKEND_MSL) {
@@ -969,6 +1053,9 @@ int asc_shader_translate(const char* vs, const char* fs, int target, asc_shader_
     return 0;
   }
   out->vertex_source = strdup(vres.source.c_str());
+  // A FS that reads a subset of the VS varyings must still declare them at the VS's
+  // registers (see align_hlsl_fs_inputs); do it on the pair before handing it out.
+  if (backend == SPVC_BACKEND_HLSL) align_hlsl_fs_inputs(fres.source, vres.source);
   out->fragment_source = strdup(fres.source.c_str());
   out->color_attachments = fres.color_attachments > 0 ? fres.color_attachments : 1;
   return 1;

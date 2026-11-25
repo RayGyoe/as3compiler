@@ -1158,6 +1158,55 @@ while our default 15:30 puts the sun at 37.9 deg with the street in direct light
 reflection or the shadow; and facade window recesses, fire escapes, road patches/cracks/manholes are
 still low-poly **content**.
 
+### 7.15 First HDR-post client: three D3D12 defects surfaced by `apps/endtime-m37` (2026-11-25)
+
+`apps/endtime-m37` (the "End of Time" black-hole port) is the first client to use an **RGBA16F scene
+RT + a separate D32 depth attachment + a multi-level bloom pyramid** at once (ocean-m34 uses RGBA32F,
+nyc an R32F shadow map; neither hit all three). The first run crashed in `makeTargets()`:
+`Error #3684` / `GetDeviceRemovedReason 0x887a0001`. Layer-by-layer this traced to three **real
+defects**, all fixed at the root in `vendor/` (AGENTS §0), not worked around in the demo:
+
+**① A depth texture got an RTV (`stage3d_d3d.cc` `s3d_create_texture_fmt`).**
+`Context3DNative.createDepthTexture` passes `renderable=1`, so D3D12 set `isRT=1` and called
+`CreateRenderTargetView` on a `D32_FLOAT` resource. A depth format **cannot** be an RTV (only a DSV);
+the call is `INVALID_CALL`, and because D3D12 reports errors asynchronously it surfaced as a later
+`CreateCommittedResource` returning `DEVICE_REMOVED`. Fix: `isRT = renderable && !isDepth` — a depth
+resource gets only an SRV (sampling) + DSV (binding). The back-buffer depth already used `isRT=0`, and
+Metal already guarded with `!isDepth`, so only D3D12 triggered. Debug-layer message:
+`A resource cannot be bound as DEPTH_WRITE and NON_DEPTH_WRITE simultaneously`.
+
+**② The PSO `DSVFormat` was hardcoded to D24 (`stage3d_d3d.cc` `s3d_select_pso`).**
+`pd.DSVFormat` was fixed at `DXGI_FORMAT_D24_UNORM_S8_UINT`, while an offscreen pass binds the
+D32/D16 from `createDepthTexture` ⇒ the DSV view format mismatches the PSO and
+`CreateGraphicsPipelineState` returns `E_INVALIDARG`. Fix: derive `dsvFmt` from
+`dsTex = renderOverride ? rtDepth : depth` and add it to the PSO key (exactly like `rtfFmt` for
+`RTVFormats[0]` — both colour and depth attachment formats are baked into the pipeline object, so the
+key must carry both). The key pin in `test/unit/stage3d.ts` gained a `|%d` field plus a new
+"DSVFormat follows the bound depth format" pin.
+
+**③ HLSL VS↔PS varying register mismatch (`shader_compiler.cc`).**
+SPIRV-Cross packs the FS input struct `SPIRV_Cross_Input` from reg0. The VS outputs
+`vN:TEXCOORD0(reg0), vUV:TEXCOORD1(reg1), vWp:TEXCOORD2(reg2)`, but an FS that reads only `vWp`
+(e.g. NUMERAL_FS) packs it at reg0 while keeping TEXCOORD2. D3D12 requires the same semantic to sit in
+the **same hardware register** in both stages, else `CreateGraphicsPipelineState` fails (debug layer:
+`Semantic 'TEXCOORD' ... mismatched hardware registers`). Fix: a new `align_hlsl_fs_inputs(fs_src,
+vs_src)` rebuilds the FS input struct, after `make_matrices_row_major`, to carry **every VS-output
+varying in VS register order and type** (skipping `SV_*`; declaring an unread varying is legal). Metal
+links by `[[user(locn)]]` location and GL by location, so neither is affected; nyc/ocean FS read all
+varyings (same order) and never triggered it — this is a "FS reads a varying subset" defect.
+
+**Diagnostic gates (kept, env-gated, off by default)**: `ASC_S3D_DEBUG=1` enables the D3D12 debug
+layer before any device creation (`d3d_glue.cc:d3d_init_shared`; the device is shared with Skia, so it
+must be here, not `s3d_init_backend`); the PSO-failure path drains `ID3D12InfoQueue` (≤6 `D3D12: ...`
+messages) then `ClearStoredMessages`; `ASC_SHADER_DUMP=1` dumps the HLSL VS/FS source after
+`make_matrices_row_major`. Together they turn "device removed / PSO failed" from an async black box
+into readable messages — the tools that located all three defects this round.
+
+**Port shape decisions** (points → view-space quads, no instancing → CPU-merged swarms, no
+normalMatrix → rotation baked into normals, additive premultiplied alpha=1, billboard texture vertical
+flip) live in `asaot3d/three-api-design.md` §40.7 (D236–D241, R119–R123) and
+`asaot3d/apps/endtime-m37/README.md`.
+
 ## 8. Red line: AOT-only, reported honestly on the AIR side
 
 **This chain cannot run on AIR (adl)** — Adobe's `Context3D` has neither float RT nor GLSL3 passthrough. Hence:

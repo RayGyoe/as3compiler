@@ -13115,7 +13115,18 @@ Icon* NativeApplication_get_icon(void* _this) { (void)_this; return (Icon*)as_do
     this.line('return as_v_str(as_str_slice(s, from, to));');
     this.indent--;
     this.line('}');
-    this.line('if (strcmp(name, "split") == 0) return as_v_arr((void*)as_str_split(s, as_v_str_val(args[0])));');
+    this.line('if (strcmp(name, "split") == 0) {');
+    this.indent++;
+    this.line('int limit = argc >= 2 ? as_v_int_cast(args[1]) : 0x7FFFFFFF;');
+    this.line('if (as_v_is_inst(args[0], (void*)&RegExp_vt)) {');
+    this.indent++;
+    this.line('RegExp* re = (RegExp*)args[0].ptr;');
+    this.line('return as_v_arr((void*)as_str_split_regex(s, re->_compiled, limit));');
+    this.indent--;
+    this.line('}');
+    this.line('return as_v_arr((void*)as_str_split_limit(s, as_v_str_val(args[0]), limit));');
+    this.indent--;
+    this.line('}');
     this.line('if (strcmp(name, "toUpperCase") == 0) return as_v_str(as_str_toUpper(s));');
     this.line('if (strcmp(name, "toLowerCase") == 0) return as_v_str(as_str_toLower(s));');
     // AVM2 implements the locale aliases with the plain methods themselves --
@@ -43467,8 +43478,14 @@ void FileStream_writeObject(void* _this, as_value v) {
         return { code: `as_str_slice(${s}, ${from}, ${to})`, type: { kind: 'string' } };
       }
       case 'split': {
-        const sep = argStr(0);
-        return { code: `as_str_split(${s}, ${sep})`, type: { kind: 'array' } };
+        const arg = this.emitExpr(args[0]);
+        const limit = args.length >= 2 ? argInt(1, '0x7FFFFFFF') : '0x7FFFFFFF';
+        if (arg.type.kind === 'object' && arg.type.className === 'RegExp') {
+          return { code: `as_str_split_regex(${s}, ${arg.code}->_compiled, ${limit})`, type: { kind: 'array' } };
+        }
+        // String delimiter: literal split (NOT a regex pattern, unlike match/search).
+        const sep = arg.type.kind === 'string' ? arg.code : this.toStringExpr(arg);
+        return { code: `as_str_split_limit(${s}, ${sep}, ${limit})`, type: { kind: 'array' } };
       }
       case 'toUpperCase': return { code: `as_str_toUpper(${s})`, type: { kind: 'string' } };
       case 'toLowerCase': return { code: `as_str_toLower(${s})`, type: { kind: 'string' } };

@@ -130,3 +130,21 @@ trace("abc".replace(/b/, function(match:String, offset:int, input:String):String
 trace("a1b2".replace(/\d/g, function(match:String, offset:int, input:String):String { return "(" + match + ")"; }) == "a(1)b(2)");  // true
 trace("John Smith".replace(/(\w+) (\w+)/, function(match:String, first:String, last:String, offset:int, whole:String):String { return last + ", " + first; }) == "Smith, John");  // true
 trace("abc".replace(/b/, function(match:String, offset:int, input:String):String { return "[" + input + "@" + offset + "]"; }) == "a[abc@1]c");  // true
+
+// --- String.split(RegExp) (ES3 15.5.4.14) ---
+// A RegExp delimiter splits at every match; a String delimiter stays literal.
+trace("1:05:15".split(/[:;.]/).join("|") == "1|05|15");  // true
+trace("a1b22c333".split(/\d+/).join("|") == "a|b|c|");  // true
+trace("one two  three".split(/\s+/).join("|") == "one|two|three");  // true
+trace("abc".split(/z/).join("|") == "abc");  // true
+trace("a,b;c".split(/[,;]/).length == 3);  // true
+// Capturing groups splice into the result after the piece they terminated.
+trace("a1b2".split(/(\d)/).join("|") == "a|1|b|2|");  // true
+// limit caps the element count for both delimiter kinds.
+trace("a,b,c,d".split(",", 2).join("|") == "a|b");  // true
+trace("a1b2c3".split(/\d/, 2).join("|") == "a|b");  // true
+trace("abc".split("", 2).join("|") == "a|b");  // true
+// A zero-width pattern advances one char per cut instead of looping forever.
+trace("abc".split(/(?:)/).join("|") == "a|b|c");  // true
+// The inert (compile-error) regex leaves the string whole, like match/replace.
+trace("a(b".split(new RegExp("(")).join("|") == "a(b");  // true

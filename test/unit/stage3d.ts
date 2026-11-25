@@ -1229,10 +1229,17 @@ function checkStage3dD3dGlue(): string[] {
     // ... and the target's pixel format, which a later stage added as another field:
     // Metal/D3D12 bake the color-attachment format into the pipeline object, so it
     // belongs in the key exactly like the blend pair does.
-    && /\|\%d\|\%s\|\%s\|\%x\|\%d"/.test(pso)
+    && /\|\%d\|\%s\|\%s\|\%x\|\%d\|\%d"/.test(pso)
     && /\(int\)\(c->blendSource != NULL \|\| c->blendDest != NULL\),/.test(pso)
     && /c->blendSource \? c->blendSource : ""/.test(pso)
     && /c->blendDest \? c->blendDest : ""/.test(pso));
+  // The depth attachment's format is baked into the PSO too: createDepthTexture can
+  // make a D32_FLOAT/D16 attachment for an offscreen pass, and a hardcoded D24 here
+  // mismatches that view and D3D12 removes the device (INVALID_CALL). The key must
+  // carry it exactly like the color-attachment format (rtfFmt) does.
+  check('the PSO DSVFormat follows the bound depth attachment, not a hardcoded D24',
+    /const int dsvFmt = \(dsTex != NULL\) \? \(int\)dsTex->format : \(int\)DXGI_FORMAT_D24_UNORM_S8_UINT;/.test(pso)
+    && /pd\.DSVFormat = dsNeeded \? \(DXGI_FORMAT\)dsvFmt : DXGI_FORMAT_UNKNOWN;/.test(pso));
   const alphaOf = bodyOfIn(d3d, 'static D3D12_BLEND s3d_blend_factor_alpha(');
   check('a *_COLOR blend factor is translated to its alpha twin for the alpha slots',
     alphaOf !== ''

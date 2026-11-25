@@ -11371,6 +11371,52 @@ static as_array* as_str_match_regex(char* s, as_regex* re, int global) {
     return as_regex_make_result(s, m, end, re, cap);
 }
 
+// String.split(RegExp): ES3 15.5.4.14 — cut at every match, splicing each
+// defined capture group into the result right after the piece it terminated
+// (non-participating groups contribute undefined). limit caps the element
+// count (AS3 String.split(delimiter, limit)); negative means unlimited. An
+// empty match at the start of the current piece is skipped (q advances one
+// char) so a zero-width pattern cannot loop forever.
+static as_array* as_str_split_regex(char* s, as_regex* re, int limit) {
+    as_array* result = as_array_new();
+    int len = (int)strlen(s);
+    if (limit == 0) return result;
+    if (limit < 0) limit = 0x7FFFFFFF;
+    if (re == NULL || re->err) {
+        as_array_push(result, as_v_str(as_str_substring_b(s, 0, len)));
+        return result;
+    }
+    int cap[2 * (AS_RE_MAX_GROUPS + 1)];
+    int pos = 0, last = 0;
+    while (pos < len) {
+        for (int i = 0; i < 2 * (re->ngroups + 1); i++) cap[i] = -1;
+        int end = -1;
+        int m = as_regex_search(re, s, len, pos, cap, &end);
+        if (m < 0) break;
+        if (end == m && m == last) { pos = m + 1; continue; }
+        as_array_push(result, as_v_str(as_str_substring_b(s, last, m)));
+        if (result->length >= limit) return result;
+        for (int g = 1; g <= re->ngroups; g++) {
+            if (cap[2 * g] >= 0) as_array_push(result, as_v_str(as_str_substring_b(s, cap[2 * g], cap[2 * g + 1])));
+            else as_array_push(result, as_v_undefined());
+            if (result->length >= limit) return result;
+        }
+        last = end;
+        pos = end;
+    }
+    if (result->length < limit) as_array_push(result, as_v_str(as_str_substring_b(s, last, len)));
+    return result;
+}
+
+// String.split(String, limit): the plain literal split, truncated to limit
+// elements (negative = unlimited). AS3 honours the limit for both delimiter
+// kinds; the regex kind is handled by as_str_split_regex.
+static as_array* as_str_split_limit(const char* s, const char* sep, int limit) {
+    as_array* r = as_str_split(s, sep);
+    if (limit >= 0 && r->length > limit) r->length = limit;
+    return r;
+}
+
 // String.search(RegExp): first match position (always from 0), -1 if none.
 static int as_str_search_regex(char* s, as_regex* re) {
     int len = (int)strlen(s);

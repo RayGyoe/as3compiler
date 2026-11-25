@@ -1163,10 +1163,18 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   // the view the pass binds.
   const S3DTexture* tgt = s3d_cur_target(c);
   const int rtfFmt = (tgt != NULL) ? (int)tgt->format : 0;
+  // The depth attachment's format is baked into the PSO too (DSVFormat). The
+  // back buffer's depth is D24_UNORM_S8_UINT, but createDepthTexture can make a
+  // D32_FLOAT / D16_UNORM attachment for an offscreen pass; a hardcoded D24 here
+  // mismatches that view and D3D12 removes the device (INVALID_CALL). Mirror the
+  // depth selection the draw itself uses (s3d_encode_draw: rtDepth when an RT is
+  // bound, else the back buffer depth).
+  const S3DTexture* dsTex = dsNeeded ? (c->renderOverride != NULL ? c->rtDepth : c->depth) : NULL;
+  const int dsvFmt = (dsTex != NULL) ? (int)dsTex->format : (int)DXGI_FORMAT_D24_UNORM_S8_UINT;
 
   char sk[S3D_KEY_CAP];
   snprintf(sk, sizeof sk,
-           "%016llx|%x|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s|%d|%s|%s|%x|%d",
+           "%016llx|%x|%d|%s|%s|%s|%s|%s|%s|%d|%d|%d|%s|%d|%s|%s|%x|%d|%d",
            (unsigned long long)(pr ? pr->srcHash : 0),
            s3d_write_mask_bits(c),
            c->depthWrite ? 1 : 0,
@@ -1185,7 +1193,8 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
            c->blendSource ? c->blendSource : "",
            c->blendDest ? c->blendDest : "",
            streamSig,
-           rtfFmt);
+           rtfFmt,
+           dsvFmt);
 
   for (int i = 0; i < pr->npso; i++) {
     if (strcmp(pr->pso[i].key, sk) == 0) {
@@ -1304,7 +1313,7 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1;
   pd.RTVFormats[0] = (rtfFmt != 0) ? (DXGI_FORMAT)rtfFmt : DXGI_FORMAT_B8G8R8A8_UNORM;
-  pd.DSVFormat = dsNeeded ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
+  pd.DSVFormat = dsNeeded ? (DXGI_FORMAT)dsvFmt : DXGI_FORMAT_UNKNOWN;
   pd.SampleDesc.Count = 1;
   pd.NodeMask = 0;
   pd.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
@@ -1316,6 +1325,23 @@ static ID3D12PipelineState* s3d_select_pso(S3DContext* c, S3DProg* pr) {
     // must be loud rather than a silent black frame.
     fprintf(stderr, "stage3d_d3d: CreateGraphicsPipelineState failed: 0x%08lx (key=%s)\n",
             (unsigned long)hr, sk);
+    // With ASC_S3D_DEBUG=1 the debug layer is on; drain its info queue so the exact
+    // rejected field (linkage / format / state) is named instead of a bare HRESULT.
+    ID3D12InfoQueue* iq = NULL;
+    if (SUCCEEDED(c->device->QueryInterface(__uuidof(ID3D12InfoQueue), (void**)&iq)) && iq != NULL) {
+      const UINT64 n = iq->GetNumStoredMessages();
+      for (UINT64 i = 0; i < n && i < 6; i++) {
+        SIZE_T len = 0;
+        iq->GetMessage(i, NULL, &len);
+        if (len == 0) continue;
+        D3D12_MESSAGE* m = (D3D12_MESSAGE*)malloc(len);
+        if (m != NULL && SUCCEEDED(iq->GetMessage(i, m, &len)))
+          fprintf(stderr, "  D3D12: %s\n", (const char*)m->pDescription);
+        free(m);
+      }
+      iq->ClearStoredMessages();
+      iq->Release();
+    }
     fflush(stderr);
     return NULL;
   }
@@ -3107,7 +3133,12 @@ void* s3d_create_texture_fmt(void* ctx, int width, int height, int fmtId,
     int m = width > height ? width : height;
     while (m > 1) { m >>= 1; mips++; }
   }
-  S3DTexture* t = s3d_make_texture_fmt(c, width, height, mips, 1, renderable ? 1 : 0,
+  // A depth attachment is NOT a colour render target: createDepthTexture passes
+  // renderable=1, but letting that set isRT would call CreateRenderTargetView on a
+  // D32_FLOAT/D16 resource, which is invalid and removes the D3D12 device
+  // (INVALID_CALL, reported at the NEXT CreateCommittedResource). The back buffer
+  // depth avoids this by passing isRT=0; do the same for any depth format.
+  S3DTexture* t = s3d_make_texture_fmt(c, width, height, mips, 1, (renderable && !isDepth) ? 1 : 0,
                                        isDepth, 0, fmt);
   if (t != NULL) t->hasChain = (mips > 1) ? 1 : 0;
   return (void*)t;

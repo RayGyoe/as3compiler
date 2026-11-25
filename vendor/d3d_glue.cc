@@ -509,6 +509,19 @@ static IDXGIAdapter1* d3d_hardware_adapter(IDXGIFactory4* factory) {
 static int d3d_init_shared(void) {
   if (g_context != nullptr) return 1;
 
+  // Opt-in D3D12 debug layer: must be enabled before ANY device is created, so it
+  // lives here at the top of the shared-device init. ASC_S3D_DEBUG=1 turns on the
+  // validation messages that name the exact rejected field (PSO linkage, format
+  // mismatch, ...); the stage3d PSO failure path drains the info queue.
+  if (getenv("ASC_S3D_DEBUG") != nullptr) {
+    ID3D12Debug* dbg = nullptr;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg))) && dbg != nullptr) {
+      dbg->EnableDebugLayer();
+      fprintf(stderr, "d3d_glue: D3D12 debug layer enabled\n");
+      dbg->Release();
+    }
+  }
+
   gr_cp<IDXGIFactory4> factory;
   D3D_OK_OR_WARN(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
   if (factory.get() == nullptr) return 0;

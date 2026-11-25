@@ -24814,3 +24814,37 @@ macOS 一侧展开结果逐项不变（同样的四个源、同样的 defines、
   的归因句必须带口径时间点，否则下一个阶段会拿旧结论当现状；③ **顺手优化要真量**：预数扩容看起来
   必赚，实测刚好打平，所以不进代码；④ **缓存指针前先问 GC**：能安全缓存的只有「别人已经持有引用」
   的那些值，其余重新算一遍比埋悬垂指针便宜得多。
+
+### 阶段四百四十八：endtime-m37 移植挖出的三个 D3D12 缺陷（v0.4.442 → v0.4.443）✅ 已完成
+
+**触发**：`asaot3d/apps/endtime-m37`（《时间的尽头》黑洞移植，单文件 three.js `temp/index.html`）
+是第一个同时吃 **RGBA16F 场景 RT + 独立 D32 深度附件 + 多级 bloom 金字塔** 的原生通道客户端。
+首跑崩在 `makeTargets()`（`Error #3684` / `GetDeviceRemovedReason 0x887a0001`），逐层定位到三个
+**真缺陷**，均按 §0 在 `vendor/` 根部修，不在 demo 侧绕行：
+
+1. **深度纹理建了 RTV**（`stage3d_d3d.cc:s3d_create_texture_fmt`）：`createDepthTexture` 传
+   `renderable=1` → `isRT=1` → 对 D32_FLOAT 调 `CreateRenderTargetView`（深度格式不能做 RTV）→
+   INVALID_CALL，异步表现为 DEVICE_REMOVED。修 `isRT = renderable && !isDepth`（深度只建 SRV+DSV，
+   与 back-buffer 深度同口径；Metal 早有 `!isDepth` 守卫，故只 D3D12 触发）。
+2. **PSO `DSVFormat` 硬编码 D24**（`stage3d_d3d.cc:s3d_select_pso`）：与离屏 D32/D16 深度附件不符 →
+   `CreateGraphicsPipelineState` E_INVALIDARG。修：DSVFormat 取 `renderOverride ? rtDepth : depth`
+   的格式并纳入 PSO key（与 RTVFormats[0] 的 rtfFmt 同理）。`test/unit/stage3d.ts` key 钉加 `|%d`
+   字段 + 新增「DSVFormat 随绑定深度格式」钉。
+3. **HLSL VS↔PS varying 寄存器错位**（`shader_compiler.cc`）：SPIRV-Cross 把 FS 输入从 reg0 紧凑排列，
+   FS 只读 VS varying **子集**时同一 TEXCOORD 在两阶段寄存器不同 → linkage 失败。修：新增
+   `align_hlsl_fs_inputs`，在 `make_matrices_row_major` 后把 FS 输入补齐到 VS 输出的全部 varying、
+   按 VS 寄存器序与类型。Metal/GL 按 location 链接不受影响；nyc/ocean FS 读全部 varying 故此前未触发。
+
+**诊断闸门（保留，env 门控默认关）**：`ASC_S3D_DEBUG=1`（设备创建前启 debug 层，`d3d_glue.cc:d3d_init_shared`，
+设备与 Skia 共享故必须在此）+ PSO 失败排干 InfoQueue；`ASC_SHADER_DUMP=1`（转储 HLSL VS/FS）。
+
+**移植形状决策**（点图元→视空间四边形、无实例化→CPU 合并 swarm、无 normalMatrix→旋转烘进法线、
+additive 预乘 alpha=1、billboard 纹理垂直翻转、自检须在淡入完成后读回）记在
+`asaot3d/three-api-design.md` §40.7（D236–D241、R119–R123）、`asaot3d/apps/endtime-m37/README.md`、
+`docs/{zh-cn,en}/native-shader.md` §7.15。demo 五项自检全 PASS（mean 57.2、覆盖 66.3%、calls=10、零回退）。
+
+**回归**：`node test.ts` 全量 **750 / 743 过 / 2 红 / 5 skip**（`temp/node-test-endtime2.log`）。
+本阶段引入的唯一红（stage3d/d3d-glue 的 PSO key 钉）已修，stage3d 组 26/26 绿。剩余 2 红
+（`emit/StringAccumulator`、`build/Yuv420HostManifest`）钉的是 git-clean 的 `emit.ts`/`build.ts`，
+属并发会话的 host-state，与本阶段 4 个改动文件（`vendor/{stage3d_d3d,d3d_glue,shader_compiler}.cc`、
+`test/unit/stage3d.ts`）无关。
