@@ -12691,6 +12691,8 @@ extern void sk_window_set_cursor(int id, int kind);
 extern void sk_window_minimize(int id);
 extern void sk_window_maximize(int id);
 extern void sk_window_restore(int id);
+extern void sk_window_set_fullscreen(int id, int on);
+extern int sk_window_is_fullscreen(int id);
 extern void sk_window_order_front(int id);
 extern void sk_window_order_back(int id);
 extern int sk_window_display_index(int id);
@@ -13028,6 +13030,22 @@ static inline void as_window_restore(int id) {
     sk_window_restore(id);
 #else
     (void)id;
+#endif
+}
+// Runtime fullScreen (Stage.displayState / NativeWindow.displayState). Offscreen-only
+// builds have no window, so the request is a no-op there like the other geometry calls.
+static inline void as_window_set_fullscreen(int id, int on) {
+#ifdef ASC_USE_WINDOW
+    sk_window_set_fullscreen(id, on);
+#else
+    (void)id; (void)on;
+#endif
+}
+static inline int as_window_is_fullscreen(int id) {
+#ifdef ASC_USE_WINDOW
+    return sk_window_is_fullscreen(id);
+#else
+    (void)id; return 0;
 #endif
 }
 static inline void as_window_order_front(int id) {
@@ -13501,6 +13519,8 @@ static inline void as_window_activate(int id) { (void)id; }
 // backend branches.
 static inline void as_window_set_cursor(int id, int kind) { (void)id; (void)kind; }
 static inline void as_window_minimize(int id) { (void)id; }
+static inline void as_window_set_fullscreen(int id, int on) { (void)id; (void)on; }
+static inline int as_window_is_fullscreen(int id) { (void)id; return 0; }
 static inline void as_window_maximize(int id) { (void)id; }
 static inline void as_window_restore(int id) { (void)id; }
 static inline void as_window_order_front(int id) { (void)id; }

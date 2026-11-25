@@ -651,6 +651,8 @@ void sk_window_activate(int id) { (void)id; }
 void sk_window_minimize(int id) { (void)id; }
 void sk_window_maximize(int id) { (void)id; }
 void sk_window_restore(int id) { (void)id; }
+void sk_window_set_fullscreen(int id, int on) { (void)id; (void)on; }
+int sk_window_is_fullscreen(int id) { (void)id; return 0; }
 void sk_window_order_front(int id) { (void)id; }
 void sk_window_order_back(int id) { (void)id; }
 int sk_window_display_index(int id) { (void)id; return 0; }

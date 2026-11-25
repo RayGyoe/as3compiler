@@ -7770,6 +7770,31 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.indent--;
     this.line('}');
     this.line('bool NativeWindow_get_active(void* _this) { return as_window_is_active(((NativeWindow*)_this)->_win) ? true : false; }');
+    // Shared displayState application for NativeWindow AND Stage (the stage drives the
+    // main window). fullScreen/fullScreenInteractive go through SDL_SetWindowFullscreen
+    // (FULLSCREEN_DESKTOP); any other state first leaves fullscreen so AIR's "normal
+    // returns to the pre-fullscreen frame" holds, then minimizes/maximizes/restores.
+    this.line('static void ASC_apply_display_state(int id, char* value) {');
+    this.indent++;
+    this.line('ASCWin* w = ASC_w(id);');
+    this.line('if (w == NULL || value == NULL) return;');
+    this.line('w->prog_writes++;');
+    this.line('if (strcmp(value, "fullScreen") == 0 || strcmp(value, "fullScreenInteractive") == 0) {');
+    this.indent++;
+    this.line('as_window_set_fullscreen(id, 1);');
+    this.indent--;
+    this.line('} else {');
+    this.indent++;
+    this.line('as_window_set_fullscreen(id, 0);');
+    this.line('if (strcmp(value, "minimized") == 0) as_window_minimize(id);');
+    this.line('else if (strcmp(value, "maximized") == 0) as_window_maximize(id);');
+    this.line('else as_window_restore(id);');
+    this.indent--;
+    this.line('}');
+    this.line('w->display_state = value;');
+    this.line('gc_write_barrier((void*)w->display_state);');
+    this.indent--;
+    this.line('}');
     this.line('char* NativeWindow_get_displayState(void* _this) {');
     this.indent++;
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
@@ -7778,16 +7803,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('}');
     this.line('void NativeWindow_set_displayState(void* _this, char* value) {');
     this.indent++;
-    this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
-    this.line('if (w == NULL || value == NULL) return;');
-    // Each of these changes the frame, so it is counted as an app-caused geometry
-    // change: maximize/restore must surface as a bare RESIZE, never as RESIZING.
-    this.line('w->prog_writes++;');
-    this.line('if (strcmp(value, "minimized") == 0) as_window_minimize(((NativeWindow*)_this)->_win);');
-    this.line('else if (strcmp(value, "maximized") == 0) as_window_maximize(((NativeWindow*)_this)->_win);');
-    this.line('else as_window_restore(((NativeWindow*)_this)->_win);');
-    this.line('w->display_state = value;');
-    this.line('gc_write_barrier((void*)w->display_state);');
+    this.line('ASC_apply_display_state(((NativeWindow*)_this)->_win, value);');
     this.indent--;
     this.line('}');
     this.line('bool NativeWindow_get_alwaysInFront(void* _this) {');
@@ -8038,6 +8054,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w != NULL) { w->display_state = (char*)"minimized"; gc_write_barrier((void*)w->display_state); }');
     this.line('if (w != NULL) w->prog_writes++;');
+    this.line('as_window_set_fullscreen(((NativeWindow*)_this)->_win, 0);');
     this.line('as_window_minimize(((NativeWindow*)_this)->_win);');
     this.indent--;
     this.line('}');
@@ -8046,6 +8063,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w != NULL) { w->display_state = (char*)"maximized"; gc_write_barrier((void*)w->display_state); }');
     this.line('if (w != NULL) w->prog_writes++;');
+    this.line('as_window_set_fullscreen(((NativeWindow*)_this)->_win, 0);');
     this.line('as_window_maximize(((NativeWindow*)_this)->_win);');
     this.indent--;
     this.line('}');
@@ -8054,6 +8072,7 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
     this.line('ASCWin* w = ASC_w(((NativeWindow*)_this)->_win);');
     this.line('if (w != NULL) { w->display_state = (char*)"normal"; gc_write_barrier((void*)w->display_state); }');
     this.line('if (w != NULL) w->prog_writes++;');
+    this.line('as_window_set_fullscreen(((NativeWindow*)_this)->_win, 0);');
     this.line('as_window_restore(((NativeWindow*)_this)->_win);');
     this.indent--;
     this.line('}');
@@ -15814,11 +15833,13 @@ this.line('AS_bake_pend_n = 0;');
     // re-derivation lives with the window table much further down the file, so it
     // is forward-declared here.
     this.line('static void ASC_stage_size_refresh(void* stage);');
+    this.line('static void ASC_apply_display_state(int id, char* value);');
     // color/align/scaleMode are window-level render inputs: writing them must mark
     // the stage dirty (docs/zh-cn/repaint-boundary.md). The rest are pure slots.
     const stageRenderDirty = new Set(['color', 'align', 'scaleMode']);
     for (const [an, cf, ct] of stageFieldAccessors) {
       if (an === 'scaleMode') continue;
+      if (an === 'displayState') continue;
       if (stageRenderDirty.has(an)) {
         this.line(`void Stage_set_${an}(void* _this, ${ct} value) { ((Stage*)_this)->${cf} = value; as_mark_dirty((DisplayObject*)_this); }`);
       } else {
@@ -15840,6 +15861,17 @@ this.line('AS_bake_pend_n = 0;');
     this.line('((Stage*)_this)->scale_mode = value;');
     this.line('ASC_stage_size_refresh(_this);');
     this.line('as_mark_dirty((DisplayObject*)_this);');
+    this.indent--;
+    this.line('}');
+    // Stage.displayState drives the MAIN window (AIR: the stage's window). The slot is
+    // kept for the getter / show-time fullscreen flag, and the geometry change goes
+    // through the same helper NativeWindow uses so both records stay in step.
+    this.line('void Stage_set_displayState(void* _this, char* value) {');
+    this.indent++;
+    this.line('((Stage*)_this)->display_state = value;');
+    this.line('gc_write_barrier((void*)value);');
+    this.line('int id = as_window_main();');
+    this.line('if (id >= 0) ASC_apply_display_state(id, value);');
     this.indent--;
     this.line('}');
     // frameRate is deliberately NOT field-backed: AIR keeps ONE frame rate for the
@@ -33294,7 +33326,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     // and the event it already dispatched is not repeated. "fullScreen" is left alone:
     // that state is AS3's own and the glue answers -1 for it.
     this.line('int osds = as_window_os_display_state(id);');
-    this.line('bool ds_owned = (w->display_state != NULL && strcmp(w->display_state, "fullScreen") == 0);');
+    this.line('bool ds_owned = (w->display_state != NULL && (strcmp(w->display_state, "fullScreen") == 0 || strcmp(w->display_state, "fullScreenInteractive") == 0));');
     this.line('if (osds >= 0 && !ds_owned) {');
     this.indent++;
     this.line('char* want = (osds == 1) ? (char*)"minimized" : (osds == 2) ? (char*)"maximized" : (char*)"normal";');
@@ -34806,7 +34838,7 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('#endif');
     this.line('w->lw = (int)width; w->lh = (int)height;');
     this.line('w->pw = (int)width; w->ph = (int)height;');
-    this.line('int fullscreen = (st->display_state != NULL && strcmp(st->display_state, "fullScreen") == 0) ? 1 : 0;');
+    this.line('int fullscreen = (st->display_state != NULL && (strcmp(st->display_state, "fullScreen") == 0 || strcmp(st->display_state, "fullScreenInteractive") == 0)) ? 1 : 0;');
     this.line('#ifdef ASC_RENDER_WINGPU');
     // GPU window: no persistent surface is created up front. The window backend
     // builds the CAMetalLayer (macOS) or the D3D12 swapchain (Windows) plus the

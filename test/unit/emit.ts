@@ -3211,6 +3211,26 @@ function checkDisplayStateFollowsWindow(): string[] {
     dsCode.includes('char* ds = (w != NULL) ? w->display_state : NULL;') &&
     !dsCode.includes('os_display_state'));
 
+  // Runtime fullScreen: Stage/NativeWindow displayState=fullScreen must reach
+  // SDL_SetWindowFullscreen through the glue; any other state leaves fullscreen first
+  // so AIR's "normal returns to the pre-fullscreen frame" holds. Measured on Windows
+  // (CutPilot fs-probe): stage 2560x1707 in fullScreen, client 1466x903 back in normal.
+  const apply = fnBody(c, 'static void ASC_apply_display_state(int id, char* value) {');
+  check('displayState=fullScreen goes through the fullscreen seam',
+    apply.includes('as_window_set_fullscreen(id, 1);') &&
+    apply.includes('strcmp(value, "fullScreenInteractive") == 0'));
+  check('any other displayState first leaves fullscreen',
+    apply.includes('as_window_set_fullscreen(id, 0);'));
+  const stageSet = fnBody(c, 'void Stage_set_displayState(void* _this, char* value) {');
+  check('Stage.displayState drives the main window through the same helper',
+    stageSet.includes('int id = as_window_main();') &&
+    stageSet.includes('ASC_apply_display_state(id, value);'));
+  const nwSet = fnBody(c, 'void NativeWindow_set_displayState(void* _this, char* value) {');
+  check('NativeWindow.displayState uses the same helper (one record, one geometry path)',
+    nwSet.includes('ASC_apply_display_state(((NativeWindow*)_this)->_win, value);'));
+  check('the glue implements the fullscreen seam with FULLSCREEN_DESKTOP',
+    readFileSync(join(root, 'vendor', 'window_glue.cc'), 'utf8').includes('SDL_SetWindowFullscreen(c->win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);'));
+
   // Seam: both build flavours must provide it, or the generated C stops linking in
   // one of them (the exact failure mode unit: platform/BackendParity guards).
   const rt = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');

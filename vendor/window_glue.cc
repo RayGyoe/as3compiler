@@ -4439,6 +4439,23 @@ void sk_window_restore(int id) {
   if (c != NULL && c->win != NULL) SDL_RestoreWindow(c->win);
 }
 
+// Runtime displayState=fullScreen (Stage / NativeWindow). SDL_WINDOW_FULLSCREEN_DESKTOP
+// keeps the desktop resolution and restores the previous bounds on the way back, which
+// is AIR's "normal returns to the pre-fullscreen frame" behaviour. The win32 backend
+// applies it via a style swap, so it works for fixed (non-resizable) windows too.
+void sk_window_set_fullscreen(int id, int on) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return;
+  SDL_SetWindowFullscreen(c->win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+}
+
+int sk_window_is_fullscreen(int id) {
+  WinCtx* c = sk_slot(id);
+  if (c == NULL || c->win == NULL) return 0;
+  Uint32 f = SDL_GetWindowFlags(c->win);
+  return (f & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) ? 1 : 0;
+}
+
 void sk_window_order_front(int id) {
   WinCtx* c = sk_slot(id);
   if (c != NULL && c->win != NULL) SDL_RaiseWindow(c->win);
