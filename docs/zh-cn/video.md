@@ -1814,6 +1814,22 @@ zc bind 尝试即 100% 成功（26/26）；未尝试的预览帧走上传路（�
 - 复现：`node cutpilot/tools/perf-ui.cjs PAINT`（`GPU.flag`=rb/present opt-in）；
   `WALK_GPU=1|present node cutpilot/tools/walk.cjs`；`AS_VIDEO_ZC=0` 全局 opt-out。
 
+### 16.15 解码游标顺帧（E 增强：`NetStream.stepFrame()` / `frameTime`）
+
+AIR 无对应物 ⇒ **增强、opt-in**（不调用则产物行为不变）。导出/顺帧采样路用它免逐帧
+`seek()` 的 GOP 追帧（seek-bound 是导出墙钟的主因）。
+
+- `stepFrame():Number`：同步解码并持有**下一帧**（presentation order），返回持有帧媒体秒；
+  EOF 回 `-1`。**隐含暂停**（游标模式）：`cursor_mode` 下 present 闸不再按墙钟直呈，
+  所有解码帧入队；取队内**最小 pts**（B-frame 解码序 ≠ pts 序）保证单调不漏不跳。
+  不受播放墙钟约束：18 帧（clip.mp4 15fps）实测 1ms 走完。
+- `frameTime:Number`：解码器当前持有帧 pts（直读 `as_video_time`）；与 `time`（缓存播放头，
+  seek 即写、帧边界更新）区分。
+- 退出游标模式：`resume()` / `play()` / `seek()` 清 `cursor_mode`（tick 的墙钟语义回归）。
+- 接缝：`vendor/video_glue.c as_video_step(id, grctx, now_ms)`；无视频构建同签名 stub 回 `-1`。
+- 钉：`examples/video-headless.as`（单调 + EOF + frameTime + 墙钟无关）、
+  `test/unit/stage3d.ts` 组 `video/decode-cursor`（源级契约）。
+
 ## 17. 参考锚点
 
 - AS3 语言参考：[`flash.net.NetStream`](https://airsdk.dev/reference/actionscript/3.0/flash/net/NetStream.html)、

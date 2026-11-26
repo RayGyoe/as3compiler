@@ -205,6 +205,12 @@ uses the upload path (never a silent downgrade). The same round fixes a fidelity
 clock anchors dropped the media base (playback from a non-zero position froze). See
 [`video.md`](docs/en/video.md) §16.14.
 
+**Decode-cursor stepping (E, 2026-11-27)**: `NetStream.stepFrame()` decodes and holds the next
+frame in presentation order (wall-clock independent, `-1` at EOF) and `NetStream.frameTime`
+reads the decoder's held-frame pts — an opt-in enhancement (AIR has no equivalent) that lets
+exporters sample sequentially instead of paying a seek GOP chase per frame. See
+[`video.md`](docs/en/video.md) §16.15.
+
 **One-command release packaging (stages 306–308)**: `--package app` builds a macOS `.app` from AIR
 `<id>`/`<name>`/`<versionNumber>`/`<versionLabel>`/`<icon>`/`<copyright>` (→ `NSHumanReadableCopyright`,
 stage 456) metadata and ad-hoc signs it. `--package dmg` signs

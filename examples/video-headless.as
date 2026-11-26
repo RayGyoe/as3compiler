@@ -110,6 +110,32 @@ while (!codeSeen("NetStream.Play.Stop") && waited < 4000) { pump(50); waited += 
 ck("Play.Stop dispatched at end", codeSeen("NetStream.Play.Stop"));
 ck("time pinned to duration at end", Math.abs(ns.time - Number(meta.duration)) < 0.05);
 
+// ---- E 增强：解码游标顺帧（stepFrame/frameTime，导出顺帧路的地基） ----
+// 墙钟无关：18 帧（clip.mp4 实为 15fps）必须在远小于一秒播放时长内走完（tick 的“落后即丢”不适用）。
+var curNs:NetStream = new NetStream(conn);
+var curVideo:Video = new Video(320, 240);
+curVideo.attachNetStream(curNs);
+curNs.client = { onMetaData: function(i:Object):void { } };
+curNs.play(CLIP);
+ck("frameTime is 0 at the held first frame", curNs.frameTime == 0);
+var curT0:int = getTimer();
+var steps:int = 0;
+var lastT:Number = -1;
+var mono:Boolean = true;
+var st:Number = curNs.stepFrame();
+while (st >= 0 && steps < 200) {
+  if (st <= lastT) mono = false;
+  lastT = st;
+  steps++;
+  st = curNs.stepFrame();
+}
+var curMs:int = getTimer() - curT0;
+ck("stepFrame walks every frame monotonically", mono && steps >= 16 && steps <= 18);
+ck("stepFrame ends at EOF (-1)", st < 0);
+ck("frameTime tracks the held frame", Math.abs(curNs.frameTime - lastT) < 0.001);
+ck("stepFrame is wall-clock independent (" + curMs + "ms for " + steps + " frames)", curMs < 2000);
+curNs.close();
+
 // ---- 另外三个容器：各自的解复用器与解码器都要真的出画面 ----
 // 每条流单独一个 NetStream（Air 的槽位是逐流的），跑完就 close()，不占 AS_VIDEO_MAX。
 var seqNs:NetStream = new NetStream(conn);

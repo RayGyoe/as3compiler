@@ -208,6 +208,11 @@ Y/UV 双平面直采（submit 借进 sampler `unit`/`unit+1`，AGAL FS 内做 YU
 Metal/WebGL 同签名恒回 0、视频走上传路（不静默降级）。同轮修复 seek/play 时钟锚不带基点的
 保真缺陷（非零起点播放冻帧）。详见 [`video.md`](docs/zh-cn/video.md) §16.14。
 
+**解码游标顺帧（E，2026-11-27）**：`NetStream.stepFrame()` 同步解码并按 presentation order
+持有下一帧（不受播放墙钟约束，EOF 回 -1）；`NetStream.frameTime` 直读解码器持有帧 pts。
+AIR 无对应物 ⇒ opt-in 增强；导出顺帧采样免逐帧 seek 的 GOP 追帧。详见
+[`video.md`](docs/zh-cn/video.md) §16.15。
+
 **D3D12 非设备丢失的交换链恢复（阶段三百零四）**：`ResizeBuffers`/`Present` 在设备仍健康时失败
 （真应用最小化恢复时实测 `E_OUTOFMEMORY`），不再逐帧重试同一交换链，而是只重建失败窗口的交换链与 fence，
 其他窗口和共享设备保持存活；重建失败由空交换链门在后续帧重试。`ASC_GPU_RESIZE_FAIL=1` 可注入一次该路径，

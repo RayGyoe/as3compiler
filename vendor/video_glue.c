@@ -348,6 +348,7 @@ typedef struct {
   double duration_ms;
   double fps;
   double frame_pts;         // pts (s) of the image currently held
+  int cursor_mode;          // E: stepFrame cursor mode -- every decoded frame queues (no clock present)
   double v_tb;              // video stream time_base (seconds per tick), 0 = unknown
   double v_start;           // seconds of the video stream's start_time (MPEG-TS is
                             // NOT 0-based: clip.ts starts at 1.533 s, and comparing
@@ -890,7 +891,7 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
   double now_s = (now_ms >= 0.0 && v->clock0_ms >= 0.0) ? (now_ms - v->clock0_ms) / 1000.0
                                                  : (now_ms >= 0.0 ? now_ms : 0.0);
   if (v->paused_at_ms != 0) now_s = v->frame_pts;   // a paused stream holds its frame
-  if (pts <= now_s + 0.001) {
+  if (!v->cursor_mode && pts <= now_s + 0.001) {
     as_video_drop_image(v);
     v->image = img;
     v->frame_pts = pts;
@@ -1659,6 +1660,7 @@ void as_video_play(int id, double now_ms, double vol) {
   // 同 seek：play 从当前媒体位置起走，时钟锚须减去该位置（否则非零起点冻帧）。
   v->clock0_ms = now_ms - (v->has_video ? v->frame_pts : (double)v->audio_written / (double)AS_VIDEO_AUDIO_RATE) * 1000.0;
   v->paused_at_ms = 0;
+  v->cursor_mode = 0;
   v->vol = vol;
   if (v->has_audio && v->audio_buf >= 0) {
     if (v->audio_voice >= 0) as_audio_voice_stop(v->audio_voice);
@@ -1677,6 +1679,7 @@ void as_video_set_paused(int id, int paused, double now_ms) {
     // paused (AIR's 'time' is media position, not wall time since play()).
     if (v->paused_at_ms != 0 && v->clock0_ms >= 0) v->clock0_ms += now_ms - v->paused_at_ms;
     v->paused_at_ms = 0;
+    v->cursor_mode = 0;   // E: 恢复播放即退出游标模式（tick 的墙钟 present 语义回归）
     if (v->has_audio && v->audio_buf >= 0 && v->audio_voice < 0) {
       // There is no "resume this voice" in the mixer: a paused voice is stopped and
       // the live buffer is a stream from frame 0, so resuming means starting a new
@@ -1773,6 +1776,35 @@ int as_video_tick(int id, void* grctx, double now_ms) {
   return as_video_state(id);
 }
 
+// E 增强（AIR 无对应物）：解码游标顺帧——同步解码并持有下一帧，不受播放墙钟约束。
+// 导出顺帧路用它免逐帧 seek 的 GOP 追帧；返回持有帧媒体秒，EOF 回 -1。
+// 语义：stepFrame 隐含暂停（游标模式）——cursor_mode 下所有解码帧入队（present 闸
+// 不再按墙钟直呈），本函数取队内最小 pts（B-frame 解码序 ≠ pts 序），保证逐帧单调不漏。
+double as_video_step(int id, void* grctx, double now_ms) {
+  if (id < 0 || id >= AS_VIDEO_MAX || !g_videos[id].used) return -1.0;
+  as_video* v = &g_videos[id];
+  if (v->failed || !v->has_video) return -1.0;
+  if (v->paused_at_ms == 0) as_video_set_paused(id, 1, now_ms);
+  v->cursor_mode = 1;
+  as_video_maybe_upgrade(v, grctx);
+  double period = v->fps > 0.0 ? 1.0 / v->fps : 0.04;
+  // 解码前瞻到队里有帧（或 EOF drained）；target 按帧周期推进、不带 LEAD（队列不溢丢）。
+  for (int guard = 0; v->qn == 0 && !(v->eof && v->drained) && guard < 100000; guard++) {
+    double target = v->frame_pts + period * (guard + 1);
+    if (v->duration_ms > 0 && target > v->duration_ms / 1000.0 + 1.0) break;
+    as_video_advance(v, grctx, target, now_ms);
+  }
+  if (v->qn == 0) return -1.0;
+  int mi = 0;
+  for (int i = 1; i < v->qn; i++) if (v->qpts[i] < v->qpts[mi]) mi = i;
+  as_video_drop_image(v);
+  v->image = (void*)v->qimg[mi];
+  v->frame_pts = v->qpts[mi];
+  for (int i = mi + 1; i < v->qn; i++) { v->qimg[i - 1] = v->qimg[i]; v->qpts[i - 1] = v->qpts[i]; }
+  v->qn--;
+  return v->frame_pts;
+}
+
 // The image to paint now, or NULL before the first frame. NOT a new reference:
 // the caller must draw it before the next tick drops it (video.md §10.2 -- the
 // owner releases per frame, never holds a pool buffer across frames).
@@ -1790,6 +1822,7 @@ void as_video_seek(int id, double seconds, double now_ms) {
   // 若 clock0=now 则 target 从 0 起而 pts 从 seconds 起 ⇒ 解码永远追不上（冻帧）。
   v->clock0_ms = now_ms - seconds * 1000.0;
   v->paused_at_ms = 0;
+  v->cursor_mode = 0;
   // Drop the audio already buffered past the seek point before the demuxer moves;
   // otherwise the mixer keeps playing the old position for a whole buffer.
   if (v->audio_voice >= 0) { as_audio_voice_stop(v->audio_voice); v->audio_voice = -1; }

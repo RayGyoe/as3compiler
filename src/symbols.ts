@@ -7329,6 +7329,9 @@ export class SymbolTable {
         ['resume', nsm({ kind: 'void' }, [])],
         ['togglePause', nsm({ kind: 'void' }, [])],
         ['seek', nsm({ kind: 'void' }, [{ name: 'offset', type: 'Number', defaultValue: null, isRest: false }])],
+        // E 增强（AIR 无对应物，opt-in）：解码游标顺帧——同步解码并持有下一帧，
+        // 返回持有帧的媒体秒（EOF 回 -1）。不受播放墙钟约束（导出顺帧路用）。
+        ['stepFrame', nsm({ kind: 'number' }, [])],
         ['close', nsm({ kind: 'void' }, [])],
       ]),
       staticFields: new Map(),
@@ -7342,6 +7345,8 @@ export class SymbolTable {
         // AIR 已定义：解码帧尺寸（首帧前 0）。G-B 零拷贝 uv 换算需要。
         ['videoWidth', { returnType: { kind: 'int' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
         ['videoHeight', { returnType: { kind: 'int' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // E 增强：解码游标（当前持有帧 pts 秒，直读解码器）；与 time（缓存播放头）区分。
+        ['frameTime', { returnType: { kind: 'number' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map([
         ['soundTransform', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'SoundTransform', defaultValue: null, isRest: false }], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],

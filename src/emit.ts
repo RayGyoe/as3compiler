@@ -17496,6 +17496,10 @@ this.line('AS_bake_pend_n = 0;');
     this.line('double NetStream_get_time(void* _this) { return ((NetStream*)_this)->_ns_tpos; }');
     this.line('int NetStream_get_videoWidth(void* _this) { return ((NetStream*)_this)->_ns_vw; }');
     this.line('int NetStream_get_videoHeight(void* _this) { return ((NetStream*)_this)->_ns_vht; }');
+    // E 增强：解码游标直读（time 是缓存播放头，frameTime 是解码器当前持有帧 pts）。
+    this.line('double NetStream_get_frameTime(void* _this) { NetStream* o = (NetStream*)_this; return o->_ns_hv < 0 ? 0.0 : as_video_time(o->_ns_hv); }');
+    // E 增强：顺帧解码一步（不受播放墙钟约束）；EOF 回 -1，落地帧同步缓存播放头。
+    this.line('double NetStream_stepFrame(void* _this) { NetStream* o = (NetStream*)_this; if (o->_ns_hv < 0) return -1.0; double t = as_video_step(o->_ns_hv, as_skia_gr_context(), as_now_ms()); if (t >= 0.0) o->_ns_tpos = t; return t; }');
     // Video: the surface keeps its requested rect (AIR's Video owns width/height
     // rather than deriving them from content) and shows the attached stream's frame.
     this.line('void Video_ctor(Video* o, int width, int height) {');

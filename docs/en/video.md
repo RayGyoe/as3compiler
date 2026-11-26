@@ -1863,6 +1863,27 @@ AGAL fragment shader: no upload, no readback, no extra pass.
   Repro: `node cutpilot/tools/perf-ui.cjs PAINT` with `GPU.flag`=rb/present; `WALK_GPU=1|present node
   cutpilot/tools/walk.cjs`; `AS_VIDEO_ZC=0` global opt-out.
 
+### 16.15 Decode-cursor stepping (E enhancement: `NetStream.stepFrame()` / `frameTime`)
+
+AIR has no equivalent ⇒ **enhancement, opt-in** (artifacts that never call it are unchanged).
+Export / sequential-sampling paths use it to avoid per-frame `seek()` GOP chasing (the
+seek-bound wall clock that dominates export time).
+
+- `stepFrame():Number`: synchronously decode and hold the **next frame** (presentation
+  order), returning its media seconds; `-1` at EOF. **Implies pause** (cursor mode): with
+  `cursor_mode` set the present gate no longer promotes by wall clock — every decoded frame
+  queues, and the step pops the **minimum pts** (B-frame decode order ≠ pts order), so the
+  cursor is monotonic with no drops or skips. Wall-clock independent: 18 frames
+  (clip.mp4 at 15 fps) walk in ~1 ms measured.
+- `frameTime:Number`: pts of the frame the decoder currently holds (reads `as_video_time`
+  live); distinct from `time` (the cached playhead, written by seek and frame boundaries).
+- Leaving cursor mode: `resume()` / `play()` / `seek()` clear `cursor_mode` (tick's wall-clock
+  semantics return).
+- Seam: `vendor/video_glue.c as_video_step(id, grctx, now_ms)`; video-less builds get a
+  same-signature stub returning `-1`.
+- Pins: `examples/video-headless.as` (monotonic + EOF + frameTime + wall-clock independence),
+  `test/unit/stage3d.ts` group `video/decode-cursor` (source-level contract).
+
 ## 17. Reference anchors
 
 - AS3 reference: [`flash.net.NetStream`](https://airsdk.dev/reference/actionscript/3.0/flash/net/NetStream.html),

@@ -2224,3 +2224,28 @@ function checkStage3dVideoZcSeam(): string[] {
 }
 
 registerGroup('stage3d/video-zc-seam', checkStage3dVideoZcSeam);
+
+// E 增强：解码游标顺帧接缝（stepFrame/frameTime）——导出顺帧路免逐帧 seek 的地基。
+// 行为钉在 examples/video-headless.as（36 帧单调 + EOF + 墙钟无关）；这里钉源级契约：
+// 暂停语义（游标模式未来帧全入队，逐帧不漏不跳）与无视频构建的同签名 stub。
+registerGroup('video/decode-cursor', () => {
+  const sym = readFileSync(join(root, 'src', 'symbols.ts'), 'utf8');
+  const emit = readFileSync(join(root, 'src', 'emit.ts'), 'utf8');
+  const rt = readFileSync(join(root, 'src', 'runtime.ts'), 'utf8');
+  const glue = readFileSync(join(root, 'vendor', 'video_glue.c'), 'utf8');
+  const out: string[] = [];
+  const ck = (name: string, cond: boolean): void => { if (!cond) out.push(name); };
+  ck('symbols stepFrame', sym.includes("['stepFrame', nsm({ kind: 'number' }, [])]"));
+  ck('symbols frameTime getter', sym.includes("['frameTime', { returnType: { kind: 'number' }, params: [], owner: 'NetStream'"));
+  ck('emit stepFrame thunk', emit.includes('double NetStream_stepFrame(void* _this)') && emit.includes('as_video_step(o->_ns_hv, as_skia_gr_context(), as_now_ms())'));
+  ck('emit frameTime reads decoder', emit.includes('double NetStream_get_frameTime(void* _this)') && emit.includes('as_video_time(o->_ns_hv)'));
+  ck('runtime extern', rt.includes('extern double as_video_step(int id, void* grctx, double now_ms);'));
+  ck('runtime no-video stub', rt.includes('static double as_video_step(int id, void* grctx, double now_ms) { (void)id; (void)grctx; (void)now_ms; return -1.0; }'));
+  ck('glue step pauses (cursor mode)', glue.includes('if (v->paused_at_ms == 0) as_video_set_paused(id, 1, now_ms);'));
+  ck('glue step defined', glue.includes('double as_video_step(int id, void* grctx, double now_ms)'));
+  ck('glue step EOF -1', glue.includes('if (v->qn == 0) return -1.0;'));
+  ck('glue cursor mode queues all', glue.includes('if (!v->cursor_mode && pts <= now_s + 0.001)'));
+  ck('glue step pops min pts (B-frame order)', glue.includes('if (v->qpts[i] < v->qpts[mi]) mi = i;'));
+  ck('glue resume clears cursor mode', glue.includes('v->cursor_mode = 0;   // E:'));
+  return out;
+});

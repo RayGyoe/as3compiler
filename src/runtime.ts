@@ -22243,6 +22243,7 @@ extern int as_video_tick(int id, void* grctx, double now_ms);
 extern int as_video_state(int id);
 extern void* as_video_frame(int id);
 extern void as_video_seek(int id, double seconds, double now_ms);
+extern double as_video_step(int id, void* grctx, double now_ms);
 extern void as_video_close(int id);
 extern const char* as_video_error(int id);
 // G-B：最近一帧零拷贝平面查询（VideoTexture 后端；无硬解/无共享 device 回 0）。
@@ -22269,6 +22270,7 @@ static int as_video_tick(int id, void* grctx, double now_ms) { (void)id; (void)g
 static int as_video_state(int id) { (void)id; return AS_VIDEO_ST_FAILED; }
 static void* as_video_frame(int id) { (void)id; return NULL; }
 static void as_video_seek(int id, double seconds, double now_ms) { (void)id; (void)seconds; (void)now_ms; }
+static double as_video_step(int id, void* grctx, double now_ms) { (void)id; (void)grctx; (void)now_ms; return -1.0; }
 static void as_video_close(int id) { (void)id; }
 static const char* as_video_error(int id) { (void)id; return ""; }
 #endif
