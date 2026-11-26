@@ -428,6 +428,33 @@ function checkCodegenDiagnostics(): string[] {
   const okXml = thrown(() => generateC(parse('var x:XML = <a/>;\nvar s:String = x;')));
   check('XML implicitly stringifies (measured: mxmlc allows it)', okXml === null);
 
+  // Argument binding is a class-compatibility gate (CutPilot R4): a String handed
+  // to a File parameter used to be pointer-cast by convert() and dereferenced as a
+  // File* -- 0xC0000005. mxmlc rejects the same source (temp/coercearg/mx: String->File
+  // and unrelated class->class are "implicit coercion ... unrelated type"). The gate
+  // is surgical: it covers class (pointer) targets only, so the scalar run-time
+  // coercions convert() legitimately performs are untouched.
+  const ag1 = gen('import flash.filesystem.File;\nfunction takeFile(f:File):void {}\ntakeFile("C:/x");');
+  check('a String argument into a File parameter is an implicit-coercion error (the R4 segfault)',
+    ag1?.message === 'Codegen error at 3:1: implicit coercion of a value of type String to a possibly unrelated type File');
+  const ag2 = gen('import flash.filesystem.File;\nimport flash.display.Sprite;\nfunction takeFile(f:File):void {}\ntakeFile(new Sprite());');
+  check('an unrelated class argument into a File parameter is rejected too',
+    ag2?.message === 'Codegen error at 4:1: implicit coercion of a value of type Sprite to a possibly unrelated type File');
+  const ag3 = gen('import flash.filesystem.File;\nvar f:File = "x";');
+  check('the same rule holds at a declaration initializer',
+    ag3?.message === 'Codegen error at 2:1: implicit coercion of a value of type String to a possibly unrelated type File');
+  // …and the legal argument coercions stay open, so the gate cannot reject valid AIR.
+  const okSub = thrown(() => generateC(parse('import flash.display.Sprite;\nimport flash.display.DisplayObject;\nfunction f(d:DisplayObject):void {}\nf(new Sprite());')));
+  check('a subclass argument satisfies a superclass parameter', okSub === null);
+  const okStarArg = thrown(() => generateC(parse('import flash.filesystem.File;\nfunction takeFile(f:File):void {}\nvar v:*;\ntakeFile(v);')));
+  check('a * argument defers to the run-time #1034 check', okStarArg === null);
+  const okNullArg = thrown(() => generateC(parse('import flash.filesystem.File;\nfunction takeFile(f:File):void {}\ntakeFile(null);')));
+  check('a null argument is accepted for a class parameter', okNullArg === null);
+  const okNumArg = thrown(() => generateC(parse('function f(n:Number):void {}\nf(5);')));
+  check('the numeric family still interconverts in argument position', okNumArg === null);
+  const okObjNumArg = thrown(() => generateC(parse('function f(n:Number):void {}\nvar o:Object={};\nf(o);')));
+  check('a scalar target keeps convert()\'s run-time coercion (Object->Number is not a pointer cast)', okObjNumArg === null);
+
   // A non-void function that can reach its closing brace is rejected here because
   // mxmlc rejects it ("函数没有返回值。"), and because emitting it means returning
   // whatever the register happens to hold (-Wreturn-type's complaint). Every

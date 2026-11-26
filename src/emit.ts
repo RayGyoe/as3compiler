@@ -9662,7 +9662,19 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
         return codes.join(', ');
       }
       if (i < args.length) {
-        codes.push(this.convert(this.emitExpr(args[i]), rtOf(p)));
+        const arg = this.emitExpr(args[i]);
+        const pt = rtOf(p);
+        // A class-typed parameter is a POINTER slot: an unrelated source (String
+        // into a File parameter) used to be pointer-cast by convert() and then
+        // dereferenced as the wrong struct -- 0xC0000005 (CutPilot R4). mxmlc
+        // rejects the same source ("implicit coercion ... unrelated type File").
+        // Gate class compatibility here; a dynamic (*) source skips the check and
+        // coerces at run time (#1034) inside unboxAny. Scalar parameters keep
+        // convert()'s run-time coercions (Object->Number ToNumber, the Error-message
+        // Object slot, the geom no-new conveniences): those are not pointer casts
+        // and are a separate concern from this class-compatibility gate.
+        if (pt.kind === 'object') this.checkImplicitCoercion(arg.type, pt);
+        codes.push(this.convert(arg, pt));
       } else if (p.defaultValue !== null) {
         codes.push(this.convert(this.emitExpr(p.defaultValue), rtOf(p)));
       } else {
@@ -46088,15 +46100,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     // Interfaces are deliberately NOT checked: our built-in interface tables are
     // narrower than playerglobal's, so a 'not implemented' verdict here could
     // reject valid AIR code -- the failure mode this whole check must avoid.
-    if (target.kind === 'object' && src.kind === 'object') {
-      if (src.className === target.className) return;
-      if (this.symbols.isSubclassOf(src.className, target.className)) return;
-      // Object is the root: every class is one, so Object targets are fine.
+    if (target.kind === 'object') {
+      // Object is the root: every value boxes into an Object-typed slot.
       if (target.className === 'Object') return;
-      // `class X extends Array` into an Array-typed slot is legal even though the
-      // C struct has no Array in its vtable chain.
-      if (this.symbols.getClass(target.className)?.arrayBacked
-          && this.symbols.getClass(src.className)?.arrayBacked) return;
+      if (src.kind === 'object') {
+        if (src.className === target.className) return;
+        if (this.symbols.isSubclassOf(src.className, target.className)) return;
+        // `class X extends Array` into an Array-typed slot is legal even though the
+        // C struct has no Array in its vtable chain.
+        if (this.symbols.getClass(target.className)?.arrayBacked
+            && this.symbols.getClass(src.className)?.arrayBacked) return;
+        throw this.implicitCoercionError(src, target);
+      }
+      // Scalars and the other reference families are unrelated to ANY class.
+      // `takeFile("C:/x")` for takeFile(f:File) used to compile silently and
+      // dereference a char* as File* (0xC0000005, CutPilot R4); mxmlc rejects the
+      // same source ("implicit coercion ... String ... unrelated type File").
+      // record/dict (dynamic Object) and interface SOURCES stay permissive: our
+      // built-in surface types some AIR-class returns loosely, and falsely
+      // rejecting valid AIR code is the failure mode this check must avoid (the
+      // same reason interface TARGETS are unchecked above).
+      if (src.kind === 'record' || src.kind === 'dict' || src.kind === 'interface') return;
       throw this.implicitCoercionError(src, target);
     }
   }

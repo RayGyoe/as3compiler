@@ -20306,6 +20306,13 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-26 追加（阶段四百七十：不相关类隐式强转实参编译期拦截）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
+> 主表 **82 → 81 行**（`未开始` 63 → **62** / `部分完成` 17 / `调研完成·实现暂缓` 2）。CutPilot R4 登记的
+> 「String→File 实参编译期放行、运行期段错误」首行已清偿：`emitArgs` 实参绑定对 class（指针）目标加
+> `checkImplicitCoercion` 相容门（object 目标分支补「非 Object 类拒绝标量/异类源」），不相容报 CodegenError、
+> `*` 源走运行期 #1034。外科式只门 class 目标，标量目标保留 convert() 的合法运行期转换（Error.message 的
+> Object 槽、geom no-new 便利），不误伤既有行为。mxmlc 定标 `temp/coercearg/mx/`，`diagnostics/Codegen` 增 8 钉。
+
 > **2026-11-26 追加（CutPilot R4 顺带量到）**：**新登记 1 行** ⇒ 主表 **81 → 82 行**（`未开始` 62 → **63**）。
 > 不相关类类型的隐式强转实参（String→File）编译期放行、运行期段错误；证据与修法见主表首行。
 
@@ -20964,7 +20971,6 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
-| **不相关类类型的隐式强转实参（`String` → `File` 形参）编译期不报错、运行期段错误** | 未开始（2026-11-26 CutPilot R4 实测） | `MCPTools.downloadMedia` 曾把 `model.fileURL`（**String**）直接传给 `MediaDownload.folderFor(projectFile:File)`：codegen 未做隐式强转检查，把 `char*` 当 `File*` 解引用 ⇒ Windows 0xC0000005。`mxmlc` 对同一源码报 implicit coercion 编译错。应在实参/赋值隐式强转点检查类类型相容性（不相容报 CodegenError，动态槽走 `#1034`） | 在 emit 的 coerce/实参绑定收敛点加类类型相容检查 + 负例钉 |
 | **同一字体字号下纯文本字段与富文本字段的 `textHeight` 可相差 0.5–1 px**（light 快路径报 AIR 模型盒 `rhalf(asc)+rhalf(desc)+leading`，SkParagraph 路径报 Skia `InternalLineMetrics::height()`——对同一个人工 strut 盒**再取整一次**） | 未开始（2026-11-16 阶段四百三十五 全量 macOS 回归发现；`examples/text-underline.as` 用例①红，Courier New 12：无下划线 13.5 / 有下划线 14） | 两条布局路径对「行盒高度」的最终取整不一致：`vendor/skia_text_glue.cc` 的 `sk_set_air_strut` 已把 Skia 的行盒强制成 AIR 的 `am.model + leading`，但 `ParagraphImpl::addLine` 存的是 `InternalLineMetrics::height()` = `round(descent-ascent+leading)`，所以 Skia 侧多了一次 0.5 进位；light 路径 `sk_text_light_new` 存的是未取整的模型值。凡 `am.model + leading` 非整数即触发，与下划线无关——下划线只是把该字段从 light 路径踢到 paragraph 路径，从而让两个值同时出现。证据 `temp/tu/ul.as`（`a.textHeight=13.5 b.textHeight=14 a.textWidth=57.609375 b.textWidth=57.609375`） | **2026-11-16 用户裁决：示例侧放宽，不追完全对齐**（`examples/text-underline.as` 已改 ±1 px 容差 + `textHeight/N` 步进），分歧本身仍留在表里等 adl 定标。先装 AIR SDK 跑 adl 定真值：① 若 AIR 报 13.5 ⇒ paragraph 路径的 `textHeight` 不能再取 Skia 的取整值，须由 AIR 盒自行累加（改 `sk_textlayout_height`/`textHeight` 的 `tops[k]` 来源）；② 若 AIR 报 14 ⇒ light 路径的 `height` 改成与 Skia 同口径取整（并复核所有文本示例的双端读数）。两种改法都先做**双端全量**再落盘，别只修单侧 |
 | **`toFixed` 对大数（如 `Number.MAX_VALUE`）的有效位截断与 AIR 不同** | 未开始（2026-11-15 阶段四百一十九 修 `.5` 舍入方向时量到） | AIR 的 D2A 数字生成器（avmplus `core/d2a.cpp`）对大数走 BigInteger 停止边界，只生成约「最短往返有效位数 + precision」个有效位、其余补零，且带 off-by-one/two（`MAX_VALUE` 在 `f1` 是 17 位而非 18、`f15` 是 30 位而非 32）。我们的 `as_num_toFixed` 用 `%.1100f` 精确展开，给出全部 309 位整数。证据 `temp/tofixed3/maxvalue-residual.txt`（9 格双端读数）。这是**独立于 `.5` 舍入方向**的「有效位截断」行为；旧 `printf` 实现同样不匹配，属既有缺口而非本轮引入 | 需移植 avmplus D2A 的 BigInteger 停止边界才能逐位复现，无简单公式（「17+precision」在 `f1`/`f15` 偏差 1–2 位）。病态用例（真实代码几乎不对 `MAX_VALUE` 调 `toFixed`），独立立项；`.5` 舍入方向本身已于阶段四百一十九修净（693 格双端矩阵 + `examples/tofixed-round.as`） |
 | **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
@@ -23695,6 +23701,38 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   **−17%**（阶段四百四十三）把它抵平到 **196–202**。也就是说「UTF-8 存储 + 对齐 UTF-16 特性」
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
+
+### 阶段四百七十：不相关类隐式强转实参的编译期拦截（String→File 段错误根治，v0.4.443 → v0.4.444）✅ 已完成
+
+**触发**：CutPilot R4 实测——`MCPTools.downloadMedia` 把 `model.fileURL`（**String**）直接传给
+`MediaDownload.folderFor(projectFile:File)`，codegen 放行、把 `char*` 当 `File*` 解引用 ⇒ Windows
+0xC0000005 段错误；`mxmlc` 对同源报 implicit coercion 编译错。最小复现 `temp/coercearg/repro.as`
+（`takeFile("C:/x")`）：AOT 编译通过、运行只打印 `before` 即 SIGSEGV，生成 C 是 `takeFile(((File*)("C:/x")))`。
+
+**根因**：声明点（初始化/赋值/return/字段）早已走 `convertImplicit` → `checkImplicitCoercion`，但**实参绑定**
+收敛点 `emitArgs` 只走 `convert`（内部统一路径，不做相容检查），于是不相关类被直接指针强转。且
+`checkImplicitCoercion` 的 object 目标分支此前只处理 `src.kind === 'object'`，标量源（String/Number/…）落到
+分支外静默放行。
+
+**修法（外科式，两处）**：
+1. `checkImplicitCoercion` object 目标分支：`Object` 根目标放行一切；`object` 源走既有子类/arrayBacked 判定；
+   **标量与其他引用族源 → 非 Object 类一律报 `implicitCoercionError`**；`record`/`dict`/`interface` 源保持宽容
+   （内建表面把部分 AIR 类返回建模得宽松，误拒合法 AIR 是本检查必须避免的失败模式，与 interface 目标不查同理）。
+2. `emitArgs` 实参位：**仅当形参是 class（`object`）目标**时调 `checkImplicitCoercion`，再走 `convert`。
+   `*` 源早退、由 `unboxAny` 运行期 #1034 兜底。
+
+**为何只门 class 目标（mxmlc 定标 `temp/coercearg/mx/` A–H）**：mxmlc 拒绝 Object→Number（A/B/E）、
+String→Number 实参（D）、普通 int→String（F/G），但**接受** `new Error(5)`/`e.message=5`（C/H）——因为
+playerglobal 把 `Error.message` 建模为 **Object**（同 `TextFormat.color/size` 的 Object 槽模式），并非 int→String。
+`Point(o,3)` 是 `ValueClassCoercion` 钉住的「non-AIR convenience」。这些**标量目标的运行期转换不是指针强转**，
+不会段错误，属与本报无关的另一层；若把声明点的全量检查搬到实参会误伤它们（首轮全量 `convertImplicit` 实测打红
+`ClassCall`/`ValueClassCoercion`）。故本阶段只精确门 class 指针目标，对齐 TODO 行「类类型相容性」的本意。
+
+**验收**：复现件编译期报 `Codegen error at 5:1: implicit coercion ... String ... File`；合法版
+`takeFile(new File("C:/x"))` 编译运行正确（`url=file:///C:/x`）。`diagnostics/Codegen` 增 8 钉（String→File 实参/
+异类实参/声明初始化 3 负例 + 子类/`*`/null/数值族/Object→Number 5 放行），组 81 钉全绿。单元全套仅 3 红均为
+既有基线（`StringAccumulator`、`Yuv420HostManifest`、`WindowSystemLimitsAndGestures`——后者经 stash 隔离确证在
+pristine HEAD 亦红，系并发会话 `df83133` 引入，非本阶段）。全量回归见 `temp/coercearg/full-470.log`。
 
 ### 阶段四百六十七：WGL/GL 透明 GPU 窗离屏读回 → UpdateLayeredWindow（v0.4.440 → v0.4.441）✅ 已完成
 
