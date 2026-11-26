@@ -821,6 +821,15 @@ int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   return 1;
 }
 
+// G-B：WebGL 后端无解码器零拷贝面（视频走 BitmapData 上传路）⇒ 恒回 0，
+// 与 D3D12 后端同签名（runtime.ts extern 契约）。
+int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,
+                   int* wOut, int* hOut, int* csOut, int* epochOut) {
+  (void)ctx; (void)unit; (void)ns; (void)gpuY; (void)gpuUV;
+  (void)wOut; (void)hOut; (void)csOut; (void)epochOut;
+  return 0;
+}
+
 // Upload a Stage3D CubeTexture (six square faces, ARGB like every other upload)
 // as one GL cube map and bind it as sampler fs{unit}. The AGAL translator only
 // declares a `samplerCube` when the bytecode says <cube>, so the GL target must

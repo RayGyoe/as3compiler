@@ -80,6 +80,8 @@ struct Slot {
   gr_cp<ID3D12Resource> uv;
   int in_use = 0;      // 1 until Skia's TextureReleaseProc says the frame is done
   int state = kSlotCommon;
+  void* img = nullptr;   // 本槽 wrap 出的 SkImage：与“当前上屏帧”匹配（G-B）
+  UINT64 value = 0;      // 本槽拷贝的共享 fence value
 };
 
 struct Stream {
@@ -124,6 +126,12 @@ struct Stream {
 
   int width = 0, height = 0;
   int ten_bit = 0;
+
+  // G-B：最近一帧的平面位置（Stage3D VideoTexture 直采路）。只在该帧成功 wrap 成
+  // SkImage 后更新；slot 环 kSlots=10，绑定方每帧重绑 ⇒ 不会采到被复写的旧槽。
+  int latest_slot = -1;
+  UINT64 latest_value = 0;
+  int latest_cs = 1;
 
   // Counters for AS_VIDEO_STATS (read through sk_video_d3d_stats).
   long long frames = 0;
@@ -367,6 +375,7 @@ void zc_barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
 void zc_release_cb(void* ctx) {
   RelToken* t = (RelToken*)ctx;
   if (t->stream->used && t->stream->epoch == t->epoch) t->slot->in_use = 0;
+  t->slot->img = nullptr;   // G-B：防 SkImage 地址复用造成 presented 匹配误中
   delete t;
 }
 
@@ -669,7 +678,47 @@ extern "C" void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int 
     return nullptr;
   }
   s->frames++;
+  slot->img = img.get();
+  slot->value = value;
+  s->latest_slot = (int)(slot - s->slots);
+  s->latest_value = value;
+  s->latest_cs = yuv_cs < 0 ? 1 : yuv_cs;
   return img.release();
+}
+
+// G-B：Stage3D 零拷贝直采入口。返回**当前上屏帧**（presented_img，即 v->image）对应槽的
+// Y/UV 平面（D3D12 resource，借用指针）与 fence value；解码器会超前解码 FIFO 未来帧，
+// latest_slot 是最新解码帧而非上屏帧 ⇒ 必须按 presented_img 匹配，否则 zc 画未来帧。
+// presented_img 无匹配时回 0（该帧走 upload 路保同源），不回退 latest_slot。
+extern "C" int sk_video_d3d_latest(void* d3d11_device, void* presented_img, void** y, void** uv,
+                                   int* w, int* h, int* ten_bit, int* cs,
+                                   unsigned long long* fence_value) {
+  if (d3d11_device == nullptr) return 0;
+  for (int i = 0; i < kMaxStreams; ++i) {
+    Stream* s = &g_streams[i];
+    if (!s->used || s->dev11_key != d3d11_device) continue;
+    if (s->failed || s->frames == 0 || s->latest_slot < 0) return 0;
+    // 上屏帧必须精确匹配：v->image 走软件回退帧时无对应槽 ⇒ 回 0 让应用层该帧走
+    // upload 路（与 CPU 同源）；回退 latest_slot 会画 FIFO 未来帧（parity 实测差 91）。
+    int pick = -1;
+    if (presented_img != nullptr) {
+      for (int k = 0; k < kSlots; ++k) {
+        if (s->slots[k].img == presented_img) { pick = k; break; }
+      }
+    }
+    if (pick < 0) return 0;
+    Slot* slot = &s->slots[pick];
+    if (slot->y.get() == nullptr || slot->uv.get() == nullptr) return 0;
+    if (y) *y = slot->y.get();
+    if (uv) *uv = slot->uv.get();
+    if (w) *w = s->width;
+    if (h) *h = s->height;
+    if (ten_bit) *ten_bit = s->ten_bit;
+    if (cs) *cs = s->latest_cs;
+    if (fence_value) *fence_value = slot->value;
+    return 1;
+  }
+  return 0;
 }
 
 // Counters, for the AS_VIDEO_STATS line: zero-copy is only worth claiming if the

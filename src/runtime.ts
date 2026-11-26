@@ -20734,6 +20734,8 @@ extern void* s3d_create_render_texture(void* ctx, int width, int height);
 extern void* s3d_create_render_texture_fmt(void* ctx, int width, int height, int isHalf);
 extern void s3d_set_render_target(void* ctx, void* tex, int enableDepthAndStencil);
 extern int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain);
+extern int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,
+                          int* wOut, int* hOut, int* csOut, int* epochOut);
 extern int s3d_readback_render(void* ctx, uint8_t* out);
 extern void s3d_destroy_texture(void* tex);
 extern void* s3d_get_render_target(void* ctx);
@@ -21267,6 +21269,16 @@ static inline int as_s3d_bind_texture(void* ctx, int unit, void* tex, int hasCha
     return s3d_bind_texture(ctx, unit, tex, hasChain);
 #else
     (void)ctx; (void)unit; (void)tex; (void)hasChain; return 0;
+#endif
+}
+// G-B：VideoTexture 零拷贝（解码器 Y/UV 双平面 borrowed SRV → AGAL FS 直采）。无 GPU 构建回 0。
+static inline int as_s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,
+                                    int* wOut, int* hOut, int* csOut, int* epochOut) {
+#ifdef ASC_RENDER_STAGE3D
+    return s3d_bind_video(ctx, unit, ns, gpuY, gpuUV, wOut, hOut, csOut, epochOut);
+#else
+    (void)ctx; (void)unit; (void)ns; (void)gpuY; (void)gpuUV; (void)wOut; (void)hOut; (void)csOut; (void)epochOut;
+    return 0;
 #endif
 }
 // ---- E6 native shader: the GPU half ----
@@ -22233,6 +22245,9 @@ extern void* as_video_frame(int id);
 extern void as_video_seek(int id, double seconds, double now_ms);
 extern void as_video_close(int id);
 extern const char* as_video_error(int id);
+// G-B：最近一帧零拷贝平面查询（VideoTexture 后端；无硬解/无共享 device 回 0）。
+extern int as_video_zc_latest(int id, void** y, void** uv, int* w, int* h,
+                              int* ten_bit, int* cs, unsigned long long* fence_value);
 // The message NetStream.play() throws when a build has no video backend at all.
 #define AS_VIDEO_ABSENT_MSG ""
 #else

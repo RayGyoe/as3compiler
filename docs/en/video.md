@@ -1821,6 +1821,48 @@ node --test --test-name-pattern='video' test/unit/video.ts                 # 115
 
 ---
 
+### 16.14 G-B: Stage3D/AGAL samples the decoder's Y/UV planes directly (VideoTexture zero-copy seam, measured 2026-11-26)
+
+The §16.9 zero-copy path ends at **Skia** (2D display list). CutPilot's GPU compositor runs on
+**Stage3D/AGAL**, which previously still paid one `uploadFromBitmapData` + one readback per video
+layer. G-B **borrows** the decoder's D3D12 planes into Stage3D samplers and does YUV→RGB inside the
+AGAL fragment shader: no upload, no readback, no extra pass.
+
+- AS3 surface: `createVideoTexture()` + `VideoTexture.attachNetStream(ns)` (real AIR API, previously
+  a no-op) + `setTextureAt(unit, vt)`. At submit, emit calls `as_s3d_bind_video`; on success **Y binds
+  at `unit`, UV at `unit+1`** (one layer consumes two sampler slots) and fills
+  `videoWidth/videoHeight/colorSpace/epoch/binds`; on failure it returns 0 and the app re-renders
+  that frame through the upload path.
+- `VideoTexture.binds` (G-B enhancement, public int) is the success counter and the **only valid
+  landing proof**: `epoch` is a fence value (unchanged while the presented frame is held) and
+  `videoWidth` is a stale leftover — both misreport failed binds as successes.
+- `colorSpace` (G-B enhancement) uses the SkYUVColorSpace numbering; the app derives YUV→RGB
+  coefficients identical to Skia's `GrYUVtoRGBEffect`.
+- Backend matrix: D3D12 direct sampling; **Metal/WebGL `s3d_bind_video` stubs return 0** (same
+  signature, pinned by `stage3d/video-zc-seam`); video then uses the upload path, never a silent
+  downgrade. Plane lifetime stays in the `video_d3d.cc` slot ring (shared device/queue/fence); the
+  bridge only borrows (`S3DTexture.borrowed` skips device-lost revive). Windows name lookup requires
+  `__declspec(dllexport)` on `as_video_zc_latest` (`AS_ZC_EXPORT`).
+- The presented frame must match exactly: `sk_video_d3d_latest(dev11, presented_img, …)` picks the
+  slot whose `img == presented_img` (`v->image`), never the FIFO `latest_slot` (that draws future
+  frames; parity measured diff 91). No match returns 0. `zc_release_cb` clears `slot->img` so
+  SkImage address reuse cannot fake a match.
+- Real defect fixed on the way: seek/play anchored `clock0_ms = now_ms` while pts continues from the
+  seek base, so `target` never caught up and **playback from a non-zero position froze**. Now seek
+  anchors `now - seconds*1000`, play anchors `now - current media position*1000`, and the in-advance
+  re-anchor carries the base too. AIR's `ns.time` is media position: this is fidelity, not enhancement.
+- Measured (Windows x64 / D3D12 / ridge.mp4 640×360 / CutPilot PAINT 150 frames): CPU 1.887 ms/frame;
+  GPU readback+zc 1.800; **GPU present+zc 1.600 (−15%)**. ALL mode 7.94 / 7.27 / 7.79 (full-tree
+  reflow dominates). zc binds succeed 26/26 when attempted; walk `zc-parity` maxDiff=0 in both rb and
+  present modes; FS arithmetic isolation pin `cutpilot/test/gb-fs.as` green.
+- Boundaries: live playback only, probe-style activation (500 ms probes, permanent fallback after
+  ≈6 s unproven), failed frames re-render via upload; the zc path must not pump streams itself
+  (nested `dispatchFrame` red line); all 8 sampler bindings cleared at frame start; AGAL temps must
+  be written before read (#3647/#3648); grade still CPU-LUT upload; ≤4 layers; no offscreen RT
+  (`Context3D` lacks `setRenderTargets`); macOS packaging unverified (Metal stub = upload path).
+  Repro: `node cutpilot/tools/perf-ui.cjs PAINT` with `GPU.flag`=rb/present; `WALK_GPU=1|present node
+  cutpilot/tools/walk.cjs`; `AS_VIDEO_ZC=0` global opt-out.
+
 ## 17. Reference anchors
 
 - AS3 reference: [`flash.net.NetStream`](https://airsdk.dev/reference/actionscript/3.0/flash/net/NetStream.html),

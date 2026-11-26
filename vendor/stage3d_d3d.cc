@@ -75,6 +75,7 @@ extern "C" {
 #define S3D_MAX_CTX 4
 #define S3D_MAX_STREAMS 8
 #define S3D_MAX_TEX 8
+#define S3D_MAX_VIDEO 8   // G-B：同时 attach 的 VideoTexture 流数（桥接条目）
 // Command allocators cannot be reset while a command list using them is in
 // flight, so the frame is triple-buffered: the batch opened for frame N reuses the
 // slot frame N-3 used, and only once that slot's fence has been reached.
@@ -192,6 +193,7 @@ typedef struct {
   ID3D12Resource* res;
   struct S3DContext* owner;   // whose RTV/DSV slots and deferred-release queue hold it
   D3D12_RESOURCE_STATES state;
+  int borrowed;   // G-B：borrowed 解码器平面，不拥有/不重建
   DXGI_FORMAT format;
   int width, height;
   int mips;       // mip levels the RESOURCE has (a D3D12 descriptor is immutable)
@@ -202,6 +204,14 @@ typedef struct {
   int isDepth;    // DSV slot
   int dsvSlot;
 } S3DTexture;
+
+// G-B：VideoTexture 零拷贝桥接条目（定义先于 S3DContext：ctx 内嵌数组）。
+struct S3DVideoBridge {
+  int ns;
+  S3DTexture yT, uvT;   // BORROWED：生命周期归 video_d3d 槽环
+  UINT64 epoch;
+  int w, h;
+};
 
 // One cached pipeline: the full draw state as a string key plus the PSO built from
 // it. See the file header for why the key is the whole state, not just the blend.
@@ -337,6 +347,9 @@ typedef struct S3DContext {
   S3DTexture* rtDepth;             // depth/stencil for `renderOverride`
   int rtDepthW, rtDepthH;
   S3DTexture* dummy;               // 1x1 stand-in for unbound sampler units
+  // --- G-B video zero-copy bridge ---
+  S3DVideoBridge vbridge[S3D_MAX_VIDEO];
+  int nvbridge;
   int width, height;
 
   // --- current render state (Stage3D is a state machine) ---
@@ -876,6 +889,7 @@ static S3DTexture* s3d_make_texture(S3DContext* c, int w, int h, int mips, int f
 // GPU resource lazily on the next bind/upload; the CPU-side contents are gone, as
 // they are after AIR's context loss, but no call may submit the old resource.
 static int s3d_revive_texture(S3DContext* c, S3DTexture* t) {
+  if (t->borrowed) return 1;   // G-B：解码器平面每帧刷新，device-lost 后由下一帧 bind 恢复
   if (c == NULL || t == NULL || c->device == NULL) return 0;
   ID3D12Device* owner = NULL;
   const HRESULT hr = t->res != NULL ? t->res->GetDevice(__uuidof(ID3D12Device), (void**)&owner) : E_FAIL;
@@ -3350,6 +3364,59 @@ int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   if (!s3d_revive_texture(c, (S3DTexture*)tex)) return 0;
   c->textures[unit] = (S3DTexture*)tex;
   c->texHasMips[unit] = hasChain ? 1 : 0;
+  return 1;
+}
+
+// ---- G-B：VideoTexture 零拷贝桥（解码器 Y/UV 平面 → AGAL FS 直采）----
+// AIR 的 VideoTexture.attachNetStream 语义：纹理采样视频帧。这里不做中间 RGBA pass：
+// 把解码器的 NV12/P010 双平面作为两个 borrowed SRV 绑到 unit / unit+1，YUV→RGB 由
+// 应用层 AGAL FS 完成（系数经 VideoTexture.colorSpace 暴露，与 Skia GrYUVtoRGBEffect
+// 同口径）⇒ 真零拷贝：无 upload、无 readback、无额外 pass、不碰 fence 记账。
+// 平面生命周期归 video_d3d.cc 的槽环（共享 fence 同步）；本桥只 borrow，不拥有。
+typedef int (*S3DZcLatestFn)(int, void**, void**, int*, int*, int*, int*, unsigned long long*);
+
+int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,
+                   int* wOut, int* hOut, int* csOut, int* epochOut) {
+  if (ctx == NULL || ns < 0 || gpuY == NULL || gpuUV == NULL) return 0;
+  if (unit < 0 || unit + 1 >= S3D_MAX_TEX) return 0;
+  S3DContext* c = (S3DContext*)ctx;
+  static S3DZcLatestFn fn = (S3DZcLatestFn)s3d_lookup_export("as_video_zc_latest");
+  if (fn == NULL) return 0;   // 本构建未链接视频解码器
+  void* y = NULL;
+  void* uv = NULL;
+  int w = 0, h = 0, ten = 0, cs = 1;
+  unsigned long long val = 0;
+  if (!fn(ns, &y, &uv, &w, &h, &ten, &cs, &val) || y == NULL || uv == NULL || w <= 0 || h <= 0)
+    return 0;
+  S3DVideoBridge* e = NULL;
+  for (int i = 0; i < c->nvbridge; i++) if (c->vbridge[i].ns == ns) { e = &c->vbridge[i]; break; }
+  if (e == NULL) {
+    if (c->nvbridge >= S3D_MAX_VIDEO) return 0;
+    e = &c->vbridge[c->nvbridge++];
+    memset(e, 0, sizeof(*e));
+    e->ns = ns;
+  }
+  // borrowed wrapper：res/format 每帧刷新（解码器槽环可能换资源）；state 恒 SRV
+  // （video_d3d  wrap 后即 PIXEL_SHADER_RESOURCE），draw 侧不再插 barrier。
+  e->yT.res = (ID3D12Resource*)y;
+  e->yT.format = ten ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+  e->yT.width = w; e->yT.height = h; e->yT.mips = 1; e->yT.faces = 1;
+  e->yT.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  e->yT.borrowed = 1;
+  e->uvT.res = (ID3D12Resource*)uv;
+  e->uvT.format = ten ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
+  e->uvT.width = (w + 1) / 2; e->uvT.height = (h + 1) / 2; e->uvT.mips = 1; e->uvT.faces = 1;
+  e->uvT.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  e->uvT.borrowed = 1;
+  if (!s3d_bind_texture(c, unit, &e->yT, 0)) return 0;
+  if (!s3d_bind_texture(c, unit + 1, &e->uvT, 0)) return 0;
+  e->epoch = val; e->w = w; e->h = h;
+  *gpuY = &e->yT;
+  *gpuUV = &e->uvT;
+  if (wOut != NULL) *wOut = w;
+  if (hOut != NULL) *hOut = h;
+  if (csOut != NULL) *csOut = cs;
+  if (epochOut != NULL) *epochOut = (int)val;
   return 1;
 }
 

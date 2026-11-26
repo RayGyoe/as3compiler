@@ -203,6 +203,11 @@ D3D12（阶段四百五十九/四百六十）与 WGL（阶段四百六十七）�
 不再把旧设备的纹理与命令队列交给新设备；AS3 侧仍持有的纹理在下一次绑定或上传时按原尺寸/格式重建，
 合成入口也会拒绝偶发的上一设备纹理。`ASC_GPU_LOSE_AT=<帧>` 的真实移除探针已验证恢复后继续渲染。
 
+**VideoTexture 零拷贝（G-B，2026-11-26）**：`VideoTexture.attachNetStream(ns)` 在 D3D12 后端接通解码器
+Y/UV 双平面直采（submit 借进 sampler `unit`/`unit+1`，AGAL FS 内做 YUV→RGB，免上传免回读）；
+Metal/WebGL 同签名恒回 0、视频走上传路（不静默降级）。同轮修复 seek/play 时钟锚不带基点的
+保真缺陷（非零起点播放冻帧）。详见 [`video.md`](docs/zh-cn/video.md) §16.14。
+
 **D3D12 非设备丢失的交换链恢复（阶段三百零四）**：`ResizeBuffers`/`Present` 在设备仍健康时失败
 （真应用最小化恢复时实测 `E_OUTOFMEMORY`），不再逐帧重试同一交换链，而是只重建失败窗口的交换链与 fence，
 其他窗口和共享设备保持存活；重建失败由空交换链门在后续帧重试。`ASC_GPU_RESIZE_FAIL=1` 可注入一次该路径，

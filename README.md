@@ -198,6 +198,13 @@ two-hundred-seventy-two): the GL build's import table is measured clean (13 DLLs
 covers the loader and import surface only — it has never been run on real Win7 hardware**, and the full list of
 what is and is not proven is in [`win32.md`](docs/en/win32.md) §6.
 
+**VideoTexture zero-copy (G-B, 2026-11-26)**: `VideoTexture.attachNetStream(ns)` wires the decoder's
+Y/UV planes straight into Stage3D samplers on the D3D12 backend (borrowed at `unit`/`unit+1` at submit,
+YUV→RGB inside the AGAL fragment shader — no upload, no readback); Metal/WebGL stubs return 0 and video
+uses the upload path (never a silent downgrade). The same round fixes a fidelity defect where seek/play
+clock anchors dropped the media base (playback from a non-zero position froze). See
+[`video.md`](docs/en/video.md) §16.14.
+
 **One-command release packaging (stages 306–308)**: `--package app` builds a macOS `.app` from AIR
 `<id>`/`<name>`/`<versionNumber>`/`<versionLabel>`/`<icon>`/`<copyright>` (→ `NSHumanReadableCopyright`,
 stage 456) metadata and ad-hoc signs it. `--package dmg` signs

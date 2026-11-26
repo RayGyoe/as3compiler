@@ -122,6 +122,9 @@ extern void* sk_video_d3d_image(void* ctx, void* tex, int slice, int w, int h,
 extern int sk_video_d3d_probe(void* ctx, void* dev11, int w, int h, int ten_bit);
 extern void sk_video_d3d_stats(long long* frames, long long* starved);
 extern void sk_video_d3d_forget(void* d3d11_device);
+extern int sk_video_d3d_latest(void* d3d11_device, void* presented_img, void** y, void** uv,
+                               int* w, int* h, int* ten_bit, int* cs,
+                               unsigned long long* fence_value);
 static void* sk_video_zc_image(void* ctx, void* tex, int slice, int w, int h, int ten_bit,
                               int yuv_cs) {
   return sk_video_d3d_image(ctx, tex, slice, w, h, ten_bit, yuv_cs);
@@ -133,6 +136,10 @@ static void sk_video_zc_stats(long long* frames, long long* starved) {
   sk_video_d3d_stats(frames, starved);
 }
 static void sk_video_zc_forget(void* dev) { sk_video_d3d_forget(dev); }
+static int sk_video_zc_latest(void* dev, void* presented_img, void** y, void** uv, int* w, int* h,
+                              int* ten_bit, int* cs, unsigned long long* fence_value) {
+  return sk_video_d3d_latest(dev, presented_img, y, uv, w, h, ten_bit, cs, fence_value);
+}
 #elif defined(ASC_RENDER_METAL) && ASC_RENDER_METAL && defined(ASC_USE_SKIA)
 #define AS_VIDEO_ZC 1
 // No per-stream identity: the MTLDevice is process-wide and the seam's texture cache
@@ -156,6 +163,12 @@ static void sk_video_zc_stats(long long* frames, long long* starved) {
   sk_video_mtl_stats(frames, starved);
 }
 static void sk_video_zc_forget(void* dev) { sk_video_mtl_forget(dev); }
+// G-B：Metal 路暂不暴露平面给 Stage3D（VideoTexture 零拷贝目前仅 D3D12 实测）。
+static int sk_video_zc_latest(void* dev, void* presented_img, void** y, void** uv, int* w, int* h,
+                              int* ten_bit, int* cs, unsigned long long* fence_value) {
+  (void)dev; (void)presented_img; (void)y; (void)uv; (void)w; (void)h; (void)ten_bit; (void)cs; (void)fence_value;
+  return 0;
+}
 #else
 #define AS_VIDEO_ZC 0
 #define AS_VIDEO_ZC_DEVICE 0
@@ -173,7 +186,24 @@ static void sk_video_zc_stats(long long* frames, long long* starved) {
   if (starved != NULL) *starved = 0;
 }
 static void sk_video_zc_forget(void* dev) { (void)dev; }
+static int sk_video_zc_latest(void* dev, void* presented_img, void** y, void** uv, int* w, int* h,
+                              int* ten_bit, int* cs, unsigned long long* fence_value) {
+  (void)dev; (void)presented_img; (void)y; (void)uv; (void)w; (void)h; (void)ten_bit; (void)cs; (void)fence_value;
+  return 0;
+}
 #endif
+
+// G-B：Stage3D VideoTexture 直采入口（按 NetStream 解码器 handle）。0 = 无零拷贝帧。
+// 放在 #endif 外：无 GPU 构建也要有符号（stage3d 侧经 dlsym 查找，缺视频链接时回 0）。
+// Windows：stage3d 侧用 GetProcAddress(exe 导出表) 按名查找 ⇒ 必须 dllexport
+// （与 d3d_glue.cc 的 sk_d3d_shared_device/queue 同纪律）。
+#if defined(_WIN32)
+#define AS_ZC_EXPORT __declspec(dllexport)
+#else
+#define AS_ZC_EXPORT
+#endif
+AS_ZC_EXPORT int as_video_zc_latest(int id, void** y, void** uv, int* w, int* h,
+                       int* ten_bit, int* cs, unsigned long long* fence_value);
 
 // The GPU decode surface and device type differ per platform, and so does the frame
 // field that carries the picture: D3D11 keeps the texture in data[0] and the array
@@ -1363,7 +1393,7 @@ static void as_video_advance(as_video* v, void* grctx, double target_s, double n
       v->frame_pts = v->seek_to;
       v->audio_written = 0;
       if (v->audio_buf >= 0) as_audio_live_rewind(v->audio_buf);
-      v->clock0_ms = -1;   // the caller re-anchors on the next tick
+      v->clock0_ms = now_ms - v->seek_to * 1000.0;   // 锚带 seek 基点（媒体位置口径）
       v->eof = 0;
       v->drained = 0;
       v->at_end = 0;
@@ -1592,6 +1622,17 @@ int as_video_open(const char* url, const char* backend, const char* formats, cha
 }
 
 // ---------------------------------------------------------------------------
+// G-B：Stage3D 零拷贝平面查询（VideoTexture.attachNetStream 的运行时后端）
+// ---------------------------------------------------------------------------
+AS_ZC_EXPORT int as_video_zc_latest(int id, void** y, void** uv, int* w, int* h,
+                       int* ten_bit, int* cs, unsigned long long* fence_value) {
+  if (id < 0 || id >= AS_VIDEO_MAX) return 0;
+  as_video* v = &g_videos[id];
+  if (!v->used || v->hw_dev11 == NULL) return 0;
+  return sk_video_zc_latest(v->hw_dev11, v->image, y, uv, w, h, ten_bit, cs, fence_value);
+}
+
+// ---------------------------------------------------------------------------
 // Geometry / metadata (0 until the first frame is decoded)
 // ---------------------------------------------------------------------------
 void as_video_info(int id, int* w, int* h, double* duration_ms, double* fps, int* has_audio) {
@@ -1615,7 +1656,8 @@ void as_video_info(int id, int* w, int* h, double* duration_ms, double* fps, int
 void as_video_play(int id, double now_ms, double vol) {
   if (id < 0 || id >= AS_VIDEO_MAX || !g_videos[id].used) return;
   as_video* v = &g_videos[id];
-  v->clock0_ms = now_ms;
+  // 同 seek：play 从当前媒体位置起走，时钟锚须减去该位置（否则非零起点冻帧）。
+  v->clock0_ms = now_ms - (v->has_video ? v->frame_pts : (double)v->audio_written / (double)AS_VIDEO_AUDIO_RATE) * 1000.0;
   v->paused_at_ms = 0;
   v->vol = vol;
   if (v->has_audio && v->audio_buf >= 0) {
@@ -1744,7 +1786,9 @@ void as_video_seek(int id, double seconds, double now_ms) {
   as_video* v = &g_videos[id];
   if (seconds < 0) seconds = 0;
   v->seek_to = seconds;
-  v->clock0_ms = now_ms;
+  // G-B 真因：时钟锚必须带上 seek 基点——target=(now-clock0)/1000 是**媒体位置**，
+  // 若 clock0=now 则 target 从 0 起而 pts 从 seconds 起 ⇒ 解码永远追不上（冻帧）。
+  v->clock0_ms = now_ms - seconds * 1000.0;
   v->paused_at_ms = 0;
   // Drop the audio already buffered past the seek point before the demuxer moves;
   // otherwise the mixer keeps playing the old position for a whole buffer.

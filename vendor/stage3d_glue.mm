@@ -2603,6 +2603,15 @@ int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   return 1;
 }
 
+// G-B：Metal 后端无解码器零拷贝面（sk_video_zc_latest 恒回 0）⇒ 视频走上传路，
+// 与 D3D12 后端同签名（runtime.ts extern 契约）。
+int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,
+                   int* wOut, int* hOut, int* csOut, int* epochOut) {
+  (void)ctx; (void)unit; (void)ns; (void)gpuY; (void)gpuUV;
+  (void)wOut; (void)hOut; (void)csOut; (void)epochOut;
+  return 0;
+}
+
 // Expose the current render target (render override if set, else back buffer) as
 // an opaque MTLTexture handle for direct GPU→GPU compositing by the Skia Metal
 // backend. The caller BORROWS it — ownership stays with the context — so the

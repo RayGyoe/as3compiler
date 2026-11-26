@@ -2170,3 +2170,57 @@ function checkStage3dMultiWindowSurface(): string[] {
 }
 
 registerGroup('stage3d/multiwindow-surface', checkStage3dMultiWindowSurface);
+
+// G-B（CutPilot 零拷贝轮）：VideoTexture 零拷贝接缝的源级钉。能力是平台门控的
+// （D3D12 直采 Y/UV 双平面；Metal/WebGL 恒回 0 走上传路），examples/ 在 macOS 全量
+// 回归里只能跑到 stub 分支 ⇒ 行为钉住在 CutPilot 套件（gb-fs 算术钉 / p3 / walk
+// zc-parity maxDiff=0）；这里钉接缝契约本身：签名跨后端一致、bind 落地计数、
+// borrowed 纹理不参与 device-lost 重建、上屏帧精确匹配、seek/play 时钟锚带基点。
+function checkStage3dVideoZcSeam(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log('PASS  [stage3d] ' + label); }
+    else { bad.push(label); console.log('FAIL  [stage3d] ' + label); }
+  };
+  const runtime = readNorm(join(root, 'src', 'runtime.ts'));
+  const emit = readNorm(join(root, 'src', 'emit.ts'));
+  const symbols = readNorm(join(root, 'src', 'symbols.ts'));
+  const d3d = readNorm(join(root, 'vendor', 'stage3d_d3d.cc'));
+  const webgl = readNorm(join(root, 'vendor', 'stage3d_webgl.cc'));
+  const metal = readNorm(join(root, 'vendor', 'stage3d_glue.mm'));
+  const vglue = readNorm(join(root, 'vendor', 'video_glue.c'));
+  const vd3d = readNorm(join(root, 'vendor', 'video_d3d.cc'));
+
+  check('runtime declares the s3d_bind_video extern with the shared signature',
+    /extern int s3d_bind_video\(void\* ctx, int unit, int ns, void\*\* gpuY, void\*\* gpuUV,/.test(runtime));
+  check('submit binds Y at unit and UV at unit+1 and counts the landing (binds++)',
+    /as_s3d_bind_texture\(o->gpu, \$\{i \+ 1\}, vgpuUV, 0\)/.test(emit) && /vt->binds\+\+;/.test(emit));
+  check('VideoTexture.binds is a public int field (app-side landing proof)',
+    /\['binds', \{ type: \{ kind: 'int' \}, init: null, visibility: 'public', owner: 'VideoTexture'/.test(symbols));
+  const backends: [string, string][] = [['WebGL', webgl], ['Metal', metal]];
+  for (const [name, src] of backends) {
+    const i = src.indexOf('int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,');
+    const body = i >= 0 ? src.slice(i, i + 400) : '';
+    check(name + ': s3d_bind_video stub exists and returns 0 (upload path)',
+      i >= 0 && /return 0;/.test(body));
+  }
+  check('D3D12 borrowed textures skip device-lost revive (next bind re-borrows)',
+    /if \(t->borrowed\) return 1;/.test(d3d) && /S3DTexture yT, uvT;/.test(d3d));
+  check('zero-copy picks the PRESENTED frame slot, never the FIFO latest',
+    /s->slots\[k\]\.img == presented_img/.test(vd3d) && /if \(pick < 0\) return 0;/.test(vd3d));
+  check('the release callback clears slot->img (address reuse cannot fake a match)',
+    /slot->img = nullptr;/.test(vd3d) || /slot->img = NULL;/.test(vd3d));
+  check('seek anchors the media clock at the seek base (no frozen decode)',
+    /v->clock0_ms = now_ms - seconds \* 1000\.0;/.test(vglue));
+  check('play anchors the media clock at the current media position',
+    /v->clock0_ms = now_ms - \(v->has_video \? v->frame_pts :/.test(vglue));
+  check('in-advance seek re-anchor also carries the base',
+    /v->clock0_ms = now_ms - v->seek_to \* 1000\.0;/.test(vglue));
+  check('Windows name lookup needs dllexport on as_video_zc_latest',
+    /AS_ZC_EXPORT/.test(vglue) && /__declspec\(dllexport\)/.test(vglue));
+  console.log('     [stage3d] ' + ok + ' check(s) passed');
+  return bad;
+}
+
+registerGroup('stage3d/video-zc-seam', checkStage3dVideoZcSeam);

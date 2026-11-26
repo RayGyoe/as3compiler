@@ -17494,6 +17494,8 @@ this.line('AS_bake_pend_n = 0;');
     // the stored slot is only replaced by a real SoundTransform.
     this.line('void NetStream_set_soundTransform(void* _this, SoundTransform* value) { NetStream* o = (NetStream*)_this; if (value == NULL) return; o->_snd = value; gc_write_barrier((void*)value); }');
     this.line('double NetStream_get_time(void* _this) { return ((NetStream*)_this)->_ns_tpos; }');
+    this.line('int NetStream_get_videoWidth(void* _this) { return ((NetStream*)_this)->_ns_vw; }');
+    this.line('int NetStream_get_videoHeight(void* _this) { return ((NetStream*)_this)->_ns_vht; }');
     // Video: the surface keeps its requested rect (AIR's Video owns width/height
     // rather than deriving them from content) and shows the attached stream's frame.
     this.line('void Video_ctor(Video* o, int width, int height) {');
@@ -29025,11 +29027,22 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('void TextureBase_ctor(TextureBase* o) { Object_ctor((Object*)o); }');
     this.line('TextureBase* TextureBase_new(void) { TextureBase* o = (TextureBase*)gc_alloc(GCT_CLASS, sizeof(TextureBase)); o->vtable = &TextureBase_vt; TextureBase_ctor(o); return o; }');
     this.line('void TextureBase_dispose(void* _this) { (void)_this; }');
-    this.line('void VideoTexture_ctor(VideoTexture* o) { TextureBase_ctor((TextureBase*)o); o->videoWidth = 0; o->videoHeight = 0; }');
+    this.line('void VideoTexture_ctor(VideoTexture* o) { TextureBase_ctor((TextureBase*)o); o->videoWidth = 0; o->videoHeight = 0; o->ns = -1; o->gpu = NULL; o->epoch = 0; o->colorSpace = 0; o->binds = 0; }');
     this.line('VideoTexture* VideoTexture_new(void) { VideoTexture* o = (VideoTexture*)gc_alloc(GCT_CLASS, sizeof(VideoTexture)); o->vtable = &VideoTexture_vt; VideoTexture_ctor(o); return o; }');
-    this.line('void VideoTexture_dispose(void* _this) { (void)_this; }');
+    this.line('void VideoTexture_dispose(void* _this) { VideoTexture* o = (VideoTexture*)_this; o->ns = -1; o->gpu = NULL; }');
+    // G-B：AIR 语义——attach 后纹理采样该流的已解码视频帧。零拷贝后端：
+    // 解码器 Y/UV 双平面 borrowed SRV 绑 unit/unit+1，YUV→RGB 由应用层 AGAL FS 完成
+    // （系数经 colorSpace 暴露）⇒ 免 upload/readback/中间 pass。
+    // 无硬解/无共享 device 时 videoWidth 保持 0，调用方据此回退 CPU 路（不静默）。
+    this.line('void VideoTexture_attachNetStream(void* _this, Object* netStream) {');
+    this.indent++;
+    this.line('VideoTexture* o = (VideoTexture*)_this;');
+    this.line('NetStream* ns = (NetStream*)netStream;');
+    this.line('o->ns = ns != NULL ? ns->_ns_hv : -1;');
+    this.line('o->gpu = NULL; o->epoch = 0; o->videoWidth = 0; o->videoHeight = 0;');
+    this.indent--;
+    this.line('}');
     this.line('void VideoTexture_attachCamera(void* _this, Object* camera) { (void)_this; (void)camera; }');
-    this.line('void VideoTexture_attachNetStream(void* _this, Object* netStream) { (void)_this; (void)netStream; }');
     this.line('void Texture_ctor(Texture* o) { TextureBase_ctor((TextureBase*)o); o->width = 0; o->height = 0; o->format = NULL; o->bitmapData = NULL; o->gpu = NULL; o->ctx = NULL; o->mips = 0; }');
     this.line('Texture* Texture_new(void) { Texture* o = (Texture*)gc_alloc(GCT_CLASS, sizeof(Texture)); o->vtable = &Texture_vt; Texture_ctor(o); return o; }');
     this.line('static bool as_tex_is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }');
@@ -29834,6 +29847,18 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.indent--;
       this.line('}');
       this.indent--;
+      this.line(`} else if (as_is((void*)o->tex${i}, &VideoTexture_vt)) {`);
+      this.indent++;
+      this.line(`VideoTexture* vt = (VideoTexture*)o->tex${i};`);
+      this.line('void* vgpuY = NULL; void* vgpuUV = NULL; int vw = 0, vh = 0, vcs = 0, vep = 0;');
+      this.line(`if (as_s3d_bind_video(o->gpu, ${i}, vt->ns, &vgpuY, &vgpuUV, &vw, &vh, &vcs, &vep)) {`);
+      this.indent++;
+      this.line('vt->gpu = vgpuY; vt->videoWidth = vw; vt->videoHeight = vh; vt->colorSpace = vcs; vt->epoch = vep; vt->binds++;');
+      this.line(`as_s3d_bind_texture(o->gpu, ${i}, vgpuY, 0);`);
+      this.line(`as_s3d_bind_texture(o->gpu, ${i + 1}, vgpuUV, 0);`);
+      this.indent--;
+      this.line('}');
+      this.indent--;
       this.line(`} else if (o->tex${i}->gpu != NULL) as_s3d_bind_texture(o->gpu, ${i}, o->tex${i}->gpu, o->tex${i}->mips);`);
       this.line(`else if (o->tex${i}->bitmapData != NULL && o->tex${i}->bitmapData->pixels != NULL) o->tex${i}->gpu = as_s3d_upload_texture(o->gpu, ${i}, o->tex${i}->width, o->tex${i}->height, (const uint32_t*)o->tex${i}->bitmapData->pixels);`);
       this.indent--;
@@ -30169,9 +30194,9 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('return t;');
     this.indent--;
     this.line('}');
-    // VideoTexture: a video-backed texture. No video decoder in this subset; the
-    // object exists so Starling's ConcreteVideoTexture can hold/attach a base,
-    // so this allocates an empty VideoTexture (videoWidth/videoHeight default 0).
+    // VideoTexture: a video-backed texture. G-B 起 attachNetStream 走零拷贝后端
+    // （解码器 Y/UV 平面 → GPU YUV→RGB pass）；无硬解/无共享 device 时保持空纹理
+    // （videoWidth 0），Starling 的 ConcreteVideoTexture 仍可 hold/attach 基类。
     this.line('VideoTexture* Context3D_createVideoTexture(void* _this) { (void)_this; return VideoTexture_new(); }');
     this.line('void Context3D_setDepthTest(void* _this, bool depthMask, char* passCompareMode) { Context3D* o = (Context3D*)_this; o->depthTestOn = depthMask; o->depthCompare = passCompareMode; as_s3d_set_depth(o->gpu, depthMask ? 1 : 0, passCompareMode); }');
     // Context3DTriangleFace -> MTLCullMode. AIR's naming: "back"/"front"/"none"/

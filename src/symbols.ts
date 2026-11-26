@@ -7339,6 +7339,9 @@ export class SymbolTable {
         // stays 0 — which is also what AIR reports for a stream that has not
         // started (seek() alone does not move the playhead; measured).
         ['time', { returnType: { kind: 'number' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        // AIR 已定义：解码帧尺寸（首帧前 0）。G-B 零拷贝 uv 换算需要。
+        ['videoWidth', { returnType: { kind: 'int' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
+        ['videoHeight', { returnType: { kind: 'int' }, params: [], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: true, isSetter: false }],
       ]),
       setters: new Map([
         ['soundTransform', { returnType: { kind: 'void' }, params: [{ name: 'value', type: 'SoundTransform', defaultValue: null, isRest: false }], owner: 'NetStream', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: true }],
@@ -8315,6 +8318,16 @@ export class SymbolTable {
       fields: new Map([
         ['videoWidth', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'VideoTexture', isStatic: false, isConst: false }],
         ['videoHeight', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'VideoTexture', isStatic: false, isConst: false }],
+    // G-B：零拷贝后端私有槽（opaque handle 用 kind:'null'，与 Texture.gpu 同机制）。
+    ['ns', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'VideoTexture', isStatic: false, isConst: false }],
+    ['gpu', { type: { kind: 'null' }, init: null, visibility: 'private', owner: 'VideoTexture', isStatic: false, isConst: false }],
+    ['epoch', { type: { kind: 'int' }, init: null, visibility: 'private', owner: 'VideoTexture', isStatic: false, isConst: false }],
+    // G-B 增强：成功 bind 计数（每帧 submit 落地 +1）。应用层据此判定本帧 bind 是否落地
+    // （epoch 是 fence value，同一上屏帧持有时不变，不能用作落地判据）。
+    ['binds', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'VideoTexture', isStatic: false, isConst: false }],
+    // G-B 增强（AIR 无此属性，opt-in 于使用零拷贝路）：SkYUVColorSpace 口径，
+    // 应用层据此算 YUV→RGB 系数（与 Skia GrYUVtoRGBEffect 同系数）。
+    ['colorSpace', { type: { kind: 'int' }, init: null, visibility: 'public', owner: 'VideoTexture', isStatic: false, isConst: false }],
       ]),
       methods: new Map([
         ['dispose', { returnType: { kind: 'void' }, params: [], owner: 'VideoTexture', visibility: 'public', isStatic: false, isFinal: false, isGetter: false, isSetter: false }],

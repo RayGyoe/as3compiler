@@ -1752,6 +1752,68 @@ node --test --test-name-pattern='video' test/unit/video.ts                 # 115
 
 ---
 
+### 16.14 G-B：Stage3D/AGAL 直采解码器 Y/UV 双平面（VideoTexture 零拷贝接缝，2026-11-26 实测）
+
+§16.9 的零拷贝终点是 **Skia**（`SkImages::TextureFromYUVATextures` → 2D 显示列表）。
+CutPilot 的 GPU 合成走 **Stage3D/AGAL**，那条路原先仍要「解码帧 → CPU BitmapData →
+`uploadFromBitmapData` → AGAL 采样」一次上传 + 一次回读。G-B 把解码器的 D3D12 平面
+**借**进 Stage3D sampler，AGAL FS 内直采 Y/UV 并做 YUV→RGB：**无上传、无回读、无额外 pass**。
+
+#### 16.14.1 接缝与契约
+
+- AS3 面：`Context3D.createVideoTexture()` + `VideoTexture.attachNetStream(ns)`（AIR 真实 API，
+  原为 no-op）+ `setTextureAt(unit, vt)`。submit 时 emit 调 `as_s3d_bind_video(ctx, unit, ns, …)`：
+  成功则 **Y 绑 unit、UV 绑 unit+1**（一层占两个 sampler 槽），并回填
+  `vt.videoWidth/videoHeight/colorSpace/epoch/binds`；失败回 0，应用层该帧重渲上传路。
+- `VideoTexture.binds`（G-B 增强，public int）＝成功 bind 计数。**落地判据必须用它**：
+  `epoch` 是 fence value，同一上屏帧持有时不变；`videoWidth` 是旧值残留——两者都会把
+  bind 失败帧误判成功（绿屏真因之一）。
+- `colorSpace`（G-B 增强）＝ SkYUVColorSpace 口径；应用层据此算 YUV→RGB 系数
+  （与 Skia `GrYUVtoRGBEffect` 同系数：limited/full × BT.601/709/2020）。
+- 后端矩阵：D3D12 直采；**Metal/WebGL 的 `s3d_bind_video` 恒回 0**（同签名空桩，
+  `stage3d/video-zc-seam` 钉组钉住），视频走上传路，不静默降级。
+- 平面生命周期归 `video_d3d.cc` 槽环（共享 device/queue/fence）；桥只 **borrow**：
+  `S3DTexture.borrowed` 纹理不参与 device-lost 重建（下一帧 bind 自然恢复）。
+- Windows 按名查找（`GetProcAddress(GetModuleHandleA(NULL))`）⇒ `as_video_zc_latest`
+  必须 `__declspec(dllexport)`（`AS_ZC_EXPORT`），否则静默回 0。
+
+#### 16.14.2 上屏帧精确匹配（不是 latest）
+
+解码器超前解码 FIFO 未来帧：`latest_slot` 是最新解码帧，**不是上屏帧**。
+`sk_video_d3d_latest(dev11, presented_img, …)` 按 `slot->img == presented_img`（即 `v->image`）
+选槽；无匹配回 0（该帧走 upload 保同源）。回退 latest 会画未来帧（parity 实测差 91）。
+`zc_release_cb` 清 `slot->img`，防 SkImage 地址复用造成误中。
+
+#### 16.14.3 顺手修的真缺陷：seek/play 时钟锚不带基点（冻帧）
+
+`target = (now_ms - clock0_ms)/1000` 是**媒体位置**；旧代码 seek/play 后 `clock0_ms = now_ms`，
+而 pts 从 seek 基点继续 ⇒ target 永远追不上 pts ⇒ **非零起点播放冻帧**（seek 0 碰巧对齐才看似正常）。
+修复：seek `clock0 = now - seconds*1000`；play `clock0 = now - 当前媒体位置*1000`；
+advance 内 seek 重锚同口径。AIR 的 `ns.time` 是媒体位置，此修复是语义保真而非增强。
+
+#### 16.14.4 实测（Windows x64 / D3D12 / ridge.mp4 640×360 / CutPilot PAINT 150 帧）
+
+| 路 | uiEach ms/帧 | 说明 |
+|---|---|---|
+| CPU | 1.887 | 基线 |
+| GPU readback + zc | 1.800 | 免上传，仍回读 |
+| GPU present + zc | **1.600（−15%）** | 免上传免回读 |
+| ALL 模式 CPU / rb+zc / present+zc | 7.94 / 7.27 / 7.79 | 全树 reflow 主导，GPU 差小 |
+
+zc bind 尝试即 100% 成功（26/26）；未尝试的预览帧走上传路（节流/门控），不画错帧。
+像素 parity：walk `zc-parity` 双模（rb/present）**maxDiff=0** 稳定复跑；FS 算术隔离钉
+`cutpilot/test/gb-fs.as`（已知 Y/U/V 上传跑同款 FS）全绿。
+
+#### 16.14.5 边界与未做
+
+- 仅 live 播放期启用；探针式激活（500ms/次，≈6s 未证明才永久回退），失败帧重渲上传路。
+- zc 路不得自行泵流（GUI 嵌套 `dispatchFrame` 红线）；每帧开头清 8 个 sampler 绑定防跨帧残留。
+- AGAL 临时寄存器必须先写后读（#3647/#3648）⇒ FS 变体也带 uv 变换前奏。
+- grade 仍 CPU LUT 缓存上传；≤4 层/ctx；无离屏 RT（`Context3D` 缺 `setRenderTargets`）。
+- macOS 打包未验证（Metal 桩恒回 0，行为＝上传路）。
+- 复现：`node cutpilot/tools/perf-ui.cjs PAINT`（`GPU.flag`=rb/present opt-in）；
+  `WALK_GPU=1|present node cutpilot/tools/walk.cjs`；`AS_VIDEO_ZC=0` 全局 opt-out。
+
 ## 17. 参考锚点
 
 - AS3 语言参考：[`flash.net.NetStream`](https://airsdk.dev/reference/actionscript/3.0/flash/net/NetStream.html)、
