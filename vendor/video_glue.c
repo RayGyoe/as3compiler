@@ -163,11 +163,11 @@ static void sk_video_zc_stats(long long* frames, long long* starved) {
   sk_video_mtl_stats(frames, starved);
 }
 static void sk_video_zc_forget(void* dev) { sk_video_mtl_forget(dev); }
-// G-B：Metal 路暂不暴露平面给 Stage3D（VideoTexture 零拷贝目前仅 D3D12 实测）。
+extern int sk_video_mtl_latest(void*, void**, void**, int*, int*, int*, int*, unsigned long long*);
 static int sk_video_zc_latest(void* dev, void* presented_img, void** y, void** uv, int* w, int* h,
                               int* ten_bit, int* cs, unsigned long long* fence_value) {
-  (void)dev; (void)presented_img; (void)y; (void)uv; (void)w; (void)h; (void)ten_bit; (void)cs; (void)fence_value;
-  return 0;
+  (void)dev;
+  return sk_video_mtl_latest(presented_img, y, uv, w, h, ten_bit, cs, fence_value);
 }
 #else
 #define AS_VIDEO_ZC 0
@@ -831,12 +831,10 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
       if (v->i420 == NULL) return 0;
       unsigned char* dst[4] = {v->i420, v->i420 + (size_t)w * h, v->i420 + (size_t)w * h * 5 / 4, NULL};
       int dstride[4] = {w, w / 2, w / 2, 0};
-      if (v->sws == NULL) {
-        v->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_YUV420P,
-                                SWS_BILINEAR, NULL, NULL, NULL);
-        if (v->sws == NULL) return 0;
-      }
-      sws_scale(v->sws, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, dstride);
+      v->sws = sws_getCachedContext(v->sws, w, h, (enum AVPixelFormat)f->format, w, h,
+                                    AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+      if (v->sws == NULL) return 0;
+      if (sws_scale(v->sws, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, dstride) != h) return 0;
       v->t_conv_ms += as_video_ms() - t_conv0;
       const double t_up0 = as_video_ms();
       img = sk_image_from_yuv_strided(grctx, v->i420, w, v->i420 + (size_t)w * h, w / 2,
@@ -851,14 +849,12 @@ static int as_video_present(as_video* v, AVFrame* f, void* grctx, double now_ms,
     // when one EXISTS. Stated here instead of silently painting black.
     if (v->bgra == NULL) v->bgra = (unsigned char*)malloc((size_t)w * (size_t)h * 4);
     if (v->bgra == NULL) return 0;
-    if (v->sws_bgra == NULL) {
-      v->sws_bgra = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_BGRA,
-                                   SWS_BILINEAR, NULL, NULL, NULL);
-      if (v->sws_bgra == NULL) return 0;
-    }
+    v->sws_bgra = sws_getCachedContext(v->sws_bgra, w, h, (enum AVPixelFormat)f->format, w, h,
+                                  AV_PIX_FMT_BGRA, SWS_BILINEAR, NULL, NULL, NULL);
+    if (v->sws_bgra == NULL) return 0;
     unsigned char* dst[4] = {v->bgra, NULL, NULL, NULL};
     int dstride[4] = {w * 4, 0, 0, 0};
-    sws_scale(v->sws_bgra, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, dstride);
+    if (sws_scale(v->sws_bgra, (const uint8_t* const*)f->data, f->linesize, 0, h, dst, dstride) != h) return 0;
     v->t_conv_ms += as_video_ms() - t_conv0;
     const double t_up0 = as_video_ms();
     img = sk_image_from_argb(v->bgra, w, h);   // copies; BGRA-ordered words as-is
@@ -1629,7 +1625,7 @@ AS_ZC_EXPORT int as_video_zc_latest(int id, void** y, void** uv, int* w, int* h,
                        int* ten_bit, int* cs, unsigned long long* fence_value) {
   if (id < 0 || id >= AS_VIDEO_MAX) return 0;
   as_video* v = &g_videos[id];
-  if (!v->used || v->hw_dev11 == NULL) return 0;
+  if (!v->used || (AS_VIDEO_ZC_DEVICE && v->hw_dev11 == NULL)) return 0;
   return sk_video_zc_latest(v->hw_dev11, v->image, y, uv, w, h, ten_bit, cs, fence_value);
 }
 

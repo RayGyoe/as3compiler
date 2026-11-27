@@ -128,7 +128,7 @@ function checkVideoSurface(): string[] {
   // the img == NULL fallback.
   const present = bodyOf('static int as_video_present');
   const gpuAt = present.indexOf('if (want_gpu) {');
-  const i420At = present.indexOf('v->sws = sws_getContext');
+  const i420At = present.indexOf('v->sws = sws_getCachedContext');
   const cpuAt = present.indexOf('if (img == NULL) {');
   check('the CPU-raster fallback converts straight to BGRA (no throwaway I420 pass)',
     // Since V3 step 2 the same branch also has to skip conversion when a pre-made GPU

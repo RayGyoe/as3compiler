@@ -1838,9 +1838,9 @@ AGAL fragment shader: no upload, no readback, no extra pass.
   `videoWidth` is a stale leftover — both misreport failed binds as successes.
 - `colorSpace` (G-B enhancement) uses the SkYUVColorSpace numbering; the app derives YUV→RGB
   coefficients identical to Skia's `GrYUVtoRGBEffect`.
-- Backend matrix: D3D12 direct sampling; **Metal/WebGL `s3d_bind_video` stubs return 0** (same
-  signature, pinned by `stage3d/video-zc-seam`); video then uses the upload path, never a silent
-  downgrade. Plane lifetime stays in the `video_d3d.cc` slot ring (shared device/queue/fence); the
+- Metal samples views of the presented VideoToolbox frame’s CoreVideo textures. Each view retains
+  its decoder buffer and wrapper until Metal finishes sampling it. Unsupported layouts use the upload path.
+  WebGL also uses uploads. On D3D12, plane lifetime stays in the `video_d3d.cc` slot ring (shared device/queue/fence); the
   bridge only borrows (`S3DTexture.borrowed` skips device-lost revive). Windows name lookup requires
   `__declspec(dllexport)` on `as_video_zc_latest` (`AS_ZC_EXPORT`).
 - The presented frame must match exactly: `sk_video_d3d_latest(dev11, presented_img, …)` picks the

@@ -1770,8 +1770,7 @@ CutPilot 的 GPU 合成走 **Stage3D/AGAL**，那条路原先仍要「解码帧 
   bind 失败帧误判成功（绿屏真因之一）。
 - `colorSpace`（G-B 增强）＝ SkYUVColorSpace 口径；应用层据此算 YUV→RGB 系数
   （与 Skia `GrYUVtoRGBEffect` 同系数：limited/full × BT.601/709/2020）。
-- 后端矩阵：D3D12 直采；**Metal/WebGL 的 `s3d_bind_video` 恒回 0**（同签名空桩，
-  `stage3d/video-zc-seam` 钉组钉住），视频走上传路，不静默降级。
+- Metal 按当前呈现的 SkImage 查找 VideoToolbox 的 Y/UV 平面，纹理视图持有解码缓冲和 CoreVideo 包装直到 GPU 采样结束。无法包装的布局回退上传。WebGL 使用上传路径。D3D12 继续从解码器槽环借用平面，通过共享队列和 fence 同步。
 - 平面生命周期归 `video_d3d.cc` 槽环（共享 device/queue/fence）；桥只 **borrow**：
   `S3DTexture.borrowed` 纹理不参与 device-lost 重建（下一帧 bind 自然恢复）。
 - Windows 按名查找（`GetProcAddress(GetModuleHandleA(NULL))`）⇒ `as_video_zc_latest`

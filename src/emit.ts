@@ -24728,6 +24728,15 @@ void FileStream_writeObject(void* _this, as_value v) {
     this.line('if (sbd->pixels == NULL) { ASC_render_scale = keep_render_scale; return; }');
     this.line('sp = (const unsigned*)sbd->pixels;');
     this.line('sw = sbd->width; sh = sbd->height;');
+    // A BitmapData source is ALREADY a raster at its own native size -- unlike the
+    // TextField/DisplayObject branches above, nothing here is re-rasterized at the
+    // destination resolution. The shared sampler multiplies sampled source coords by
+    // `rs` to undo that destination-resolution raster; applying it to a native raster
+    // double-counts the matrix scale (a scale-2 draw sampled 1:1, painting only the
+    // top-left source-sized corner and leaving the rest black -- CutPilot MAC-5 fit
+    // of a 192x108 clip into 640x360). Pin rs to 1 so the inverse matrix alone maps
+    // destination->source. (adl: bd.draw(bd, scaleMatrix) magnifies the whole bitmap.)
+    this.line('rs = 1.0;');
     this.indent--;
     this.line('} else {');
     this.indent++;

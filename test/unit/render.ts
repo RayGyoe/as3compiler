@@ -458,6 +458,13 @@ function checkBakeResolution(): string[] {
     emitted.includes('double scx = (ia * ((double)cx0 + 0.5) + ic * ((double)dy + 0.5) + itx) * rs;') &&
     emitted.includes('double scy = (ib * ((double)cx0 + 0.5) + id * ((double)dy + 0.5) + ity) * rs;') &&
     emitted.includes('scx += _dscx; scy += _dscy;'));
+  // A BitmapData source is a native raster, NOT re-rasterized at the destination
+  // resolution, so the sampler must NOT multiply its coords by rs (that double-counts
+  // the matrix scale: a scale-2 draw sampled 1:1 and painted only the top-left corner).
+  // CutPilot MAC-5: fitting a 192x108 clip into 640x360 came out black except one block.
+  check('a BitmapData draw source pins rs=1 (native raster, inverse matrix alone)',
+    emitted.includes('sp = (const unsigned*)sbd->pixels;') &&
+    emitted.includes('sw = sbd->width; sh = sbd->height;\nrs = 1.0;'));
   check('both draw raster branches are scaled and the source rect +1 is one bitmap px',
     (emitted.match(/as_skia_canvas_scale\(canvas, rs, rs\);/g) ?? []).length === 2 &&
     emitted.includes("sw = (int)ceil(tf->_fieldWidth * rs) + (tf->border ? 1 : 0); if (sw < 1) sw = 1;") &&

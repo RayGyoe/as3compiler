@@ -2198,13 +2198,11 @@ function checkStage3dVideoZcSeam(): string[] {
     /as_s3d_bind_texture\(o->gpu, \$\{i \+ 1\}, vgpuUV, 0\)/.test(emit) && /vt->binds\+\+;/.test(emit));
   check('VideoTexture.binds is a public int field (app-side landing proof)',
     /\['binds', \{ type: \{ kind: 'int' \}, init: null, visibility: 'public', owner: 'VideoTexture'/.test(symbols));
-  const backends: [string, string][] = [['WebGL', webgl], ['Metal', metal]];
-  for (const [name, src] of backends) {
-    const i = src.indexOf('int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,');
-    const body = i >= 0 ? src.slice(i, i + 400) : '';
-    check(name + ': s3d_bind_video stub exists and returns 0 (upload path)',
-      i >= 0 && /return 0;/.test(body));
-  }
+  check('WebGL falls back to uploads', /int s3d_bind_video\([^{}]+\)\s*\{[^}]*return 0;/.test(webgl));
+  check('Metal binds both planes of the presented frame',
+    metal.includes('as_video_zc_latest(ns, &planes[0], &planes[1]') &&
+    metal.includes('s3d_bind_texture(c, unit + i, planes[i], 0)') &&
+    vglue.includes('sk_video_mtl_latest(presented_img, y, uv'));
   check('D3D12 borrowed textures skip device-lost revive (next bind re-borrows)',
     /if \(t->borrowed\) return 1;/.test(d3d) && /S3DTexture yT, uvT;/.test(d3d));
   check('zero-copy picks the PRESENTED frame slot, never the FIFO latest',

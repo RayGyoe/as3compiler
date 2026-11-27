@@ -336,6 +336,7 @@ struct S3DContext {
   // samplers are named and SPIRV-Cross numbers them per stage, so a vertex-only
   // sampler and a fragment-only sampler can both be unit 0 legitimately; sharing one
   // row made whichever bound last win and the other stage sample the wrong texture.
+  id<MTLTexture> videoPlanes[S3D_MAX_TEX];  // retained across draws until replaced
   id<MTLTexture> textures[2][S3D_MAX_TEX];  // [S3D_STAGE_*] -> units (0 = vertex, 1 = fragment)
   // clear color / blend
   float clearR, clearG, clearB, clearA;
@@ -1206,6 +1207,7 @@ void s3d_destroy(void* ctx) {
   // uncommitted encoders would be dropped (and the draws with them).
   s3d_flush(ctx);
   s3d_unregister_ctx(c);
+  for (int i = 0; i < S3D_MAX_TEX; i++) [c->videoPlanes[i] release];
   // MRC: release every retained resource the context owns. device/queue/target
   // and the vertex/index/constant buffers are +1 (from create/init and uploads).
   // c->textures[i] and c->renderOverride are BORROWED references (their +1 is
@@ -2603,13 +2605,27 @@ int s3d_bind_texture(void* ctx, int unit, void* tex, int hasChain) {
   return 1;
 }
 
-// G-B：Metal 后端无解码器零拷贝面（sk_video_zc_latest 恒回 0）⇒ 视频走上传路，
-// 与 D3D12 后端同签名（runtime.ts extern 契约）。
+extern int as_video_zc_latest(int, void**, void**, int*, int*, int*, int*, unsigned long long*)
+    __attribute__((weak_import));
+
 int s3d_bind_video(void* ctx, int unit, int ns, void** gpuY, void** gpuUV,
                    int* wOut, int* hOut, int* csOut, int* epochOut) {
-  (void)ctx; (void)unit; (void)ns; (void)gpuY; (void)gpuUV;
-  (void)wOut; (void)hOut; (void)csOut; (void)epochOut;
-  return 0;
+  if (!ctx || !gpuY || !gpuUV || unit < 0 || unit >= S3D_MAX_TEX - 1 || !as_video_zc_latest) return 0;
+  S3DContext* c = (S3DContext*)ctx;
+  void* planes[2] = {};
+  unsigned long long epoch = 0;
+  if (!as_video_zc_latest(ns, &planes[0], &planes[1], wOut, hOut, NULL, csOut, &epoch)) return 0;
+  if ([(id<MTLTexture>)planes[0] device] != c->device) return 0;
+  for (int i = 0; i < 2; i++) {
+    id<MTLTexture> plane = [(id<MTLTexture>)planes[i] retain];
+    [c->videoPlanes[unit + i] release];
+    c->videoPlanes[unit + i] = plane;
+    s3d_bind_texture(c, unit + i, planes[i], 0);
+  }
+  *gpuY = planes[0];
+  *gpuUV = planes[1];
+  if (epochOut) *epochOut = (int)epoch;
+  return 1;
 }
 
 // Expose the current render target (render override if set, else back buffer) as

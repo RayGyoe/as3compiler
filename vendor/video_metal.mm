@@ -42,6 +42,9 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreVideo/CVMetalTextureCache.h>
 
+#import <objc/runtime.h>
+#include <mutex>
+#include <unordered_map>
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
@@ -81,11 +84,58 @@ struct ZcToken {
   CVMetalTextureRef y;
   CVMetalTextureRef uv;
   CVPixelBufferRef pb;
+  uint32_t imageId;
+  int colorSpace;
+  id<MTLTexture> views[2];
 };
+
+// Skia can retain the backing textures beyond the lifetime of the SkImage.
+// Key by its unique ID so allocator address reuse cannot select a stale frame.
+static std::mutex planeLock;
+static std::unordered_map<uint32_t, ZcToken*> presentedPlanes;
+static char planeOwnerKey;
+
+static id<MTLTexture> zc_view(CVMetalTextureRef wrapper, CVPixelBufferRef pb) {
+  id<MTLTexture> plane = CVMetalTextureGetTexture(wrapper);
+  id<MTLTexture> view = [plane newTextureViewWithPixelFormat:plane.pixelFormat];
+  if (view != nil) {
+    // The command buffer retains this view until GPU completion. Keep the
+    // decoder buffer and its CoreVideo wrapper alive for that entire interval.
+    objc_setAssociatedObject(view, &planeOwnerKey, @[(id)wrapper, (id)pb],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+  }
+  return view;
+}
+
+int sk_video_mtl_latest(void* image, void** y, void** uv, int* w, int* h,
+                        int* ten, int* cs, unsigned long long* epoch) {
+  if (!image || !y || !uv) return 0;
+  std::lock_guard<std::mutex> lock(planeLock);
+  auto it = presentedPlanes.find(static_cast<SkImage*>(image)->uniqueID());
+  if (it == presentedPlanes.end()) return 0;
+  ZcToken* t = it->second;
+  if (!t->views[0]) t->views[0] = zc_view(t->y, t->pb);
+  if (!t->views[1]) t->views[1] = zc_view(t->uv, t->pb);
+  if (!t->views[0] || !t->views[1]) return 0;
+  *y = t->views[0];
+  *uv = t->views[1];
+  if (w) *w = (int)t->views[0].width;
+  if (h) *h = (int)t->views[0].height;
+  if (ten) *ten = t->views[0].pixelFormat == MTLPixelFormatR16Unorm;
+  if (cs) *cs = t->colorSpace;
+  if (epoch) *epoch = t->imageId;
+  return 1;
+}
 
 static void zc_release(void* ctx) {
   ZcToken* t = (ZcToken*)ctx;
   if (t == NULL) return;
+  if (t->imageId) {
+    std::lock_guard<std::mutex> lock(planeLock);
+    presentedPlanes.erase(t->imageId);
+  }
+  [t->views[0] release];
+  [t->views[1] release];
   if (t->y != NULL) CFRelease(t->y);
   if (t->uv != NULL) CFRelease(t->uv);
   if (t->pb != NULL) CFRelease(t->pb);
@@ -313,6 +363,12 @@ extern "C" void* sk_video_mtl_image(void* ctx, void* cvbuf, int w, int h, int te
       // "If ReleaseProc is provided it is also called before return on failure"), so the
       // token and its pixel buffer are freed here, not leaked.
       return NULL;
+    }
+    {
+      std::lock_guard<std::mutex> lock(planeLock);
+      token->imageId = img->uniqueID();
+      token->colorSpace = yuv_cs < 0 ? 1 : yuv_cs;
+      presentedPlanes.emplace(token->imageId, token);
     }
     g_frames++;
     return img.release();
