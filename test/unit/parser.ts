@@ -222,3 +222,61 @@ function checkE4xComputedName(): string[] {
 
 registerGroup('unit: parser/ClassFieldDeclarators', checkClassFieldDeclarators);
 registerGroup('unit: parser/E4xComputedName', checkE4xComputedName);
+// ---- 阶段四百七十一: an import belongs to its BLOCK, not to the file ----
+//
+// Starling.as imports starling.display.DisplayObject inside `package starling.core`
+// and flash.display.DisplayObject at file level for the helper function below the
+// package block ("put here to avoid naming conflicts", says the source). A single
+// flat per-file import list cannot express that, so the free helper's parameter
+// resolved to starling's class and the legal `helper(_nativeStage)` call became an
+// implicit-coercion error. mxmlc 51.4.1 is the judge for every rule pinned here
+// (temp/impscope/adl/{b,c,d,e,f,g,h}).
+function checkImportScope(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [impscope] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [impscope] ${label}`); }
+  };
+  const decls = (src: string): any[] => parse(src).body as any[];
+  const byName = (src: string, name: string): any => decls(src).find((s) => s.name === name);
+
+  const starling = 'package p {\n  import alt.DisplayObject;\n  public class C { public function C() {} }\n}\n'
+    + 'package alt { public class DisplayObject {} }\n'
+    + 'import flash.display.DisplayObject;\nfunction helper(o:DisplayObject):Boolean { return o == null; }';
+  check('a package class sees only its own block\'s imports',
+    byName(starling, 'C')?.imports.join(',') === 'alt.DisplayObject');
+  check('a file-level function sees only the file-level imports',
+    byName(starling, 'helper')?.imports.join(',') === 'flash.display.DisplayObject');
+  check('the file-level import does not leak into the package class',
+    !byName(starling, 'C')?.imports.includes('flash.display.DisplayObject'));
+  check('the package import does not leak into the file-level function',
+    !byName(starling, 'helper')?.imports.includes('alt.DisplayObject'));
+  check('Program.imports still lists every import in source order (reach.ts over-approximates)',
+    parse(starling).imports.join(',') === 'alt.DisplayObject,flash.display.DisplayObject');
+
+  // Hoisting: mxmlc accepts an import written AFTER the declarations that use it,
+  // in both scopes (probes g and h), so the list is sealed when the block closes.
+  const lateFile = byName('function helper(o:Point):Boolean { return o == null; }\nimport flash.geom.Point;', 'helper');
+  check('a file-level import reaches a function written before it',
+    lateFile?.imports.join(',') === 'flash.geom.Point');
+  const latePkg = byName('package p {\n  public class C { public function C() {} }\n  import flash.geom.Point;\n}', 'C');
+  check('a package import reaches a class written before it',
+    latePkg?.imports.join(',') === 'flash.geom.Point');
+
+  // A file-level HELPER CLASS is in the file scope too (probe f): the package's
+  // import must not reach it, and the file's own must.
+  const helperCls = byName(starling + '\nclass Helper { public var v:DisplayObject = null; }', 'Helper');
+  check('a file-level helper class takes the file scope, not the package\'s',
+    helperCls?.imports.join(',') === 'flash.display.DisplayObject');
+
+  // An import written BEFORE the package block is still file-level (probe e).
+  const before = byName('import flash.geom.Point;\npackage p {\n  import alt.DisplayObject;\n  public class C { public function C() {} }\n}', 'C');
+  check('a file-level import written before `package` stays out of the package scope',
+    before?.imports.join(',') === 'alt.DisplayObject');
+
+  if (ok > 0) console.log(`[impscope] ${ok} import-scope checks passed`);
+  return bad;
+}
+
+registerGroup('unit: parser/ImportScope', checkImportScope);

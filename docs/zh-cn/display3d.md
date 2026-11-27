@@ -837,6 +837,13 @@ half 3x3            -> #3682   （half 也吃 2 的幂规则）
 setRenderToTexture  -> #3746    （纹理本身是压缩格式时）
 ```
 
+**`setRenderToTexture` 的形参是 `TextureBase`，不是 `Texture`**（阶段四百七十一）。mxmlc 51.4.1 接受
+一个裸 `TextureBase` 与一个 `RectangleTexture`（`temp/impscope/rtt`）；我们曾声明成 `Texture`，
+于是 Starling `Painter.applyRenderTarget` 合法的 `setRenderToTexture(_state.renderTargetBase, ...)`
+在实参类兼容性闸门（阶段四百七十）下被判为隐式强转。现在 C 侧按**类**取 2D 载荷
+（`Texture` 与 `RectangleTexture` 共享 `Texture` 的布局）；cube / video 目标需要本后端未实现的
+面/附件选择器，因此**大声报明**（`as_throw_unsupported`）而不是静默改渲到 back buffer。
+
 `#3745` 与 `#3759` 都是 `ArgumentError`，文案逐字取自 adl：
 `Error #3745: Compressed texture size is too small. The minimum size for compressed textures is 4x4.`
 / `Error #3759: The selected texture format is not valid in this profile.`

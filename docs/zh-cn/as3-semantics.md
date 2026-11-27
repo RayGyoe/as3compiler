@@ -548,6 +548,51 @@ C、而不是像 AS3」的地方，其中两条背后是**真的语义 bug**（`
 `getPixel32`/`getPixels` 输出时把 alpha 强制成 `0xFF`，我们保留源字里的 alpha
 （adl `FF030201` vs AOT `04030201`）——见 `skia.md` §6.18「如实报明」。
 
+### 3.12 `import` 的作用域是「块」，自由函数的签名属于**声明它的那个作用域**（阶段四百七十一 · mxmlc 51.4.1 实测）
+
+AS3 的 `import` 不是文件级指令：写在 `package p { ... }` 里的只对**那个包块**可见，写在包块之外的
+只对**文件级声明**可见，两个方向都不泄漏；而且它对**整个块**生效，写在声明后面也算。七组探针
+（`temp/impscope/adl/`）逐条实测：
+
+| 探针 | 形态 | mxmlc 51.4.1 |
+|---|---|---|
+| a | 包内 `import alt.DisplayObject` + 包外 `import flash.display.DisplayObject`，文件级 helper 收 flash 的 `Stage` | **接受** |
+| b | 文件级函数用**包内** import 的短名 | 错误：找不到类型 `DisplayObject` |
+| c | 包内类用**包外** import 的短名 | 错误：找不到类型 `DisplayObject` |
+| d | 把包内那个 `alt.DisplayObject` 传给文件级 helper | 错误：`DisplayObject` → 不相关类型 `DisplayObject` 的隐式强转 |
+| e | 包外 import 写在 `package` **之前**，包内类用它 | 错误：找不到类型（位置不改变归属） |
+| f | 包外 helper **类**用包内 import | 错误：找不到类型 |
+| g / h | import 写在**声明之后**（文件级 / 包块内各一） | **接受**（块内提升） |
+
+这不是学院派细节：Starling 的 `starling/core/Starling.as` 正是 a 的形状——包块 import
+`starling.display.DisplayObject`，文件尾再 import `flash.display.DisplayObject` 给文件级 helper
+`isNativeDisplayObjectEmpty` 用，源码注释写着「put here to avoid naming conflicts」。
+
+我们此前有两处不符：
+
+1. **parser 只有一张文件级 import 表**，包块内外的 import 混在一起，短名同名时后写的赢；
+2. **自由函数不带 import 上下文**（`FuncInfo` 只有 `params` 的原始类型名），于是形参类型在
+   **调用方**的作用域里解析——原型、定义、thunk、调用点四处一起解析成调用方那个类。
+
+两者叠加的结果是 `helper(_nativeStage)` 被判成 `Stage → starling.display.DisplayObject` 的隐式强转。
+注意这条**不是**阶段四百七十（实参类兼容性闸门）引入的缺陷：闸门只是把一个早就存在的错误解析
+**暴露**出来——修前生成的 C 里，helper 的形参、thunk 的 `as_v_req_inst` 和调用点的强转全都写着
+`starling_display_DisplayObject*`，四处一致地错，C 编译器当然不报错。
+
+现按 AIR 口径落地：parser 为包块与文件级各记一张表、在块结束时**封定**（覆盖块内全部声明，
+实现提升），`FuncDecl` 与 `ClassDecl`/`InterfaceDecl` 一样携带本作用域的 import 快照；
+`FuncInfo.importAlias` 让原型/定义/thunk/调用点统一走**声明作用域**。这与既有的
+「方法形参走声明类的 alias」（`declAliasOf`）是同一条规则，只是补上了自由函数这一半。
+
+**未修（如实报明）**：短名在本作用域的 import 表里查不到时，`resolveType` 仍会退到全局短名表，
+所以 b/c/e/f 四种**泄漏形态我们仍然接受**（mxmlc 拒绝）。这是「多接受非法程序」而不是
+「把合法程序译错」，且全局兜底是脚本作用域与大量既有示例的承重墙，收紧它是独立工程——
+已登记在 `TODO.md` 的遗留表。
+
+回归：`examples/import-scope.as`（6 组断言，adl 51.4.1 逐条 PASS）、
+`unit: parser/ImportScope`（9 钉）、`unit: emit/FreeFunctionImportScope`（8 钉）、
+`unit: diagnostics/ImportScope`（3 钉，含 d 的拒绝文案与 a 的放行）。
+
 ## 4. 保真与增强原则
 
 §2 的红线与 §3 的分歧点都在回答「**怎么和 AIR 对齐**」。本节补上另一半：**对齐之外，什么算「增强」**。

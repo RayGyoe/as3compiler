@@ -461,6 +461,57 @@ Regression pins: `test/unit/c-warnings.ts` (all the shapes above in one program,
 C89 struct initialisers would dominate the report) and `r1..r9` in `test/unit/diagnostics.ts` for the
 return-path acceptance set.
 
+### 3.12 An `import` belongs to its BLOCK, and a free function's signature belongs to the scope that DECLARES it (stage 471, measured on mxmlc 51.4.1)
+
+An AS3 `import` is not a file-level directive: one written inside `package p { ... }` is visible only
+there, one written outside the package block only to the file-level declarations, and neither leaks into
+the other. It also applies to the WHOLE block, so an import written after a declaration still reaches it.
+Seven probes (`temp/impscope/adl/`) measured on mxmlc 51.4.1:
+
+| probe | shape | mxmlc 51.4.1 |
+|---|---|---|
+| a | `import alt.DisplayObject` in the package + `import flash.display.DisplayObject` at file level; the file-level helper takes a flash `Stage` | **accepted** |
+| b | a file-level function using a short name imported INSIDE the package | error: type `DisplayObject` not found |
+| c | a package class using a short name imported OUTSIDE the package | error: type `DisplayObject` not found |
+| d | handing the package's `alt.DisplayObject` to the file-level helper | error: implicit coercion from `DisplayObject` to the unrelated type `DisplayObject` |
+| e | a file-level import written BEFORE `package`, used inside it | error: type not found (position does not change ownership) |
+| f | a file-level helper CLASS using a package import | error: type not found |
+| g / h | the import written AFTER the declaration (file level / inside the package) | **accepted** (hoisted within the block) |
+
+This is not academic: Starling's `starling/core/Starling.as` is exactly shape (a) -- the package block
+imports `starling.display.DisplayObject`, and the file tail imports `flash.display.DisplayObject` for the
+file-level helper `isNativeDisplayObjectEmpty` ("put here to avoid naming conflicts", says the source).
+
+We had two mismatches:
+
+1. **the parser kept ONE flat per-file import list**, merging both scopes, so a duplicated short name was
+   resolved last-wins;
+2. **a free function carried no import context** (`FuncInfo` kept only the raw parameter type names), so
+   its parameter types were resolved in the CALLER's scope -- prototype, definition, thunk and call site
+   all agreeing on the caller's class.
+
+Together they turned `helper(_nativeStage)` into an implicit coercion from `Stage` to
+`starling.display.DisplayObject`. Note this was **not** introduced by stage 470 (the argument
+class-compatibility gate): the gate merely EXPOSED a resolution bug that was already there -- the
+previously generated C spelled `starling_display_DisplayObject*` in the helper's parameter, in the thunk's
+`as_v_req_inst` and in the call-site cast, four places consistently wrong, which of course compiles.
+
+Now aligned with AIR: the parser keeps one list per scope and SEALS it when the block closes (covering
+every declaration in it, which is what implements hoisting); `FuncDecl` carries its scope's import
+snapshot just like `ClassDecl`/`InterfaceDecl`; and `FuncInfo.importAlias` makes the prototype, definition,
+thunk and every call site resolve through the DECLARING scope. This is the same rule methods already
+followed (`declAliasOf`) -- only the free-function half was missing.
+
+**Not fixed (stated honestly)**: when a short name is absent from the current scope's import table,
+`resolveType` still falls back to the global short-name table, so the four LEAK shapes b/c/e/f are still
+ACCEPTED by us where mxmlc rejects them. That is "accepting an invalid program", not "mistranslating a
+valid one", and the global fallback is load-bearing for script scope and many existing examples;
+tightening it is separate work, registered in `TODO.md`'s leftover table.
+
+Regression: `examples/import-scope.as` (6 assertions, each PASS on adl 51.4.1),
+`unit: parser/ImportScope` (9 pins), `unit: emit/FreeFunctionImportScope` (8 pins),
+`unit: diagnostics/ImportScope` (3 pins, including d's rejection text and a's acceptance).
+
 ## 4. Fidelity and Enhancement Principles
 
 §2's red lines and §3's divergence points both answer "**how to align with AIR**". This section supplies the

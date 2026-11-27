@@ -65,7 +65,20 @@ export function parse(source: string): Program {
 class Parser {
   private pos = 0;
   private tokens: Token[];
+  // Every import in source order, for the file-level consumers that deliberately
+  // over-approximate (reach.ts's closure, the script-scope alias seed).
   private imports: string[] = [];
+  // AS3 scopes an import to the BLOCK it is written in, not to the file: an import
+  // inside `package p { ... }` is visible only there, and an import outside the
+  // package block only to the file-level declarations beside it. Measured on
+  // mxmlc 51.4.1 (temp/impscope/adl/{b,c,e,f}): each of the four leak directions is
+  // a hard "找不到类型" error, including a file-level import written BEFORE the
+  // package block. Two lists, because a single flat list cannot express Starling's
+  // `package starling.core { import starling.display.DisplayObject; ... }` followed
+  // by `import flash.display.DisplayObject;` + a file-level helper that takes the
+  // flash one -- the same short name means two different classes in one file.
+  private fileImports: string[] = [];
+  private pkgImports: string[] | null = null;
   private currentPackage: string | null = null;
   private swfFrameRate: number | undefined;
 
@@ -187,8 +200,28 @@ class Parser {
     // body into the top level — class/interface/function declarations then land
     // directly in program.body where symbol collection and code emission expect
     // them. Only top-level blocks are flattened (never those inside functions).
-    return { body: flattenTopLevelBlocks(body), imports: this.imports, swfFrameRate: this.swfFrameRate };
+    const flat = flattenTopLevelBlocks(body);
+    // Package declarations are sealed by parsePackage with their OWN block's list;
+    // only the file-level ones take the file's.
+    this.sealImports(flat.filter((s) => !this.pkgDecls.has(s)), this.fileImports);
+    return { body: flat, imports: this.imports, swfFrameRate: this.swfFrameRate };
   }
+
+  // An import is visible to the WHOLE block it is written in, not just to the
+  // declarations that follow it: mxmlc 51.4.1 accepts both a file-level helper
+  // written BEFORE its `import` and a class written before an import inside the
+  // same package block (temp/impscope/adl/{g,h}). The parse-time snapshot is
+  // therefore only a prefix; seal every declaration of a finished scope with that
+  // scope's complete list.
+  private sealImports(stmts: Stmt[], imports: string[]): void {
+    for (const s of stmts) {
+      if (s.kind === 'ClassDecl' || s.kind === 'InterfaceDecl' || s.kind === 'FuncDecl') s.imports = imports.slice();
+    }
+  }
+
+  // Declarations a package block produced (they are spliced into the same top-level
+  // body, so identity is what tells the two scopes apart).
+  private pkgDecls = new Set<Stmt>();
 
   // `[SWF(frameRate = 30)]`: AIR's Stage reads this back through `stage.frameRate`
   // (measured on adl 51.4.1 -- with the metadata absent the default is 24, and a
@@ -231,12 +264,16 @@ class Parser {
     // same-line `import a.b import c.d` is still a hard error.
     this.consumeSemicolon();
     this.imports.push(path);
+    this.activeImports().push(path);
   }
 
   // `package a.b.c { ... }` — parse the qualified name, then parse the body with
   // that namespace attached to its declarations (for cross-file resolution).
   // AS3 also allows an unnamed package (`package { ... }`), which is the default
   // package; its name is the empty string.
+  // The import list a declaration written HERE can see (see `fileImports`).
+  private activeImports(): string[] { return this.pkgImports ?? this.fileImports; }
+
   private parsePackage(body: Stmt[]): void {
     this.expect('package');
     let pkg = '';
@@ -248,8 +285,11 @@ class Parser {
       }
     }
     this.expect('{');
+    const bodyStart = body.length;
     const saved = this.currentPackage;
+    const savedImports = this.pkgImports;
     this.currentPackage = pkg;
+    this.pkgImports = [];
     while (!this.at('}') && this.peek().kind !== 'eof') {
       const before = this.pos;
       if (this.atIdent('import')) {
@@ -289,7 +329,11 @@ class Parser {
       }
     }
     this.expect('}');
+    const pkgBody = body.slice(bodyStart);
+    this.sealImports(pkgBody, this.pkgImports!);
+    for (const s of pkgBody) this.pkgDecls.add(s);
     this.currentPackage = saved;
+    this.pkgImports = savedImports;
   }
 
   // ---- statements ----
@@ -815,7 +859,7 @@ class Parser {
       returnType = this.parseType();
     }
     const body = this.parseBlock();
-    return { kind: 'FuncDecl', name, params, returnType, body, metadata };
+    return { kind: 'FuncDecl', name, params, returnType, body, metadata, imports: this.activeImports().slice() };
   }
 
   private parseClassDecl(isFinal: boolean, metadata: Metadata[] = [], isDynamic = false): Stmt {
@@ -976,7 +1020,7 @@ class Parser {
       }
     }
     this.expect('}');
-    return { kind: 'ClassDecl', name, packageName: this.currentPackage, superClass, members, isFinal, isDynamic, implements: implementsList, metadata, imports: this.imports.slice(), fileId: null };
+    return { kind: 'ClassDecl', name, packageName: this.currentPackage, superClass, members, isFinal, isDynamic, implements: implementsList, metadata, imports: this.activeImports().slice(), fileId: null };
   }
 
   private parseInterfaceDecl(): Stmt {
@@ -1018,7 +1062,7 @@ class Parser {
       methods.push({ name: mName, params, returnType, isGetter, isSetter });
     }
     this.expect('}');
-    return { kind: 'InterfaceDecl', name, packageName: this.currentPackage, extendsList, methods, imports: this.imports.slice(), fileId: null };
+    return { kind: 'InterfaceDecl', name, packageName: this.currentPackage, extendsList, methods, imports: this.activeImports().slice(), fileId: null };
   }
 
   // ---- expressions ----

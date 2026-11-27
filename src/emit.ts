@@ -486,6 +486,16 @@ export class Emitter {
   // them (see emitShellClasses).
   private shellSingletons: string[] = [];
   private currentClass: string | null = null;
+  // The import table of the FREE FUNCTION being emitted (null inside a class).
+  // A free function has no `currentClass`, so `rt`/`ann` used to fall through to
+  // the global last-wins short-name table -- which answers with whichever file
+  // claimed the name first. Starling.as declares a file-level helper taking
+  // flash.display.DisplayObject while its package block imports
+  // starling.display.DisplayObject; the global table picked starling for the
+  // helper's own parameter, so the definition, its thunk and every call site
+  // agreed on the WRONG class (and the arg-coercion gate of 阶段四百七十 then
+  // rejected the legal `helper(_nativeStage)` call).
+  private funcAlias: Map<string, string> | null = null;
   private currentMethod: string | null = null;
   private suppressBreak = 0;
   private labels: { asName: string; cName: string; tryDepth: number }[] = [];
@@ -1922,8 +1932,13 @@ export class Emitter {
   // `Type(expr)` cast syntax, `new (expr)`), where an unknown name is legal. A
   // genuine type ANNOTATION goes through `ann` instead (批次1c).
   private rt(t: ASType | null): CType {
-    const alias = this.currentClass ? this.symbols.getClass(this.currentClass)?.importAlias : null;
-    return resolveType(t, alias);
+    return resolveType(t, this.activeAlias());
+  }
+
+  // The import table in force: the enclosing class's, or the enclosing free
+  // function's. Null means "no file context" -- the global short-name table.
+  private activeAlias(): Map<string, string> | null {
+    return this.currentClass ? (this.symbols.getClass(this.currentClass)?.importAlias ?? null) : this.funcAlias;
   }
 
   // Resolve a type ANNOTATION and reject an unknown type name.
@@ -1934,7 +1949,7 @@ export class Emitter {
   // behaviour was a `cc` diagnostic (`error: unknown type name 'Nope2'`) with no
   // AS3 location at all.
   private ann(t: ASType | null): CType {
-    const alias = this.currentClass ? this.symbols.getClass(this.currentClass)?.importAlias : null;
+    const alias = this.activeAlias();
     checkTypeAnnotation(t, alias, this.symbols);
     return resolveType(t, alias);
   }
@@ -3431,7 +3446,7 @@ export class Emitter {
     }
     // free functions
     for (const [fname, f] of this.symbols.funcs) {
-      this.line(`${this.cTypeName(f.returnType)} ${this.freeCName(fname)}(${this.paramDecls(f.params)});`);
+      this.line(`${this.cTypeName(f.returnType)} ${this.freeCName(fname)}(${this.paramDecls(f.params, f.importAlias)});`);
     }
     // Vector.<T> monomorphized helpers.
     for (const [, elem] of this.vectorSpecs) {
@@ -9200,7 +9215,11 @@ SQLError* SQLErrorEvent_get_error(void* _this) { return ((SQLErrorEvent*)_this)-
 
   private emitFunctionValues(): void {
     for (const [fname, f] of this.symbols.funcs) {
+      // The thunk unboxes through `rt`, so it needs the declaring scope too.
+      const savedAlias = this.funcAlias;
+      this.funcAlias = f.importAlias;
       this.emitThunk(`${this.freeCName(fname)}__call`, this.freeCName(fname), f.params, f.returnType, null, null, undefined, this.fnQName(null, fname));
+      this.funcAlias = savedAlias;
     }
     // Bound-method thunks for implicit `this.method` references. The receiver is
     // the captured `this`; dispatch goes through the vtable so overridden methods
@@ -30321,18 +30340,27 @@ void FileStream_writeObject(void* _this, as_value v) {
     // (render-to-texture). drawTriangles then renders into that MTLTexture; the
     // texture can later be sampled via setTextureAt (s3d_bind_texture) or read
     // back with drawToBitmapData (s3d_readback_render).
-    this.line('void Context3D_setRenderToTexture(void* _this, Texture* texture, bool enableDepthAndStencil, int antiAlias, int surfaceSelector) {');
+    this.line('void Context3D_setRenderToTexture(void* _this, TextureBase* texture, bool enableDepthAndStencil, int antiAlias, int surfaceSelector) {');
     this.indent++;
     this.line('Context3D* o = (Context3D*)_this;');
     this.line('(void)antiAlias; (void)surfaceSelector;');
+    // The parameter is AIR's TextureBase, so the concrete payload has to be
+    // recovered by class, not by a blind cast: Texture and RectangleTexture share
+    // Texture's layout (see setRectangleTextureAt), while a cube or video target
+    // keeps `gpu` at a different offset and needs a face/attachment selector this
+    // backend does not implement. Report that loudly instead of silently binding
+    // the back buffer (AGENTS.md §1.5).
+    this.line('if (texture != NULL && !as_is((void*)texture, (void*)&Texture_vt) && !as_is((void*)texture, (void*)&RectangleTexture_vt))');
+    this.line('  as_throw_unsupported("Context3D.setRenderToTexture: this backend renders to Texture/RectangleTexture targets only");');
+    this.line('Texture* tex2d = (Texture*)texture;');
     // Compressed textures cannot be render targets on any backend; AIR raises this
     // at setRenderToTexture time (not at createTexture: the create accepts the flag
     // for every format -- measured, temp/texfmt/README.md §4).
-    this.line('if (texture != NULL && as_tex_fmt_compressed(texture->format))');
+    this.line('if (tex2d != NULL && as_tex_fmt_compressed(tex2d->format))');
     this.line('  as_throw(Error_new((char*)"Error #3746: Rendering to compressed textures is not allowed.", 3746));');
     // enableDepthAndStencil asks for a depth/stencil surface matching the render
     // target (Metal rejects a pass whose depth attachment has a different size).
-    this.line('as_s3d_set_render_target(o->gpu, (texture != NULL) ? texture->gpu : NULL, enableDepthAndStencil ? 1 : 0);');
+    this.line('as_s3d_set_render_target(o->gpu, (tex2d != NULL) ? tex2d->gpu : NULL, enableDepthAndStencil ? 1 : 0);');
     this.indent--;
     this.line('}');
     this.line('void Context3D_setRenderToBackBuffer(void* _this) {');
@@ -35768,6 +35796,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       if (stmt.kind !== 'FuncDecl') continue;
       setGenPos(stmt.line, stmt.col);
       const f = this.symbols.getFunc(stmt.name)!;
+      this.funcAlias = f.importAlias;
       this.pushScope();
       this.functionScope = this.scopes[this.scopes.length - 1];
       for (const p of stmt.params) this.declareVar(p.name, this.ann(p.type));
@@ -35785,6 +35814,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       this.line('}');
       this.line('');
       this.functionScope = null;
+      this.funcAlias = null;
       this.hoistedLocals = new Set();
       this.popScope();
       this.currentReturnType = null;
@@ -42010,7 +42040,7 @@ void FileStream_writeObject(void* _this, as_value v) {
       }
       const f = this.symbols.getFunc(callee.name);
       if (f) {
-        return { code: `${this.freeCName(callee.name)}(${this.emitArgs(f.params, expr.args)})`, type: f.returnType };
+        return { code: `${this.freeCName(callee.name)}(${this.emitArgs(f.params, expr.args, f.importAlias)})`, type: f.returnType };
       }
       // A callable VALUE held in a variable / field / parameter (var f:Function = ...).
       // AIR's call opcode also accepts a Function stored in an Object-typed or

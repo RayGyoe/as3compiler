@@ -782,6 +782,14 @@ disagree.
 over ceiling `#3683` → compressed smaller than 4x4 `#3745` (but `#3682` wins if it is also not a power of
 two: 3x3 compressed is `#3682`) → `#3746` when a compressed texture is made a render target.
 
+**`setRenderToTexture` takes a `TextureBase`, not a `Texture`** (stage 471). mxmlc 51.4.1 accepts a bare
+`TextureBase` and a `RectangleTexture` (`temp/impscope/rtt`); we used to declare `Texture`, so Starling
+`Painter.applyRenderTarget`'s legal `setRenderToTexture(_state.renderTargetBase, ...)` was rejected as an
+implicit coercion once argument binding became a class-compatibility gate (stage 470). The C side now
+recovers the 2D payload **by class** (`Texture` and `RectangleTexture` share `Texture`'s layout); a cube or
+video target needs a face/attachment selector this backend does not implement, so it is **reported loudly**
+(`as_throw_unsupported`) instead of silently rendering to the back buffer.
+
 **Upload length is `texels × bytes-per-texel`** (blocks for compressed), short is `RangeError #3669`,
 extra bytes are ignored: `bgra` 4 / `bgrPacked565` 2 / `bgraPacked4444` 2 / `rgbaHalfFloat` 8 /
 `compressed` 8 per block / `compressedAlpha` 16 per block. 565 expands with **rounding**

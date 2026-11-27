@@ -53,7 +53,11 @@ export interface FieldInfo { type: CType; init: Expr | null; visibility: Visibil
   // all REJECTED by AIR.
   isAccessor?: boolean; }
 export interface MethodInfo { returnType: CType; params: Param[]; owner: string; visibility: Visibility; isStatic: boolean; isFinal: boolean; isGetter: boolean; isSetter: boolean; metadata?: Metadata[]; isProxyNs?: boolean; ns?: string; }
-export interface FuncInfo { returnType: CType; params: Param[]; metadata?: Metadata[]; }
+// A free function's signature belongs to the SCOPE that declares it, exactly like
+// a class's members: `importAlias` is that scope's import table (see
+// Parser.activeImports), so every consumer of `params` resolves the type names the
+// way the declaring file spells them instead of the caller's meaning.
+export interface FuncInfo { returnType: CType; params: Param[]; metadata?: Metadata[]; importAlias: Map<string, string>; }
 
 // The ten interceptor methods of flash.utils.Proxy, which AIR declares in the
 // `flash_proxy` namespace rather than the public one. They are still registered as
@@ -8713,8 +8717,12 @@ export class SymbolTable {
           ['drawToBitmapData', c3m({ kind: 'void' }, [
             { name: 'destination', type: 'BitmapData', defaultValue: null, isRest: false },
           ])],
+          // AIR's target parameter is TextureBase, NOT Texture: mxmlc 51.4.1 accepts
+          // a bare TextureBase and a RectangleTexture here (temp/impscope/rtt). The
+          // narrower declaration rejected Starling's legal
+          // `setRenderToTexture(_state.renderTargetBase, ...)`.
           ['setRenderToTexture', c3m({ kind: 'void' }, [
-            { name: 'texture', type: 'Texture', defaultValue: null, isRest: false },
+            { name: 'texture', type: 'TextureBase', defaultValue: null, isRest: false },
             { name: 'enableDepthAndStencil', type: 'Boolean', defaultValue: { kind: 'Bool', value: false }, isRest: false },
             { name: 'antiAlias', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
             { name: 'surfaceSelector', type: 'int', defaultValue: { kind: 'Num', value: 0, isInt: true }, isRest: false },
@@ -9155,9 +9163,12 @@ export class SymbolTable {
           }
         }
       } else if (stmt.kind === 'FuncDecl') {
-        checkTypeAnnotation(stmt.returnType, null, this);
-        for (const p of stmt.params) checkTypeAnnotation(p.type, null, this);
-        this.funcMap.set(stmt.name, { returnType: resolveType(stmt.returnType), params: stmt.params, metadata: stmt.metadata });
+        // A file-level function lives in the DEFAULT package, so its alias is built
+        // with no same-package seed -- only the imports of its own scope.
+        const importAlias = buildImportAlias(stmt.imports, this.classMap, null);
+        checkTypeAnnotation(stmt.returnType, importAlias, this);
+        for (const p of stmt.params) checkTypeAnnotation(p.type, importAlias, this);
+        this.funcMap.set(stmt.name, { returnType: resolveType(stmt.returnType, importAlias), params: stmt.params, metadata: stmt.metadata, importAlias });
         // [WasmExport] on a top-level function: it lowers to a same-named, `this`-free
         // C global, directly callable from JS.
         const we = stmt.metadata.find((md) => md.name === 'WasmExport');
@@ -9165,8 +9176,8 @@ export class SymbolTable {
           this.exportList.push({
             symbol: stmt.name,
             alias: we.args[0] ?? null,
-            returnType: resolveType(stmt.returnType),
-            params: stmt.params.map((p) => ({ name: p.name, type: resolveType(p.type) })),
+            returnType: resolveType(stmt.returnType, importAlias),
+            params: stmt.params.map((p) => ({ name: p.name, type: resolveType(p.type, importAlias) })),
           });
         }
       }

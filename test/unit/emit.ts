@@ -6091,3 +6091,58 @@ function checkIntArithOverflow(): string[] {
   return bad;
 }
 registerGroup('unit: emit/IntArithOverflow', checkIntArithOverflow);
+
+// ---- 阶段四百七十一: a free function's signature resolves in its OWN scope ----
+//
+// The parameter types of a free function used to be re-resolved at every call
+// site through `this.rt`, i.e. in the CALLER's import context (and, with no class
+// in scope, through the global last-wins short-name table). Starling's file-level
+// `isNativeDisplayObjectEmpty(object:DisplayObject)` therefore took starling's
+// DisplayObject in its prototype, its definition, its thunk AND at the call site —
+// four places agreeing on the wrong class. The example suite cannot pin this: the
+// wrong cast compiles as long as nothing checks class compatibility.
+function checkFreeFunctionImportScope(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [fnscope] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [fnscope] ${label}`); }
+  };
+  const src = 'package p {\n  import alt.DisplayObject;\n'
+    + '  public class C { public function C() { trace(helper(new flash.display.Sprite())); }'
+    + ' public function t():String { return new DisplayObject().tag; } }\n}\n'
+    + 'package alt { public class DisplayObject { public var tag:String = "alt"; } }\n'
+    + 'import flash.display.DisplayObject;\n'
+    + 'function helper(o:DisplayObject):Boolean { return o == null; }';
+  const c = generateC(parse(src)).c;
+
+  check('the prototype takes the file scope\'s class',
+    c.includes('static bool helper(DisplayObject* _o);'));
+  check('the definition agrees with the prototype',
+    c.includes('static bool helper(DisplayObject* _o) {'));
+  check('the calling thunk unboxes as the file scope\'s class',
+    c.includes('&DisplayObject_vt, "flash.display::DisplayObject"'));
+  check('no place declares the parameter as the package\'s class',
+    !c.includes('alt_DisplayObject* _o)') && !c.includes('alt_DisplayObject* _o;'));
+  check('the package class still means its OWN DisplayObject',
+    c.includes('alt_DisplayObject_new()'));
+
+  // AIR's Context3D.setRenderToTexture takes TextureBase, not Texture (mxmlc
+  // 51.4.1 accepts a bare TextureBase and a RectangleTexture: temp/impscope/rtt).
+  // The narrower declaration rejected Starling Painter's legal
+  // `setRenderToTexture(_state.renderTargetBase, ...)` once argument binding
+  // became a class-compatibility gate (阶段四百七十).
+  const rtt = generateC(parse('import flash.display3D.Context3D;\nimport flash.display3D.textures.TextureBase;\n'
+    + 'var ctx:Context3D = null;\nvar tb:TextureBase = null;\nctx.setRenderToTexture(tb);')).c;
+  check('setRenderToTexture takes AIR\'s TextureBase',
+    rtt.includes('void Context3D_setRenderToTexture(void* _this, TextureBase* texture,'));
+  check('...and recovers the 2D payload by class instead of a blind cast',
+    rtt.includes('as_is((void*)texture, (void*)&Texture_vt)')
+    && rtt.includes('as_is((void*)texture, (void*)&RectangleTexture_vt)'));
+  check('...while a cube/video target is reported, not silently dropped',
+    rtt.includes('as_throw_unsupported("Context3D.setRenderToTexture'));
+
+  if (ok > 0) console.log(`[fnscope] ${ok} free-function scope checks passed`);
+  return bad;
+}
+registerGroup('unit: emit/FreeFunctionImportScope', checkFreeFunctionImportScope);

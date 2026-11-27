@@ -74,7 +74,7 @@ export type Stmt = (
   // `with (obj) { body }`: an object scope is inserted into the name-resolution
   // chain for the body (see the semantics measured in emit.ts's emitWith).
   | { kind: 'With'; obj: Expr; body: Stmt }
-  | { kind: 'FuncDecl'; name: string; params: Param[]; returnType: ASType; body: Block; metadata: Metadata[] }
+  | { kind: 'FuncDecl'; name: string; params: Param[]; returnType: ASType; body: Block; metadata: Metadata[]; imports: string[] }
   | { kind: 'ClassDecl'; name: string; packageName: string | null; superClass: string | null; members: ClassMember[]; isFinal: boolean; isDynamic: boolean; implements: string[]; metadata: Metadata[]; imports: string[]; fileId: string | null }
   // `extendsList` holds the parent interfaces of `interface I extends A, B {}`.
   // AS3 allows multiple parents, and a class implementing I must also satisfy

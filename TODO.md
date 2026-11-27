@@ -20306,6 +20306,14 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 ### 遗留待开发
 
+> **2026-11-27 追加（阶段四百七十一：`import` 的块作用域 + 自由函数签名按声明作用域解析）**：**移出 0 行 / 改写 0 行 / 新登记 1 行** ⇒
+> 主表 **81 → 82 行**（`未开始` 60 → **61** / `部分完成` 19 / `调研完成·实现暂缓` 2，逐行数过）。本阶段修的是**解析归属**：
+> parser 此前只有一张文件级 import 表（包块内外混用、同名短名后写的赢），且自由函数不带 import 上下文
+> （形参类型在**调用方**作用域里解析），于是 Starling 的 `isNativeDisplayObjectEmpty(_nativeStage)` 被判成
+> `Stage → starling.display.DisplayObject` 隐式强转。**新登记的是另一半**：短名在本作用域查不到时仍退到
+> 全局短名表，所以 mxmlc 拒绝的四种「import 泄漏」形态我们仍然接受（多接受非法程序，不是把合法程序译错）。
+> 顺带修齐 `Context3D.setRenderToTexture` 的形参（`Texture` → AIR 的 `TextureBase`）。
+
 > **2026-11-26 追加（阶段四百七十：不相关类隐式强转实参编译期拦截）**：**移出 1 行 / 改写 0 行 / 新登记 0 行** ⇒
 > 主表 **82 → 81 行**（`未开始` 63 → **62** / `部分完成` 17 / `调研完成·实现暂缓` 2）。CutPilot R4 登记的
 > 「String→File 实参编译期放行、运行期段错误」首行已清偿：`emitArgs` 实参绑定对 class（指针）目标加
@@ -20971,6 +20979,7 @@ AccessRefreshToken.homeView + Main.homeView → HomeView`。同时也证明「�
 
 | 遗留项 | 状态 | 说明 | 建议 |
 |--------|------|------|------|
+| **`import` 的可见性未强制：短名在本作用域的 import 表里查不到时仍退到全局短名表**（mxmlc 拒绝的四种泄漏形态我们接受） | 未开始（2026-11-27 阶段四百七十一 用 mxmlc 51.4.1 逐条定标时量到） | AS3 的 import 只对**所在块**可见：包块内的不给文件级声明用、包外的不给包内类用，写在 `package` 之前也不改变归属。四条负例 `temp/impscope/adl/{b,c,e,f}` 在 mxmlc 全是「找不到类型」，我们全部编译通过——`resolveType` 的兜底是全局短名表（`typeAlias`），它不区分作用域。属**多接受非法程序**，不是把合法程序译错（后者已在阶段四百七十一修净） | 收紧需要先把全局兜底的承重面拆清：脚本作用域、`diagnostics/Codegen` 里不带 import 的 `DisplayObject`/`Sprite` 用例、以及大量既有示例都靠它。建议先给「有明确 import 作用域的声明」加一条可开关的严格模式，跑全量看红面，再决定是否设默认 |
 | **同一字体字号下纯文本字段与富文本字段的 `textHeight` 可相差 0.5–1 px**（light 快路径报 AIR 模型盒 `rhalf(asc)+rhalf(desc)+leading`，SkParagraph 路径报 Skia `InternalLineMetrics::height()`——对同一个人工 strut 盒**再取整一次**） | 未开始（2026-11-16 阶段四百三十五 全量 macOS 回归发现；`examples/text-underline.as` 用例①红，Courier New 12：无下划线 13.5 / 有下划线 14） | 两条布局路径对「行盒高度」的最终取整不一致：`vendor/skia_text_glue.cc` 的 `sk_set_air_strut` 已把 Skia 的行盒强制成 AIR 的 `am.model + leading`，但 `ParagraphImpl::addLine` 存的是 `InternalLineMetrics::height()` = `round(descent-ascent+leading)`，所以 Skia 侧多了一次 0.5 进位；light 路径 `sk_text_light_new` 存的是未取整的模型值。凡 `am.model + leading` 非整数即触发，与下划线无关——下划线只是把该字段从 light 路径踢到 paragraph 路径，从而让两个值同时出现。证据 `temp/tu/ul.as`（`a.textHeight=13.5 b.textHeight=14 a.textWidth=57.609375 b.textWidth=57.609375`） | **2026-11-16 用户裁决：示例侧放宽，不追完全对齐**（`examples/text-underline.as` 已改 ±1 px 容差 + `textHeight/N` 步进），分歧本身仍留在表里等 adl 定标。先装 AIR SDK 跑 adl 定真值：① 若 AIR 报 13.5 ⇒ paragraph 路径的 `textHeight` 不能再取 Skia 的取整值，须由 AIR 盒自行累加（改 `sk_textlayout_height`/`textHeight` 的 `tops[k]` 来源）；② 若 AIR 报 14 ⇒ light 路径的 `height` 改成与 Skia 同口径取整（并复核所有文本示例的双端读数）。两种改法都先做**双端全量**再落盘，别只修单侧 |
 | **`toFixed` 对大数（如 `Number.MAX_VALUE`）的有效位截断与 AIR 不同** | 未开始（2026-11-15 阶段四百一十九 修 `.5` 舍入方向时量到） | AIR 的 D2A 数字生成器（avmplus `core/d2a.cpp`）对大数走 BigInteger 停止边界，只生成约「最短往返有效位数 + precision」个有效位、其余补零，且带 off-by-one/two（`MAX_VALUE` 在 `f1` 是 17 位而非 18、`f15` 是 30 位而非 32）。我们的 `as_num_toFixed` 用 `%.1100f` 精确展开，给出全部 309 位整数。证据 `temp/tofixed3/maxvalue-residual.txt`（9 格双端读数）。这是**独立于 `.5` 舍入方向**的「有效位截断」行为；旧 `printf` 实现同样不匹配，属既有缺口而非本轮引入 | 需移植 avmplus D2A 的 BigInteger 停止边界才能逐位复现，无简单公式（「17+precision」在 `f1`/`f15` 偏差 1–2 位）。病态用例（真实代码几乎不对 `MAX_VALUE` 调 `toFixed`），独立立项；`.5` 舍入方向本身已于阶段四百一十九修净（693 格双端矩阵 + `examples/tofixed-round.as`） |
 | **Metal 与 WGL 两个窗口 GPU 后端没有任何设备丢失检测**（`metal_glue.mm` 不看 `MTLCommandBuffer.status`、`gl_glue.cc` 不看 `GL_CONTEXT_LOST`/`glGetError()`；D3D12 侧阶段二百七十八 起有「丢弃+重建」，阶段二百九十七 修掉了它自己的崩溃） | 未开始（2026-10-27 阶段二百九十七 修 Windows 端时按「平台缺陷跨端一次修完」逐端查过；两端都**没有可对照的代码**可改，属既有缺口，非本轮引入） | 后果与 D3D12 不同，因为是**静默**的：Metal 上设备重启（Apple Silicon 上是 `MTLCommandBufferError` 的「innocent victim」）后帧照样编码、照样 `presentDrawable`，画面停在最后一帧且没有任何一行日志；WGL 上 `GL_CONTEXT_LOST` 之后每个 GL 调用都是 no-op，窗口冻住。两端都**不会崩**，所以一直没人报。 | 先做**检测+报明**（Metal：命令缓冲 `status == MTLCommandBufferStatusError` 且 `error.code` 属设备类时打一行并丢弃该帧；GL：每帧一个 `glGetError()==GL_CONTEXT_LOST` 检查），再决定要不要做重建（GL 的重建要重建整个 SDL GL 上下文，代价远大于 D3D12/Metal）。**必须在真机上做**：本机（Windows）编译不了 `.mm`，也无法制造 GL 上下文丢失。 |
@@ -23701,6 +23710,71 @@ AIR 用 UTF-16 存储，`charCodeAt`/`substring` 是 O(1)，我们每个切片�
   **−17%**（阶段四百四十三）把它抵平到 **196–202**。也就是说「UTF-8 存储 + 对齐 UTF-16 特性」
   这条路**已经不再比换表示更贵**，只是 `cjkscan` 这种「非 ASCII 随机访问」形状上仍慢一拍。
 - ⇒ 这不是实现缺陷，是**表示选择**；已从遗留表移出，本文节即该项的最终记录。
+
+### 阶段四百七十一：`import` 的块作用域 + 自由函数签名按声明作用域解析（v0.4.446 → v0.4.447）✅ 已完成
+
+**触发**：用户报 `examples/air-starling-demo` 编译红——
+`Codegen error at 840:17: implicit coercion of a value of type Stage to a possibly unrelated type starling_display_DisplayObject in starling_core_Starling.mustAlwaysRender`。
+
+**根因（两处叠加，都不是阶段四百七十引入的）**：
+
+1. **parser 只有一张文件级 import 表**。`Starling.as` 在 `package starling.core` 里 import
+   `starling.display.DisplayObject`，又在**包块之外**（文件尾）import `flash.display.DisplayObject`
+   给文件级 helper `isNativeDisplayObjectEmpty` 用——源码注释写着「put here to avoid naming conflicts」。
+   一张表无法表达「同名短名在同一文件的两个作用域里指两个类」。
+2. **自由函数不带 import 上下文**：`FuncInfo` 只存 `params` 的原始类型名，`emitArgs(f.params, args)`
+   不传 alias ⇒ 形参类型在**调用方**作用域里解析（无类在作用域时退到全局短名表）。于是原型、定义、
+   thunk、调用点**四处一致地**解析成 starling 那个类。
+
+⇒ 阶段四百七十的实参类兼容性闸门只是把这个**早就存在的错误解析**暴露出来：修前生成的 C 里
+`isNativeDisplayObjectEmpty` 的形参、thunk 的 `as_v_req_inst`、调用点的强转全写着
+`starling_display_DisplayObject*`，四处一致地错，C 编译器当然不报错（证据：仓库里旧的
+`examples/air-starling-demo/Starling-Demo.c:50389/53996/127569`）。
+
+**mxmlc 51.4.1 定标（`temp/impscope/adl/`，七组）**：a 正例接受；b（文件级函数用包内 import）、
+c（包内类用包外 import）、e（包外 import 写在 `package` 之前）、f（包外 helper 类用包内 import）
+全部「找不到类型」；d（把包内那个类传给文件级 helper）报隐式强转；g/h（import 写在声明**之后**，
+文件级/包块内各一）**接受** ⇒ import 对**整个块**生效，与位置无关。
+
+**修法**：
+1. `parser.ts`：`fileImports` / `pkgImports` 两张表，`parseImport` 按当前块入表；块结束时
+   `sealImports` 用**完整**列表覆盖块内全部声明（这就是提升），`parseProgram` 只封文件级那些
+   （`pkgDecls` 按身份区分，因为包内声明也平铺在同一个 `body` 里）。`FuncDecl` 新增 `imports` 字段
+   （`ast.ts` 先行），与 `ClassDecl`/`InterfaceDecl` 同形。
+2. `symbols.ts`：`FuncInfo.importAlias`，pass 1 用 `buildImportAlias(stmt.imports, classMap, null)`
+   建表（文件级函数属默认包），返回类型/形参校验/`[WasmExport]` 导出签名统一走它。
+3. `emit.ts`：新增 `funcAlias` 与 `activeAlias()`（`rt`/`ann` 在无类作用域时取它），自由函数的
+   **原型**（`paramDecls(f.params, f.importAlias)`）、**定义**（进函数体前置 `funcAlias`）、
+   **thunk**、**调用点**（`emitArgs(..., f.importAlias)`）四处统一。这与既有的「方法形参走声明类的
+   alias」（`declAliasOf`）是同一条规则，只是补上了自由函数这一半。
+
+**顺带修齐 `Context3D.setRenderToTexture` 的形参**：AIR 是 `TextureBase`，不是 `Texture`
+（mxmlc 接受裸 `TextureBase` 与 `RectangleTexture`，`temp/impscope/rtt`）。我们声明成 `Texture`，
+于是 Starling `Painter.applyRenderTarget` 合法的 `setRenderToTexture(_state.renderTargetBase, ...)`
+同样被闸门拒绝。C 侧改为按**类**取 2D 载荷（`as_is` 走 super 链，`Texture`/`RectangleTexture`
+共享 `Texture` 布局，用户子类也命中）；cube/video 目标需要本后端未实现的面/附件选择器，
+**大声报明** `as_throw_unsupported`，不静默改渲到 back buffer（§1.5）。
+
+**验收（mac arm64）**：
+- `examples/air-starling-demo` 端到端：编译链接通过，运行 `onLoadProgress = 1` / `onLoadComplete`，
+  benchmark 跑到 `obj=20576 fps=120.5`（`temp/impscope/demo-run2.log`）。生成 C 的四处已全是
+  `DisplayObject*` / `"flash.display::DisplayObject"`（`temp/impscope/demo2.c:50563/54170/127892/152945`）。
+  **注意**：`--air-app` 产物的 `File.applicationDirectory` 是**可执行文件所在目录**，把 `-o` 指到
+  `temp/` 再跑会因找不到 `assets/` 报 `#3003`——那是摆放位置问题，不是编译器缺陷（首轮误判已纠正）。
+- 新增 `examples/import-scope.as`（6 组断言，逐条在 adl 51.4.1 上 PASS，`temp/impscope/adlroot/result.txt`）。
+- 新增钉子 20 检查：`unit: parser/ImportScope`（9）、`unit: emit/FreeFunctionImportScope`（8，含
+  `setRenderToTexture` 三条）、`unit: diagnostics/ImportScope`（3，含 d 的拒绝文案与 a 的放行）。
+- 全量 `node test.ts`：**756 用例 / 752 通过 / 4 红**，680 s（`temp/node-test-s471.log`）。
+  **4 红全部是基线红，与本阶段无关，已逐一隔离确证**：把本阶段 4 个 `src/` 文件 `git stash` 后
+  单独复跑仍红——`unit: platform/WindowSystemLimitsAndGestures`（阶段四百七十已记录在案）、
+  `video/`「CPU-raster fallback …」；另两红 `s3d-multiwindow` / `s3d-multiviewport` 是**并行会话
+  未提交的 G-B 改动**引入：`vendor/stage3d_glue.mm` 新增引用 `as_video_zc_latest`，而该符号只在
+  `vendor/video_glue.c` 里，这两个示例的清单不链接 video 后端 ⇒ `ld: Undefined symbols _as_video_zc_latest`。
+  `git show HEAD:vendor/stage3d_glue.mm` 对该符号 0 命中，stash 后复跑同样红，证据闭合。
+
+**未修（如实报明，已登记遗留表）**：短名在本作用域 import 表里查不到时仍退到全局短名表，
+所以 b/c/e/f 四种泄漏形态我们仍然接受。这是「多接受非法程序」而不是「把合法程序译错」，
+且全局兜底是脚本作用域与大量既有示例的承重墙，收紧它是独立工程。
 
 ### 阶段四百七十：不相关类隐式强转实参的编译期拦截（String→File 段错误根治，v0.4.443 → v0.4.444）✅ 已完成
 

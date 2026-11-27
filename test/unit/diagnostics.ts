@@ -499,3 +499,39 @@ function checkCodegenDiagnostics(): string[] {
 registerGroup('unit: diagnostics/Lex', checkLexDiagnostics);
 registerGroup('unit: diagnostics/Parse', checkParseDiagnostics);
 registerGroup('unit: diagnostics/Codegen', checkCodegenDiagnostics);
+// ---- 阶段四百七十一: the two import scopes stay independent ----
+//
+// mxmlc 51.4.1 probe d (temp/impscope/adl/d): with `import alt.DisplayObject`
+// inside the package block and `import flash.display.DisplayObject` at file level,
+// handing the package's instance to the file-level helper is an implicit-coercion
+// error — both types are spelled DisplayObject, which is exactly why the two
+// scopes must not be merged. The legal direction (a flash Sprite into that helper)
+// must stay accepted: that is Starling's `isNativeDisplayObjectEmpty(_nativeStage)`.
+function checkImportScopeDiagnostics(): string[] {
+  const bad: string[] = [];
+  let ok = 0;
+  const check = (label: string, cond: boolean): void => {
+    if (cond) { ok++; console.log(`PASS  [impscopediag] ${label}`); }
+    else { bad.push(label); console.log(`FAIL  [impscopediag] ${label}`); }
+  };
+  const pre = 'package p {\n  import alt.DisplayObject;\n  public class C { public function C() { trace(helper(new DisplayObject())); } }\n}\n'
+    + 'package alt { public class DisplayObject {} }\n'
+    + 'import flash.display.DisplayObject;\nfunction helper(o:DisplayObject):Boolean { return o == null; }';
+  const e1 = thrown(() => generateC(parse(pre)));
+  check('the package\'s DisplayObject cannot cross into the file scope\'s parameter',
+    e1?.message === 'Codegen error at 3:42: implicit coercion of a value of type alt_DisplayObject to a possibly unrelated type DisplayObject in p_C');
+  check('...and the diagnostic carries that position',
+    e1?.line === 3 && e1?.col === 42);
+
+  const legal = 'package p {\n  import alt.DisplayObject;\n'
+    + '  public class C { public function C() { trace(helper(new flash.display.Sprite())); } }\n}\n'
+    + 'package alt { public class DisplayObject {} }\n'
+    + 'import flash.display.DisplayObject;\nfunction helper(o:DisplayObject):Boolean { return o == null; }';
+  check('a flash Sprite into the same helper is accepted (Starling\'s real call)',
+    thrown(() => generateC(parse(legal))) === null);
+
+  if (ok > 0) console.log(`[impscopediag] ${ok} import-scope diagnostic checks passed`);
+  return bad;
+}
+
+registerGroup('unit: diagnostics/ImportScope', checkImportScopeDiagnostics);
