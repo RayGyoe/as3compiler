@@ -179,6 +179,36 @@ pump(function():Boolean { return exited2; }, 8000);
 check(exited2, "closeInput() delivers EOF, so the child exits");
 ok("standardInput");
 
+// --- 5b. EP: bulk stdin (video-export shape) + standardInputProgress ---------
+// A ~300 KiB write must cross in bounded ticks without stalling the thread, and
+// the flush signal must account for every byte: backpressure producers (export
+// pipe feed) pace themselves on it instead of guessing how far the pipe got.
+var np2b:NativeProcess = new NativeProcess();
+var si2b:NativeProcessStartupInfo = new NativeProcessStartupInfo();
+si2b.executable = new File(shellPath);
+si2b.arguments = argsOf([shellFlag, isWindows ? "more" : "cat"]);
+var echoedB:int = 0;
+var flushedB:int = 0;
+var exitedB:Boolean = false;
+np2b.addEventListener(ProgressEvent.STANDARD_OUTPUT_DATA, function(e:ProgressEvent):void {
+  echoedB += np2b.standardOutput.bytesAvailable;
+  np2b.standardOutput.readUTFBytes(np2b.standardOutput.bytesAvailable);
+});
+np2b.addEventListener(ProgressEvent.STANDARD_INPUT_PROGRESS, function(e:ProgressEvent):void { flushedB += int(e.bytesLoaded); });
+np2b.addEventListener(NativeProcessExitEvent.EXIT, function(e:NativeProcessExitEvent):void { exitedB = true; });
+np2b.start(si2b);
+var bulk:String = "";
+for (var bi:int = 0; bi < 2400; bi++) bulk += "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+np2b.standardInput.writeUTFBytes(bulk);
+pump(function():Boolean { return flushedB >= bulk.length; }, 8000);
+check(flushedB == bulk.length, "standardInputProgress accounts for every flushed byte (" + flushedB + "/" + bulk.length + ")");
+check(np2b.standardInput.length < 65536, "stdin write buffer is compacted after flush (" + np2b.standardInput.length + " bytes left)");
+np2b.closeInput();
+pump(function():Boolean { return exitedB; }, 8000);
+check(exitedB, "bulk closeInput() delivers EOF after draining");
+check(echoedB >= bulk.length, "the child received the whole bulk write (" + echoedB + " bytes)");
+ok("bulk stdin + progress");
+
 // --- 6. start() twice, then force-stop -------------------------------------
 var np3:NativeProcess = new NativeProcess();
 var si3:NativeProcessStartupInfo = new NativeProcessStartupInfo();

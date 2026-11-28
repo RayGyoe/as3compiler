@@ -49,7 +49,21 @@ function checkNativeProcess(): string[] {
     /fcntl\(in_pipe\[1\], F_SETFL, fcntl\(in_pipe\[1\], F_GETFL, 0\) \| O_NONBLOCK\)/.test(runtime));
   check('a child cannot hold a console window open', runtime.includes('CREATE_NO_WINDOW'));
   check('one frame never writes an unbounded amount to the child',
-    /want > 4096/.test(runtime));
+    /want > \(1 << 20\)/.test(runtime));
+  // EP seam: video export feeds whole frames through stdin; the write side must
+  // never stall the AS3 thread and producers need a flushed-bytes signal.
+  check('the stdin write side is non-blocking on Windows (PIPE_NOWAIT)',
+    runtime.includes('PIPE_NOWAIT') && runtime.includes('SetNamedPipeHandleState(in_w'));
+  check('the stdin pipe buffer holds a full video frame (1 MiB)',
+    /CreatePipe\(&in_r, &in_w, &sa, 1 << 20\)/.test(runtime));
+  check('POSIX grows the pipe buffer best-effort (F_SETPIPE_SZ)',
+    /#ifdef F_SETPIPE_SZ[\s\S]{0,120}F_SETPIPE_SZ, 1 << 20/.test(runtime));
+  check('flushed stdin bytes are reported (standardInputProgress at the tick)',
+    /as_np_dispatch_data\(np, np->standardInput, "standardInputProgress", s->in_sent - in_before\)/.test(runtime));
+  check('the flushed stdin prefix is discarded (write buffer bounded by pending bytes)',
+    /memmove\(inb->data, \(unsigned char\*\)inb->data \+ s->in_sent/.test(runtime) && /inb->length = rem;/.test(runtime));
+  check('closeInput drains pending bytes before closing (no truncated video)',
+    /as_np_close_stdin[\s\S]{0,400}for \(int i = 0; i < 10000 && in != NULL && s->in_sent < in->length/.test(runtime));
 
   // --- measured streak: the command line is joined verbatim ----------------
   //

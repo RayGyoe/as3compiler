@@ -80,6 +80,9 @@ start(info)                  -> running is true on the very next line
   line a child writes on its way out is delivered before the exit event.
 - `ProgressEvent.bytesLoaded` is the **byte count** read this frame; `bytesTotal` is **`0`** —
   a pipe announces no length. That is the measurement, not an omission.
+- **EP seam**: `STANDARD_INPUT_PROGRESS` reports, at the frame boundary, the **stdin bytes
+  flushed this frame** (same `bytesLoaded` convention, `bytesTotal=0`) so producers (export
+  pipe feed) can pace themselves with backpressure instead of guessing pipe progress.
 - `running` is still `true` on the line after `exit(true)`; the exit event clears it. So `exit()`
   is not a synchronous stop, and nothing may assume it is.
 - The same `NativeProcess` object **can start again** after an exit, and the new child's code
@@ -96,10 +99,19 @@ start(info)                  -> running is true on the very next line
   script call `tickFrame()` itself.
 - Reads are **non-blocking**: `PeekNamedPipe` + `ReadFile` on Windows, `O_NONBLOCK` `read` on
   POSIX, with `EAGAIN` / `ERROR_NO_DATA` treated as "nothing this frame".
-- Writing stdin is non-blocking too and bounded to 4096 bytes per frame, so a child that never
-  reads its stdin cannot stall the AS3 thread.
-- `closeInput()` flushes what is still buffered, then closes the write end — which is the EOF that
-  `more`/`cat` style children need in order to exit.
+- Writing stdin is non-blocking too (`PIPE_NOWAIT` on Windows, `O_NONBLOCK` on POSIX) and
+  bounded to **1 MiB** per frame (EP seam: video export feeds whole frames; the old 4096 cap
+  needed thousands of pump ticks per frame). The pipe buffer is 1 MiB (`F_SETPIPE_SZ`
+  best-effort on POSIX; macOS has no equivalent and keeps its default). A child that never
+  reads its stdin cannot stall the AS3 thread: a full pipe means "retry next tick".
+- `closeInput()` **drains** pending bytes (bounded wait loop) before closing the write end —
+  with a non-blocking write side a single flush can leave a tail, and closing would truncate
+  the video; `more`/`cat` style children need this EOF to exit. Note `Sleep(1)` is ≈15.6 ms at
+  the default Windows timer resolution, so a "10000 iterations" bound is ~156 s, not 10 s.
+- **Compaction after flush** (EP): the sent prefix is discarded from `standardInput` (tail
+  memmoved to the front, `length` shrunk, `in_sent` reset) so the write buffer stays bounded by
+  pending bytes. An append-only buffer realloc-copied gigabytes on a thousand-frame export
+  (measured working set 5.3 GB; the producer stalled on memcpy).
 - `exit(force)` only signals/terminates; **reaping still happens at the frame boundary** so data
   already in the pipe is delivered first.
 
@@ -200,8 +212,8 @@ child has no message loop to ask, so on Windows this backend ignores `force` and
 
 | Item | Content |
 |---|---|
-| Example | `examples/native-process.as`: 16 assertion groups covering shapes, error ids/texts, event order, `bytesLoaded/bytesTotal`, stdin round trip + EOF, `#3213`, force stop, restart, `workingDirectory`. The script picks its child by host (`cmd.exe` on Windows, `/bin/sh` elsewhere), so one script covers both. Measured **on Windows only** in stage 391: the POSIX branch of the runtime (`fork`/`execv`, `O_NONBLOCK`, `waitpid`) was **not executed on this machine**, so until the macOS arm64 CI job (which compiles and runs this same example) reports it, POSIX support is written but unmeasured |
-| Unit pins | `unit: desktop/NativeProcess`: module shape (slot count, frame-boundary pump, non-blocking reads, `CREATE_NO_WINDOW`, POSIX `O_NONBLOCK`, error text constants, the `standardInput` flush point) plus the example's presence |
+| Example | `examples/native-process.as`: 17 assertion groups covering shapes, error ids/texts, event order, `bytesLoaded/bytesTotal`, stdin round trip + EOF, **EP bulk stdin (~300 KiB) + `STANDARD_INPUT_PROGRESS` byte accounting**, `#3213`, force stop, restart, `workingDirectory`. The script picks its child by host (`cmd.exe` on Windows, `/bin/sh` elsewhere), so one script covers both. Measured **on Windows only** in stage 391: the POSIX branch of the runtime (`fork`/`execv`, `O_NONBLOCK`, `waitpid`) was **not executed on this machine**, so until the macOS arm64 CI job (which compiles and runs this same example) reports it, POSIX support is written but unmeasured |
+| Unit pins | `unit: desktop/NativeProcess`: module shape (slot count, frame-boundary pump, non-blocking reads, `CREATE_NO_WINDOW`, POSIX `O_NONBLOCK`, error text constants, the `standardInput` flush point), **the EP seam (`PIPE_NOWAIT`, 1 MiB pipe/flush cap, `F_SETPIPE_SZ`, the `standardInputProgress` dispatch point, the close-drain loop)** plus the example's presence |
 | `adl` evidence | `temp/npa/air/T.as` (shape), `NP.as`/`NP2.as` (errors and events), `Q.as` (command-line joining) |
 | web target | `node src/index.ts examples/web/hello-web.as --manifest examples/web/hello-web.build.json` (emcc 3.1.44, `-O2`) | **Build successful** (19.4 s): the 10 `fork`/`execv`/`fcntl` errors are gone and `isSupported` answers `false` on that target. WASI was **not** run end to end here — this host has no invocable WASI SDK (`wasiCc()` yields a path with no `.exe` on Windows, and `WASI_SDK_HOME` is unset), but WASI and web share the **same `ASC_NP_NONE` branch**, and `unit: desktop/NativeProcessSeam` pins that the two cannot be split apart |
 | Regression | see the full-run row in `TODO.md` stage 391 |

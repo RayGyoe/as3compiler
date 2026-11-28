@@ -228,8 +228,17 @@ static int as_np_spawn(as_np_slot* s, const char* exe, const char* cwd, as_vecto
     sa.bInheritHandle = TRUE;
     // The child inherits the three "business ends"; the parent keeps the others
     // non-inheritable so a grandchild cannot hold the pipe open and prevent EOF.
-    if (!CreatePipe(&in_r, &in_w, &sa, 0)) goto done;
+    if (!CreatePipe(&in_r, &in_w, &sa, 1 << 20)) goto done;
     if (!SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0)) goto done;
+    {
+        // EP seam: non-blocking write side. The old blocking WriteFile could stall
+        // the AS3 thread whenever the child drained slower than we produced (video
+        // export feeds whole frames); PIPE_NOWAIT turns a full pipe into "retry next
+        // tick" instead of a GUI hang. The 1 MiB buffer lets a full frame go out in
+        // one tick once the child has drained.
+        DWORD mode = PIPE_NOWAIT;
+        SetNamedPipeHandleState(in_w, &mode, NULL, NULL);
+    }
     if (!CreatePipe(&out_r, &out_w, &sa, 0)) goto done;
     if (!SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0)) goto done;
     if (!CreatePipe(&err_r, &err_w, &sa, 0)) goto done;
@@ -337,6 +346,12 @@ done:
     // Non-blocking reads AND a non-blocking write side: the AS3 thread must never
     // block on a child that is not reading its stdin.
     fcntl(in_pipe[1], F_SETFL, fcntl(in_pipe[1], F_GETFL, 0) | O_NONBLOCK);
+    // EP seam: best-effort 1 MiB pipe buffer so a full video frame fits one write
+    // (Linux F_SETPIPE_SZ; macOS has no equivalent and keeps the 64 KiB default --
+    // the non-blocking partial-write loop still makes progress every tick).
+#ifdef F_SETPIPE_SZ
+    fcntl(in_pipe[1], F_SETPIPE_SZ, 1 << 20);
+#endif
     fcntl(out_pipe[0], F_SETFL, fcntl(out_pipe[0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(err_pipe[0], F_SETFL, fcntl(err_pipe[0], F_GETFL, 0) | O_NONBLOCK);
     s->pid = pid;
@@ -419,7 +434,7 @@ static void as_np_flush_stdin(as_np_slot* s, ByteArray* in) {
 #endif
     while (s->in_sent < in->length) {
         int want = in->length - s->in_sent;
-        if (want > 4096) want = 4096;   // bounded per tick: never a long blocking write
+        if (want > (1 << 20)) want = 1 << 20;   // bounded per tick; a full video frame fits
 #ifdef _WIN32
         {
             DWORD wrote = 0;
@@ -439,7 +454,19 @@ static void as_np_flush_stdin(as_np_slot* s, ByteArray* in) {
 }
 
 static void as_np_close_stdin(as_np_slot* s, ByteArray* in) {
-    as_np_flush_stdin(s, in);
+    // EP seam: drain before closing. With a non-blocking write side a single flush
+    // may leave pending bytes; closing the handle would drop them (truncated video).
+    // The child is normally draining continuously, so this loop exits in a few ms;
+    // the bound keeps a wedged child from hanging the caller forever.
+    for (int i = 0; i < 10000 && in != NULL && s->in_sent < in->length; i++) {
+        as_np_flush_stdin(s, in);
+        if (s->in_sent >= in->length) break;
+#ifdef _WIN32
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
     if (s->stdin_closed) return;
     s->stdin_closed = 1;
 #ifdef _WIN32
@@ -568,8 +595,10 @@ static void as_np_tick(void) {
         int err_n;
         int code = 0;
         int done = 0;
+        int in_before = 0;
         if (!s->used || !s->running) continue;
         np = (NativeProcess*)s->obj;
+        in_before = s->in_sent;
 
         out_n = as_np_read_pipe(s, 0, np->standardOutput);
         err_n = as_np_read_pipe(s, 1, np->standardError);
@@ -584,6 +613,22 @@ static void as_np_tick(void) {
             if (!s->used) continue;
         }
         as_np_flush_stdin(s, np->standardInput);
+        // EP seam: report flushed stdin bytes so producers can pace themselves
+        // (backpressure) instead of guessing how far the pipe got. Same
+        // bytesLoaded/bytesTotal=0 convention as the read side.
+        if (s->in_sent > in_before)
+            as_np_dispatch_data(np, np->standardInput, "standardInputProgress", s->in_sent - in_before);
+        if (!s->used) continue;   // a handler disposed the process
+        // EP: discard the flushed prefix so the write buffer stays bounded by
+        // pending bytes. Append-only growth made a 1500-frame export realloc-copy
+        // gigabytes (working set 5.3 GB; the producer stalled on memcpy).
+        if (s->in_sent > 0 && np->standardInput != NULL) {
+            ByteArray* inb = np->standardInput;
+            int rem = inb->length - s->in_sent;
+            if (rem > 0) memmove(inb->data, (unsigned char*)inb->data + s->in_sent, (size_t)rem);
+            inb->length = rem;
+            s->in_sent = 0;
+        }
 
 #ifdef ASC_NP_WIN
         if (s->proc != NULL && WaitForSingleObject(s->proc, 0) == WAIT_OBJECT_0) {

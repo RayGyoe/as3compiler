@@ -77,6 +77,9 @@ start(info)                  -> running 立刻 = true（同一行可读）
   `exit` 之前投递，取输出的调用方不会丢末尾。
 - `ProgressEvent.bytesLoaded` = 本帧读到的**字节数**；`bytesTotal` = **`0`**——管道不预告长度，
   这是实测值，不是省略。
+- **EP 接缝**：`STANDARD_INPUT_PROGRESS` 在帧边界报告**本帧冲出的 stdin 字节数**
+  （`bytesLoaded` 同口径、`bytesTotal=0`）——生产者（如导出 pipe 喂入）靠它做背压，
+  不用猜管道走到哪。
 - `running` 在 `exit(true)` 调用的**同一行仍为 `true`**，由 `exit` 事件清掉。实测如此，
   故不能把 `exit()` 当成同步停止。
 - 同一个 `NativeProcess` 对象在 `exit` 之后**可以再 `start()`**，退出码按新子进程重新报。
@@ -90,8 +93,16 @@ start(info)                  -> running 立刻 = true（同一行可读）
   定时器**同一个边界**。带窗口构建每帧一次，无窗口构建由 AS3 自己调 `tickFrame()`。
 - 读是**非阻塞**的：Windows 用 `PeekNamedPipe` + `ReadFile`，POSIX 用 `O_NONBLOCK` 的 `read`，
   `EAGAIN`/`ERROR_NO_DATA` 一律当「本帧没有」。
-- 写 stdin 也是**非阻塞**的，且每帧最多 4096 字节；子进程不读 stdin 也不会卡住 AS3 线程。
-- `closeInput()` 先冲掉尚未发出的字节，再关写端——`more`/`cat` 这类子进程靠这个 EOF 退出。
+- 写 stdin 也是**非阻塞**的（Windows `PIPE_NOWAIT`、POSIX `O_NONBLOCK`），每帧上限 **1 MiB**
+  （EP 接缝：视频导出整帧喂入；旧 4096 上限一帧要上千个泵 tick）；管道缓冲 1 MiB
+  （POSIX `F_SETPIPE_SZ` best-effort，macOS 无对应物保持默认）。子进程不读 stdin 也不会卡住
+  AS3 线程：满管＝「下帧重试」。
+- `closeInput()` **先排空**尚未发出的字节（有界等待循环）再关写端——非阻塞写端单次冲写
+  可能留尾字节，直接关会截断视频；`more`/`cat` 这类子进程靠这个 EOF 退出。
+  注意 Windows 默认时钟分辨率下 `Sleep(1)` ≈15.6 ms，「10000 次」的界实际是 ~156 s 而非 10 s。
+- **flush 后 compaction**（EP）：已送前缀从 `standardInput` 丢弃（尾段 memmove 到首、
+  `length` 收缩、`in_sent` 归零）⇒ 写缓冲以「未冲出字节」为界。append-only 缓冲在千帧级
+  导出里会 realloc-copy GB 级（实测工作集 5.3 GB、生产者被 memcpy 拖死）。
 - `exit(force)` 只发信号/终止，**不当场回收**：回收仍在帧边界，好让已在管道里的数据先投递。
 
 ---
@@ -179,8 +190,8 @@ AIR 的 `force=false` 语义是「请求子进程自己关闭」（GUI 子进程
 
 | 项 | 内容 |
 |---|---|
-| 示例 | `examples/native-process.as`：16 组断言，覆盖形状、错误号/文案、事件顺序、`bytesLoaded/bytesTotal`、stdin 往返 + EOF、`#3213`、强杀、重启、`workingDirectory` 生效。子进程按宿主选（Windows `cmd.exe`，其余 `/bin/sh`），同一份脚本覆盖两端；但**本阶段只在 Windows 上实测**，POSIX 分支（`fork`/`execv`、`O_NONBLOCK`、`waitpid`）在本机**没跑过**——要等 macOS arm64 的 CI 跑同一份示例才算数，在那之前 POSIX 侧的口径是「写了、未测」 |
-| 单元钉 | `unit: desktop/NativeProcess`：钉模块形状（槽位数、帧边界泵、非阻塞读、`CREATE_NO_WINDOW`、POSIX `O_NONBLOCK`、错误文案常量、`standardInput` 缓冲冲写点）、钉示例存在 |
+| 示例 | `examples/native-process.as`：17 组断言，覆盖形状、错误号/文案、事件顺序、`bytesLoaded/bytesTotal`、stdin 往返 + EOF、**EP 大块 stdin（~300 KiB）+ `STANDARD_INPUT_PROGRESS` 逐字节账目**、`#3213`、强杀、重启、`workingDirectory` 生效。子进程按宿主选（Windows `cmd.exe`，其余 `/bin/sh`），同一份脚本覆盖两端；但**本阶段只在 Windows 上实测**，POSIX 分支（`fork`/`execv`、`O_NONBLOCK`、`waitpid`）在本机**没跑过**——要等 macOS arm64 的 CI 跑同一份示例才算数，在那之前 POSIX 侧的口径是「写了、未测」 |
+| 单元钉 | `unit: desktop/NativeProcess`：钉模块形状（槽位数、帧边界泵、非阻塞读、`CREATE_NO_WINDOW`、POSIX `O_NONBLOCK`、错误文案常量、`standardInput` 缓冲冲写点）、**EP 接缝（`PIPE_NOWAIT`、1 MiB 管道/冲写上限、`F_SETPIPE_SZ`、`standardInputProgress` 投递点、close 排空循环）**、钉示例存在 |
 | `adl` 证据 | `temp/npa/air/T.as`（形状）、`NP.as`/`NP2.as`（错误与事件）、`Q.as`（命令行拼接） |
 | web 目标 | `node src/index.ts examples/web/hello-web.as --manifest examples/web/hello-web.build.json`（emcc 3.1.44，`-O2`） | **Build successful**（19.4 s）：`fork`/`execv`/`fcntl` 的 10 个错误消失，`isSupported` 在该目标上为 `false`。WASI **未在本机跑通**——本机没有可调用的 WASI SDK（`wasiCc()` 在 Windows 上给出不带 `.exe` 的路径，`WASI_SDK_HOME` 也没有配），但 WASI 与 web **共用同一个 `ASC_NP_NONE` 分支**，`unit: desktop/NativeProcessSeam` 钉死两者不可被拆开 |
 | 回归 | 见 `TODO.md` 阶段三百九十一的全量结果行 |
