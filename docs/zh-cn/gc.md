@@ -378,6 +378,17 @@ SWEEP ──(每帧扫一片，回收 white、black 复位 white)──> IDLE
 - **触发阈值自适应**：`gc_threshold = max(1 MiB, inuse/8)`，垃圾约占堆 1/8 才开新轮，避免在大堆上
   「上一轮还没走完就又重启标记」。
 - 两个旋钮都可用环境变量 `ASC_GC_BUDGET` / `ASC_GC_THRESHOLD` 绝对覆盖（调参用，默认走自适应）。
+- **分配比例多切片 + 高分配率触发上限（EP-C，2026-11-28）**：帧边界按 vsync 到达，而时间片生产者
+  （视频导出 24 ms 片）每个边界可分配十几 MB；「每边界一片 3 ms」的回收吞吐跟不上分配 ⇒
+  incremental 轮滞后、垃圾堆到 GB 级（GUI 导出实测 2701 MB @1500 帧；无头边界速率不受限仅 92 MB）。
+  修法两条，均不改动单切片延迟帽：① `gc_step` 按「自上一安全点分配字节」追加切片
+  （`slices = 1 + alloc_since / 4 MiB`，封顶 `ASC_GC_MAX_SLICES` 默认 5，安全点总帽
+  `ASC_GC_POINT_BUDGET_MS` 默认 15 ms）；② 高分配率时给自适应触发阈值加帽
+  （`ASC_GC_TRIGGER_CEIL_BYTES` 默认 32 MiB）——`inuse/8` 是正反馈（inuse 含未扫垃圾 ⇒ 堆越大
+  触发越晚），不封顶会在时间片生产者下形成 GB 级平衡。空闲帧分配 < 4 MiB ⇒ 恰好一片，行为不变。
+  实测同二进制里程碑 A/B：基线 2701 → 仅① 1019 → ①+② **927 MB（−66%）**，导出墙钟不变；
+  去帽 env（`ASC_GC_TIME_BUDGET_MS=0 ASC_GC_BUDGET=200000`）704 MB 为下界参照（单切片停顿不再受限，
+  不作默认）。钉：`unit: memledger/GcSlicePacing`。
 
 **单步伪代码**（每帧一次）：
 
@@ -400,6 +411,9 @@ void gc_step(void) {
     }
 }
 ```
+
+（EP-C 后上表是**单切片** `gc_slice(t0, cap)`；`gc_step` 外层按分配比例循环调用它，
+每切片自带新的 `t0`/`cap`，安全点总帽先到者停。）
 
 ### 6.4 write barrier（写屏障）完整实现
 

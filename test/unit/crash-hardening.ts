@@ -179,7 +179,10 @@ function checkCrashHardening(): string[] {
     rt.includes('static void* as_error_new_oom(const char* msg, int id);') &&
     em.includes("static void* as_error_new_oom(const char* m, int id) { return Error_new((char*)m, id); }"));
   const segAt = rt.indexOf('static void* gc_alloc(int type, size_t size) {');
-  const segBody = segAt >= 0 ? rt.slice(segAt, segAt + 9000) : '';
+  // Extract to the next column-0 `static ` (function boundary), not a fixed char
+  // window: a fixed window silently drops tail checks whenever the body grows.
+  const segEnd = segAt >= 0 ? rt.indexOf('\nstatic ', segAt + 10) : -1;
+  const segBody = segAt >= 0 ? rt.slice(segAt, segEnd < 0 ? rt.length : segEnd) : '';
   check('gc_alloc never stores a malloc result before testing it',
     segBody.includes('char* seg_base = oom_forced ? NULL : (char*)malloc(seg_size);') &&
     segBody.includes('if (s == NULL || seg_base == NULL) {') &&

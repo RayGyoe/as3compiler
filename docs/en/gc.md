@@ -449,6 +449,21 @@ chunk of work drops the frame rate from 120 to 75, cutting the benchmark's ramp-
   on a large heap.
 - Both knobs can be absolutely overridden by the environment variables `ASC_GC_BUDGET` / `ASC_GC_THRESHOLD`
   (for tuning; the default is adaptive).
+- **Allocation-proportional extra slices + high-rate trigger ceiling (EP-C, 2026-11-28)**: frame
+  boundaries arrive at vsync rate while a time-sliced producer (video export, 24 ms slices) can
+  allocate tens of MB per boundary; "one 3 ms slice per boundary" drains slower than the producer
+  allocates, so the incremental cycle lags and garbage piles to GB scale (measured 2701 MB @1500
+  export frames in GUI; headless, with unlimited boundary rate, stayed at 92 MB). Two changes, neither
+  touching the per-slice latency cap: (1) `gc_step` runs extra slices proportional to bytes allocated
+  since the previous safe point (`slices = 1 + alloc_since / 4 MiB`, capped by `ASC_GC_MAX_SLICES`
+  default 5, whole-safe-point cap `ASC_GC_POINT_BUDGET_MS` default 15 ms); (2) while the allocation
+  rate is high, cap the adaptive trigger (`ASC_GC_TRIGGER_CEIL_BYTES` default 32 MiB) -- `inuse/8` is
+  a feedback loop (inuse includes unswept garbage, so a bigger heap triggers later), which under a
+  time-sliced producer settles at a GB-scale equilibrium. Idle frames allocate < 4 MiB => exactly one
+  slice, unchanged. Same-binary milestone A/B: baseline 2701 -> (1) only 1019 -> (1)+(2) **927 MB
+  (-66%)**, export wall unchanged; the uncapped env (`ASC_GC_TIME_BUDGET_MS=0 ASC_GC_BUDGET=200000`)
+  reaches 704 MB as a lower-bound reference (single-slice pause no longer bounded; not the default).
+  Pin: `unit: memledger/GcSlicePacing`.
 
 **Single-step pseudocode** (once per frame):
 
@@ -468,6 +483,9 @@ void gc_step(void) {
     }
 }
 ```
+
+(Since EP-C the table above is one **slice**, `gc_slice(t0, cap)`; `gc_step` loops over it
+allocation-proportionally, each slice with a fresh `t0`/`cap`, stopping at the whole-safe-point cap.)
 
 ### 6.4 Write Barrier: Complete Implementation
 

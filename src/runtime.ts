@@ -1096,6 +1096,8 @@ static gc_header* gc_find_block(size_t size, gc_header*** out_head, gc_header** 
 }
 static gc_header* gc_all = NULL;        // live objects, sweep walks this
 static size_t gc_bytes_allocated = 0;   // bytes since last collect (trigger)
+static size_t gc_step_alloc = 0;        // EP-C: bytes since last frame safe point (slice pacing)
+static int gc_alloc_rate_high = 0;      // EP-C: last safe point allocated >= one slice unit
 // O(1) mirror of "header+payload bytes currently linked in gc_all" -- exactly the
 // quantity the linear walk in gc_heap_used_bytes() used to sum. That walk is
 // O(live objects), and System.totalMemory/freeMemory sum it: Starling's
@@ -1337,6 +1339,7 @@ static void gc_grey_push(gc_header* h);
 // Collection entry points used by gc_alloc's non-GUI trigger below. Both live
 // after the mark/sweep code as well, so they need the same treatment.
 static size_t gc_trigger(void);
+static size_t gc_trigger_ceil_bytes(void);
 static void gc_collect(void);
 
 // ---------- allocation failure ----------
@@ -1626,6 +1629,7 @@ static void* gc_alloc(int type, size_t size) {
             h->color = GC_BLACK;
         }
         gc_bytes_allocated += sizeof(gc_header) + h->size;
+        gc_step_alloc += sizeof(gc_header) + h->size;
         void* body = (void*)((char*)h + sizeof(gc_header));
         // Skip the zero-fill for raw string buffers: gc_scan never reads their
         // bytes as pointers (GCT_STRING is a leaf), and every producer writes
@@ -10058,28 +10062,74 @@ static size_t gc_trigger(void) {
     if (override_threshold != 0) return override_threshold;
     size_t adaptive = gc_dbg_inuse_bytes() / 8;
     size_t floor = gc_frame_driven ? gc_threshold : GC_NONGUI_FLOOR;
-    return adaptive > floor ? adaptive : floor;
+    size_t t = adaptive > floor ? adaptive : floor;
+    // EP-C: the adaptive term is a feedback loop -- inuse includes unswept garbage,
+    // so a lagging cycle raises the trigger, which lets the heap grow further
+    // (measured GB-scale equilibrium under a time-sliced producer). While the
+    // allocation rate is high, cap the trigger so cycles start every ~32 MiB
+    // instead of every heap/8; idle programs keep the adaptive behaviour.
+    if (gc_alloc_rate_high) {
+        size_t ceil = gc_trigger_ceil_bytes();
+        if (t > ceil) t = ceil;
+    }
+    return t;
+}
+static size_t gc_trigger_ceil_bytes(void) {
+    static size_t v = 0;
+    static bool resolved = false;
+    if (!resolved) {
+        const char* e = getenv("ASC_GC_TRIGGER_CEIL_BYTES");
+        v = e ? (size_t)strtoul(e, NULL, 10) : (32u << 20);
+        resolved = true;
+    }
+    return v ? v : (32u << 20);
 }
 
-static void gc_step(void) {
-    // Reaching this at all means a frame safe point exists (Stage_dispatchFrame is
-    // gc_step()'s only caller), which is what makes the incremental path -- and
-    // its bounded per-frame pause -- the right one for this program. From here on
-    // gc_alloc stops triggering its own stop-the-world collections.
-    gc_frame_driven = true;
-    gc_in_gc = 1;
-    // One slice budget measured against the clock, shared by the mark and sweep
-    // phases so the whole gc_step stays inside it. A deferred System.gc() request
-    // also starts a cycle here (see as_system_gc / gc_force_requested).
-    const double t0 = as_now_ms();
-    const double cap_ms = gc_time_budget_ms();
+// EP-C: allocation-proportional slice pacing knobs (see gc_step). A GUI frame
+// boundary arrives at vsync rate while a time-sliced producer (video export) can
+// allocate many MB per boundary; one slice per boundary then drains slower than
+// the producer allocates. These knobs scale the number of slices per safe point
+// with the bytes allocated since the previous one, without touching the per-slice
+// latency cap.
+static size_t gc_alloc_slice_bytes(void) {
+    static size_t v = 0;
+    static bool resolved = false;
+    if (!resolved) {
+        const char* e = getenv("ASC_GC_ALLOC_SLICE_BYTES");
+        v = e ? (size_t)strtoul(e, NULL, 10) : (4u << 20);
+        resolved = true;
+    }
+    return v ? v : (4u << 20);
+}
+static size_t gc_max_slices(void) {
+    static size_t v = 0;
+    static bool resolved = false;
+    if (!resolved) {
+        const char* e = getenv("ASC_GC_MAX_SLICES");
+        v = e ? (size_t)strtoul(e, NULL, 10) : 5;
+        resolved = true;
+    }
+    return v ? v : 5;
+}
+static double gc_point_budget_ms(void) {
+    static double v = -1.0;
+    if (v < 0) {
+        const char* e = getenv("ASC_GC_POINT_BUDGET_MS");
+        v = e ? atof(e) : 15.0;
+    }
+    return v;
+}
+
+// One incremental slice (mark and/or sweep) bounded by cap_ms. Returns whether a
+// cycle is still in progress afterwards, so gc_step can decide to run more slices.
+static bool gc_slice(double t0, double cap_ms) {
     if (gc_inc.state == GC_IDLE) {
         // Segment release / allocator trim is rate-limited and idempotent, so it
         // also runs here (every frame) rather than only at a cycle end: a scene
         // that stopped allocating never ends another cycle, and RSS would then
         // stay at the high-water mark forever after the ramp is over.
         gc_release_empty_segs();
-        if (!gc_force_requested && gc_bytes_allocated < gc_trigger()) { gc_in_gc = 0; return; }
+        if (!gc_force_requested && gc_bytes_allocated < gc_trigger()) return false;
         gc_force_requested = 0;
         gc_inc.state = GC_MARK;
         gc_inc.grey_top = 0;  // fresh mark; a previous cycle drains to empty first
@@ -10105,6 +10155,34 @@ static void gc_step(void) {
     }
     if (gc_inc.state == GC_SWEEP) {
         if (gc_sweep_step(gc_budget(), t0, cap_ms)) gc_finish_cycle();
+    }
+    return gc_inc.state != GC_IDLE;
+}
+
+static void gc_step(void) {
+    // Reaching this at all means a frame safe point exists (Stage_dispatchFrame is
+    // gc_step()'s only caller), which is what makes the incremental path -- and
+    // its bounded per-frame pause -- the right one for this program. From here on
+    // gc_alloc stops triggering its own stop-the-world collections.
+    gc_frame_driven = true;
+    gc_in_gc = 1;
+    // EP-C: run extra slices in the SAME safe point, proportional to bytes allocated
+    // since the previous one (measured: GUI export piled GB-scale garbage because one
+    // 3 ms slice per vsync boundary drained slower than the 24 ms producer slice
+    // allocated; headless, with unlimited boundary rate, stayed at ~92 MB). Each slice
+    // keeps its own cap_ms so a single-slice pause is unchanged; point_cap bounds the
+    // whole safe point. Idle frames allocate < one unit ⇒ exactly one slice as before.
+    const size_t alloc_since = gc_step_alloc;
+    gc_step_alloc = 0;
+    gc_alloc_rate_high = alloc_since >= gc_alloc_slice_bytes() ? 1 : 0;
+    size_t slices = 1 + alloc_since / gc_alloc_slice_bytes();
+    const size_t max_slices = gc_max_slices();
+    if (slices > max_slices) slices = max_slices;
+    const double point_t0 = as_now_ms();
+    const double point_cap = gc_point_budget_ms();
+    for (size_t s = 0; s < slices; s++) {
+        if (!gc_slice(as_now_ms(), gc_time_budget_ms())) break;
+        if (point_cap > 0 && as_now_ms() - point_t0 >= point_cap) break;
     }
     gc_in_gc = 0;
 }
