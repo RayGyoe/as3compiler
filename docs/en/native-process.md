@@ -100,10 +100,11 @@ start(info)                  -> running is true on the very next line
 - Reads are **non-blocking**: `PeekNamedPipe` + `ReadFile` on Windows, `O_NONBLOCK` `read` on
   POSIX, with `EAGAIN` / `ERROR_NO_DATA` treated as "nothing this frame".
 - Writing stdin is non-blocking too (`PIPE_NOWAIT` on Windows, `O_NONBLOCK` on POSIX) and
-  bounded to **1 MiB** per frame (EP seam: video export feeds whole frames; the old 4096 cap
-  needed thousands of pump ticks per frame). The pipe buffer is 1 MiB (`F_SETPIPE_SZ`
-  best-effort on POSIX; macOS has no equivalent and keeps its default). A child that never
-  reads its stdin cannot stall the AS3 thread: a full pipe means "retry next tick".
+  bounded to **16 MiB** per frame (EP seam: video export feeds whole frames; the old 4096 cap
+  needed thousands of pump ticks per frame). The pipe buffer is 16 MiB (`F_SETPIPE_SZ`
+  best-effort on POSIX, capped by pipe-max-size; macOS has no equivalent and keeps its default).
+  1 MiB throttled GUI pipe export to ~pipe-capacity x vsync-rate bytes/s; 16 MiB lifts that.
+  A child that never reads its stdin cannot stall the AS3 thread: a full pipe means "retry next tick".
 - `closeInput()` **drains** pending bytes (bounded wait loop) before closing the write end —
   with a non-blocking write side a single flush can leave a tail, and closing would truncate
   the video; `more`/`cat` style children need this EOF to exit. Note `Sleep(1)` is ≈15.6 ms at
@@ -112,6 +113,11 @@ start(info)                  -> running is true on the very next line
   memmoved to the front, `length` shrunk, `in_sent` reset) so the write buffer stays bounded by
   pending bytes. An append-only buffer realloc-copied gigabytes on a thousand-frame export
   (measured working set 5.3 GB; the producer stalled on memcpy).
+  **EP-B key**: compaction must also reset the write cursor `position` to `rem`.
+  `ByteArray_writeBytes` appends at `position`; shrinking only `length` while `position` stays
+  at the old cumulative offset leaves a hole of stale bytes (`rem..position`) that the next
+  flush re-sends (ffmpeg measured ~25x the written bytes). `position = rem` keeps
+  `bytesAvailable` 0 and makes the next write append right after the pending tail.
 - `exit(force)` only signals/terminates; **reaping still happens at the frame boundary** so data
   already in the pipe is delivered first.
 
@@ -213,7 +219,7 @@ child has no message loop to ask, so on Windows this backend ignores `force` and
 | Item | Content |
 |---|---|
 | Example | `examples/native-process.as`: 17 assertion groups covering shapes, error ids/texts, event order, `bytesLoaded/bytesTotal`, stdin round trip + EOF, **EP bulk stdin (~300 KiB) + `STANDARD_INPUT_PROGRESS` byte accounting**, `#3213`, force stop, restart, `workingDirectory`. The script picks its child by host (`cmd.exe` on Windows, `/bin/sh` elsewhere), so one script covers both. Measured **on Windows only** in stage 391: the POSIX branch of the runtime (`fork`/`execv`, `O_NONBLOCK`, `waitpid`) was **not executed on this machine**, so until the macOS arm64 CI job (which compiles and runs this same example) reports it, POSIX support is written but unmeasured |
-| Unit pins | `unit: desktop/NativeProcess`: module shape (slot count, frame-boundary pump, non-blocking reads, `CREATE_NO_WINDOW`, POSIX `O_NONBLOCK`, error text constants, the `standardInput` flush point), **the EP seam (`PIPE_NOWAIT`, 1 MiB pipe/flush cap, `F_SETPIPE_SZ`, the `standardInputProgress` dispatch point, the close-drain loop)** plus the example's presence |
+| Unit pins | `unit: desktop/NativeProcess`: module shape (slot count, frame-boundary pump, non-blocking reads, `CREATE_NO_WINDOW`, POSIX `O_NONBLOCK`, error text constants, the `standardInput` flush point), **the EP seam (`PIPE_NOWAIT`, 16 MiB pipe/flush cap, `F_SETPIPE_SZ`, the `standardInputProgress` dispatch point, the compaction cursor reset, the close-drain loop)** plus the example's presence |
 | `adl` evidence | `temp/npa/air/T.as` (shape), `NP.as`/`NP2.as` (errors and events), `Q.as` (command-line joining) |
 | web target | `node src/index.ts examples/web/hello-web.as --manifest examples/web/hello-web.build.json` (emcc 3.1.44, `-O2`) | **Build successful** (19.4 s): the 10 `fork`/`execv`/`fcntl` errors are gone and `isSupported` answers `false` on that target. WASI was **not** run end to end here — this host has no invocable WASI SDK (`wasiCc()` yields a path with no `.exe` on Windows, and `WASI_SDK_HOME` is unset), but WASI and web share the **same `ASC_NP_NONE` branch**, and `unit: desktop/NativeProcessSeam` pins that the two cannot be split apart |
 | Regression | see the full-run row in `TODO.md` stage 391 |

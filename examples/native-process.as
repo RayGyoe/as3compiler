@@ -183,10 +183,14 @@ ok("standardInput");
 // A ~300 KiB write must cross in bounded ticks without stalling the thread, and
 // the flush signal must account for every byte: backpressure producers (export
 // pipe feed) pace themselves on it instead of guessing how far the pipe got.
+// The echo child must copy RAW bytes: Windows 'more' rewrites LF to CRLF, which
+// would break exact byte equality (measured +2400 on 2400 lines).
+var rawExe:String = isWindows ? 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' : shellPath;
+var rawArgs:Array = isWindows ? ['-NoProfile', '-Command', '$i=[Console]::OpenStandardInput(); $o=[Console]::OpenStandardOutput(); $i.CopyTo($o)'] : [shellFlag, 'cat'];
 var np2b:NativeProcess = new NativeProcess();
 var si2b:NativeProcessStartupInfo = new NativeProcessStartupInfo();
-si2b.executable = new File(shellPath);
-si2b.arguments = argsOf([shellFlag, isWindows ? "more" : "cat"]);
+si2b.executable = new File(rawExe);
+si2b.arguments = argsOf(rawArgs);
 var echoedB:int = 0;
 var flushedB:int = 0;
 var exitedB:Boolean = false;
@@ -206,8 +210,46 @@ check(np2b.standardInput.length < 65536, "stdin write buffer is compacted after 
 np2b.closeInput();
 pump(function():Boolean { return exitedB; }, 8000);
 check(exitedB, "bulk closeInput() delivers EOF after draining");
-check(echoedB >= bulk.length, "the child received the whole bulk write (" + echoedB + " bytes)");
+check(echoedB == bulk.length, "the child received exactly the bulk write (" + echoedB + "/" + bulk.length + ")");
 ok("bulk stdin + progress");
+
+// --- 5c. EP: interleaved multi-write byte accounting (compaction cursor) -----
+// writeBytes appends at `position`; if compaction shrinks length but leaves the
+// cursor at the old cumulative offset, the next write opens a hole of stale bytes
+// that the flush re-sent (measured on ffmpeg: ~25x the written bytes). Drain fully
+// between chunks so compaction runs with an advanced cursor, then demand exact
+// byte equality on both the progress signal and the child's echo.
+var np2c:NativeProcess = new NativeProcess();
+var si2c:NativeProcessStartupInfo = new NativeProcessStartupInfo();
+si2c.executable = new File(rawExe);
+si2c.arguments = argsOf(rawArgs);
+var echoedC:int = 0;
+var flushedC:int = 0;
+var totalC:int = 0;
+var maxLenC:int = 0;
+var exitedC:Boolean = false;
+np2c.addEventListener(ProgressEvent.STANDARD_OUTPUT_DATA, function(e:ProgressEvent):void {
+  echoedC += np2c.standardOutput.bytesAvailable;
+  np2c.standardOutput.readUTFBytes(np2c.standardOutput.bytesAvailable);
+});
+np2c.addEventListener(ProgressEvent.STANDARD_INPUT_PROGRESS, function(e:ProgressEvent):void { flushedC += int(e.bytesLoaded); });
+np2c.addEventListener(NativeProcessExitEvent.EXIT, function(e:NativeProcessExitEvent):void { exitedC = true; });
+np2c.start(si2c);
+var chunk:String = "";
+for (var cj:int = 0; cj < 64; cj++) chunk += "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+for (var ci:int = 0; ci < 40; ci++) {
+  np2c.standardInput.writeUTFBytes(chunk);
+  totalC += chunk.length;
+  pump(function():Boolean { return flushedC >= totalC; }, 4000);
+  if (np2c.standardInput.length > maxLenC) maxLenC = np2c.standardInput.length;
+}
+check(flushedC == totalC, "interleaved writes: progress accounts exactly (" + flushedC + "/" + totalC + ")");
+check(maxLenC <= chunk.length, "interleaved writes: buffer never grows past one chunk (max " + maxLenC + ")");
+np2c.closeInput();
+pump(function():Boolean { return exitedC; }, 8000);
+check(exitedC, "interleaved closeInput() delivers EOF");
+check(echoedC == totalC, "interleaved writes: child received exactly what was written (" + echoedC + "/" + totalC + ")");
+ok("interleaved stdin accounting");
 
 // --- 6. start() twice, then force-stop -------------------------------------
 var np3:NativeProcess = new NativeProcess();

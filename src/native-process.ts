@@ -228,14 +228,15 @@ static int as_np_spawn(as_np_slot* s, const char* exe, const char* cwd, as_vecto
     sa.bInheritHandle = TRUE;
     // The child inherits the three "business ends"; the parent keeps the others
     // non-inheritable so a grandchild cannot hold the pipe open and prevent EOF.
-    if (!CreatePipe(&in_r, &in_w, &sa, 1 << 20)) goto done;
+    if (!CreatePipe(&in_r, &in_w, &sa, 1 << 24)) goto done;
     if (!SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0)) goto done;
     {
         // EP seam: non-blocking write side. The old blocking WriteFile could stall
         // the AS3 thread whenever the child drained slower than we produced (video
         // export feeds whole frames); PIPE_NOWAIT turns a full pipe into "retry next
-        // tick" instead of a GUI hang. The 1 MiB buffer lets a full frame go out in
-        // one tick once the child has drained.
+        // tick" instead of a GUI hang. The 16 MiB buffer lets a full frame go out in
+        // one tick once the child has drained. (1 MiB throttled GUI pipe export to
+        // ~pipe-capacity x vsync-rate bytes/s; 16 MiB lifts that ceiling.)
         DWORD mode = PIPE_NOWAIT;
         SetNamedPipeHandleState(in_w, &mode, NULL, NULL);
     }
@@ -346,11 +347,11 @@ done:
     // Non-blocking reads AND a non-blocking write side: the AS3 thread must never
     // block on a child that is not reading its stdin.
     fcntl(in_pipe[1], F_SETFL, fcntl(in_pipe[1], F_GETFL, 0) | O_NONBLOCK);
-    // EP seam: best-effort 1 MiB pipe buffer so a full video frame fits one write
-    // (Linux F_SETPIPE_SZ; macOS has no equivalent and keeps the 64 KiB default --
-    // the non-blocking partial-write loop still makes progress every tick).
+    // EP seam: best-effort 16 MiB pipe buffer so a full video frame fits one write
+    // (Linux F_SETPIPE_SZ, capped by pipe-max-size; macOS has no equivalent and keeps
+    // the 64 KiB default -- the non-blocking partial-write loop still progresses).
 #ifdef F_SETPIPE_SZ
-    fcntl(in_pipe[1], F_SETPIPE_SZ, 1 << 20);
+    fcntl(in_pipe[1], F_SETPIPE_SZ, 1 << 24);
 #endif
     fcntl(out_pipe[0], F_SETFL, fcntl(out_pipe[0], F_GETFL, 0) | O_NONBLOCK);
     fcntl(err_pipe[0], F_SETFL, fcntl(err_pipe[0], F_GETFL, 0) | O_NONBLOCK);
@@ -434,7 +435,7 @@ static void as_np_flush_stdin(as_np_slot* s, ByteArray* in) {
 #endif
     while (s->in_sent < in->length) {
         int want = in->length - s->in_sent;
-        if (want > (1 << 20)) want = 1 << 20;   // bounded per tick; a full video frame fits
+        if (want > (1 << 24)) want = 1 << 24;   // bounded per tick; pipe capacity sets the real ceiling
 #ifdef _WIN32
         {
             DWORD wrote = 0;
@@ -622,11 +623,17 @@ static void as_np_tick(void) {
         // EP: discard the flushed prefix so the write buffer stays bounded by
         // pending bytes. Append-only growth made a 1500-frame export realloc-copy
         // gigabytes (working set 5.3 GB; the producer stalled on memcpy).
+        // The write cursor MUST move with the compaction: ByteArray_writeBytes
+        // writes at 'position', so leaving it at the old cumulative offset opened
+        // a hole of stale bytes that the next flush re-sent (ffmpeg measured ~25x
+        // the written bytes). position = rem keeps bytesAvailable 0 and makes the
+        // next write append right after the pending tail.
         if (s->in_sent > 0 && np->standardInput != NULL) {
             ByteArray* inb = np->standardInput;
             int rem = inb->length - s->in_sent;
             if (rem > 0) memmove(inb->data, (unsigned char*)inb->data + s->in_sent, (size_t)rem);
             inb->length = rem;
+            inb->position = rem;
             s->in_sent = 0;
         }
 
